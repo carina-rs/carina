@@ -2,7 +2,7 @@
 
 use indexmap::IndexMap;
 
-use crate::resource::Value;
+use crate::resource::{ConcreteValue, Value};
 
 use super::value_type_name;
 
@@ -26,7 +26,7 @@ pub(crate) fn builtin_map(args: &[Value]) -> Result<Value, String> {
     }
 
     let accessor = match &args[0] {
-        Value::String(s) if s.starts_with('.') => &s[1..],
+        Value::Concrete(ConcreteValue::String(s)) if s.starts_with('.') => &s[1..],
         _ => {
             return Err(
                 "map() first argument must be a field accessor string starting with '.' (e.g., \".field_name\")".to_string(),
@@ -35,26 +35,28 @@ pub(crate) fn builtin_map(args: &[Value]) -> Result<Value, String> {
     };
 
     match &args[1] {
-        Value::List(items) => {
+        Value::Concrete(ConcreteValue::List(items)) => {
             let mapped: Result<Vec<Value>, String> = items
                 .iter()
                 .map(|item| match item {
-                    Value::Map(map) => map.get(accessor).cloned().ok_or_else(|| {
-                        format!("map(): field '{}' not found in map element", accessor)
-                    }),
+                    Value::Concrete(ConcreteValue::Map(map)) => {
+                        map.get(accessor).cloned().ok_or_else(|| {
+                            format!("map(): field '{}' not found in map element", accessor)
+                        })
+                    }
                     other => Err(format!(
                         "map() expects list of maps, got list of {}",
                         value_type_name(other)
                     )),
                 })
                 .collect();
-            Ok(Value::List(mapped?))
+            Ok(Value::Concrete(ConcreteValue::List(mapped?)))
         }
-        Value::Map(map) => {
+        Value::Concrete(ConcreteValue::Map(map)) => {
             let mapped: Result<IndexMap<String, Value>, String> = map
                 .iter()
                 .map(|(k, v)| match v {
-                    Value::Map(inner) => inner
+                    Value::Concrete(ConcreteValue::Map(inner)) => inner
                         .get(accessor)
                         .cloned()
                         .map(|val| (k.clone(), val))
@@ -70,7 +72,7 @@ pub(crate) fn builtin_map(args: &[Value]) -> Result<Value, String> {
                     )),
                 })
                 .collect();
-            Ok(Value::Map(mapped?))
+            Ok(Value::Concrete(ConcreteValue::Map(mapped?)))
         }
         other => Err(format!(
             "map() second argument must be a list or map, got {}",
@@ -84,34 +86,48 @@ mod tests {
     use indexmap::IndexMap;
 
     use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
-    use crate::resource::Value;
+    use crate::resource::{ConcreteValue, Value};
 
     fn make_map(pairs: Vec<(&str, Value)>) -> Value {
-        Value::Map(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+        Value::Concrete(ConcreteValue::Map(
+            pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+        ))
     }
 
     #[test]
     fn map_list_of_maps_extracts_field() {
         let args = vec![
-            Value::String(".subnet_id".to_string()),
-            Value::List(vec![
+            Value::Concrete(ConcreteValue::String(".subnet_id".to_string())),
+            Value::Concrete(ConcreteValue::List(vec![
                 make_map(vec![
-                    ("name", Value::String("subnet-a".to_string())),
-                    ("subnet_id", Value::String("id-1".to_string())),
+                    (
+                        "name",
+                        Value::Concrete(ConcreteValue::String("subnet-a".to_string())),
+                    ),
+                    (
+                        "subnet_id",
+                        Value::Concrete(ConcreteValue::String("id-1".to_string())),
+                    ),
                 ]),
                 make_map(vec![
-                    ("name", Value::String("subnet-b".to_string())),
-                    ("subnet_id", Value::String("id-2".to_string())),
+                    (
+                        "name",
+                        Value::Concrete(ConcreteValue::String("subnet-b".to_string())),
+                    ),
+                    (
+                        "subnet_id",
+                        Value::Concrete(ConcreteValue::String("id-2".to_string())),
+                    ),
                 ]),
-            ]),
+            ])),
         ];
         let result = evaluate_builtin("map", &args).unwrap();
         assert_eq!(
             result,
-            Value::List(vec![
-                Value::String("id-1".to_string()),
-                Value::String("id-2".to_string()),
-            ])
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("id-1".to_string())),
+                Value::Concrete(ConcreteValue::String("id-2".to_string())),
+            ]))
         );
     }
 
@@ -121,23 +137,44 @@ mod tests {
         outer.insert(
             "a".to_string(),
             make_map(vec![
-                ("name", Value::String("foo".to_string())),
-                ("id", Value::String("1".to_string())),
+                (
+                    "name",
+                    Value::Concrete(ConcreteValue::String("foo".to_string())),
+                ),
+                (
+                    "id",
+                    Value::Concrete(ConcreteValue::String("1".to_string())),
+                ),
             ]),
         );
         outer.insert(
             "b".to_string(),
             make_map(vec![
-                ("name", Value::String("bar".to_string())),
-                ("id", Value::String("2".to_string())),
+                (
+                    "name",
+                    Value::Concrete(ConcreteValue::String("bar".to_string())),
+                ),
+                (
+                    "id",
+                    Value::Concrete(ConcreteValue::String("2".to_string())),
+                ),
             ]),
         );
-        let args = vec![Value::String(".id".to_string()), Value::Map(outer)];
+        let args = vec![
+            Value::Concrete(ConcreteValue::String(".id".to_string())),
+            Value::Concrete(ConcreteValue::Map(outer)),
+        ];
         let result = evaluate_builtin("map", &args).unwrap();
         match result {
-            Value::Map(m) => {
-                assert_eq!(m.get("a"), Some(&Value::String("1".to_string())));
-                assert_eq!(m.get("b"), Some(&Value::String("2".to_string())));
+            Value::Concrete(ConcreteValue::Map(m)) => {
+                assert_eq!(
+                    m.get("a"),
+                    Some(&Value::Concrete(ConcreteValue::String("1".to_string())))
+                );
+                assert_eq!(
+                    m.get("b"),
+                    Some(&Value::Concrete(ConcreteValue::String("2".to_string())))
+                );
             }
             other => panic!("Expected Map, got {:?}", other),
         }
@@ -145,9 +182,12 @@ mod tests {
 
     #[test]
     fn map_empty_list() {
-        let args = vec![Value::String(".field".to_string()), Value::List(vec![])];
+        let args = vec![
+            Value::Concrete(ConcreteValue::String(".field".to_string())),
+            Value::Concrete(ConcreteValue::List(vec![])),
+        ];
         let result = evaluate_builtin("map", &args).unwrap();
-        assert_eq!(result, Value::List(vec![]));
+        assert_eq!(result, Value::Concrete(ConcreteValue::List(vec![])));
     }
 
     #[test]
@@ -160,7 +200,7 @@ mod tests {
     #[test]
     fn map_partial_application_one_arg() {
         use crate::builtins::evaluate_builtin_for_tests;
-        let args = vec![Value::String(".field".to_string())];
+        let args = vec![Value::Concrete(ConcreteValue::String(".field".to_string()))];
         let result = evaluate_builtin_for_tests("map", &args).unwrap();
         assert!(result.is_closure());
     }
@@ -168,9 +208,9 @@ mod tests {
     #[test]
     fn map_error_wrong_arg_count_three() {
         let args = vec![
-            Value::List(vec![]),
-            Value::String(".field".to_string()),
-            Value::String("extra".to_string()),
+            Value::Concrete(ConcreteValue::List(vec![])),
+            Value::Concrete(ConcreteValue::String(".field".to_string())),
+            Value::Concrete(ConcreteValue::String("extra".to_string())),
         ];
         let result = evaluate_builtin("map", &args);
         assert!(result.is_err());
@@ -179,7 +219,10 @@ mod tests {
 
     #[test]
     fn map_error_accessor_without_dot() {
-        let args = vec![Value::String("field".to_string()), Value::List(vec![])];
+        let args = vec![
+            Value::Concrete(ConcreteValue::String("field".to_string())),
+            Value::Concrete(ConcreteValue::List(vec![])),
+        ];
         let result = evaluate_builtin("map", &args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("field accessor"));
@@ -187,7 +230,10 @@ mod tests {
 
     #[test]
     fn map_error_accessor_not_string() {
-        let args = vec![Value::Int(42), Value::List(vec![])];
+        let args = vec![
+            Value::Concrete(ConcreteValue::Int(42)),
+            Value::Concrete(ConcreteValue::List(vec![])),
+        ];
         let result = evaluate_builtin("map", &args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("field accessor"));
@@ -196,8 +242,10 @@ mod tests {
     #[test]
     fn map_error_non_map_elements_in_list() {
         let args = vec![
-            Value::String(".field".to_string()),
-            Value::List(vec![Value::String("not a map".to_string())]),
+            Value::Concrete(ConcreteValue::String(".field".to_string())),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("not a map".to_string()),
+            )])),
         ];
         let result = evaluate_builtin("map", &args);
         assert!(result.is_err());
@@ -207,11 +255,11 @@ mod tests {
     #[test]
     fn map_error_missing_field() {
         let args = vec![
-            Value::String(".missing".to_string()),
-            Value::List(vec![make_map(vec![(
+            Value::Concrete(ConcreteValue::String(".missing".to_string())),
+            Value::Concrete(ConcreteValue::List(vec![make_map(vec![(
                 "name",
-                Value::String("foo".to_string()),
-            )])]),
+                Value::Concrete(ConcreteValue::String("foo".to_string())),
+            )])])),
         ];
         let result = evaluate_builtin("map", &args);
         assert!(result.is_err());
@@ -221,8 +269,8 @@ mod tests {
     #[test]
     fn map_error_second_arg_not_collection() {
         let args = vec![
-            Value::String(".field".to_string()),
-            Value::String("not a collection".to_string()),
+            Value::Concrete(ConcreteValue::String(".field".to_string())),
+            Value::Concrete(ConcreteValue::String("not a collection".to_string())),
         ];
         let result = evaluate_builtin("map", &args);
         assert!(result.is_err());

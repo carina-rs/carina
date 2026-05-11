@@ -156,7 +156,7 @@ mod tests {
     use super::*;
     use carina_core::effect::Effect;
     use carina_core::plan::Plan;
-    use carina_core::resource::{Resource, Value};
+    use carina_core::resource::{ConcreteValue, Resource, Value};
     use carina_core::schema::SchemaRegistry;
 
     #[test]
@@ -173,7 +173,10 @@ mod tests {
         plan.add(Effect::Create(
             Resource::new("ec2.Vpc", "my-vpc")
                 .with_binding("vpc")
-                .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string())),
+                .with_attribute(
+                    "cidr_block",
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                ),
         ));
         plan.add(Effect::Create(
             Resource::new("ec2.Subnet", "my-subnet")

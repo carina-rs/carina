@@ -938,7 +938,9 @@ mod tests {
             cfg.attributes
                 .get("_installed_at")
                 .and_then(|v| match v {
-                    carina_core::resource::Value::String(s) => Some(s.as_str()),
+                    carina_core::resource::Value::Concrete(
+                        carina_core::resource::ConcreteValue::String(s),
+                    ) => Some(s.as_str()),
                     _ => None,
                 })
                 .map(|p| std::path::Path::new(p).exists())
@@ -955,7 +957,7 @@ mod tests {
     #[test]
     fn install_fingerprint_flips_when_local_wasm_is_deleted() {
         use carina_core::parser::ProviderConfig;
-        use carina_core::resource::Value;
+        use carina_core::resource::{ConcreteValue, Value};
 
         let tmp = tempfile::tempdir().unwrap();
         let installed = tmp.path().join("carina-provider-foo.wasm");
@@ -964,7 +966,7 @@ mod tests {
         let mut attributes = IndexMap::new();
         attributes.insert(
             "_installed_at".to_string(),
-            Value::String(installed.display().to_string()),
+            Value::Concrete(ConcreteValue::String(installed.display().to_string())),
         );
         let config = ProviderConfig {
             name: "foo".into(),
@@ -1022,7 +1024,7 @@ mod tests {
 mod reload_skip_tests {
     use super::*;
     use carina_core::parser::ProviderConfig;
-    use carina_core::resource::Value;
+    use carina_core::resource::{ConcreteValue, Value};
     use indexmap::IndexMap;
 
     fn mk_config(name: &str, source: Option<&str>) -> ProviderConfig {
@@ -1090,13 +1092,15 @@ mod reload_skip_tests {
     fn configs_match_returns_false_when_attributes_change() {
         let dir = std::path::PathBuf::from("/tmp/x");
         let mut cfg_a = mk_config("awscc", Some("github.com/carina-rs/carina-provider-awscc"));
-        cfg_a
-            .attributes
-            .insert("region".into(), Value::String("us-east-1".into()));
+        cfg_a.attributes.insert(
+            "region".into(),
+            Value::Concrete(ConcreteValue::String("us-east-1".into())),
+        );
         let mut cfg_b = mk_config("awscc", Some("github.com/carina-rs/carina-provider-awscc"));
-        cfg_b
-            .attributes
-            .insert("region".into(), Value::String("ap-northeast-1".into()));
+        cfg_b.attributes.insert(
+            "region".into(),
+            Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
+        );
         let a = vec![(dir.clone(), cfg_a)];
         let b = vec![(dir, cfg_b)];
         assert!(!configs_match(&a, &b));
@@ -1108,19 +1112,23 @@ mod reload_skip_tests {
         // depend on the order in which attributes were inserted.
         let dir = std::path::PathBuf::from("/tmp/x");
         let mut cfg_a = mk_config("awscc", Some("github.com/carina-rs/carina-provider-awscc"));
-        cfg_a
-            .attributes
-            .insert("region".into(), Value::String("us-east-1".into()));
-        cfg_a
-            .attributes
-            .insert("profile".into(), Value::String("dev".into()));
+        cfg_a.attributes.insert(
+            "region".into(),
+            Value::Concrete(ConcreteValue::String("us-east-1".into())),
+        );
+        cfg_a.attributes.insert(
+            "profile".into(),
+            Value::Concrete(ConcreteValue::String("dev".into())),
+        );
         let mut cfg_b = mk_config("awscc", Some("github.com/carina-rs/carina-provider-awscc"));
-        cfg_b
-            .attributes
-            .insert("profile".into(), Value::String("dev".into()));
-        cfg_b
-            .attributes
-            .insert("region".into(), Value::String("us-east-1".into()));
+        cfg_b.attributes.insert(
+            "profile".into(),
+            Value::Concrete(ConcreteValue::String("dev".into())),
+        );
+        cfg_b.attributes.insert(
+            "region".into(),
+            Value::Concrete(ConcreteValue::String("us-east-1".into())),
+        );
         let a = vec![(dir.clone(), cfg_a)];
         let b = vec![(dir, cfg_b)];
         assert!(configs_match(&a, &b));

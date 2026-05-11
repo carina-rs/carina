@@ -7,7 +7,9 @@ use crate::effect::{CascadingUpdate, Effect, TemporaryName};
 use crate::identifier::generate_random_suffix;
 use crate::parser::WaitBinding;
 use crate::plan::{Plan, PlanError};
-use crate::resource::{Directives, Resource, ResourceId, ResourceKind, State, Value};
+use crate::resource::{
+    ConcreteValue, DeferredValue, Directives, Resource, ResourceId, ResourceKind, State, Value,
+};
 use crate::schema::{
     ResourceSchema, SchemaKind, SchemaRegistry, WAIT_DEFAULT_INTERVAL, WAIT_DEFAULT_TIMEOUT,
 };
@@ -96,12 +98,12 @@ fn generate_temporary_name(
 
     // Get the current value of the name attribute
     let original_value = match resource.get_attr(name_attr) {
-        Some(Value::String(s)) => s.clone(),
+        Some(Value::Concrete(ConcreteValue::String(s))) => s.clone(),
         _ => return None,
     };
 
     // Skip if the name_attribute value changed (new name is already different from old)
-    if let Some(Value::String(from_name)) = from.attributes.get(name_attr)
+    if let Some(Value::Concrete(ConcreteValue::String(from_name))) = from.attributes.get(name_attr)
         && *from_name != original_value
     {
         return None;
@@ -268,7 +270,7 @@ pub fn create_plan(
                         let mut modified = to;
                         modified.set_attr(
                             temp.attribute.clone(),
-                            Value::String(temp.temporary_value.clone()),
+                            Value::Concrete(ConcreteValue::String(temp.temporary_value.clone())),
                         );
                         modified
                     } else {
@@ -333,7 +335,7 @@ pub fn create_plan(
             }
             let identifier = state.identifier.clone().unwrap_or_default();
             let binding = state.attributes.get("_binding").and_then(|v| match v {
-                Value::String(s) => Some(s.clone()),
+                Value::Concrete(ConcreteValue::String(s)) => Some(s.clone()),
                 _ => None,
             });
             // Use stored dependency bindings from state file if available,
@@ -574,7 +576,7 @@ pub fn cascade_dependent_updates(
             let ref_attrs: Vec<String> = resource
                 .attributes
                 .iter()
-                .filter(|(_, v)| matches!(v, Value::ResourceRef { path } if path.binding() == dep))
+                .filter(|(_, v)| matches!(v, Value::Deferred(DeferredValue::ResourceRef{ path }) if path.binding() == dep))
                 .map(|(k, _)| k.clone())
                 .collect();
 
@@ -582,10 +584,14 @@ pub fn cascade_dependent_updates(
                 .attributes
                 .iter()
                 .filter_map(|(k, v)| match v {
-                    Value::ResourceRef { path } if path.binding() == dep => Some((
-                        k.clone(),
-                        format!("{}.{}", path.binding(), path.attribute()),
-                    )),
+                    Value::Deferred(DeferredValue::ResourceRef { path })
+                        if path.binding() == dep =>
+                    {
+                        Some((
+                            k.clone(),
+                            format!("{}.{}", path.binding(), path.attribute()),
+                        ))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -664,7 +670,7 @@ pub fn cascade_dependent_updates(
                     .attributes
                     .iter()
                     .filter(|(_, v)| {
-                        matches!(v, Value::ResourceRef { path } if path.binding() == replaced_binding)
+                        matches!(v, Value::Deferred(DeferredValue::ResourceRef{ path }) if path.binding() == replaced_binding)
                     })
                     .map(|(k, _)| k.clone())
                     .collect();
@@ -702,7 +708,7 @@ pub fn cascade_dependent_updates(
                         .attributes
                         .iter()
                         .filter_map(|(k, v)| match v {
-                            Value::ResourceRef { path }
+                            Value::Deferred(DeferredValue::ResourceRef { path })
                                 if path.binding() == replaced_binding
                                     && create_only_refs.contains(k) =>
                             {

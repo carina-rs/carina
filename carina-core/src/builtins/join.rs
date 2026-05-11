@@ -1,6 +1,6 @@
 //! `join(separator, list)` built-in function
 
-use crate::resource::Value;
+use crate::resource::{ConcreteValue, Value};
 
 use super::value_type_name;
 
@@ -24,7 +24,7 @@ pub(crate) fn builtin_join(args: &[Value]) -> Result<Value, String> {
     }
 
     let separator = match &args[0] {
-        Value::String(s) => s.clone(),
+        Value::Concrete(ConcreteValue::String(s)) => s.clone(),
         other => {
             return Err(format!(
                 "join() first argument must be a string, got {}",
@@ -34,7 +34,7 @@ pub(crate) fn builtin_join(args: &[Value]) -> Result<Value, String> {
     };
 
     let items = match &args[1] {
-        Value::List(items) => items,
+        Value::Concrete(ConcreteValue::List(items)) => items,
         other => {
             return Err(format!(
                 "join() second argument must be a list, got {}",
@@ -46,86 +46,106 @@ pub(crate) fn builtin_join(args: &[Value]) -> Result<Value, String> {
     let joined: String = items
         .iter()
         .map(|v| match v {
-            Value::String(s) => s.clone(),
-            Value::Int(n) => n.to_string(),
-            Value::Float(f) => f.to_string(),
-            Value::Bool(b) => b.to_string(),
-            Value::Duration(d) => crate::value::render_duration(*d),
+            Value::Concrete(ConcreteValue::String(s)) => s.clone(),
+            Value::Concrete(ConcreteValue::Int(n)) => n.to_string(),
+            Value::Concrete(ConcreteValue::Float(f)) => f.to_string(),
+            Value::Concrete(ConcreteValue::Bool(b)) => b.to_string(),
+            Value::Concrete(ConcreteValue::Duration(d)) => crate::value::render_duration(*d),
             other => format!("{:?}", other),
         })
         .collect::<Vec<_>>()
         .join(&separator);
 
-    Ok(Value::String(joined))
+    Ok(Value::Concrete(ConcreteValue::String(joined)))
 }
 
 #[cfg(test)]
 mod tests {
     use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
-    use crate::resource::Value;
+    use crate::resource::{ConcreteValue, Value};
 
     #[test]
     fn join_basic() {
         let args = vec![
-            Value::String("-".to_string()),
-            Value::List(vec![
-                Value::String("a".to_string()),
-                Value::String("b".to_string()),
-                Value::String("c".to_string()),
-            ]),
+            Value::Concrete(ConcreteValue::String("-".to_string())),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("a".to_string())),
+                Value::Concrete(ConcreteValue::String("b".to_string())),
+                Value::Concrete(ConcreteValue::String("c".to_string())),
+            ])),
         ];
         let result = evaluate_builtin("join", &args).unwrap();
-        assert_eq!(result, Value::String("a-b-c".to_string()));
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::String("a-b-c".to_string()))
+        );
     }
 
     #[test]
     fn join_empty_separator() {
         let args = vec![
-            Value::String("".to_string()),
-            Value::List(vec![
-                Value::String("a".to_string()),
-                Value::String("b".to_string()),
-            ]),
+            Value::Concrete(ConcreteValue::String("".to_string())),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("a".to_string())),
+                Value::Concrete(ConcreteValue::String("b".to_string())),
+            ])),
         ];
         let result = evaluate_builtin("join", &args).unwrap();
-        assert_eq!(result, Value::String("ab".to_string()));
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::String("ab".to_string()))
+        );
     }
 
     #[test]
     fn join_empty_list() {
-        let args = vec![Value::String("-".to_string()), Value::List(vec![])];
+        let args = vec![
+            Value::Concrete(ConcreteValue::String("-".to_string())),
+            Value::Concrete(ConcreteValue::List(vec![])),
+        ];
         let result = evaluate_builtin("join", &args).unwrap();
-        assert_eq!(result, Value::String("".to_string()));
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::String("".to_string()))
+        );
     }
 
     #[test]
     fn join_single_element() {
         let args = vec![
-            Value::String("-".to_string()),
-            Value::List(vec![Value::String("only".to_string())]),
+            Value::Concrete(ConcreteValue::String("-".to_string())),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("only".to_string()),
+            )])),
         ];
         let result = evaluate_builtin("join", &args).unwrap();
-        assert_eq!(result, Value::String("only".to_string()));
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::String("only".to_string()))
+        );
     }
 
     #[test]
     fn join_mixed_types() {
         let args = vec![
-            Value::String(", ".to_string()),
-            Value::List(vec![
-                Value::String("hello".to_string()),
-                Value::Int(42),
-                Value::Bool(true),
-            ]),
+            Value::Concrete(ConcreteValue::String(", ".to_string())),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("hello".to_string())),
+                Value::Concrete(ConcreteValue::Int(42)),
+                Value::Concrete(ConcreteValue::Bool(true)),
+            ])),
         ];
         let result = evaluate_builtin("join", &args).unwrap();
-        assert_eq!(result, Value::String("hello, 42, true".to_string()));
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::String("hello, 42, true".to_string()))
+        );
     }
 
     #[test]
     fn join_partial_application() {
         use crate::builtins::evaluate_builtin_for_tests;
-        let args = vec![Value::String("-".to_string())];
+        let args = vec![Value::Concrete(ConcreteValue::String("-".to_string()))];
         let result = evaluate_builtin_for_tests("join", &args).unwrap();
         assert!(result.is_closure());
     }
@@ -133,8 +153,10 @@ mod tests {
     #[test]
     fn join_non_string_separator() {
         let args = vec![
-            Value::Int(1),
-            Value::List(vec![Value::String("a".to_string())]),
+            Value::Concrete(ConcreteValue::Int(1)),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("a".to_string()),
+            )])),
         ];
         let result = evaluate_builtin("join", &args);
         assert!(result.is_err());
@@ -148,8 +170,8 @@ mod tests {
     #[test]
     fn join_non_list_second_arg() {
         let args = vec![
-            Value::String("-".to_string()),
-            Value::String("not a list".to_string()),
+            Value::Concrete(ConcreteValue::String("-".to_string())),
+            Value::Concrete(ConcreteValue::String("not a list".to_string())),
         ];
         let result = evaluate_builtin("join", &args);
         assert!(result.is_err());

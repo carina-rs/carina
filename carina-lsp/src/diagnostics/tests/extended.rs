@@ -1043,7 +1043,7 @@ let name = join("-", parts)
 fn validate_module_arg_type_ipv4_address_invalid() {
     let engine = test_engine();
     let type_expr = carina_core::parser::TypeExpr::Simple("ipv4_address".to_string());
-    let value = Value::String("not-an-ip".to_string());
+    let value = Value::Concrete(ConcreteValue::String("not-an-ip".to_string()));
     let result = engine.validate_module_arg_type(&type_expr, &value);
     assert!(
         result.is_some(),
@@ -1055,7 +1055,7 @@ fn validate_module_arg_type_ipv4_address_invalid() {
 fn validate_module_arg_type_ipv4_address_valid() {
     let engine = test_engine();
     let type_expr = carina_core::parser::TypeExpr::Simple("ipv4_address".to_string());
-    let value = Value::String("192.168.1.1".to_string());
+    let value = Value::Concrete(ConcreteValue::String("192.168.1.1".to_string()));
     let result = engine.validate_module_arg_type(&type_expr, &value);
     assert!(
         result.is_none(),
@@ -1068,7 +1068,7 @@ fn validate_module_arg_type_ipv4_address_valid() {
 fn validate_module_arg_type_ipv6_cidr_invalid() {
     let engine = test_engine();
     let type_expr = carina_core::parser::TypeExpr::Simple("ipv6_cidr".to_string());
-    let value = Value::String("not-a-cidr".to_string());
+    let value = Value::Concrete(ConcreteValue::String("not-a-cidr".to_string()));
     let result = engine.validate_module_arg_type(&type_expr, &value);
     assert!(
         result.is_some(),
@@ -1080,7 +1080,7 @@ fn validate_module_arg_type_ipv6_cidr_invalid() {
 fn validate_module_arg_type_ipv6_cidr_valid() {
     let engine = test_engine();
     let type_expr = carina_core::parser::TypeExpr::Simple("ipv6_cidr".to_string());
-    let value = Value::String("2001:db8::/32".to_string());
+    let value = Value::Concrete(ConcreteValue::String("2001:db8::/32".to_string()));
     let result = engine.validate_module_arg_type(&type_expr, &value);
     assert!(
         result.is_none(),
@@ -1093,7 +1093,7 @@ fn validate_module_arg_type_ipv6_cidr_valid() {
 fn validate_module_arg_type_ipv6_address_invalid() {
     let engine = test_engine();
     let type_expr = carina_core::parser::TypeExpr::Simple("ipv6_address".to_string());
-    let value = Value::String("not-an-ipv6".to_string());
+    let value = Value::Concrete(ConcreteValue::String("not-an-ipv6".to_string()));
     let result = engine.validate_module_arg_type(&type_expr, &value);
     assert!(
         result.is_some(),
@@ -1105,7 +1105,7 @@ fn validate_module_arg_type_ipv6_address_invalid() {
 fn validate_module_arg_type_ipv6_address_valid() {
     let engine = test_engine();
     let type_expr = carina_core::parser::TypeExpr::Simple("ipv6_address".to_string());
-    let value = Value::String("2001:db8::1".to_string());
+    let value = Value::Concrete(ConcreteValue::String("2001:db8::1".to_string()));
     let result = engine.validate_module_arg_type(&type_expr, &value);
     assert!(
         result.is_none(),
@@ -1120,10 +1120,10 @@ fn validate_module_arg_type_list_ipv4_address_invalid() {
     let type_expr = carina_core::parser::TypeExpr::List(Box::new(
         carina_core::parser::TypeExpr::Simple("ipv4_address".to_string()),
     ));
-    let value = Value::List(vec![
-        Value::String("192.168.1.1".to_string()),
-        Value::String("bad-ip".to_string()),
-    ]);
+    let value = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::String("192.168.1.1".to_string())),
+        Value::Concrete(ConcreteValue::String("bad-ip".to_string())),
+    ]));
     let result = engine.validate_module_arg_type(&type_expr, &value);
     assert!(
         result.is_some(),
@@ -1142,10 +1142,10 @@ fn validate_module_arg_type_list_ipv6_cidr_valid() {
     let type_expr = carina_core::parser::TypeExpr::List(Box::new(
         carina_core::parser::TypeExpr::Simple("ipv6_cidr".to_string()),
     ));
-    let value = Value::List(vec![
-        Value::String("2001:db8::/32".to_string()),
-        Value::String("::/0".to_string()),
-    ]);
+    let value = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::String("2001:db8::/32".to_string())),
+        Value::Concrete(ConcreteValue::String("::/0".to_string())),
+    ]));
     let result = engine.validate_module_arg_type(&type_expr, &value);
     assert!(
         result.is_none(),
@@ -1286,7 +1286,9 @@ fn resource_ref_type_check_helper_regression() {
 
     fn dummy_validate(v: &carina_core::resource::Value) -> Result<(), String> {
         match v {
-            carina_core::resource::Value::String(s) if s.starts_with("test.") => Ok(()),
+            carina_core::resource::Value::Concrete(
+                carina_core::resource::ConcreteValue::String(s),
+            ) if s.starts_with("test.") => Ok(()),
             _ => Err("invalid custom value".to_string()),
         }
     }
@@ -1457,7 +1459,10 @@ fn resource_validation_failed_with_attribute_points_to_attribute_line() {
             AttributeType::map(AttributeType::String),
         ))
         .with_validator(|attrs| {
-            if let Some(carina_core::resource::Value::Map(map)) = attrs.get("tags") {
+            if let Some(carina_core::resource::Value::Concrete(
+                carina_core::resource::ConcreteValue::Map(map),
+            )) = attrs.get("tags")
+            {
                 let has_key = map.keys().any(|k| k.eq_ignore_ascii_case("key"));
                 let has_value = map.keys().any(|k| k.eq_ignore_ascii_case("value"));
                 if has_key && has_value {
@@ -1741,14 +1746,18 @@ fn distinct_semantic_customs_are_rejected() {
 
     fn validate_account_id(v: &carina_core::resource::Value) -> Result<(), String> {
         match v {
-            carina_core::resource::Value::String(s) if s.len() == 12 => Ok(()),
+            carina_core::resource::Value::Concrete(
+                carina_core::resource::ConcreteValue::String(s),
+            ) if s.len() == 12 => Ok(()),
             _ => Err("expected 12-digit account ID".to_string()),
         }
     }
 
     fn validate_target_id(v: &carina_core::resource::Value) -> Result<(), String> {
         match v {
-            carina_core::resource::Value::String(_) => Ok(()),
+            carina_core::resource::Value::Concrete(
+                carina_core::resource::ConcreteValue::String(_),
+            ) => Ok(()),
             _ => Err("expected string".to_string()),
         }
     }
@@ -1809,10 +1818,10 @@ target_id = caller.account_id
 #[test]
 fn exports_cross_file_ref_no_false_positive() {
     // Regression: when exports.crn references a binding from a sibling file,
-    // single-file parsing leaves the reference as Value::String("binding.attr").
+    // single-file parsing leaves the reference as Value::Concrete(ConcreteValue::String("binding.attr")).
     // The custom type validator (e.g., aws_account_id: 12-digit check) must
     // skip these dot-notation strings to avoid false positives.
-    use carina_core::resource::Value;
+    use carina_core::resource::{ConcreteValue, Value};
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let aws_account_id_type = AttributeType::Custom {
@@ -1821,8 +1830,12 @@ fn exports_cross_file_ref_no_false_positive() {
         pattern: None,
         length: None,
         validate: carina_core::schema::legacy_validator(|v| match v {
-            Value::String(s) if s.len() == 12 && s.chars().all(|c| c.is_ascii_digit()) => Ok(()),
-            Value::String(s) => Err(format!(
+            Value::Concrete(ConcreteValue::String(s))
+                if s.len() == 12 && s.chars().all(|c| c.is_ascii_digit()) =>
+            {
+                Ok(())
+            }
+            Value::Concrete(ConcreteValue::String(s)) => Err(format!(
                 "must be exactly 12 digits, got {} characters",
                 s.len()
             )),

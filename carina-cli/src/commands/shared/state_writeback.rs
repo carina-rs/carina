@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use carina_core::effect::Effect;
 use carina_core::executor::ExecutionResult;
 use carina_core::plan::Plan;
-use carina_core::resource::{Resource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 use carina_core::schema::SchemaRegistry;
 use carina_state::{LockInfo, ResourceState, StateBackend, StateFile};
 
@@ -34,9 +34,10 @@ pub(crate) fn apply_name_overrides(resources: &mut [Resource], state_file: &Opti
     for resource in resources.iter_mut() {
         if let Some(name_overrides) = overrides.get(&resource.id) {
             for (attr, value) in name_overrides {
-                resource
-                    .attributes
-                    .insert(attr.clone(), Value::String(value.clone()));
+                resource.attributes.insert(
+                    attr.clone(),
+                    Value::Concrete(ConcreteValue::String(value.clone())),
+                );
             }
         }
     }
@@ -147,7 +148,7 @@ pub(crate) fn resolve_exports(
 ///
 /// Returns:
 /// - `Ok(Some(json))` for a representable concrete value
-/// - `Ok(None)` for `Value::Secret` (state.exports must not embed
+/// - `Ok(None)` for `Value::Deferred(DeferredValue::Secret)` (state.exports must not embed
 ///   plaintext secrets, so exports of secret-typed values are skipped)
 /// - `Err(SerializationError)` for variants that should not have
 ///   reached this boundary — the resolver / canonicalize / for-expand
@@ -156,16 +157,20 @@ pub(crate) fn resolve_exports(
 pub(crate) fn dsl_value_to_json(
     value: &carina_core::resource::Value,
 ) -> Result<Option<serde_json::Value>, carina_core::value::SerializationError> {
-    use carina_core::resource::Value;
+    use carina_core::resource::{ConcreteValue, DeferredValue, Value};
     use carina_core::value::{SerializationContext, SerializationError};
     let ctx = SerializationContext::StateWriteback;
     match value {
-        Value::String(s) => Ok(Some(serde_json::Value::String(s.clone()))),
-        Value::Bool(b) => Ok(Some(serde_json::Value::Bool(*b))),
-        Value::Int(i) => Ok(Some(serde_json::Value::Number((*i).into()))),
-        Value::Float(f) => Ok(serde_json::Number::from_f64(*f).map(serde_json::Value::Number)),
-        Value::Duration(d) => Ok(Some(serde_json::Value::Number((d.as_secs() as i64).into()))),
-        Value::List(items) => {
+        Value::Concrete(ConcreteValue::String(s)) => Ok(Some(serde_json::Value::String(s.clone()))),
+        Value::Concrete(ConcreteValue::Bool(b)) => Ok(Some(serde_json::Value::Bool(*b))),
+        Value::Concrete(ConcreteValue::Int(i)) => Ok(Some(serde_json::Value::Number((*i).into()))),
+        Value::Concrete(ConcreteValue::Float(f)) => {
+            Ok(serde_json::Number::from_f64(*f).map(serde_json::Value::Number))
+        }
+        Value::Concrete(ConcreteValue::Duration(d)) => {
+            Ok(Some(serde_json::Value::Number((d.as_secs() as i64).into())))
+        }
+        Value::Concrete(ConcreteValue::List(items)) => {
             // `Result::transpose` flips `Result<Option<T>, E>` to
             // `Option<Result<T, E>>`, so `filter_map` drops the
             // `Ok(None)` skips and propagates `Err`.
@@ -176,13 +181,13 @@ pub(crate) fn dsl_value_to_json(
                 .collect::<Result<_, _>>()?;
             Ok(Some(serde_json::Value::Array(json_items)))
         }
-        Value::StringList(items) => Ok(Some(serde_json::Value::Array(
+        Value::Concrete(ConcreteValue::StringList(items)) => Ok(Some(serde_json::Value::Array(
             items
                 .iter()
                 .map(|s| serde_json::Value::String(s.clone()))
                 .collect(),
         ))),
-        Value::Map(map) => {
+        Value::Concrete(ConcreteValue::Map(map)) => {
             let json_map: serde_json::Map<String, serde_json::Value> = map
                 .iter()
                 .map(|(k, v)| dsl_value_to_json(v).map(|jv| jv.map(|j| (k.clone(), j))))
@@ -190,26 +195,34 @@ pub(crate) fn dsl_value_to_json(
                 .collect::<Result<_, _>>()?;
             Ok(Some(serde_json::Value::Object(json_map)))
         }
-        Value::Unknown(reason) => Err(SerializationError::UnknownNotAllowed {
-            reason: reason.clone(),
-            context: ctx,
-        }),
-        Value::ResourceRef { path } => Err(SerializationError::UnresolvedResourceRef {
-            path: path.to_dot_string(),
-            context: ctx,
-        }),
-        Value::BindingRef { binding } => Err(SerializationError::UnresolvedResourceRef {
-            path: binding.clone(),
-            context: ctx,
-        }),
-        Value::Interpolation(_) => {
+        Value::Deferred(DeferredValue::Unknown(reason)) => {
+            Err(SerializationError::UnknownNotAllowed {
+                reason: reason.clone(),
+                context: ctx,
+            })
+        }
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+            Err(SerializationError::UnresolvedResourceRef {
+                path: path.to_dot_string(),
+                context: ctx,
+            })
+        }
+        Value::Deferred(DeferredValue::BindingRef { binding }) => {
+            Err(SerializationError::UnresolvedResourceRef {
+                path: binding.clone(),
+                context: ctx,
+            })
+        }
+        Value::Deferred(DeferredValue::Interpolation(_)) => {
             Err(SerializationError::UnresolvedInterpolation { context: ctx })
         }
-        Value::FunctionCall { name, .. } => Err(SerializationError::UnresolvedFunctionCall {
-            name: name.clone(),
-            context: ctx,
-        }),
-        Value::Secret(_) => Ok(None),
+        Value::Deferred(DeferredValue::FunctionCall { name, .. }) => {
+            Err(SerializationError::UnresolvedFunctionCall {
+                name: name.clone(),
+                context: ctx,
+            })
+        }
+        Value::Deferred(DeferredValue::Secret(_)) => Ok(None),
     }
 }
 
@@ -364,17 +377,19 @@ pub(crate) fn build_orphan_resource(sf: &carina_state::StateFile, id: &ResourceI
 #[cfg(test)]
 mod stage4_unknown_err_tests {
     use super::*;
-    use carina_core::resource::{AccessPath, UnknownReason, Value};
+    use carina_core::resource::{AccessPath, ConcreteValue, DeferredValue, UnknownReason, Value};
     use carina_core::value::{SerializationContext, SerializationError};
 
     /// RFC #2371 stage 4 contract pin: `dsl_value_to_json` returns
-    /// `Err(SerializationError::UnknownNotAllowed)` for `Value::Unknown`.
+    /// `Err(SerializationError::UnknownNotAllowed)` for `Value::Deferred(DeferredValue::Unknown)`.
     /// State files must never carry the variant (constraint b); a
     /// silent fallback would re-introduce v1 corruption.
     #[test]
     fn unknown_returns_err_in_dsl_value_to_json() {
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-        let v = Value::Unknown(UnknownReason::UpstreamRef { path: path.clone() });
+        let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+            path: path.clone(),
+        }));
         let err = dsl_value_to_json(&v).unwrap_err();
         match err {
             SerializationError::UnknownNotAllowed {
@@ -387,14 +402,14 @@ mod stage4_unknown_err_tests {
         }
     }
 
-    /// `Value::ResourceRef` reaching apply-time export resolution
+    /// `Value::Deferred(DeferredValue::ResourceRef)` reaching apply-time export resolution
     /// is a resolver bug — surface as `UnresolvedResourceRef` instead
     /// of silently dropping the export. (#2385)
     #[test]
     fn resource_ref_returns_unresolved_err() {
-        let v = Value::ResourceRef {
+        let v = Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::with_fields("net", "vpc", vec!["vpc_id".into()]),
-        };
+        });
         let err = dsl_value_to_json(&v).unwrap_err();
         assert!(
             matches!(
@@ -408,12 +423,14 @@ mod stage4_unknown_err_tests {
         );
     }
 
-    /// `Value::Interpolation` reaching apply-time is a resolver /
+    /// `Value::Deferred(DeferredValue::Interpolation)` reaching apply-time is a resolver /
     /// canonicalize bug — surface as `UnresolvedInterpolation`. (#2386)
     #[test]
     fn interpolation_returns_unresolved_err() {
         use carina_core::resource::InterpolationPart;
-        let v = Value::Interpolation(vec![InterpolationPart::Literal("x".into())]);
+        let v = Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Literal("x".into()),
+        ]));
         let err = dsl_value_to_json(&v).unwrap_err();
         assert!(
             matches!(
@@ -426,14 +443,14 @@ mod stage4_unknown_err_tests {
         );
     }
 
-    /// `Value::FunctionCall` reaching apply-time is a resolver bug —
+    /// `Value::Deferred(DeferredValue::FunctionCall)` reaching apply-time is a resolver bug —
     /// surface as `UnresolvedFunctionCall`. (#2386)
     #[test]
     fn function_call_returns_unresolved_err() {
-        let v = Value::FunctionCall {
+        let v = Value::Deferred(DeferredValue::FunctionCall {
             name: "join".into(),
             args: vec![],
-        };
+        });
         let err = dsl_value_to_json(&v).unwrap_err();
         assert!(
             matches!(
@@ -447,11 +464,13 @@ mod stage4_unknown_err_tests {
         );
     }
 
-    /// `Value::Secret` continues to be skipped silently — exports must
+    /// `Value::Deferred(DeferredValue::Secret)` continues to be skipped silently — exports must
     /// not embed plaintext secrets in state.
     #[test]
     fn secret_returns_ok_none() {
-        let v = Value::Secret(Box::new(Value::String("password".into())));
+        let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("password".into()),
+        ))));
         assert!(matches!(dsl_value_to_json(&v), Ok(None)));
     }
 }

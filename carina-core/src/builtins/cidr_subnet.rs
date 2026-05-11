@@ -2,7 +2,7 @@
 
 use std::net::Ipv4Addr;
 
-use crate::resource::Value;
+use crate::resource::{ConcreteValue, Value};
 
 use super::value_type_name;
 
@@ -28,7 +28,7 @@ pub(crate) fn builtin_cidr_subnet(args: &[Value]) -> Result<Value, String> {
     }
 
     let prefix_str = match &args[0] {
-        Value::String(s) => s.clone(),
+        Value::Concrete(ConcreteValue::String(s)) => s.clone(),
         other => {
             return Err(format!(
                 "cidr_subnet() first argument (prefix) must be a string, got {}",
@@ -38,7 +38,7 @@ pub(crate) fn builtin_cidr_subnet(args: &[Value]) -> Result<Value, String> {
     };
 
     let newbits = match &args[1] {
-        Value::Int(n) => *n,
+        Value::Concrete(ConcreteValue::Int(n)) => *n,
         other => {
             return Err(format!(
                 "cidr_subnet() second argument (newbits) must be an integer, got {}",
@@ -48,7 +48,7 @@ pub(crate) fn builtin_cidr_subnet(args: &[Value]) -> Result<Value, String> {
     };
 
     let netnum = match &args[2] {
-        Value::Int(n) => *n,
+        Value::Concrete(ConcreteValue::Int(n)) => *n,
         other => {
             return Err(format!(
                 "cidr_subnet() third argument (netnum) must be an integer, got {}",
@@ -58,7 +58,7 @@ pub(crate) fn builtin_cidr_subnet(args: &[Value]) -> Result<Value, String> {
     };
 
     let result = calculate_cidr_subnet(&prefix_str, newbits, netnum)?;
-    Ok(Value::String(result))
+    Ok(Value::Concrete(ConcreteValue::String(result)))
 }
 
 /// Parse a CIDR string into (Ipv4Addr, prefix_length).
@@ -150,13 +150,13 @@ fn calculate_cidr_subnet(prefix: &str, newbits: i64, netnum: i64) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
-    use crate::resource::Value;
+    use crate::resource::{ConcreteValue, Value};
 
     fn cidr_subnet(prefix: &str, newbits: i64, netnum: i64) -> Result<Value, String> {
         let args = vec![
-            Value::String(prefix.to_string()),
-            Value::Int(newbits),
-            Value::Int(netnum),
+            Value::Concrete(ConcreteValue::String(prefix.to_string())),
+            Value::Concrete(ConcreteValue::Int(newbits)),
+            Value::Concrete(ConcreteValue::Int(netnum)),
         ];
         evaluate_builtin("cidr_subnet", &args)
     }
@@ -165,15 +165,15 @@ mod tests {
     fn basic_subnet_calculation() {
         assert_eq!(
             cidr_subnet("10.0.0.0/16", 8, 0).unwrap(),
-            Value::String("10.0.0.0/24".to_string())
+            Value::Concrete(ConcreteValue::String("10.0.0.0/24".to_string()))
         );
         assert_eq!(
             cidr_subnet("10.0.0.0/16", 8, 1).unwrap(),
-            Value::String("10.0.1.0/24".to_string())
+            Value::Concrete(ConcreteValue::String("10.0.1.0/24".to_string()))
         );
         assert_eq!(
             cidr_subnet("10.0.0.0/16", 8, 2).unwrap(),
-            Value::String("10.0.2.0/24".to_string())
+            Value::Concrete(ConcreteValue::String("10.0.2.0/24".to_string()))
         );
     }
 
@@ -181,7 +181,7 @@ mod tests {
     fn subnet_255() {
         assert_eq!(
             cidr_subnet("10.0.0.0/16", 8, 255).unwrap(),
-            Value::String("10.0.255.0/24".to_string())
+            Value::Concrete(ConcreteValue::String("10.0.255.0/24".to_string()))
         );
     }
 
@@ -189,15 +189,15 @@ mod tests {
     fn slash_8_to_slash_16() {
         assert_eq!(
             cidr_subnet("10.0.0.0/8", 8, 0).unwrap(),
-            Value::String("10.0.0.0/16".to_string())
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string()))
         );
         assert_eq!(
             cidr_subnet("10.0.0.0/8", 8, 1).unwrap(),
-            Value::String("10.1.0.0/16".to_string())
+            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string()))
         );
         assert_eq!(
             cidr_subnet("10.0.0.0/8", 8, 255).unwrap(),
-            Value::String("10.255.0.0/16".to_string())
+            Value::Concrete(ConcreteValue::String("10.255.0.0/16".to_string()))
         );
     }
 
@@ -205,15 +205,15 @@ mod tests {
     fn slash_24_to_slash_28() {
         assert_eq!(
             cidr_subnet("192.168.1.0/24", 4, 0).unwrap(),
-            Value::String("192.168.1.0/28".to_string())
+            Value::Concrete(ConcreteValue::String("192.168.1.0/28".to_string()))
         );
         assert_eq!(
             cidr_subnet("192.168.1.0/24", 4, 1).unwrap(),
-            Value::String("192.168.1.16/28".to_string())
+            Value::Concrete(ConcreteValue::String("192.168.1.16/28".to_string()))
         );
         assert_eq!(
             cidr_subnet("192.168.1.0/24", 4, 15).unwrap(),
-            Value::String("192.168.1.240/28".to_string())
+            Value::Concrete(ConcreteValue::String("192.168.1.240/28".to_string()))
         );
     }
 
@@ -221,11 +221,11 @@ mod tests {
     fn slash_0_base() {
         assert_eq!(
             cidr_subnet("0.0.0.0/0", 8, 0).unwrap(),
-            Value::String("0.0.0.0/8".to_string())
+            Value::Concrete(ConcreteValue::String("0.0.0.0/8".to_string()))
         );
         assert_eq!(
             cidr_subnet("0.0.0.0/0", 8, 10).unwrap(),
-            Value::String("10.0.0.0/8".to_string())
+            Value::Concrete(ConcreteValue::String("10.0.0.0/8".to_string()))
         );
     }
 
@@ -234,11 +234,11 @@ mod tests {
         // /24 + 8 newbits = /32
         assert_eq!(
             cidr_subnet("192.168.1.0/24", 8, 0).unwrap(),
-            Value::String("192.168.1.0/32".to_string())
+            Value::Concrete(ConcreteValue::String("192.168.1.0/32".to_string()))
         );
         assert_eq!(
             cidr_subnet("192.168.1.0/24", 8, 42).unwrap(),
-            Value::String("192.168.1.42/32".to_string())
+            Value::Concrete(ConcreteValue::String("192.168.1.42/32".to_string()))
         );
     }
 
@@ -246,11 +246,11 @@ mod tests {
     fn newbits_1_halves_network() {
         assert_eq!(
             cidr_subnet("10.0.0.0/16", 1, 0).unwrap(),
-            Value::String("10.0.0.0/17".to_string())
+            Value::Concrete(ConcreteValue::String("10.0.0.0/17".to_string()))
         );
         assert_eq!(
             cidr_subnet("10.0.0.0/16", 1, 1).unwrap(),
-            Value::String("10.0.128.0/17".to_string())
+            Value::Concrete(ConcreteValue::String("10.0.128.0/17".to_string()))
         );
     }
 
@@ -300,7 +300,10 @@ mod tests {
     fn partial_application_with_two_args() {
         use crate::builtins::evaluate_builtin_for_tests;
         use crate::eval_value::EvalValue;
-        let args = vec![Value::String("10.0.0.0/16".to_string()), Value::Int(8)];
+        let args = vec![
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            Value::Concrete(ConcreteValue::Int(8)),
+        ];
         let result = evaluate_builtin_for_tests("cidr_subnet", &args).unwrap();
         match result {
             EvalValue::Closure {
@@ -319,16 +322,20 @@ mod tests {
     #[test]
     fn error_wrong_arg_types() {
         // First arg not string
-        let args = vec![Value::Int(10), Value::Int(8), Value::Int(0)];
+        let args = vec![
+            Value::Concrete(ConcreteValue::Int(10)),
+            Value::Concrete(ConcreteValue::Int(8)),
+            Value::Concrete(ConcreteValue::Int(0)),
+        ];
         let result = evaluate_builtin("cidr_subnet", &args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("must be a string"));
 
         // Second arg not int
         let args = vec![
-            Value::String("10.0.0.0/16".to_string()),
-            Value::String("8".to_string()),
-            Value::Int(0),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            Value::Concrete(ConcreteValue::String("8".to_string())),
+            Value::Concrete(ConcreteValue::Int(0)),
         ];
         let result = evaluate_builtin("cidr_subnet", &args);
         assert!(result.is_err());
@@ -336,9 +343,9 @@ mod tests {
 
         // Third arg not int
         let args = vec![
-            Value::String("10.0.0.0/16".to_string()),
-            Value::Int(8),
-            Value::String("0".to_string()),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            Value::Concrete(ConcreteValue::Int(8)),
+            Value::Concrete(ConcreteValue::String("0".to_string())),
         ];
         let result = evaluate_builtin("cidr_subnet", &args);
         assert!(result.is_err());
@@ -357,7 +364,7 @@ mod tests {
         // Even if the input has host bits set, they are masked off
         assert_eq!(
             cidr_subnet("10.0.0.5/16", 8, 1).unwrap(),
-            Value::String("10.0.1.0/24".to_string())
+            Value::Concrete(ConcreteValue::String("10.0.1.0/24".to_string()))
         );
     }
 }

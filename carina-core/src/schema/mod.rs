@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 
-use crate::resource::{ConcreteValueRef, Resource, Value};
+use crate::resource::{ConcreteValue, ConcreteValueRef, DeferredValue, Resource, Value};
 use crate::utils::{extract_enum_value_with_values, validate_enum_namespace};
 use crate::value::format_value_with_key;
 
@@ -92,11 +92,11 @@ fn walk_custom_lookup(
     // which only resolve to a concrete string at apply time.
     if matches!(
         value,
-        Value::FunctionCall { .. }
-            | Value::Secret(_)
-            | Value::ResourceRef { .. }
-            | Value::Interpolation(_)
-            | Value::Unknown(_)
+        Value::Deferred(DeferredValue::FunctionCall { .. })
+            | Value::Deferred(DeferredValue::Secret(_))
+            | Value::Deferred(DeferredValue::ResourceRef { .. })
+            | Value::Deferred(DeferredValue::Interpolation(_))
+            | Value::Deferred(DeferredValue::Unknown(_))
     ) {
         return;
     }
@@ -121,21 +121,21 @@ fn walk_custom_lookup(
             }
         }
         AttributeType::List { inner, .. } => {
-            if let Value::List(items) = value {
+            if let Value::Concrete(ConcreteValue::List(items)) = value {
                 for item in items {
                     walk_custom_lookup(inner, item, attr_name, lookup, errors);
                 }
             }
         }
         AttributeType::Map { value: inner, .. } => {
-            if let Value::Map(map) = value {
+            if let Value::Concrete(ConcreteValue::Map(map)) = value {
                 for v in map.values() {
                     walk_custom_lookup(inner, v, attr_name, lookup, errors);
                 }
             }
         }
         AttributeType::Struct { fields, .. } => {
-            if let Value::Map(map) = value {
+            if let Value::Concrete(ConcreteValue::Map(map)) = value {
                 for f in fields {
                     if let Some(v) = map.get(&f.name) {
                         walk_custom_lookup(&f.field_type, v, attr_name, lookup, errors);
@@ -697,7 +697,7 @@ impl AttributeType {
         // the field value through `as_concrete()` again, so deferred
         // field values silently contribute no errors here. Phase 2 of
         // RFC #2972 makes this a single, type-aware filter point
-        // instead of the old per-site `matches!(v, Value::ResourceRef
+        // instead of the old per-site `matches!(v, Value::Deferred(DeferredValue::ResourceRef)
         // { .. })` skip.
         for (k, v) in map {
             match accepted.get(k.as_str()) {
@@ -753,8 +753,8 @@ impl AttributeType {
     /// Phase 2 of RFC #2972: takes [`ConcreteValueRef`], so deferred
     /// values (`ResourceRef`, `Interpolation`, ...) cannot reach this
     /// path — they were filtered at the dispatcher in [`Self::validate`].
-    /// The pre-Phase-2 `Value::String(_) | Value::ResourceRef { .. } |
-    /// Value::Interpolation(_)` arm is now structurally unrepresentable.
+    /// The pre-Phase-2 `Value::Concrete(ConcreteValue::String(_)) | Value::Deferred(DeferredValue::ResourceRef{ .. }) |
+    /// Value::Deferred(DeferredValue::Interpolation(_))` arm is now structurally unrepresentable.
     fn validate_primitive(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
         match (self, value) {
             (AttributeType::String, ConcreteValueRef::String(_)) => Ok(()),
@@ -781,7 +781,7 @@ impl AttributeType {
     /// top-level dispatcher.
     ///
     /// Phase 2 of RFC #2972: takes [`ConcreteValueRef`]. Pre-Phase-2
-    /// `Value::Interpolation` and `Value::ResourceRef` short-circuits
+    /// `Value::Deferred(DeferredValue::Interpolation)` and `Value::Deferred(DeferredValue::ResourceRef)` short-circuits
     /// are gone — the dispatcher filters deferred values.
     fn validate_string_enum(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
         let AttributeType::StringEnum {
@@ -797,7 +797,7 @@ impl AttributeType {
         let resolved_value = Self::resolve_enum_input(name, namespace.as_deref(), value);
         // Capture the user's original input for diagnostics. The parser
         // collapses both quoted literals (`"aaa"`) and bare identifiers
-        // (`dedicated`) into `Value::String`, and `resolve_enum_input`
+        // (`dedicated`) into `Value::Concrete(ConcreteValue::String)`, and `resolve_enum_input`
         // rewrites the non-dotted form into a synthesized namespaced
         // string for lookup. That synthesized form must stay internal:
         // error messages should quote what the user actually typed.
@@ -806,7 +806,7 @@ impl AttributeType {
             ConcreteValueRef::String(s) => Some(s),
             _ => None,
         };
-        if let Value::String(s) = &resolved_value {
+        if let Value::Concrete(ConcreteValue::String(s)) = &resolved_value {
             // Check if the raw string directly matches a valid enum value
             // before namespace validation. This handles values containing
             // dots (e.g., "ipsec.1") that would be misinterpreted as
@@ -886,7 +886,7 @@ impl AttributeType {
     /// closure after expanding any enum-shorthand identifier in `value`.
     ///
     /// Phase 2 of RFC #2972: takes [`ConcreteValueRef`]. The deferred-skip
-    /// guard for `Value::ResourceRef`/`Value::Interpolation` is gone —
+    /// guard for `Value::Deferred(DeferredValue::ResourceRef)`/`Value::Deferred(DeferredValue::Interpolation)` is gone —
     /// the dispatcher filters them out in [`Self::validate`].
     fn validate_custom(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
         let AttributeType::Custom {
@@ -925,12 +925,12 @@ impl AttributeType {
         // same way.
         if let ConcreteValueRef::StringList(items) = value {
             for (i, s) in items.iter().enumerate() {
-                inner.validate(&Value::String(s.clone())).map_err(|e| {
-                    TypeError::ListItemError {
+                inner
+                    .validate(&Value::Concrete(ConcreteValue::String(s.clone())))
+                    .map_err(|e| TypeError::ListItemError {
                         index: i,
                         inner: Box::new(e),
-                    }
-                })?;
+                    })?;
             }
             return Ok(());
         }
@@ -971,7 +971,7 @@ impl AttributeType {
         // Validate keys against key type
         for k in map.keys() {
             key_type
-                .validate(&Value::String(k.clone()))
+                .validate(&Value::Concrete(ConcreteValue::String(k.clone())))
                 .map_err(|e| TypeError::MapKeyError {
                     key: k.clone(),
                     inner: Box::new(e),
@@ -989,7 +989,7 @@ impl AttributeType {
     /// Validate a `Struct` variant: required fields, known field names, and
     /// recursively check each field's value.
     ///
-    /// Block syntax produces `Value::List([Value::Map(...)])`, but bare
+    /// Block syntax produces `Value::Concrete(ConcreteValue::List([Value::Map(...)]))`, but bare
     /// `Struct` requires map assignment syntax (`attr = { ... }`); a
     /// `List` is rejected explicitly with `BlockSyntaxNotAllowed`.
     ///
@@ -1423,7 +1423,7 @@ fn reshape_for_string_literal(
         namespace: Some(_),
         ..
     } = attr_type
-        && let Value::String(typed) = value
+        && let Value::Concrete(ConcreteValue::String(typed)) = value
         && let TypeError::ValidationFailed { message } = &tagged
     {
         return TypeError::StringLiteralExpectedEnum {
@@ -1740,22 +1740,26 @@ impl TypeError {
 impl Value {
     fn type_name(&self) -> String {
         match self {
-            Value::String(_) => "String".to_string(),
-            Value::Int(_) => "Int".to_string(),
-            Value::Float(_) => "Float".to_string(),
-            Value::Bool(_) => "Bool".to_string(),
-            Value::Duration(_) => "Duration".to_string(),
-            Value::List(_) => "List".to_string(),
-            Value::StringList(_) => "StringList".to_string(),
-            Value::Map(_) => "Map".to_string(),
-            Value::ResourceRef { path } => {
+            Value::Concrete(ConcreteValue::String(_)) => "String".to_string(),
+            Value::Concrete(ConcreteValue::Int(_)) => "Int".to_string(),
+            Value::Concrete(ConcreteValue::Float(_)) => "Float".to_string(),
+            Value::Concrete(ConcreteValue::Bool(_)) => "Bool".to_string(),
+            Value::Concrete(ConcreteValue::Duration(_)) => "Duration".to_string(),
+            Value::Concrete(ConcreteValue::List(_)) => "List".to_string(),
+            Value::Concrete(ConcreteValue::StringList(_)) => "StringList".to_string(),
+            Value::Concrete(ConcreteValue::Map(_)) => "Map".to_string(),
+            Value::Deferred(DeferredValue::ResourceRef { path }) => {
                 format!("ResourceRef({})", path.to_dot_string())
             }
-            Value::BindingRef { binding } => format!("BindingRef({})", binding),
-            Value::Interpolation(_) => "Interpolation".to_string(),
-            Value::FunctionCall { name, .. } => format!("FunctionCall({})", name),
-            Value::Secret(_) => "Secret".to_string(),
-            Value::Unknown(_) => "Unknown".to_string(),
+            Value::Deferred(DeferredValue::BindingRef { binding }) => {
+                format!("BindingRef({})", binding)
+            }
+            Value::Deferred(DeferredValue::Interpolation(_)) => "Interpolation".to_string(),
+            Value::Deferred(DeferredValue::FunctionCall { name, .. }) => {
+                format!("FunctionCall({})", name)
+            }
+            Value::Deferred(DeferredValue::Secret(_)) => "Secret".to_string(),
+            Value::Deferred(DeferredValue::Unknown(_)) => "Unknown".to_string(),
         }
     }
 }
@@ -1782,14 +1786,16 @@ impl ConcreteValueRef<'_> {
     /// be migrated to the projection without a wider API change.
     fn to_owned_value(self) -> Value {
         match self {
-            ConcreteValueRef::String(s) => Value::String(s.to_string()),
-            ConcreteValueRef::Int(n) => Value::Int(n),
-            ConcreteValueRef::Float(f) => Value::Float(f),
-            ConcreteValueRef::Bool(b) => Value::Bool(b),
-            ConcreteValueRef::Duration(d) => Value::Duration(d),
-            ConcreteValueRef::List(items) => Value::List(items.to_vec()),
-            ConcreteValueRef::StringList(items) => Value::StringList(items.to_vec()),
-            ConcreteValueRef::Map(map) => Value::Map(map.clone()),
+            ConcreteValueRef::String(s) => Value::Concrete(ConcreteValue::String(s.to_string())),
+            ConcreteValueRef::Int(n) => Value::Concrete(ConcreteValue::Int(n)),
+            ConcreteValueRef::Float(f) => Value::Concrete(ConcreteValue::Float(f)),
+            ConcreteValueRef::Bool(b) => Value::Concrete(ConcreteValue::Bool(b)),
+            ConcreteValueRef::Duration(d) => Value::Concrete(ConcreteValue::Duration(d)),
+            ConcreteValueRef::List(items) => Value::Concrete(ConcreteValue::List(items.to_vec())),
+            ConcreteValueRef::StringList(items) => {
+                Value::Concrete(ConcreteValue::StringList(items.to_vec()))
+            }
+            ConcreteValueRef::Map(map) => Value::Concrete(ConcreteValue::Map(map.clone())),
         }
     }
 }
@@ -1806,7 +1812,7 @@ pub mod validators {
     /// # Example
     /// ```
     /// use std::collections::HashMap;
-    /// use carina_core::resource::Value;
+    /// use carina_core::resource::{ConcreteValue, DeferredValue, Value};
     /// use carina_core::schema::{validators, TypeError};
     ///
     /// fn my_validator(attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
@@ -2422,14 +2428,14 @@ fn resolve_block_names_in_map(
         .collect();
 
     // Rename block name keys to canonical names, but only when the value
-    // is a List (from block syntax). Non-list values (e.g., Value::Map from
+    // is a List (from block syntax). Non-list values (e.g., Value::Concrete(ConcreteValue::Map) from
     // attribute assignment) target the actual field with that name.
     let renames: Vec<(String, String)> = map
         .keys()
         .filter_map(|key| {
             bn_map.get(key).and_then(|canon| {
                 // Only rename if the value is a List (block-originated)
-                if matches!(map.get(key), Some(Value::List(_))) {
+                if matches!(map.get(key), Some(Value::Concrete(ConcreteValue::List(_)))) {
                     Some((key.clone(), canon.clone()))
                 } else {
                     None
@@ -2462,16 +2468,16 @@ fn resolve_block_names_in_map(
         };
         match &field.field_type {
             AttributeType::Struct { fields: inner, .. } => {
-                if let Value::Map(inner_map) = value {
+                if let Value::Concrete(ConcreteValue::Map(inner_map)) = value {
                     resolve_block_names_in_map(inner_map, inner, resource_id, errors);
                 }
             }
             AttributeType::List { inner, .. } => {
                 if let AttributeType::Struct { fields: inner, .. } = inner.as_ref()
-                    && let Value::List(items) = value
+                    && let Value::Concrete(ConcreteValue::List(items)) = value
                 {
                     for item in items.iter_mut() {
-                        if let Value::Map(item_map) = item {
+                        if let Value::Concrete(ConcreteValue::Map(item_map)) = item {
                             resolve_block_names_in_map(item_map, inner, resource_id, errors);
                         }
                     }
@@ -2505,13 +2511,16 @@ pub fn resolve_block_names(
 
         // Collect keys to rename: (block_name_key, canonical_attr_name)
         // Only rename when the value is a List (from block syntax). Non-list values
-        // (e.g., Value::Map from attribute assignment) target the actual field with that name.
+        // (e.g., Value::Concrete(ConcreteValue::Map) from attribute assignment) target the actual field with that name.
         let renames: Vec<(String, String)> = resource
             .attributes
             .keys()
             .filter_map(|key| {
                 bn_map.get(key).and_then(|canon| {
-                    if matches!(resource.get_attr(key), Some(Value::List(_))) {
+                    if matches!(
+                        resource.get_attr(key),
+                        Some(Value::Concrete(ConcreteValue::List(_)))
+                    ) {
                         Some((key.clone(), canon.clone()))
                     } else {
                         None
@@ -2548,7 +2557,7 @@ pub fn resolve_block_names(
             };
             match &attr_schema.attr_type {
                 AttributeType::Struct { fields, .. } => {
-                    if let Value::Map(inner_map) = value {
+                    if let Value::Concrete(ConcreteValue::Map(inner_map)) = value {
                         resolve_block_names_in_map(
                             inner_map,
                             fields,
@@ -2559,10 +2568,10 @@ pub fn resolve_block_names(
                 }
                 AttributeType::List { inner, .. } => {
                     if let AttributeType::Struct { fields, .. } = inner.as_ref()
-                        && let Value::List(items) = value
+                        && let Value::Concrete(ConcreteValue::List(items)) = value
                     {
                         for item in items.iter_mut() {
-                            if let Value::Map(item_map) = item {
+                            if let Value::Concrete(ConcreteValue::Map(item_map)) = item {
                                 resolve_block_names_in_map(
                                     item_map,
                                     fields,
@@ -2599,7 +2608,7 @@ pub mod types {
             pattern: None,
             length: None,
             validate: legacy_validator(|value| {
-                if let Value::Int(n) = value {
+                if let Value::Concrete(ConcreteValue::Int(n)) = value {
                     if *n > 0 {
                         Ok(())
                     } else {
@@ -2622,7 +2631,7 @@ pub mod types {
             pattern: None,
             length: None,
             validate: legacy_validator(|value| {
-                if let Value::String(s) = value {
+                if let Value::Concrete(ConcreteValue::String(s)) = value {
                     validate_ipv4_cidr(s)
                 } else {
                     Err("Expected string".to_string())
@@ -2641,7 +2650,7 @@ pub mod types {
             pattern: None,
             length: None,
             validate: legacy_validator(|value| {
-                if let Value::String(s) = value {
+                if let Value::Concrete(ConcreteValue::String(s)) = value {
                     validate_ipv4_address(s)
                 } else {
                     Err("Expected string".to_string())
@@ -2660,7 +2669,7 @@ pub mod types {
             pattern: None,
             length: None,
             validate: legacy_validator(|value| {
-                if let Value::String(s) = value {
+                if let Value::Concrete(ConcreteValue::String(s)) = value {
                     validate_ipv6_address(s)
                 } else {
                     Err("Expected string".to_string())
@@ -2679,7 +2688,7 @@ pub mod types {
             pattern: None,
             length: None,
             validate: legacy_validator(|value| {
-                if let Value::String(s) = value {
+                if let Value::Concrete(ConcreteValue::String(s)) = value {
                     validate_ipv6_cidr(s)
                 } else {
                     Err("Expected string".to_string())
@@ -2707,7 +2716,7 @@ pub mod types {
             pattern: None,
             length: None,
             validate: legacy_validator(|value| {
-                if let Value::String(s) = value {
+                if let Value::Concrete(ConcreteValue::String(s)) = value {
                     validate_email(s)
                 } else {
                     Err("Expected string".to_string())

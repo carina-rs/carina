@@ -264,7 +264,9 @@ impl BackendConfig {
     /// Get a string attribute value
     pub fn get_string(&self, key: &str) -> Option<&str> {
         match self.attributes.get(key) {
-            Some(carina_core::resource::Value::String(s)) => Some(s.as_str()),
+            Some(carina_core::resource::Value::Concrete(
+                carina_core::resource::ConcreteValue::String(s),
+            )) => Some(s.as_str()),
             _ => None,
         }
     }
@@ -272,7 +274,9 @@ impl BackendConfig {
     /// Get a boolean attribute value
     pub fn get_bool(&self, key: &str) -> Option<bool> {
         match self.attributes.get(key) {
-            Some(carina_core::resource::Value::Bool(b)) => Some(*b),
+            Some(carina_core::resource::Value::Concrete(
+                carina_core::resource::ConcreteValue::Bool(b),
+            )) => Some(*b),
             _ => None,
         }
     }
@@ -327,13 +331,19 @@ mod tests {
 
     #[test]
     fn test_backend_config_from_provider_context() {
-        use carina_core::resource::Value;
+        use carina_core::resource::{ConcreteValue, Value};
 
         let provider_context = carina_core::parser::BackendConfig {
             backend_type: "s3".to_string(),
             attributes: [
-                ("bucket".to_string(), Value::String("my-bucket".to_string())),
-                ("key".to_string(), Value::String("state.json".to_string())),
+                (
+                    "bucket".to_string(),
+                    Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
+                ),
+                (
+                    "key".to_string(),
+                    Value::Concrete(ConcreteValue::String("state.json".to_string())),
+                ),
             ]
             .into_iter()
             .collect(),

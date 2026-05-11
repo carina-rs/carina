@@ -7,7 +7,7 @@ use super::context::next_pair;
 use super::error::ParseError;
 use super::expressions::string_literal::{parse_string_literal, unescape_single_quoted};
 use crate::eval_value::EvalValue;
-use crate::resource::{ResourceId, Value};
+use crate::resource::{ConcreteValue, DeferredValue, ResourceId, Value};
 
 /// Convert PascalCase to snake_case (e.g., "VpcId" → "vpc_id", "AwsAccountId" → "aws_account_id").
 pub fn pascal_to_snake(s: &str) -> String {
@@ -49,20 +49,20 @@ pub fn snake_to_pascal(s: &str) -> String {
 /// Return a human-readable type name for a Value
 pub(crate) fn value_type_name(value: &Value) -> &'static str {
     match value {
-        Value::String(_) => "string",
-        Value::Int(_) => "int",
-        Value::Float(_) => "float",
-        Value::Bool(_) => "bool",
-        Value::Duration(_) => "duration",
-        Value::List(_) => "list",
-        Value::StringList(_) => "list",
-        Value::Map(_) => "map",
-        Value::ResourceRef { .. } => "resource reference",
-        Value::BindingRef { .. } => "binding reference",
-        Value::Interpolation(_) => "string",
-        Value::FunctionCall { .. } => "function call",
-        Value::Secret(_) => "secret",
-        Value::Unknown(_) => "unknown",
+        Value::Concrete(ConcreteValue::String(_)) => "string",
+        Value::Concrete(ConcreteValue::Int(_)) => "int",
+        Value::Concrete(ConcreteValue::Float(_)) => "float",
+        Value::Concrete(ConcreteValue::Bool(_)) => "bool",
+        Value::Concrete(ConcreteValue::Duration(_)) => "duration",
+        Value::Concrete(ConcreteValue::List(_)) => "list",
+        Value::Concrete(ConcreteValue::StringList(_)) => "list",
+        Value::Concrete(ConcreteValue::Map(_)) => "map",
+        Value::Deferred(DeferredValue::ResourceRef { .. }) => "resource reference",
+        Value::Deferred(DeferredValue::BindingRef { .. }) => "binding reference",
+        Value::Deferred(DeferredValue::Interpolation(_)) => "string",
+        Value::Deferred(DeferredValue::FunctionCall { .. }) => "function call",
+        Value::Deferred(DeferredValue::Secret(_)) => "secret",
+        Value::Deferred(DeferredValue::Unknown(_)) => "unknown",
     }
 }
 

@@ -11,7 +11,7 @@ use carina_core::effect::Effect;
 use carina_core::parser::ProviderContext;
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
-use carina_core::resource::{Resource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 use carina_core::value::{format_value, json_to_dsl_value};
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, LockInfo, ResourceState, StateBackend,
@@ -474,7 +474,7 @@ async fn run_state_bucket_delete(
         .attributes
         .get("bucket")
         .and_then(|v| match v {
-            Value::String(s) => Some(s.as_str()),
+            Value::Concrete(ConcreteValue::String(s)) => Some(s.as_str()),
             _ => None,
         })
         .ok_or("Backend configuration missing 'bucket' attribute")?;

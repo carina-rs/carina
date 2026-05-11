@@ -12,19 +12,19 @@
 //!
 //! Inference rules:
 //!
-//! - `Value::String/Int/Bool/Float` → corresponding `TypeExpr` primitive.
-//! - `Value::List(items)` → `List(T)` where `T` is the unified element
+//! - `Value::Concrete(ConcreteValue::String)/Int/Bool/Float` → corresponding `TypeExpr` primitive.
+//! - `Value::Concrete(ConcreteValue::List(items))` → `List(T)` where `T` is the unified element
 //!   type. Heterogeneous lists fail inference.
-//! - `Value::Map(entries)` → `Map(T)` where `T` unifies value types.
-//! - `Value::ResourceRef { binding, attribute, field_path }` → walk
+//! - `Value::Concrete(ConcreteValue::Map(entries))` → `Map(T)` where `T` unifies value types.
+//! - `Value::Deferred(DeferredValue::ResourceRef{ binding, attribute, field_path })` → walk
 //!   the binding's resource schema, descend `field_path`, convert the
 //!   reached `AttributeType` into a `TypeExpr`.
-//! - `Value::Interpolation(_)` → `TypeExpr::String` (interpolation
+//! - `Value::Deferred(DeferredValue::Interpolation(_))` → `TypeExpr::String` (interpolation
 //!   results are always strings; users who need a specific Custom
 //!   identity must annotate to narrow).
-//! - `Value::Secret(_)` → `TypeExpr::String` (the secret's plaintext
+//! - `Value::Deferred(DeferredValue::Secret(_))` → `TypeExpr::String` (the secret's plaintext
 //!   shape; same reasoning as Interpolation).
-//! - `Value::FunctionCall { name, .. }` → consult `builtins`'s
+//! - `Value::Deferred(DeferredValue::FunctionCall{ name, .. })` → consult `builtins`'s
 //!   `BuiltinReturnType`. `String/Int/List/Map/Secret` map to the
 //!   corresponding `TypeExpr` primitive; `Any` (`lookup`, `min`,
 //!   `max`, `map`) is "depends on arguments" — counts as inference
@@ -34,7 +34,7 @@ use std::collections::HashMap;
 
 use crate::builtins::{BuiltinReturnType, builtin_functions};
 use crate::parser::TypeExpr;
-use crate::resource::Value;
+use crate::resource::{ConcreteValue, DeferredValue, Value};
 use crate::schema::{AttributeType, ResourceSchema, SchemaKind, SchemaRegistry};
 
 /// Why inference failed. Carries the rhs description so downstream
@@ -290,19 +290,23 @@ fn infer_type_from_value_with_visiting(
     visiting: &mut indexmap::IndexSet<String>,
 ) -> Result<TypeExpr, InferenceError> {
     match value {
-        Value::String(_) => Ok(TypeExpr::String),
-        Value::Int(_) => Ok(TypeExpr::Int),
-        Value::Float(_) => Ok(TypeExpr::Float),
-        Value::Bool(_) => Ok(TypeExpr::Bool),
-        Value::Duration(_) => Ok(TypeExpr::Duration),
-        Value::Interpolation(_) => Ok(TypeExpr::String),
-        Value::Secret(_) => Ok(TypeExpr::String),
-        Value::List(items) => infer_collection(items, bindings, schemas, visiting, TypeExpr::List),
-        Value::StringList(_) => Ok(TypeExpr::List(Box::new(TypeExpr::String))),
-        Value::Map(entries) => {
+        Value::Concrete(ConcreteValue::String(_)) => Ok(TypeExpr::String),
+        Value::Concrete(ConcreteValue::Int(_)) => Ok(TypeExpr::Int),
+        Value::Concrete(ConcreteValue::Float(_)) => Ok(TypeExpr::Float),
+        Value::Concrete(ConcreteValue::Bool(_)) => Ok(TypeExpr::Bool),
+        Value::Concrete(ConcreteValue::Duration(_)) => Ok(TypeExpr::Duration),
+        Value::Deferred(DeferredValue::Interpolation(_)) => Ok(TypeExpr::String),
+        Value::Deferred(DeferredValue::Secret(_)) => Ok(TypeExpr::String),
+        Value::Concrete(ConcreteValue::List(items)) => {
+            infer_collection(items, bindings, schemas, visiting, TypeExpr::List)
+        }
+        Value::Concrete(ConcreteValue::StringList(_)) => {
+            Ok(TypeExpr::List(Box::new(TypeExpr::String)))
+        }
+        Value::Concrete(ConcreteValue::Map(entries)) => {
             infer_collection(entries.values(), bindings, schemas, visiting, TypeExpr::Map)
         }
-        Value::ResourceRef { path } => infer_resource_ref_with_visiting(
+        Value::Deferred(DeferredValue::ResourceRef { path }) => infer_resource_ref_with_visiting(
             path.binding(),
             path.attribute(),
             path.field_path(),
@@ -314,11 +318,11 @@ fn infer_type_from_value_with_visiting(
         // `BindingRef` is a bare-binding placeholder with no attribute
         // and therefore no inferable position. Inference treats it as
         // "type unknown until accessed" — same shape as `Unknown(_)`.
-        Value::BindingRef { .. } => Err(InferenceError::UnknownType {
+        Value::Deferred(DeferredValue::BindingRef { .. }) => Err(InferenceError::UnknownType {
             reason: "bare binding reference has no attribute to infer".to_string(),
         }),
-        Value::FunctionCall { name, .. } => infer_function_call(name),
-        Value::Unknown(_) => Err(InferenceError::UnknownType {
+        Value::Deferred(DeferredValue::FunctionCall { name, .. }) => infer_function_call(name),
+        Value::Deferred(DeferredValue::Unknown(_)) => Err(InferenceError::UnknownType {
             reason: "value not yet known at plan time (unresolved upstream)".to_string(),
         }),
     }
@@ -740,7 +744,7 @@ mod tests {
     #[test]
     fn literal_string_inferred_as_string() {
         let r = infer_type_from_value(
-            &Value::String("hello".to_string()),
+            &Value::Concrete(ConcreteValue::String("hello".to_string())),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
         );
@@ -750,7 +754,7 @@ mod tests {
     #[test]
     fn literal_int_inferred_as_int() {
         let r = infer_type_from_value(
-            &Value::Int(42),
+            &Value::Concrete(ConcreteValue::Int(42)),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
         );
@@ -760,7 +764,7 @@ mod tests {
     #[test]
     fn literal_bool_inferred_as_bool() {
         let r = infer_type_from_value(
-            &Value::Bool(true),
+            &Value::Concrete(ConcreteValue::Bool(true)),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
         );
@@ -773,7 +777,9 @@ mod tests {
         // result is always String. Use one literal part.
         use crate::resource::InterpolationPart;
         let r = infer_type_from_value(
-            &Value::Interpolation(vec![InterpolationPart::Literal("hello".to_string())]),
+            &Value::Deferred(DeferredValue::Interpolation(vec![
+                InterpolationPart::Literal("hello".to_string()),
+            ])),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
         );
@@ -783,7 +789,9 @@ mod tests {
     #[test]
     fn secret_inferred_as_string() {
         let r = infer_type_from_value(
-            &Value::Secret(Box::new(Value::String("hidden".to_string()))),
+            &Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("hidden".to_string()),
+            )))),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
         );
@@ -793,10 +801,10 @@ mod tests {
     #[test]
     fn list_of_strings_inferred_as_list_string() {
         let r = infer_type_from_value(
-            &Value::List(vec![
-                Value::String("a".to_string()),
-                Value::String("b".to_string()),
-            ]),
+            &Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("a".to_string())),
+                Value::Concrete(ConcreteValue::String("b".to_string())),
+            ])),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
         );
@@ -806,7 +814,10 @@ mod tests {
     #[test]
     fn list_with_mixed_types_fails() {
         let r = infer_type_from_value(
-            &Value::List(vec![Value::String("a".to_string()), Value::Int(1)]),
+            &Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("a".to_string())),
+                Value::Concrete(ConcreteValue::Int(1)),
+            ])),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
         );
@@ -819,10 +830,16 @@ mod tests {
     #[test]
     fn map_of_strings_inferred_as_map_string() {
         let mut entries = indexmap::IndexMap::new();
-        entries.insert("a".to_string(), Value::String("x".to_string()));
-        entries.insert("b".to_string(), Value::String("y".to_string()));
+        entries.insert(
+            "a".to_string(),
+            Value::Concrete(ConcreteValue::String("x".to_string())),
+        );
+        entries.insert(
+            "b".to_string(),
+            Value::Concrete(ConcreteValue::String("y".to_string())),
+        );
         let r = infer_type_from_value(
-            &Value::Map(entries),
+            &Value::Concrete(ConcreteValue::Map(entries)),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
         );
@@ -832,10 +849,13 @@ mod tests {
     #[test]
     fn map_with_mixed_value_types_fails() {
         let mut entries = indexmap::IndexMap::new();
-        entries.insert("a".to_string(), Value::String("x".to_string()));
-        entries.insert("b".to_string(), Value::Int(1));
+        entries.insert(
+            "a".to_string(),
+            Value::Concrete(ConcreteValue::String("x".to_string())),
+        );
+        entries.insert("b".to_string(), Value::Concrete(ConcreteValue::Int(1)));
         let r = infer_type_from_value(
-            &Value::Map(entries),
+            &Value::Concrete(ConcreteValue::Map(entries)),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
         );
@@ -862,7 +882,7 @@ mod tests {
 
         let path = AccessPath::with_fields("vpc", "tags", vec!["environment".to_string()]);
         let r = infer_type_from_value(
-            &Value::ResourceRef { path },
+            &Value::Deferred(DeferredValue::ResourceRef { path }),
             &binding_to_vpc("vpc"),
             &schemas,
         );
@@ -877,13 +897,13 @@ mod tests {
         // meant `lookup` to return `Int`) silently lock the export to
         // String. All-or-nothing is the safer default.
         let r = infer_type_from_value(
-            &Value::List(vec![
-                Value::FunctionCall {
+            &Value::Concrete(ConcreteValue::List(vec![
+                Value::Deferred(DeferredValue::FunctionCall {
                     name: "lookup".to_string(),
                     args: vec![],
-                },
-                Value::String("extra".to_string()),
-            ]),
+                }),
+                Value::Concrete(ConcreteValue::String("extra".to_string())),
+            ])),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
         );
@@ -893,7 +913,7 @@ mod tests {
     #[test]
     fn empty_list_fails_inference() {
         let r = infer_type_from_value(
-            &Value::List(vec![]),
+            &Value::Concrete(ConcreteValue::List(vec![])),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
         );
@@ -908,7 +928,7 @@ mod tests {
         // stores `: VpcId` annotations.
         let path = AccessPath::new("vpc", "vpc_id");
         let r = infer_type_from_value(
-            &Value::ResourceRef { path },
+            &Value::Deferred(DeferredValue::ResourceRef { path }),
             &binding_to_vpc("vpc"),
             &schemas_with_vpc(),
         );
@@ -919,7 +939,7 @@ mod tests {
     fn resource_ref_to_string_attr_inferred_as_string() {
         let path = AccessPath::new("vpc", "cidr_block");
         let r = infer_type_from_value(
-            &Value::ResourceRef { path },
+            &Value::Deferred(DeferredValue::ResourceRef { path }),
             &binding_to_vpc("vpc"),
             &schemas_with_vpc(),
         );
@@ -930,7 +950,7 @@ mod tests {
     fn resource_ref_unknown_binding_errors() {
         let path = AccessPath::new("missing", "vpc_id");
         let r = infer_type_from_value(
-            &Value::ResourceRef { path },
+            &Value::Deferred(DeferredValue::ResourceRef { path }),
             &InferenceBindings::new(),
             &schemas_with_vpc(),
         );
@@ -941,7 +961,7 @@ mod tests {
     fn resource_ref_unknown_attribute_errors() {
         let path = AccessPath::new("vpc", "missing");
         let r = infer_type_from_value(
-            &Value::ResourceRef { path },
+            &Value::Deferred(DeferredValue::ResourceRef { path }),
             &binding_to_vpc("vpc"),
             &schemas_with_vpc(),
         );
@@ -952,10 +972,10 @@ mod tests {
     fn function_call_join_inferred_as_string() {
         // `join` returns String per builtins metadata.
         let r = infer_type_from_value(
-            &Value::FunctionCall {
+            &Value::Deferred(DeferredValue::FunctionCall {
                 name: "join".to_string(),
                 args: vec![],
-            },
+            }),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
         );
@@ -967,10 +987,10 @@ mod tests {
         // `lookup` returns Any — depends on arguments. Annotation
         // required.
         let r = infer_type_from_value(
-            &Value::FunctionCall {
+            &Value::Deferred(DeferredValue::FunctionCall {
                 name: "lookup".to_string(),
                 args: vec![],
-            },
+            }),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
         );
@@ -999,7 +1019,7 @@ mod tests {
             vec![crate::resource::Subscript::Int { index: 0 }],
         );
         let r = infer_type_from_value(
-            &Value::ResourceRef { path },
+            &Value::Deferred(DeferredValue::ResourceRef { path }),
             &binding_to_vpc("vpc"),
             &schemas,
         );
@@ -1012,7 +1032,7 @@ mod tests {
         // `UnknownBinding` rather than silently degrading to `None`.
         let path = AccessPath::new("mian", "vpc_id");
         let r = infer_type_from_value(
-            &Value::ResourceRef { path },
+            &Value::Deferred(DeferredValue::ResourceRef { path }),
             &binding_to_vpc("main"),
             &schemas_with_vpc(),
         );
@@ -1030,7 +1050,7 @@ mod tests {
         bindings.insert("network".to_string(), InferenceBinding::UpstreamState);
         let path = AccessPath::new("network", "vpc_id");
         let r = infer_type_from_value(
-            &Value::ResourceRef { path },
+            &Value::Deferred(DeferredValue::ResourceRef { path }),
             &bindings,
             &SchemaRegistry::new(),
         );
@@ -1047,9 +1067,9 @@ mod tests {
         let upstream_path = AccessPath::new("network", "vpc_id");
         let r = infer_type_expr(
             None,
-            Some(&Value::ResourceRef {
+            Some(&Value::Deferred(DeferredValue::ResourceRef {
                 path: upstream_path,
-            }),
+            })),
             &bindings,
             &SchemaRegistry::new(),
         );
@@ -1058,7 +1078,9 @@ mod tests {
         let typo_path = AccessPath::new("nonexistent", "vpc_id");
         let r = infer_type_expr(
             None,
-            Some(&Value::ResourceRef { path: typo_path }),
+            Some(&Value::Deferred(DeferredValue::ResourceRef {
+                path: typo_path,
+            })),
             &bindings,
             &SchemaRegistry::new(),
         );
@@ -1081,7 +1103,7 @@ mod tests {
 
         let path = AccessPath::new("vpc", "polymorphic");
         let r = infer_type_from_value(
-            &Value::ResourceRef { path },
+            &Value::Deferred(DeferredValue::ResourceRef { path }),
             &binding_to_vpc("vpc"),
             &schemas,
         );
@@ -1162,7 +1184,11 @@ mod tests {
             },
         );
         let path = AccessPath::new("policy", "policy_document");
-        let r = infer_type_from_value(&Value::ResourceRef { path }, &bindings, &schemas);
+        let r = infer_type_from_value(
+            &Value::Deferred(DeferredValue::ResourceRef { path }),
+            &bindings,
+            &schemas,
+        );
         // Pin the inferred shape, not just `is_ok`: the outer Struct
         // is preserved with its `statement` field, and the buried
         // Union inside the inner Statement struct collapses to the
@@ -1198,10 +1224,10 @@ mod tests {
     #[test]
     fn function_call_unknown_name_fails_inference() {
         let r = infer_type_from_value(
-            &Value::FunctionCall {
+            &Value::Deferred(DeferredValue::FunctionCall {
                 name: "nonexistent".to_string(),
                 args: vec![],
-            },
+            }),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
         );
@@ -1240,10 +1266,10 @@ mod tests {
             name: "zone_id".to_string(),
             type_expr: None,
             // `lookup` returns Any: inference fails, sentinel produced.
-            value: Some(Value::FunctionCall {
+            value: Some(Value::Deferred(DeferredValue::FunctionCall {
                 name: "lookup".to_string(),
                 args: vec![],
-            }),
+            })),
         });
 
         let (inferred, errors) = apply_inference(parsed, &SchemaRegistry::new());
@@ -1260,7 +1286,9 @@ mod tests {
         parsed.export_params.push(crate::parser::ParsedExportParam {
             name: "vpc_id".to_string(),
             type_expr: Some(TypeExpr::Simple("vpc_id".to_string())),
-            value: Some(Value::String("vpc-abc".to_string())),
+            value: Some(Value::Concrete(ConcreteValue::String(
+                "vpc-abc".to_string(),
+            ))),
         });
 
         let (inferred, errors) = apply_inference(parsed, &SchemaRegistry::new());
@@ -1487,20 +1515,26 @@ mod tests {
         let mut bindings = InferenceBindings::new();
         bindings.insert(
             "a".to_string(),
-            virtual_binding(&[("x", Value::String("hi".to_string()))]),
+            virtual_binding(&[(
+                "x",
+                Value::Concrete(ConcreteValue::String("hi".to_string())),
+            )]),
         );
         bindings.insert(
             "b".to_string(),
-            virtual_binding(&[("y", Value::String("there".to_string()))]),
+            virtual_binding(&[(
+                "y",
+                Value::Concrete(ConcreteValue::String("there".to_string())),
+            )]),
         );
 
         // List of two refs to *different* Virtual bindings. After the
         // first ref returns, the visited-set must no longer contain `a`
         // when the second ref descends into `b`.
-        let entries = Value::List(vec![
+        let entries = Value::Concrete(ConcreteValue::List(vec![
             Value::resource_ref("a".to_string(), "x".to_string(), vec![]),
             Value::resource_ref("b".to_string(), "y".to_string(), vec![]),
-        ]);
+        ]));
         let r = infer_type_from_value(&entries, &bindings, &SchemaRegistry::new());
         assert_eq!(
             r,

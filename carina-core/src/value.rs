@@ -6,7 +6,7 @@ use argon2::Argon2;
 use indexmap::IndexMap;
 use thiserror::Error;
 
-use crate::resource::{InterpolationPart, UnknownReason, Value};
+use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value};
 use crate::schema::AttributeType;
 use crate::utils::{convert_enum_value, is_dsl_enum_format};
 
@@ -53,7 +53,7 @@ impl std::fmt::Display for SerializationContext {
 /// message string.
 #[derive(Debug, Error)]
 pub enum SerializationError {
-    /// A `Value::Unknown` reached a serialization boundary. Producers
+    /// A `Value::Deferred(DeferredValue::Unknown)` reached a serialization boundary. Producers
     /// must strip / resolve it before this point — see
     /// `PlanPreprocessor::strip_unknown_attributes` for the WASM
     /// boundary stripping pass.
@@ -69,7 +69,7 @@ pub enum SerializationError {
         value: f64,
         context: SerializationContext,
     },
-    /// A `Value::ResourceRef` reached a serialization boundary that
+    /// A `Value::Deferred(DeferredValue::ResourceRef)` reached a serialization boundary that
     /// expected a concrete value. Resolvers must substitute the
     /// reference before this point. Reaching this arm at apply-time
     /// state writeback or plan-file write is a resolver bug.
@@ -85,13 +85,13 @@ pub enum SerializationError {
         path: String,
         context: SerializationContext,
     },
-    /// A `Value::Interpolation` reached a serialization boundary. The
+    /// A `Value::Deferred(DeferredValue::Interpolation)` reached a serialization boundary. The
     /// canonicalize pass should collapse interpolations to a `String`
     /// once all parts resolve; reaching this arm means a part stayed
     /// unresolved through apply-time export resolution.
     #[error("cannot serialize at {context}: unresolved interpolation")]
     UnresolvedInterpolation { context: SerializationContext },
-    /// A `Value::FunctionCall` reached a serialization boundary. The
+    /// A `Value::Deferred(DeferredValue::FunctionCall)` reached a serialization boundary. The
     /// resolver should evaluate the function (built-in or user-defined)
     /// before this point; reaching this arm is a resolver bug.
     #[error("cannot serialize at {context}: unresolved function call {name}(...)")]
@@ -198,7 +198,7 @@ pub(crate) fn argon2id_hash(input: &[u8], context: Option<&SecretHashContext>) -
 /// Returns an error if `value` contains a non-finite float (NaN or infinity)
 /// because JSON cannot represent these values.
 ///
-/// For `Value::Secret`, uses the fallback salt. Use `value_to_json_with_context`
+/// For `Value::Deferred(DeferredValue::Secret)`, uses the fallback salt. Use `value_to_json_with_context`
 /// to provide resource context for deterministic context-specific salt.
 pub fn value_to_json(value: &Value) -> Result<serde_json::Value, SerializationError> {
     value_to_json_with_context(value, None)
@@ -206,7 +206,7 @@ pub fn value_to_json(value: &Value) -> Result<serde_json::Value, SerializationEr
 
 /// Convert `Value` to `serde_json::Value` with optional secret hash context.
 ///
-/// When `context` is provided and the value contains `Value::Secret`, the hash
+/// When `context` is provided and the value contains `Value::Deferred(DeferredValue::Secret)`, the hash
 /// uses a deterministic salt derived from the resource context. This ensures
 /// that the same password on different resources produces different hashes.
 pub fn value_to_json_with_context(
@@ -215,10 +215,12 @@ pub fn value_to_json_with_context(
 ) -> Result<serde_json::Value, SerializationError> {
     let ctx = SerializationContext::ValueToJson;
     match value {
-        Value::String(s) => Ok(serde_json::Value::String(s.clone())),
-        Value::Int(n) => Ok(serde_json::Value::Number((*n).into())),
-        Value::Duration(d) => Ok(serde_json::Value::Number((d.as_secs() as i64).into())),
-        Value::Float(f) => {
+        Value::Concrete(ConcreteValue::String(s)) => Ok(serde_json::Value::String(s.clone())),
+        Value::Concrete(ConcreteValue::Int(n)) => Ok(serde_json::Value::Number((*n).into())),
+        Value::Concrete(ConcreteValue::Duration(d)) => {
+            Ok(serde_json::Value::Number((d.as_secs() as i64).into()))
+        }
+        Value::Concrete(ConcreteValue::Float(f)) => {
             let num =
                 serde_json::Number::from_f64(*f).ok_or(SerializationError::NonFiniteFloat {
                     value: *f,
@@ -226,48 +228,54 @@ pub fn value_to_json_with_context(
                 })?;
             Ok(serde_json::Value::Number(num))
         }
-        Value::Bool(b) => Ok(serde_json::Value::Bool(*b)),
-        Value::List(items) => {
+        Value::Concrete(ConcreteValue::Bool(b)) => Ok(serde_json::Value::Bool(*b)),
+        Value::Concrete(ConcreteValue::List(items)) => {
             let arr: Result<Vec<_>, _> = items
                 .iter()
                 .map(|item| value_to_json_with_context(item, context))
                 .collect();
             Ok(serde_json::Value::Array(arr?))
         }
-        Value::StringList(items) => Ok(serde_json::Value::Array(
+        Value::Concrete(ConcreteValue::StringList(items)) => Ok(serde_json::Value::Array(
             items
                 .iter()
                 .map(|s| serde_json::Value::String(s.clone()))
                 .collect(),
         )),
-        Value::Map(map) => {
+        Value::Concrete(ConcreteValue::Map(map)) => {
             let obj: Result<serde_json::Map<_, _>, _> = map
                 .iter()
                 .map(|(k, v)| value_to_json_with_context(v, context).map(|jv| (k.clone(), jv)))
                 .collect();
             Ok(serde_json::Value::Object(obj?))
         }
-        Value::ResourceRef { path } => Err(SerializationError::UnresolvedResourceRef {
-            path: path.to_dot_string(),
-            context: ctx,
-        }),
-        Value::BindingRef { binding } => Err(SerializationError::UnresolvedResourceRef {
-            // A bare-binding reference is by construction never a
-            // resolved value — it must be substituted by the resolver
-            // pass before reaching any serialization boundary. Report
-            // through the same channel as `ResourceRef` so the same
-            // diagnostic path covers both producer kinds.
-            path: binding.clone(),
-            context: ctx,
-        }),
-        Value::Interpolation(_) => {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+            Err(SerializationError::UnresolvedResourceRef {
+                path: path.to_dot_string(),
+                context: ctx,
+            })
+        }
+        Value::Deferred(DeferredValue::BindingRef { binding }) => {
+            Err(SerializationError::UnresolvedResourceRef {
+                // A bare-binding reference is by construction never a
+                // resolved value — it must be substituted by the resolver
+                // pass before reaching any serialization boundary. Report
+                // through the same channel as `ResourceRef` so the same
+                // diagnostic path covers both producer kinds.
+                path: binding.clone(),
+                context: ctx,
+            })
+        }
+        Value::Deferred(DeferredValue::Interpolation(_)) => {
             Err(SerializationError::UnresolvedInterpolation { context: ctx })
         }
-        Value::FunctionCall { name, .. } => Err(SerializationError::UnresolvedFunctionCall {
-            name: name.clone(),
-            context: ctx,
-        }),
-        Value::Secret(inner) => {
+        Value::Deferred(DeferredValue::FunctionCall { name, .. }) => {
+            Err(SerializationError::UnresolvedFunctionCall {
+                name: name.clone(),
+                context: ctx,
+            })
+        }
+        Value::Deferred(DeferredValue::Secret(inner)) => {
             let inner_json = value_to_json_with_context(inner, context)?;
             // `serde_json::Value -> String` only fails on a custom
             // `Serialize` impl or invalid map keys, neither of which a
@@ -279,10 +287,12 @@ pub fn value_to_json_with_context(
                 "{SECRET_PREFIX}{hash_hex}",
             )))
         }
-        Value::Unknown(reason) => Err(SerializationError::UnknownNotAllowed {
-            reason: reason.clone(),
-            context: ctx,
-        }),
+        Value::Deferred(DeferredValue::Unknown(reason)) => {
+            Err(SerializationError::UnknownNotAllowed {
+                reason: reason.clone(),
+                context: ctx,
+            })
+        }
     }
 }
 
@@ -293,24 +303,26 @@ pub fn value_to_json_with_context(
 /// entries when building attribute maps.
 pub fn json_to_dsl_value(json: &serde_json::Value) -> Option<Value> {
     match json {
-        serde_json::Value::String(s) => Some(Value::String(s.clone())),
+        serde_json::Value::String(s) => Some(Value::Concrete(ConcreteValue::String(s.clone()))),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                Some(Value::Int(i))
+                Some(Value::Concrete(ConcreteValue::Int(i)))
             } else {
-                Some(Value::Float(n.as_f64().unwrap_or(0.0)))
+                Some(Value::Concrete(ConcreteValue::Float(
+                    n.as_f64().unwrap_or(0.0),
+                )))
             }
         }
-        serde_json::Value::Bool(b) => Some(Value::Bool(*b)),
-        serde_json::Value::Array(items) => Some(Value::List(
+        serde_json::Value::Bool(b) => Some(Value::Concrete(ConcreteValue::Bool(*b))),
+        serde_json::Value::Array(items) => Some(Value::Concrete(ConcreteValue::List(
             items.iter().filter_map(json_to_dsl_value).collect(),
-        )),
+        ))),
         serde_json::Value::Object(map) => {
             let m: IndexMap<_, _> = map
                 .iter()
                 .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
                 .collect();
-            Some(Value::Map(m))
+            Some(Value::Concrete(ConcreteValue::Map(m)))
         }
         serde_json::Value::Null => None,
     }
@@ -401,7 +413,7 @@ impl FormatSink for WidthCounter {
 ///
 /// Picks the largest unit that divides the duration cleanly:
 /// `3600s` → `1h`, `60s` → `1min`, anything else → `Ns`. The original
-/// authoring unit is not preserved (`Value::Duration` carries only a
+/// authoring unit is not preserved (`Value::Concrete(ConcreteValue::Duration)` carries only a
 /// `std::time::Duration`), so this is a deterministic re-rendering
 /// rule — not a faithful round-trip.
 ///
@@ -434,7 +446,7 @@ pub(crate) fn format_value_into<S: FormatSink>(
     sink: &mut S,
 ) -> Result<(), Overflow> {
     match value {
-        Value::String(s) => {
+        Value::Concrete(ConcreteValue::String(s)) => {
             // Secret hash strings should display as "(secret)" to avoid
             // leaking internal hash representation in plan output.
             if s.starts_with(SECRET_PREFIX) {
@@ -452,9 +464,9 @@ pub(crate) fn format_value_into<S: FormatSink>(
             sink.write_str(s)?;
             sink.write_str("\"")
         }
-        Value::Int(n) => sink.write_str(&n.to_string()),
-        Value::Duration(d) => sink.write_str(&render_duration(*d)),
-        Value::Float(f) => {
+        Value::Concrete(ConcreteValue::Int(n)) => sink.write_str(&n.to_string()),
+        Value::Concrete(ConcreteValue::Duration(d)) => sink.write_str(&render_duration(*d)),
+        Value::Concrete(ConcreteValue::Float(f)) => {
             let s = f.to_string();
             sink.write_str(&s)?;
             if !s.contains('.') {
@@ -462,8 +474,10 @@ pub(crate) fn format_value_into<S: FormatSink>(
             }
             Ok(())
         }
-        Value::Bool(b) => sink.write_str(if *b { "true" } else { "false" }),
-        Value::List(items) => {
+        Value::Concrete(ConcreteValue::Bool(b)) => {
+            sink.write_str(if *b { "true" } else { "false" })
+        }
+        Value::Concrete(ConcreteValue::List(items)) => {
             sink.write_str("[")?;
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
@@ -473,10 +487,10 @@ pub(crate) fn format_value_into<S: FormatSink>(
             }
             sink.write_str("]")
         }
-        Value::StringList(items) => {
+        Value::Concrete(ConcreteValue::StringList(items)) => {
             // Canonicalised string-or-list-of-strings shape (#2510).
-            // Renders with the same `[ "a", "b" ]` form as `Value::List`
-            // of `Value::String` so plan output stays uniform.
+            // Renders with the same `[ "a", "b" ]` form as `Value::Concrete(ConcreteValue::List)`
+            // of `Value::Concrete(ConcreteValue::String)` so plan output stays uniform.
             sink.write_str("[")?;
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
@@ -488,7 +502,7 @@ pub(crate) fn format_value_into<S: FormatSink>(
             }
             sink.write_str("]")
         }
-        Value::Map(map) => {
+        Value::Concrete(ConcreteValue::Map(map)) => {
             let mut keys: Vec<_> = map.keys().collect();
             keys.sort();
             sink.write_str("{")?;
@@ -502,9 +516,11 @@ pub(crate) fn format_value_into<S: FormatSink>(
             }
             sink.write_str("}")
         }
-        Value::ResourceRef { path } => sink.write_str(&path.to_dot_string()),
-        Value::BindingRef { binding } => sink.write_str(binding),
-        Value::Interpolation(parts) => {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+            sink.write_str(&path.to_dot_string())
+        }
+        Value::Deferred(DeferredValue::BindingRef { binding }) => sink.write_str(binding),
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
             sink.write_str("\"")?;
             for part in parts {
                 match part {
@@ -518,7 +534,7 @@ pub(crate) fn format_value_into<S: FormatSink>(
             }
             sink.write_str("\"")
         }
-        Value::FunctionCall { name, args } => {
+        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
             sink.write_str(name)?;
             sink.write_str("(")?;
             for (i, arg) in args.iter().enumerate() {
@@ -529,17 +545,17 @@ pub(crate) fn format_value_into<S: FormatSink>(
             }
             sink.write_str(")")
         }
-        Value::Secret(_) => sink.write_str("(secret)"),
-        Value::Unknown(reason) => sink.write_str(&render_unknown(reason)),
+        Value::Deferred(DeferredValue::Secret(_)) => sink.write_str("(secret)"),
+        Value::Deferred(DeferredValue::Unknown(reason)) => sink.write_str(&render_unknown(reason)),
     }
 }
 
 /// Check if a Value contains any Secret values at any nesting depth.
 pub fn contains_secret(value: &Value) -> bool {
     match value {
-        Value::Secret(_) => true,
-        Value::Map(map) => map.values().any(contains_secret),
-        Value::List(items) => items.iter().any(contains_secret),
+        Value::Deferred(DeferredValue::Secret(_)) => true,
+        Value::Concrete(ConcreteValue::Map(map)) => map.values().any(contains_secret),
+        Value::Concrete(ConcreteValue::List(items)) => items.iter().any(contains_secret),
         _ => false,
     }
 }
@@ -565,8 +581,8 @@ pub fn merge_secrets_into_provider_json(
     context: Option<&SecretHashContext>,
 ) -> Result<serde_json::Value, SerializationError> {
     match desired {
-        Value::Secret(_) => value_to_json_with_context(desired, context),
-        Value::Map(desired_map) => {
+        Value::Deferred(DeferredValue::Secret(_)) => value_to_json_with_context(desired, context),
+        Value::Concrete(ConcreteValue::Map(desired_map)) => {
             if let serde_json::Value::Object(provider_obj) = provider_json {
                 let mut merged = provider_obj.clone();
                 for (k, desired_val) in desired_map {
@@ -595,7 +611,7 @@ pub fn merge_secrets_into_provider_json(
                 value_to_json_with_context(desired, context)
             }
         }
-        Value::List(desired_items) => {
+        Value::Concrete(ConcreteValue::List(desired_items)) => {
             if let serde_json::Value::Array(provider_arr) = provider_json {
                 let mut merged = Vec::with_capacity(provider_arr.len());
                 for (i, provider_elem) in provider_arr.iter().enumerate() {
@@ -622,7 +638,7 @@ pub fn merge_secrets_into_provider_json(
     }
 }
 
-/// Recursively replace all `Value::Secret(inner)` with `Value::String(hash)`.
+/// Recursively replace all `Value::Deferred(DeferredValue::Secret(inner))` with `Value::Concrete(ConcreteValue::String(hash))`.
 ///
 /// This ensures that when a `Value` tree is serialized (e.g., via serde), no
 /// secret plaintext is ever written. The hash uses Argon2id with the fallback
@@ -630,28 +646,32 @@ pub fn merge_secrets_into_provider_json(
 /// the goal is redaction, not state comparison.
 pub fn redact_secrets_in_value(value: &Value) -> Result<Value, SerializationError> {
     match value {
-        Value::Secret(inner) => {
+        Value::Deferred(DeferredValue::Secret(inner)) => {
             let inner_json = value_to_json(inner)?;
             let json_str = serde_json::to_string(&inner_json)
                 .expect("serde_json::Value -> String is infallible");
             let hash_hex = argon2id_hash(json_str.as_bytes(), None);
-            Ok(Value::String(format!("{SECRET_PREFIX}{hash_hex}")))
+            Ok(Value::Concrete(ConcreteValue::String(format!(
+                "{SECRET_PREFIX}{hash_hex}"
+            ))))
         }
-        Value::Map(map) => {
+        Value::Concrete(ConcreteValue::Map(map)) => {
             let redacted: Result<IndexMap<String, Value>, _> = map
                 .iter()
                 .map(|(k, v)| redact_secrets_in_value(v).map(|rv| (k.clone(), rv)))
                 .collect();
-            Ok(Value::Map(redacted?))
+            Ok(Value::Concrete(ConcreteValue::Map(redacted?)))
         }
-        Value::List(items) => {
+        Value::Concrete(ConcreteValue::List(items)) => {
             let redacted: Result<Vec<_>, _> = items.iter().map(redact_secrets_in_value).collect();
-            Ok(Value::List(redacted?))
+            Ok(Value::Concrete(ConcreteValue::List(redacted?)))
         }
-        Value::Unknown(reason) => Err(SerializationError::UnknownNotAllowed {
-            reason: reason.clone(),
-            context: SerializationContext::SecretRedaction,
-        }),
+        Value::Deferred(DeferredValue::Unknown(reason)) => {
+            Err(SerializationError::UnknownNotAllowed {
+                reason: reason.clone(),
+                context: SerializationContext::SecretRedaction,
+            })
+        }
         other => Ok(other.clone()),
     }
 }
@@ -816,7 +836,7 @@ impl<'a> PrettyLayout<'a> {
     /// Width of the prefix (`<indent>key: `) that the caller has already
     /// emitted, in columns. Used as the budget consumed before any value
     /// content can fit on the same line. Map keys can carry non-ASCII
-    /// characters (the `Value::Map` key type is `String` with no
+    /// characters (the `Value::Concrete(ConcreteValue::Map)` key type is `String` with no
     /// encoding constraint), so width is measured in Unicode scalar values.
     fn prefix_cols(&self) -> usize {
         self.parent_indent_cols + self.key.chars().count() + 2
@@ -837,20 +857,20 @@ impl<'a> PrettyLayout<'a> {
 ///
 /// Behavior:
 /// - Scalar variants are identical to `format_value_with_key(value, None)`.
-/// - `Value::List` of all `Value::Map` always renders vertically. Each
+/// - `Value::Concrete(ConcreteValue::List)` of all `Value::Concrete(ConcreteValue::Map)` always renders vertically. Each
 ///   element's first key is prefixed with `* ` at `parent_indent_cols + 2`;
 ///   continuation keys align at `parent_indent_cols + 4`. Map keys are
 ///   sorted alphabetically. Consecutive elements are also separated by
 ///   a blank line. The marker is `*` rather than `-` because `-`
 ///   collides with the destroy action marker at the resource-row level
 ///   (#2545 dropped the marker, #2552 brought it back as `*`).
-/// - `Value::List` of scalars renders inline `[a, b, c]` if the entire line
+/// - `Value::Concrete(ConcreteValue::List)` of scalars renders inline `[a, b, c]` if the entire line
 ///   (`<indent>key: <inline>`) fits within `PRETTY_LINE_LIMIT`; otherwise
 ///   expands to a bracketed multi-line form.
-/// - `Value::StringList` (the canonicalized `Union[String, list(String)]`
+/// - `Value::Concrete(ConcreteValue::StringList)` (the canonicalized `Union[String, list(String)]`
 ///   form, #2511) follows the same inline-vs-vertical rule as
-///   `Value::List` of `Value::String` (#2528).
-/// - `Value::Map` renders inline if it fits, otherwise expands vertically
+///   `Value::Concrete(ConcreteValue::List)` of `Value::Concrete(ConcreteValue::String)` (#2528).
+/// - `Value::Concrete(ConcreteValue::Map)` renders inline if it fits, otherwise expands vertically
 ///   with each key at `parent_indent_cols + 2`.
 ///
 /// When adding a new layout-bearing `Value` variant, add a new arm here
@@ -858,7 +878,7 @@ impl<'a> PrettyLayout<'a> {
 /// the line-budget check, which is wrong for any container variant.
 pub fn format_value_pretty(value: &Value, layout: PrettyLayout<'_>) -> String {
     match value {
-        Value::List(items) => {
+        Value::Concrete(ConcreteValue::List(items)) => {
             if items.is_empty() {
                 return "[]".to_string();
             }
@@ -877,15 +897,15 @@ pub fn format_value_pretty(value: &Value, layout: PrettyLayout<'_>) -> String {
             }
             format_list_of_scalars_vertical(items, layout.child_indent_cols())
         }
-        Value::StringList(items) => {
-            // #2528: `Value::StringList` is the canonicalized form the
+        Value::Concrete(ConcreteValue::StringList(items)) => {
+            // #2528: `Value::Concrete(ConcreteValue::StringList)` is the canonicalized form the
             // `Union[String, list(String)]` shape collapses to (#2511).
-            // It behaves like `Value::List` of `Value::String` for
+            // It behaves like `Value::Concrete(ConcreteValue::List)` of `Value::Concrete(ConcreteValue::String)` for
             // layout purposes — apply the same inline-vs-vertical
             // decision so a long list under a dynamic-key Map (e.g. an
             // IAM `condition.string_like.<context-key>: [a, b]`) breaks
             // across lines instead of dumping inline. Lift items to
-            // `Value::String` for the vertical fallback so the per-item
+            // `Value::Concrete(ConcreteValue::String)` for the vertical fallback so the per-item
             // rendering (SECRET_PREFIX redaction, DSL-enum resolution)
             // stays byte-identical to `format_value_with_key`'s arm.
             if items.is_empty() {
@@ -898,7 +918,7 @@ pub fn format_value_pretty(value: &Value, layout: PrettyLayout<'_>) -> String {
             let lifted: Vec<Value> = items.iter().cloned().map(Value::String).collect();
             format_list_of_scalars_vertical(&lifted, layout.child_indent_cols())
         }
-        Value::Map(map) => {
+        Value::Concrete(ConcreteValue::Map(map)) => {
             if map.is_empty() {
                 return "{}".to_string();
             }
@@ -950,7 +970,7 @@ fn format_list_of_maps_vertical(items: &[Value], entry_indent_cols: usize) -> St
     let mut out = String::new();
     let mut first_element = true;
     for item in items {
-        if let Value::Map(map) = item {
+        if let Value::Concrete(ConcreteValue::Map(map)) = item {
             if !first_element {
                 out.push('\n');
             }
@@ -1034,26 +1054,29 @@ fn format_map_vertical(map: &IndexMap<String, Value>, key_indent_cols: usize) ->
 
 /// Check if a value is a list of maps (list-of-struct)
 pub fn is_list_of_maps(value: &Value) -> bool {
-    if let Value::List(items) = value {
-        !items.is_empty() && items.iter().all(|item| matches!(item, Value::Map(_)))
+    if let Value::Concrete(ConcreteValue::List(items)) = value {
+        !items.is_empty()
+            && items
+                .iter()
+                .all(|item| matches!(item, Value::Concrete(ConcreteValue::Map(_))))
     } else {
         false
     }
 }
 
-/// Extract a `Vec<String>` from a `Value::StringList` or a `Value::List`
-/// whose every element is `Value::String`. Returns `None` for other
+/// Extract a `Vec<String>` from a `Value::Concrete(ConcreteValue::StringList)` or a `Value::Concrete(ConcreteValue::List)`
+/// whose every element is `Value::Concrete(ConcreteValue::String)`. Returns `None` for other
 /// shapes. Empty lists return `Some(vec![])` so callers can distinguish
 /// "empty string list" from "not a string list" — needed by #2943's
 /// diff path so a list shrinking to empty still routes through
 /// per-element `-` lines instead of the inline `[a, b] → []` form.
 pub fn as_string_list(value: &Value) -> Option<Vec<String>> {
     match value {
-        Value::StringList(items) => Some(items.clone()),
-        Value::List(items) => items
+        Value::Concrete(ConcreteValue::StringList(items)) => Some(items.clone()),
+        Value::Concrete(ConcreteValue::List(items)) => items
             .iter()
             .map(|v| match v {
-                Value::String(s) => Some(s.clone()),
+                Value::Concrete(ConcreteValue::String(s)) => Some(s.clone()),
                 _ => None,
             })
             .collect(),
@@ -1069,7 +1092,8 @@ pub fn as_string_list(value: &Value) -> Option<Vec<String>> {
 /// regular map under the parent key, and skipping the blank for it
 /// avoids noise around common single-statement policies. (#2555)
 pub fn needs_trailing_separator(value: &Value) -> bool {
-    is_list_of_maps(value) && matches!(value, Value::List(items) if items.len() >= 2)
+    is_list_of_maps(value)
+        && matches!(value, Value::Concrete(ConcreteValue::List(items)) if items.len() >= 2)
 }
 
 /// Count the number of shared key-value pairs between two map Values.
@@ -1077,7 +1101,7 @@ pub fn needs_trailing_separator(value: &Value) -> bool {
 /// Returns 0 if either value is not a Map.
 pub fn map_similarity(a: &Value, b: &Value) -> usize {
     match (a, b) {
-        (Value::Map(ma), Value::Map(mb)) => ma
+        (Value::Concrete(ConcreteValue::Map(ma)), Value::Concrete(ConcreteValue::Map(mb))) => ma
             .iter()
             .filter(|(k, v)| {
                 mb.get(*k)
@@ -1124,16 +1148,16 @@ fn peel_custom(t: &AttributeType) -> &AttributeType {
     cur
 }
 
-/// Convert `value` to the canonical `Value::StringList` form when
+/// Convert `value` to the canonical `Value::Concrete(ConcreteValue::StringList)` form when
 /// `attr_type` is the `string_or_list_of_strings` shape, recursing into
 /// containers (List, Map, Struct) so nested fields are also
 /// canonicalized.
 ///
 /// Conversion rules for `string_or_list_of_strings`:
-/// - `Value::String(s)` → `Value::StringList(vec![s])`
-/// - `Value::List([Value::String(_), ...])` (every element a String) →
-///   `Value::StringList(vec![..])`
-/// - `Value::StringList(_)` is returned unchanged
+/// - `Value::Concrete(ConcreteValue::String(s))` → `Value::Concrete(ConcreteValue::StringList(vec![s]))`
+/// - `Value::Concrete(ConcreteValue::List([Value::String(_), ...]))` (every element a String) →
+///   `Value::Concrete(ConcreteValue::StringList(vec![..]))`
+/// - `Value::Concrete(ConcreteValue::StringList(_))` is returned unchanged
 /// - any other shape (e.g. a list with non-string elements, a Map, a
 ///   ResourceRef, an unresolved Interpolation/FunctionCall) is returned
 ///   unchanged. Such shapes either fail validation downstream (wrong
@@ -1152,21 +1176,21 @@ pub fn canonicalize_with_type(value: Value, attr_type: &AttributeType) -> Value 
         return canonicalize_to_string_list(value);
     }
     match (value, unwrapped) {
-        (Value::List(items), AttributeType::List { inner, .. }) => {
+        (Value::Concrete(ConcreteValue::List(items)), AttributeType::List { inner, .. }) => {
             let canonicalized = items
                 .into_iter()
                 .map(|v| canonicalize_with_type(v, inner.as_ref()))
                 .collect();
-            Value::List(canonicalized)
+            Value::Concrete(ConcreteValue::List(canonicalized))
         }
-        (Value::Map(map), AttributeType::Map { value: vt, .. }) => {
+        (Value::Concrete(ConcreteValue::Map(map)), AttributeType::Map { value: vt, .. }) => {
             let canonicalized = map
                 .into_iter()
                 .map(|(k, v)| (k, canonicalize_with_type(v, vt.as_ref())))
                 .collect();
-            Value::Map(canonicalized)
+            Value::Concrete(ConcreteValue::Map(canonicalized))
         }
-        (Value::Map(map), AttributeType::Struct { fields, .. }) => {
+        (Value::Concrete(ConcreteValue::Map(map)), AttributeType::Struct { fields, .. }) => {
             let canonicalized = map
                 .into_iter()
                 .map(|(k, v)| {
@@ -1181,11 +1205,11 @@ pub fn canonicalize_with_type(value: Value, attr_type: &AttributeType) -> Value 
                     (k, canon)
                 })
                 .collect();
-            Value::Map(canonicalized)
+            Value::Concrete(ConcreteValue::Map(canonicalized))
         }
-        (Value::Secret(inner), _) => {
-            Value::Secret(Box::new(canonicalize_with_type(*inner, attr_type)))
-        }
+        (Value::Deferred(DeferredValue::Secret(inner)), _) => Value::Deferred(
+            DeferredValue::Secret(Box::new(canonicalize_with_type(*inner, attr_type))),
+        ),
         (v, _) => v,
     }
 }
@@ -1194,26 +1218,32 @@ pub fn canonicalize_with_type(value: Value, attr_type: &AttributeType) -> Value 
 /// `string_or_list_of_strings` case.
 fn canonicalize_to_string_list(value: Value) -> Value {
     match value {
-        Value::StringList(items) => Value::StringList(items),
-        Value::String(s) => Value::StringList(vec![s]),
-        Value::List(items) => {
+        Value::Concrete(ConcreteValue::StringList(items)) => {
+            Value::Concrete(ConcreteValue::StringList(items))
+        }
+        Value::Concrete(ConcreteValue::String(s)) => {
+            Value::Concrete(ConcreteValue::StringList(vec![s]))
+        }
+        Value::Concrete(ConcreteValue::List(items)) => {
             let mut strings = Vec::with_capacity(items.len());
             for item in &items {
                 match item {
-                    Value::String(s) => strings.push(s.clone()),
-                    _ => return Value::List(items),
+                    Value::Concrete(ConcreteValue::String(s)) => strings.push(s.clone()),
+                    _ => return Value::Concrete(ConcreteValue::List(items)),
                 }
             }
-            Value::StringList(strings)
+            Value::Concrete(ConcreteValue::StringList(strings))
         }
-        Value::Secret(inner) => Value::Secret(Box::new(canonicalize_to_string_list(*inner))),
+        Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
+            Box::new(canonicalize_to_string_list(*inner)),
+        )),
         other => other,
     }
 }
 
 /// Walk every resource's attributes, canonicalizing values whose
 /// declared schema type is `Union[String, list(String)]` into
-/// `Value::StringList`. Resources whose schema is not in the registry
+/// `Value::Concrete(ConcreteValue::StringList)`. Resources whose schema is not in the registry
 /// (provider not loaded, unknown resource type) are skipped — schema
 /// validation surfaces the mismatch elsewhere.
 ///
@@ -1242,11 +1272,11 @@ pub fn canonicalize_resources_with_schemas(
 
 /// Walk every entry in a `current_states` map and canonicalize attribute
 /// values whose declared schema type is `Union[String, list(String)]`
-/// into `Value::StringList`.
+/// into `Value::Concrete(ConcreteValue::StringList)`.
 ///
 /// State files written before #2510 / #2511 (or by an apply path that
 /// somehow produced the legacy shape) come back through serde as the
-/// natural `Value::String` / `Value::List` form. Run this immediately
+/// natural `Value::Concrete(ConcreteValue::String)` / `Value::Concrete(ConcreteValue::List)` form. Run this immediately
 /// after `current_states` is built — typically right after
 /// `StateFile::build_state_for_resource` populates the map — so the
 /// differ never sees a non-canonical state value compared against a
@@ -1303,7 +1333,9 @@ mod tests {
 
     #[test]
     fn value_to_json_duration_emits_integer_seconds() {
-        let v = Value::Duration(std::time::Duration::from_secs(4500));
+        let v = Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
+            4500,
+        )));
         let j = value_to_json_with_context(&v, None).unwrap();
         assert_eq!(j, serde_json::json!(4500));
     }
@@ -1311,14 +1343,18 @@ mod tests {
     #[test]
     fn value_duration_round_trips_serde() {
         // Confirms the `#[serde(with = "duration_secs")]` adapter on
-        // `Value::Duration` emits and reads back integer seconds, not
+        // `Value::Concrete(ConcreteValue::Duration)` emits and reads back integer seconds, not
         // the default `{secs, nanos}` shape.
-        let v = Value::Duration(std::time::Duration::from_secs(4500));
+        let v = Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
+            4500,
+        )));
         let json = serde_json::to_string(&v).unwrap();
         let back: Value = serde_json::from_str(&json).unwrap();
         match back {
-            Value::Duration(d) => assert_eq!(d, std::time::Duration::from_secs(4500)),
-            other => panic!("expected Value::Duration, got {other:?}"),
+            Value::Concrete(ConcreteValue::Duration(d)) => {
+                assert_eq!(d, std::time::Duration::from_secs(4500))
+            }
+            other => panic!("expected Value::Concrete(ConcreteValue::Duration), got {other:?}"),
         }
     }
 
@@ -1419,25 +1455,25 @@ mod tests {
 
     #[test]
     fn test_value_to_json_string() {
-        let v = Value::String("hello".to_string());
+        let v = Value::Concrete(ConcreteValue::String("hello".to_string()));
         assert_eq!(value_to_json(&v).unwrap(), serde_json::json!("hello"));
     }
 
     #[test]
     fn test_value_to_json_int() {
-        let v = Value::Int(42);
+        let v = Value::Concrete(ConcreteValue::Int(42));
         assert_eq!(value_to_json(&v).unwrap(), serde_json::json!(42));
     }
 
     #[test]
     fn test_value_to_json_float() {
-        let v = Value::Float(1.5);
+        let v = Value::Concrete(ConcreteValue::Float(1.5));
         assert_eq!(value_to_json(&v).unwrap(), serde_json::json!(1.5));
     }
 
     #[test]
     fn test_value_to_json_nan_returns_error() {
-        let v = Value::Float(f64::NAN);
+        let v = Value::Concrete(ConcreteValue::Float(f64::NAN));
         let result = value_to_json(&v);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("NaN"));
@@ -1445,7 +1481,7 @@ mod tests {
 
     #[test]
     fn test_value_to_json_infinity_returns_error() {
-        let v = Value::Float(f64::INFINITY);
+        let v = Value::Concrete(ConcreteValue::Float(f64::INFINITY));
         let result = value_to_json(&v);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("inf"));
@@ -1453,7 +1489,7 @@ mod tests {
 
     #[test]
     fn test_value_to_json_neg_infinity_returns_error() {
-        let v = Value::Float(f64::NEG_INFINITY);
+        let v = Value::Concrete(ConcreteValue::Float(f64::NEG_INFINITY));
         let result = value_to_json(&v);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("-inf"));
@@ -1461,7 +1497,10 @@ mod tests {
 
     #[test]
     fn test_value_to_json_nan_in_list_returns_error() {
-        let v = Value::List(vec![Value::Int(1), Value::Float(f64::NAN)]);
+        let v = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::Int(1)),
+            Value::Concrete(ConcreteValue::Float(f64::NAN)),
+        ]));
         let result = value_to_json(&v);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("NaN"));
@@ -1470,8 +1509,11 @@ mod tests {
     #[test]
     fn test_value_to_json_nan_in_map_returns_error() {
         let mut map = IndexMap::new();
-        map.insert("key".to_string(), Value::Float(f64::INFINITY));
-        let v = Value::Map(map);
+        map.insert(
+            "key".to_string(),
+            Value::Concrete(ConcreteValue::Float(f64::INFINITY)),
+        );
+        let v = Value::Concrete(ConcreteValue::Map(map));
         let result = value_to_json(&v);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("inf"));
@@ -1479,21 +1521,27 @@ mod tests {
 
     #[test]
     fn test_value_to_json_bool() {
-        let v = Value::Bool(true);
+        let v = Value::Concrete(ConcreteValue::Bool(true));
         assert_eq!(value_to_json(&v).unwrap(), serde_json::json!(true));
     }
 
     #[test]
     fn test_value_to_json_list() {
-        let v = Value::List(vec![Value::Int(1), Value::Int(2)]);
+        let v = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::Int(1)),
+            Value::Concrete(ConcreteValue::Int(2)),
+        ]));
         assert_eq!(value_to_json(&v).unwrap(), serde_json::json!([1, 2]));
     }
 
     #[test]
     fn test_value_to_json_map() {
         let mut map = IndexMap::new();
-        map.insert("key".to_string(), Value::String("val".to_string()));
-        let v = Value::Map(map);
+        map.insert(
+            "key".to_string(),
+            Value::Concrete(ConcreteValue::String("val".to_string())),
+        );
+        let v = Value::Concrete(ConcreteValue::Map(map));
         assert_eq!(
             value_to_json(&v).unwrap(),
             serde_json::json!({"key": "val"})
@@ -1502,7 +1550,7 @@ mod tests {
 
     #[test]
     fn test_value_to_json_resource_ref_returns_err() {
-        // RFC #2371 #2385: `Value::ResourceRef` reaching JSON
+        // RFC #2371 #2385: `Value::Deferred(DeferredValue::ResourceRef)` reaching JSON
         // serialization is a resolver bug — surface as a structured
         // `UnresolvedResourceRef` Err instead of the legacy
         // `"${vpc.id}"` debug-string fallback.
@@ -1522,11 +1570,13 @@ mod tests {
 
     #[test]
     fn test_value_to_json_interpolation_returns_err() {
-        // RFC #2371 #2386: `Value::Interpolation` reaching JSON
+        // RFC #2371 #2386: `Value::Deferred(DeferredValue::Interpolation)` reaching JSON
         // serialization is a canonicalize / resolver bug — surface as
         // `UnresolvedInterpolation` instead of producing a partial
         // string with embedded debug formatting.
-        let v = Value::Interpolation(vec![InterpolationPart::Literal("hello".into())]);
+        let v = Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Literal("hello".into()),
+        ]));
         let err = value_to_json(&v).unwrap_err();
         assert!(
             matches!(
@@ -1541,13 +1591,13 @@ mod tests {
 
     #[test]
     fn test_value_to_json_function_call_returns_err() {
-        // RFC #2371 #2386: `Value::FunctionCall` reaching JSON
+        // RFC #2371 #2386: `Value::Deferred(DeferredValue::FunctionCall)` reaching JSON
         // serialization is a resolver bug — the function should have
         // been evaluated by this point.
-        let v = Value::FunctionCall {
+        let v = Value::Deferred(DeferredValue::FunctionCall {
             name: "join".into(),
             args: vec![],
-        };
+        });
         let err = value_to_json(&v).unwrap_err();
         assert!(
             matches!(
@@ -1566,26 +1616,35 @@ mod tests {
         let j = serde_json::json!("hello");
         assert_eq!(
             json_to_dsl_value(&j),
-            Some(Value::String("hello".to_string()))
+            Some(Value::Concrete(ConcreteValue::String("hello".to_string())))
         );
     }
 
     #[test]
     fn test_json_to_dsl_value_int() {
         let j = serde_json::json!(42);
-        assert_eq!(json_to_dsl_value(&j), Some(Value::Int(42)));
+        assert_eq!(
+            json_to_dsl_value(&j),
+            Some(Value::Concrete(ConcreteValue::Int(42)))
+        );
     }
 
     #[test]
     fn test_json_to_dsl_value_float() {
         let j = serde_json::json!(1.5);
-        assert_eq!(json_to_dsl_value(&j), Some(Value::Float(1.5)));
+        assert_eq!(
+            json_to_dsl_value(&j),
+            Some(Value::Concrete(ConcreteValue::Float(1.5)))
+        );
     }
 
     #[test]
     fn test_json_to_dsl_value_bool() {
         let j = serde_json::json!(true);
-        assert_eq!(json_to_dsl_value(&j), Some(Value::Bool(true)));
+        assert_eq!(
+            json_to_dsl_value(&j),
+            Some(Value::Concrete(ConcreteValue::Bool(true)))
+        );
     }
 
     #[test]
@@ -1593,7 +1652,10 @@ mod tests {
         let j = serde_json::json!([1, 2]);
         assert_eq!(
             json_to_dsl_value(&j),
-            Some(Value::List(vec![Value::Int(1), Value::Int(2)]))
+            Some(Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::Int(1)),
+                Value::Concrete(ConcreteValue::Int(2))
+            ])))
         );
     }
 
@@ -1608,7 +1670,10 @@ mod tests {
         let j = serde_json::json!([1, null, 2]);
         assert_eq!(
             json_to_dsl_value(&j),
-            Some(Value::List(vec![Value::Int(1), Value::Int(2)]))
+            Some(Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::Int(1)),
+                Value::Concrete(ConcreteValue::Int(2))
+            ])))
         );
     }
 
@@ -1616,11 +1681,14 @@ mod tests {
     fn test_json_to_dsl_value_null_in_object() {
         let j = serde_json::json!({"a": 1, "b": null, "c": "hello"});
         let result = json_to_dsl_value(&j).unwrap();
-        if let Value::Map(map) = result {
+        if let Value::Concrete(ConcreteValue::Map(map)) = result {
             assert_eq!(map.len(), 2);
-            assert_eq!(map.get("a"), Some(&Value::Int(1)));
+            assert_eq!(map.get("a"), Some(&Value::Concrete(ConcreteValue::Int(1))));
             assert_eq!(map.get("b"), None);
-            assert_eq!(map.get("c"), Some(&Value::String("hello".to_string())));
+            assert_eq!(
+                map.get("c"),
+                Some(&Value::Concrete(ConcreteValue::String("hello".to_string())))
+            );
         } else {
             panic!("Expected Map");
         }
@@ -1628,11 +1696,11 @@ mod tests {
 
     #[test]
     fn test_roundtrip_value_json() {
-        let original = Value::List(vec![
-            Value::String("hello".to_string()),
-            Value::Int(42),
-            Value::Bool(false),
-        ]);
+        let original = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("hello".to_string())),
+            Value::Concrete(ConcreteValue::Int(42)),
+            Value::Concrete(ConcreteValue::Bool(false)),
+        ]));
         let json = value_to_json(&original).unwrap();
         let back = json_to_dsl_value(&json).unwrap();
         assert_eq!(back, original);
@@ -1640,13 +1708,15 @@ mod tests {
 
     #[test]
     fn test_format_value_string() {
-        let v = Value::String("hello".to_string());
+        let v = Value::Concrete(ConcreteValue::String("hello".to_string()));
         assert_eq!(format_value(&v), "\"hello\"");
     }
 
     #[test]
     fn test_format_value_dsl_enum() {
-        let v = Value::String("aws.s3.VersioningStatus.Enabled".to_string());
+        let v = Value::Concrete(ConcreteValue::String(
+            "aws.s3.VersioningStatus.Enabled".to_string(),
+        ));
         assert_eq!(format_value(&v), "\"Enabled\"");
     }
 
@@ -1654,13 +1724,17 @@ mod tests {
     fn test_format_value_dsl_enum_region() {
         // Region displays in DSL form (underscored) until provider alias tables
         // are extended to include to_dsl reverse mappings (see issue #1675).
-        let v = Value::String("aws.Region.ap_northeast_1".to_string());
+        let v = Value::Concrete(ConcreteValue::String(
+            "aws.Region.ap_northeast_1".to_string(),
+        ));
         assert_eq!(format_value(&v), "\"ap_northeast_1\"");
     }
 
     #[test]
     fn test_format_value_dsl_enum_5_part() {
-        let v = Value::String("awscc.ec2.Vpc.InstanceTenancy.dedicated".to_string());
+        let v = Value::Concrete(ConcreteValue::String(
+            "awscc.ec2.Vpc.InstanceTenancy.dedicated".to_string(),
+        ));
         assert_eq!(format_value(&v), "\"dedicated\"");
     }
 
@@ -1668,37 +1742,42 @@ mod tests {
     fn test_format_value_two_part_enum_string() {
         // Two-part enum strings like "InstanceTenancy.dedicated" are formatted
         // through convert_enum_value which extracts the value part
-        let v = Value::String("InstanceTenancy.dedicated".to_string());
+        let v = Value::Concrete(ConcreteValue::String(
+            "InstanceTenancy.dedicated".to_string(),
+        ));
         assert_eq!(format_value(&v), "\"dedicated\"");
     }
 
     #[test]
     fn test_format_value_bare_enum_string() {
-        let v = Value::String("dedicated".to_string());
+        let v = Value::Concrete(ConcreteValue::String("dedicated".to_string()));
         assert_eq!(format_value(&v), "\"dedicated\"");
     }
 
     #[test]
     fn test_format_value_int() {
-        let v = Value::Int(42);
+        let v = Value::Concrete(ConcreteValue::Int(42));
         assert_eq!(format_value(&v), "42");
     }
 
     #[test]
     fn test_format_value_float() {
-        let v = Value::Float(1.5);
+        let v = Value::Concrete(ConcreteValue::Float(1.5));
         assert_eq!(format_value(&v), "1.5");
     }
 
     #[test]
     fn test_format_value_bool() {
-        let v = Value::Bool(true);
+        let v = Value::Concrete(ConcreteValue::Bool(true));
         assert_eq!(format_value(&v), "true");
     }
 
     #[test]
     fn test_format_value_list() {
-        let v = Value::List(vec![Value::Int(1), Value::Int(2)]);
+        let v = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::Int(1)),
+            Value::Concrete(ConcreteValue::Int(2)),
+        ]));
         assert_eq!(format_value(&v), "[1, 2]");
     }
 
@@ -1708,15 +1787,15 @@ mod tests {
         assert_eq!(format_value(&v), "vpc.id");
     }
 
-    /// `Value::Unknown(UpstreamRef)` renders unquoted as
+    /// `Value::Deferred(DeferredValue::Unknown(UpstreamRef))` renders unquoted as
     /// `(known after upstream apply: <ref>)` via `format_value_with_key`.
     /// Stage 2 of RFC #2371 — the variant replaced the NUL-prefixed
-    /// `Value::String` sentinel from #2367.
+    /// `Value::Concrete(ConcreteValue::String)` sentinel from #2367.
     #[test]
     fn test_format_value_unresolved_upstream() {
         use crate::resource::{AccessPath, UnknownReason};
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
-        let v = Value::Unknown(UnknownReason::UpstreamRef { path });
+        let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef { path }));
         assert_eq!(
             format_value(&v),
             "(known after upstream apply: network.vpc.vpc_id)"
@@ -1727,11 +1806,11 @@ mod tests {
     /// `Err(SerializationError::UnknownNotAllowed { reason })` rather
     /// than panicking. The `reason` field must round-trip the variant
     /// passed in so the caller can render an actionable diagnostic.
-    /// A silent fallback (e.g. `Ok(Value::String("Unknown(...)"))`)
+    /// A silent fallback (e.g. `Ok(Value::Concrete(ConcreteValue::String("Unknown(...)")))`)
     /// would re-introduce the v1 corruption bug (#2375).
     #[test]
     fn unknown_returns_err_in_value_to_json() {
-        let v = Value::Unknown(UnknownReason::ForKey);
+        let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey));
         let err = value_to_json(&v).unwrap_err();
         assert!(
             matches!(
@@ -1747,7 +1826,7 @@ mod tests {
 
     #[test]
     fn unknown_returns_err_in_redact_secrets_in_value() {
-        let v = Value::Unknown(UnknownReason::ForKey);
+        let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey));
         let err = redact_secrets_in_value(&v).unwrap_err();
         assert!(
             matches!(
@@ -1788,48 +1867,69 @@ mod tests {
     #[test]
     fn test_is_list_of_maps_true() {
         let mut map = IndexMap::new();
-        map.insert("key".to_string(), Value::String("val".to_string()));
-        let v = Value::List(vec![Value::Map(map)]);
+        map.insert(
+            "key".to_string(),
+            Value::Concrete(ConcreteValue::String("val".to_string())),
+        );
+        let v = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(map),
+        )]));
         assert!(is_list_of_maps(&v));
     }
 
     #[test]
     fn test_is_list_of_maps_false_empty() {
-        let v = Value::List(vec![]);
+        let v = Value::Concrete(ConcreteValue::List(vec![]));
         assert!(!is_list_of_maps(&v));
     }
 
     #[test]
     fn test_is_list_of_maps_false_not_maps() {
-        let v = Value::List(vec![Value::Int(1)]);
+        let v = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Int(1),
+        )]));
         assert!(!is_list_of_maps(&v));
     }
 
     #[test]
     fn test_is_list_of_maps_false_not_list() {
-        let v = Value::Int(1);
+        let v = Value::Concrete(ConcreteValue::Int(1));
         assert!(!is_list_of_maps(&v));
     }
 
     #[test]
     fn test_map_similarity_matching() {
         let mut m1 = IndexMap::new();
-        m1.insert("a".to_string(), Value::Int(1));
-        m1.insert("b".to_string(), Value::Int(2));
+        m1.insert("a".to_string(), Value::Concrete(ConcreteValue::Int(1)));
+        m1.insert("b".to_string(), Value::Concrete(ConcreteValue::Int(2)));
         let mut m2 = IndexMap::new();
-        m2.insert("a".to_string(), Value::Int(1));
-        m2.insert("b".to_string(), Value::Int(3));
-        assert_eq!(map_similarity(&Value::Map(m1), &Value::Map(m2)), 1);
+        m2.insert("a".to_string(), Value::Concrete(ConcreteValue::Int(1)));
+        m2.insert("b".to_string(), Value::Concrete(ConcreteValue::Int(3)));
+        assert_eq!(
+            map_similarity(
+                &Value::Concrete(ConcreteValue::Map(m1)),
+                &Value::Concrete(ConcreteValue::Map(m2))
+            ),
+            1
+        );
     }
 
     #[test]
     fn test_map_similarity_non_maps() {
-        assert_eq!(map_similarity(&Value::Int(1), &Value::Int(1)), 0);
+        assert_eq!(
+            map_similarity(
+                &Value::Concrete(ConcreteValue::Int(1)),
+                &Value::Concrete(ConcreteValue::Int(1))
+            ),
+            0
+        );
     }
 
     #[test]
     fn test_value_to_json_secret_produces_hash() {
-        let v = Value::Secret(Box::new(Value::String("my-password".to_string())));
+        let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("my-password".to_string()),
+        ))));
         let json = value_to_json(&v).unwrap();
         let s = json.as_str().unwrap();
         assert!(
@@ -1844,8 +1944,12 @@ mod tests {
 
     #[test]
     fn test_value_to_json_secret_is_deterministic() {
-        let v1 = Value::Secret(Box::new(Value::String("my-password".to_string())));
-        let v2 = Value::Secret(Box::new(Value::String("my-password".to_string())));
+        let v1 = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("my-password".to_string()),
+        ))));
+        let v2 = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("my-password".to_string()),
+        ))));
         let json1 = value_to_json(&v1).unwrap();
         let json2 = value_to_json(&v2).unwrap();
         assert_eq!(json1, json2);
@@ -1853,8 +1957,12 @@ mod tests {
 
     #[test]
     fn test_value_to_json_secret_different_values_different_hashes() {
-        let v1 = Value::Secret(Box::new(Value::String("password-1".to_string())));
-        let v2 = Value::Secret(Box::new(Value::String("password-2".to_string())));
+        let v1 = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("password-1".to_string()),
+        ))));
+        let v2 = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("password-2".to_string()),
+        ))));
         let json1 = value_to_json(&v1).unwrap();
         let json2 = value_to_json(&v2).unwrap();
         assert_ne!(json1, json2);
@@ -1862,19 +1970,26 @@ mod tests {
 
     #[test]
     fn test_format_value_secret() {
-        let v = Value::Secret(Box::new(Value::String("my-password".to_string())));
+        let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("my-password".to_string()),
+        ))));
         assert_eq!(format_value(&v), "(secret)");
     }
 
     #[test]
     fn test_format_value_secret_in_map() {
         let mut map = IndexMap::new();
-        map.insert("Name".to_string(), Value::String("test".to_string()));
+        map.insert(
+            "Name".to_string(),
+            Value::Concrete(ConcreteValue::String("test".to_string())),
+        );
         map.insert(
             "SecretTag".to_string(),
-            Value::Secret(Box::new(Value::String("my-password".to_string()))),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("my-password".to_string()),
+            )))),
         );
-        let v = Value::Map(map);
+        let v = Value::Concrete(ConcreteValue::Map(map));
         let formatted = format_value(&v);
         // Secret values inside maps should show as (secret), not the raw value
         assert!(
@@ -1892,12 +2007,17 @@ mod tests {
     #[test]
     fn test_value_to_json_secret_in_map() {
         let mut map = IndexMap::new();
-        map.insert("Name".to_string(), Value::String("test".to_string()));
+        map.insert(
+            "Name".to_string(),
+            Value::Concrete(ConcreteValue::String("test".to_string())),
+        );
         map.insert(
             "SecretTag".to_string(),
-            Value::Secret(Box::new(Value::String("my-password".to_string()))),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("my-password".to_string()),
+            )))),
         );
-        let v = Value::Map(map);
+        let v = Value::Concrete(ConcreteValue::Map(map));
         let json = value_to_json(&v).unwrap();
         let obj = json.as_object().unwrap();
         assert_eq!(obj.get("Name").unwrap().as_str().unwrap(), "test");
@@ -1916,13 +2036,15 @@ mod tests {
             "{}{}",
             SECRET_PREFIX, "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
         );
-        let v = Value::String(hash_str);
+        let v = Value::Concrete(ConcreteValue::String(hash_str));
         assert_eq!(format_value(&v), "(secret)");
     }
 
     #[test]
     fn test_value_to_json_with_context_different_resources_different_hashes() {
-        let v = Value::Secret(Box::new(Value::String("my-password".to_string())));
+        let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("my-password".to_string()),
+        ))));
         let ctx1 = SecretHashContext::new("ec2.Vpc", "vpc-1", "password");
         let ctx2 = SecretHashContext::new("rds.db_instance", "my-db", "password");
         let json1 = value_to_json_with_context(&v, Some(&ctx1)).unwrap();
@@ -1935,7 +2057,9 @@ mod tests {
 
     #[test]
     fn test_value_to_json_with_context_different_attributes_different_hashes() {
-        let v = Value::Secret(Box::new(Value::String("my-password".to_string())));
+        let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("my-password".to_string()),
+        ))));
         let ctx1 = SecretHashContext::new("rds.db_instance", "my-db", "master_password");
         let ctx2 = SecretHashContext::new("rds.db_instance", "my-db", "admin_password");
         let json1 = value_to_json_with_context(&v, Some(&ctx1)).unwrap();
@@ -1948,7 +2072,9 @@ mod tests {
 
     #[test]
     fn test_value_to_json_with_context_same_context_is_deterministic() {
-        let v = Value::Secret(Box::new(Value::String("my-password".to_string())));
+        let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("my-password".to_string()),
+        ))));
         let ctx = SecretHashContext::new("rds.db_instance", "my-db", "master_password");
         let json1 = value_to_json_with_context(&v, Some(&ctx)).unwrap();
         let json2 = value_to_json_with_context(&v, Some(&ctx)).unwrap();
@@ -1960,7 +2086,9 @@ mod tests {
 
     #[test]
     fn test_value_to_json_with_context_differs_from_no_context() {
-        let v = Value::Secret(Box::new(Value::String("my-password".to_string())));
+        let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("my-password".to_string()),
+        ))));
         let ctx = SecretHashContext::new("rds.db_instance", "my-db", "master_password");
         let json_with_ctx = value_to_json_with_context(&v, Some(&ctx)).unwrap();
         let json_no_ctx = value_to_json(&v).unwrap();
@@ -1972,11 +2100,13 @@ mod tests {
 
     #[test]
     fn test_redact_secrets_in_value_replaces_secret() {
-        let v = Value::Secret(Box::new(Value::String("my-password".to_string())));
+        let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("my-password".to_string()),
+        ))));
         let redacted = redact_secrets_in_value(&v).unwrap();
         // Should be a String starting with the secret prefix, not a Secret variant
         match &redacted {
-            Value::String(s) => {
+            Value::Concrete(ConcreteValue::String(s)) => {
                 assert!(
                     s.starts_with(SECRET_PREFIX),
                     "Expected secret hash prefix, got: {}",
@@ -1984,7 +2114,7 @@ mod tests {
                 );
             }
             _ => panic!(
-                "Expected Value::String after redaction, got: {:?}",
+                "Expected Value::Concrete(ConcreteValue::String) after redaction, got: {:?}",
                 redacted
             ),
         }
@@ -1992,7 +2122,9 @@ mod tests {
 
     #[test]
     fn test_redact_secrets_in_value_no_plaintext_in_serialized_output() {
-        let v = Value::Secret(Box::new(Value::String("super-secret-password".to_string())));
+        let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("super-secret-password".to_string()),
+        ))));
         let redacted = redact_secrets_in_value(&v).unwrap();
         let json = serde_json::to_string(&redacted).unwrap();
         assert!(
@@ -2005,12 +2137,17 @@ mod tests {
     #[test]
     fn test_redact_secrets_in_value_nested_in_map() {
         let mut map = IndexMap::new();
-        map.insert("name".to_string(), Value::String("test".to_string()));
+        map.insert(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("test".to_string())),
+        );
         map.insert(
             "password".to_string(),
-            Value::Secret(Box::new(Value::String("s3cret".to_string()))),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("s3cret".to_string()),
+            )))),
         );
-        let v = Value::Map(map);
+        let v = Value::Concrete(ConcreteValue::Map(map));
         let redacted = redact_secrets_in_value(&v).unwrap();
         let json = serde_json::to_string(&redacted).unwrap();
         assert!(
@@ -2027,10 +2164,12 @@ mod tests {
 
     #[test]
     fn test_redact_secrets_in_value_nested_in_list() {
-        let v = Value::List(vec![
-            Value::String("visible".to_string()),
-            Value::Secret(Box::new(Value::String("hidden".to_string()))),
-        ]);
+        let v = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("visible".to_string())),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("hidden".to_string()),
+            )))),
+        ]));
         let redacted = redact_secrets_in_value(&v).unwrap();
         let json = serde_json::to_string(&redacted).unwrap();
         assert!(
@@ -2043,7 +2182,7 @@ mod tests {
 
     #[test]
     fn test_redact_secrets_in_value_preserves_non_secret() {
-        let v = Value::String("not-a-secret".to_string());
+        let v = Value::Concrete(ConcreteValue::String("not-a-secret".to_string()));
         let redacted = redact_secrets_in_value(&v).unwrap();
         assert_eq!(redacted, v);
     }
@@ -2051,10 +2190,15 @@ mod tests {
     #[test]
     fn test_redact_secrets_in_attributes() {
         let mut attrs = HashMap::new();
-        attrs.insert("name".to_string(), Value::String("my-bucket".to_string()));
+        attrs.insert(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
+        );
         attrs.insert(
             "password".to_string(),
-            Value::Secret(Box::new(Value::String("hunter2".to_string()))),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("hunter2".to_string()),
+            )))),
         );
         let redacted = redact_secrets_in_attributes(&attrs).unwrap();
         let json = serde_json::to_string(&redacted).unwrap();
@@ -2083,49 +2227,68 @@ mod tests {
 
     #[test]
     fn format_value_pretty_string_matches_format_value() {
-        let v = Value::String("hello".to_string());
+        let v = Value::Concrete(ConcreteValue::String("hello".to_string()));
         assert_eq!(format_value_pretty(&v, layout(0, "k")), format_value(&v));
     }
 
     #[test]
     fn format_value_pretty_int_renders_as_integer_literal() {
-        let v = Value::Int(42);
+        let v = Value::Concrete(ConcreteValue::Int(42));
         assert_eq!(format_value_pretty(&v, layout(0, "k")), "42");
     }
 
     #[test]
     fn format_value_pretty_bool_renders_as_keyword() {
-        let v = Value::Bool(true);
+        let v = Value::Concrete(ConcreteValue::Bool(true));
         assert_eq!(format_value_pretty(&v, layout(0, "k")), "true");
     }
 
     #[test]
     fn format_value_pretty_dsl_enum_resolves_to_provider_value() {
-        let v = Value::String("aws.s3.Bucket.VersioningStatus.enabled".to_string());
+        let v = Value::Concrete(ConcreteValue::String(
+            "aws.s3.Bucket.VersioningStatus.enabled".to_string(),
+        ));
         assert_eq!(format_value_pretty(&v, layout(0, "k")), format_value(&v));
     }
 
     #[test]
     fn format_value_pretty_secret_masked() {
-        let v = Value::Secret(Box::new(Value::String("my-password".to_string())));
+        let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("my-password".to_string()),
+        ))));
         assert_eq!(format_value_pretty(&v, layout(0, "k")), "(secret)");
     }
 
     #[test]
     fn format_value_pretty_unknown_renders_like_format_value() {
-        let v = Value::Unknown(UnknownReason::ForKey);
+        let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey));
         assert_eq!(format_value_pretty(&v, layout(0, "k")), format_value(&v));
     }
 
     #[test]
     fn format_value_pretty_list_of_maps_vertical() {
         let mut s1 = IndexMap::new();
-        s1.insert("sid".to_string(), Value::String("First".to_string()));
-        s1.insert("effect".to_string(), Value::String("Allow".to_string()));
+        s1.insert(
+            "sid".to_string(),
+            Value::Concrete(ConcreteValue::String("First".to_string())),
+        );
+        s1.insert(
+            "effect".to_string(),
+            Value::Concrete(ConcreteValue::String("Allow".to_string())),
+        );
         let mut s2 = IndexMap::new();
-        s2.insert("sid".to_string(), Value::String("Second".to_string()));
-        s2.insert("effect".to_string(), Value::String("Deny".to_string()));
-        let v = Value::List(vec![Value::Map(s1), Value::Map(s2)]);
+        s2.insert(
+            "sid".to_string(),
+            Value::Concrete(ConcreteValue::String("Second".to_string())),
+        );
+        s2.insert(
+            "effect".to_string(),
+            Value::Concrete(ConcreteValue::String("Deny".to_string())),
+        );
+        let v = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::Map(s1)),
+            Value::Concrete(ConcreteValue::Map(s2)),
+        ]));
 
         // parent_indent_cols=6 → entry_indent_cols=8, where `* ` marker
         // sits; first key follows at col 10, continuation keys also at
@@ -2140,8 +2303,13 @@ mod tests {
     #[test]
     fn format_value_pretty_list_of_maps_single_entry() {
         let mut m = IndexMap::new();
-        m.insert("k".to_string(), Value::String("v".to_string()));
-        let v = Value::List(vec![Value::Map(m)]);
+        m.insert(
+            "k".to_string(),
+            Value::Concrete(ConcreteValue::String("v".to_string())),
+        );
+        let v = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(m),
+        )]));
         // parent_indent_cols=4 → entry_indent_cols=6, `* ` at col 6, key
         // at col 8.
         let out = format_value_pretty(&v, layout(4, "items"));
@@ -2157,10 +2325,13 @@ mod tests {
     fn format_value_pretty_list_of_maps_three_entries_separated_by_blank_lines() {
         let make = |sid: &str| {
             let mut m = IndexMap::new();
-            m.insert("sid".to_string(), Value::String(sid.to_string()));
-            Value::Map(m)
+            m.insert(
+                "sid".to_string(),
+                Value::Concrete(ConcreteValue::String(sid.to_string())),
+            );
+            Value::Concrete(ConcreteValue::Map(m))
         };
-        let v = Value::List(vec![make("A"), make("B"), make("C")]);
+        let v = Value::Concrete(ConcreteValue::List(vec![make("A"), make("B"), make("C")]));
         let out = format_value_pretty(&v, layout(4, "items"));
         // Exactly N-1 = 2 blank-line separators between three elements.
         // The trailing blank before the next sibling key (#2555) is
@@ -2188,16 +2359,28 @@ mod tests {
     fn format_value_pretty_map_with_list_of_maps_then_sibling_separates() {
         let long = "x".repeat(40);
         let mut s1 = IndexMap::new();
-        s1.insert("sid_a".to_string(), Value::String(long.clone()));
+        s1.insert(
+            "sid_a".to_string(),
+            Value::Concrete(ConcreteValue::String(long.clone())),
+        );
         let mut s2 = IndexMap::new();
-        s2.insert("sid_b".to_string(), Value::String(long.clone()));
+        s2.insert(
+            "sid_b".to_string(),
+            Value::Concrete(ConcreteValue::String(long.clone())),
+        );
         let mut outer = IndexMap::new();
         outer.insert(
             "statement".to_string(),
-            Value::List(vec![Value::Map(s1), Value::Map(s2)]),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::Map(s1)),
+                Value::Concrete(ConcreteValue::Map(s2)),
+            ])),
         );
-        outer.insert("version".to_string(), Value::String("2012".to_string()));
-        let v = Value::Map(outer);
+        outer.insert(
+            "version".to_string(),
+            Value::Concrete(ConcreteValue::String("2012".to_string())),
+        );
+        let v = Value::Concrete(ConcreteValue::Map(outer));
         let out = format_value_pretty(&v, layout(2, "config"));
         // The blank-line MUST sit between the last element's last key
         // and the sibling `version:` key. Use unique key names so the
@@ -2216,16 +2399,28 @@ mod tests {
     fn format_value_pretty_map_with_trailing_list_of_maps_no_orphan_blank() {
         let long = "x".repeat(40);
         let mut s1 = IndexMap::new();
-        s1.insert("sid".to_string(), Value::String(long.clone()));
+        s1.insert(
+            "sid".to_string(),
+            Value::Concrete(ConcreteValue::String(long.clone())),
+        );
         let mut s2 = IndexMap::new();
-        s2.insert("sid".to_string(), Value::String(long.clone()));
+        s2.insert(
+            "sid".to_string(),
+            Value::Concrete(ConcreteValue::String(long.clone())),
+        );
         let mut outer = IndexMap::new();
-        outer.insert("version".to_string(), Value::String("2012".to_string()));
+        outer.insert(
+            "version".to_string(),
+            Value::Concrete(ConcreteValue::String("2012".to_string())),
+        );
         outer.insert(
             "statement".to_string(),
-            Value::List(vec![Value::Map(s1), Value::Map(s2)]),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::Map(s1)),
+                Value::Concrete(ConcreteValue::Map(s2)),
+            ])),
         );
-        let v = Value::Map(outer);
+        let v = Value::Concrete(ConcreteValue::Map(outer));
         let out = format_value_pretty(&v, layout(2, "config"));
         assert!(
             !out.ends_with("\n\n"),
@@ -2235,16 +2430,16 @@ mod tests {
 
     #[test]
     fn format_value_pretty_empty_list_inline() {
-        let v = Value::List(vec![]);
+        let v = Value::Concrete(ConcreteValue::List(vec![]));
         assert_eq!(format_value_pretty(&v, layout(0, "k")), "[]");
     }
 
     #[test]
     fn format_value_pretty_list_of_strings_under_80_inline() {
-        let v = Value::List(vec![
-            Value::String("a".to_string()),
-            Value::String("b".to_string()),
-        ]);
+        let v = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("a".to_string())),
+            Value::Concrete(ConcreteValue::String("b".to_string())),
+        ]));
         assert_eq!(format_value_pretty(&v, layout(0, "k")), "[\"a\", \"b\"]");
     }
 
@@ -2252,9 +2447,9 @@ mod tests {
     fn format_value_pretty_list_of_strings_over_80_vertical() {
         // 5 strings of ~20 chars each → inline ~110 chars
         let items: Vec<Value> = (0..5)
-            .map(|i| Value::String(format!("iam:LongActionName{}", i)))
+            .map(|i| Value::Concrete(ConcreteValue::String(format!("iam:LongActionName{}", i))))
             .collect();
-        let v = Value::List(items);
+        let v = Value::Concrete(ConcreteValue::List(items));
         // parent_indent_cols=4, key="action" → first item starts at parent_indent+2 = col 6.
         let out = format_value_pretty(&v, layout(4, "action"));
         assert!(
@@ -2276,7 +2471,9 @@ mod tests {
         // Inline form fits exactly within 80 cols at parent_indent=0, key="x" (1 char):
         // total = 0 + 1 + 2 + len(inline). For len(inline)=77, total=80 → stay inline.
         let item = "x".repeat(73); // inline = 1 + 1 + 73 + 1 + 1 = 77
-        let v = Value::List(vec![Value::String(item)]);
+        let v = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String(item),
+        )]));
         let inline = format_value_with_key(&v, None);
         assert_eq!(inline.len(), 77, "fixture sanity: {} chars", inline.len());
         // total budget = 0 + 1 + 2 + 77 = 80, exactly at limit → inline.
@@ -2287,7 +2484,9 @@ mod tests {
     fn format_value_pretty_list_of_strings_threshold_boundary_81_expands() {
         // 1 char over threshold: 0 + 1 + 2 + 78 = 81 → expand.
         let item = "x".repeat(74); // inline = 78
-        let v = Value::List(vec![Value::String(item)]);
+        let v = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String(item),
+        )]));
         let inline = format_value_with_key(&v, None);
         assert_eq!(inline.len(), 78, "fixture sanity: {} chars", inline.len());
         let out = format_value_pretty(&v, layout(0, "x"));
@@ -2303,7 +2502,9 @@ mod tests {
         // total = 10 + 2 + 2 + 75 = 89 → expand.
         let inline_target = 75;
         let item = "x".repeat(inline_target - 4);
-        let v = Value::List(vec![Value::String(item)]);
+        let v = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String(item),
+        )]));
         let inline = format_value_with_key(&v, None);
         assert_eq!(inline.len(), inline_target);
         let out = format_value_pretty(&v, layout(10, "kk"));
@@ -2315,13 +2516,24 @@ mod tests {
         let mut inner = IndexMap::new();
         inner.insert("StringEquals".to_string(), {
             let mut m = IndexMap::new();
-            m.insert("aws:Tag".to_string(), Value::String("prod".to_string()));
-            Value::Map(m)
+            m.insert(
+                "aws:Tag".to_string(),
+                Value::Concrete(ConcreteValue::String("prod".to_string())),
+            );
+            Value::Concrete(ConcreteValue::Map(m))
         });
         let mut entry = IndexMap::new();
-        entry.insert("sid".to_string(), Value::String("X".to_string()));
-        entry.insert("condition".to_string(), Value::Map(inner));
-        let v = Value::List(vec![Value::Map(entry)]);
+        entry.insert(
+            "sid".to_string(),
+            Value::Concrete(ConcreteValue::String("X".to_string())),
+        );
+        entry.insert(
+            "condition".to_string(),
+            Value::Concrete(ConcreteValue::Map(inner)),
+        );
+        let v = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(entry),
+        )]));
         // parent_indent_cols=4 → entry_indent_cols=6; first sorted key
         // is preceded by `* ` at col 6 (#2552).
         let out = format_value_pretty(&v, layout(4, "statement"));
@@ -2335,12 +2547,20 @@ mod tests {
     #[test]
     fn format_value_pretty_list_of_maps_with_long_string_list_inside() {
         let actions: Vec<Value> = (0..6)
-            .map(|i| Value::String(format!("iam:Action{:03}", i)))
+            .map(|i| Value::Concrete(ConcreteValue::String(format!("iam:Action{:03}", i))))
             .collect();
         let mut entry = IndexMap::new();
-        entry.insert("sid".to_string(), Value::String("X".to_string()));
-        entry.insert("action".to_string(), Value::List(actions));
-        let v = Value::List(vec![Value::Map(entry)]);
+        entry.insert(
+            "sid".to_string(),
+            Value::Concrete(ConcreteValue::String("X".to_string())),
+        );
+        entry.insert(
+            "action".to_string(),
+            Value::Concrete(ConcreteValue::List(actions)),
+        );
+        let v = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(entry),
+        )]));
         let out = format_value_pretty(&v, layout(4, "statement"));
         assert!(
             out.contains("action: ["),
@@ -2354,20 +2574,20 @@ mod tests {
 
     #[test]
     fn format_value_pretty_string_list_under_dynamic_key_breaks_vertically() {
-        // #2528 hypothesis: when the deepest value is `Value::StringList`
+        // #2528 hypothesis: when the deepest value is `Value::Concrete(ConcreteValue::StringList)`
         // (the canonical form #2511 folds `Union[String, list(String)]`
-        // into) rather than `Value::List`, `format_value_pretty` treats
+        // into) rather than `Value::Concrete(ConcreteValue::List)`, `format_value_pretty` treats
         // it as a scalar fallthrough and renders inline. This pins the
         // expected vertical break.
         let mut string_like = IndexMap::new();
         string_like.insert(
             "token.actions.githubusercontent.com:sub".to_string(),
-            Value::StringList(vec![
+            Value::Concrete(ConcreteValue::StringList(vec![
                 "repo:carina-rs/infra:ref:refs/heads/main".to_string(),
                 "repo:carina-rs/infra:pull_request".to_string(),
-            ]),
+            ])),
         );
-        let v = Value::Map(string_like);
+        let v = Value::Concrete(ConcreteValue::Map(string_like));
         // Mirror the layout under `condition.string_like:` (parent at
         // col 12 from the MapExpanded entry indentation). Inside a Map
         // the value text starts after `<key>: ` so the bracketed form
@@ -2388,10 +2608,13 @@ mod tests {
     #[test]
     fn format_value_pretty_top_level_string_list_breaks_vertically_when_oversize() {
         // The same fix applies when a top-level attribute value is
-        // already canonicalized to `Value::StringList`. Pre-fix the
+        // already canonicalized to `Value::Concrete(ConcreteValue::StringList)`. Pre-fix the
         // wildcard arm collapsed it to `["a", "b", ...]` even when the
         // line exceeded `PRETTY_LINE_LIMIT`.
-        let v = Value::StringList(vec!["a".repeat(40), "b".repeat(40)]);
+        let v = Value::Concrete(ConcreteValue::StringList(vec![
+            "a".repeat(40),
+            "b".repeat(40),
+        ]));
         let out = format_value_pretty(&v, layout(0, "k"));
         assert!(
             out.starts_with("[\n"),
@@ -2401,18 +2624,18 @@ mod tests {
 
     #[test]
     fn format_value_pretty_string_list_vertical_redacts_secret_prefix_strings() {
-        // Pin parity with `Value::List<Value::String>`: a string with
+        // Pin parity with `Value::Concrete(ConcreteValue::List)<Value::Concrete(ConcreteValue::String)>`: a string with
         // the SECRET_PREFIX must render as `(secret)` even when reached
         // through the StringList vertical path. Pre-fix attempt
         // (a dedicated `format_list_of_strings_vertical` that quoted the
         // raw &str) would have leaked the hash; the current shape lifts
-        // items to `Value::String` and reuses
+        // items to `Value::Concrete(ConcreteValue::String)` and reuses
         // `format_list_of_scalars_vertical`, so the SECRET_PREFIX arm
         // in `format_value_with_key` runs unchanged.
-        let v = Value::StringList(vec![
+        let v = Value::Concrete(ConcreteValue::StringList(vec![
             format!("{}deadbeef", SECRET_PREFIX),
             "x".repeat(80), // force vertical
-        ]);
+        ]));
         let out = format_value_pretty(&v, layout(0, "k"));
         assert!(
             out.contains("(secret),"),
@@ -2441,17 +2664,32 @@ mod tests {
         let mut string_like = IndexMap::new();
         string_like.insert(
             "token.actions.githubusercontent.com:sub".to_string(),
-            Value::List(vec![
-                Value::String("repo:carina-rs/infra:ref:refs/heads/main".to_string()),
-                Value::String("repo:carina-rs/infra:pull_request".to_string()),
-            ]),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String(
+                    "repo:carina-rs/infra:ref:refs/heads/main".to_string(),
+                )),
+                Value::Concrete(ConcreteValue::String(
+                    "repo:carina-rs/infra:pull_request".to_string(),
+                )),
+            ])),
         );
         let mut condition = IndexMap::new();
-        condition.insert("string_like".to_string(), Value::Map(string_like));
+        condition.insert(
+            "string_like".to_string(),
+            Value::Concrete(ConcreteValue::Map(string_like)),
+        );
         let mut entry = IndexMap::new();
-        entry.insert("sid".to_string(), Value::String("AssumeRole".to_string()));
-        entry.insert("condition".to_string(), Value::Map(condition));
-        let v = Value::List(vec![Value::Map(entry)]);
+        entry.insert(
+            "sid".to_string(),
+            Value::Concrete(ConcreteValue::String("AssumeRole".to_string())),
+        );
+        entry.insert(
+            "condition".to_string(),
+            Value::Concrete(ConcreteValue::Map(condition)),
+        );
+        let v = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(entry),
+        )]));
         let out = format_value_pretty(&v, layout(4, "statement"));
         // The dynamic-key list value must break across lines (bracketed
         // form), not collapse to `<dynamic-key>: ["a", "b"]`.
@@ -2467,16 +2705,16 @@ mod tests {
 
     #[test]
     fn format_value_pretty_empty_map_inline() {
-        let v = Value::Map(IndexMap::new());
+        let v = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
         assert_eq!(format_value_pretty(&v, layout(0, "k")), "{}");
     }
 
     #[test]
     fn format_value_pretty_small_map_inline_fits() {
         let mut m = IndexMap::new();
-        m.insert("a".to_string(), Value::Int(1));
-        m.insert("b".to_string(), Value::Int(2));
-        let v = Value::Map(m);
+        m.insert("a".to_string(), Value::Concrete(ConcreteValue::Int(1)));
+        m.insert("b".to_string(), Value::Concrete(ConcreteValue::Int(2)));
+        let v = Value::Concrete(ConcreteValue::Map(m));
         // {a: 1, b: 2} = 12 chars; total = 0 + 1 + 2 + 12 = 15 → inline.
         assert_eq!(format_value_pretty(&v, layout(0, "k")), "{a: 1, b: 2}");
     }
@@ -2484,9 +2722,15 @@ mod tests {
     #[test]
     fn format_value_pretty_top_level_map_expands_when_over_threshold() {
         let mut m = IndexMap::new();
-        m.insert("first_key".to_string(), Value::String("a".repeat(40)));
-        m.insert("second_key".to_string(), Value::String("b".repeat(40)));
-        let v = Value::Map(m);
+        m.insert(
+            "first_key".to_string(),
+            Value::Concrete(ConcreteValue::String("a".repeat(40))),
+        );
+        m.insert(
+            "second_key".to_string(),
+            Value::Concrete(ConcreteValue::String("b".repeat(40))),
+        );
+        let v = Value::Concrete(ConcreteValue::Map(m));
         let inline = format_value_with_key(&v, None);
         assert!(inline.len() > PRETTY_LINE_LIMIT, "fixture sanity");
 
@@ -2509,25 +2753,29 @@ mod tests {
 
         let path = AccessPath::new("vpc", "id");
         let cases = vec![
-            Value::String("hello".to_string()),
-            Value::Int(42),
-            Value::Float(2.5),
-            Value::Bool(false),
-            Value::Secret(Box::new(Value::String("pw".to_string()))),
-            Value::Unknown(UnknownReason::ForKey),
-            Value::Unknown(UnknownReason::UpstreamRef { path: path.clone() }),
-            Value::ResourceRef { path: path.clone() },
-            Value::Interpolation(vec![
+            Value::Concrete(ConcreteValue::String("hello".to_string())),
+            Value::Concrete(ConcreteValue::Int(42)),
+            Value::Concrete(ConcreteValue::Float(2.5)),
+            Value::Concrete(ConcreteValue::Bool(false)),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("pw".to_string()),
+            )))),
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey)),
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+                path: path.clone(),
+            })),
+            Value::Deferred(DeferredValue::ResourceRef { path: path.clone() }),
+            Value::Deferred(DeferredValue::Interpolation(vec![
                 InterpolationPart::Literal("prefix-".to_string()),
-                InterpolationPart::Expr(Value::ResourceRef { path }),
-            ]),
-            Value::FunctionCall {
+                InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef { path })),
+            ])),
+            Value::Deferred(DeferredValue::FunctionCall {
                 name: "concat".to_string(),
                 args: vec![
-                    Value::String("a".to_string()),
-                    Value::String("b".to_string()),
+                    Value::Concrete(ConcreteValue::String("a".to_string())),
+                    Value::Concrete(ConcreteValue::String("b".to_string())),
                 ],
-            },
+            }),
         ];
 
         for v in &cases {
@@ -2551,45 +2799,57 @@ mod tests {
     #[test]
     fn canonicalize_scalar_to_string_list() {
         let t = string_or_list_of_strings();
-        let v = Value::String("repo:foo:*".to_string());
+        let v = Value::Concrete(ConcreteValue::String("repo:foo:*".to_string()));
         let canon = canonicalize_with_type(v, &t);
-        assert_eq!(canon, Value::StringList(vec!["repo:foo:*".to_string()]));
+        assert_eq!(
+            canon,
+            Value::Concrete(ConcreteValue::StringList(vec!["repo:foo:*".to_string()]))
+        );
     }
 
     #[test]
     fn canonicalize_single_element_list_to_string_list() {
         let t = string_or_list_of_strings();
-        let v = Value::List(vec![Value::String("repo:foo:*".to_string())]);
+        let v = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("repo:foo:*".to_string()),
+        )]));
         let canon = canonicalize_with_type(v, &t);
-        assert_eq!(canon, Value::StringList(vec!["repo:foo:*".to_string()]));
+        assert_eq!(
+            canon,
+            Value::Concrete(ConcreteValue::StringList(vec!["repo:foo:*".to_string()]))
+        );
     }
 
     #[test]
     fn canonicalize_multi_element_list_to_string_list() {
         let t = string_or_list_of_strings();
-        let v = Value::List(vec![
-            Value::String("a".to_string()),
-            Value::String("b".to_string()),
-            Value::String("c".to_string()),
-        ]);
+        let v = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("a".to_string())),
+            Value::Concrete(ConcreteValue::String("b".to_string())),
+            Value::Concrete(ConcreteValue::String("c".to_string())),
+        ]));
         let canon = canonicalize_with_type(v, &t);
         assert_eq!(
             canon,
-            Value::StringList(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+            Value::Concrete(ConcreteValue::StringList(vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string()
+            ]))
         );
     }
 
     #[test]
     fn canonicalize_idempotent_on_string_list() {
         let t = string_or_list_of_strings();
-        let v = Value::StringList(vec!["a".to_string()]);
+        let v = Value::Concrete(ConcreteValue::StringList(vec!["a".to_string()]));
         let canon = canonicalize_with_type(v.clone(), &t);
         assert_eq!(canon, v);
     }
 
     #[test]
     fn canonicalize_passes_through_non_applicable_type() {
-        let v = Value::String("foo".to_string());
+        let v = Value::Concrete(ConcreteValue::String("foo".to_string()));
         let canon = canonicalize_with_type(v.clone(), &AttributeType::String);
         assert_eq!(canon, v);
     }
@@ -2599,7 +2859,9 @@ mod tests {
         let t = string_or_list_of_strings();
         // List with non-String elements stays as List — not the canonical
         // form. Schema validation will flag it elsewhere.
-        let v = Value::List(vec![Value::Int(1)]);
+        let v = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Int(1),
+        )]));
         let canon = canonicalize_with_type(v.clone(), &t);
         assert_eq!(canon, v);
     }
@@ -2616,15 +2878,17 @@ mod tests {
         let mut map = IndexMap::new();
         map.insert(
             "action".to_string(),
-            Value::String("s3:GetObject".to_string()),
+            Value::Concrete(ConcreteValue::String("s3:GetObject".to_string())),
         );
-        let v = Value::Map(map);
+        let v = Value::Concrete(ConcreteValue::Map(map));
         let canon = canonicalize_with_type(v, &t);
         match canon {
-            Value::Map(m) => {
+            Value::Concrete(ConcreteValue::Map(m)) => {
                 assert_eq!(
                     m.get("action"),
-                    Some(&Value::StringList(vec!["s3:GetObject".to_string()]))
+                    Some(&Value::Concrete(ConcreteValue::StringList(vec![
+                        "s3:GetObject".to_string()
+                    ])))
                 );
             }
             _ => panic!("expected Map"),
@@ -2643,15 +2907,17 @@ mod tests {
         let mut map = IndexMap::new();
         map.insert(
             "Action".to_string(),
-            Value::String("s3:GetObject".to_string()),
+            Value::Concrete(ConcreteValue::String("s3:GetObject".to_string())),
         );
-        let v = Value::Map(map);
+        let v = Value::Concrete(ConcreteValue::Map(map));
         let canon = canonicalize_with_type(v, &t);
         match canon {
-            Value::Map(m) => {
+            Value::Concrete(ConcreteValue::Map(m)) => {
                 assert_eq!(
                     m.get("Action"),
-                    Some(&Value::StringList(vec!["s3:GetObject".to_string()]))
+                    Some(&Value::Concrete(ConcreteValue::StringList(vec![
+                        "s3:GetObject".to_string()
+                    ])))
                 );
             }
             _ => panic!("expected Map"),
@@ -2667,15 +2933,17 @@ mod tests {
         let mut map = IndexMap::new();
         map.insert(
             "token.actions.githubusercontent.com:sub".to_string(),
-            Value::String("repo:foo:*".to_string()),
+            Value::Concrete(ConcreteValue::String("repo:foo:*".to_string())),
         );
-        let v = Value::Map(map);
+        let v = Value::Concrete(ConcreteValue::Map(map));
         let canon = canonicalize_with_type(v, &t);
         match canon {
-            Value::Map(m) => {
+            Value::Concrete(ConcreteValue::Map(m)) => {
                 assert_eq!(
                     m.get("token.actions.githubusercontent.com:sub"),
-                    Some(&Value::StringList(vec!["repo:foo:*".to_string()]))
+                    Some(&Value::Concrete(ConcreteValue::StringList(vec![
+                        "repo:foo:*".to_string()
+                    ])))
                 );
             }
             _ => panic!("expected Map"),
@@ -2694,19 +2962,27 @@ mod tests {
             namespace: None,
             to_dsl: None,
         };
-        let v = Value::String("x".to_string());
+        let v = Value::Concrete(ConcreteValue::String("x".to_string()));
         let canon = canonicalize_with_type(v, &t);
-        assert_eq!(canon, Value::StringList(vec!["x".to_string()]));
+        assert_eq!(
+            canon,
+            Value::Concrete(ConcreteValue::StringList(vec!["x".to_string()]))
+        );
     }
 
     #[test]
     fn canonicalize_secret_recurses_inner() {
         let t = string_or_list_of_strings();
-        let v = Value::Secret(Box::new(Value::String("s".to_string())));
+        let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("s".to_string()),
+        ))));
         let canon = canonicalize_with_type(v, &t);
         match canon {
-            Value::Secret(inner) => {
-                assert_eq!(*inner, Value::StringList(vec!["s".to_string()]));
+            Value::Deferred(DeferredValue::Secret(inner)) => {
+                assert_eq!(
+                    *inner,
+                    Value::Concrete(ConcreteValue::StringList(vec!["s".to_string()]))
+                );
             }
             _ => panic!("expected Secret"),
         }
@@ -2714,7 +2990,10 @@ mod tests {
 
     #[test]
     fn canonicalize_value_to_json_string_list_serializes_as_array() {
-        let v = Value::StringList(vec!["a".to_string(), "b".to_string()]);
+        let v = Value::Concrete(ConcreteValue::StringList(vec![
+            "a".to_string(),
+            "b".to_string(),
+        ]));
         let json = value_to_json(&v).expect("StringList serializes cleanly");
         assert_eq!(
             json,
@@ -2746,15 +3025,17 @@ mod tests {
     #[test]
     fn inline_width_parity_for_scalars() {
         for v in [
-            Value::String("hello".to_string()),
-            Value::String("(empty)".to_string()),
-            Value::Int(42),
-            Value::Int(-7),
-            Value::Float(1.5),
-            Value::Float(2.0),
-            Value::Bool(true),
-            Value::Bool(false),
-            Value::Secret(Box::new(Value::String("hidden".to_string()))),
+            Value::Concrete(ConcreteValue::String("hello".to_string())),
+            Value::Concrete(ConcreteValue::String("(empty)".to_string())),
+            Value::Concrete(ConcreteValue::Int(42)),
+            Value::Concrete(ConcreteValue::Int(-7)),
+            Value::Concrete(ConcreteValue::Float(1.5)),
+            Value::Concrete(ConcreteValue::Float(2.0)),
+            Value::Concrete(ConcreteValue::Bool(true)),
+            Value::Concrete(ConcreteValue::Bool(false)),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("hidden".to_string()),
+            )))),
         ] {
             assert_inline_width_matches_build(&v);
         }
@@ -2762,27 +3043,33 @@ mod tests {
 
     #[test]
     fn inline_width_parity_for_lists_and_maps() {
-        let list = Value::List(vec![
-            Value::String("a".to_string()),
-            Value::Int(1),
-            Value::Bool(true),
-        ]);
+        let list = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("a".to_string())),
+            Value::Concrete(ConcreteValue::Int(1)),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        ]));
         assert_inline_width_matches_build(&list);
 
         let mut map = IndexMap::new();
-        map.insert("k1".to_string(), Value::String("v1".to_string()));
-        map.insert("k2".to_string(), Value::Int(99));
-        assert_inline_width_matches_build(&Value::Map(map));
+        map.insert(
+            "k1".to_string(),
+            Value::Concrete(ConcreteValue::String("v1".to_string())),
+        );
+        map.insert("k2".to_string(), Value::Concrete(ConcreteValue::Int(99)));
+        assert_inline_width_matches_build(&Value::Concrete(ConcreteValue::Map(map)));
 
         // Nested list/map.
         let mut inner = IndexMap::new();
-        inner.insert("x".to_string(), Value::Int(1));
-        let nested = Value::List(vec![Value::Map(inner), Value::String("end".to_string())]);
+        inner.insert("x".to_string(), Value::Concrete(ConcreteValue::Int(1)));
+        let nested = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::Map(inner)),
+            Value::Concrete(ConcreteValue::String("end".to_string())),
+        ]));
         assert_inline_width_matches_build(&nested);
 
         // Empty collections.
-        assert_inline_width_matches_build(&Value::List(vec![]));
-        assert_inline_width_matches_build(&Value::Map(IndexMap::new()));
+        assert_inline_width_matches_build(&Value::Concrete(ConcreteValue::List(vec![])));
+        assert_inline_width_matches_build(&Value::Concrete(ConcreteValue::Map(IndexMap::new())));
     }
 
     #[test]
@@ -2791,7 +3078,9 @@ mod tests {
         // resolve to their provider value before being quoted in
         // `format_value_with_key`. inline_width must follow the same
         // resolution to match the rendered byte length.
-        let v = Value::String("aws.Region.ap_northeast_1".to_string());
+        let v = Value::Concrete(ConcreteValue::String(
+            "aws.Region.ap_northeast_1".to_string(),
+        ));
         assert_inline_width_matches_build(&v);
     }
 
@@ -2802,9 +3091,9 @@ mod tests {
         // every leaf. The cheapest observable proxy: a budget of 1 on a
         // value whose first byte already exceeds it returns None even
         // though the value itself is structurally complex.
-        let mut deep = Value::Int(1);
+        let mut deep = Value::Concrete(ConcreteValue::Int(1));
         for _ in 0..10 {
-            deep = Value::List(vec![deep]);
+            deep = Value::Concrete(ConcreteValue::List(vec![deep]));
         }
         assert_eq!(
             inline_width(&deep, 1),
@@ -2815,17 +3104,22 @@ mod tests {
 
     #[test]
     fn canonicalize_format_value_string_list() {
-        let v = Value::StringList(vec!["a".to_string(), "b".to_string()]);
+        let v = Value::Concrete(ConcreteValue::StringList(vec![
+            "a".to_string(),
+            "b".to_string(),
+        ]));
         assert_eq!(format_value(&v), "[\"a\", \"b\"]");
     }
 
     #[test]
     fn canonicalize_partial_eq_distinguishes_list_and_string_list() {
-        // `Value::List([String("x")])` and `Value::StringList(vec!["x"])`
+        // `Value::Concrete(ConcreteValue::List([String("x")]))` and `Value::Concrete(ConcreteValue::StringList(vec!["x"]))`
         // are *not* equal under PartialEq — the type system carries the
         // canonical-form invariant. Producers must canonicalize first.
-        let a = Value::List(vec![Value::String("x".to_string())]);
-        let b = Value::StringList(vec!["x".to_string()]);
+        let a = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("x".to_string()),
+        )]));
+        let b = Value::Concrete(ConcreteValue::StringList(vec!["x".to_string()]));
         assert_ne!(a, b);
     }
 
@@ -2869,12 +3163,14 @@ mod tests {
         let registry = build_test_registry();
         let mut resources = vec![make_resource(vec![(
             "subject",
-            Value::String("repo:foo:*".to_string()),
+            Value::Concrete(ConcreteValue::String("repo:foo:*".to_string())),
         )])];
         canonicalize_resources_with_schemas(&mut resources, &registry);
         assert_eq!(
             resources[0].attributes.get("subject"),
-            Some(&Value::StringList(vec!["repo:foo:*".to_string()]))
+            Some(&Value::Concrete(ConcreteValue::StringList(vec![
+                "repo:foo:*".to_string()
+            ])))
         );
     }
 
@@ -2883,12 +3179,16 @@ mod tests {
         let registry = build_test_registry();
         let mut resources = vec![make_resource(vec![(
             "subject",
-            Value::List(vec![Value::String("repo:foo:*".to_string())]),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("repo:foo:*".to_string()),
+            )])),
         )])];
         canonicalize_resources_with_schemas(&mut resources, &registry);
         assert_eq!(
             resources[0].attributes.get("subject"),
-            Some(&Value::StringList(vec!["repo:foo:*".to_string()]))
+            Some(&Value::Concrete(ConcreteValue::StringList(vec![
+                "repo:foo:*".to_string()
+            ])))
         );
     }
 
@@ -2898,12 +3198,12 @@ mod tests {
         let registry = crate::schema::SchemaRegistry::new();
         let mut resources = vec![make_resource(vec![(
             "subject",
-            Value::String("x".to_string()),
+            Value::Concrete(ConcreteValue::String("x".to_string())),
         )])];
         canonicalize_resources_with_schemas(&mut resources, &registry);
         assert_eq!(
             resources[0].attributes.get("subject"),
-            Some(&Value::String("x".to_string()))
+            Some(&Value::Concrete(ConcreteValue::String("x".to_string())))
         );
     }
 
@@ -2913,13 +3213,19 @@ mod tests {
         // unknown attribute — leave it alone.
         let registry = build_test_registry();
         let mut resources = vec![make_resource(vec![
-            ("subject", Value::String("x".to_string())),
-            ("name", Value::String("p1".to_string())),
+            (
+                "subject",
+                Value::Concrete(ConcreteValue::String("x".to_string())),
+            ),
+            (
+                "name",
+                Value::Concrete(ConcreteValue::String("p1".to_string())),
+            ),
         ])];
         canonicalize_resources_with_schemas(&mut resources, &registry);
         assert_eq!(
             resources[0].attributes.get("name"),
-            Some(&Value::String("p1".to_string()))
+            Some(&Value::Concrete(ConcreteValue::String("p1".to_string())))
         );
     }
 
@@ -2931,11 +3237,13 @@ mod tests {
         let registry = build_test_registry();
         let mut a = vec![make_resource(vec![(
             "subject",
-            Value::String("repo:foo:*".to_string()),
+            Value::Concrete(ConcreteValue::String("repo:foo:*".to_string())),
         )])];
         let mut b = vec![make_resource(vec![(
             "subject",
-            Value::List(vec![Value::String("repo:foo:*".to_string())]),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("repo:foo:*".to_string()),
+            )])),
         )])];
         canonicalize_resources_with_schemas(&mut a, &registry);
         canonicalize_resources_with_schemas(&mut b, &registry);
@@ -2968,13 +3276,18 @@ mod tests {
     fn canonicalize_states_with_schemas_scalar_to_string_list() {
         let registry = build_test_registry();
         let mut states = std::collections::HashMap::new();
-        let s = make_state(vec![("subject", Value::String("repo:foo:*".to_string()))]);
+        let s = make_state(vec![(
+            "subject",
+            Value::Concrete(ConcreteValue::String("repo:foo:*".to_string())),
+        )]);
         states.insert(s.id.clone(), s);
         canonicalize_states_with_schemas(&mut states, &registry);
         let state = states.values().next().unwrap();
         assert_eq!(
             state.attributes.get("subject"),
-            Some(&Value::StringList(vec!["repo:foo:*".to_string()]))
+            Some(&Value::Concrete(ConcreteValue::StringList(vec![
+                "repo:foo:*".to_string()
+            ])))
         );
     }
 
@@ -2984,14 +3297,18 @@ mod tests {
         let mut states = std::collections::HashMap::new();
         let s = make_state(vec![(
             "subject",
-            Value::List(vec![Value::String("repo:foo:*".to_string())]),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("repo:foo:*".to_string()),
+            )])),
         )]);
         states.insert(s.id.clone(), s);
         canonicalize_states_with_schemas(&mut states, &registry);
         let state = states.values().next().unwrap();
         assert_eq!(
             state.attributes.get("subject"),
-            Some(&Value::StringList(vec!["repo:foo:*".to_string()]))
+            Some(&Value::Concrete(ConcreteValue::StringList(vec![
+                "repo:foo:*".to_string()
+            ])))
         );
     }
 
@@ -2999,13 +3316,16 @@ mod tests {
     fn canonicalize_states_with_schemas_skips_unknown_resource() {
         let registry = crate::schema::SchemaRegistry::new();
         let mut states = std::collections::HashMap::new();
-        let s = make_state(vec![("subject", Value::String("x".to_string()))]);
+        let s = make_state(vec![(
+            "subject",
+            Value::Concrete(ConcreteValue::String("x".to_string())),
+        )]);
         states.insert(s.id.clone(), s);
         canonicalize_states_with_schemas(&mut states, &registry);
         let state = states.values().next().unwrap();
         assert_eq!(
             state.attributes.get("subject"),
-            Some(&Value::String("x".to_string()))
+            Some(&Value::Concrete(ConcreteValue::String("x".to_string())))
         );
     }
 
@@ -3013,18 +3333,23 @@ mod tests {
     fn canonicalize_states_diff_empty_after_both_sides_canonical() {
         // The acceptance criterion from #2513: a desired side written
         // as `["x"]` and a state side stored as `"x"` collapse to the
-        // same `Value::StringList(vec!["x"])` after both pass through
+        // same `Value::Concrete(ConcreteValue::StringList(vec!["x"]))` after both pass through
         // canonicalization.
         let registry = build_test_registry();
 
         let mut resources = vec![make_resource(vec![(
             "subject",
-            Value::List(vec![Value::String("repo:foo:*".to_string())]),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("repo:foo:*".to_string()),
+            )])),
         )])];
         canonicalize_resources_with_schemas(&mut resources, &registry);
 
         let mut states = std::collections::HashMap::new();
-        let s = make_state(vec![("subject", Value::String("repo:foo:*".to_string()))]);
+        let s = make_state(vec![(
+            "subject",
+            Value::Concrete(ConcreteValue::String("repo:foo:*".to_string())),
+        )]);
         states.insert(s.id.clone(), s);
         canonicalize_states_with_schemas(&mut states, &registry);
 
@@ -3039,29 +3364,35 @@ mod tests {
 
     #[test]
     fn validate_list_accepts_string_list() {
-        // The schema's `validate_list` must accept `Value::StringList`
-        // as the structural equivalent of `Value::List([String, ...])`,
+        // The schema's `validate_list` must accept `Value::Concrete(ConcreteValue::StringList)`
+        // as the structural equivalent of `Value::Concrete(ConcreteValue::List([String, ...]))`,
         // so a Union[String, list(String)] member's `list(String)`
         // branch validates the canonical form cleanly.
         use crate::schema::AttributeType;
         let list_of_string = AttributeType::list(AttributeType::String);
-        let v = Value::StringList(vec!["a".to_string(), "b".to_string()]);
+        let v = Value::Concrete(ConcreteValue::StringList(vec![
+            "a".to_string(),
+            "b".to_string(),
+        ]));
         assert!(list_of_string.validate(&v).is_ok());
     }
 
     #[test]
     fn validate_union_accepts_canonical_string_list() {
         let union = string_or_list_of_strings();
-        let v = Value::StringList(vec!["x".to_string()]);
+        let v = Value::Concrete(ConcreteValue::StringList(vec!["x".to_string()]));
         assert!(union.validate(&v).is_ok());
     }
 
     #[test]
     fn format_value_string_list_renders_brackets() {
-        // `format_value` must render `Value::StringList` with bracket
+        // `format_value` must render `Value::Concrete(ConcreteValue::StringList)` with bracket
         // syntax — not a `_` wildcard fallback that would print debug
         // garbage in plan output.
-        let v = Value::StringList(vec!["a".to_string(), "b".to_string()]);
+        let v = Value::Concrete(ConcreteValue::StringList(vec![
+            "a".to_string(),
+            "b".to_string(),
+        ]));
         let formatted = format_value(&v);
         assert_eq!(formatted, "[\"a\", \"b\"]");
     }
@@ -3070,11 +3401,11 @@ mod tests {
     fn inline_width_returns_none_when_just_over_budget() {
         // List of three short strings: `["aa", "bb", "cc"]` = 18 bytes.
         // Budget 17 must return None; budget 18 must return Some(18).
-        let v = Value::List(vec![
-            Value::String("aa".to_string()),
-            Value::String("bb".to_string()),
-            Value::String("cc".to_string()),
-        ]);
+        let v = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("aa".to_string())),
+            Value::Concrete(ConcreteValue::String("bb".to_string())),
+            Value::Concrete(ConcreteValue::String("cc".to_string())),
+        ]));
         assert_eq!(
             format_value_with_key(&v, None).len(),
             18,
@@ -3093,10 +3424,10 @@ mod tests {
         // PRETTY_LINE_LIMIT (80) at the prefix boundary and confirm both
         // sides of the boundary still pick the same form.
         // Just under the limit (inline expected).
-        let small_list = Value::List(vec![
-            Value::String("aaaaaaaaaaaa".to_string()),
-            Value::String("bbbbbbbbbbbb".to_string()),
-        ]);
+        let small_list = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("aaaaaaaaaaaa".to_string())),
+            Value::Concrete(ConcreteValue::String("bbbbbbbbbbbb".to_string())),
+        ]));
         let small = format_value_pretty(&small_list, layout(0, "k"));
         assert!(
             !small.contains('\n'),
@@ -3104,11 +3435,11 @@ mod tests {
         );
 
         // Over the limit (vertical expected).
-        let big_list = Value::List(vec![
-            Value::String("a".repeat(40)),
-            Value::String("b".repeat(40)),
-            Value::String("c".repeat(40)),
-        ]);
+        let big_list = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("a".repeat(40))),
+            Value::Concrete(ConcreteValue::String("b".repeat(40))),
+            Value::Concrete(ConcreteValue::String("c".repeat(40))),
+        ]));
         let big = format_value_pretty(&big_list, layout(0, "k"));
         assert!(
             big.contains('\n'),

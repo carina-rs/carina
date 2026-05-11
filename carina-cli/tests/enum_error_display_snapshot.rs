@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 
-use carina_core::resource::Value;
+use carina_core::resource::{ConcreteValue, Value};
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
 
 fn render_first_error(
@@ -55,7 +55,9 @@ fn invalid_enum_variant_namespaced_display() {
     let mut attrs = HashMap::new();
     attrs.insert(
         "versioning".to_string(),
-        Value::String("aws.s3.Bucket.VersioningStatus.NotReal".to_string()),
+        Value::Concrete(ConcreteValue::String(
+            "aws.s3.Bucket.VersioningStatus.NotReal".to_string(),
+        )),
     );
     insta::assert_snapshot!(render_first_error(&schema, attrs, false));
 }
@@ -68,7 +70,9 @@ fn invalid_enum_variant_bare_display() {
         namespace: None,
         dsl_aliases: vec![],
     };
-    let err = t.validate(&Value::String("zzz".to_string())).unwrap_err();
+    let err = t
+        .validate(&Value::Concrete(ConcreteValue::String("zzz".to_string())))
+        .unwrap_err();
     insta::assert_snapshot!(err.to_string());
 }
 
@@ -83,7 +87,9 @@ fn invalid_enum_variant_with_dsl_aliases_display() {
             ("Suspended".to_string(), "suspended".to_string()),
         ],
     };
-    let err = t.validate(&Value::String("zzz".to_string())).unwrap_err();
+    let err = t
+        .validate(&Value::Concrete(ConcreteValue::String("zzz".to_string())))
+        .unwrap_err();
     insta::assert_snapshot!(err.to_string());
 }
 
@@ -102,7 +108,10 @@ fn string_literal_expected_enum_string_enum_display() {
         .required(),
     );
     let mut attrs = HashMap::new();
-    attrs.insert("target_type".to_string(), Value::String("aaa".to_string()));
+    attrs.insert(
+        "target_type".to_string(),
+        Value::Concrete(ConcreteValue::String("aaa".to_string())),
+    );
     insta::assert_snapshot!(render_first_error(&schema, attrs, true));
 }
 
@@ -110,8 +119,10 @@ fn string_literal_expected_enum_string_enum_display() {
 fn string_literal_expected_enum_custom_namespaced_display() {
     fn validate_mode(v: &Value) -> Result<(), String> {
         match v {
-            Value::String(s) if s == "test.r.Mode.fast" => Ok(()),
-            Value::String(s) => Err(format!("invalid Mode '{}': expected fast", s)),
+            Value::Concrete(ConcreteValue::String(s)) if s == "test.r.Mode.fast" => Ok(()),
+            Value::Concrete(ConcreteValue::String(s)) => {
+                Err(format!("invalid Mode '{}': expected fast", s))
+            }
             _ => Err("expected String".to_string()),
         }
     }
@@ -131,6 +142,9 @@ fn string_literal_expected_enum_custom_namespaced_display() {
         .required(),
     );
     let mut attrs = HashMap::new();
-    attrs.insert("mode".to_string(), Value::String("aaa".to_string()));
+    attrs.insert(
+        "mode".to_string(),
+        Value::Concrete(ConcreteValue::String("aaa".to_string())),
+    );
     insta::assert_snapshot!(render_first_error(&schema, attrs, true));
 }

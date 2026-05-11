@@ -2,7 +2,7 @@ use super::*;
 
 use carina_core::effect::{CascadingUpdate, Effect};
 use carina_core::plan::Plan;
-use carina_core::resource::{Directives, Resource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, Directives, Resource, ResourceId, State, Value};
 
 fn make_resource(resource_type: &str, name: &str, binding: &str, deps: &[&str]) -> Resource {
     let mut r = Resource::new(resource_type, name);
@@ -419,7 +419,7 @@ fn test_extract_compact_hint_string_fallback() {
     let mut r = Resource::new("ec2.route", "hash456");
     r.set_attr(
         "destination_cidr_block".to_string(),
-        Value::String("0.0.0.0/0".to_string()),
+        Value::Concrete(ConcreteValue::String("0.0.0.0/0".to_string())),
     );
 
     let hint = extract_compact_hint(&r, None);
@@ -440,7 +440,7 @@ fn test_extract_compact_hint_prefers_string_over_resource_ref() {
     let mut r = Resource::new("ec2.route", "hash_mixed");
     r.set_attr(
         "destination".to_string(),
-        Value::String("10.0.0.0/8".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/8".to_string())),
     );
     r.set_attr(
         "gateway_id".to_string(),
@@ -458,7 +458,9 @@ fn test_extract_compact_hint_service_name_shortening() {
     let mut r = Resource::new("ec2.vpc_endpoint", "hash_svc");
     r.set_attr(
         "service_name".to_string(),
-        Value::String("com.amazonaws.ap-northeast-1.ecr.dkr".to_string()),
+        Value::Concrete(ConcreteValue::String(
+            "com.amazonaws.ap-northeast-1.ecr.dkr".to_string(),
+        )),
     );
 
     let hint = extract_compact_hint(&r, None);
@@ -468,7 +470,9 @@ fn test_extract_compact_hint_service_name_shortening() {
     let mut r2 = Resource::new("ec2.vpc_endpoint", "hash_svc2");
     r2.set_attr(
         "service_name".to_string(),
-        Value::String("com.amazonaws.ap-northeast-1.s3".to_string()),
+        Value::Concrete(ConcreteValue::String(
+            "com.amazonaws.ap-northeast-1.s3".to_string(),
+        )),
     );
 
     let hint2 = extract_compact_hint(&r2, None);
@@ -485,7 +489,7 @@ fn test_extract_compact_hint_all_refs_match_parent() {
     );
     r.set_attr(
         "description".to_string(),
-        Value::String("Allow HTTPS from VPC".to_string()),
+        Value::Concrete(ConcreteValue::String("Allow HTTPS from VPC".to_string())),
     );
 
     // When parent is endpoint_sg, should skip group_id and use description
@@ -499,15 +503,17 @@ fn test_extract_compact_hint_prefers_string_for_vpc_endpoint() {
     let mut r = Resource::new("ec2.vpc_endpoint", "hash_ep");
     r.set_attr(
         "service_name".to_string(),
-        Value::String("com.amazonaws.ap-northeast-1.ecr.dkr".to_string()),
+        Value::Concrete(ConcreteValue::String(
+            "com.amazonaws.ap-northeast-1.ecr.dkr".to_string(),
+        )),
     );
     r.set_attr(
         "security_group_ids".to_string(),
-        Value::List(vec![Value::resource_ref(
+        Value::Concrete(ConcreteValue::List(vec![Value::resource_ref(
             "endpoint_sg".to_string(),
             "group_id".to_string(),
             vec![],
-        )]),
+        )])),
     );
     r.set_attr(
         "vpc_id".to_string(),
@@ -595,7 +601,7 @@ fn test_print_plan_compact_with_anonymous_resources() {
     let mut anon = Resource::new("ec2.route", "hash_anon");
     anon.set_attr(
         "destination_cidr_block".to_string(),
-        Value::String("0.0.0.0/0".to_string()),
+        Value::Concrete(ConcreteValue::String("0.0.0.0/0".to_string())),
     );
     anon.set_attr(
         "route_table_id".to_string(),
@@ -625,11 +631,11 @@ fn test_extract_compact_hint_list_containing_resource_ref() {
     let mut r = Resource::new("ec2.vpc_endpoint", "hash_list_ref");
     r.set_attr(
         "security_group_ids".to_string(),
-        Value::List(vec![Value::resource_ref(
+        Value::Concrete(ConcreteValue::List(vec![Value::resource_ref(
             "endpoint_sg".to_string(),
             "group_id".to_string(),
             vec![],
-        )]),
+        )])),
     );
 
     let hint = extract_compact_hint(&r, None);
@@ -646,11 +652,11 @@ fn test_extract_compact_hint_list_ref_skips_parent() {
     let mut r = Resource::new("ec2.vpc_endpoint", "hash_list_parent");
     r.set_attr(
         "security_group_ids".to_string(),
-        Value::List(vec![Value::resource_ref(
+        Value::Concrete(ConcreteValue::List(vec![Value::resource_ref(
             "endpoint_sg".to_string(),
             "group_id".to_string(),
             vec![],
-        )]),
+        )])),
     );
 
     let hint = extract_compact_hint(&r, Some("endpoint_sg"));
@@ -677,7 +683,9 @@ fn test_extract_compact_hint_resolves_dsl_enum() {
     let mut r = Resource::new("ec2.Subnet", "hash_enum");
     r.set_attr(
         "availability_zone".to_string(),
-        Value::String("awscc.AvailabilityZone.ap_northeast_1a".to_string()),
+        Value::Concrete(ConcreteValue::String(
+            "awscc.AvailabilityZone.ap_northeast_1a".to_string(),
+        )),
     );
 
     let hint = extract_compact_hint(&r, None);
@@ -695,7 +703,10 @@ fn test_extract_compact_hint_resolves_dsl_enum() {
 fn test_extract_compact_hint_skips_internal_attributes() {
     let mut r = Resource::new("ec2.Vpc", "hash_internal");
     r.binding = Some("vpc".to_string());
-    r.set_attr("_hash".to_string(), Value::String("abc123".to_string()));
+    r.set_attr(
+        "_hash".to_string(),
+        Value::Concrete(ConcreteValue::String("abc123".to_string())),
+    );
 
     let hint = extract_compact_hint(&r, None);
     assert_eq!(hint, None, "Internal attributes should be skipped");
@@ -710,23 +721,26 @@ fn test_cascading_update_shows_attribute_diffs() {
         ResourceId::new("ec2.Vpc", "vpc"),
         HashMap::from([(
             "cidr_block".to_string(),
-            Value::String("10.0.0.0/16".to_string()),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
         )]),
     );
     let vpc_to = Resource::new("ec2.Vpc", "vpc")
         .with_binding("vpc")
-        .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+        );
 
     let subnet_from = State::existing(
         ResourceId::new("ec2.Subnet", "subnet"),
         HashMap::from([
             (
                 "vpc_id".to_string(),
-                Value::String("vpc-old123".to_string()),
+                Value::Concrete(ConcreteValue::String("vpc-old123".to_string())),
             ),
             (
                 "cidr_block".to_string(),
-                Value::String("10.0.1.0/24".to_string()),
+                Value::Concrete(ConcreteValue::String("10.0.1.0/24".to_string())),
             ),
         ]),
     );
@@ -735,7 +749,10 @@ fn test_cascading_update_shows_attribute_diffs() {
             "vpc_id",
             Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         )
-        .with_attribute("cidr_block", Value::String("10.0.1.0/24".to_string()));
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.0.1.0/24".to_string())),
+        );
 
     let replace_effect = Effect::Replace {
         id: ResourceId::new("ec2.Vpc", "vpc"),
@@ -782,11 +799,11 @@ fn test_format_cascading_update_attr_diff() {
             HashMap::from([
                 (
                     "vpc_id".to_string(),
-                    Value::String("vpc-old123".to_string()),
+                    Value::Concrete(ConcreteValue::String("vpc-old123".to_string())),
                 ),
                 (
                     "cidr_block".to_string(),
-                    Value::String("10.0.1.0/24".to_string()),
+                    Value::Concrete(ConcreteValue::String("10.0.1.0/24".to_string())),
                 ),
             ]),
         )),
@@ -795,7 +812,10 @@ fn test_format_cascading_update_attr_diff() {
                 "vpc_id",
                 Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
             )
-            .with_attribute("cidr_block", Value::String("10.0.1.0/24".to_string())),
+            .with_attribute(
+                "cidr_block",
+                Value::Concrete(ConcreteValue::String("10.0.1.0/24".to_string())),
+            ),
     };
 
     let output = format_cascading_update_diff(&cascade, "    ", "vpc");
@@ -836,25 +856,35 @@ fn test_replace_changed_create_only_same_value_shown_as_known_after_apply() {
     use std::collections::HashMap;
 
     let from_attrs = HashMap::from([
-        ("vpc_id".to_string(), Value::String("vpc-123".to_string())),
+        (
+            "vpc_id".to_string(),
+            Value::Concrete(ConcreteValue::String("vpc-123".to_string())),
+        ),
         (
             "cidr_block".to_string(),
-            Value::String("10.0.1.0/24".to_string()),
+            Value::Concrete(ConcreteValue::String("10.0.1.0/24".to_string())),
         ),
     ]);
     let to_attrs = HashMap::from([
-        ("_binding".to_string(), Value::String("subnet".to_string())),
-        ("vpc_id".to_string(), Value::String("vpc-123".to_string())),
+        (
+            "_binding".to_string(),
+            Value::Concrete(ConcreteValue::String("subnet".to_string())),
+        ),
+        (
+            "vpc_id".to_string(),
+            Value::Concrete(ConcreteValue::String("vpc-123".to_string())),
+        ),
         (
             "cidr_block".to_string(),
-            Value::String("10.0.1.0/24".to_string()),
+            Value::Concrete(ConcreteValue::String("10.0.1.0/24".to_string())),
         ),
     ]);
 
     // Verify the precondition: the values are semantically equal
     assert!(
-        Value::String("vpc-123".to_string())
-            .semantically_equal(&Value::String("vpc-123".to_string())),
+        Value::Concrete(ConcreteValue::String("vpc-123".to_string())).semantically_equal(
+            &Value::Concrete(ConcreteValue::String("vpc-123".to_string()))
+        ),
         "precondition: old and new vpc_id should be semantically equal"
     );
 
@@ -895,11 +925,11 @@ fn test_replace_cascade_ref_hints_show_binding() {
 
     let from_attrs = HashMap::from([(
         "vpc_id".to_string(),
-        Value::String("vpc-0bf023ff87bf1aa0c".to_string()),
+        Value::Concrete(ConcreteValue::String("vpc-0bf023ff87bf1aa0c".to_string())),
     )]);
     let to_attrs = HashMap::from([(
         "vpc_id".to_string(),
-        Value::String("vpc-0bf023ff87bf1aa0c".to_string()),
+        Value::Concrete(ConcreteValue::String("vpc-0bf023ff87bf1aa0c".to_string())),
     )]);
 
     let hints = vec![("vpc_id".to_string(), "vpc.vpc_id".to_string())];
@@ -945,15 +975,15 @@ fn test_format_cascading_update_diff_excludes_non_ref_attributes() {
             HashMap::from([
                 (
                     "vpc_id".to_string(),
-                    Value::String("vpc-old123".to_string()),
+                    Value::Concrete(ConcreteValue::String("vpc-old123".to_string())),
                 ),
                 (
                     "availability_zone".to_string(),
-                    Value::String("ap-northeast-1a".to_string()),
+                    Value::Concrete(ConcreteValue::String("ap-northeast-1a".to_string())),
                 ),
                 (
                     "cidr_block".to_string(),
-                    Value::String("10.0.1.0/24".to_string()),
+                    Value::Concrete(ConcreteValue::String("10.0.1.0/24".to_string())),
                 ),
             ]),
         )),
@@ -964,9 +994,14 @@ fn test_format_cascading_update_diff_excludes_non_ref_attributes() {
             )
             .with_attribute(
                 "availability_zone",
-                Value::String("awscc.AvailabilityZone.ap_northeast_1a".to_string()),
+                Value::Concrete(ConcreteValue::String(
+                    "awscc.AvailabilityZone.ap_northeast_1a".to_string(),
+                )),
             )
-            .with_attribute("cidr_block", Value::String("10.0.1.0/24".to_string())),
+            .with_attribute(
+                "cidr_block",
+                Value::Concrete(ConcreteValue::String("10.0.1.0/24".to_string())),
+            ),
     };
 
     let replaced_binding = "vpc";
@@ -1005,16 +1040,18 @@ fn test_format_cascading_update_diff_includes_list_with_ref() {
             ResourceId::new("ec2.Instance", "instance"),
             HashMap::from([(
                 "security_group_ids".to_string(),
-                Value::List(vec![Value::String("sg-old123".to_string())]),
+                Value::Concrete(ConcreteValue::List(vec![Value::String(
+                    "sg-old123".to_string(),
+                )])),
             )]),
         )),
         to: Resource::new("ec2.Instance", "instance").with_attribute(
             "security_group_ids",
-            Value::List(vec![Value::resource_ref(
+            Value::Concrete(ConcreteValue::List(vec![Value::resource_ref(
                 "sg".to_string(),
                 "group_id".to_string(),
                 vec![],
-            )]),
+            )])),
         ),
     };
 
@@ -1060,7 +1097,7 @@ fn test_mixed_plan_tree_with_delete_effect() {
         ResourceId::new("ec2.Vpc", "vpc"),
         HashMap::from([(
             "cidr_block".to_string(),
-            Value::String("10.0.0.0/16".to_string()),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
         )]),
     );
 
@@ -1070,7 +1107,7 @@ fn test_mixed_plan_tree_with_delete_effect() {
         ResourceId::new("ec2.SecurityGroup", "sg"),
         HashMap::from([(
             "ref_vpc".to_string(),
-            Value::String("vpc-old123".to_string()),
+            Value::Concrete(ConcreteValue::String("vpc-old123".to_string())),
         )]),
     );
 
@@ -1160,7 +1197,7 @@ fn test_resolved_ref_loses_dependency_for_tree_nesting() {
         ResourceId::new("ec2.Vpc", "vpc"),
         HashMap::from([(
             "cidr_block".to_string(),
-            Value::String("10.0.0.0/16".to_string()),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
         )]),
     );
 
@@ -1172,11 +1209,11 @@ fn test_resolved_ref_loses_dependency_for_tree_nesting() {
     // This is the resolved value — a plain string, NOT a ResourceRef
     sg.set_attr(
         "vpc_id".to_string(),
-        Value::String("vpc-0123456789abcdef0".to_string()),
+        Value::Concrete(ConcreteValue::String("vpc-0123456789abcdef0".to_string())),
     );
     sg.set_attr(
         "group_description".to_string(),
-        Value::String("Test security group".to_string()),
+        Value::Concrete(ConcreteValue::String("Test security group".to_string())),
     );
     // _dependency_bindings is saved by resolve_refs_with_state() before
     // ResourceRef values are resolved to strings.
@@ -1474,19 +1511,19 @@ fn colored_value_preserves_vertical_map_layout() {
 
 #[test]
 fn format_export_value_duration_renders_canonical() {
-    // Regression: simplify + Round 1 added the Value::Duration arm so
+    // Regression: simplify + Round 1 added the Value::Concrete(ConcreteValue::Duration) arm so
     // exports of a Duration attribute don't fall through to the
     // wildcard "(known after apply)" placeholder. Pin the canonical
     // form here so a future refactor cannot silently regress to either
     // the wildcard or the {:?} Debug shape.
-    let v = Value::Duration(std::time::Duration::from_secs(60));
+    let v = Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(60)));
     assert_eq!(format_export_value(&v), "1min");
 }
 
 #[test]
 fn format_deferred_value_duration_renders_canonical() {
     // Same shape as format_export_value but on the deferred-for path.
-    let v = Value::Duration(std::time::Duration::from_secs(60));
+    let v = Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(60)));
     let result = format_deferred_value(&v);
     // The deferred path may inject ANSI dimming for Unknown variants,
     // but a resolved Duration must render verbatim.

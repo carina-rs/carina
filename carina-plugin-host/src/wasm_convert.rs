@@ -9,8 +9,8 @@ use carina_core::provider::{
     UpdatePatch as CoreUpdatePatch, UpdateRequest as CoreUpdateRequest,
 };
 use carina_core::resource::{
-    Directives, Resource as CoreResource, ResourceId as CoreResourceId, State as CoreState,
-    Value as CoreValue,
+    ConcreteValue, DeferredValue, Directives, Resource as CoreResource,
+    ResourceId as CoreResourceId, State as CoreState, Value as CoreValue,
 };
 use carina_core::schema::{
     AttributeSchema as CoreAttributeSchema, AttributeType as CoreAttributeType,
@@ -29,16 +29,16 @@ use crate::wasm_bindings::carina::provider::types as wit;
 /// List and Map values are serialized to JSON strings because WIT does
 /// not support recursive types.
 ///
-/// Returns `Err(SerializationError)` for `Value::Unknown`,
-/// `Value::ResourceRef`, `Value::Interpolation`, and
-/// `Value::FunctionCall`. The plan-time pipeline strips every attribute
+/// Returns `Err(SerializationError)` for `Value::Deferred(DeferredValue::Unknown)`,
+/// `Value::Deferred(DeferredValue::ResourceRef)`, `Value::Deferred(DeferredValue::Interpolation)`, and
+/// `Value::Deferred(DeferredValue::FunctionCall)`. The plan-time pipeline strips every attribute
 /// that recursively contains one of these via
 /// `PlanPreprocessor::prepare`'s strip-and-restore pass, so reaching
 /// any of these arms is a producer-side bug — the diagnostic identifies
 /// which variant leaked. See RFC #2371 stage 2 (#2378) for `Unknown`
 /// and #2387 for `ResourceRef` / `Interpolation` / `FunctionCall`.
 ///
-/// `Value::Secret(inner)` is encoded as the `secret-val` WIT variant
+/// `Value::Deferred(DeferredValue::Secret(inner))` is encoded as the `secret-val` WIT variant
 /// (#2390): the inner is JSON-encoded the same way `list-val` / `map-val`
 /// encode their contents, and a typed signal crosses the boundary so the
 /// WASM provider can distinguish a secret from a plain string. The
@@ -47,35 +47,37 @@ use crate::wasm_bindings::carina::provider::types as wit;
 /// equivalent to the pre-#2387 `ResourceRef` debug-string.
 pub fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, SerializationError> {
     match v {
-        CoreValue::String(s) => Ok(wit::Value::StrVal(s.clone())),
-        CoreValue::Int(i) => Ok(wit::Value::IntVal(*i)),
-        CoreValue::Float(f) => Ok(wit::Value::FloatVal(*f)),
-        CoreValue::Bool(b) => Ok(wit::Value::BoolVal(*b)),
+        CoreValue::Concrete(ConcreteValue::String(s)) => Ok(wit::Value::StrVal(s.clone())),
+        CoreValue::Concrete(ConcreteValue::Int(i)) => Ok(wit::Value::IntVal(*i)),
+        CoreValue::Concrete(ConcreteValue::Float(f)) => Ok(wit::Value::FloatVal(*f)),
+        CoreValue::Concrete(ConcreteValue::Bool(b)) => Ok(wit::Value::BoolVal(*b)),
         // Duration crosses the WIT boundary as integer seconds — see
         // `notes/specs/2026-05-10-duration-design.md` for the rationale
         // (no `duration-val` variant; existing `aws`/`awscc` plugins
         // need no rebuild). The inbound `wit_to_core_value` path is
         // intentionally one-way for now: every `IntVal` reads back as
-        // `Value::Int`, regardless of whether the destination schema
+        // `Value::Concrete(ConcreteValue::Int)`, regardless of whether the destination schema
         // attribute is typed `Duration`. Re-typing on the inbound side
         // (so a Duration-typed schema attribute reconstructs as
-        // `Value::Duration`) is a deferred follow-up — without it, a
+        // `Value::Concrete(ConcreteValue::Duration)`) is a deferred follow-up — without it, a
         // post-apply state diff for a Duration attribute will surface
         // as `Duration(75min) → Int(4500)` until the schema-aware
         // re-typing lands. For MVP every consumer of Duration is
         // host-side (`wait { timeout = ... }`), so the asymmetry is
         // contained to the not-yet-existent provider-side use case.
-        CoreValue::Duration(d) => Ok(wit::Value::IntVal(d.as_secs() as i64)),
-        CoreValue::List(items) => {
+        CoreValue::Concrete(ConcreteValue::Duration(d)) => {
+            Ok(wit::Value::IntVal(d.as_secs() as i64))
+        }
+        CoreValue::Concrete(ConcreteValue::List(items)) => {
             let json_items: Result<Vec<serde_json::Value>, _> =
                 items.iter().map(core_value_to_json).collect();
             let json_str = serde_json::to_string(&json_items?)
                 .expect("serde_json::Value -> String is infallible");
             Ok(wit::Value::ListVal(json_str))
         }
-        CoreValue::StringList(items) => {
+        CoreValue::Concrete(ConcreteValue::StringList(items)) => {
             // Cross the WASM boundary as a plain JSON array of strings —
-            // the provider sees the same shape as `Value::List([String])`,
+            // the provider sees the same shape as `Value::Concrete(ConcreteValue::List([String]))`,
             // matching AWS's wire-format expectation for the
             // `string_or_list_of_strings` IAM shape.
             let json_arr: Vec<serde_json::Value> = items
@@ -86,7 +88,7 @@ pub fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, SerializationError
                 .expect("serde_json::Value -> String is infallible");
             Ok(wit::Value::ListVal(json_str))
         }
-        CoreValue::Map(map) => {
+        CoreValue::Concrete(ConcreteValue::Map(map)) => {
             let json_map: Result<serde_json::Map<String, serde_json::Value>, _> = map
                 .iter()
                 .map(|(k, v)| core_value_to_json(v).map(|jv| (k.clone(), jv)))
@@ -95,26 +97,36 @@ pub fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, SerializationError
                 .expect("serde_json::Value -> String is infallible");
             Ok(wit::Value::MapVal(json_str))
         }
-        CoreValue::Unknown(reason) => Err(SerializationError::UnknownNotAllowed {
-            reason: reason.clone(),
-            context: SerializationContext::WasmBoundary,
-        }),
-        CoreValue::ResourceRef { path } => Err(SerializationError::UnresolvedResourceRef {
-            path: path.to_dot_string(),
-            context: SerializationContext::WasmBoundary,
-        }),
-        CoreValue::BindingRef { binding } => Err(SerializationError::UnresolvedResourceRef {
-            path: binding.clone(),
-            context: SerializationContext::WasmBoundary,
-        }),
-        CoreValue::Interpolation(_) => Err(SerializationError::UnresolvedInterpolation {
-            context: SerializationContext::WasmBoundary,
-        }),
-        CoreValue::FunctionCall { name, .. } => Err(SerializationError::UnresolvedFunctionCall {
-            name: name.clone(),
-            context: SerializationContext::WasmBoundary,
-        }),
-        CoreValue::Secret(inner) => {
+        CoreValue::Deferred(DeferredValue::Unknown(reason)) => {
+            Err(SerializationError::UnknownNotAllowed {
+                reason: reason.clone(),
+                context: SerializationContext::WasmBoundary,
+            })
+        }
+        CoreValue::Deferred(DeferredValue::ResourceRef { path }) => {
+            Err(SerializationError::UnresolvedResourceRef {
+                path: path.to_dot_string(),
+                context: SerializationContext::WasmBoundary,
+            })
+        }
+        CoreValue::Deferred(DeferredValue::BindingRef { binding }) => {
+            Err(SerializationError::UnresolvedResourceRef {
+                path: binding.clone(),
+                context: SerializationContext::WasmBoundary,
+            })
+        }
+        CoreValue::Deferred(DeferredValue::Interpolation(_)) => {
+            Err(SerializationError::UnresolvedInterpolation {
+                context: SerializationContext::WasmBoundary,
+            })
+        }
+        CoreValue::Deferred(DeferredValue::FunctionCall { name, .. }) => {
+            Err(SerializationError::UnresolvedFunctionCall {
+                name: name.clone(),
+                context: SerializationContext::WasmBoundary,
+            })
+        }
+        CoreValue::Deferred(DeferredValue::Secret(inner)) => {
             let json = core_value_to_json(inner)?;
             let json_str =
                 serde_json::to_string(&json).expect("serde_json::Value -> String is infallible");
@@ -126,26 +138,28 @@ pub fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, SerializationError
 /// Convert a WIT Value to a core Value.
 pub fn wit_to_core_value(v: &wit::Value) -> CoreValue {
     match v {
-        wit::Value::StrVal(s) => CoreValue::String(s.clone()),
-        wit::Value::IntVal(i) => CoreValue::Int(*i),
-        wit::Value::FloatVal(f) => CoreValue::Float(*f),
-        wit::Value::BoolVal(b) => CoreValue::Bool(*b),
+        wit::Value::StrVal(s) => CoreValue::Concrete(ConcreteValue::String(s.clone())),
+        wit::Value::IntVal(i) => CoreValue::Concrete(ConcreteValue::Int(*i)),
+        wit::Value::FloatVal(f) => CoreValue::Concrete(ConcreteValue::Float(*f)),
+        wit::Value::BoolVal(b) => CoreValue::Concrete(ConcreteValue::Bool(*b)),
         wit::Value::ListVal(json) => {
             let items: Vec<serde_json::Value> = serde_json::from_str(json).unwrap_or_default();
-            CoreValue::List(items.iter().map(json_to_core_value).collect())
+            CoreValue::Concrete(ConcreteValue::List(
+                items.iter().map(json_to_core_value).collect(),
+            ))
         }
         wit::Value::MapVal(json) => {
             let map: serde_json::Map<String, serde_json::Value> =
                 serde_json::from_str(json).unwrap_or_default();
-            CoreValue::Map(
+            CoreValue::Concrete(ConcreteValue::Map(
                 map.iter()
                     .map(|(k, v)| (k.clone(), json_to_core_value(v)))
                     .collect(),
-            )
+            ))
         }
         wit::Value::SecretVal(json) => {
             // Decode the JSON-encoded inner value the same way `ListVal` /
-            // `MapVal` decode theirs, then re-wrap in `Value::Secret` so the
+            // `MapVal` decode theirs, then re-wrap in `Value::Deferred(DeferredValue::Secret)` so the
             // host's secret-tracking machinery (state hashing, plan
             // redaction) keeps working. A malformed encoding falls back to
             // an empty string secret rather than panicking — the WASM
@@ -153,7 +167,7 @@ pub fn wit_to_core_value(v: &wit::Value) -> CoreValue {
             let inner_json: serde_json::Value =
                 serde_json::from_str(json).unwrap_or(serde_json::Value::Null);
             let inner = json_to_core_value(&inner_json);
-            CoreValue::Secret(Box::new(inner))
+            CoreValue::Deferred(DeferredValue::Secret(Box::new(inner)))
         }
     }
 }
@@ -165,49 +179,61 @@ pub fn wit_to_core_value(v: &wit::Value) -> CoreValue {
 /// pass that keeps these arms unreachable in legitimate flows.
 fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationError> {
     match v {
-        CoreValue::String(s) => Ok(serde_json::Value::String(s.clone())),
-        CoreValue::Int(i) => Ok(serde_json::Value::Number((*i).into())),
-        CoreValue::Float(f) => Ok(serde_json::Number::from_f64(*f)
+        CoreValue::Concrete(ConcreteValue::String(s)) => Ok(serde_json::Value::String(s.clone())),
+        CoreValue::Concrete(ConcreteValue::Int(i)) => Ok(serde_json::Value::Number((*i).into())),
+        CoreValue::Concrete(ConcreteValue::Float(f)) => Ok(serde_json::Number::from_f64(*f)
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null)),
-        CoreValue::Bool(b) => Ok(serde_json::Value::Bool(*b)),
-        CoreValue::Duration(d) => Ok(serde_json::Value::Number((d.as_secs() as i64).into())),
-        CoreValue::List(items) => {
+        CoreValue::Concrete(ConcreteValue::Bool(b)) => Ok(serde_json::Value::Bool(*b)),
+        CoreValue::Concrete(ConcreteValue::Duration(d)) => {
+            Ok(serde_json::Value::Number((d.as_secs() as i64).into()))
+        }
+        CoreValue::Concrete(ConcreteValue::List(items)) => {
             let arr: Result<Vec<_>, _> = items.iter().map(core_value_to_json).collect();
             Ok(serde_json::Value::Array(arr?))
         }
-        CoreValue::StringList(items) => Ok(serde_json::Value::Array(
+        CoreValue::Concrete(ConcreteValue::StringList(items)) => Ok(serde_json::Value::Array(
             items
                 .iter()
                 .map(|s| serde_json::Value::String(s.clone()))
                 .collect(),
         )),
-        CoreValue::Map(map) => {
+        CoreValue::Concrete(ConcreteValue::Map(map)) => {
             let obj: Result<serde_json::Map<String, serde_json::Value>, _> = map
                 .iter()
                 .map(|(k, v)| core_value_to_json(v).map(|jv| (k.clone(), jv)))
                 .collect();
             Ok(serde_json::Value::Object(obj?))
         }
-        CoreValue::Unknown(reason) => Err(SerializationError::UnknownNotAllowed {
-            reason: reason.clone(),
-            context: SerializationContext::WasmBoundary,
-        }),
-        CoreValue::ResourceRef { path } => Err(SerializationError::UnresolvedResourceRef {
-            path: path.to_dot_string(),
-            context: SerializationContext::WasmBoundary,
-        }),
-        CoreValue::BindingRef { binding } => Err(SerializationError::UnresolvedResourceRef {
-            path: binding.clone(),
-            context: SerializationContext::WasmBoundary,
-        }),
-        CoreValue::Interpolation(_) => Err(SerializationError::UnresolvedInterpolation {
-            context: SerializationContext::WasmBoundary,
-        }),
-        CoreValue::FunctionCall { name, .. } => Err(SerializationError::UnresolvedFunctionCall {
-            name: name.clone(),
-            context: SerializationContext::WasmBoundary,
-        }),
+        CoreValue::Deferred(DeferredValue::Unknown(reason)) => {
+            Err(SerializationError::UnknownNotAllowed {
+                reason: reason.clone(),
+                context: SerializationContext::WasmBoundary,
+            })
+        }
+        CoreValue::Deferred(DeferredValue::ResourceRef { path }) => {
+            Err(SerializationError::UnresolvedResourceRef {
+                path: path.to_dot_string(),
+                context: SerializationContext::WasmBoundary,
+            })
+        }
+        CoreValue::Deferred(DeferredValue::BindingRef { binding }) => {
+            Err(SerializationError::UnresolvedResourceRef {
+                path: binding.clone(),
+                context: SerializationContext::WasmBoundary,
+            })
+        }
+        CoreValue::Deferred(DeferredValue::Interpolation(_)) => {
+            Err(SerializationError::UnresolvedInterpolation {
+                context: SerializationContext::WasmBoundary,
+            })
+        }
+        CoreValue::Deferred(DeferredValue::FunctionCall { name, .. }) => {
+            Err(SerializationError::UnresolvedFunctionCall {
+                name: name.clone(),
+                context: SerializationContext::WasmBoundary,
+            })
+        }
         // Within this helper a `Secret` would only appear if the caller
         // wrapped one inside a `List` / `Map` payload going to a WIT
         // `list-val` / `map-val`. Render it as the JSON-encoded inner so
@@ -216,33 +242,33 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
         // that decode `list-val` / `map-val` see the inner JSON shape;
         // `secret-val` is the channel used to mark the *attribute* itself
         // as a secret.
-        CoreValue::Secret(inner) => core_value_to_json(inner),
+        CoreValue::Deferred(DeferredValue::Secret(inner)) => core_value_to_json(inner),
     }
 }
 
 /// Helper: convert a serde_json::Value to a core Value.
 fn json_to_core_value(v: &serde_json::Value) -> CoreValue {
     match v {
-        serde_json::Value::String(s) => CoreValue::String(s.clone()),
+        serde_json::Value::String(s) => CoreValue::Concrete(ConcreteValue::String(s.clone())),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                CoreValue::Int(i)
+                CoreValue::Concrete(ConcreteValue::Int(i))
             } else if let Some(f) = n.as_f64() {
-                CoreValue::Float(f)
+                CoreValue::Concrete(ConcreteValue::Float(f))
             } else {
-                CoreValue::String(n.to_string())
+                CoreValue::Concrete(ConcreteValue::String(n.to_string()))
             }
         }
-        serde_json::Value::Bool(b) => CoreValue::Bool(*b),
-        serde_json::Value::Array(items) => {
-            CoreValue::List(items.iter().map(json_to_core_value).collect())
-        }
-        serde_json::Value::Object(map) => CoreValue::Map(
+        serde_json::Value::Bool(b) => CoreValue::Concrete(ConcreteValue::Bool(*b)),
+        serde_json::Value::Array(items) => CoreValue::Concrete(ConcreteValue::List(
+            items.iter().map(json_to_core_value).collect(),
+        )),
+        serde_json::Value::Object(map) => CoreValue::Concrete(ConcreteValue::Map(
             map.iter()
                 .map(|(k, v)| (k.clone(), json_to_core_value(v)))
                 .collect(),
-        ),
-        serde_json::Value::Null => CoreValue::String(String::new()),
+        )),
+        serde_json::Value::Null => CoreValue::Concrete(ConcreteValue::String(String::new())),
     }
 }
 
@@ -581,7 +607,7 @@ fn build_validator_from_types(
 fn validate_tags_key_value(
     attrs: &HashMap<String, CoreValue>,
 ) -> Result<(), Vec<carina_core::schema::TypeError>> {
-    if let Some(CoreValue::Map(map)) = attrs.get("tags") {
+    if let Some(CoreValue::Concrete(ConcreteValue::Map(map))) = attrs.get("tags") {
         let (mut has_key, mut has_value) = (false, false);
         for k in map.keys() {
             if k.eq_ignore_ascii_case("key") {
@@ -685,7 +711,7 @@ fn proto_struct_field_to_core(f: &proto::StructField) -> CoreStructField {
 mod tests {
     use super::*;
 
-    /// RFC #2371 stage 4 contract pin: `Value::Unknown` reaching either
+    /// RFC #2371 stage 4 contract pin: `Value::Deferred(DeferredValue::Unknown)` reaching either
     /// WASM-boundary converter is a stage-2 invariant violation
     /// (`PlanPreprocessor::strip_unknown_attributes` must remove it
     /// first). The converters now return `Err(SerializationError::
@@ -696,7 +722,9 @@ mod tests {
     fn unknown_returns_err_in_core_to_wit_value() {
         use carina_core::resource::{AccessPath, UnknownReason};
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
-        let v = CoreValue::Unknown(UnknownReason::UpstreamRef { path: path.clone() });
+        let v = CoreValue::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+            path: path.clone(),
+        }));
         let err = core_to_wit_value(&v).unwrap_err();
         match err {
             SerializationError::UnknownNotAllowed {
@@ -711,7 +739,9 @@ mod tests {
     fn unknown_returns_err_in_core_value_to_json() {
         use carina_core::resource::{AccessPath, UnknownReason};
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
-        let v = CoreValue::Unknown(UnknownReason::UpstreamRef { path: path.clone() });
+        let v = CoreValue::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+            path: path.clone(),
+        }));
         let err = core_value_to_json(&v).unwrap_err();
         assert!(matches!(
             err,
@@ -726,7 +756,7 @@ mod tests {
 
     #[test]
     fn test_scalar_bool_roundtrip() {
-        let core = CoreValue::Bool(true);
+        let core = CoreValue::Concrete(ConcreteValue::Bool(true));
         let wit = core_to_wit_value(&core).unwrap();
         let back = wit_to_core_value(&wit);
         assert_eq!(core, back);
@@ -734,7 +764,7 @@ mod tests {
 
     #[test]
     fn test_scalar_int_roundtrip() {
-        let core = CoreValue::Int(42);
+        let core = CoreValue::Concrete(ConcreteValue::Int(42));
         let wit = core_to_wit_value(&core).unwrap();
         let back = wit_to_core_value(&wit);
         assert_eq!(core, back);
@@ -742,7 +772,7 @@ mod tests {
 
     #[test]
     fn test_scalar_float_roundtrip() {
-        let core = CoreValue::Float(2.78);
+        let core = CoreValue::Concrete(ConcreteValue::Float(2.78));
         let wit = core_to_wit_value(&core).unwrap();
         let back = wit_to_core_value(&wit);
         assert_eq!(core, back);
@@ -750,7 +780,7 @@ mod tests {
 
     #[test]
     fn test_scalar_string_roundtrip() {
-        let core = CoreValue::String("hello".into());
+        let core = CoreValue::Concrete(ConcreteValue::String("hello".into()));
         let wit = core_to_wit_value(&core).unwrap();
         let back = wit_to_core_value(&wit);
         assert_eq!(core, back);
@@ -758,11 +788,11 @@ mod tests {
 
     #[test]
     fn test_list_roundtrip() {
-        let core = CoreValue::List(vec![
-            CoreValue::String("a".into()),
-            CoreValue::Int(1),
-            CoreValue::Bool(false),
-        ]);
+        let core = CoreValue::Concrete(ConcreteValue::List(vec![
+            CoreValue::Concrete(ConcreteValue::String("a".into())),
+            CoreValue::Concrete(ConcreteValue::Int(1)),
+            CoreValue::Concrete(ConcreteValue::Bool(false)),
+        ]));
         let wit = core_to_wit_value(&core).unwrap();
         assert!(matches!(wit, wit::Value::ListVal(_)));
         let back = wit_to_core_value(&wit);
@@ -771,14 +801,20 @@ mod tests {
 
     #[test]
     fn test_map_roundtrip() {
-        let core = CoreValue::Map(
+        let core = CoreValue::Concrete(ConcreteValue::Map(
             vec![
-                ("key1".to_string(), CoreValue::String("val1".into())),
-                ("key2".to_string(), CoreValue::Int(99)),
+                (
+                    "key1".to_string(),
+                    CoreValue::Concrete(ConcreteValue::String("val1".into())),
+                ),
+                (
+                    "key2".to_string(),
+                    CoreValue::Concrete(ConcreteValue::Int(99)),
+                ),
             ]
             .into_iter()
             .collect(),
-        );
+        ));
         let wit = core_to_wit_value(&core).unwrap();
         assert!(matches!(wit, wit::Value::MapVal(_)));
         let back = wit_to_core_value(&wit);
@@ -787,15 +823,21 @@ mod tests {
 
     #[test]
     fn test_nested_list_of_maps_roundtrip() {
-        let inner_map = CoreValue::Map(
+        let inner_map = CoreValue::Concrete(ConcreteValue::Map(
             vec![
-                ("name".to_string(), CoreValue::String("test".into())),
-                ("count".to_string(), CoreValue::Int(5)),
+                (
+                    "name".to_string(),
+                    CoreValue::Concrete(ConcreteValue::String("test".into())),
+                ),
+                (
+                    "count".to_string(),
+                    CoreValue::Concrete(ConcreteValue::Int(5)),
+                ),
             ]
             .into_iter()
             .collect(),
-        );
-        let core = CoreValue::List(vec![inner_map.clone(), inner_map]);
+        ));
+        let core = CoreValue::Concrete(ConcreteValue::List(vec![inner_map.clone(), inner_map]));
         let wit = core_to_wit_value(&core).unwrap();
         let back = wit_to_core_value(&wit);
         assert_eq!(core, back);
@@ -803,29 +845,32 @@ mod tests {
 
     #[test]
     fn test_nested_map_of_lists_roundtrip() {
-        let core = CoreValue::Map(
+        let core = CoreValue::Concrete(ConcreteValue::Map(
             vec![
                 (
                     "tags".to_string(),
-                    CoreValue::List(vec![
+                    CoreValue::Concrete(ConcreteValue::List(vec![
                         CoreValue::String("a".into()),
                         CoreValue::String("b".into()),
-                    ]),
+                    ])),
                 ),
                 (
                     "counts".to_string(),
-                    CoreValue::List(vec![CoreValue::Int(1), CoreValue::Int(2)]),
+                    CoreValue::Concrete(ConcreteValue::List(vec![
+                        CoreValue::Int(1),
+                        CoreValue::Int(2),
+                    ])),
                 ),
             ]
             .into_iter()
             .collect(),
-        );
+        ));
         let wit = core_to_wit_value(&core).unwrap();
         let back = wit_to_core_value(&wit);
         assert_eq!(core, back);
     }
 
-    /// #2387: `Value::ResourceRef` reaching `core_to_wit_value` is a
+    /// #2387: `Value::Deferred(DeferredValue::ResourceRef)` reaching `core_to_wit_value` is a
     /// stage-2 invariant violation now — the strip-and-restore pass in
     /// `PlanPreprocessor::prepare` removes any attribute that
     /// recursively contains a `ResourceRef` before this boundary. The
@@ -836,7 +881,7 @@ mod tests {
     fn resource_ref_returns_err_in_core_to_wit_value() {
         use carina_core::resource::AccessPath;
         let path = AccessPath::new("sso", "identity_store_id");
-        let v = CoreValue::ResourceRef { path: path.clone() };
+        let v = CoreValue::Deferred(DeferredValue::ResourceRef { path: path.clone() });
         let err = core_to_wit_value(&v).unwrap_err();
         match err {
             SerializationError::UnresolvedResourceRef {
@@ -850,12 +895,12 @@ mod tests {
     #[test]
     fn interpolation_returns_err_in_core_to_wit_value() {
         use carina_core::resource::{AccessPath, InterpolationPart};
-        let v = CoreValue::Interpolation(vec![
+        let v = CoreValue::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("prefix-".into()),
-            InterpolationPart::Expr(CoreValue::ResourceRef {
+            InterpolationPart::Expr(CoreValue::Deferred(DeferredValue::ResourceRef {
                 path: AccessPath::new("vpc", "id"),
-            }),
-        ]);
+            })),
+        ]));
         let err = core_to_wit_value(&v).unwrap_err();
         assert!(matches!(
             err,
@@ -868,15 +913,15 @@ mod tests {
     #[test]
     fn function_call_returns_err_in_core_to_wit_value() {
         use carina_core::resource::AccessPath;
-        let v = CoreValue::FunctionCall {
+        let v = CoreValue::Deferred(DeferredValue::FunctionCall {
             name: "join".into(),
             args: vec![
-                CoreValue::String("-".into()),
-                CoreValue::ResourceRef {
+                CoreValue::Concrete(ConcreteValue::String("-".into())),
+                CoreValue::Deferred(DeferredValue::ResourceRef {
                     path: AccessPath::new("vpc", "id"),
-                },
+                }),
             ],
-        };
+        });
         let err = core_to_wit_value(&v).unwrap_err();
         match err {
             SerializationError::UnresolvedFunctionCall {
@@ -891,7 +936,7 @@ mod tests {
     fn resource_ref_returns_err_in_core_value_to_json() {
         use carina_core::resource::AccessPath;
         let path = AccessPath::new("sso", "identity_store_id");
-        let v = CoreValue::ResourceRef { path: path.clone() };
+        let v = CoreValue::Deferred(DeferredValue::ResourceRef { path: path.clone() });
         let err = core_value_to_json(&v).unwrap_err();
         assert!(matches!(
             err,
@@ -902,12 +947,14 @@ mod tests {
         ));
     }
 
-    /// #2390: `Value::Secret` crosses the boundary as the `secret-val`
+    /// #2390: `Value::Deferred(DeferredValue::Secret)` crosses the boundary as the `secret-val`
     /// WIT variant carrying the JSON-encoded inner — never as a
     /// `format!("{v:?}")` debug string.
     #[test]
     fn secret_string_emits_secret_val_variant() {
-        let v = CoreValue::Secret(Box::new(CoreValue::String("password".into())));
+        let v = CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
+            ConcreteValue::String("password".into()),
+        ))));
         let wit_v = core_to_wit_value(&v).unwrap();
         match wit_v {
             wit::Value::SecretVal(json) => assert_eq!(json, "\"password\""),
@@ -919,7 +966,9 @@ mod tests {
     fn secret_int_emits_secret_val_variant() {
         // Audit (carina#2390 step 12) confirmed `secret()` accepts any
         // scalar; pin the wire format for non-string inner values too.
-        let v = CoreValue::Secret(Box::new(CoreValue::Int(42)));
+        let v = CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
+            ConcreteValue::Int(42),
+        ))));
         let wit_v = core_to_wit_value(&v).unwrap();
         match wit_v {
             wit::Value::SecretVal(json) => assert_eq!(json, "42"),
@@ -932,12 +981,14 @@ mod tests {
         // Round-tripping through the WIT boundary preserves the
         // `Secret` wrapper so host-side machinery (state hashing, plan
         // redaction) keeps recognising it after a guest call returns.
-        let original = CoreValue::Secret(Box::new(CoreValue::String("hunter2".into())));
+        let original = CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
+            ConcreteValue::String("hunter2".into()),
+        ))));
         let wit_v = core_to_wit_value(&original).unwrap();
         let back = wit_to_core_value(&wit_v);
         match back {
-            CoreValue::Secret(inner) => match *inner {
-                CoreValue::String(s) => assert_eq!(s, "hunter2"),
+            CoreValue::Deferred(DeferredValue::Secret(inner)) => match *inner {
+                CoreValue::Concrete(ConcreteValue::String(s)) => assert_eq!(s, "hunter2"),
                 other => panic!("expected inner String, got: {other:?}"),
             },
             other => panic!("expected Secret, got: {other:?}"),
@@ -952,9 +1003,9 @@ mod tests {
         // decoding the list see the operational value. The
         // *attribute*-level secret signal goes through `secret-val` via
         // `core_to_wit_value`, not this path.
-        let v = CoreValue::List(vec![CoreValue::Secret(Box::new(CoreValue::String(
-            "p".into(),
-        )))]);
+        let v = CoreValue::Concrete(ConcreteValue::List(vec![CoreValue::Deferred(
+            DeferredValue::Secret(Box::new(CoreValue::String("p".into()))),
+        )]));
         let wit_v = core_to_wit_value(&v).unwrap();
         match wit_v {
             wit::Value::ListVal(json) => assert_eq!(json, "[\"p\"]"),
@@ -981,8 +1032,14 @@ mod tests {
     fn test_state_roundtrip() {
         let id = CoreResourceId::with_provider("aws", "s3.Bucket", "my-bucket");
         let mut attrs = HashMap::new();
-        attrs.insert("name".into(), CoreValue::String("my-bucket".into()));
-        attrs.insert("region".into(), CoreValue::String("us-east-1".into()));
+        attrs.insert(
+            "name".into(),
+            CoreValue::Concrete(ConcreteValue::String("my-bucket".into())),
+        );
+        attrs.insert(
+            "region".into(),
+            CoreValue::Concrete(ConcreteValue::String("us-east-1".into())),
+        );
         let core = CoreState::existing(id.clone(), attrs);
 
         let wit = core_to_wit_state(&core).unwrap();
@@ -996,7 +1053,10 @@ mod tests {
     #[test]
     fn test_state_with_identifier_roundtrip() {
         let id = CoreResourceId::with_provider("aws", "ec2.Vpc", "main");
-        let attrs = HashMap::from([("cidr".into(), CoreValue::String("10.0.0.0/16".into()))]);
+        let attrs = HashMap::from([(
+            "cidr".into(),
+            CoreValue::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+        )]);
         let core = CoreState::existing(id.clone(), attrs).with_identifier("vpc-12345");
 
         let wit = core_to_wit_state(&core).unwrap();
@@ -1010,8 +1070,11 @@ mod tests {
     #[test]
     fn test_value_map_roundtrip() {
         let map: HashMap<String, CoreValue> = vec![
-            ("a".into(), CoreValue::String("hello".into())),
-            ("b".into(), CoreValue::Int(42)),
+            (
+                "a".into(),
+                CoreValue::Concrete(ConcreteValue::String("hello".into())),
+            ),
+            ("b".into(), CoreValue::Concrete(ConcreteValue::Int(42))),
         ]
         .into_iter()
         .collect();
@@ -1027,8 +1090,14 @@ mod tests {
     fn test_resource_roundtrip() {
         let mut resource = CoreResource::with_provider("aws", "s3.Bucket", "my-bucket");
         resource.attributes = indexmap::IndexMap::from([
-            ("name".into(), CoreValue::String("my-bucket".into())),
-            ("region".into(), CoreValue::String("us-east-1".into())),
+            (
+                "name".into(),
+                CoreValue::Concrete(ConcreteValue::String("my-bucket".into())),
+            ),
+            (
+                "region".into(),
+                CoreValue::Concrete(ConcreteValue::String("us-east-1".into())),
+            ),
         ]);
 
         let wit = core_to_wit_resource(&resource).unwrap();
@@ -1350,15 +1419,15 @@ mod tests {
 
     #[test]
     fn test_deeply_nested_list_map_roundtrip() {
-        let policy_document = CoreValue::Map(
+        let policy_document = CoreValue::Concrete(ConcreteValue::Map(
             vec![
                 (
                     "version".to_string(),
-                    CoreValue::String("2012-10-17".into()),
+                    CoreValue::Concrete(ConcreteValue::String("2012-10-17".into())),
                 ),
                 (
                     "statement".to_string(),
-                    CoreValue::List(vec![CoreValue::Map(
+                    CoreValue::Concrete(ConcreteValue::List(vec![CoreValue::Map(
                         vec![
                             ("effect".to_string(), CoreValue::String("Allow".into())),
                             (
@@ -1369,23 +1438,25 @@ mod tests {
                         ]
                         .into_iter()
                         .collect(),
-                    )]),
+                    )])),
                 ),
             ]
             .into_iter()
             .collect(),
-        );
-        let policies = CoreValue::List(vec![CoreValue::Map(
-            vec![
-                (
-                    "policy_name".to_string(),
-                    CoreValue::String("test-policy".into()),
-                ),
-                ("policy_document".to_string(), policy_document),
-            ]
-            .into_iter()
-            .collect(),
-        )]);
+        ));
+        let policies = CoreValue::Concrete(ConcreteValue::List(vec![CoreValue::Concrete(
+            ConcreteValue::Map(
+                vec![
+                    (
+                        "policy_name".to_string(),
+                        CoreValue::String("test-policy".into()),
+                    ),
+                    ("policy_document".to_string(), policy_document),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        )]));
 
         let wit = core_to_wit_value(&policies).unwrap();
         let back = wit_to_core_value(&wit);
@@ -1562,14 +1633,20 @@ mod tests {
         let mut attrs = HashMap::new();
         attrs.insert(
             "tags".to_string(),
-            CoreValue::Map(
+            CoreValue::Concrete(ConcreteValue::Map(
                 [
-                    ("key".to_string(), CoreValue::String("Project".into())),
-                    ("value".to_string(), CoreValue::String("carina".into())),
+                    (
+                        "key".to_string(),
+                        CoreValue::Concrete(ConcreteValue::String("Project".into())),
+                    ),
+                    (
+                        "value".to_string(),
+                        CoreValue::Concrete(ConcreteValue::String("carina".into())),
+                    ),
                 ]
                 .into_iter()
                 .collect(),
-            ),
+            )),
         );
         assert!(validator(&attrs).is_err());
 
@@ -1577,11 +1654,14 @@ mod tests {
         let mut attrs = HashMap::new();
         attrs.insert(
             "tags".to_string(),
-            CoreValue::Map(
-                [("Project".to_string(), CoreValue::String("carina".into()))]
-                    .into_iter()
-                    .collect(),
-            ),
+            CoreValue::Concrete(ConcreteValue::Map(
+                [(
+                    "Project".to_string(),
+                    CoreValue::Concrete(ConcreteValue::String("carina".into())),
+                )]
+                .into_iter()
+                .collect(),
+            )),
         );
         assert!(validator(&attrs).is_ok());
     }

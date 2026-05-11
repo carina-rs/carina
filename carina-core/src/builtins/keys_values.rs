@@ -1,6 +1,6 @@
 //! `keys(map)` and `values(map)` built-in functions
 
-use crate::resource::Value;
+use crate::resource::{ConcreteValue, Value};
 
 use super::value_type_name;
 
@@ -20,10 +20,12 @@ pub(crate) fn builtin_keys(args: &[Value]) -> Result<Value, String> {
     }
 
     match &args[0] {
-        Value::Map(map) => {
+        Value::Concrete(ConcreteValue::Map(map)) => {
             let mut keys: Vec<String> = map.keys().cloned().collect();
             keys.sort();
-            Ok(Value::List(keys.into_iter().map(Value::String).collect()))
+            Ok(Value::Concrete(ConcreteValue::List(
+                keys.into_iter().map(Value::String).collect(),
+            )))
         }
         other => Err(format!(
             "keys() argument must be a Map, got {}",
@@ -48,12 +50,12 @@ pub(crate) fn builtin_values(args: &[Value]) -> Result<Value, String> {
     }
 
     match &args[0] {
-        Value::Map(map) => {
+        Value::Concrete(ConcreteValue::Map(map)) => {
             let mut keys: Vec<String> = map.keys().cloned().collect();
             keys.sort();
-            Ok(Value::List(
+            Ok(Value::Concrete(ConcreteValue::List(
                 keys.into_iter().map(|k| map[&k].clone()).collect(),
-            ))
+            )))
         }
         other => Err(format!(
             "values() argument must be a Map, got {}",
@@ -67,41 +69,46 @@ mod tests {
     use indexmap::IndexMap;
 
     use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
-    use crate::resource::Value;
+    use crate::resource::{ConcreteValue, Value};
 
     #[test]
     fn keys_basic() {
-        let args = vec![Value::Map(IndexMap::from([
-            ("b".to_string(), Value::Int(2)),
-            ("a".to_string(), Value::Int(1)),
-            ("c".to_string(), Value::Int(3)),
-        ]))];
+        let args = vec![Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("b".to_string(), Value::Concrete(ConcreteValue::Int(2))),
+            ("a".to_string(), Value::Concrete(ConcreteValue::Int(1))),
+            ("c".to_string(), Value::Concrete(ConcreteValue::Int(3))),
+        ])))];
         let result = evaluate_builtin("keys", &args).unwrap();
         assert_eq!(
             result,
-            Value::List(vec![
-                Value::String("a".to_string()),
-                Value::String("b".to_string()),
-                Value::String("c".to_string()),
-            ])
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("a".to_string())),
+                Value::Concrete(ConcreteValue::String("b".to_string())),
+                Value::Concrete(ConcreteValue::String("c".to_string())),
+            ]))
         );
     }
 
     #[test]
     fn keys_empty_map() {
-        let args = vec![Value::Map(IndexMap::new())];
+        let args = vec![Value::Concrete(ConcreteValue::Map(IndexMap::new()))];
         let result = evaluate_builtin("keys", &args).unwrap();
-        assert_eq!(result, Value::List(vec![]));
+        assert_eq!(result, Value::Concrete(ConcreteValue::List(vec![])));
     }
 
     #[test]
     fn keys_single_entry() {
-        let args = vec![Value::Map(IndexMap::from([(
+        let args = vec![Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "only".to_string(),
-            Value::String("value".to_string()),
-        )]))];
+            Value::Concrete(ConcreteValue::String("value".to_string())),
+        )])))];
         let result = evaluate_builtin("keys", &args).unwrap();
-        assert_eq!(result, Value::List(vec![Value::String("only".to_string())]));
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("only".to_string())
+            )]))
+        );
     }
 
     #[test]
@@ -113,7 +120,10 @@ mod tests {
 
     #[test]
     fn keys_wrong_arg_count_two() {
-        let args = vec![Value::Map(IndexMap::new()), Value::Map(IndexMap::new())];
+        let args = vec![
+            Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+            Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+        ];
         let result = evaluate_builtin("keys", &args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("expects 1 argument"));
@@ -121,7 +131,9 @@ mod tests {
 
     #[test]
     fn keys_invalid_type() {
-        let args = vec![Value::List(vec![Value::Int(1)])];
+        let args = vec![Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Int(1),
+        )]))];
         let result = evaluate_builtin("keys", &args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("must be a Map"));
@@ -129,37 +141,47 @@ mod tests {
 
     #[test]
     fn values_basic() {
-        let args = vec![Value::Map(IndexMap::from([
-            ("b".to_string(), Value::Int(2)),
-            ("a".to_string(), Value::Int(1)),
-            ("c".to_string(), Value::Int(3)),
-        ]))];
+        let args = vec![Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("b".to_string(), Value::Concrete(ConcreteValue::Int(2))),
+            ("a".to_string(), Value::Concrete(ConcreteValue::Int(1))),
+            ("c".to_string(), Value::Concrete(ConcreteValue::Int(3))),
+        ])))];
         let result = evaluate_builtin("values", &args).unwrap();
         // Values should be ordered by sorted keys: a=1, b=2, c=3
         assert_eq!(
             result,
-            Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::Int(1)),
+                Value::Concrete(ConcreteValue::Int(2)),
+                Value::Concrete(ConcreteValue::Int(3))
+            ]))
         );
     }
 
     #[test]
     fn values_empty_map() {
-        let args = vec![Value::Map(IndexMap::new())];
+        let args = vec![Value::Concrete(ConcreteValue::Map(IndexMap::new()))];
         let result = evaluate_builtin("values", &args).unwrap();
-        assert_eq!(result, Value::List(vec![]));
+        assert_eq!(result, Value::Concrete(ConcreteValue::List(vec![])));
     }
 
     #[test]
     fn values_mixed_types() {
-        let args = vec![Value::Map(IndexMap::from([
-            ("name".to_string(), Value::String("test".to_string())),
-            ("count".to_string(), Value::Int(42)),
-        ]))];
+        let args = vec![Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("test".to_string())),
+            ),
+            ("count".to_string(), Value::Concrete(ConcreteValue::Int(42))),
+        ])))];
         let result = evaluate_builtin("values", &args).unwrap();
         // Sorted by key: count=42, name="test"
         assert_eq!(
             result,
-            Value::List(vec![Value::Int(42), Value::String("test".to_string()),])
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::Int(42)),
+                Value::Concrete(ConcreteValue::String("test".to_string())),
+            ]))
         );
     }
 
@@ -172,7 +194,10 @@ mod tests {
 
     #[test]
     fn values_wrong_arg_count_two() {
-        let args = vec![Value::Map(IndexMap::new()), Value::Map(IndexMap::new())];
+        let args = vec![
+            Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+            Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+        ];
         let result = evaluate_builtin("values", &args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("expects 1 argument"));
@@ -180,7 +205,9 @@ mod tests {
 
     #[test]
     fn values_invalid_type() {
-        let args = vec![Value::String("not a map".to_string())];
+        let args = vec![Value::Concrete(ConcreteValue::String(
+            "not a map".to_string(),
+        ))];
         let result = evaluate_builtin("values", &args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("must be a Map"));

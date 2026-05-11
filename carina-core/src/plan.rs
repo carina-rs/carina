@@ -420,7 +420,7 @@ mod tests {
 
     #[test]
     fn format_effect_brief_renders_wait() {
-        use crate::resource::{ResourceId, Value};
+        use crate::resource::{ConcreteValue, ResourceId, Value};
         use crate::wait::predicate::{AttrPath, WaitPredicate};
         use std::time::Duration;
 
@@ -430,7 +430,7 @@ mod tests {
             target_identifier: None,
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
-                value: Value::String("ISSUED".to_string()),
+                value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
             },
             until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
             timeout: Duration::from_secs(75 * 60),
@@ -445,7 +445,7 @@ mod tests {
 
     #[test]
     fn plan_summary_counts_wait() {
-        use crate::resource::{ResourceId, Value};
+        use crate::resource::{ConcreteValue, ResourceId, Value};
         use crate::wait::predicate::{AttrPath, WaitPredicate};
         use std::time::Duration;
 
@@ -457,7 +457,7 @@ mod tests {
             target_identifier: None,
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
-                value: Value::String("ISSUED".to_string()),
+                value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
             },
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: Duration::from_secs(60),

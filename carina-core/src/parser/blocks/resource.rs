@@ -11,7 +11,7 @@ use crate::parser::context::{ParseContext, extract_key_string, first_inner, next
 use crate::parser::error::ParseError;
 use crate::parser::parse_expression;
 use crate::parser::util::expression_is_plain_string_literal;
-use crate::resource::{Resource, ResourceId, ResourceKind, Value};
+use crate::resource::{ConcreteValue, Resource, ResourceId, ResourceKind, Value};
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -44,7 +44,10 @@ pub(in crate::parser) fn parse_anonymous_resource(
     let resource_name = String::new();
 
     let mut attributes = attributes;
-    attributes.insert("_type".to_string(), Value::String(namespaced_type.clone()));
+    attributes.insert(
+        "_type".to_string(),
+        Value::Concrete(ConcreteValue::String(namespaced_type.clone())),
+    );
 
     // Extract directives block from attributes (it's a meta-argument, not a real attribute)
     let directives = extract_directives(&mut attributes)?;
@@ -87,7 +90,7 @@ pub(in crate::parser) fn parse_block_contents_with_quoted(
 ) -> Result<IndexMap<String, Value>, ParseError> {
     // `IndexMap` so the order in which the user wrote attributes in the
     // .crn file flows all the way to `Resource.attributes` and to
-    // `Value::Map` payloads — anything that re-renders attributes
+    // `Value::Concrete(ConcreteValue::Map)` payloads — anything that re-renders attributes
     // (formatter, plan display, diagnostics) sees a stable order.
     let mut attributes: IndexMap<String, Value> = IndexMap::new();
     let mut nested_blocks: IndexMap<String, Vec<Value>> = IndexMap::new();
@@ -138,7 +141,7 @@ pub(in crate::parser) fn parse_block_contents_with_quoted(
                         nested_blocks
                             .entry(block_name)
                             .or_default()
-                            .push(Value::Map(block_attrs));
+                            .push(Value::Concrete(ConcreteValue::Map(block_attrs)));
                     }
                     _ => {}
                 }
@@ -158,7 +161,7 @@ pub(in crate::parser) fn parse_block_contents_with_quoted(
 
     // Convert nested blocks to list attributes
     for (name, blocks) in nested_blocks {
-        attributes.insert(name, Value::List(blocks));
+        attributes.insert(name, Value::Concrete(ConcreteValue::List(blocks)));
     }
 
     Ok(attributes)
@@ -210,7 +213,10 @@ pub(crate) fn parse_resource_expr(
     // Extract directives block from attributes (it's a meta-argument, not a real attribute)
     let directives = extract_directives(&mut attributes)?;
 
-    attributes.insert("_type".to_string(), Value::String(namespaced_type.clone()));
+    attributes.insert(
+        "_type".to_string(),
+        Value::Concrete(ConcreteValue::String(namespaced_type.clone())),
+    );
 
     let id = ResourceId::with_provider(provider, resource_type, resource_name);
 
@@ -259,7 +265,10 @@ pub(crate) fn parse_read_resource_expr(
     // Extract directives block from attributes (it's a meta-argument, not a real attribute)
     let directives = extract_directives(&mut attributes)?;
 
-    attributes.insert("_type".to_string(), Value::String(namespaced_type.clone()));
+    attributes.insert(
+        "_type".to_string(),
+        Value::Concrete(ConcreteValue::String(namespaced_type.clone())),
+    );
 
     let id = ResourceId::with_provider(provider, resource_type, resource_name);
 

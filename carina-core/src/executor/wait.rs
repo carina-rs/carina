@@ -65,7 +65,7 @@ pub async fn execute_wait_effect(
 mod tests {
     use super::*;
     use crate::provider::{BoxFuture, CreateRequest, DeleteRequest, ReadRequest, UpdateRequest};
-    use crate::resource::{Resource, Value};
+    use crate::resource::{ConcreteValue, Resource, Value};
     use crate::wait::predicate::{AttrPath, WaitPredicate};
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -152,14 +152,17 @@ mod tests {
 
     fn state_with_status(status: &str) -> State {
         let mut attrs = HashMap::new();
-        attrs.insert("status".to_string(), Value::String(status.to_string()));
+        attrs.insert(
+            "status".to_string(),
+            Value::Concrete(ConcreteValue::String(status.to_string())),
+        );
         State::existing(ResourceId::new("acm.Certificate", "cert"), attrs)
     }
 
     fn equals_status(value: &str) -> WaitPredicate {
         WaitPredicate::Equals {
             attr: AttrPath::single("status"),
-            value: Value::String(value.to_string()),
+            value: Value::Concrete(ConcreteValue::String(value.to_string())),
         }
     }
 
@@ -180,7 +183,9 @@ mod tests {
         let state = result.expect("wait should succeed");
         assert_eq!(
             state.attributes.get("status"),
-            Some(&Value::String("ISSUED".to_string()))
+            Some(&Value::Concrete(ConcreteValue::String(
+                "ISSUED".to_string()
+            )))
         );
         assert_eq!(provider.read_count(), 1);
     }

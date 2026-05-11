@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::parser::{ResourceTypePath, TypeExpr};
-use crate::resource::Value;
+use crate::resource::{ConcreteValue, DeferredValue, Value};
 
 /// Dependency between resources
 #[derive(Debug, Clone)]
@@ -118,15 +118,15 @@ impl DependencyGraph {
 /// Format a Value for display
 fn format_value(value: &Value) -> String {
     match value {
-        Value::String(s) => {
+        Value::Concrete(ConcreteValue::String(s)) => {
             if s.len() > 50 {
                 format!("\"{}...\"", &s[..47])
             } else {
                 format!("\"{}\"", s)
             }
         }
-        Value::Int(n) => n.to_string(),
-        Value::Float(f) => {
+        Value::Concrete(ConcreteValue::Int(n)) => n.to_string(),
+        Value::Concrete(ConcreteValue::Float(f)) => {
             let s = f.to_string();
             if s.contains('.') {
                 s
@@ -134,9 +134,9 @@ fn format_value(value: &Value) -> String {
                 format!("{}.0", s)
             }
         }
-        Value::Bool(b) => b.to_string(),
-        Value::Duration(d) => crate::value::render_duration(*d),
-        Value::List(items) => {
+        Value::Concrete(ConcreteValue::Bool(b)) => b.to_string(),
+        Value::Concrete(ConcreteValue::Duration(d)) => crate::value::render_duration(*d),
+        Value::Concrete(ConcreteValue::List(items)) => {
             if items.is_empty() {
                 "[]".to_string()
             } else if items.len() <= 3 {
@@ -146,7 +146,7 @@ fn format_value(value: &Value) -> String {
                 format!("[{} items]", items.len())
             }
         }
-        Value::StringList(items) => {
+        Value::Concrete(ConcreteValue::StringList(items)) => {
             if items.is_empty() {
                 "[]".to_string()
             } else if items.len() <= 3 {
@@ -156,18 +156,18 @@ fn format_value(value: &Value) -> String {
                 format!("[{} items]", items.len())
             }
         }
-        Value::Map(map) => {
+        Value::Concrete(ConcreteValue::Map(map)) => {
             if map.is_empty() {
                 "{}".to_string()
             } else {
                 format!("{{...{} keys}}", map.len())
             }
         }
-        Value::ResourceRef { path } => {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
             format!("{}.{}", path.binding(), path.attribute())
         }
-        Value::BindingRef { binding } => binding.clone(),
-        Value::Interpolation(parts) => {
+        Value::Deferred(DeferredValue::BindingRef { binding }) => binding.clone(),
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
             use crate::resource::InterpolationPart;
             let inner: String = parts
                 .iter()
@@ -178,12 +178,12 @@ fn format_value(value: &Value) -> String {
                 .collect();
             format!("\"{}\"", inner)
         }
-        Value::FunctionCall { name, args } => {
+        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
             let arg_strs: Vec<_> = args.iter().map(format_value).collect();
             format!("{}({})", name, arg_strs.join(", "))
         }
-        Value::Secret(_) => "(secret)".to_string(),
-        Value::Unknown(reason) => crate::value::render_unknown(reason),
+        Value::Deferred(DeferredValue::Secret(_)) => "(secret)".to_string(),
+        Value::Deferred(DeferredValue::Unknown(reason)) => crate::value::render_unknown(reason),
     }
 }
 
@@ -368,7 +368,7 @@ impl RootConfigSignature {
                 .attributes
                 .get("_type")
                 .and_then(|v| match v {
-                    Value::String(s) => Some(s.clone()),
+                    Value::Concrete(ConcreteValue::String(s)) => Some(s.clone()),
                     _ => None,
                 })
                 .unwrap_or_else(|| resource.id.resource_type.clone());
@@ -446,7 +446,7 @@ impl RootConfigSignature {
         binding_types: &HashMap<String, ResourceTypePath>,
     ) {
         match value {
-            Value::ResourceRef { path } => {
+            Value::Deferred(DeferredValue::ResourceRef { path }) => {
                 let target_type = binding_types.get(path.binding()).cloned();
                 graph.add_edge(
                     from.to_string(),
@@ -462,7 +462,7 @@ impl RootConfigSignature {
             // #2847) are dependencies just like attribute refs; the
             // displayed `attribute` slot stays empty so
             // `format_dep_detail` renders `target (via used_in)`.
-            Value::BindingRef { binding } => {
+            Value::Deferred(DeferredValue::BindingRef { binding }) => {
                 let target_type = binding_types.get(binding).cloned();
                 graph.add_edge(
                     from.to_string(),
@@ -474,17 +474,17 @@ impl RootConfigSignature {
                     },
                 );
             }
-            Value::List(items) => {
+            Value::Concrete(ConcreteValue::List(items)) => {
                 for item in items {
                     Self::collect_typed_dependencies(from, attr_key, item, graph, binding_types);
                 }
             }
-            Value::Map(map) => {
+            Value::Concrete(ConcreteValue::Map(map)) => {
                 for (k, v) in map {
                     Self::collect_typed_dependencies(from, k, v, graph, binding_types);
                 }
             }
-            Value::Interpolation(parts) => {
+            Value::Deferred(DeferredValue::Interpolation(parts)) => {
                 use crate::resource::InterpolationPart;
                 for part in parts {
                     if let InterpolationPart::Expr(v) = part {
@@ -492,7 +492,7 @@ impl RootConfigSignature {
                     }
                 }
             }
-            Value::FunctionCall { args, .. } => {
+            Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
                 for arg in args {
                     Self::collect_typed_dependencies(from, attr_key, arg, graph, binding_types);
                 }
@@ -782,7 +782,7 @@ impl ModuleSignature {
                 .attributes
                 .get("_type")
                 .and_then(|v| match v {
-                    Value::String(s) => Some(s.clone()),
+                    Value::Concrete(ConcreteValue::String(s)) => Some(s.clone()),
                     _ => None,
                 })
                 .unwrap_or_else(|| resource.id.resource_type.clone());
@@ -839,7 +839,9 @@ impl ModuleSignature {
             .iter()
             .map(|attr_param| {
                 let source_binding = attr_param.value.as_ref().and_then(|v| match v {
-                    Value::ResourceRef { path } => Some(path.binding().to_string()),
+                    Value::Deferred(DeferredValue::ResourceRef { path }) => {
+                        Some(path.binding().to_string())
+                    }
                     _ => None,
                 });
 
@@ -869,7 +871,7 @@ impl ModuleSignature {
         argument_types: &HashMap<String, TypeExpr>,
     ) {
         match value {
-            Value::ResourceRef { path } => {
+            Value::Deferred(DeferredValue::ResourceRef { path }) => {
                 let binding_name = path.binding();
                 let target_type = if let Some(arg_type) = argument_types.get(binding_name) {
                     // Argument parameter reference (lexically scoped)
@@ -895,7 +897,7 @@ impl ModuleSignature {
             // Bare-binding refs (`vpc_id = vpc` referencing argument
             // `vpc`, since #2847) — same dependency edge, empty
             // attribute slot.
-            Value::BindingRef { binding } => {
+            Value::Deferred(DeferredValue::BindingRef { binding }) => {
                 let target_type = if let Some(arg_type) = argument_types.get(binding) {
                     if let TypeExpr::Ref(p) = arg_type {
                         Some(p.clone())
@@ -915,7 +917,7 @@ impl ModuleSignature {
                     },
                 );
             }
-            Value::List(items) => {
+            Value::Concrete(ConcreteValue::List(items)) => {
                 for item in items {
                     Self::collect_typed_dependencies(
                         from,
@@ -927,7 +929,7 @@ impl ModuleSignature {
                     );
                 }
             }
-            Value::Map(map) => {
+            Value::Concrete(ConcreteValue::Map(map)) => {
                 for (k, v) in map {
                     Self::collect_typed_dependencies(
                         from,
@@ -939,7 +941,7 @@ impl ModuleSignature {
                     );
                 }
             }
-            Value::Interpolation(parts) => {
+            Value::Deferred(DeferredValue::Interpolation(parts)) => {
                 use crate::resource::InterpolationPart;
                 for part in parts {
                     if let InterpolationPart::Expr(v) = part {
@@ -954,7 +956,7 @@ impl ModuleSignature {
                     }
                 }
             }
-            Value::FunctionCall { args, .. } => {
+            Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
                 for arg in args {
                     Self::collect_typed_dependencies(
                         from,

@@ -14,7 +14,7 @@ use crate::document::Document;
 use crate::position;
 use carina_core::parser::{ParseError, ParsedFile};
 use carina_core::provider::ProviderFactory;
-use carina_core::resource::Value;
+use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
 
 /// Create a `Diagnostic` on a single line with the standard "carina" source.
@@ -409,12 +409,12 @@ impl DiagnosticEngine {
                         // Type validation
                         if let Some(attr_schema) = schema.attributes.get(canonical_name) {
                             // Check for block syntax on bare Struct attributes:
-                            // Block syntax produces Value::List, but bare Struct requires
+                            // Block syntax produces Value::Concrete(ConcreteValue::List), but bare Struct requires
                             // map assignment syntax: attr = { ... }
                             if matches!(
                                 &attr_schema.attr_type,
                                 carina_core::schema::AttributeType::Struct { .. }
-                            ) && matches!(attr_value, Value::List(_))
+                            ) && matches!(attr_value, Value::Concrete(ConcreteValue::List(_)))
                             {
                                 let search_name =
                                     attr_schema.block_name.as_deref().unwrap_or(attr_name);
@@ -459,32 +459,35 @@ impl DiagnosticEngine {
                             }
                             let type_error = match (&attr_schema.attr_type, attr_value) {
                                 // Bool type should not receive String
-                                (carina_core::schema::AttributeType::Bool, Value::String(s)) => {
-                                    Some(format!(
-                                        "Type mismatch: expected Bool, got String \"{}\". Use true or false.",
-                                        s
-                                    ))
-                                }
+                                (
+                                    carina_core::schema::AttributeType::Bool,
+                                    Value::Concrete(ConcreteValue::String(s)),
+                                ) => Some(format!(
+                                    "Type mismatch: expected Bool, got String \"{}\". Use true or false.",
+                                    s
+                                )),
                                 // Int type should not receive String
-                                (carina_core::schema::AttributeType::Int, Value::String(s)) => {
-                                    Some(format!(
-                                        "Type mismatch: expected Int, got String \"{}\".",
-                                        s
-                                    ))
-                                }
+                                (
+                                    carina_core::schema::AttributeType::Int,
+                                    Value::Concrete(ConcreteValue::String(s)),
+                                ) => Some(format!(
+                                    "Type mismatch: expected Int, got String \"{}\".",
+                                    s
+                                )),
                                 // Float type should not receive String
-                                (carina_core::schema::AttributeType::Float, Value::String(s)) => {
-                                    Some(format!(
-                                        "Type mismatch: expected Float, got String \"{}\".",
-                                        s
-                                    ))
-                                }
+                                (
+                                    carina_core::schema::AttributeType::Float,
+                                    Value::Concrete(ConcreteValue::String(s)),
+                                ) => Some(format!(
+                                    "Type mismatch: expected Float, got String \"{}\".",
+                                    s
+                                )),
                                 // ResourceRef type check for Union, StringEnum, and Custom types
                                 (
                                     carina_core::schema::AttributeType::Union(_)
                                     | carina_core::schema::AttributeType::StringEnum { .. }
                                     | carina_core::schema::AttributeType::Custom { .. },
-                                    Value::ResourceRef { path },
+                                    Value::Deferred(DeferredValue::ResourceRef { path }),
                                 ) => check_resource_ref_type_mismatch(
                                     &binding_schema_map,
                                     &attr_schema.attr_type,
@@ -522,9 +525,14 @@ impl DiagnosticEngine {
                                     },
                                     value,
                                 ) => {
-                                    // `Value::Unknown` resolves at upstream apply — skip,
+                                    // `Value::Deferred(DeferredValue::Unknown)` resolves at upstream apply — skip,
                                     // matching the CLI's `walk_custom_lookup` behavior.
-                                    if matches!(value, carina_core::resource::Value::Unknown(_)) {
+                                    if matches!(
+                                        value,
+                                        carina_core::resource::Value::Deferred(
+                                            carina_core::resource::DeferredValue::Unknown(_)
+                                        )
+                                    ) {
                                         None
                                     } else {
                                         let name = semantic_name.as_deref().unwrap_or("");
@@ -558,11 +566,11 @@ impl DiagnosticEngine {
                                         // string when wrapping for the LSP message. See #2094.
                                         let inner_msg = inner_err.to_string();
                                         if namespace.is_some()
-                                            && matches!(value, Value::String(s) if !s.contains('.'))
+                                            && matches!(value, Value::Concrete(ConcreteValue::String(s)) if !s.contains('.'))
                                             && resource.quoted_string_attrs.contains(attr_name)
                                         {
                                             let typed = match value {
-                                                Value::String(s) => s.as_str(),
+                                                Value::Concrete(ConcreteValue::String(s)) => s.as_str(),
                                                 _ => "",
                                             };
                                             format!(
@@ -576,7 +584,10 @@ impl DiagnosticEngine {
                                     }
                                 }
                                 // String type - check for bare resource binding
-                                (carina_core::schema::AttributeType::String, Value::String(s)) => {
+                                (
+                                    carina_core::schema::AttributeType::String,
+                                    Value::Concrete(ConcreteValue::String(s)),
+                                ) => {
                                     if let Some(binding) =
                                         s.strip_prefix("${").and_then(|s| s.strip_suffix("}"))
                                     {
@@ -597,7 +608,7 @@ impl DiagnosticEngine {
                                 // List<Struct> is handled by validate_struct_value below)
                                 (
                                     carina_core::schema::AttributeType::List { inner, .. },
-                                    Value::List(_),
+                                    Value::Concrete(ConcreteValue::List(_)),
                                 ) if !matches!(
                                     inner.as_ref(),
                                     carina_core::schema::AttributeType::Struct { .. }
@@ -610,13 +621,14 @@ impl DiagnosticEngine {
                                         .map(|e| e.with_attribute(attr_name).to_string())
                                 }
                                 // Validate Map value types
-                                (carina_core::schema::AttributeType::Map { .. }, Value::Map(_)) => {
-                                    attr_schema
-                                        .attr_type
-                                        .validate(attr_value)
-                                        .err()
-                                        .map(|e| e.with_attribute(attr_name).to_string())
-                                }
+                                (
+                                    carina_core::schema::AttributeType::Map { .. },
+                                    Value::Concrete(ConcreteValue::Map(_)),
+                                ) => attr_schema
+                                    .attr_type
+                                    .validate(attr_value)
+                                    .err()
+                                    .map(|e| e.with_attribute(attr_name).to_string()),
                                 // Validate Union static values (non-ResourceRef, non-BindingRef).
                                 // Ref-shaped values are unresolved at this
                                 // checkpoint and must not be type-checked
@@ -625,7 +637,8 @@ impl DiagnosticEngine {
                                 (carina_core::schema::AttributeType::Union(_), value)
                                     if !matches!(
                                         value,
-                                        Value::ResourceRef { .. } | Value::BindingRef { .. }
+                                        Value::Deferred(DeferredValue::ResourceRef { .. })
+                                            | Value::Deferred(DeferredValue::BindingRef { .. })
                                     ) =>
                                 {
                                     attr_schema

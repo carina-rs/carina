@@ -11,7 +11,7 @@ use crate::provider::{
     CreateRequest, DeleteRequest, Provider, ReadRequest, UpdateRequest, build_update_patch,
 };
 use crate::resolver::resolve_ref_value;
-use crate::resource::{Resource, ResourceId, State, Value};
+use crate::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, State, Value};
 
 use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
 
@@ -133,17 +133,19 @@ pub(super) fn resolve_resource_with_source(
     Ok(resolved)
 }
 
-/// Recursively unwrap `Value::Secret(inner)` to just the inner value.
+/// Recursively unwrap `Value::Deferred(DeferredValue::Secret(inner))` to just the inner value.
 /// This ensures the provider never sees the Secret wrapper.
 fn unwrap_secret(value: Value) -> Value {
     match value {
-        Value::Secret(inner) => unwrap_secret(*inner),
-        Value::List(items) => Value::List(items.into_iter().map(unwrap_secret).collect()),
-        Value::Map(map) => Value::Map(
+        Value::Deferred(DeferredValue::Secret(inner)) => unwrap_secret(*inner),
+        Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
+            items.into_iter().map(unwrap_secret).collect(),
+        )),
+        Value::Concrete(ConcreteValue::Map(map)) => Value::Concrete(ConcreteValue::Map(
             map.into_iter()
                 .map(|(k, v)| (k, unwrap_secret(v)))
                 .collect(),
-        ),
+        )),
         other => other,
     }
 }

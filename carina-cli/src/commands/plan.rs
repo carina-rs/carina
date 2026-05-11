@@ -9,7 +9,7 @@ use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::effect::Effect;
 use carina_core::parser::{BackendConfig, ProviderConfig, ProviderContext, UpstreamState};
 use carina_core::plan::Plan;
-use carina_core::resource::{Resource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, State, Value};
 use carina_core::value::{
     redact_secrets_in_plan, redact_secrets_in_resource, redact_secrets_in_state,
 };
@@ -193,7 +193,7 @@ pub async fn run_plan(
                 .attributes
                 .get("bucket")
                 .and_then(|v| match v {
-                    Value::String(s) => Some(s.clone()),
+                    Value::Concrete(ConcreteValue::String(s)) => Some(s.clone()),
                     _ => None,
                 })
                 .ok_or("Backend bucket name not specified")?;
@@ -206,7 +206,7 @@ pub async fn run_plan(
                 r.id.resource_type == backend_resource_type
                     && r.attributes
                         .get("bucket")
-                        .is_some_and(|v| matches!(v, Value::String(s) if s == &bucket_name))
+                        .is_some_and(|v| matches!(v, Value::Concrete(ConcreteValue::String(s)) if s == &bucket_name))
             });
 
             if !has_bucket_resource {
@@ -214,7 +214,7 @@ pub async fn run_plan(
                     .attributes
                     .get("auto_create")
                     .and_then(|v| match v {
-                        Value::Bool(b) => Some(*b),
+                        Value::Concrete(ConcreteValue::Bool(b)) => Some(*b),
                         _ => None,
                     })
                     .unwrap_or(true);
@@ -412,7 +412,7 @@ pub async fn run_plan(
 /// For each `remote_state` block, reads the referenced state file and builds a
 /// map of resource bindings to their attributes. The result maps each remote_state
 /// binding name to a `HashMap<String, Value>` where keys are resource binding names
-/// and values are `Value::Map` of that resource's attributes.
+/// and values are `Value::Concrete(ConcreteValue::Map)` of that resource's attributes.
 /// Resolve export value expressions for plan display.
 pub(crate) fn resolve_export_values_for_display(
     export_params: &[carina_core::parser::InferredExportParam],
@@ -449,11 +449,11 @@ pub(crate) fn resolve_export_value(
     use carina_core::resolver::resolve_ref_value;
 
     match value {
-        Value::ResourceRef { .. } => {
+        Value::Deferred(DeferredValue::ResourceRef { .. }) => {
             resolve_ref_value(value, bindings).unwrap_or_else(|_| value.clone())
         }
         // Cross-file: "binding.attr" parsed as String instead of ResourceRef
-        Value::String(s) if s.contains('.') && !s.contains(' ') => {
+        Value::Concrete(ConcreteValue::String(s)) if s.contains('.') && !s.contains(' ') => {
             let parts: Vec<&str> = s.splitn(2, '.').collect();
             if parts.len() == 2
                 && let Some(attrs) = bindings.get(parts[0])
@@ -463,19 +463,19 @@ pub(crate) fn resolve_export_value(
             }
             value.clone()
         }
-        Value::List(items) => {
+        Value::Concrete(ConcreteValue::List(items)) => {
             let resolved: Vec<Value> = items
                 .iter()
                 .map(|item| resolve_export_value(item, bindings))
                 .collect();
-            Value::List(resolved)
+            Value::Concrete(ConcreteValue::List(resolved))
         }
-        Value::Map(map) => {
+        Value::Concrete(ConcreteValue::Map(map)) => {
             let resolved: indexmap::IndexMap<String, Value> = map
                 .iter()
                 .map(|(k, v)| (k.clone(), resolve_export_value(v, bindings)))
                 .collect();
-            Value::Map(resolved)
+            Value::Concrete(ConcreteValue::Map(resolved))
         }
         _ => value.clone(),
     }
@@ -532,7 +532,7 @@ pub fn compute_export_diffs(
         // plan display; surface as `None` so the diff prints without
         // a type tag.
         let type_expr = param.type_expr.clone().into_known();
-        // Plan display tolerates `Value::Unknown` in the export rhs
+        // Plan display tolerates `Value::Deferred(DeferredValue::Unknown)` in the export rhs
         // (the deferred-for body will resolve it later). Map both the
         // skip variants and the Unknown error to `None`; the diff
         // surfaces as a "value not yet known" change without a JSON.
@@ -833,7 +833,7 @@ mod load_upstream_states_tests {
 
         assert_eq!(
             result["orgs"]["account_id"],
-            Value::String("123".to_string())
+            Value::Concrete(ConcreteValue::String("123".to_string()))
         );
     }
 
@@ -1053,7 +1053,7 @@ let internal = upstream_state {{ source = '{}' }}"#,
         );
         assert_eq!(
             bindings["bootstrap"]["oidc_provider_arn"],
-            Value::String("arn:...".to_string()),
+            Value::Concrete(ConcreteValue::String("arn:...".to_string())),
             "B's exports must come through unchanged"
         );
     }
@@ -1196,7 +1196,7 @@ exports { region: String = "ap-northeast-1" }"#,
         .expect("upstream bindings");
         assert_eq!(
             bindings["a"]["region"],
-            Value::String("ap-northeast-1".to_string())
+            Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string()))
         );
     }
 }
@@ -1260,7 +1260,7 @@ mod export_diff_tests {
 
     #[test]
     fn compute_export_diffs_added_when_state_empty() {
-        let params = vec![param("count", Value::Int(42))];
+        let params = vec![param("count", Value::Concrete(ConcreteValue::Int(42)))];
         let current = HashMap::new();
         let changes = compute_export_diffs(&params, &current);
         assert_eq!(changes.len(), 1);
@@ -1269,7 +1269,7 @@ mod export_diff_tests {
 
     #[test]
     fn compute_export_diffs_modified_when_value_differs() {
-        let params = vec![param("count", Value::Int(42))];
+        let params = vec![param("count", Value::Concrete(ConcreteValue::Int(42)))];
         let mut current = HashMap::new();
         current.insert("count".to_string(), serde_json::json!(7));
         let changes = compute_export_diffs(&params, &current);
@@ -1279,7 +1279,7 @@ mod export_diff_tests {
 
     #[test]
     fn compute_export_diffs_unchanged_when_value_matches() {
-        let params = vec![param("count", Value::Int(42))];
+        let params = vec![param("count", Value::Concrete(ConcreteValue::Int(42)))];
         let mut current = HashMap::new();
         current.insert("count".to_string(), serde_json::json!(42));
         let changes = compute_export_diffs(&params, &current);
@@ -1299,8 +1299,8 @@ mod export_diff_tests {
     #[test]
     fn compute_export_diffs_mixed_sorted_by_name() {
         let params = vec![
-            param("added", Value::Int(1)),
-            param("modified", Value::Int(2)),
+            param("added", Value::Concrete(ConcreteValue::Int(1))),
+            param("modified", Value::Concrete(ConcreteValue::Int(2))),
         ];
         let mut current = HashMap::new();
         current.insert("modified".to_string(), serde_json::json!(99));
@@ -1321,12 +1321,14 @@ mod plan_serialization_error_tests {
     //! the actionable wording and that every effect shape (top-level
     //! attributes, nested List/Map, Replace cascade) propagates the
     //! error.
-    use carina_core::resource::{AccessPath, Resource, UnknownReason, Value};
+    use carina_core::resource::{
+        AccessPath, ConcreteValue, DeferredValue, Resource, UnknownReason, Value,
+    };
     use carina_core::value::{SerializationError, redact_secrets_in_resource, value_to_json};
 
     fn upstream_unknown() -> Value {
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-        Value::Unknown(UnknownReason::UpstreamRef { path })
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef { path }))
     }
 
     #[test]
@@ -1345,7 +1347,10 @@ mod plan_serialization_error_tests {
 
     #[test]
     fn value_to_json_errors_on_unknown_inside_list_or_map() {
-        let list_val = Value::List(vec![Value::String("a".into()), upstream_unknown()]);
+        let list_val = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("a".into())),
+            upstream_unknown(),
+        ]));
         assert!(matches!(
             value_to_json(&list_val).unwrap_err(),
             SerializationError::UnknownNotAllowed { .. }
@@ -1354,7 +1359,7 @@ mod plan_serialization_error_tests {
         let mut m: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
         m.insert("Name".into(), upstream_unknown());
         assert!(matches!(
-            value_to_json(&Value::Map(m)).unwrap_err(),
+            value_to_json(&Value::Concrete(ConcreteValue::Map(m))).unwrap_err(),
             SerializationError::UnknownNotAllowed { .. }
         ));
     }
@@ -1377,7 +1382,8 @@ mod plan_serialization_error_tests {
             (UnknownReason::ForKey, "ForKey"),
             (UnknownReason::ForIndex, "ForIndex"),
         ] {
-            let err = value_to_json(&Value::Unknown(variant.clone())).unwrap_err();
+            let err = value_to_json(&Value::Deferred(DeferredValue::Unknown(variant.clone())))
+                .unwrap_err();
             match err {
                 SerializationError::UnknownNotAllowed { reason, .. } => {
                     assert_eq!(reason, variant, "expected {label} round-trip");

@@ -388,7 +388,7 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
 mod tests {
     use super::*;
     use carina_core::detail_rows::MapExpandedEntry;
-    use carina_core::resource::Value;
+    use carina_core::resource::{ConcreteValue, Value};
     use indexmap::IndexMap;
 
     /// A multi-element list-of-maps entry inside a `MapExpanded` row
@@ -399,20 +399,23 @@ mod tests {
     fn map_expanded_inserts_blank_after_multi_element_list_of_maps() {
         let stmt = |sid: &str| {
             let mut m = IndexMap::new();
-            m.insert("sid".to_string(), Value::String(sid.to_string()));
-            Value::Map(m)
+            m.insert(
+                "sid".to_string(),
+                Value::Concrete(ConcreteValue::String(sid.to_string())),
+            );
+            Value::Concrete(ConcreteValue::Map(m))
         };
         let row = DetailRow::MapExpanded {
             key: "policy_document".to_string(),
             entries: vec![
                 MapExpandedEntry {
                     key: "statement".to_string(),
-                    value: Value::List(vec![stmt("A"), stmt("B")]),
+                    value: Value::Concrete(ConcreteValue::List(vec![stmt("A"), stmt("B")])),
                     annotation: None,
                 },
                 MapExpandedEntry {
                     key: "version".to_string(),
-                    value: Value::String("2012-10-17".to_string()),
+                    value: Value::Concrete(ConcreteValue::String("2012-10-17".to_string())),
                     annotation: None,
                 },
             ],
@@ -442,20 +445,23 @@ mod tests {
     fn map_expanded_no_orphan_blank_after_trailing_list_of_maps() {
         let stmt = |sid: &str| {
             let mut m = IndexMap::new();
-            m.insert("sid".to_string(), Value::String(sid.to_string()));
-            Value::Map(m)
+            m.insert(
+                "sid".to_string(),
+                Value::Concrete(ConcreteValue::String(sid.to_string())),
+            );
+            Value::Concrete(ConcreteValue::Map(m))
         };
         let row = DetailRow::MapExpanded {
             key: "policy_document".to_string(),
             entries: vec![
                 MapExpandedEntry {
                     key: "version".to_string(),
-                    value: Value::String("2012-10-17".to_string()),
+                    value: Value::Concrete(ConcreteValue::String("2012-10-17".to_string())),
                     annotation: None,
                 },
                 MapExpandedEntry {
                     key: "statement".to_string(),
-                    value: Value::List(vec![stmt("A"), stmt("B")]),
+                    value: Value::Concrete(ConcreteValue::List(vec![stmt("A"), stmt("B")])),
                     annotation: None,
                 },
             ],

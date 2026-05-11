@@ -1,6 +1,6 @@
 //! `min(a, b)` and `max(a, b)` built-in functions
 
-use crate::resource::Value;
+use crate::resource::{ConcreteValue, Value};
 
 use super::value_type_name;
 
@@ -51,35 +51,35 @@ fn compare_values(
     prefer_first: fn(f64, f64) -> bool,
 ) -> Result<Value, String> {
     match (a, b) {
-        (Value::Int(x), Value::Int(y)) => {
+        (Value::Concrete(ConcreteValue::Int(x)), Value::Concrete(ConcreteValue::Int(y))) => {
             let (fx, fy) = (*x as f64, *y as f64);
             if prefer_first(fx, fy) {
-                Ok(Value::Int(*x))
+                Ok(Value::Concrete(ConcreteValue::Int(*x)))
             } else {
-                Ok(Value::Int(*y))
+                Ok(Value::Concrete(ConcreteValue::Int(*y)))
             }
         }
-        (Value::Float(x), Value::Float(y)) => {
+        (Value::Concrete(ConcreteValue::Float(x)), Value::Concrete(ConcreteValue::Float(y))) => {
             if prefer_first(*x, *y) {
-                Ok(Value::Float(*x))
+                Ok(Value::Concrete(ConcreteValue::Float(*x)))
             } else {
-                Ok(Value::Float(*y))
+                Ok(Value::Concrete(ConcreteValue::Float(*y)))
             }
         }
-        (Value::Int(x), Value::Float(y)) => {
+        (Value::Concrete(ConcreteValue::Int(x)), Value::Concrete(ConcreteValue::Float(y))) => {
             let fx = *x as f64;
             if prefer_first(fx, *y) {
-                Ok(Value::Float(fx))
+                Ok(Value::Concrete(ConcreteValue::Float(fx)))
             } else {
-                Ok(Value::Float(*y))
+                Ok(Value::Concrete(ConcreteValue::Float(*y)))
             }
         }
-        (Value::Float(x), Value::Int(y)) => {
+        (Value::Concrete(ConcreteValue::Float(x)), Value::Concrete(ConcreteValue::Int(y))) => {
             let fy = *y as f64;
             if prefer_first(*x, fy) {
-                Ok(Value::Float(*x))
+                Ok(Value::Concrete(ConcreteValue::Float(*x)))
             } else {
-                Ok(Value::Float(fy))
+                Ok(Value::Concrete(ConcreteValue::Float(fy)))
             }
         }
         _ => Err(format!(
@@ -94,50 +94,99 @@ fn compare_values(
 #[cfg(test)]
 mod tests {
     use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
-    use crate::resource::Value;
+    use crate::resource::{ConcreteValue, Value};
 
     // ── min() tests ──
 
     #[test]
     fn min_two_ints() {
-        let result = evaluate_builtin("min", &[Value::Int(3), Value::Int(5)]).unwrap();
-        assert_eq!(result, Value::Int(3));
+        let result = evaluate_builtin(
+            "min",
+            &[
+                Value::Concrete(ConcreteValue::Int(3)),
+                Value::Concrete(ConcreteValue::Int(5)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result, Value::Concrete(ConcreteValue::Int(3)));
     }
 
     #[test]
     fn min_two_ints_reversed() {
-        let result = evaluate_builtin("min", &[Value::Int(5), Value::Int(3)]).unwrap();
-        assert_eq!(result, Value::Int(3));
+        let result = evaluate_builtin(
+            "min",
+            &[
+                Value::Concrete(ConcreteValue::Int(5)),
+                Value::Concrete(ConcreteValue::Int(3)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result, Value::Concrete(ConcreteValue::Int(3)));
     }
 
     #[test]
     fn min_two_ints_equal() {
-        let result = evaluate_builtin("min", &[Value::Int(4), Value::Int(4)]).unwrap();
-        assert_eq!(result, Value::Int(4));
+        let result = evaluate_builtin(
+            "min",
+            &[
+                Value::Concrete(ConcreteValue::Int(4)),
+                Value::Concrete(ConcreteValue::Int(4)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result, Value::Concrete(ConcreteValue::Int(4)));
     }
 
     #[test]
     fn min_two_floats() {
-        let result = evaluate_builtin("min", &[Value::Float(2.5), Value::Float(1.0)]).unwrap();
-        assert_eq!(result, Value::Float(1.0));
+        let result = evaluate_builtin(
+            "min",
+            &[
+                Value::Concrete(ConcreteValue::Float(2.5)),
+                Value::Concrete(ConcreteValue::Float(1.0)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result, Value::Concrete(ConcreteValue::Float(1.0)));
     }
 
     #[test]
     fn min_int_and_float() {
-        let result = evaluate_builtin("min", &[Value::Int(1), Value::Float(2.5)]).unwrap();
-        assert_eq!(result, Value::Float(1.0));
+        let result = evaluate_builtin(
+            "min",
+            &[
+                Value::Concrete(ConcreteValue::Int(1)),
+                Value::Concrete(ConcreteValue::Float(2.5)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result, Value::Concrete(ConcreteValue::Float(1.0)));
     }
 
     #[test]
     fn min_float_and_int() {
-        let result = evaluate_builtin("min", &[Value::Float(3.5), Value::Int(2)]).unwrap();
-        assert_eq!(result, Value::Float(2.0));
+        let result = evaluate_builtin(
+            "min",
+            &[
+                Value::Concrete(ConcreteValue::Float(3.5)),
+                Value::Concrete(ConcreteValue::Int(2)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result, Value::Concrete(ConcreteValue::Float(2.0)));
     }
 
     #[test]
     fn min_negative_ints() {
-        let result = evaluate_builtin("min", &[Value::Int(-3), Value::Int(5)]).unwrap();
-        assert_eq!(result, Value::Int(-3));
+        let result = evaluate_builtin(
+            "min",
+            &[
+                Value::Concrete(ConcreteValue::Int(-3)),
+                Value::Concrete(ConcreteValue::Int(5)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result, Value::Concrete(ConcreteValue::Int(-3)));
     }
 
     #[test]
@@ -150,20 +199,34 @@ mod tests {
     #[test]
     fn min_partial_application_one_arg() {
         use crate::builtins::evaluate_builtin_for_tests;
-        let result = evaluate_builtin_for_tests("min", &[Value::Int(1)]).unwrap();
+        let result =
+            evaluate_builtin_for_tests("min", &[Value::Concrete(ConcreteValue::Int(1))]).unwrap();
         assert!(result.is_closure());
     }
 
     #[test]
     fn min_wrong_arg_count_three() {
-        let result = evaluate_builtin("min", &[Value::Int(1), Value::Int(2), Value::Int(3)]);
+        let result = evaluate_builtin(
+            "min",
+            &[
+                Value::Concrete(ConcreteValue::Int(1)),
+                Value::Concrete(ConcreteValue::Int(2)),
+                Value::Concrete(ConcreteValue::Int(3)),
+            ],
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("expects 2 arguments"));
     }
 
     #[test]
     fn min_invalid_type_string() {
-        let result = evaluate_builtin("min", &[Value::String("a".to_string()), Value::Int(1)]);
+        let result = evaluate_builtin(
+            "min",
+            &[
+                Value::Concrete(ConcreteValue::String("a".to_string())),
+                Value::Concrete(ConcreteValue::Int(1)),
+            ],
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("must be Int or Float"));
     }
@@ -172,44 +235,93 @@ mod tests {
 
     #[test]
     fn max_two_ints() {
-        let result = evaluate_builtin("max", &[Value::Int(3), Value::Int(5)]).unwrap();
-        assert_eq!(result, Value::Int(5));
+        let result = evaluate_builtin(
+            "max",
+            &[
+                Value::Concrete(ConcreteValue::Int(3)),
+                Value::Concrete(ConcreteValue::Int(5)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result, Value::Concrete(ConcreteValue::Int(5)));
     }
 
     #[test]
     fn max_two_ints_reversed() {
-        let result = evaluate_builtin("max", &[Value::Int(5), Value::Int(3)]).unwrap();
-        assert_eq!(result, Value::Int(5));
+        let result = evaluate_builtin(
+            "max",
+            &[
+                Value::Concrete(ConcreteValue::Int(5)),
+                Value::Concrete(ConcreteValue::Int(3)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result, Value::Concrete(ConcreteValue::Int(5)));
     }
 
     #[test]
     fn max_two_ints_equal() {
-        let result = evaluate_builtin("max", &[Value::Int(4), Value::Int(4)]).unwrap();
-        assert_eq!(result, Value::Int(4));
+        let result = evaluate_builtin(
+            "max",
+            &[
+                Value::Concrete(ConcreteValue::Int(4)),
+                Value::Concrete(ConcreteValue::Int(4)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result, Value::Concrete(ConcreteValue::Int(4)));
     }
 
     #[test]
     fn max_two_floats() {
-        let result = evaluate_builtin("max", &[Value::Float(2.5), Value::Float(1.0)]).unwrap();
-        assert_eq!(result, Value::Float(2.5));
+        let result = evaluate_builtin(
+            "max",
+            &[
+                Value::Concrete(ConcreteValue::Float(2.5)),
+                Value::Concrete(ConcreteValue::Float(1.0)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result, Value::Concrete(ConcreteValue::Float(2.5)));
     }
 
     #[test]
     fn max_int_and_float() {
-        let result = evaluate_builtin("max", &[Value::Int(1), Value::Float(2.5)]).unwrap();
-        assert_eq!(result, Value::Float(2.5));
+        let result = evaluate_builtin(
+            "max",
+            &[
+                Value::Concrete(ConcreteValue::Int(1)),
+                Value::Concrete(ConcreteValue::Float(2.5)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result, Value::Concrete(ConcreteValue::Float(2.5)));
     }
 
     #[test]
     fn max_float_and_int() {
-        let result = evaluate_builtin("max", &[Value::Float(3.5), Value::Int(2)]).unwrap();
-        assert_eq!(result, Value::Float(3.5));
+        let result = evaluate_builtin(
+            "max",
+            &[
+                Value::Concrete(ConcreteValue::Float(3.5)),
+                Value::Concrete(ConcreteValue::Int(2)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result, Value::Concrete(ConcreteValue::Float(3.5)));
     }
 
     #[test]
     fn max_negative_ints() {
-        let result = evaluate_builtin("max", &[Value::Int(-3), Value::Int(5)]).unwrap();
-        assert_eq!(result, Value::Int(5));
+        let result = evaluate_builtin(
+            "max",
+            &[
+                Value::Concrete(ConcreteValue::Int(-3)),
+                Value::Concrete(ConcreteValue::Int(5)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result, Value::Concrete(ConcreteValue::Int(5)));
     }
 
     #[test]
@@ -221,7 +333,13 @@ mod tests {
 
     #[test]
     fn max_invalid_type_bool() {
-        let result = evaluate_builtin("max", &[Value::Bool(true), Value::Int(1)]);
+        let result = evaluate_builtin(
+            "max",
+            &[
+                Value::Concrete(ConcreteValue::Bool(true)),
+                Value::Concrete(ConcreteValue::Int(1)),
+            ],
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("must be Int or Float"));
     }

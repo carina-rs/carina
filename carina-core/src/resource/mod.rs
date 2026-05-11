@@ -401,9 +401,30 @@ pub(crate) mod duration_secs {
     }
 }
 
-/// Attribute value of a resource
+/// Attribute value of a resource.
+///
+/// Phase 5 of [RFC #2972](https://github.com/carina-rs/carina/issues/2972):
+/// physically split into the concrete / deferred axis. Every
+/// pattern site explicitly acknowledges which axis it handles, so
+/// "deferred Value leaked into concrete-only path" bugs are
+/// structurally unrepresentable workspace-wide (not just inside
+/// `validate_*`).
+///
+/// The serde representation uses `#[serde(untagged)]` so existing
+/// state files (in the pre-Phase-5 flat shape) round-trip via the
+/// inner enums' externally-tagged defaults — exactly the legacy
+/// JSON shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum Value {
+    Concrete(ConcreteValue),
+    Deferred(DeferredValue),
+}
+
+/// Concrete-axis variants: values that carry their own runtime type
+/// and are safe to type-check at validate time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ConcreteValue {
     String(String),
     Int(i64),
     Float(f64),
@@ -411,90 +432,89 @@ pub enum Value {
     /// Time duration carried as `std::time::Duration`.
     ///
     /// Constructed from a `<integer><unit>` literal in DSL source
-    /// (`75min`, `1h`, `30s`); the original unit is not preserved —
-    /// `Display` and `carina fmt` re-render via the canonical-form
-    /// rule documented in `notes/specs/2026-05-10-duration-design.md`.
-    /// Serialises to JSON as integer seconds at every value-tree
-    /// boundary (state file, plan file, WIT plugin contract).
+    /// `75min`, `1h`, `30s`. Serialises to JSON as integer seconds at
+    /// every value-tree boundary (state file, plan file, WIT plugin
+    /// contract).
     #[serde(with = "duration_secs")]
     Duration(std::time::Duration),
     List(Vec<Value>),
     /// Canonical form for fields whose schema type is
     /// `Union(vec![String, list(String)])` — the IAM-style
-    /// `string_or_list_of_strings` shape. AWS normalizes single-element
-    /// list condition values back to scalars, so a desired `["x"]` and
-    /// the actual `"x"` would otherwise diff forever. Carrying the
-    /// canonical shape in the type system makes the divergence
-    /// impossible at the differ boundary. See #2481, #2510.
-    ///
-    /// Producers must always go through
-    /// [`crate::value::canonicalize_with_type`] — never construct
-    /// `StringList` directly from user input or wire data without the
-    /// type, because the canonicalization decision depends on the
-    /// declared `AttributeType`.
+    /// `string_or_list_of_strings` shape. See #2481, #2510.
     StringList(Vec<String>),
     Map(IndexMap<String, Value>),
+}
+
+/// Deferred-axis variants: placeholders that resolve later
+/// (apply time, upstream load, function evaluation).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DeferredValue {
     /// Reference to another resource's attribute via an access path.
-    ///
-    /// The access path segments represent:
-    /// - segment 0: binding name (e.g., "vpc")
-    /// - segment 1: attribute name (e.g., "vpc_id")
-    /// - segments 2+: nested field path
-    ///
-    /// `AccessPath` carries a non-empty `attribute`; the type system
-    /// guarantees this — see [`AccessPath`]. A reference to a binding
-    /// without any attribute access (`bootstrap` standalone, the
-    /// directory-aware Pass-2 seed for sibling-defined names) is
-    /// represented as [`Value::BindingRef`] instead.
-    ResourceRef {
-        path: AccessPath,
-    },
+    ResourceRef { path: AccessPath },
     /// Reference to a binding without an attribute selector.
-    ///
-    /// Two producer sites:
-    /// - [`crate::parser::parse_with_seeded_bindings`] seeds every
-    ///   sibling-defined name (#2817) so in-file expressions resolve
-    ///   `name.attr` correctly; the seed itself carries no attribute.
-    /// - The parser's `variable_ref` rule emits `BindingRef` for a bare
-    ///   `let arn = bootstrap` (no `.attr` chain).
-    ///
-    /// `BindingRef` is invisible to attribute-walking code paths
-    /// (`visit_refs`, `check_upstream_state_field_references`, etc.) by
-    /// construction: there is no `attribute` slot for them to read. This
-    /// makes the empty-field diagnostic class (#2847) unrepresentable —
-    /// a sibling-only seed cannot synthesize a fake attribute reference
-    /// because the type carries none.
-    BindingRef {
-        binding: String,
-    },
+    BindingRef { binding: String },
     /// String interpolation: `"prefix-${expr}-suffix"`
-    /// Parts are evaluated and concatenated into a final String.
     Interpolation(Vec<InterpolationPart>),
-    /// Built-in function call: `join("-", ["a", "b"])` or via pipe `["a", "b"] |> join("-")`
-    /// Evaluated during reference resolution.
-    FunctionCall {
-        /// Function name (e.g., "join")
-        name: String,
-        /// Arguments to the function
-        args: Vec<Value>,
-    },
-    /// A secret value. The inner value is sent to the provider but stored as a
-    /// SHA256 hash in state. Plan output displays `(secret)` instead of the value.
+    /// Built-in function call: `join("-", ["a", "b"])` or via pipe
+    /// `["a", "b"] |> join("-")`. Evaluated during reference resolution.
+    FunctionCall { name: String, args: Vec<Value> },
+    /// A secret value. The inner value is sent to the provider but
+    /// stored as a SHA256 hash in state.
     Secret(Box<Value>),
-    /// A value not known at plan time. Plan-display only — must never
-    /// reach `apply`, state files, or provider plugins. See RFC #2371.
-    ///
-    /// `#[serde(skip)]` blocks both serialization (returns `Err`) and
-    /// deserialization (the variant is unreachable from any JSON input).
-    /// Together with the `Err(SerializationError::UnknownNotAllowed)`
-    /// arm at every serialization boundary (`value_to_json`,
-    /// `dsl_value_to_json`, `core_to_wit_value`, `redact_secrets_*`,
-    /// `backend_lock::value_to_json`), this enforces RFC constraints b
-    /// and c: a `Value::Unknown` cannot survive a state-file / plan-file
-    /// round trip, and any internal producer bug surfaces as a typed
-    /// error rather than corrupted output.
+    /// A value not known at plan time. RFC #2371.
     #[serde(skip)]
     Unknown(UnknownReason),
+}
+
+/// Backward-compatible variant constructors. Call sites can write
+/// `Value::String(s)` etc. exactly as in the pre-Phase-5 flat enum;
+/// pattern positions descend through `Value::Concrete(ConcreteValue::X(...))`.
+#[allow(non_snake_case)]
+impl Value {
+    #[inline]
+    pub fn String(s: String) -> Self {
+        Value::Concrete(ConcreteValue::String(s))
+    }
+    #[inline]
+    pub fn Int(n: i64) -> Self {
+        Value::Concrete(ConcreteValue::Int(n))
+    }
+    #[inline]
+    pub fn Float(f: f64) -> Self {
+        Value::Concrete(ConcreteValue::Float(f))
+    }
+    #[inline]
+    pub fn Bool(b: bool) -> Self {
+        Value::Concrete(ConcreteValue::Bool(b))
+    }
+    #[inline]
+    pub fn Duration(d: std::time::Duration) -> Self {
+        Value::Concrete(ConcreteValue::Duration(d))
+    }
+    #[inline]
+    pub fn List(items: Vec<Value>) -> Self {
+        Value::Concrete(ConcreteValue::List(items))
+    }
+    #[inline]
+    pub fn StringList(items: Vec<String>) -> Self {
+        Value::Concrete(ConcreteValue::StringList(items))
+    }
+    #[inline]
+    pub fn Map(map: IndexMap<String, Value>) -> Self {
+        Value::Concrete(ConcreteValue::Map(map))
+    }
+    #[inline]
+    pub fn Interpolation(parts: Vec<InterpolationPart>) -> Self {
+        Value::Deferred(DeferredValue::Interpolation(parts))
+    }
+    #[inline]
+    pub fn Secret(inner: Box<Value>) -> Self {
+        Value::Deferred(DeferredValue::Secret(inner))
+    }
+    #[inline]
+    pub fn Unknown(reason: UnknownReason) -> Self {
+        Value::Deferred(DeferredValue::Unknown(reason))
+    }
 }
 
 /// Borrowing projection of [`Value`] restricted to the **concrete** axis
@@ -561,20 +581,17 @@ impl Value {
     /// unrepresentable. See RFC #2972.
     pub fn as_concrete(&self) -> Option<ConcreteValueRef<'_>> {
         match self {
-            Value::String(s) => Some(ConcreteValueRef::String(s)),
-            Value::Int(n) => Some(ConcreteValueRef::Int(*n)),
-            Value::Float(f) => Some(ConcreteValueRef::Float(*f)),
-            Value::Bool(b) => Some(ConcreteValueRef::Bool(*b)),
-            Value::Duration(d) => Some(ConcreteValueRef::Duration(*d)),
-            Value::List(items) => Some(ConcreteValueRef::List(items)),
-            Value::StringList(items) => Some(ConcreteValueRef::StringList(items)),
-            Value::Map(map) => Some(ConcreteValueRef::Map(map)),
-            Value::ResourceRef { .. }
-            | Value::BindingRef { .. }
-            | Value::Interpolation(_)
-            | Value::FunctionCall { .. }
-            | Value::Secret(_)
-            | Value::Unknown(_) => None,
+            Value::Concrete(c) => Some(match c {
+                ConcreteValue::String(s) => ConcreteValueRef::String(s),
+                ConcreteValue::Int(n) => ConcreteValueRef::Int(*n),
+                ConcreteValue::Float(f) => ConcreteValueRef::Float(*f),
+                ConcreteValue::Bool(b) => ConcreteValueRef::Bool(*b),
+                ConcreteValue::Duration(d) => ConcreteValueRef::Duration(*d),
+                ConcreteValue::List(items) => ConcreteValueRef::List(items),
+                ConcreteValue::StringList(items) => ConcreteValueRef::StringList(items),
+                ConcreteValue::Map(map) => ConcreteValueRef::Map(map),
+            }),
+            Value::Deferred(_) => None,
         }
     }
 
@@ -583,22 +600,17 @@ impl Value {
     /// [`Self::as_concrete`].
     pub fn as_deferred(&self) -> Option<DeferredValueRef<'_>> {
         match self {
-            Value::ResourceRef { path } => Some(DeferredValueRef::ResourceRef { path }),
-            Value::BindingRef { binding } => Some(DeferredValueRef::BindingRef { binding }),
-            Value::Interpolation(parts) => Some(DeferredValueRef::Interpolation(parts)),
-            Value::FunctionCall { name, args } => {
-                Some(DeferredValueRef::FunctionCall { name, args })
-            }
-            Value::Secret(inner) => Some(DeferredValueRef::Secret(inner)),
-            Value::Unknown(reason) => Some(DeferredValueRef::Unknown(reason)),
-            Value::String(_)
-            | Value::Int(_)
-            | Value::Float(_)
-            | Value::Bool(_)
-            | Value::Duration(_)
-            | Value::List(_)
-            | Value::StringList(_)
-            | Value::Map(_) => None,
+            Value::Deferred(d) => Some(match d {
+                DeferredValue::ResourceRef { path } => DeferredValueRef::ResourceRef { path },
+                DeferredValue::BindingRef { binding } => DeferredValueRef::BindingRef { binding },
+                DeferredValue::Interpolation(parts) => DeferredValueRef::Interpolation(parts),
+                DeferredValue::FunctionCall { name, args } => {
+                    DeferredValueRef::FunctionCall { name, args }
+                }
+                DeferredValue::Secret(inner) => DeferredValueRef::Secret(inner),
+                DeferredValue::Unknown(reason) => DeferredValueRef::Unknown(reason),
+            }),
+            Value::Concrete(_) => None,
         }
     }
 }
@@ -661,23 +673,56 @@ impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             // Constraint: Unknown is never equal to anything.
-            (Value::Unknown(_), _) | (_, Value::Unknown(_)) => false,
-            (Value::String(a), Value::String(b)) => a == b,
-            (Value::Int(a), Value::Int(b)) => a == b,
-            (Value::Float(a), Value::Float(b)) => a == b,
-            (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Duration(a), Value::Duration(b)) => a == b,
-            (Value::List(a), Value::List(b)) => a == b,
-            (Value::StringList(a), Value::StringList(b)) => a == b,
-            (Value::Map(a), Value::Map(b)) => a == b,
-            (Value::ResourceRef { path: a }, Value::ResourceRef { path: b }) => a == b,
-            (Value::BindingRef { binding: a }, Value::BindingRef { binding: b }) => a == b,
-            (Value::Interpolation(a), Value::Interpolation(b)) => a == b,
+            (Value::Deferred(DeferredValue::Unknown(_)), _)
+            | (_, Value::Deferred(DeferredValue::Unknown(_))) => false,
             (
-                Value::FunctionCall { name: an, args: aa },
-                Value::FunctionCall { name: bn, args: ba },
+                Value::Concrete(ConcreteValue::String(a)),
+                Value::Concrete(ConcreteValue::String(b)),
+            ) => a == b,
+            (Value::Concrete(ConcreteValue::Int(a)), Value::Concrete(ConcreteValue::Int(b))) => {
+                a == b
+            }
+            (
+                Value::Concrete(ConcreteValue::Float(a)),
+                Value::Concrete(ConcreteValue::Float(b)),
+            ) => a == b,
+            (Value::Concrete(ConcreteValue::Bool(a)), Value::Concrete(ConcreteValue::Bool(b))) => {
+                a == b
+            }
+            (
+                Value::Concrete(ConcreteValue::Duration(a)),
+                Value::Concrete(ConcreteValue::Duration(b)),
+            ) => a == b,
+            (Value::Concrete(ConcreteValue::List(a)), Value::Concrete(ConcreteValue::List(b))) => {
+                a == b
+            }
+            (
+                Value::Concrete(ConcreteValue::StringList(a)),
+                Value::Concrete(ConcreteValue::StringList(b)),
+            ) => a == b,
+            (Value::Concrete(ConcreteValue::Map(a)), Value::Concrete(ConcreteValue::Map(b))) => {
+                a == b
+            }
+            (
+                Value::Deferred(DeferredValue::ResourceRef { path: a }),
+                Value::Deferred(DeferredValue::ResourceRef { path: b }),
+            ) => a == b,
+            (
+                Value::Deferred(DeferredValue::BindingRef { binding: a }),
+                Value::Deferred(DeferredValue::BindingRef { binding: b }),
+            ) => a == b,
+            (
+                Value::Deferred(DeferredValue::Interpolation(a)),
+                Value::Deferred(DeferredValue::Interpolation(b)),
+            ) => a == b,
+            (
+                Value::Deferred(DeferredValue::FunctionCall { name: an, args: aa }),
+                Value::Deferred(DeferredValue::FunctionCall { name: bn, args: ba }),
             ) => an == bn && aa == ba,
-            (Value::Secret(a), Value::Secret(b)) => a == b,
+            (
+                Value::Deferred(DeferredValue::Secret(a)),
+                Value::Deferred(DeferredValue::Secret(b)),
+            ) => a == b,
             _ => false,
         }
     }
@@ -708,18 +753,18 @@ fn canonicalize_interpolation(parts: Vec<InterpolationPart>) -> Value {
         }
     }
     if merged.is_empty() {
-        return Value::String(String::new());
+        return Value::Concrete(ConcreteValue::String(String::new()));
     }
     if merged.len() == 1 {
         // Pop the sole element. If it is a Literal, we collapse to
         // `Value::String`; otherwise it is a non-foldable Expr and we
         // rebuild the single-element Interpolation.
         match merged.pop().expect("len == 1") {
-            InterpolationPart::Literal(s) => return Value::String(s),
+            InterpolationPart::Literal(s) => return Value::Concrete(ConcreteValue::String(s)),
             expr @ InterpolationPart::Expr(_) => merged.push(expr),
         }
     }
-    Value::Interpolation(merged)
+    Value::Deferred(DeferredValue::Interpolation(merged))
 }
 
 /// If `v` is a string-shaped scalar, return its string form (consuming
@@ -732,10 +777,10 @@ fn canonicalize_interpolation(parts: Vec<InterpolationPart>) -> Value {
 /// stay as `Expr(Secret(...))`.
 fn value_into_literal(v: Value) -> Result<String, Value> {
     match v {
-        Value::String(s) => Ok(s),
-        Value::Int(n) => Ok(n.to_string()),
-        Value::Float(f) => Ok(f.to_string()),
-        Value::Bool(b) => Ok(b.to_string()),
+        Value::Concrete(ConcreteValue::String(s)) => Ok(s),
+        Value::Concrete(ConcreteValue::Int(n)) => Ok(n.to_string()),
+        Value::Concrete(ConcreteValue::Float(f)) => Ok(f.to_string()),
+        Value::Concrete(ConcreteValue::Bool(b)) => Ok(b.to_string()),
         other => Err(other),
     }
 }
@@ -769,26 +814,29 @@ impl Value {
     /// only has a `&mut Value` (e.g. inside `IndexMap::values_mut()`).
     pub fn canonicalize_in_place(&mut self) {
         match self {
-            Value::List(items) => {
+            Value::Concrete(ConcreteValue::List(items)) => {
                 for item in items {
                     item.canonicalize_in_place();
                 }
             }
-            Value::Map(map) => {
+            Value::Concrete(ConcreteValue::Map(map)) => {
                 for v in map.values_mut() {
                     v.canonicalize_in_place();
                 }
             }
-            Value::Secret(inner) => inner.canonicalize_in_place(),
-            Value::FunctionCall { args, .. } => {
+            Value::Deferred(DeferredValue::Secret(inner)) => inner.canonicalize_in_place(),
+            Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
                 for arg in args {
                     arg.canonicalize_in_place();
                 }
             }
-            Value::Interpolation(_) => {
+            Value::Deferred(DeferredValue::Interpolation(_)) => {
                 // Move the parts out so we can consume and rebuild them.
-                let parts = match std::mem::replace(self, Value::Interpolation(Vec::new())) {
-                    Value::Interpolation(parts) => parts,
+                let parts = match std::mem::replace(
+                    self,
+                    Value::Deferred(DeferredValue::Interpolation(Vec::new())),
+                ) {
+                    Value::Deferred(DeferredValue::Interpolation(parts)) => parts,
                     _ => unreachable!("matched Value::Interpolation"),
                 };
                 *self = canonicalize_interpolation(parts);
@@ -808,15 +856,15 @@ impl Value {
         attribute_name: impl Into<String>,
         field_path: Vec<String>,
     ) -> Self {
-        Value::ResourceRef {
+        Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::with_fields(binding_name, attribute_name, field_path),
-        }
+        })
     }
 
     /// If this is a `ResourceRef`, returns the binding name.
     pub fn ref_binding(&self) -> Option<&str> {
         match self {
-            Value::ResourceRef { path } => Some(path.binding()),
+            Value::Deferred(DeferredValue::ResourceRef { path }) => Some(path.binding()),
             _ => None,
         }
     }
@@ -824,7 +872,7 @@ impl Value {
     /// If this is a `ResourceRef`, returns the attribute name.
     pub fn ref_attribute(&self) -> Option<&str> {
         match self {
-            Value::ResourceRef { path } => Some(path.attribute()),
+            Value::Deferred(DeferredValue::ResourceRef { path }) => Some(path.attribute()),
             _ => None,
         }
     }
@@ -832,7 +880,7 @@ impl Value {
     /// If this is a `ResourceRef`, returns the field path.
     pub fn ref_field_path(&self) -> Option<&[String]> {
         match self {
-            Value::ResourceRef { path } => Some(path.field_path()),
+            Value::Deferred(DeferredValue::ResourceRef { path }) => Some(path.field_path()),
             _ => None,
         }
     }
@@ -840,47 +888,47 @@ impl Value {
     /// Recursively walk this value, invoking `f` on each `ResourceRef`'s `AccessPath`.
     pub fn visit_refs(&self, f: &mut impl FnMut(&AccessPath)) {
         match self {
-            Value::ResourceRef { path } => f(path),
-            Value::List(items) => {
+            Value::Deferred(DeferredValue::ResourceRef { path }) => f(path),
+            Value::Concrete(ConcreteValue::List(items)) => {
                 for v in items {
                     v.visit_refs(f);
                 }
             }
-            Value::Map(map) => {
+            Value::Concrete(ConcreteValue::Map(map)) => {
                 for v in map.values() {
                     v.visit_refs(f);
                 }
             }
-            Value::Interpolation(parts) => {
+            Value::Deferred(DeferredValue::Interpolation(parts)) => {
                 for part in parts {
                     if let InterpolationPart::Expr(v) = part {
                         v.visit_refs(f);
                     }
                 }
             }
-            Value::FunctionCall { args, .. } => {
+            Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
                 for arg in args {
                     arg.visit_refs(f);
                 }
             }
-            Value::Secret(inner) => inner.visit_refs(f),
-            Value::String(_)
-            | Value::Int(_)
-            | Value::Float(_)
-            | Value::Bool(_)
-            | Value::Duration(_)
-            | Value::StringList(_) => {}
+            Value::Deferred(DeferredValue::Secret(inner)) => inner.visit_refs(f),
+            Value::Concrete(ConcreteValue::String(_))
+            | Value::Concrete(ConcreteValue::Int(_))
+            | Value::Concrete(ConcreteValue::Float(_))
+            | Value::Concrete(ConcreteValue::Bool(_))
+            | Value::Concrete(ConcreteValue::Duration(_))
+            | Value::Concrete(ConcreteValue::StringList(_)) => {}
             // `BindingRef` carries no attribute, so attribute-walking
             // visitors have nothing to do. Callers that *do* care about
             // bare-binding references walk them explicitly via
             // `visit_binding_refs`.
-            Value::BindingRef { .. } => {}
+            Value::Deferred(DeferredValue::BindingRef { .. }) => {}
             // `Value::Unknown` is what a previously-unresolved
             // `ResourceRef` was *replaced with* by `stamp_unresolved_upstream`.
             // It carries an `AccessPath` for display, but it is no longer
             // a live reference to walk — dependency analysis happens
             // upstream of the stamping pass.
-            Value::Unknown(_) => {}
+            Value::Deferred(DeferredValue::Unknown(_)) => {}
         }
     }
 }
@@ -917,8 +965,12 @@ impl Value {
     /// for all other variants, falls back to PartialEq.
     pub fn semantically_equal(&self, other: &Value) -> bool {
         match (self, other) {
-            (Value::List(a), Value::List(b)) => lists_equal(a, b),
-            (Value::Map(a), Value::Map(b)) => maps_semantically_equal(a, b),
+            (Value::Concrete(ConcreteValue::List(a)), Value::Concrete(ConcreteValue::List(b))) => {
+                lists_equal(a, b)
+            }
+            (Value::Concrete(ConcreteValue::Map(a)), Value::Concrete(ConcreteValue::Map(b))) => {
+                maps_semantically_equal(a, b)
+            }
             _ => self == other,
         }
     }
@@ -935,15 +987,15 @@ impl Value {
     fn hash_into(&self, hasher: &mut impl Hasher) {
         std::mem::discriminant(self).hash(hasher);
         match self {
-            Value::String(s) => s.hash(hasher),
-            Value::Int(i) => i.hash(hasher),
-            Value::Float(f) => {
+            Value::Concrete(ConcreteValue::String(s)) => s.hash(hasher),
+            Value::Concrete(ConcreteValue::Int(i)) => i.hash(hasher),
+            Value::Concrete(ConcreteValue::Float(f)) => {
                 // Use bits for deterministic hashing (NaN == NaN for our purposes)
                 f.to_bits().hash(hasher);
             }
-            Value::Bool(b) => b.hash(hasher),
-            Value::Duration(d) => d.as_secs().hash(hasher),
-            Value::List(items) => {
+            Value::Concrete(ConcreteValue::Bool(b)) => b.hash(hasher),
+            Value::Concrete(ConcreteValue::Duration(d)) => d.as_secs().hash(hasher),
+            Value::Concrete(ConcreteValue::List(items)) => {
                 // For list hashing, use an order-independent combination (wrapping sum)
                 // so that lists with same elements in different order hash the same.
                 // Wrapping sum is preferred over XOR because XOR causes all lists
@@ -955,7 +1007,7 @@ impl Value {
                 }
                 sum_hash.hash(hasher);
             }
-            Value::StringList(items) => {
+            Value::Concrete(ConcreteValue::StringList(items)) => {
                 // Hash with the same order-independent shape as
                 // `Value::List` so that a `List([String("x")])` and a
                 // `StringList(vec!["x"])` cannot collide on hash equality
@@ -970,7 +1022,7 @@ impl Value {
                 }
                 sum_hash.hash(hasher);
             }
-            Value::Map(map) => {
+            Value::Concrete(ConcreteValue::Map(map)) => {
                 map.len().hash(hasher);
                 // Sort keys for deterministic hashing
                 let mut keys: Vec<&String> = map.keys().collect();
@@ -980,13 +1032,13 @@ impl Value {
                     map[key].hash_into(hasher);
                 }
             }
-            Value::ResourceRef { path } => {
+            Value::Deferred(DeferredValue::ResourceRef { path }) => {
                 path.hash(hasher);
             }
-            Value::BindingRef { binding } => {
+            Value::Deferred(DeferredValue::BindingRef { binding }) => {
                 binding.hash(hasher);
             }
-            Value::Interpolation(parts) => {
+            Value::Deferred(DeferredValue::Interpolation(parts)) => {
                 parts.len().hash(hasher);
                 for part in parts {
                     match part {
@@ -1001,17 +1053,17 @@ impl Value {
                     }
                 }
             }
-            Value::FunctionCall { name, args } => {
+            Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
                 name.hash(hasher);
                 args.len().hash(hasher);
                 for arg in args {
                     arg.hash_into(hasher);
                 }
             }
-            Value::Secret(inner) => {
+            Value::Deferred(DeferredValue::Secret(inner)) => {
                 inner.hash_into(hasher);
             }
-            Value::Unknown(reason) => {
+            Value::Deferred(DeferredValue::Unknown(reason)) => {
                 // `Value::Unknown` reaches `merge_lists_hashed` → this
                 // function whenever a list element is unresolved. Hash
                 // deterministically: the outer `discriminant(self)`
@@ -1128,7 +1180,10 @@ fn lists_equal_hashed(a: &[Value], b: &[Value]) -> bool {
 /// For other types: return desired as-is.
 pub fn merge_with_saved(desired: &Value, saved: &Value) -> Value {
     match (desired, saved) {
-        (Value::Map(desired_map), Value::Map(saved_map)) => {
+        (
+            Value::Concrete(ConcreteValue::Map(desired_map)),
+            Value::Concrete(ConcreteValue::Map(saved_map)),
+        ) => {
             let mut merged = saved_map.clone();
             for (k, v) in desired_map {
                 let merged_v = if let Some(saved_v) = saved_map.get(k) {
@@ -1138,11 +1193,12 @@ pub fn merge_with_saved(desired: &Value, saved: &Value) -> Value {
                 };
                 merged.insert(k.clone(), merged_v);
             }
-            Value::Map(merged)
+            Value::Concrete(ConcreteValue::Map(merged))
         }
-        (Value::List(desired_list), Value::List(saved_list)) => {
-            Value::List(merge_lists(desired_list, saved_list))
-        }
+        (
+            Value::Concrete(ConcreteValue::List(desired_list)),
+            Value::Concrete(ConcreteValue::List(saved_list)),
+        ) => Value::Concrete(ConcreteValue::List(merge_lists(desired_list, saved_list))),
         _ => desired.clone(),
     }
 }
@@ -1230,12 +1286,12 @@ fn merge_lists_hashed(desired: &[Value], saved: &[Value]) -> Vec<Value> {
 
         // For Maps, also check other saved Maps for partial matches
         // (a Map may have extra fields from saved state, giving a different hash)
-        if matches!(d, Value::Map(_)) {
+        if matches!(d, Value::Concrete(ConcreteValue::Map(_))) {
             for (j, s) in saved.iter().enumerate() {
                 if used[j] || matches!(best_idx, Some(bi) if bi == j) {
                     continue;
                 }
-                if !matches!(s, Value::Map(_)) {
+                if !matches!(s, Value::Concrete(ConcreteValue::Map(_))) {
                     continue;
                 }
                 let score = similarity_score(d, s);
@@ -1263,7 +1319,7 @@ fn merge_lists_hashed(desired: &[Value], saved: &[Value]) -> Vec<Value> {
 /// Otherwise: return 0.
 fn similarity_score(a: &Value, b: &Value) -> usize {
     match (a, b) {
-        (Value::Map(am), Value::Map(bm)) => am
+        (Value::Concrete(ConcreteValue::Map(am)), Value::Concrete(ConcreteValue::Map(bm))) => am
             .iter()
             .filter(|(k, v)| {
                 bm.get(*k)

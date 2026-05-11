@@ -6,7 +6,10 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use indexmap::IndexMap;
 
 use crate::parser::{ArgumentParameter, ModuleCall};
-use crate::resource::{Directives, Resource, ResourceId, ResourceKind, ResourceName, Value};
+use crate::resource::{
+    ConcreteValue, DeferredValue, Directives, Resource, ResourceId, ResourceKind, ResourceName,
+    Value,
+};
 
 use super::error::ModuleError;
 use super::resolver::ModuleResolver;
@@ -65,7 +68,7 @@ impl ModuleResolver<'_> {
         // `subject_patterns: list(String) = ["repo:${github_repo}:*"]`.
         // The parser registers each argument as a placeholder ResourceRef
         // binding while parsing the block, so the default lands here as a
-        // tree containing `Value::ResourceRef { binding: "<other_arg>" }`
+        // tree containing `Value::Deferred(DeferredValue::ResourceRef{ binding: "<other_arg>" })`
         // nodes.
         //
         // **Initial pass** seeds each entry with either the caller-
@@ -226,7 +229,7 @@ impl ModuleResolver<'_> {
                 // "test-role-${env}"` keeps a single-arg `Interpolation`
                 // with `Expr(String("dev"))` instead of
                 // `String("test-role-dev")`, and downstream consumers
-                // that match on `Value::String` (state diff, plan
+                // that match on `Value::Concrete(ConcreteValue::String)` (state diff, plan
                 // rendering) miss the resolved value. Symmetric with
                 // the default-evaluation path above. #2815 / #2817.
                 substituted.canonicalize_in_place();
@@ -282,31 +285,39 @@ impl ModuleResolver<'_> {
 ///
 /// Argument parameter names are registered as lexical bindings in the
 /// parser. A bare-name reference (`source_arn`) parses as
-/// [`Value::BindingRef`]; an attribute access (`source_arn.field`)
-/// parses as [`Value::ResourceRef`]. Both forms can target an argument
+/// [`Value::Deferred(DeferredValue::BindingRef)`]; an attribute access (`source_arn.field`)
+/// parses as [`Value::Deferred(DeferredValue::ResourceRef)`]. Both forms can target an argument
 /// parameter, so substitution covers both.
 pub(super) fn substitute_arguments(value: &Value, arguments: &HashMap<String, Value>) -> Value {
     match value {
-        Value::BindingRef { binding } if arguments.contains_key(binding) => arguments
-            .get(binding)
-            .cloned()
-            .unwrap_or_else(|| value.clone()),
-        Value::ResourceRef { path } if arguments.contains_key(path.binding()) => arguments
-            .get(path.binding())
-            .cloned()
-            .unwrap_or_else(|| value.clone()),
-        Value::List(items) => Value::List(
+        Value::Deferred(DeferredValue::BindingRef { binding })
+            if arguments.contains_key(binding) =>
+        {
+            arguments
+                .get(binding)
+                .cloned()
+                .unwrap_or_else(|| value.clone())
+        }
+        Value::Deferred(DeferredValue::ResourceRef { path })
+            if arguments.contains_key(path.binding()) =>
+        {
+            arguments
+                .get(path.binding())
+                .cloned()
+                .unwrap_or_else(|| value.clone())
+        }
+        Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
             items
                 .iter()
                 .map(|v| substitute_arguments(v, arguments))
                 .collect(),
-        ),
-        Value::Map(map) => Value::Map(
+        )),
+        Value::Concrete(ConcreteValue::Map(map)) => Value::Concrete(ConcreteValue::Map(
             map.iter()
                 .map(|(k, v)| (k.clone(), substitute_arguments(v, arguments)))
                 .collect(),
-        ),
-        Value::Interpolation(parts) => {
+        )),
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
             use crate::resource::InterpolationPart;
             let substituted_parts: Vec<InterpolationPart> = parts
                 .iter()
@@ -317,15 +328,17 @@ pub(super) fn substitute_arguments(value: &Value, arguments: &HashMap<String, Va
                     other => other.clone(),
                 })
                 .collect();
-            Value::Interpolation(substituted_parts)
+            Value::Deferred(DeferredValue::Interpolation(substituted_parts))
         }
-        Value::FunctionCall { name, args } => Value::FunctionCall {
-            name: name.clone(),
-            args: args
-                .iter()
-                .map(|v| substitute_arguments(v, arguments))
-                .collect(),
-        },
+        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|v| substitute_arguments(v, arguments))
+                    .collect(),
+            })
+        }
         _ => value.clone(),
     }
 }
@@ -340,28 +353,32 @@ pub(super) fn rewrite_intra_module_refs(
     intra_module_bindings: &HashSet<String>,
 ) -> Value {
     match value {
-        Value::BindingRef { binding } if intra_module_bindings.contains(binding) => {
-            Value::BindingRef {
+        Value::Deferred(DeferredValue::BindingRef { binding })
+            if intra_module_bindings.contains(binding) =>
+        {
+            Value::Deferred(DeferredValue::BindingRef {
                 binding: format!("{}.{}", instance_prefix, binding),
-            }
+            })
         }
-        Value::ResourceRef { path } if intra_module_bindings.contains(path.binding()) => {
-            Value::ResourceRef {
+        Value::Deferred(DeferredValue::ResourceRef { path })
+            if intra_module_bindings.contains(path.binding()) =>
+        {
+            Value::Deferred(DeferredValue::ResourceRef {
                 path: crate::resource::AccessPath::with_fields_and_subscripts(
                     format!("{}.{}", instance_prefix, path.binding()),
                     path.attribute().to_string(),
                     path.field_path().to_vec(),
                     path.subscripts().to_vec(),
                 ),
-            }
+            })
         }
-        Value::List(items) => Value::List(
+        Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
             items
                 .iter()
                 .map(|v| rewrite_intra_module_refs(v, instance_prefix, intra_module_bindings))
                 .collect(),
-        ),
-        Value::Map(map) => Value::Map(
+        )),
+        Value::Concrete(ConcreteValue::Map(map)) => Value::Concrete(ConcreteValue::Map(
             map.iter()
                 .map(|(k, v)| {
                     (
@@ -370,8 +387,8 @@ pub(super) fn rewrite_intra_module_refs(
                     )
                 })
                 .collect(),
-        ),
-        Value::Interpolation(parts) => {
+        )),
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
             use crate::resource::InterpolationPart;
             let rewritten_parts: Vec<InterpolationPart> = parts
                 .iter()
@@ -382,15 +399,17 @@ pub(super) fn rewrite_intra_module_refs(
                     other => other.clone(),
                 })
                 .collect();
-            Value::Interpolation(rewritten_parts)
+            Value::Deferred(DeferredValue::Interpolation(rewritten_parts))
         }
-        Value::FunctionCall { name, args } => Value::FunctionCall {
-            name: name.clone(),
-            args: args
-                .iter()
-                .map(|v| rewrite_intra_module_refs(v, instance_prefix, intra_module_bindings))
-                .collect(),
-        },
+        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|v| rewrite_intra_module_refs(v, instance_prefix, intra_module_bindings))
+                    .collect(),
+            })
+        }
         _ => value.clone(),
     }
 }
@@ -600,38 +619,38 @@ fn rewrite_ref_prefixes(
     remap: &std::collections::HashMap<(String, u64), u64>,
 ) -> Value {
     match value {
-        Value::ResourceRef { path } => {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
             let binding = path.binding();
             if let Some((prefix, rest)) = binding.split_once('.')
                 && let Some((module, simhash)) = parse_synthetic_instance_prefix(prefix)
                 && let Some(&target) = remap.get(&(module.to_string(), simhash))
             {
                 let new_binding = format!("{}_{:016x}.{}", module, target, rest);
-                return Value::ResourceRef {
+                return Value::Deferred(DeferredValue::ResourceRef {
                     path: crate::resource::AccessPath::with_fields_and_subscripts(
                         new_binding,
                         path.attribute().to_string(),
                         path.field_path().to_vec(),
                         path.subscripts().to_vec(),
                     ),
-                };
+                });
             }
             value.clone()
         }
-        Value::List(items) => Value::List(
+        Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
             items
                 .iter()
                 .map(|v| rewrite_ref_prefixes(v, remap))
                 .collect(),
-        ),
-        Value::Map(map) => Value::Map(
+        )),
+        Value::Concrete(ConcreteValue::Map(map)) => Value::Concrete(ConcreteValue::Map(
             map.iter()
                 .map(|(k, v)| (k.clone(), rewrite_ref_prefixes(v, remap)))
                 .collect(),
-        ),
-        Value::Interpolation(parts) => {
+        )),
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
             use crate::resource::InterpolationPart;
-            Value::Interpolation(
+            Value::Deferred(DeferredValue::Interpolation(
                 parts
                     .iter()
                     .map(|p| match p {
@@ -641,15 +660,17 @@ fn rewrite_ref_prefixes(
                         }
                     })
                     .collect(),
-            )
+            ))
         }
-        Value::FunctionCall { name, args } => Value::FunctionCall {
-            name: name.clone(),
-            args: args
-                .iter()
-                .map(|v| rewrite_ref_prefixes(v, remap))
-                .collect(),
-        },
+        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|v| rewrite_ref_prefixes(v, remap))
+                    .collect(),
+            })
+        }
         _ => value.clone(),
     }
 }

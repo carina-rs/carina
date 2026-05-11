@@ -12,7 +12,7 @@ use crate::parser::{
     ParseContext, ParseError, Rule, evaluate_user_function, extract_key_string, first_inner,
     is_static_value, next_pair, parse_block_contents, parse_expression, parse_expression_eval,
 };
-use crate::resource::{AccessPath, Subscript, Value};
+use crate::resource::{AccessPath, ConcreteValue, DeferredValue, Subscript, Value};
 use indexmap::IndexMap;
 
 /// Decode a duration literal (`75min`, `1h`, `30s`) into integer
@@ -59,7 +59,9 @@ pub(crate) fn parse_duration_secs(src: &str, line: usize) -> Result<u64, ParseEr
 
 pub(crate) fn parse_duration_literal(src: &str, line: usize) -> Result<Value, ParseError> {
     let secs = parse_duration_secs(src, line)?;
-    Ok(Value::Duration(std::time::Duration::from_secs(secs)))
+    Ok(Value::Concrete(ConcreteValue::Duration(
+        std::time::Duration::from_secs(secs),
+    )))
 }
 
 /// Convert an index-expression value into a `Subscript`. Only
@@ -70,12 +72,12 @@ pub(crate) fn parse_duration_literal(src: &str, line: usize) -> Result<Value, Pa
 /// resolver silently fall back to the unresolved ref.
 fn subscript_from_value(value: Value) -> Result<Subscript, ParseError> {
     match value {
-        Value::Int(n) if n < 0 => Err(ParseError::InvalidExpression {
+        Value::Concrete(ConcreteValue::Int(n)) if n < 0 => Err(ParseError::InvalidExpression {
             line: 0,
             message: format!("index access key must be non-negative, got {}", n),
         }),
-        Value::Int(n) => Ok(Subscript::Int { index: n }),
-        Value::String(s) => Ok(Subscript::Str { key: s }),
+        Value::Concrete(ConcreteValue::Int(n)) => Ok(Subscript::Int { index: n }),
+        Value::Concrete(ConcreteValue::String(s)) => Ok(Subscript::Str { key: s }),
         other => Err(ParseError::InvalidExpression {
             line: 0,
             message: format!(
@@ -113,7 +115,7 @@ fn parse_namespaced_id_value(
             parts[2..].iter().map(|s| s.to_string()).collect(),
             subscripts,
         );
-        EvalValue::from_value(Value::ResourceRef { path })
+        EvalValue::from_value(Value::Deferred(DeferredValue::ResourceRef { path }))
     };
 
     if ctx.is_resource_binding(parts[0]) {
@@ -131,7 +133,7 @@ fn parse_namespaced_id_value(
     // directly. This branch retained as a safety net for the truly-
     // undefined identifier path (typos, mid-edit references in the LSP
     // single-file fallback parses) — without it, an unknown subscripted
-    // ID would fall through to the enum-shorthand `Value::String`
+    // ID would fall through to the enum-shorthand `Value::Concrete(ConcreteValue::String)`
     // fallback below and silently mistype as a string. Originally added
     // for #2435.
     if !subscripts.is_empty() {
@@ -165,7 +167,9 @@ fn parse_namespaced_id_value(
         return Ok(as_resource_ref(Vec::new()));
     }
 
-    Ok(EvalValue::from_value(Value::String(full_str.to_string())))
+    Ok(EvalValue::from_value(Value::Concrete(
+        ConcreteValue::String(full_str.to_string()),
+    )))
 }
 
 pub(crate) fn parse_primary_eval(
@@ -192,7 +196,9 @@ pub(crate) fn parse_primary_eval(
                 .into_inner()
                 .map(|item| parse_expression(item, ctx))
                 .collect();
-            Ok(EvalValue::from_value(Value::List(items?)))
+            Ok(EvalValue::from_value(Value::Concrete(ConcreteValue::List(
+                items?,
+            ))))
         }
         Rule::map => {
             let mut map: IndexMap<String, Value> = IndexMap::new();
@@ -219,15 +225,17 @@ pub(crate) fn parse_primary_eval(
                         nested_blocks
                             .entry(block_name)
                             .or_default()
-                            .push(Value::Map(block_attrs));
+                            .push(Value::Concrete(ConcreteValue::Map(block_attrs)));
                     }
                     _ => {}
                 }
             }
             for (name, blocks) in nested_blocks {
-                map.insert(name, Value::List(blocks));
+                map.insert(name, Value::Concrete(ConcreteValue::List(blocks)));
             }
-            Ok(EvalValue::from_value(Value::Map(map)))
+            Ok(EvalValue::from_value(Value::Concrete(ConcreteValue::Map(
+                map,
+            ))))
         }
         Rule::namespaced_id => parse_namespaced_id_value(inner, ctx, Vec::new()),
         Rule::subscripted_id => {
@@ -251,7 +259,9 @@ pub(crate) fn parse_primary_eval(
         }
         Rule::boolean => {
             let b = inner.as_str() == "true";
-            Ok(EvalValue::from_value(Value::Bool(b)))
+            Ok(EvalValue::from_value(Value::Concrete(ConcreteValue::Bool(
+                b,
+            ))))
         }
         Rule::float => {
             let f: f64 = inner
@@ -261,7 +271,9 @@ pub(crate) fn parse_primary_eval(
                     line: inner.line_col().0,
                     message: format!("invalid float literal: {e}"),
                 })?;
-            Ok(EvalValue::from_value(Value::Float(f)))
+            Ok(EvalValue::from_value(Value::Concrete(
+                ConcreteValue::Float(f),
+            )))
         }
         Rule::number => {
             let n: i64 = inner
@@ -271,7 +283,9 @@ pub(crate) fn parse_primary_eval(
                     line: inner.line_col().0,
                     message: format!("integer literal out of range: {e}"),
                 })?;
-            Ok(EvalValue::from_value(Value::Int(n)))
+            Ok(EvalValue::from_value(Value::Concrete(ConcreteValue::Int(
+                n,
+            ))))
         }
         Rule::duration_literal => {
             let line = inner.line_col().0;
@@ -333,10 +347,12 @@ pub(crate) fn parse_primary_eval(
                 });
             }
 
-            Ok(EvalValue::from_value(Value::FunctionCall {
-                name: func_name,
-                args,
-            }))
+            Ok(EvalValue::from_value(Value::Deferred(
+                DeferredValue::FunctionCall {
+                    name: func_name,
+                    args,
+                },
+            )))
         }
         Rule::variable_ref => {
             // variable_ref = { identifier ~ (field_access | index_access)* }
@@ -352,8 +368,8 @@ pub(crate) fn parse_primary_eval(
                 // Simple variable reference (no access chain)
                 match ctx.get_variable(first_ident) {
                     Some(val) => Ok(val.clone()),
-                    None => Ok(EvalValue::from_value(Value::String(
-                        first_ident.to_string(),
+                    None => Ok(EvalValue::from_value(Value::Concrete(
+                        ConcreteValue::String(first_ident.to_string()),
                     ))),
                 }
             } else {
@@ -436,9 +452,11 @@ pub(crate) fn parse_primary_eval(
                     // unrepresentable.
                     match ctx.get_variable(&binding_name) {
                         Some(val) => Ok(val.clone()),
-                        None => Ok(EvalValue::from_value(Value::BindingRef {
-                            binding: binding_name,
-                        })),
+                        None => Ok(EvalValue::from_value(Value::Deferred(
+                            DeferredValue::BindingRef {
+                                binding: binding_name,
+                            },
+                        ))),
                     }
                 } else {
                     let attribute_name = field_names.remove(0);
@@ -448,14 +466,16 @@ pub(crate) fn parse_primary_eval(
                         field_names,
                         subscripts,
                     );
-                    Ok(EvalValue::from_value(Value::ResourceRef { path }))
+                    Ok(EvalValue::from_value(Value::Deferred(
+                        DeferredValue::ResourceRef { path },
+                    )))
                 }
             }
         }
         Rule::if_expr => parse_if_value_expr(inner, ctx).map(EvalValue::from_value),
         Rule::expression => parse_expression_eval(inner, ctx),
-        _ => Ok(EvalValue::from_value(Value::String(
-            inner.as_str().to_string(),
+        _ => Ok(EvalValue::from_value(Value::Concrete(
+            ConcreteValue::String(inner.as_str().to_string()),
         ))),
     }
 }

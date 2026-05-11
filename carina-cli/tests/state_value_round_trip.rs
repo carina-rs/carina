@@ -89,8 +89,8 @@ fn fixture_attributes_round_trip_through_value_codec() {
                 };
 
                 // Lower: Value → JSON via the production codec.
-                // Some inputs (e.g. a hypothetical `Value::Secret` or
-                // `Value::Unknown` in a fixture) intentionally error
+                // Some inputs (e.g. a hypothetical `Value::Deferred(DeferredValue::Secret)` or
+                // `Value::Deferred(DeferredValue::Unknown)` in a fixture) intentionally error
                 // here. None of the in-tree fixtures contain such
                 // values, but if a future fixture adds one, surface
                 // the error rather than swallow it.

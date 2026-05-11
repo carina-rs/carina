@@ -11,7 +11,7 @@ use indexmap::IndexMap;
 use crate::diff_helpers::{compute_map_diff, compute_unchanged_count};
 use crate::effect::Effect;
 use crate::non_empty::NonEmptyVec;
-use crate::resource::{ResourceId, Value};
+use crate::resource::{ConcreteValue, DeferredValue, ResourceId, Value};
 use crate::schema::SchemaRegistry;
 use crate::value::{format_value, format_value_with_key, is_list_of_maps, map_similarity};
 
@@ -388,11 +388,11 @@ fn build_create_rows(
         .attributes
         .get("_default_tag_keys")
         .and_then(|v| match v {
-            Value::List(items) => Some(
+            Value::Concrete(ConcreteValue::List(items)) => Some(
                 items
                     .iter()
                     .filter_map(|item| match item {
-                        Value::String(s) => Some(s.clone()),
+                        Value::Concrete(ConcreteValue::String(s)) => Some(s.clone()),
                         _ => None,
                     })
                     .collect(),
@@ -413,26 +413,28 @@ fn build_create_rows(
         // Expand tags map into individual rows with default_tags annotation
         if key.as_str() == "tags"
             && !default_tag_keys.is_empty()
-            && let Value::Map(map) = value
+            && let Value::Concrete(ConcreteValue::Map(map)) = value
         {
             rows.push(build_expanded_tags_row(map, &default_tag_keys));
             continue;
         }
-        // `Value::List` (any element type) goes through PrettyAttribute so
+        // `Value::Concrete(ConcreteValue::List)` (any element type) goes through PrettyAttribute so
         // `format_value_pretty` can apply its 80-col threshold and YAML-style
-        // vertical layout. `Value::Map` keeps the existing MapExpanded path
+        // vertical layout. `Value::Concrete(ConcreteValue::Map)` keeps the existing MapExpanded path
         // because that variant carries per-entry annotation slots that
         // PrettyAttribute does not represent (used by tags/default_tags).
-        if let Value::List(_) = value {
+        if let Value::Concrete(ConcreteValue::List(_)) = value {
             rows.push(DetailRow::PrettyAttribute {
                 key: key.to_string(),
                 value: value.clone(),
             });
-        } else if let Value::Map(map) = value {
+        } else if let Value::Concrete(ConcreteValue::Map(map)) = value {
             rows.push(build_expanded_map_row(key, map));
         } else {
             let ref_binding = match value {
-                Value::ResourceRef { path } => Some(path.binding().to_string()),
+                Value::Deferred(DeferredValue::ResourceRef { path }) => {
+                    Some(path.binding().to_string())
+                }
                 _ => None,
             };
             rows.push(DetailRow::Attribute {
@@ -792,11 +794,13 @@ fn build_delete_rows(
         keys.sort();
         for key in keys {
             let value = &attrs[key];
-            if let Value::Map(map) = value {
+            if let Value::Concrete(ConcreteValue::Map(map)) = value {
                 rows.push(build_expanded_map_row(key, map));
             } else {
                 let ref_binding = match value {
-                    Value::ResourceRef { path } => Some(path.binding().to_string()),
+                    Value::Deferred(DeferredValue::ResourceRef { path }) => {
+                        Some(path.binding().to_string())
+                    }
                     _ => None,
                 };
                 rows.push(DetailRow::Attribute {
@@ -835,11 +839,11 @@ fn compute_map_diff_entries(
     detail: DetailLevel,
 ) -> Vec<MapDiffEntryIR> {
     let new_map = match new_value {
-        Value::Map(m) => m,
+        Value::Concrete(ConcreteValue::Map(m)) => m,
         _ => return Vec::new(),
     };
     let old_map = match old_value {
-        Some(Value::Map(m)) => m,
+        Some(Value::Concrete(ConcreteValue::Map(m))) => m,
         _ => {
             let empty: IndexMap<String, Value> = IndexMap::new();
             let diff = compute_map_diff(&empty, new_map);
@@ -861,7 +865,9 @@ fn compute_map_diff_entries(
         match item {
             crate::diff_helpers::MapDiffItem::Changed(e) => {
                 // If both old and new are maps, recursively diff
-                if matches!(&e.old_value, Value::Map(_)) && matches!(&e.new_value, Value::Map(_)) {
+                if matches!(&e.old_value, Value::Concrete(ConcreteValue::Map(_)))
+                    && matches!(&e.new_value, Value::Concrete(ConcreteValue::Map(_)))
+                {
                     let nested = compute_map_diff_entries(Some(&e.old_value), &e.new_value, detail);
                     // #2910: `from_vec` returns None for the all-empty
                     // recursive case (every grandchild was itself
@@ -952,11 +958,11 @@ fn compute_list_of_maps_diff_parts(
     Vec<ListOfMapsDiffItem>,
 ) {
     let new_items = match new_value {
-        Value::List(items) => items,
+        Value::Concrete(ConcreteValue::List(items)) => items,
         _ => return (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
     };
     let old_items = match old_value {
-        Some(Value::List(items)) => items,
+        Some(Value::Concrete(ConcreteValue::List(items))) => items,
         _ => &vec![] as &Vec<Value>,
     };
 
@@ -1028,7 +1034,7 @@ fn compute_list_of_maps_diff_parts(
     // Build output parts
     let mut unchanged = Vec::new();
     for (ni, new_item) in new_items.iter().enumerate() {
-        if let Value::Map(map) = new_item
+        if let Value::Concrete(ConcreteValue::Map(map)) = new_item
             && new_matched[ni]
         {
             let mut keys: Vec<_> = map.keys().collect();
@@ -1043,7 +1049,11 @@ fn compute_list_of_maps_diff_parts(
 
     let mut modified = Vec::new();
     for &(oi, ni) in &paired {
-        if let (Value::Map(old_map), Value::Map(new_map)) = (&old_items[oi], &new_items[ni]) {
+        if let (
+            Value::Concrete(ConcreteValue::Map(old_map)),
+            Value::Concrete(ConcreteValue::Map(new_map)),
+        ) = (&old_items[oi], &new_items[ni])
+        {
             let mut keys: Vec<_> = new_map.keys().collect();
             keys.sort();
             let mut fields: Vec<ListOfMapsDiffField> = Vec::new();
@@ -1061,7 +1071,9 @@ fn compute_list_of_maps_diff_parts(
                     continue;
                 }
                 let old_val = old_map.get(k);
-                if matches!(old_val, Some(Value::Map(_))) && matches!(&new_map[k], Value::Map(_)) {
+                if matches!(old_val, Some(Value::Concrete(ConcreteValue::Map(_))))
+                    && matches!(&new_map[k], Value::Concrete(ConcreteValue::Map(_)))
+                {
                     let nested = compute_map_diff_entries(old_val, &new_map[k], detail);
                     fields.push(ListOfMapsDiffField::NestedMapChanged {
                         key: k.to_string(),
@@ -1144,13 +1156,13 @@ pub fn hidden_unchanged_summary(count: usize, noun_singular: &str) -> String {
 
 /// Build alphabetically-sorted `ListOfMapsDiffItem`s from a list of map
 /// indices into `items`. Non-map entries at the listed indices are silently
-/// skipped — only `Value::Map` items contribute fields. This is what the
+/// skipped — only `Value::Concrete(ConcreteValue::Map)` items contribute fields. This is what the
 /// renderer consumes for the added/removed slots of a list-of-maps diff.
 fn collect_added_removed_items(indices: &[usize], items: &[Value]) -> Vec<ListOfMapsDiffItem> {
     indices
         .iter()
         .filter_map(|&i| {
-            if let Value::Map(map) = &items[i] {
+            if let Value::Concrete(ConcreteValue::Map(map)) = &items[i] {
                 let mut entries: Vec<(&String, &Value)> = map.iter().collect();
                 entries.sort_by(|a, b| a.0.cmp(b.0));
                 let fields = entries
@@ -1166,13 +1178,17 @@ fn collect_added_removed_items(indices: &[usize], items: &[Value]) -> Vec<ListOf
 }
 
 /// Check whether the diff at this attribute should render via the
-/// per-key `MapDiff` walk. True when `new_value` is a `Value::Map` and
+/// per-key `MapDiff` walk. True when `new_value` is a `Value::Concrete(ConcreteValue::Map)` and
 /// `old_value` is either absent (attribute being added — #2936) or
-/// itself a `Value::Map`. A non-Map old value (type mismatch, e.g.
+/// itself a `Value::Concrete(ConcreteValue::Map)`. A non-Map old value (type mismatch, e.g.
 /// string → map) keeps the inline `prev → next` form so the prior
 /// scalar stays visible.
 fn should_render_as_map_diff(old_value: Option<&Value>, new_value: &Value) -> bool {
-    matches!(new_value, Value::Map(_)) && matches!(old_value, None | Some(Value::Map(_)))
+    matches!(new_value, Value::Concrete(ConcreteValue::Map(_)))
+        && matches!(
+            old_value,
+            None | Some(Value::Concrete(ConcreteValue::Map(_)))
+        )
 }
 
 /// Compute a string-list diff for a single attribute (#2943).
@@ -1248,8 +1264,14 @@ mod tests {
     #[test]
     fn test_create_basic_attributes() {
         let resource = Resource::new("s3.Bucket", "my-bucket")
-            .with_attribute("bucket", Value::String("my-bucket".to_string()))
-            .with_attribute("region", Value::String("us-east-1".to_string()));
+            .with_attribute(
+                "bucket",
+                Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
+            )
+            .with_attribute(
+                "region",
+                Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
+            );
         let effect = Effect::Create(resource);
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
         assert_eq!(rows.len(), 2);
@@ -1263,13 +1285,15 @@ mod tests {
             ResourceId::new("s3.Bucket", "my-bucket"),
             [(
                 "versioning".to_string(),
-                Value::String("Disabled".to_string()),
+                Value::Concrete(ConcreteValue::String("Disabled".to_string())),
             )]
             .into_iter()
             .collect(),
         );
-        let to = Resource::new("s3.Bucket", "my-bucket")
-            .with_attribute("versioning", Value::String("Enabled".to_string()));
+        let to = Resource::new("s3.Bucket", "my-bucket").with_attribute(
+            "versioning",
+            Value::Concrete(ConcreteValue::String("Enabled".to_string())),
+        );
         let effect = Effect::Update {
             id: ResourceId::new("s3.Bucket", "my-bucket"),
             from: Box::new(from),
@@ -1287,20 +1311,35 @@ mod tests {
         let from = State::existing(
             ResourceId::new("s3.Bucket", "my-bucket"),
             [
-                ("name".to_string(), Value::String("test".to_string())),
-                ("region".to_string(), Value::String("us-east-1".to_string())),
+                (
+                    "name".to_string(),
+                    Value::Concrete(ConcreteValue::String("test".to_string())),
+                ),
+                (
+                    "region".to_string(),
+                    Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
+                ),
                 (
                     "versioning".to_string(),
-                    Value::String("Disabled".to_string()),
+                    Value::Concrete(ConcreteValue::String("Disabled".to_string())),
                 ),
             ]
             .into_iter()
             .collect(),
         );
         let to = Resource::new("s3.Bucket", "my-bucket")
-            .with_attribute("name", Value::String("test".to_string()))
-            .with_attribute("region", Value::String("us-east-1".to_string()))
-            .with_attribute("versioning", Value::String("Enabled".to_string()));
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("test".to_string())),
+            )
+            .with_attribute(
+                "region",
+                Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
+            )
+            .with_attribute(
+                "versioning",
+                Value::Concrete(ConcreteValue::String("Enabled".to_string())),
+            );
         let effect = Effect::Update {
             id: ResourceId::new("s3.Bucket", "my-bucket"),
             from: Box::new(from),
@@ -1326,20 +1365,35 @@ mod tests {
         let from = State::existing(
             ResourceId::new("s3.Bucket", "my-bucket"),
             [
-                ("authored".to_string(), Value::String("a".to_string())),
-                ("server_only".to_string(), Value::String("s".to_string())),
+                (
+                    "authored".to_string(),
+                    Value::Concrete(ConcreteValue::String("a".to_string())),
+                ),
+                (
+                    "server_only".to_string(),
+                    Value::Concrete(ConcreteValue::String("s".to_string())),
+                ),
                 (
                     "trigger_diff".to_string(),
-                    Value::String("old-value".to_string()),
+                    Value::Concrete(ConcreteValue::String("old-value".to_string())),
                 ),
             ]
             .into_iter()
             .collect(),
         );
         let to = Resource::new("s3.Bucket", "my-bucket")
-            .with_attribute("authored", Value::String("a".to_string()))
-            .with_attribute("server_only", Value::String("s".to_string()))
-            .with_attribute("trigger_diff", Value::String("new-value".to_string()));
+            .with_attribute(
+                "authored",
+                Value::Concrete(ConcreteValue::String("a".to_string())),
+            )
+            .with_attribute(
+                "server_only",
+                Value::Concrete(ConcreteValue::String("s".to_string())),
+            )
+            .with_attribute(
+                "trigger_diff",
+                Value::Concrete(ConcreteValue::String("new-value".to_string())),
+            );
         let effect = Effect::Update {
             id: ResourceId::new("s3.Bucket", "my-bucket"),
             from: Box::new(from),
@@ -1400,7 +1454,7 @@ mod tests {
             id.clone(),
             [(
                 "bucket".to_string(),
-                Value::String("old-bucket".to_string()),
+                Value::Concrete(ConcreteValue::String("old-bucket".to_string())),
             )]
             .into_iter()
             .collect(),
@@ -1415,17 +1469,22 @@ mod tests {
         let from = State::existing(
             ResourceId::new("s3.Bucket", "my-bucket"),
             [
-                ("name".to_string(), Value::String("test".to_string())),
+                (
+                    "name".to_string(),
+                    Value::Concrete(ConcreteValue::String("test".to_string())),
+                ),
                 (
                     "removed_attr".to_string(),
-                    Value::String("old-val".to_string()),
+                    Value::Concrete(ConcreteValue::String("old-val".to_string())),
                 ),
             ]
             .into_iter()
             .collect(),
         );
-        let to = Resource::new("s3.Bucket", "my-bucket")
-            .with_attribute("name", Value::String("test".to_string()));
+        let to = Resource::new("s3.Bucket", "my-bucket").with_attribute(
+            "name",
+            Value::Concrete(ConcreteValue::String("test".to_string())),
+        );
         let effect = Effect::Update {
             id: ResourceId::new("s3.Bucket", "my-bucket"),
             from: Box::new(from),
@@ -1440,10 +1499,16 @@ mod tests {
     #[test]
     fn test_create_map_expanded() {
         let mut tags = IndexMap::new();
-        tags.insert("Name".to_string(), Value::String("test".to_string()));
-        tags.insert("Environment".to_string(), Value::String("prod".to_string()));
-        let resource =
-            Resource::new("s3.Bucket", "my-bucket").with_attribute("tags", Value::Map(tags));
+        tags.insert(
+            "Name".to_string(),
+            Value::Concrete(ConcreteValue::String("test".to_string())),
+        );
+        tags.insert(
+            "Environment".to_string(),
+            Value::Concrete(ConcreteValue::String("prod".to_string())),
+        );
+        let resource = Resource::new("s3.Bucket", "my-bucket")
+            .with_attribute("tags", Value::Concrete(ConcreteValue::Map(tags)));
         let effect = Effect::Create(resource);
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
         assert_eq!(rows.len(), 1);
@@ -1452,10 +1517,16 @@ mod tests {
                 assert_eq!(key, "tags");
                 assert_eq!(entries.len(), 2);
                 assert_eq!(entries[0].key, "Environment");
-                assert_eq!(entries[0].value, Value::String("prod".to_string()));
+                assert_eq!(
+                    entries[0].value,
+                    Value::Concrete(ConcreteValue::String("prod".to_string()))
+                );
                 assert!(entries[0].annotation.is_none());
                 assert_eq!(entries[1].key, "Name");
-                assert_eq!(entries[1].value, Value::String("test".to_string()));
+                assert_eq!(
+                    entries[1].value,
+                    Value::Concrete(ConcreteValue::String("test".to_string()))
+                );
                 assert!(entries[1].annotation.is_none());
             }
             other => panic!("expected MapExpanded, got {:?}", other),
@@ -1470,22 +1541,39 @@ mod tests {
     #[test]
     fn test_create_map_expanded_carries_raw_value_for_nested_list_of_maps() {
         let mut statement1 = IndexMap::new();
-        statement1.insert("sid".to_string(), Value::String("AllowRead".to_string()));
-        statement1.insert("effect".to_string(), Value::String("Allow".to_string()));
+        statement1.insert(
+            "sid".to_string(),
+            Value::Concrete(ConcreteValue::String("AllowRead".to_string())),
+        );
+        statement1.insert(
+            "effect".to_string(),
+            Value::Concrete(ConcreteValue::String("Allow".to_string())),
+        );
         let mut statement2 = IndexMap::new();
-        statement2.insert("sid".to_string(), Value::String("DenyWrite".to_string()));
-        statement2.insert("effect".to_string(), Value::String("Deny".to_string()));
+        statement2.insert(
+            "sid".to_string(),
+            Value::Concrete(ConcreteValue::String("DenyWrite".to_string())),
+        );
+        statement2.insert(
+            "effect".to_string(),
+            Value::Concrete(ConcreteValue::String("Deny".to_string())),
+        );
         let mut policy = IndexMap::new();
         policy.insert(
             "version".to_string(),
-            Value::String("2012-10-17".to_string()),
+            Value::Concrete(ConcreteValue::String("2012-10-17".to_string())),
         );
         policy.insert(
             "statement".to_string(),
-            Value::List(vec![Value::Map(statement1), Value::Map(statement2.clone())]),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::Map(statement1)),
+                Value::Concrete(ConcreteValue::Map(statement2.clone())),
+            ])),
         );
-        let resource = Resource::new("iam.RolePolicy", "test")
-            .with_attribute("policy_document", Value::Map(policy));
+        let resource = Resource::new("iam.RolePolicy", "test").with_attribute(
+            "policy_document",
+            Value::Concrete(ConcreteValue::Map(policy)),
+        );
         let effect = Effect::Create(resource);
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
         let entries = rows
@@ -1502,14 +1590,17 @@ mod tests {
             .find(|e| e.key == "statement")
             .expect("expected `statement` entry");
         match &stmt_entry.value {
-            Value::List(items) => {
+            Value::Concrete(ConcreteValue::List(items)) => {
                 assert_eq!(items.len(), 2, "list-of-maps preserved as raw Value");
                 assert!(
-                    matches!(items[0], Value::Map(_)),
-                    "inner element kept as Value::Map, not stringified"
+                    matches!(items[0], Value::Concrete(ConcreteValue::Map(_))),
+                    "inner element kept as Value::Concrete(ConcreteValue::Map), not stringified"
                 );
             }
-            other => panic!("expected Value::List, got {:?}", other),
+            other => panic!(
+                "expected Value::Concrete(ConcreteValue::List), got {:?}",
+                other
+            ),
         }
     }
 
@@ -1525,13 +1616,19 @@ mod tests {
             explicit_dependencies: std::collections::HashSet::new(),
         };
         let mut tags = IndexMap::new();
-        tags.insert("Name".to_string(), Value::String("test".to_string()));
+        tags.insert(
+            "Name".to_string(),
+            Value::Concrete(ConcreteValue::String("test".to_string())),
+        );
         let mut delete_attrs: HashMap<ResourceId, HashMap<String, Value>> = HashMap::new();
         delete_attrs.insert(
             id.clone(),
-            [("tags".to_string(), Value::Map(tags))]
-                .into_iter()
-                .collect(),
+            [(
+                "tags".to_string(),
+                Value::Concrete(ConcreteValue::Map(tags)),
+            )]
+            .into_iter()
+            .collect(),
         );
         let rows = build_detail_rows(&effect, None, DetailLevel::Full, Some(&delete_attrs), None);
         assert_eq!(rows.len(), 1);
@@ -1540,7 +1637,10 @@ mod tests {
                 assert_eq!(key, "tags");
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].key, "Name");
-                assert_eq!(entries[0].value, Value::String("test".to_string()));
+                assert_eq!(
+                    entries[0].value,
+                    Value::Concrete(ConcreteValue::String("test".to_string()))
+                );
             }
             other => panic!("expected MapExpanded, got {:?}", other),
         }
@@ -1552,13 +1652,15 @@ mod tests {
             ResourceId::new("ec2.Vpc", "my-vpc"),
             [(
                 "cidr_block".to_string(),
-                Value::String("10.0.0.0/16".to_string()),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
             )]
             .into_iter()
             .collect(),
         );
-        let to = Resource::new("ec2.Vpc", "my-vpc")
-            .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
+        let to = Resource::new("ec2.Vpc", "my-vpc").with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+        );
         let effect = Effect::Replace {
             id: ResourceId::new("ec2.Vpc", "my-vpc"),
             from: Box::new(from),
@@ -1585,19 +1687,22 @@ mod tests {
 
         let refs_vpc = Value::resource_ref("vpc", "id", vec![]);
 
-        let interpolation = Value::Interpolation(vec![
+        let interpolation = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("vpc-".to_string()),
             InterpolationPart::Expr(refs_vpc.clone()),
-        ]);
+        ]));
         assert!(value_references_binding(&interpolation, "vpc"));
 
-        let function_call = Value::FunctionCall {
+        let function_call = Value::Deferred(DeferredValue::FunctionCall {
             name: "join".to_string(),
-            args: vec![Value::String(",".to_string()), refs_vpc.clone()],
-        };
+            args: vec![
+                Value::Concrete(ConcreteValue::String(",".to_string())),
+                refs_vpc.clone(),
+            ],
+        });
         assert!(value_references_binding(&function_call, "vpc"));
 
-        let secret = Value::Secret(Box::new(refs_vpc));
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(refs_vpc)));
         assert!(value_references_binding(&secret, "vpc"));
 
         // Closure variant removed from `Value` (issue #2230): closures
@@ -1605,7 +1710,7 @@ mod tests {
 
         // Still false when the binding is genuinely absent.
         assert!(!value_references_binding(
-            &Value::String("plain".to_string()),
+            &Value::Concrete(ConcreteValue::String("plain".to_string())),
             "vpc"
         ));
     }
@@ -1613,10 +1718,20 @@ mod tests {
     #[test]
     fn create_row_list_of_maps_emits_pretty_attribute() {
         let mut entry = indexmap::IndexMap::new();
-        entry.insert("sid".to_string(), Value::String("S1".to_string()));
-        entry.insert("effect".to_string(), Value::String("Allow".to_string()));
-        let resource = Resource::new("iam.RolePolicy", "test")
-            .with_attribute("statement", Value::List(vec![Value::Map(entry)]));
+        entry.insert(
+            "sid".to_string(),
+            Value::Concrete(ConcreteValue::String("S1".to_string())),
+        );
+        entry.insert(
+            "effect".to_string(),
+            Value::Concrete(ConcreteValue::String("Allow".to_string())),
+        );
+        let resource = Resource::new("iam.RolePolicy", "test").with_attribute(
+            "statement",
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(entry),
+            )])),
+        );
         let effect = Effect::Create(resource);
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
 
@@ -1629,15 +1744,20 @@ mod tests {
             "expected PrettyAttribute row for statement, got: {rows:?}"
         );
         assert!(
-            matches!(pretty_value.unwrap(), Value::List(_)),
-            "PrettyAttribute should carry the raw Value::List"
+            matches!(
+                pretty_value.unwrap(),
+                Value::Concrete(ConcreteValue::List(_))
+            ),
+            "PrettyAttribute should carry the raw Value::Concrete(ConcreteValue::List)"
         );
     }
 
     #[test]
     fn create_row_scalar_attribute_unchanged() {
-        let resource = Resource::new("iam.Role", "test")
-            .with_attribute("role_name", Value::String("foo".to_string()));
+        let resource = Resource::new("iam.Role", "test").with_attribute(
+            "role_name",
+            Value::Concrete(ConcreteValue::String("foo".to_string())),
+        );
         let effect = Effect::Create(resource);
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
         assert!(
@@ -1655,10 +1775,14 @@ mod tests {
         // format_value_pretty's 80-col threshold can apply.
         let resource = Resource::new("iam.Role", "test").with_attribute(
             "managed_policy_arns",
-            Value::List(vec![
-                Value::String("arn:aws:iam::aws:policy/Policy1".to_string()),
-                Value::String("arn:aws:iam::aws:policy/Policy2".to_string()),
-            ]),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String(
+                    "arn:aws:iam::aws:policy/Policy1".to_string(),
+                )),
+                Value::Concrete(ConcreteValue::String(
+                    "arn:aws:iam::aws:policy/Policy2".to_string(),
+                )),
+            ])),
         );
         let effect = Effect::Create(resource);
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
@@ -1674,8 +1798,8 @@ mod tests {
             "expected PrettyAttribute row for list-of-string attribute, got: {rows:?}"
         );
         assert!(
-            matches!(pretty.unwrap(), Value::List(_)),
-            "PrettyAttribute should carry the raw Value::List"
+            matches!(pretty.unwrap(), Value::Concrete(ConcreteValue::List(_))),
+            "PrettyAttribute should carry the raw Value::Concrete(ConcreteValue::List)"
         );
     }
 
@@ -1684,8 +1808,8 @@ mod tests {
         // Pins down `tags = []` behavior — a regression that re-introduces
         // an `!items.is_empty()` guard would silently bypass the routing
         // for empty lists, breaking the formatting-path uniformity.
-        let resource =
-            Resource::new("iam.Role", "test").with_attribute("tags", Value::List(vec![]));
+        let resource = Resource::new("iam.Role", "test")
+            .with_attribute("tags", Value::Concrete(ConcreteValue::List(vec![])));
         let effect = Effect::Create(resource);
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
         assert!(

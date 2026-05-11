@@ -19,7 +19,7 @@ use std::path::Path;
 
 use crate::config_loader::{find_crn_files_in_dir, parse_directory};
 use crate::parser::{ProviderContext, ResourceContext, TypeExpr, UpstreamState};
-use crate::resource::{Subscript, Value};
+use crate::resource::{ConcreteValue, DeferredValue, Subscript, Value};
 use crate::schema::{AttributeType, SchemaRegistry, suggest_similar_name};
 
 /// One export's declared type and literal value, as carried through
@@ -382,7 +382,7 @@ enum NonResourceScope {
 /// Walk a parsed project and return an error for every reference whose root
 /// binding is in `exports` but whose field isn't in its declared key set.
 /// Also covers deferred for-iterables (e.g. `for _ in orgs.accounts`), which
-/// parse into `deferred_for_expressions` rather than `Value::ResourceRef`.
+/// parse into `deferred_for_expressions` rather than `Value::Deferred(DeferredValue::ResourceRef)`.
 ///
 /// Bindings absent from `exports` are skipped — the caller decides what to
 /// do about unresolved upstreams.
@@ -573,7 +573,7 @@ fn check_ref_against_type(
 }
 
 /// Positional walker: descend `value` and `expected` in lockstep,
-/// threading the inner expected type to each leaf `Value::ResourceRef`
+/// threading the inner expected type to each leaf `Value::Deferred(DeferredValue::ResourceRef)`
 /// so the comparison fires against the *position's* schema type rather
 /// than the outer attribute's. Without this, a ref deep inside a
 /// struct field or interpolation gets compared to the outer attr type
@@ -595,10 +595,10 @@ fn walk_value_against_type(
     errors: &mut Vec<UpstreamTypeError>,
 ) {
     match value {
-        Value::ResourceRef { path } => {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
             check_resource_ref_at_position(path, expected, exports, location, errors);
         }
-        Value::List(items) => {
+        Value::Concrete(ConcreteValue::List(items)) => {
             // Descend `list(T)` element-wise. For non-list receivers
             // the existing top-level shape check (run elsewhere)
             // already flags the kind mismatch, so we just walk each
@@ -612,7 +612,7 @@ fn walk_value_against_type(
                 walk_value_against_type(item, inner, exports, location, errors);
             }
         }
-        Value::Map(entries) => match expected {
+        Value::Concrete(ConcreteValue::Map(entries)) => match expected {
             AttributeType::Map { value: inner, .. } => {
                 for v in entries.values() {
                     walk_value_against_type(v, inner, exports, location, errors);
@@ -646,7 +646,7 @@ fn walk_value_against_type(
                 }
             }
         },
-        Value::Interpolation(parts) => {
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
             // The result of an interpolation is always a string, so
             // every embedded `Expr` part sits in a String position
             // regardless of where the interpolation itself appears.
@@ -656,10 +656,10 @@ fn walk_value_against_type(
                 }
             }
         }
-        Value::Secret(inner) => {
+        Value::Deferred(DeferredValue::Secret(inner)) => {
             walk_value_against_type(inner, expected, exports, location, errors);
         }
-        Value::FunctionCall { args, .. } => {
+        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
             // Function arguments occupy function-internal positions
             // whose declared types live on the function definition
             // (out of reach here). Walk with `expected` as a
@@ -669,18 +669,18 @@ fn walk_value_against_type(
                 walk_value_against_type(arg, expected, exports, location, errors);
             }
         }
-        Value::String(_)
-        | Value::Int(_)
-        | Value::Float(_)
-        | Value::Bool(_)
-        | Value::Duration(_)
-        | Value::StringList(_)
-        | Value::Unknown(_) => {}
+        Value::Concrete(ConcreteValue::String(_))
+        | Value::Concrete(ConcreteValue::Int(_))
+        | Value::Concrete(ConcreteValue::Float(_))
+        | Value::Concrete(ConcreteValue::Bool(_))
+        | Value::Concrete(ConcreteValue::Duration(_))
+        | Value::Concrete(ConcreteValue::StringList(_))
+        | Value::Deferred(DeferredValue::Unknown(_)) => {}
         // `BindingRef` carries no attribute, so there is nothing to
         // type-check at a "field reference" position. The same applies
         // to all other walkers in this module: a bare-binding seed
         // cannot stand in for an attribute reference. (#2847)
-        Value::BindingRef { .. } => {}
+        Value::Deferred(DeferredValue::BindingRef { .. }) => {}
     }
 }
 
@@ -997,7 +997,7 @@ impl UpstreamRefDiagnostic for UpstreamAttributeAccessShapeError {
     }
 }
 
-/// Walk every `Value::ResourceRef` whose root is an `upstream_state`
+/// Walk every `Value::Deferred(DeferredValue::ResourceRef)` whose root is an `upstream_state`
 /// binding and whose `field_path` is non-empty, and emit an error
 /// whenever a path segment doesn't fit the declared upstream
 /// `TypeExpr`.
@@ -1161,7 +1161,7 @@ impl UpstreamRefDiagnostic for UpstreamSubscriptShapeError {
     }
 }
 
-/// Walk every `Value::ResourceRef` whose root is an `upstream_state`
+/// Walk every `Value::Deferred(DeferredValue::ResourceRef)` whose root is an `upstream_state`
 /// binding and whose `subscripts` chain is non-empty, and emit an error
 /// whenever a subscript's kind (integer vs string) doesn't fit the
 /// declared upstream `TypeExpr` at that depth.
@@ -1493,7 +1493,7 @@ mod tests {
         // `exports { }` block. Without the value, downstream consumers
         // (LSP map-literal-key completion, future doc-extracting tools)
         // have to re-parse the upstream directory a second time per call.
-        use crate::resource::Value;
+        use crate::resource::{ConcreteValue, Value};
 
         let tmp = tempfile::tempdir().unwrap();
         let upstream_dir = tmp.path().join("organizations");
@@ -1521,8 +1521,10 @@ mod tests {
             "type annotation must still be present"
         );
         let value = entry.value.as_ref().expect("export value must be carried");
-        let Value::Map(entries) = value else {
-            panic!("expected Value::Map for map literal export, got {value:?}");
+        let Value::Concrete(ConcreteValue::Map(entries)) = value else {
+            panic!(
+                "expected Value::Concrete(ConcreteValue::Map) for map literal export, got {value:?}"
+            );
         };
         let mut keys: Vec<&String> = entries.keys().collect();
         keys.sort();
@@ -1708,7 +1710,7 @@ mod tests {
         // surfaced as a `ResourceRef { attribute: "" }` and tripped the
         // walker into emitting `does not export ``.`. Type-split makes
         // the offending shape unrepresentable: a sibling-only seed is a
-        // `Value::BindingRef`, which has no attribute slot for the
+        // `Value::Deferred(DeferredValue::BindingRef)`, which has no attribute slot for the
         // walker to read, so the empty-field diagnostic class is
         // statically eliminated.
         let tmp = tempfile::tempdir().unwrap();
@@ -1732,7 +1734,10 @@ mod tests {
         // can no longer impersonate an attribute reference.
         let bootstrap_var = parsed.variables.get("bootstrap");
         assert!(
-            matches!(bootstrap_var, Some(Value::BindingRef { .. }) | None),
+            matches!(
+                bootstrap_var,
+                Some(Value::Deferred(DeferredValue::BindingRef { .. })) | None
+            ),
             "sibling-only `bootstrap` must be either absent or a \
              BindingRef, got: {bootstrap_var:?}"
         );

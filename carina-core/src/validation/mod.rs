@@ -10,7 +10,7 @@ use indexmap::IndexMap;
 use crate::binding_index::BindingIndex;
 use crate::parser::{ModuleCall, ProviderContext, TypeExpr, validate_custom_type};
 use crate::provider::ProviderFactory;
-use crate::resource::{Resource, Value};
+use crate::resource::{ConcreteValue, DeferredValue, Resource, Value};
 use crate::schema::{AttributeType, SchemaRegistry, suggest_similar_name};
 
 /// Validate resources against their schemas.
@@ -117,7 +117,7 @@ pub fn validate_resource_ref_types<E>(
             }
 
             let (ref_binding, ref_attr) = match attr_value {
-                Value::ResourceRef { path } => {
+                Value::Deferred(DeferredValue::ResourceRef { path }) => {
                     (path.binding().to_string(), path.attribute().to_string())
                 }
                 _ => continue,
@@ -220,7 +220,7 @@ pub fn validate_attribute_param_ref_types(
         };
 
         // Only check ResourceRef values
-        let Value::ResourceRef { path } = value else {
+        let Value::Deferred(DeferredValue::ResourceRef { path }) = value else {
             continue;
         };
         let ref_binding = path.binding().to_string();
@@ -322,7 +322,7 @@ fn collect_ref_type_errors(
     use crate::parser::TypeExpr;
 
     match (type_expr, value) {
-        (_, Value::ResourceRef { path }) => {
+        (_, Value::Deferred(DeferredValue::ResourceRef { path })) => {
             let ref_binding = path.binding();
             let ref_attr = path.attribute();
 
@@ -345,17 +345,17 @@ fn collect_ref_type_errors(
                 ));
             }
         }
-        (TypeExpr::List(inner), Value::List(items)) => {
+        (TypeExpr::List(inner), Value::Concrete(ConcreteValue::List(items))) => {
             for item in items {
                 collect_ref_type_errors(inner, item, param_name, binding_map, registry, errors);
             }
         }
-        (TypeExpr::Map(inner), Value::Map(map)) => {
+        (TypeExpr::Map(inner), Value::Concrete(ConcreteValue::Map(map))) => {
             for value in map.values() {
                 collect_ref_type_errors(inner, value, param_name, binding_map, registry, errors);
             }
         }
-        (TypeExpr::Struct { fields }, Value::Map(map)) => {
+        (TypeExpr::Struct { fields }, Value::Concrete(ConcreteValue::Map(map))) => {
             for (name, field_ty) in fields {
                 if let Some(value) = map.get(name) {
                     collect_ref_type_errors(
@@ -744,7 +744,7 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
     // `collect_dot_notation_refs` also runs on resource attributes: when
     // a resource in file A references `binding.attr` where `binding` is
     // declared in sibling file B, per-file parse stores it as
-    // `Value::String("binding.attr")`. `resolve_resource_refs_with_config`
+    // `Value::Concrete(ConcreteValue::String("binding.attr"))`. `resolve_resource_refs_with_config`
     // lifts those to `ResourceRef` only when the value sits at the top
     // level of an attribute; inside a list / map / interpolation the
     // string form survives, so a reference nested in
@@ -813,15 +813,15 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
 /// Recursively collect all `ResourceRef` binding names from a value tree.
 pub(crate) fn collect_resource_refs(value: &Value, refs: &mut HashSet<String>) {
     match value {
-        Value::ResourceRef { path } => {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
             refs.insert(path.binding().to_string());
         }
-        Value::List(items) => {
+        Value::Concrete(ConcreteValue::List(items)) => {
             for item in items {
                 collect_resource_refs(item, refs);
             }
         }
-        Value::Map(map) => {
+        Value::Concrete(ConcreteValue::Map(map)) => {
             for v in map.values() {
                 collect_resource_refs(v, refs);
             }
@@ -837,7 +837,9 @@ pub(crate) fn collect_resource_refs(value: &Value, refs: &mut HashSet<String>) {
 /// the first component as a potential binding name.
 pub(crate) fn collect_dot_notation_refs(value: &Value, refs: &mut HashSet<String>) {
     match value {
-        Value::String(s) if s.contains('.') && !s.contains(' ') && !s.starts_with('/') => {
+        Value::Concrete(ConcreteValue::String(s))
+            if s.contains('.') && !s.contains(' ') && !s.starts_with('/') =>
+        {
             if let Some(binding) = s.split('.').next()
                 && !binding.is_empty()
                 && binding
@@ -847,12 +849,12 @@ pub(crate) fn collect_dot_notation_refs(value: &Value, refs: &mut HashSet<String
                 refs.insert(binding.to_string());
             }
         }
-        Value::List(items) => {
+        Value::Concrete(ConcreteValue::List(items)) => {
             for item in items {
                 collect_dot_notation_refs(item, refs);
             }
         }
-        Value::Map(map) => {
+        Value::Concrete(ConcreteValue::Map(map)) => {
             for v in map.values() {
                 collect_dot_notation_refs(v, refs);
             }
@@ -870,15 +872,15 @@ pub fn validate_type_expr_value(
     value: &Value,
     config: &ProviderContext,
 ) -> Option<String> {
-    // `Value::Unknown` resolves at upstream apply — the concrete type
+    // `Value::Deferred(DeferredValue::Unknown)` resolves at upstream apply — the concrete type
     // is unknowable here. Same skip rule the schema validator and
     // `check_fn_arg_type` follow.
-    if matches!(value, Value::Unknown(_)) {
+    if matches!(value, Value::Deferred(DeferredValue::Unknown(_))) {
         return None;
     }
     match (type_expr, value) {
         (TypeExpr::Simple(name), _) => validate_custom_type(name, value, config).err(),
-        (TypeExpr::List(inner), Value::List(items)) => {
+        (TypeExpr::List(inner), Value::Concrete(ConcreteValue::List(items))) => {
             for (i, item) in items.iter().enumerate() {
                 if let Some(e) = validate_type_expr_value(inner, item, config) {
                     return Some(format!("Element {}: {}", i, e));
@@ -886,7 +888,7 @@ pub fn validate_type_expr_value(
             }
             None
         }
-        (TypeExpr::Struct { fields }, Value::Map(entries)) => {
+        (TypeExpr::Struct { fields }, Value::Concrete(ConcreteValue::Map(entries))) => {
             validate_struct_fields(fields, entries, config)
         }
         (TypeExpr::Struct { .. }, _) => Some(format!(
@@ -894,40 +896,48 @@ pub fn validate_type_expr_value(
             type_expr,
             crate::parser::value_type_name(value)
         )),
-        (TypeExpr::Bool, Value::String(s)) => Some(format!(
+        (TypeExpr::Bool, Value::Concrete(ConcreteValue::String(s))) => Some(format!(
             "expected {type_expr}, got string \"{s}\". Use true or false."
         )),
-        (TypeExpr::Int, Value::String(s)) => {
+        (TypeExpr::Int, Value::Concrete(ConcreteValue::String(s))) => {
             Some(format!("expected {type_expr}, got string \"{s}\"."))
         }
-        (TypeExpr::Float, Value::String(s)) => {
+        (TypeExpr::Float, Value::Concrete(ConcreteValue::String(s))) => {
             Some(format!("expected {type_expr}, got string \"{s}\"."))
         }
-        (TypeExpr::String, Value::Bool(b)) => {
+        (TypeExpr::String, Value::Concrete(ConcreteValue::Bool(b))) => {
             Some(format!("expected {type_expr}, got bool ({b})."))
         }
-        (TypeExpr::String, Value::Int(n)) => Some(format!("expected {type_expr}, got int ({n}).")),
-        (TypeExpr::String, Value::Float(f)) => {
+        (TypeExpr::String, Value::Concrete(ConcreteValue::Int(n))) => {
+            Some(format!("expected {type_expr}, got int ({n})."))
+        }
+        (TypeExpr::String, Value::Concrete(ConcreteValue::Float(f))) => {
             Some(format!("expected {type_expr}, got float ({f})."))
         }
-        (TypeExpr::Bool, Value::Int(n)) => Some(format!("expected {type_expr}, got int ({n}).")),
-        (TypeExpr::Int, Value::Bool(b)) => Some(format!("expected {type_expr}, got bool ({b}).")),
-        (TypeExpr::Float, Value::Bool(b)) => Some(format!("expected {type_expr}, got bool ({b}).")),
+        (TypeExpr::Bool, Value::Concrete(ConcreteValue::Int(n))) => {
+            Some(format!("expected {type_expr}, got int ({n})."))
+        }
+        (TypeExpr::Int, Value::Concrete(ConcreteValue::Bool(b))) => {
+            Some(format!("expected {type_expr}, got bool ({b})."))
+        }
+        (TypeExpr::Float, Value::Concrete(ConcreteValue::Bool(b))) => {
+            Some(format!("expected {type_expr}, got bool ({b})."))
+        }
         // Schema types are string subtypes — reject non-string values
-        (TypeExpr::SchemaType { .. }, Value::Bool(b)) => {
+        (TypeExpr::SchemaType { .. }, Value::Concrete(ConcreteValue::Bool(b))) => {
             Some(format!("expected {}, got bool ({}).", type_expr, b))
         }
-        (TypeExpr::SchemaType { .. }, Value::Int(n)) => {
+        (TypeExpr::SchemaType { .. }, Value::Concrete(ConcreteValue::Int(n))) => {
             Some(format!("expected {}, got int ({}).", type_expr, n))
         }
-        (TypeExpr::SchemaType { .. }, Value::Float(f)) => {
+        (TypeExpr::SchemaType { .. }, Value::Concrete(ConcreteValue::Float(f))) => {
             Some(format!("expected {}, got float ({}).", type_expr, f))
         }
         _ => None,
     }
 }
 
-/// Check shape-level problems of a `Value::Map` against a struct field
+/// Check shape-level problems of a `Value::Concrete(ConcreteValue::Map)` against a struct field
 /// list: extra keys and missing keys. Returns `None` when the key sets
 /// match. Callers then walk each field with their own type-check pass.
 pub fn struct_field_shape_errors(

@@ -22,7 +22,7 @@ mod upper_lower;
 
 use crate::eval_value::EvalValue;
 use crate::parser::ProviderContext;
-use crate::resource::Value;
+use crate::resource::{ConcreteValue, DeferredValue, Value};
 
 /// Coarse-grained return type for a built-in function. Used by the LSP to
 /// filter value-position completion candidates to those whose return type
@@ -39,20 +39,20 @@ use crate::resource::Value;
 /// built-in currently returns those types; add them when one does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinReturnType {
-    /// Returns a plain `Value::String` (no semantic subtype).
+    /// Returns a plain `Value::Concrete(ConcreteValue::String)` (no semantic subtype).
     String,
-    /// Returns a `Value::Int`.
+    /// Returns a `Value::Concrete(ConcreteValue::Int)`.
     Int,
-    /// Returns a `Value::List` of some element type.
+    /// Returns a `Value::Concrete(ConcreteValue::List)` of some element type.
     List,
-    /// Returns a `Value::Map`.
+    /// Returns a `Value::Concrete(ConcreteValue::Map)`.
     Map,
     /// Return shape depends on the arguments (e.g. `lookup`, `min`, `max`,
     /// `map`). Matches any base type the attribute accepts, but still fails
     /// to match `Custom` / `StringEnum` attributes — the caller has no
     /// evidence the returned value satisfies those semantic constraints.
     Any,
-    /// Returns a `Value::Secret` wrapper.
+    /// Returns a `Value::Deferred(DeferredValue::Secret)` wrapper.
     Secret,
 }
 
@@ -412,20 +412,20 @@ pub(crate) fn evaluate_builtin_with_config_to_value(
 /// Return a human-readable type name for a Value
 fn value_type_name(value: &Value) -> &'static str {
     match value {
-        Value::String(_) => "String",
-        Value::Int(_) => "Int",
-        Value::Float(_) => "Float",
-        Value::Bool(_) => "Bool",
-        Value::Duration(_) => "Duration",
-        Value::List(_) => "List",
-        Value::StringList(_) => "StringList",
-        Value::Map(_) => "Map",
-        Value::ResourceRef { .. } => "ResourceRef",
-        Value::BindingRef { .. } => "BindingRef",
-        Value::Interpolation(_) => "Interpolation",
-        Value::FunctionCall { .. } => "FunctionCall",
-        Value::Secret(_) => "Secret",
-        Value::Unknown(_) => "Unknown",
+        Value::Concrete(ConcreteValue::String(_)) => "String",
+        Value::Concrete(ConcreteValue::Int(_)) => "Int",
+        Value::Concrete(ConcreteValue::Float(_)) => "Float",
+        Value::Concrete(ConcreteValue::Bool(_)) => "Bool",
+        Value::Concrete(ConcreteValue::Duration(_)) => "Duration",
+        Value::Concrete(ConcreteValue::List(_)) => "List",
+        Value::Concrete(ConcreteValue::StringList(_)) => "StringList",
+        Value::Concrete(ConcreteValue::Map(_)) => "Map",
+        Value::Deferred(DeferredValue::ResourceRef { .. }) => "ResourceRef",
+        Value::Deferred(DeferredValue::BindingRef { .. }) => "BindingRef",
+        Value::Deferred(DeferredValue::Interpolation(_)) => "Interpolation",
+        Value::Deferred(DeferredValue::FunctionCall { .. }) => "FunctionCall",
+        Value::Deferred(DeferredValue::Secret(_)) => "Secret",
+        Value::Deferred(DeferredValue::Unknown(_)) => "Unknown",
     }
 }
 

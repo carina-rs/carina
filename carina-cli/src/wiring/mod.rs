@@ -21,7 +21,9 @@ use carina_core::provider::{
     ProviderRouter,
 };
 use carina_core::resolver::{resolve_refs_for_plan, resolve_refs_with_state_and_remote};
-use carina_core::resource::{Resource, ResourceId, State, Value, contains_resource_ref};
+use carina_core::resource::{
+    ConcreteValue, DeferredValue, Resource, ResourceId, State, Value, contains_resource_ref,
+};
 use carina_core::schema::{SchemaRegistry, resolve_block_names};
 use carina_core::utils;
 use carina_core::validation;
@@ -256,7 +258,7 @@ pub fn validate_attribute_param_ref_types_with_ctx(
 }
 
 /// Reject any resolved value that still carries
-/// `Value::Unknown(UnknownReason::EmptyInterpolation)`. The parser
+/// `Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation))`. The parser
 /// accepts mid-edit `${}` to keep the AST intact (#2480) and the LSP
 /// surfaces it as a per-location warning, but `carina validate` /
 /// `plan` / `apply` must refuse to proceed — letting the marker flow
@@ -301,7 +303,7 @@ where
 }
 
 /// Recursively walk a `Value` tree looking for any
-/// `Value::Unknown(UnknownReason::EmptyInterpolation)`. Returns `true`
+/// `Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation))`. Returns `true`
 /// when one is found at any depth — inside lists, maps, secrets,
 /// function-call arguments, or as the `Expr` segment of an
 /// `Interpolation`. Mirrors the variant coverage of the sibling
@@ -310,15 +312,21 @@ where
 fn value_contains_empty_interpolation(value: &Value) -> bool {
     use carina_core::resource::{InterpolationPart, UnknownReason};
     match value {
-        Value::Unknown(UnknownReason::EmptyInterpolation) => true,
-        Value::Interpolation(parts) => parts.iter().any(|p| match p {
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation)) => true,
+        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|p| match p {
             InterpolationPart::Expr(v) => value_contains_empty_interpolation(v),
             InterpolationPart::Literal(_) => false,
         }),
-        Value::List(items) => items.iter().any(value_contains_empty_interpolation),
-        Value::Map(entries) => entries.values().any(value_contains_empty_interpolation),
-        Value::Secret(inner) => value_contains_empty_interpolation(inner),
-        Value::FunctionCall { args, .. } => args.iter().any(value_contains_empty_interpolation),
+        Value::Concrete(ConcreteValue::List(items)) => {
+            items.iter().any(value_contains_empty_interpolation)
+        }
+        Value::Concrete(ConcreteValue::Map(entries)) => {
+            entries.values().any(value_contains_empty_interpolation)
+        }
+        Value::Deferred(DeferredValue::Secret(inner)) => value_contains_empty_interpolation(inner),
+        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+            args.iter().any(value_contains_empty_interpolation)
+        }
         _ => false,
     }
 }
@@ -548,8 +556,8 @@ impl<'a> PlanPreprocessor<'a> {
         provider_configs: &[ProviderConfig],
     ) {
         // RFC #2371 stage 2 + #2387: strip every attribute the WASM
-        // provider boundary refuses to serialize — `Value::Unknown`
-        // (#2378) and `Value::ResourceRef` plus the wrappers that hide
+        // provider boundary refuses to serialize — `Value::Deferred(DeferredValue::Unknown)`
+        // (#2378) and `Value::Deferred(DeferredValue::ResourceRef)` plus the wrappers that hide
         // a ref (`Interpolation` / `FunctionCall` / `Secret`-of-ref,
         // #2387) — before `normalize_desired` runs, then restore them
         // at their original index. After this pass, `core_to_wit_value`
@@ -558,13 +566,13 @@ impl<'a> PlanPreprocessor<'a> {
             value_contains_unknown(v) || contains_resource_ref(v)
         });
         // Hard assert (not debug_assert): RFC #2371 constraint b says
-        // state files never carry `Value::Unknown`, and the
+        // state files never carry `Value::Deferred(DeferredValue::Unknown)`, and the
         // strip-and-restore design depends on it. A release-mode
         // violation would degrade silently into a WASM-boundary panic
         // far from the source — fail fast here instead.
         assert!(
             !current_states_contain_unknown(current_states),
-            "Value::Unknown found in current_states — RFC #2371 constraint b violated"
+            "Value::Deferred(DeferredValue::Unknown) found in current_states — RFC #2371 constraint b violated"
         );
         self.normalizer.normalize_desired(resources);
         self.normalizer.normalize_state(current_states);
@@ -598,9 +606,9 @@ struct StrippedAttribute {
 /// predicate that covers two kinds the WASM provider boundary refuses
 /// to serialize:
 ///
-/// - `value_contains_unknown` — `Value::Unknown` (RFC #2371 stage 2 /
+/// - `value_contains_unknown` — `Value::Deferred(DeferredValue::Unknown)` (RFC #2371 stage 2 /
 ///   #2377)
-/// - `contains_resource_ref` — `Value::ResourceRef` plus the wrappers
+/// - `contains_resource_ref` — `Value::Deferred(DeferredValue::ResourceRef)` plus the wrappers
 ///   that recursively contain one (`Interpolation` / `FunctionCall` /
 ///   `Secret` / nested `List` / `Map`); without this strip the
 ///   `core_to_wit_value` `_` debug-format fallback would silently
@@ -669,17 +677,19 @@ fn restore_stripped_attributes(
 }
 
 fn value_contains_unknown(value: &carina_core::resource::Value) -> bool {
-    use carina_core::resource::{InterpolationPart, Value};
+    use carina_core::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
     match value {
-        Value::Unknown(_) => true,
-        Value::List(items) => items.iter().any(value_contains_unknown),
-        Value::Map(map) => map.values().any(value_contains_unknown),
-        Value::Interpolation(parts) => parts.iter().any(|p| match p {
+        Value::Deferred(DeferredValue::Unknown(_)) => true,
+        Value::Concrete(ConcreteValue::List(items)) => items.iter().any(value_contains_unknown),
+        Value::Concrete(ConcreteValue::Map(map)) => map.values().any(value_contains_unknown),
+        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|p| match p {
             InterpolationPart::Expr(v) => value_contains_unknown(v),
             _ => false,
         }),
-        Value::FunctionCall { args, .. } => args.iter().any(value_contains_unknown),
-        Value::Secret(inner) => value_contains_unknown(inner),
+        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+            args.iter().any(value_contains_unknown)
+        }
+        Value::Deferred(DeferredValue::Secret(inner)) => value_contains_unknown(inner),
         _ => false,
     }
 }
@@ -798,18 +808,18 @@ fn resolve_value_alias(
     factory: &dyn ProviderFactory,
 ) {
     match value {
-        Value::String(s) if utils::is_dsl_enum_format(s) => {
+        Value::Concrete(ConcreteValue::String(s)) if utils::is_dsl_enum_format(s) => {
             let raw = utils::convert_enum_value(s);
             if let Some(canonical) = factory.get_enum_alias_reverse(resource_type, attr_name, raw) {
                 *s = canonical;
             }
         }
-        Value::List(items) => {
+        Value::Concrete(ConcreteValue::List(items)) => {
             for item in items.iter_mut() {
                 resolve_value_alias(item, resource_type, attr_name, factory);
             }
         }
-        Value::Map(map) => {
+        Value::Concrete(ConcreteValue::Map(map)) => {
             let map_keys: Vec<String> = map.keys().cloned().collect();
             for map_key in map_keys {
                 if let Some(v) = map.get_mut(&map_key) {
@@ -1345,7 +1355,7 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
     // Type-level canonicalization for `Union[String, list(String)]`
     // fields (IAM-style `string_or_list_of_strings`). Done after refs
     // resolve so concrete `String` / `List` shapes can be folded to the
-    // canonical `Value::StringList` form before differ / display see
+    // canonical `Value::Concrete(ConcreteValue::StringList)` form before differ / display see
     // them. See #2481, #2511.
     carina_core::value::canonicalize_resources_with_schemas(&mut resources, ctx.schemas());
     // Same canonicalization for the actual-side state values (#2481, #2513).
@@ -1601,7 +1611,7 @@ fn resolve_import_target(
             continue;
         }
         if let Some(attr) = name_attr
-            && let Some(Value::String(s)) = resource.get_attr(attr)
+            && let Some(Value::Concrete(ConcreteValue::String(s))) = resource.get_attr(attr)
             && s == to.name_str()
         {
             fallback_id = Some(resource.id.clone());

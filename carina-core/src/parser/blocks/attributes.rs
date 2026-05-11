@@ -12,7 +12,7 @@ use crate::parser::expressions::string_literal::parse_string_value;
 use crate::parser::expressions::validate_expr::parse_validate_expr;
 use crate::parser::parse_expression;
 use crate::parser::types::parse_type_expr;
-use crate::resource::{Directives, Resource, Value};
+use crate::resource::{ConcreteValue, DeferredValue, Directives, Resource, Value};
 use indexmap::IndexMap;
 
 /// Parse arguments block. See `register_argument_binding` for the
@@ -53,7 +53,7 @@ pub(in crate::parser) fn parse_arguments_block(
                                     let string_pair =
                                         first_inner(inner_attr, "string", "arg_description_attr")?;
                                     let value = parse_string_value(string_pair, ctx)?;
-                                    if let Value::String(s) = value {
+                                    if let Value::Concrete(ConcreteValue::String(s)) = value {
                                         description = Some(s);
                                     }
                                 }
@@ -90,7 +90,10 @@ pub(in crate::parser) fn parse_arguments_block(
                                                     )?;
                                                     let value =
                                                         parse_string_value(string_pair, ctx)?;
-                                                    if let Value::String(s) = value {
+                                                    if let Value::Concrete(ConcreteValue::String(
+                                                        s,
+                                                    )) = value
+                                                    {
                                                         error_msg = Some(s);
                                                     }
                                                 }
@@ -142,9 +145,9 @@ pub(in crate::parser) fn parse_arguments_block(
 /// empty `attribute` would be a type-level lie — the same shape that
 /// produced the empty-field diagnostic in #2847.
 fn register_argument_binding(ctx: &mut ParseContext, name: &str) {
-    let placeholder_ref = Value::BindingRef {
+    let placeholder_ref = Value::Deferred(DeferredValue::BindingRef {
         binding: name.to_string(),
-    };
+    });
     ctx.set_variable(name.to_string(), placeholder_ref);
     let placeholder = Resource::new("_argument", name);
     ctx.set_resource_binding(name.to_string(), placeholder);
@@ -242,25 +245,35 @@ pub(in crate::parser) fn parse_exports_block(
 pub(in crate::parser) fn extract_directives(
     attributes: &mut IndexMap<String, Value>,
 ) -> Result<Directives, ParseError> {
-    if let Some(Value::List(blocks)) = attributes.shift_remove("directives") {
+    if let Some(Value::Concrete(ConcreteValue::List(blocks))) =
+        attributes.shift_remove("directives")
+    {
         // Take the first directives block (there should only be one)
-        if let Some(Value::Map(map)) = blocks.into_iter().next() {
-            let force_delete = matches!(map.get("force_delete"), Some(Value::Bool(true)));
-            let create_before_destroy =
-                matches!(map.get("create_before_destroy"), Some(Value::Bool(true)));
-            let prevent_destroy = matches!(map.get("prevent_destroy"), Some(Value::Bool(true)));
+        if let Some(Value::Concrete(ConcreteValue::Map(map))) = blocks.into_iter().next() {
+            let force_delete = matches!(
+                map.get("force_delete"),
+                Some(Value::Concrete(ConcreteValue::Bool(true)))
+            );
+            let create_before_destroy = matches!(
+                map.get("create_before_destroy"),
+                Some(Value::Concrete(ConcreteValue::Bool(true)))
+            );
+            let prevent_destroy = matches!(
+                map.get("prevent_destroy"),
+                Some(Value::Concrete(ConcreteValue::Bool(true)))
+            );
             let depends_on = match map.get("depends_on") {
                 None => Vec::new(),
-                Some(Value::List(items)) => {
+                Some(Value::Concrete(ConcreteValue::List(items))) => {
                     let mut names = Vec::with_capacity(items.len());
                     for item in items {
                         match item {
-                            Value::BindingRef { binding } => {
+                            Value::Deferred(DeferredValue::BindingRef { binding }) => {
                                 // Bare binding identifier — the canonical
                                 // shape after #2847.
                                 names.push(binding.clone());
                             }
-                            Value::ResourceRef { path } => {
+                            Value::Deferred(DeferredValue::ResourceRef { path }) => {
                                 // `binding.attr` — attribute selectors are
                                 // rejected in MVP (only bare bindings allowed).
                                 return Err(ParseError::InvalidExpression {
@@ -273,7 +286,7 @@ pub(in crate::parser) fn extract_directives(
                                     ),
                                 });
                             }
-                            Value::String(name) => {
+                            Value::Concrete(ConcreteValue::String(name)) => {
                                 // Pre-#2847 indirection marker `${name}`.
                                 // Quoted strings are rejected upstream in
                                 // `check_directives_depends_on_elements`.

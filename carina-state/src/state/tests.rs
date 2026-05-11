@@ -189,7 +189,7 @@ fn test_build_directives() {
 
 #[test]
 fn test_build_saved_attrs() {
-    use carina_core::resource::{ResourceId, Value};
+    use carina_core::resource::{ConcreteValue, ResourceId, Value};
 
     let mut state = StateFile::new();
     let rs = ResourceState::new("s3.Bucket", "my-bucket", "awscc")
@@ -201,7 +201,9 @@ fn test_build_saved_attrs() {
     let attrs = saved.get(&id).unwrap();
     assert_eq!(
         attrs.get("region"),
-        Some(&Value::String("ap-northeast-1".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "ap-northeast-1".to_string()
+        )))
     );
 }
 
@@ -252,7 +254,7 @@ fn test_resource_state_deserialization_without_v3_fields() {
 
 #[test]
 fn test_from_provider_state() {
-    use carina_core::resource::{Resource, State as ProviderState, Value};
+    use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
 
     let mut resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket");
     resource.directives.force_delete = true;
@@ -265,7 +267,7 @@ fn test_from_provider_state() {
         identifier: Some("my-bucket-abcd1234".to_string()),
         attributes: [(
             "region".to_string(),
-            Value::String("ap-northeast-1".to_string()),
+            Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
         )]
         .into_iter()
         .collect(),
@@ -290,15 +292,18 @@ fn test_from_provider_state() {
 
 #[test]
 fn test_from_provider_state_without_existing() {
-    use carina_core::resource::{Resource, State as ProviderState, Value};
+    use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
 
     let resource = Resource::with_provider("aws", "s3.Bucket", "test");
     let provider_state = ProviderState {
         id: resource.id.clone(),
         identifier: Some("test-id".to_string()),
-        attributes: [("name".to_string(), Value::String("test".to_string()))]
-            .into_iter()
-            .collect(),
+        attributes: [(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("test".to_string())),
+        )]
+        .into_iter()
+        .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
     };
@@ -399,7 +404,7 @@ fn test_build_directives_provider_scoped() {
 
 #[test]
 fn test_build_saved_attrs_provider_scoped() {
-    use carina_core::resource::{ResourceId, Value};
+    use carina_core::resource::{ConcreteValue, ResourceId, Value};
 
     let mut state = StateFile::new();
     let aws_rs = ResourceState::new("s3.Bucket", "main", "aws")
@@ -416,17 +421,21 @@ fn test_build_saved_attrs_provider_scoped() {
 
     assert_eq!(
         saved.get(&aws_id).unwrap().get("region"),
-        Some(&Value::String("us-east-1".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "us-east-1".to_string()
+        )))
     );
     assert_eq!(
         saved.get(&awscc_id).unwrap().get("region"),
-        Some(&Value::String("ap-northeast-1".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "ap-northeast-1".to_string()
+        )))
     );
 }
 
 #[test]
 fn test_build_state_for_resource_existing() {
-    use carina_core::resource::{Resource, Value};
+    use carina_core::resource::{ConcreteValue, Resource, Value};
 
     let mut state = StateFile::new();
     state.upsert_resource(
@@ -442,7 +451,9 @@ fn test_build_state_for_resource_existing() {
     assert_eq!(result.identifier, Some("my-bucket-id".to_string()));
     assert_eq!(
         result.attributes.get("region"),
-        Some(&Value::String("ap-northeast-1".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "ap-northeast-1".to_string()
+        )))
     );
 }
 
@@ -475,7 +486,7 @@ fn test_build_state_for_resource_without_identifier() {
 
 #[test]
 fn test_from_provider_state_stores_binding_and_dependencies() {
-    use carina_core::resource::{Resource, State as ProviderState, Value};
+    use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
 
     let mut resource = Resource::with_provider("awscc", "ec2.Subnet", "my-subnet");
     resource.binding = Some("my_subnet".to_string());
@@ -487,9 +498,12 @@ fn test_from_provider_state_stores_binding_and_dependencies() {
     let provider_state = ProviderState {
         id: resource.id.clone(),
         identifier: Some("subnet-123".to_string()),
-        attributes: [("vpc_id".to_string(), Value::String("vpc-abc".to_string()))]
-            .into_iter()
-            .collect(),
+        attributes: [(
+            "vpc_id".to_string(),
+            Value::Concrete(ConcreteValue::String("vpc-abc".to_string())),
+        )]
+        .into_iter()
+        .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
     };
@@ -504,7 +518,7 @@ fn test_from_provider_state_stores_binding_and_dependencies() {
 
 #[test]
 fn test_build_orphan_states_injects_binding() {
-    use carina_core::resource::{ResourceId, Value};
+    use carina_core::resource::{ConcreteValue, ResourceId, Value};
 
     let mut state = StateFile::new();
     let mut rs =
@@ -521,7 +535,9 @@ fn test_build_orphan_states_injects_binding() {
     assert!(orphan_state.exists);
     assert_eq!(
         orphan_state.attributes.get("_binding"),
-        Some(&Value::String("my_subnet".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "my_subnet".to_string()
+        )))
     );
 }
 
@@ -665,15 +681,18 @@ fn test_check_and_migrate_bytes_invalid_utf8() {
 
 #[test]
 fn test_merge_write_only_attributes() {
-    use carina_core::resource::{Resource, State as ProviderState, Value};
+    use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
 
     // Simulate a VPC resource with a write-only attribute (ipv4_netmask_length)
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc");
     resource.set_attr(
         "cidr_block".to_string(),
-        Value::String("10.0.0.0/16".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
-    resource.set_attr("ipv4_netmask_length".to_string(), Value::Int(16));
+    resource.set_attr(
+        "ipv4_netmask_length".to_string(),
+        Value::Concrete(ConcreteValue::Int(16)),
+    );
 
     // Provider returns state without write-only attributes (API doesn't return them)
     let provider_state = ProviderState {
@@ -681,7 +700,7 @@ fn test_merge_write_only_attributes() {
         identifier: Some("vpc-123".to_string()),
         attributes: [(
             "cidr_block".to_string(),
-            Value::String("10.0.0.0/16".to_string()),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
         )]
         .into_iter()
         .collect(),
@@ -711,13 +730,13 @@ fn test_merge_write_only_attributes() {
 
 #[test]
 fn test_merge_write_only_attributes_not_in_desired() {
-    use carina_core::resource::{Resource, State as ProviderState, Value};
+    use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
 
     // Resource without write-only attribute specified
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc");
     resource.set_attr(
         "cidr_block".to_string(),
-        Value::String("10.0.0.0/16".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
 
     let provider_state = ProviderState {
@@ -725,7 +744,7 @@ fn test_merge_write_only_attributes_not_in_desired() {
         identifier: Some("vpc-123".to_string()),
         attributes: [(
             "cidr_block".to_string(),
-            Value::String("10.0.0.0/16".to_string()),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
         )]
         .into_iter()
         .collect(),
@@ -746,13 +765,13 @@ fn test_merge_write_only_attributes_not_in_desired() {
 
 #[test]
 fn test_merge_write_only_skips_if_already_in_provider_state() {
-    use carina_core::resource::{Resource, State as ProviderState, Value};
+    use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
 
     // Resource with a write-only attribute
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc");
     resource.set_attr(
         "some_attr".to_string(),
-        Value::String("desired".to_string()),
+        Value::Concrete(ConcreteValue::String("desired".to_string())),
     );
 
     // Provider happens to return this attribute (unusual for write-only but possible)
@@ -761,7 +780,7 @@ fn test_merge_write_only_skips_if_already_in_provider_state() {
         identifier: Some("vpc-123".to_string()),
         attributes: [(
             "some_attr".to_string(),
-            Value::String("from-api".to_string()),
+            Value::Concrete(ConcreteValue::String("from-api".to_string())),
         )]
         .into_iter()
         .collect(),
@@ -818,13 +837,17 @@ fn test_write_only_attributes_omitted_when_empty() {
 
 #[test]
 fn test_from_provider_state_secret_stored_as_hash() {
-    use carina_core::resource::{Resource, State as ProviderState, Value};
+    use carina_core::resource::{
+        ConcreteValue, DeferredValue, Resource, State as ProviderState, Value,
+    };
     use carina_core::value::SECRET_PREFIX;
 
     let mut resource = Resource::with_provider("awscc", "rds.db_instance", "my-db");
     resource.set_attr(
         "master_password".to_string(),
-        Value::Secret(Box::new(Value::String("my-password".to_string()))),
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("my-password".to_string()),
+        )))),
     );
 
     let provider_state = ProviderState {
@@ -833,7 +856,7 @@ fn test_from_provider_state_secret_stored_as_hash() {
         // Provider returns the actual password (since secret was unwrapped before sending)
         attributes: [(
             "master_password".to_string(),
-            Value::String("my-password".to_string()),
+            Value::Concrete(ConcreteValue::String("my-password".to_string())),
         )]
         .into_iter()
         .collect(),
@@ -863,31 +886,47 @@ fn test_from_provider_state_secret_stored_as_hash() {
 
 #[test]
 fn test_from_provider_state_secret_in_map_stored_as_hash() {
-    use carina_core::resource::{Resource, State as ProviderState, Value};
+    use carina_core::resource::{
+        ConcreteValue, DeferredValue, Resource, State as ProviderState, Value,
+    };
     use carina_core::value::SECRET_PREFIX;
 
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc");
     let mut tags_map = IndexMap::new();
-    tags_map.insert("Name".to_string(), Value::String("test".to_string()));
+    tags_map.insert(
+        "Name".to_string(),
+        Value::Concrete(ConcreteValue::String("test".to_string())),
+    );
     tags_map.insert(
         "SecretTag".to_string(),
-        Value::Secret(Box::new(Value::String("super-secret-value".to_string()))),
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("super-secret-value".to_string()),
+        )))),
     );
-    resource.set_attr("tags".to_string(), Value::Map(tags_map));
+    resource.set_attr(
+        "tags".to_string(),
+        Value::Concrete(ConcreteValue::Map(tags_map)),
+    );
 
     let mut state_tags = IndexMap::new();
-    state_tags.insert("Name".to_string(), Value::String("test".to_string()));
+    state_tags.insert(
+        "Name".to_string(),
+        Value::Concrete(ConcreteValue::String("test".to_string())),
+    );
     state_tags.insert(
         "SecretTag".to_string(),
-        Value::String("super-secret-value".to_string()),
+        Value::Concrete(ConcreteValue::String("super-secret-value".to_string())),
     );
 
     let provider_state = ProviderState {
         id: resource.id.clone(),
         identifier: Some("vpc-123".to_string()),
-        attributes: [("tags".to_string(), Value::Map(state_tags))]
-            .into_iter()
-            .collect(),
+        attributes: [(
+            "tags".to_string(),
+            Value::Concrete(ConcreteValue::Map(state_tags)),
+        )]
+        .into_iter()
+        .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
     };
@@ -916,7 +955,9 @@ fn test_from_provider_state_secret_in_map_stored_as_hash() {
 
 #[test]
 fn test_from_provider_state_secret_in_map_preserves_provider_extra_keys() {
-    use carina_core::resource::{Resource, State as ProviderState, Value};
+    use carina_core::resource::{
+        ConcreteValue, DeferredValue, Resource, State as ProviderState, Value,
+    };
     use carina_core::value::SECRET_PREFIX;
 
     // User specifies only SecretTag in tags
@@ -924,28 +965,39 @@ fn test_from_provider_state_secret_in_map_preserves_provider_extra_keys() {
     let mut tags_map = IndexMap::new();
     tags_map.insert(
         "SecretTag".to_string(),
-        Value::Secret(Box::new(Value::String("super-secret-value".to_string()))),
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("super-secret-value".to_string()),
+        )))),
     );
-    resource.set_attr("tags".to_string(), Value::Map(tags_map));
+    resource.set_attr(
+        "tags".to_string(),
+        Value::Concrete(ConcreteValue::Map(tags_map)),
+    );
 
     // Provider returns extra keys (e.g., CloudControl adds Name automatically)
     let mut state_tags = IndexMap::new();
-    state_tags.insert("Name".to_string(), Value::String("test".to_string()));
+    state_tags.insert(
+        "Name".to_string(),
+        Value::Concrete(ConcreteValue::String("test".to_string())),
+    );
     state_tags.insert(
         "ExtraTag".to_string(),
-        Value::String("extra-value".to_string()),
+        Value::Concrete(ConcreteValue::String("extra-value".to_string())),
     );
     state_tags.insert(
         "SecretTag".to_string(),
-        Value::String("super-secret-value".to_string()),
+        Value::Concrete(ConcreteValue::String("super-secret-value".to_string())),
     );
 
     let provider_state = ProviderState {
         id: resource.id.clone(),
         identifier: Some("vpc-123".to_string()),
-        attributes: [("tags".to_string(), Value::Map(state_tags))]
-            .into_iter()
-            .collect(),
+        attributes: [(
+            "tags".to_string(),
+            Value::Concrete(ConcreteValue::Map(state_tags)),
+        )]
+        .into_iter()
+        .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
     };
@@ -977,16 +1029,20 @@ fn test_from_provider_state_secret_in_map_preserves_provider_extra_keys() {
 
 #[test]
 fn test_from_provider_state_secret_in_list_stored_as_hash() {
-    use carina_core::resource::{Resource, State as ProviderState, Value};
+    use carina_core::resource::{
+        ConcreteValue, DeferredValue, Resource, State as ProviderState, Value,
+    };
     use carina_core::value::SECRET_PREFIX;
 
     let mut resource = Resource::with_provider("awscc", "test.resource", "my-res");
     resource.set_attr(
         "values".to_string(),
-        Value::List(vec![
-            Value::String("public".to_string()),
-            Value::Secret(Box::new(Value::String("secret-item".to_string()))),
-        ]),
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("public".to_string())),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("secret-item".to_string()),
+            )))),
+        ])),
     );
 
     let provider_state = ProviderState {
@@ -994,10 +1050,10 @@ fn test_from_provider_state_secret_in_list_stored_as_hash() {
         identifier: Some("res-123".to_string()),
         attributes: [(
             "values".to_string(),
-            Value::List(vec![
-                Value::String("public".to_string()),
-                Value::String("secret-item".to_string()),
-            ]),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("public".to_string())),
+                Value::Concrete(ConcreteValue::String("secret-item".to_string())),
+            ])),
         )]
         .into_iter()
         .collect(),
@@ -1032,7 +1088,9 @@ fn build_remote_bindings_returns_exports() {
     let bindings = state.build_remote_bindings();
     assert_eq!(
         bindings.get("account_id"),
-        Some(&Value::String("123456789012".to_string()))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "123456789012".to_string()
+        )))
     );
 }
 
@@ -1110,13 +1168,15 @@ fn check_and_migrate_canonicalizes_legacy_map_key_addresses() {
 }
 
 /// RFC #2371 #2385: state writeback rejects unresolved `Value` variants
-/// surfaced from a buggy provider that returns a `Value::ResourceRef`
+/// surfaced from a buggy provider that returns a `Value::Deferred(DeferredValue::ResourceRef)`
 /// in `state.attributes`. Provider-returned states must be concrete; a
 /// resolver / provider bug produces a typed `UnresolvedResourceRef`
 /// error rather than a debug-formatted string in state JSON.
 #[test]
 fn from_provider_state_rejects_resource_ref_in_provider_attributes() {
-    use carina_core::resource::{AccessPath, Resource, State as ProviderState, Value};
+    use carina_core::resource::{
+        AccessPath, DeferredValue, Resource, State as ProviderState, Value,
+    };
 
     let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket");
     let provider_state = ProviderState {
@@ -1124,9 +1184,9 @@ fn from_provider_state_rejects_resource_ref_in_provider_attributes() {
         identifier: Some("my-bucket".to_string()),
         attributes: [(
             "owner".to_string(),
-            Value::ResourceRef {
+            Value::Deferred(DeferredValue::ResourceRef {
                 path: AccessPath::with_fields("net", "vpc", vec!["vpc_id".into()]),
-            },
+            }),
         )]
         .into_iter()
         .collect(),

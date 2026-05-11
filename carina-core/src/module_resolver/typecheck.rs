@@ -1,7 +1,7 @@
 //! Type-checking of module call arguments against declared `TypeExpr`s.
 
 use crate::parser::{ArgumentParameter, ProviderContext, TypeExpr, validate_custom_type};
-use crate::resource::Value;
+use crate::resource::{ConcreteValue, DeferredValue, Value};
 
 use super::error::ModuleError;
 
@@ -46,14 +46,14 @@ pub(super) enum TypeCheckResult {
 /// parser represents arguments-block names that propagate into nested
 /// module calls (#2549).
 ///
-/// `Value::BindingRef` is the canonical representation since #2847;
+/// `Value::Deferred(DeferredValue::BindingRef)` is the canonical representation since #2847;
 /// the type system guarantees no attribute/field/subscript can hide
 /// inside it.
 fn enclosing_arg_type<'a>(
     value: &Value,
     enclosing_args: Option<&'a [ArgumentParameter]>,
 ) -> Option<&'a TypeExpr> {
-    let Value::BindingRef { binding } = value else {
+    let Value::Deferred(DeferredValue::BindingRef { binding }) = value else {
         return None;
     };
     enclosing_args?
@@ -84,7 +84,9 @@ pub(super) fn check_type_match(
         // and behave like `Unknown` for typecheck purposes.
         _ if matches!(
             value,
-            Value::FunctionCall { .. } | Value::Unknown(_) | Value::BindingRef { .. }
+            Value::Deferred(DeferredValue::FunctionCall { .. })
+                | Value::Deferred(DeferredValue::Unknown(_))
+                | Value::Deferred(DeferredValue::BindingRef { .. })
         ) =>
         {
             TypeCheckResult::Ok
@@ -92,7 +94,9 @@ pub(super) fn check_type_match(
         TypeExpr::String => {
             if matches!(
                 value,
-                Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
+                Value::Concrete(ConcreteValue::String(_))
+                    | Value::Deferred(DeferredValue::Interpolation(_))
+                    | Value::Deferred(DeferredValue::ResourceRef { .. })
             ) {
                 TypeCheckResult::Ok
             } else {
@@ -100,35 +104,35 @@ pub(super) fn check_type_match(
             }
         }
         TypeExpr::Int => {
-            if matches!(value, Value::Int(_)) {
+            if matches!(value, Value::Concrete(ConcreteValue::Int(_))) {
                 TypeCheckResult::Ok
             } else {
                 TypeCheckResult::Mismatch
             }
         }
         TypeExpr::Float => {
-            if matches!(value, Value::Float(_)) {
+            if matches!(value, Value::Concrete(ConcreteValue::Float(_))) {
                 TypeCheckResult::Ok
             } else {
                 TypeCheckResult::Mismatch
             }
         }
         TypeExpr::Bool => {
-            if matches!(value, Value::Bool(_)) {
+            if matches!(value, Value::Concrete(ConcreteValue::Bool(_))) {
                 TypeCheckResult::Ok
             } else {
                 TypeCheckResult::Mismatch
             }
         }
         TypeExpr::Duration => {
-            if matches!(value, Value::Duration(_)) {
+            if matches!(value, Value::Concrete(ConcreteValue::Duration(_))) {
                 TypeCheckResult::Ok
             } else {
                 TypeCheckResult::Mismatch
             }
         }
         TypeExpr::List(inner) => {
-            if let Value::List(items) = value {
+            if let Value::Concrete(ConcreteValue::List(items)) = value {
                 for item in items {
                     match check_type_match(inner, item, config, enclosing_args) {
                         TypeCheckResult::Ok => {}
@@ -141,7 +145,7 @@ pub(super) fn check_type_match(
             }
         }
         TypeExpr::Map(inner) => {
-            if let Value::Map(entries) = value {
+            if let Value::Concrete(ConcreteValue::Map(entries)) = value {
                 for v in entries.values() {
                     match check_type_match(inner, v, config, enclosing_args) {
                         TypeCheckResult::Ok => {}
@@ -157,7 +161,9 @@ pub(super) fn check_type_match(
         TypeExpr::Simple(name) => {
             if !matches!(
                 value,
-                Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
+                Value::Concrete(ConcreteValue::String(_))
+                    | Value::Deferred(DeferredValue::Interpolation(_))
+                    | Value::Deferred(DeferredValue::ResourceRef { .. })
             ) {
                 TypeCheckResult::Mismatch
             } else if let Err(e) = validate_custom_type(name, value, config) {
@@ -170,7 +176,9 @@ pub(super) fn check_type_match(
         TypeExpr::Ref(_) | TypeExpr::SchemaType { .. } => {
             if matches!(
                 value,
-                Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
+                Value::Concrete(ConcreteValue::String(_))
+                    | Value::Deferred(DeferredValue::Interpolation(_))
+                    | Value::Deferred(DeferredValue::ResourceRef { .. })
             ) {
                 TypeCheckResult::Ok
             } else {
@@ -178,7 +186,7 @@ pub(super) fn check_type_match(
             }
         }
         TypeExpr::Struct { fields } => {
-            let Value::Map(entries) = value else {
+            let Value::Concrete(ConcreteValue::Map(entries)) = value else {
                 return TypeCheckResult::Mismatch;
             };
             if crate::validation::struct_field_shape_errors(fields, entries).is_some() {
@@ -195,9 +203,9 @@ pub(super) fn check_type_match(
             TypeCheckResult::Ok
         }
         // Closed-set string literal type (`'dev'` etc., carina-rs/carina#2611).
-        // Only an exact-string `Value::String` match is accepted.
+        // Only an exact-string `Value::Concrete(ConcreteValue::String)` match is accepted.
         TypeExpr::StringLiteral(expected) => {
-            if matches!(value, Value::String(s) if s == expected) {
+            if matches!(value, Value::Concrete(ConcreteValue::String(s)) if s == expected) {
                 TypeCheckResult::Ok
             } else {
                 TypeCheckResult::Mismatch

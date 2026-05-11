@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::effect::Effect;
-use crate::resource::{Resource, Value};
+use crate::resource::{ConcreteValue, DeferredValue, Resource, Value};
 
 /// Extract binding names that a resource depends on.
 ///
@@ -45,15 +45,15 @@ pub fn get_resource_dependencies(resource: &Resource) -> HashSet<String> {
 fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
     fn walk(value: &Value, deps: &mut HashSet<String>) {
         match value {
-            Value::ResourceRef { path } => {
+            Value::Deferred(DeferredValue::ResourceRef { path }) => {
                 deps.insert(path.binding().to_string());
             }
-            Value::BindingRef { binding } => {
+            Value::Deferred(DeferredValue::BindingRef { binding }) => {
                 deps.insert(binding.clone());
             }
-            Value::List(items) => items.iter().for_each(|v| walk(v, deps)),
-            Value::Map(map) => map.values().for_each(|v| walk(v, deps)),
-            Value::Interpolation(parts) => {
+            Value::Concrete(ConcreteValue::List(items)) => items.iter().for_each(|v| walk(v, deps)),
+            Value::Concrete(ConcreteValue::Map(map)) => map.values().for_each(|v| walk(v, deps)),
+            Value::Deferred(DeferredValue::Interpolation(parts)) => {
                 use crate::resource::InterpolationPart;
                 for part in parts {
                     if let InterpolationPart::Expr(v) = part {
@@ -61,15 +61,17 @@ fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
                     }
                 }
             }
-            Value::FunctionCall { args, .. } => args.iter().for_each(|v| walk(v, deps)),
-            Value::Secret(inner) => walk(inner, deps),
-            Value::String(_)
-            | Value::Int(_)
-            | Value::Float(_)
-            | Value::Bool(_)
-            | Value::Duration(_)
-            | Value::StringList(_)
-            | Value::Unknown(_) => {}
+            Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+                args.iter().for_each(|v| walk(v, deps))
+            }
+            Value::Deferred(DeferredValue::Secret(inner)) => walk(inner, deps),
+            Value::Concrete(ConcreteValue::String(_))
+            | Value::Concrete(ConcreteValue::Int(_))
+            | Value::Concrete(ConcreteValue::Float(_))
+            | Value::Concrete(ConcreteValue::Bool(_))
+            | Value::Concrete(ConcreteValue::Duration(_))
+            | Value::Concrete(ConcreteValue::StringList(_))
+            | Value::Deferred(DeferredValue::Unknown(_)) => {}
         }
     }
     walk(value, deps);

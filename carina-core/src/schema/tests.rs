@@ -29,8 +29,14 @@ fn resource_schema_as_data_source_sets_kind() {
 #[test]
 fn validate_string_type() {
     let t = AttributeType::String;
-    assert!(t.validate(&Value::String("hello".to_string())).is_ok());
-    assert!(t.validate(&Value::Int(42)).is_err());
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String("hello".to_string())))
+            .is_ok()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::Int(42)))
+            .is_err()
+    );
 }
 
 #[test]
@@ -42,14 +48,23 @@ fn validate_string_enum_type() {
         dsl_aliases: vec![],
     };
     assert!(
-        t.validate(&Value::String(
+        t.validate(&Value::Concrete(ConcreteValue::String(
             "awscc.ec2.ipam_pool.AddressFamily.IPv4".to_string()
-        ))
+        )))
         .is_ok()
     );
-    assert!(t.validate(&Value::String("IPv6".to_string())).is_ok());
-    assert!(t.validate(&Value::String("ipv4".to_string())).is_ok());
-    assert!(t.validate(&Value::String("IPv5".to_string())).is_err());
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String("IPv6".to_string())))
+            .is_ok()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String("ipv4".to_string())))
+            .is_ok()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String("IPv5".to_string())))
+            .is_err()
+    );
 }
 
 #[test]
@@ -78,18 +93,29 @@ fn validate_string_enum_accepts_dsl_alias() {
         dsl_aliases: vec![("-1".to_string(), "all".to_string())],
     };
     // Canonical value "-1" should be accepted
-    assert!(t.validate(&Value::String("-1".to_string())).is_ok());
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String("-1".to_string())))
+            .is_ok()
+    );
     // DSL alias "all" should be accepted
     assert!(
-        t.validate(&Value::String(
+        t.validate(&Value::Concrete(ConcreteValue::String(
             "awscc.ec2.SecurityGroup.IpProtocol.all".to_string()
-        ))
+        )))
         .is_ok()
     );
     // Other canonical values should still work
-    assert!(t.validate(&Value::String("tcp".to_string())).is_ok());
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String("tcp".to_string())))
+            .is_ok()
+    );
     // Invalid values should still be rejected
-    assert!(t.validate(&Value::String("invalid".to_string())).is_err());
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "invalid".to_string()
+        )))
+        .is_err()
+    );
 }
 
 #[test]
@@ -111,7 +137,7 @@ fn validate_string_enum_all_without_dsl_aliases_requires_explicit_variant() {
     // Without "all" in values and no dsl_aliases entry mapping to "all", it is rejected
     assert!(
         without_all
-            .validate(&Value::String("all".to_string()))
+            .validate(&Value::Concrete(ConcreteValue::String("all".to_string())))
             .is_err()
     );
 
@@ -129,7 +155,11 @@ fn validate_string_enum_all_without_dsl_aliases_requires_explicit_variant() {
         namespace: None,
         dsl_aliases: vec![],
     };
-    assert!(with_all.validate(&Value::String("all".to_string())).is_ok());
+    assert!(
+        with_all
+            .validate(&Value::Concrete(ConcreteValue::String("all".to_string())))
+            .is_ok()
+    );
 }
 
 #[test]
@@ -143,16 +173,26 @@ fn validate_string_enum_accepts_values_with_dots() {
         dsl_aliases: vec![],
     };
     // Quoted string with dot should match directly
-    assert!(t.validate(&Value::String("ipsec.1".to_string())).is_ok());
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "ipsec.1".to_string()
+        )))
+        .is_ok()
+    );
     // Fully qualified form should also be accepted
     assert!(
-        t.validate(&Value::String(
+        t.validate(&Value::Concrete(ConcreteValue::String(
             "awscc.ec2.vpn_gateway.Type.ipsec.1".to_string()
-        ))
+        )))
         .is_ok()
     );
     // Invalid value should still be rejected
-    assert!(t.validate(&Value::String("ipsec.2".to_string())).is_err());
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "ipsec.2".to_string()
+        )))
+        .is_err()
+    );
 }
 
 #[test]
@@ -166,7 +206,9 @@ fn invalid_enum_error_preserves_user_typed_string_literal() {
         namespace: Some("awscc.sso.Assignment".to_string()),
         dsl_aliases: vec![],
     };
-    let err = t.validate(&Value::String("aaa".to_string())).unwrap_err();
+    let err = t
+        .validate(&Value::Concrete(ConcreteValue::String("aaa".to_string())))
+        .unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("'aaa'"),
@@ -190,7 +232,9 @@ fn invalid_enum_error_names_the_enum_type_and_fully_qualified_variants() {
         namespace: Some("awscc.sso.Assignment".to_string()),
         dsl_aliases: vec![],
     };
-    let err = t.validate(&Value::String("aaa".to_string())).unwrap_err();
+    let err = t
+        .validate(&Value::Concrete(ConcreteValue::String("aaa".to_string())))
+        .unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("TargetType"),
@@ -214,7 +258,7 @@ fn with_attribute_adds_attribute_name_to_enum_error() {
         dsl_aliases: vec![],
     };
     let err = t
-        .validate(&Value::String("aaa".to_string()))
+        .validate(&Value::Concrete(ConcreteValue::String("aaa".to_string())))
         .unwrap_err()
         .with_attribute("target_id");
     let msg = err.to_string();
@@ -264,7 +308,10 @@ fn schema_validate_wraps_enum_error_with_attribute_name() {
         .required(),
     );
     let mut attrs = HashMap::new();
-    attrs.insert("target_type".to_string(), Value::String("aaa".to_string()));
+    attrs.insert(
+        "target_type".to_string(),
+        Value::Concrete(ConcreteValue::String("aaa".to_string())),
+    );
     let errs = schema.validate(&attrs).unwrap_err();
     let joined = errs
         .iter()
@@ -387,7 +434,10 @@ fn schema_validate_with_origins_emits_string_literal_diagnostic_for_quoted_enum(
         .required(),
     );
     let mut attrs = HashMap::new();
-    attrs.insert("target_type".to_string(), Value::String("aaa".to_string()));
+    attrs.insert(
+        "target_type".to_string(),
+        Value::Concrete(ConcreteValue::String("aaa".to_string())),
+    );
 
     // String-literal origin → reshaped diagnostic
     let errs = schema
@@ -431,7 +481,7 @@ fn schema_validate_with_origins_leaves_valid_values_alone() {
     let mut attrs = HashMap::new();
     attrs.insert(
         "target_type".to_string(),
-        Value::String("AWS_ACCOUNT".to_string()),
+        Value::Concrete(ConcreteValue::String("AWS_ACCOUNT".to_string())),
     );
     assert!(
         schema.validate_with_origins(&attrs, &|_| true).is_ok(),
@@ -449,8 +499,10 @@ fn schema_validate_with_origins_reshapes_custom_namespaced_type() {
     // while marking the variant and type name correctly.
     fn validate_mode(v: &Value) -> Result<(), String> {
         match v {
-            Value::String(s) if s == "test.r.Mode.fast" => Ok(()),
-            Value::String(s) => Err(format!("invalid Mode '{}': expected fast", s)),
+            Value::Concrete(ConcreteValue::String(s)) if s == "test.r.Mode.fast" => Ok(()),
+            Value::Concrete(ConcreteValue::String(s)) => {
+                Err(format!("invalid Mode '{}': expected fast", s))
+            }
             _ => Err("expected String".to_string()),
         }
     }
@@ -473,7 +525,10 @@ fn schema_validate_with_origins_reshapes_custom_namespaced_type() {
     // Two-part form like "test.r.Mode.aaa" would skip the Custom
     // branch by passing validation; use a bare-shape literal that
     // resolve_enum_input can't save.
-    attrs.insert("mode".to_string(), Value::String("aaa".to_string()));
+    attrs.insert(
+        "mode".to_string(),
+        Value::Concrete(ConcreteValue::String("aaa".to_string())),
+    );
     let errs = schema
         .validate_with_origins(&attrs, &|n| n == "mode")
         .unwrap_err();
@@ -500,7 +555,9 @@ fn invalid_enum_error_without_namespace_uses_bare_variants() {
         namespace: None,
         dsl_aliases: vec![],
     };
-    let err = t.validate(&Value::String("zzz".to_string())).unwrap_err();
+    let err = t
+        .validate(&Value::Concrete(ConcreteValue::String("zzz".to_string())))
+        .unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("fast") && msg.contains("slow"),
@@ -516,7 +573,7 @@ fn invalid_enum_error_without_namespace_uses_bare_variants() {
 #[test]
 fn invalid_enum_error_preserves_bare_identifier_form() {
     // When the user types the namespaced form directly (bare identifier
-    // path produces the same `Value::String(...)`), the error echoes the
+    // path produces the same `Value::Concrete(ConcreteValue::String(...))`), the error echoes the
     // full form back — still the "user-typed" form because that's what
     // was in the Value. This verifies the fix doesn't regress that case.
     let t = AttributeType::StringEnum {
@@ -526,7 +583,9 @@ fn invalid_enum_error_preserves_bare_identifier_form() {
         dsl_aliases: vec![],
     };
     let input = "awscc.sso.Assignment.TargetType.NOT_REAL".to_string();
-    let err = t.validate(&Value::String(input.clone())).unwrap_err();
+    let err = t
+        .validate(&Value::Concrete(ConcreteValue::String(input.clone())))
+        .unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains(&input),
@@ -548,9 +607,9 @@ fn validate_string_enum_rejects_double_namespace() {
     };
     // Double-namespace must be rejected
     assert!(
-        t.validate(&Value::String(
+        t.validate(&Value::Concrete(ConcreteValue::String(
             "awscc.ec2.Vpc.InstanceTenancy.awscc.ec2.Vpc.InstanceTenancy.default".to_string()
-        ))
+        )))
         .is_err()
     );
 }
@@ -558,35 +617,65 @@ fn validate_string_enum_rejects_double_namespace() {
 #[test]
 fn validate_float_type() {
     let t = AttributeType::Float;
-    assert!(t.validate(&Value::Float(2.5)).is_ok());
-    assert!(t.validate(&Value::Float(-0.5)).is_ok());
-    assert!(t.validate(&Value::Int(42)).is_ok()); // integers are valid numbers
-    assert!(t.validate(&Value::String("3.14".to_string())).is_err());
-    assert!(t.validate(&Value::Bool(true)).is_err());
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::Float(2.5)))
+            .is_ok()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::Float(-0.5)))
+            .is_ok()
+    );
+    assert!(t.validate(&Value::Concrete(ConcreteValue::Int(42))).is_ok()); // integers are valid numbers
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String("3.14".to_string())))
+            .is_err()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::Bool(true)))
+            .is_err()
+    );
 }
 
 #[test]
 fn validate_float_rejects_non_finite() {
     let t = AttributeType::Float;
-    assert!(t.validate(&Value::Float(f64::NAN)).is_err());
-    assert!(t.validate(&Value::Float(f64::INFINITY)).is_err());
-    assert!(t.validate(&Value::Float(f64::NEG_INFINITY)).is_err());
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::Float(f64::NAN)))
+            .is_err()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::Float(f64::INFINITY)))
+            .is_err()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::Float(f64::NEG_INFINITY)))
+            .is_err()
+    );
 }
 
 #[test]
 fn validate_int_rejects_float() {
     let t = AttributeType::Int;
-    assert!(t.validate(&Value::Int(42)).is_ok());
-    assert!(t.validate(&Value::Float(2.5)).is_err()); // strict integer typing
+    assert!(t.validate(&Value::Concrete(ConcreteValue::Int(42))).is_ok());
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::Float(2.5)))
+            .is_err()
+    ); // strict integer typing
 }
 
 #[test]
 fn validate_positive_int() {
     let t = types::positive_int();
-    assert!(t.validate(&Value::Int(1)).is_ok());
-    assert!(t.validate(&Value::Int(100)).is_ok());
-    assert!(t.validate(&Value::Int(0)).is_err());
-    assert!(t.validate(&Value::Int(-1)).is_err());
+    assert!(t.validate(&Value::Concrete(ConcreteValue::Int(1))).is_ok());
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::Int(100)))
+            .is_ok()
+    );
+    assert!(t.validate(&Value::Concrete(ConcreteValue::Int(0))).is_err());
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::Int(-1)))
+            .is_err()
+    );
 }
 
 #[test]
@@ -597,9 +686,15 @@ fn validate_resource_schema() {
         .attribute(AttributeSchema::new("enabled", AttributeType::Bool));
 
     let mut attrs = HashMap::new();
-    attrs.insert("name".to_string(), Value::String("my-resource".to_string()));
-    attrs.insert("count".to_string(), Value::Int(5));
-    attrs.insert("enabled".to_string(), Value::Bool(true));
+    attrs.insert(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("my-resource".to_string())),
+    );
+    attrs.insert("count".to_string(), Value::Concrete(ConcreteValue::Int(5)));
+    attrs.insert(
+        "enabled".to_string(),
+        Value::Concrete(ConcreteValue::Bool(true)),
+    );
 
     assert!(schema.validate(&attrs).is_ok());
 }
@@ -620,32 +715,65 @@ fn validate_cidr_type() {
 
     // Valid CIDRs
     assert!(
-        t.validate(&Value::String("10.0.0.0/16".to_string()))
-            .is_ok()
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "10.0.0.0/16".to_string()
+        )))
+        .is_ok()
     );
     assert!(
-        t.validate(&Value::String("192.168.1.0/24".to_string()))
-            .is_ok()
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "192.168.1.0/24".to_string()
+        )))
+        .is_ok()
     );
-    assert!(t.validate(&Value::String("0.0.0.0/0".to_string())).is_ok());
     assert!(
-        t.validate(&Value::String("255.255.255.255/32".to_string()))
-            .is_ok()
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "0.0.0.0/0".to_string()
+        )))
+        .is_ok()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "255.255.255.255/32".to_string()
+        )))
+        .is_ok()
     );
 
     // Invalid CIDRs
-    assert!(t.validate(&Value::String("10.0.0.0".to_string())).is_err()); // no prefix
     assert!(
-        t.validate(&Value::String("10.0.0.0/33".to_string()))
-            .is_err()
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "10.0.0.0".to_string()
+        )))
+        .is_err()
+    ); // no prefix
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "10.0.0.0/33".to_string()
+        )))
+        .is_err()
     ); // prefix too large
     assert!(
-        t.validate(&Value::String("10.0.0.256/16".to_string()))
-            .is_err()
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "10.0.0.256/16".to_string()
+        )))
+        .is_err()
     ); // octet > 255
-    assert!(t.validate(&Value::String("10.0.0/16".to_string())).is_err()); // only 3 octets
-    assert!(t.validate(&Value::String("invalid".to_string())).is_err()); // not a CIDR
-    assert!(t.validate(&Value::Int(42)).is_err()); // wrong type
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "10.0.0/16".to_string()
+        )))
+        .is_err()
+    ); // only 3 octets
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "invalid".to_string()
+        )))
+        .is_err()
+    ); // not a CIDR
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::Int(42)))
+            .is_err()
+    ); // wrong type
 }
 
 #[test]
@@ -661,27 +789,47 @@ fn validate_struct_type() {
 
     // Valid: all required fields present
     let mut map = IndexMap::new();
-    map.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
-    map.insert("from_port".to_string(), Value::Int(80));
-    assert!(t.validate(&Value::Map(map)).is_ok());
+    map.insert(
+        "ip_protocol".to_string(),
+        Value::Concrete(ConcreteValue::String("tcp".to_string())),
+    );
+    map.insert(
+        "from_port".to_string(),
+        Value::Concrete(ConcreteValue::Int(80)),
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::Map(map)))
+            .is_ok()
+    );
 
     // Invalid: missing required field
     let empty_map = IndexMap::new();
-    assert!(t.validate(&Value::Map(empty_map)).is_err());
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::Map(empty_map)))
+            .is_err()
+    );
 
     // Invalid: wrong type for field
     let mut bad_map = IndexMap::new();
-    bad_map.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
+    bad_map.insert(
+        "ip_protocol".to_string(),
+        Value::Concrete(ConcreteValue::String("tcp".to_string())),
+    );
     bad_map.insert(
         "from_port".to_string(),
-        Value::String("not_a_number".to_string()),
+        Value::Concrete(ConcreteValue::String("not_a_number".to_string())),
     );
-    assert!(t.validate(&Value::Map(bad_map)).is_err());
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::Map(bad_map)))
+            .is_err()
+    );
 
     // Invalid: not a Map
     assert!(
-        t.validate(&Value::String("not a struct".to_string()))
-            .is_err()
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "not a struct".to_string()
+        )))
+        .is_err()
     );
 }
 
@@ -699,12 +847,15 @@ fn struct_rejects_unknown_field() {
 
     // Unknown field should be rejected
     let mut map = IndexMap::new();
-    map.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
+    map.insert(
+        "ip_protocol".to_string(),
+        Value::Concrete(ConcreteValue::String("tcp".to_string())),
+    );
     map.insert(
         "unknown_field".to_string(),
-        Value::String("value".to_string()),
+        Value::Concrete(ConcreteValue::String("value".to_string())),
     );
-    let result = t.validate(&Value::Map(map));
+    let result = t.validate(&Value::Concrete(ConcreteValue::Map(map)));
     assert!(result.is_err());
     let err = result.unwrap_err();
     match &err {
@@ -735,8 +886,11 @@ fn struct_suggests_similar_field() {
 
     // Typo: "ip_protcol" -> should suggest "ip_protocol"
     let mut map = IndexMap::new();
-    map.insert("ip_protcol".to_string(), Value::String("tcp".to_string()));
-    let result = t.validate(&Value::Map(map));
+    map.insert(
+        "ip_protcol".to_string(),
+        Value::Concrete(ConcreteValue::String("tcp".to_string())),
+    );
+    let result = t.validate(&Value::Concrete(ConcreteValue::Map(map)));
     assert!(result.is_err());
     let err = result.unwrap_err();
     match &err {
@@ -754,12 +908,15 @@ fn struct_suggests_similar_field() {
 
     // Typo: "cidr_iip" -> should suggest "cidr_ip"
     let mut map2 = IndexMap::new();
-    map2.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
+    map2.insert(
+        "ip_protocol".to_string(),
+        Value::Concrete(ConcreteValue::String("tcp".to_string())),
+    );
     map2.insert(
         "cidr_iip".to_string(),
-        Value::String("10.0.0.0/8".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/8".to_string())),
     );
-    let result2 = t.validate(&Value::Map(map2));
+    let result2 = t.validate(&Value::Concrete(ConcreteValue::Map(map2)));
     assert!(result2.is_err());
     let err2 = result2.unwrap_err();
     match &err2 {
@@ -785,8 +942,13 @@ fn struct_error_message_format() {
 
     // With suggestion
     let mut map = IndexMap::new();
-    map.insert("vpc_idd".to_string(), Value::String("vpc-123".to_string()));
-    let err = t.validate(&Value::Map(map)).unwrap_err();
+    map.insert(
+        "vpc_idd".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-123".to_string())),
+    );
+    let err = t
+        .validate(&Value::Concrete(ConcreteValue::Map(map)))
+        .unwrap_err();
     assert_eq!(
         err.to_string(),
         "Unknown field 'vpc_idd' in SecurityGroupIngress, did you mean 'vpc_id'?"
@@ -796,9 +958,11 @@ fn struct_error_message_format() {
     let mut map2 = IndexMap::new();
     map2.insert(
         "completely_different".to_string(),
-        Value::String("x".to_string()),
+        Value::Concrete(ConcreteValue::String("x".to_string())),
     );
-    let err2 = t.validate(&Value::Map(map2)).unwrap_err();
+    let err2 = t
+        .validate(&Value::Concrete(ConcreteValue::Map(map2)))
+        .unwrap_err();
     assert_eq!(
         err2.to_string(),
         "Unknown field 'completely_different' in SecurityGroupIngress"
@@ -847,18 +1011,25 @@ fn validate_list_of_struct() {
     let list_type = AttributeType::list(struct_type);
 
     let mut item = IndexMap::new();
-    item.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
-    let list = Value::List(vec![Value::Map(item)]);
+    item.insert(
+        "ip_protocol".to_string(),
+        Value::Concrete(ConcreteValue::String("tcp".to_string())),
+    );
+    let list = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+        ConcreteValue::Map(item),
+    )]));
     assert!(list_type.validate(&list).is_ok());
 
     // Invalid item in list
-    let bad_list = Value::List(vec![Value::Map(IndexMap::new())]);
+    let bad_list = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+        ConcreteValue::Map(IndexMap::new()),
+    )]));
     assert!(list_type.validate(&bad_list).is_err());
 }
 
 #[test]
 fn struct_rejects_block_syntax_single_element() {
-    // Block syntax produces Value::List([Value::Map(...)]) which should be rejected
+    // Block syntax produces Value::Concrete(ConcreteValue::List([Value::Map(...)])) which should be rejected
     // for bare Struct attributes
     let struct_type = AttributeType::Struct {
         name: "VersioningConfiguration".to_string(),
@@ -866,8 +1037,13 @@ fn struct_rejects_block_syntax_single_element() {
     };
 
     let mut map = IndexMap::new();
-    map.insert("status".to_string(), Value::String("Enabled".to_string()));
-    let single_list = Value::List(vec![Value::Map(map)]);
+    map.insert(
+        "status".to_string(),
+        Value::Concrete(ConcreteValue::String("Enabled".to_string())),
+    );
+    let single_list = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+        ConcreteValue::Map(map),
+    )]));
     let result = struct_type.validate(&single_list);
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -892,10 +1068,19 @@ fn struct_rejects_block_syntax_multiple_elements() {
     };
 
     let mut map1 = IndexMap::new();
-    map1.insert("status".to_string(), Value::String("Enabled".to_string()));
+    map1.insert(
+        "status".to_string(),
+        Value::Concrete(ConcreteValue::String("Enabled".to_string())),
+    );
     let mut map2 = IndexMap::new();
-    map2.insert("status".to_string(), Value::String("Suspended".to_string()));
-    let multi_list = Value::List(vec![Value::Map(map1), Value::Map(map2)]);
+    map2.insert(
+        "status".to_string(),
+        Value::Concrete(ConcreteValue::String("Suspended".to_string())),
+    );
+    let multi_list = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::Map(map1)),
+        Value::Concrete(ConcreteValue::Map(map2)),
+    ]));
     let result = struct_type.validate(&multi_list);
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -912,22 +1097,41 @@ fn validate_ipv4_cidr_type() {
 
     // Valid IPv4 CIDRs
     assert!(
-        t.validate(&Value::String("10.0.0.0/16".to_string()))
-            .is_ok()
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "10.0.0.0/16".to_string()
+        )))
+        .is_ok()
     );
-    assert!(t.validate(&Value::String("0.0.0.0/0".to_string())).is_ok());
     assert!(
-        t.validate(&Value::String("255.255.255.255/32".to_string()))
-            .is_ok()
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "0.0.0.0/0".to_string()
+        )))
+        .is_ok()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "255.255.255.255/32".to_string()
+        )))
+        .is_ok()
     );
 
     // Invalid IPv4 CIDRs
     assert!(
-        t.validate(&Value::String("10.0.0.0/33".to_string()))
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "10.0.0.0/33".to_string()
+        )))
+        .is_err()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "10.0.0.0".to_string()
+        )))
+        .is_err()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::Int(42)))
             .is_err()
     );
-    assert!(t.validate(&Value::String("10.0.0.0".to_string())).is_err());
-    assert!(t.validate(&Value::Int(42)).is_err());
 }
 
 #[test]
@@ -935,43 +1139,76 @@ fn validate_ipv6_cidr_type() {
     let t = types::ipv6_cidr();
 
     // Valid IPv6 CIDRs
-    assert!(t.validate(&Value::String("::/0".to_string())).is_ok());
     assert!(
-        t.validate(&Value::String("2001:db8::/32".to_string()))
+        t.validate(&Value::Concrete(ConcreteValue::String("::/0".to_string())))
             .is_ok()
     );
-    assert!(t.validate(&Value::String("fe80::/10".to_string())).is_ok());
-    assert!(t.validate(&Value::String("::1/128".to_string())).is_ok());
     assert!(
-        t.validate(&Value::String(
-            "2001:0db8:85a3:0000:0000:8a2e:0370:7334/64".to_string()
-        ))
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "2001:db8::/32".to_string()
+        )))
         .is_ok()
     );
-    assert!(t.validate(&Value::String("ff00::/8".to_string())).is_ok());
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "fe80::/10".to_string()
+        )))
+        .is_ok()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "::1/128".to_string()
+        )))
+        .is_ok()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "2001:0db8:85a3:0000:0000:8a2e:0370:7334/64".to_string()
+        )))
+        .is_ok()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "ff00::/8".to_string()
+        )))
+        .is_ok()
+    );
 
     // Invalid IPv6 CIDRs
     assert!(
-        t.validate(&Value::String("2001:db8::/129".to_string()))
-            .is_err()
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "2001:db8::/129".to_string()
+        )))
+        .is_err()
     ); // prefix > 128
     assert!(
-        t.validate(&Value::String("2001:db8::".to_string()))
-            .is_err()
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "2001:db8::".to_string()
+        )))
+        .is_err()
     ); // missing prefix
     assert!(
-        t.validate(&Value::String("2001:gggg::/32".to_string()))
-            .is_err()
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "2001:gggg::/32".to_string()
+        )))
+        .is_err()
     ); // invalid hex
     assert!(
-        t.validate(&Value::String("2001:db8::1::2/64".to_string()))
-            .is_err()
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "2001:db8::1::2/64".to_string()
+        )))
+        .is_err()
     ); // double ::
     assert!(
-        t.validate(&Value::String("10.0.0.0/16".to_string()))
-            .is_err()
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "10.0.0.0/16".to_string()
+        )))
+        .is_err()
     ); // IPv4, not IPv6
-    assert!(t.validate(&Value::Int(42)).is_err()); // wrong type
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::Int(42)))
+            .is_err()
+    ); // wrong type
 }
 
 #[test]
@@ -996,25 +1233,47 @@ fn validate_cidr_accepts_both_ipv4_and_ipv6() {
 
     // Valid IPv4 CIDRs
     assert!(
-        t.validate(&Value::String("10.0.0.0/16".to_string()))
-            .is_ok()
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "10.0.0.0/16".to_string()
+        )))
+        .is_ok()
     );
-    assert!(t.validate(&Value::String("0.0.0.0/0".to_string())).is_ok());
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "0.0.0.0/0".to_string()
+        )))
+        .is_ok()
+    );
 
     // Valid IPv6 CIDRs
     assert!(
-        t.validate(&Value::String("2001:db8::/32".to_string()))
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "2001:db8::/32".to_string()
+        )))
+        .is_ok()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String("::/0".to_string())))
             .is_ok()
     );
-    assert!(t.validate(&Value::String("::/0".to_string())).is_ok());
 
     // Invalid
     assert!(
-        t.validate(&Value::String("not-a-cidr".to_string()))
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "not-a-cidr".to_string()
+        )))
+        .is_err()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "10.0.0.0".to_string()
+        )))
+        .is_err()
+    ); // no prefix
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::Int(42)))
             .is_err()
     );
-    assert!(t.validate(&Value::String("10.0.0.0".to_string())).is_err()); // no prefix
-    assert!(t.validate(&Value::Int(42)).is_err());
 }
 
 #[test]
@@ -1046,26 +1305,60 @@ fn validate_ipv4_address_type() {
     let t = types::ipv4_address();
 
     // Valid IPv4 addresses
-    assert!(t.validate(&Value::String("10.0.1.5".to_string())).is_ok());
     assert!(
-        t.validate(&Value::String("192.168.0.1".to_string()))
-            .is_ok()
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "10.0.1.5".to_string()
+        )))
+        .is_ok()
     );
-    assert!(t.validate(&Value::String("0.0.0.0".to_string())).is_ok());
     assert!(
-        t.validate(&Value::String("255.255.255.255".to_string()))
-            .is_ok()
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "192.168.0.1".to_string()
+        )))
+        .is_ok()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "0.0.0.0".to_string()
+        )))
+        .is_ok()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "255.255.255.255".to_string()
+        )))
+        .is_ok()
     );
 
     // Invalid IPv4 addresses
     assert!(
-        t.validate(&Value::String("10.0.0.0/16".to_string()))
-            .is_err()
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "10.0.0.0/16".to_string()
+        )))
+        .is_err()
     ); // CIDR, not address
-    assert!(t.validate(&Value::String("256.0.0.1".to_string())).is_err()); // octet > 255
-    assert!(t.validate(&Value::String("10.0.1".to_string())).is_err()); // only 3 octets
-    assert!(t.validate(&Value::String("not-an-ip".to_string())).is_err());
-    assert!(t.validate(&Value::Int(42)).is_err()); // wrong type
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "256.0.0.1".to_string()
+        )))
+        .is_err()
+    ); // octet > 255
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "10.0.1".to_string()
+        )))
+        .is_err()
+    ); // only 3 octets
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "not-an-ip".to_string()
+        )))
+        .is_err()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::Int(42)))
+            .is_err()
+    ); // wrong type
 }
 
 #[test]
@@ -1073,27 +1366,50 @@ fn validate_ipv6_address_type() {
     let t = types::ipv6_address();
 
     // Valid IPv6 addresses
-    assert!(t.validate(&Value::String("::1".to_string())).is_ok());
     assert!(
-        t.validate(&Value::String("2001:db8::1".to_string()))
+        t.validate(&Value::Concrete(ConcreteValue::String("::1".to_string())))
             .is_ok()
     );
-    assert!(t.validate(&Value::String("fe80::1".to_string())).is_ok());
     assert!(
-        t.validate(&Value::String(
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "2001:db8::1".to_string()
+        )))
+        .is_ok()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "fe80::1".to_string()
+        )))
+        .is_ok()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String(
             "2001:0db8:85a3:0000:0000:8a2e:0370:7334".to_string()
-        ))
+        )))
         .is_ok()
     );
 
     // Invalid IPv6 addresses
     assert!(
-        t.validate(&Value::String("2001:db8::/32".to_string()))
-            .is_err()
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "2001:db8::/32".to_string()
+        )))
+        .is_err()
     ); // CIDR, not address
-    assert!(t.validate(&Value::String("not-an-ip".to_string())).is_err());
-    assert!(t.validate(&Value::String("".to_string())).is_err());
-    assert!(t.validate(&Value::Int(42)).is_err()); // wrong type
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "not-an-ip".to_string()
+        )))
+        .is_err()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String("".to_string())))
+            .is_err()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::Int(42)))
+            .is_err()
+    ); // wrong type
 }
 
 #[test]
@@ -1142,12 +1458,18 @@ fn resource_validator_called() {
 
     // Valid: no forbidden attribute
     let mut attrs = HashMap::new();
-    attrs.insert("name".to_string(), Value::String("test".to_string()));
+    attrs.insert(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("test".to_string())),
+    );
     assert!(schema.validate(&attrs).is_ok());
 
     // Invalid: forbidden attribute present
     let mut bad_attrs = HashMap::new();
-    bad_attrs.insert("forbidden".to_string(), Value::String("bad".to_string()));
+    bad_attrs.insert(
+        "forbidden".to_string(),
+        Value::Concrete(ConcreteValue::String("bad".to_string())),
+    );
     let result = schema.validate(&bad_attrs);
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().len(), 1);
@@ -1159,11 +1481,17 @@ fn validate_exclusive_required_helper() {
 
     // Valid: exactly one field present
     let mut attrs = HashMap::new();
-    attrs.insert("option_a".to_string(), Value::String("value".to_string()));
+    attrs.insert(
+        "option_a".to_string(),
+        Value::Concrete(ConcreteValue::String("value".to_string())),
+    );
     assert!(validate_exclusive_required(&attrs, &["option_a", "option_b"]).is_ok());
 
     let mut attrs2 = HashMap::new();
-    attrs2.insert("option_b".to_string(), Value::String("value".to_string()));
+    attrs2.insert(
+        "option_b".to_string(),
+        Value::Concrete(ConcreteValue::String("value".to_string())),
+    );
     assert!(validate_exclusive_required(&attrs2, &["option_a", "option_b"]).is_ok());
 
     // Invalid: neither field present
@@ -1180,8 +1508,14 @@ fn validate_exclusive_required_helper() {
 
     // Invalid: both fields present
     let mut both = HashMap::new();
-    both.insert("option_a".to_string(), Value::String("a".to_string()));
-    both.insert("option_b".to_string(), Value::String("b".to_string()));
+    both.insert(
+        "option_a".to_string(),
+        Value::Concrete(ConcreteValue::String("a".to_string())),
+    );
+    both.insert(
+        "option_b".to_string(),
+        Value::Concrete(ConcreteValue::String("b".to_string())),
+    );
     let result = validate_exclusive_required(&both, &["option_a", "option_b"]);
     assert!(result.is_err());
     let errors = result.unwrap_err();
@@ -1211,38 +1545,50 @@ fn exclusive_required_with_resource_schema() {
 
     // Valid: has cidr_block only
     let mut attrs1 = HashMap::new();
-    attrs1.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
+    attrs1.insert(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-123".to_string())),
+    );
     attrs1.insert(
         "cidr_block".to_string(),
-        Value::String("10.0.0.0/24".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/24".to_string())),
     );
     assert!(schema.validate(&attrs1).is_ok());
 
     // Valid: has ipv4_ipam_pool_id only
     let mut attrs2 = HashMap::new();
-    attrs2.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
+    attrs2.insert(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-123".to_string())),
+    );
     attrs2.insert(
         "ipv4_ipam_pool_id".to_string(),
-        Value::String("ipam-pool-123".to_string()),
+        Value::Concrete(ConcreteValue::String("ipam-pool-123".to_string())),
     );
     assert!(schema.validate(&attrs2).is_ok());
 
     // Invalid: has neither
     let mut attrs3 = HashMap::new();
-    attrs3.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
+    attrs3.insert(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-123".to_string())),
+    );
     let result = schema.validate(&attrs3);
     assert!(result.is_err());
 
     // Invalid: has both
     let mut attrs4 = HashMap::new();
-    attrs4.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
+    attrs4.insert(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-123".to_string())),
+    );
     attrs4.insert(
         "cidr_block".to_string(),
-        Value::String("10.0.0.0/24".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/24".to_string())),
     );
     attrs4.insert(
         "ipv4_ipam_pool_id".to_string(),
-        Value::String("ipam-pool-123".to_string()),
+        Value::Concrete(ConcreteValue::String("ipam-pool-123".to_string())),
     );
     let result = schema.validate(&attrs4);
     assert!(result.is_err());
@@ -1264,7 +1610,7 @@ fn exclusive_required_declarative() {
     let mut one = HashMap::new();
     one.insert(
         "cidr_block".to_string(),
-        Value::String("10.0.0.0/16".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
     assert!(schema.validate(&one).is_ok());
 
@@ -1283,11 +1629,11 @@ fn exclusive_required_declarative() {
     let mut both = HashMap::new();
     both.insert(
         "cidr_block".to_string(),
-        Value::String("10.0.0.0/16".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
     both.insert(
         "ipv4_ipam_pool_id".to_string(),
-        Value::String("pool-1".to_string()),
+        Value::Concrete(ConcreteValue::String("pool-1".to_string())),
     );
     let err = schema.validate(&both).unwrap_err();
     assert!(
@@ -1322,8 +1668,14 @@ fn exclusive_required_multiple_groups() {
 
     // Satisfy both groups
     let mut ok = HashMap::new();
-    ok.insert("a".to_string(), Value::String("1".to_string()));
-    ok.insert("x".to_string(), Value::String("1".to_string()));
+    ok.insert(
+        "a".to_string(),
+        Value::Concrete(ConcreteValue::String("1".to_string())),
+    );
+    ok.insert(
+        "x".to_string(),
+        Value::Concrete(ConcreteValue::String("1".to_string())),
+    );
     assert!(schema.validate(&ok).is_ok());
 }
 
@@ -1336,7 +1688,7 @@ fn validate_union_type() {
         pattern: None,
         length: None,
         validate: legacy_validator(|value| {
-            if let Value::String(s) = value {
+            if let Value::Concrete(ConcreteValue::String(s)) = value {
                 if s.starts_with("a-") {
                     Ok(())
                 } else {
@@ -1355,7 +1707,7 @@ fn validate_union_type() {
         pattern: None,
         length: None,
         validate: legacy_validator(|value| {
-            if let Value::String(s) = value {
+            if let Value::Concrete(ConcreteValue::String(s)) = value {
                 if s.starts_with("b-") {
                     Ok(())
                 } else {
@@ -1374,19 +1726,25 @@ fn validate_union_type() {
     // Valid: matches first member
     assert!(
         union_type
-            .validate(&Value::String("a-12345678".to_string()))
+            .validate(&Value::Concrete(ConcreteValue::String(
+                "a-12345678".to_string()
+            )))
             .is_ok()
     );
     // Valid: matches second member
     assert!(
         union_type
-            .validate(&Value::String("b-12345678".to_string()))
+            .validate(&Value::Concrete(ConcreteValue::String(
+                "b-12345678".to_string()
+            )))
             .is_ok()
     );
     // Invalid: matches neither
     assert!(
         union_type
-            .validate(&Value::String("c-12345678".to_string()))
+            .validate(&Value::Concrete(ConcreteValue::String(
+                "c-12345678".to_string()
+            )))
             .is_err()
     );
     // Valid: ResourceRef is accepted by Custom members
@@ -1417,11 +1775,16 @@ fn union_struct_unknown_field_shows_specific_error() {
     let mut map = IndexMap::new();
     map.insert(
         "federated".to_string(),
-        Value::String("arn:...".to_string()),
+        Value::Concrete(ConcreteValue::String("arn:...".to_string())),
     );
-    map.insert("aaa".to_string(), Value::String("bbb".to_string()));
+    map.insert(
+        "aaa".to_string(),
+        Value::Concrete(ConcreteValue::String("bbb".to_string())),
+    );
 
-    let err = principal_type.validate(&Value::Map(map)).unwrap_err();
+    let err = principal_type
+        .validate(&Value::Concrete(ConcreteValue::Map(map)))
+        .unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("aaa"),
@@ -1530,17 +1893,19 @@ fn block_name_map_empty_when_no_block_names() {
 fn resolve_block_names_renames_key() {
     let mut resources = vec![{
         let mut r = Resource::new("ec2.ipam", "my-ipam");
-        // Block syntax produces Value::List
+        // Block syntax produces Value::Concrete(ConcreteValue::List)
         r.set_attr(
             "operating_region".to_string(),
-            Value::List(vec![Value::Map({
-                let mut m = IndexMap::new();
-                m.insert(
-                    "region_name".to_string(),
-                    Value::String("us-east-1".to_string()),
-                );
-                m
-            })]),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map({
+                    let mut m = IndexMap::new();
+                    m.insert(
+                        "region_name".to_string(),
+                        Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
+                    );
+                    m
+                }),
+            )])),
         );
         r
     }];
@@ -1564,7 +1929,10 @@ fn resolve_block_names_renames_key() {
 fn resolve_block_names_noop_when_no_match() {
     let mut resources = vec![{
         let mut r = Resource::new("ec2.ipam", "my-ipam");
-        r.set_attr("name".to_string(), Value::String("test".to_string()));
+        r.set_attr(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("test".to_string())),
+        );
         r
     }];
 
@@ -1584,29 +1952,33 @@ fn resolve_block_names_noop_when_no_match() {
 fn resolve_block_names_errors_on_mixed_syntax() {
     let mut resources = vec![{
         let mut r = Resource::new("ec2.ipam", "my-ipam");
-        // Block syntax produces Value::List
+        // Block syntax produces Value::Concrete(ConcreteValue::List)
         r.set_attr(
             "operating_region".to_string(),
-            Value::List(vec![Value::Map({
-                let mut m = IndexMap::new();
-                m.insert(
-                    "region_name".to_string(),
-                    Value::String("us-east-1".to_string()),
-                );
-                m
-            })]),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map({
+                    let mut m = IndexMap::new();
+                    m.insert(
+                        "region_name".to_string(),
+                        Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
+                    );
+                    m
+                }),
+            )])),
         );
         // User also explicitly set the canonical name
         r.set_attr(
             "operating_regions".to_string(),
-            Value::List(vec![Value::Map({
-                let mut m = IndexMap::new();
-                m.insert(
-                    "region_name".to_string(),
-                    Value::String("us-west-2".to_string()),
-                );
-                m
-            })]),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map({
+                    let mut m = IndexMap::new();
+                    m.insert(
+                        "region_name".to_string(),
+                        Value::Concrete(ConcreteValue::String("us-west-2".to_string())),
+                    );
+                    m
+                }),
+            )])),
         );
         r
     }];
@@ -1633,7 +2005,7 @@ fn resolve_block_names_skips_unknown_schema() {
         let mut r = Resource::new("unknown.type", "test");
         r.set_attr(
             "operating_region".to_string(),
-            Value::String("us-east-1".to_string()),
+            Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
         );
         r
     }];
@@ -1667,19 +2039,24 @@ fn resolve_block_names_nested_struct() {
     let mut inner_map = IndexMap::new();
     inner_map.insert(
         "transition".to_string(),
-        Value::List(vec![Value::Map({
-            let mut m = IndexMap::new();
-            m.insert(
-                "storage_class".to_string(),
-                Value::String("GLACIER".to_string()),
-            );
-            m
-        })]),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map({
+                let mut m = IndexMap::new();
+                m.insert(
+                    "storage_class".to_string(),
+                    Value::Concrete(ConcreteValue::String("GLACIER".to_string())),
+                );
+                m
+            }),
+        )])),
     );
 
     let mut resources = vec![{
         let mut r = Resource::new("s3.Bucket", "my-bucket");
-        r.set_attr("lifecycle_configuration".to_string(), Value::Map(inner_map));
+        r.set_attr(
+            "lifecycle_configuration".to_string(),
+            Value::Concrete(ConcreteValue::Map(inner_map)),
+        );
         r
     }];
 
@@ -1708,7 +2085,7 @@ fn resolve_block_names_nested_struct() {
 
     // The nested "transition" key should be renamed to "transitions"
     let lifecycle = match resources[0].get_attr("lifecycle_configuration") {
-        Some(Value::Map(m)) => m,
+        Some(Value::Concrete(ConcreteValue::Map(m))) => m,
         _ => panic!("expected Map"),
     };
     assert!(
@@ -1725,26 +2102,29 @@ fn resolve_block_names_nested_struct() {
 fn resolve_block_names_singular_field_not_renamed_when_assigned() {
     // When a struct has both `transition` (Struct) and `transitions` (List(Struct))
     // with block_name("transition") on the List field, an attribute assignment
-    // `transition = { ... }` (Value::Map) should NOT be renamed to `transitions`.
-    // Only block syntax `transition { ... }` (Value::List) should be renamed.
+    // `transition = { ... }` (Value::Concrete(ConcreteValue::Map)) should NOT be renamed to `transitions`.
+    // Only block syntax `transition { ... }` (Value::Concrete(ConcreteValue::List)) should be renamed.
     let mut inner_map = IndexMap::new();
     // This is an attribute assignment: transition = { storage_class = "GLACIER" }
-    // Parser produces Value::Map for attribute assignments
+    // Parser produces Value::Concrete(ConcreteValue::Map) for attribute assignments
     inner_map.insert(
         "transition".to_string(),
-        Value::Map({
+        Value::Concrete(ConcreteValue::Map({
             let mut m = IndexMap::new();
             m.insert(
                 "storage_class".to_string(),
-                Value::String("GLACIER".to_string()),
+                Value::Concrete(ConcreteValue::String("GLACIER".to_string())),
             );
             m
-        }),
+        })),
     );
 
     let mut resources = vec![{
         let mut r = Resource::new("s3.Bucket", "my-bucket");
-        r.set_attr("lifecycle_configuration".to_string(), Value::Map(inner_map));
+        r.set_attr(
+            "lifecycle_configuration".to_string(),
+            Value::Concrete(ConcreteValue::Map(inner_map)),
+        );
         r
     }];
 
@@ -1779,10 +2159,10 @@ fn resolve_block_names_singular_field_not_renamed_when_assigned() {
     resolve_block_names(&mut resources, &schemas).unwrap();
 
     let lifecycle = match resources[0].get_attr("lifecycle_configuration") {
-        Some(Value::Map(m)) => m,
+        Some(Value::Concrete(ConcreteValue::Map(m))) => m,
         _ => panic!("expected Map"),
     };
-    // The Value::Map should remain as "transition" (not renamed)
+    // The Value::Concrete(ConcreteValue::Map) should remain as "transition" (not renamed)
     assert!(
         lifecycle.contains_key("transition"),
         "expected 'transition' key to remain (attribute assignment)"
@@ -1798,22 +2178,27 @@ fn resolve_block_names_block_syntax_renamed_when_singular_field_exists() {
     // Block syntax `transition { ... }` should still be renamed to `transitions`
     // even when a singular `transition` field exists in the schema.
     let mut inner_map = IndexMap::new();
-    // Block syntax produces Value::List
+    // Block syntax produces Value::Concrete(ConcreteValue::List)
     inner_map.insert(
         "transition".to_string(),
-        Value::List(vec![Value::Map({
-            let mut m = IndexMap::new();
-            m.insert(
-                "storage_class".to_string(),
-                Value::String("GLACIER".to_string()),
-            );
-            m
-        })]),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map({
+                let mut m = IndexMap::new();
+                m.insert(
+                    "storage_class".to_string(),
+                    Value::Concrete(ConcreteValue::String("GLACIER".to_string())),
+                );
+                m
+            }),
+        )])),
     );
 
     let mut resources = vec![{
         let mut r = Resource::new("s3.Bucket", "my-bucket");
-        r.set_attr("lifecycle_configuration".to_string(), Value::Map(inner_map));
+        r.set_attr(
+            "lifecycle_configuration".to_string(),
+            Value::Concrete(ConcreteValue::Map(inner_map)),
+        );
         r
     }];
 
@@ -1848,10 +2233,10 @@ fn resolve_block_names_block_syntax_renamed_when_singular_field_exists() {
     resolve_block_names(&mut resources, &schemas).unwrap();
 
     let lifecycle = match resources[0].get_attr("lifecycle_configuration") {
-        Some(Value::Map(m)) => m,
+        Some(Value::Concrete(ConcreteValue::Map(m))) => m,
         _ => panic!("expected Map"),
     };
-    // Block syntax (Value::List) should be renamed to "transitions"
+    // Block syntax (Value::Concrete(ConcreteValue::List)) should be renamed to "transitions"
     assert!(
         lifecycle.contains_key("transitions"),
         "expected 'transitions' key after resolve (block syntax)"
@@ -1869,14 +2254,19 @@ fn resolve_block_names_same_block_and_canonical_name() {
     // This regression was introduced in PR #913 and fixed in PR #917.
     let mut resources = vec![{
         let mut r = Resource::new("ec2.SecurityGroup", "my-sg");
-        // Block syntax produces Value::List
+        // Block syntax produces Value::Concrete(ConcreteValue::List)
         r.set_attr(
             "ingress".to_string(),
-            Value::List(vec![Value::Map({
-                let mut m = IndexMap::new();
-                m.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
-                m
-            })]),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map({
+                    let mut m = IndexMap::new();
+                    m.insert(
+                        "ip_protocol".to_string(),
+                        Value::Concrete(ConcreteValue::String("tcp".to_string())),
+                    );
+                    m
+                }),
+            )])),
         );
         r
     }];
@@ -1903,7 +2293,7 @@ fn resolve_block_names_same_block_and_canonical_name() {
     assert!(resources[0].attributes.contains_key("ingress"));
     // Value should be unchanged
     match resources[0].get_attr("ingress") {
-        Some(Value::List(items)) => assert_eq!(items.len(), 1),
+        Some(Value::Concrete(ConcreteValue::List(items))) => assert_eq!(items.len(), 1),
         other => panic!("expected List, got {:?}", other),
     }
 }
@@ -1911,25 +2301,31 @@ fn resolve_block_names_same_block_and_canonical_name() {
 #[test]
 fn resolve_block_names_same_block_and_canonical_name_multiple_items() {
     // When block_name == canonical name and the user provides multiple block
-    // items (Value::List with multiple entries), no conflict should occur.
+    // items (Value::Concrete(ConcreteValue::List) with multiple entries), no conflict should occur.
     // The key already exists (it IS the canonical key), so the `continue`
     // path handles it. This test verifies all items are preserved.
     let mut resources = vec![{
         let mut r = Resource::new("ec2.SecurityGroup", "my-sg");
         r.set_attr(
             "ingress".to_string(),
-            Value::List(vec![
-                Value::Map({
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::Map({
                     let mut m = IndexMap::new();
-                    m.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
+                    m.insert(
+                        "ip_protocol".to_string(),
+                        Value::Concrete(ConcreteValue::String("tcp".to_string())),
+                    );
                     m
-                }),
-                Value::Map({
+                })),
+                Value::Concrete(ConcreteValue::Map({
                     let mut m = IndexMap::new();
-                    m.insert("ip_protocol".to_string(), Value::String("udp".to_string()));
+                    m.insert(
+                        "ip_protocol".to_string(),
+                        Value::Concrete(ConcreteValue::String("udp".to_string())),
+                    );
                     m
-                }),
-            ]),
+                })),
+            ])),
         );
         r
     }];
@@ -1954,7 +2350,7 @@ fn resolve_block_names_same_block_and_canonical_name_multiple_items() {
 
     assert!(resources[0].attributes.contains_key("ingress"));
     match resources[0].get_attr("ingress") {
-        Some(Value::List(items)) => assert_eq!(items.len(), 2),
+        Some(Value::Concrete(ConcreteValue::List(items))) => assert_eq!(items.len(), 2),
         other => panic!("expected List with 2 items, got {:?}", other),
     }
 }
@@ -1966,17 +2362,28 @@ fn resolve_block_names_nested_same_block_and_canonical_name() {
     let mut inner_map = IndexMap::new();
     inner_map.insert(
         "tag".to_string(),
-        Value::List(vec![Value::Map({
-            let mut m = IndexMap::new();
-            m.insert("key".to_string(), Value::String("Name".to_string()));
-            m.insert("value".to_string(), Value::String("test".to_string()));
-            m
-        })]),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map({
+                let mut m = IndexMap::new();
+                m.insert(
+                    "key".to_string(),
+                    Value::Concrete(ConcreteValue::String("Name".to_string())),
+                );
+                m.insert(
+                    "value".to_string(),
+                    Value::Concrete(ConcreteValue::String("test".to_string())),
+                );
+                m
+            }),
+        )])),
     );
 
     let mut resources = vec![{
         let mut r = Resource::new("test.resource", "my-resource");
-        r.set_attr("config".to_string(), Value::Map(inner_map));
+        r.set_attr(
+            "config".to_string(),
+            Value::Concrete(ConcreteValue::Map(inner_map)),
+        );
         r
     }];
 
@@ -2008,7 +2415,7 @@ fn resolve_block_names_nested_same_block_and_canonical_name() {
     resolve_block_names(&mut resources, &schemas).unwrap();
 
     let config = match resources[0].get_attr("config") {
-        Some(Value::Map(m)) => m,
+        Some(Value::Concrete(ConcreteValue::Map(m))) => m,
         _ => panic!("expected Map"),
     };
     // Key should remain as "tag" (no rename needed since block_name == canonical)
@@ -2017,7 +2424,7 @@ fn resolve_block_names_nested_same_block_and_canonical_name() {
         "expected 'tag' key to remain (block_name == canonical name)"
     );
     match config.get("tag") {
-        Some(Value::List(items)) => assert_eq!(items.len(), 1),
+        Some(Value::Concrete(ConcreteValue::List(items))) => assert_eq!(items.len(), 1),
         other => panic!("expected List, got {:?}", other),
     }
 }
@@ -2059,9 +2466,12 @@ fn validate_rejects_unknown_attribute() {
     let mut attrs = HashMap::new();
     attrs.insert(
         "bucket_name".to_string(),
-        Value::String("my-bucket".to_string()),
+        Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
     );
-    attrs.insert("tags".to_string(), Value::Map(IndexMap::new()));
+    attrs.insert(
+        "tags".to_string(),
+        Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+    );
 
     let result = schema.validate(&attrs);
     assert!(result.is_err());
@@ -2082,9 +2492,12 @@ fn validate_allows_known_attributes_only() {
     let mut attrs = HashMap::new();
     attrs.insert(
         "bucket_name".to_string(),
-        Value::String("my-bucket".to_string()),
+        Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
     );
-    attrs.insert("tags".to_string(), Value::Map(IndexMap::new()));
+    attrs.insert(
+        "tags".to_string(),
+        Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+    );
 
     assert!(schema.validate(&attrs).is_ok());
 }
@@ -2097,7 +2510,7 @@ fn validate_unknown_attribute_with_suggestion() {
     let mut attrs = HashMap::new();
     attrs.insert(
         "bukcet_name".to_string(),
-        Value::String("my-bucket".to_string()),
+        Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
     );
 
     let result = schema.validate(&attrs);
@@ -2129,7 +2542,9 @@ fn validate_accepts_block_name_alias() {
     let mut attrs = HashMap::new();
     attrs.insert(
         "ingress_rule".to_string(),
-        Value::List(vec![Value::String("rule1".to_string())]),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("rule1".to_string()),
+        )])),
     );
 
     assert!(schema.validate(&attrs).is_ok());
@@ -2143,9 +2558,12 @@ fn validate_skips_internal_attributes() {
     let mut attrs = HashMap::new();
     attrs.insert(
         "bucket_name".to_string(),
-        Value::String("my-bucket".to_string()),
+        Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
     );
-    attrs.insert("_binding".to_string(), Value::String("b".to_string()));
+    attrs.insert(
+        "_binding".to_string(),
+        Value::Concrete(ConcreteValue::String("b".to_string())),
+    );
 
     assert!(schema.validate(&attrs).is_ok());
 }
@@ -2556,34 +2974,51 @@ fn validate_email_type() {
 
     // Valid emails
     assert!(
-        t.validate(&Value::String("user@example.com".to_string()))
-            .is_ok()
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "user@example.com".to_string()
+        )))
+        .is_ok()
     );
     assert!(
-        t.validate(&Value::String(
+        t.validate(&Value::Concrete(ConcreteValue::String(
             "user.name+tag@sub.example.co.jp".to_string()
-        ))
+        )))
         .is_ok()
     );
 
     // Invalid emails
     assert!(
-        t.validate(&Value::String("no-at-sign.com".to_string()))
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "no-at-sign.com".to_string()
+        )))
+        .is_err()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "noTLD@host".to_string()
+        )))
+        .is_err()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "@example.com".to_string()
+        )))
+        .is_err()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String("user@".to_string())))
             .is_err()
     );
     assert!(
-        t.validate(&Value::String("noTLD@host".to_string()))
+        t.validate(&Value::Concrete(ConcreteValue::String("".to_string())))
             .is_err()
     );
-    assert!(
-        t.validate(&Value::String("@example.com".to_string()))
-            .is_err()
-    );
-    assert!(t.validate(&Value::String("user@".to_string())).is_err());
-    assert!(t.validate(&Value::String("".to_string())).is_err());
 
     // Wrong type
-    assert!(t.validate(&Value::Int(42)).is_err());
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::Int(42)))
+            .is_err()
+    );
 }
 
 #[cfg(test)]
@@ -2603,7 +3038,7 @@ mod validate_collect_tests {
         for (k, v) in entries {
             map.insert(k.to_string(), v);
         }
-        Value::Map(map)
+        Value::Concrete(ConcreteValue::Map(map))
     }
 
     #[test]
@@ -2616,8 +3051,11 @@ mod validate_collect_tests {
             ],
         );
         let v = map_value(vec![
-            ("status", Value::String("Enabled".to_string())),
-            ("mfa_delete", Value::Bool(false)),
+            (
+                "status",
+                Value::Concrete(ConcreteValue::String("Enabled".to_string())),
+            ),
+            ("mfa_delete", Value::Concrete(ConcreteValue::Bool(false))),
         ]);
         let errors = ty.validate_collect(&v);
         assert!(
@@ -2636,8 +3074,11 @@ mod validate_collect_tests {
             vec![StructField::new("status", AttributeType::String)],
         );
         let v = map_value(vec![
-            ("statuus", Value::String("Enabled".to_string())),
-            ("mfa", Value::Bool(false)),
+            (
+                "statuus",
+                Value::Concrete(ConcreteValue::String("Enabled".to_string())),
+            ),
+            ("mfa", Value::Concrete(ConcreteValue::Bool(false))),
         ]);
         let errors = ty.validate_collect(&v);
         assert_eq!(
@@ -2663,7 +3104,10 @@ mod validate_collect_tests {
         let outer = struct_type("Outer", vec![StructField::new("nested", inner).required()]);
         let v = map_value(vec![(
             "nested",
-            map_value(vec![("count", Value::String("not an int".to_string()))]),
+            map_value(vec![(
+                "count",
+                Value::Concrete(ConcreteValue::String("not an int".to_string())),
+            )]),
         )]);
         let errors = outer.validate_collect(&v);
         assert_eq!(errors.len(), 1, "got {errors:?}");
@@ -2686,10 +3130,13 @@ mod validate_collect_tests {
         };
 
         // Two list items, second one has wrong type for `name`
-        let v = Value::List(vec![
-            map_value(vec![("name", Value::String("ok".to_string()))]),
-            map_value(vec![("name", Value::Int(42))]),
-        ]);
+        let v = Value::Concrete(ConcreteValue::List(vec![
+            map_value(vec![(
+                "name",
+                Value::Concrete(ConcreteValue::String("ok".to_string())),
+            )]),
+            map_value(vec![("name", Value::Concrete(ConcreteValue::Int(42)))]),
+        ]));
         let errors = outer_attr.validate_collect(&v);
         assert_eq!(errors.len(), 1, "got {errors:?}");
         let path = &errors[0].0;
@@ -2712,7 +3159,10 @@ mod validate_collect_tests {
                     .with_block_name("transition"),
             ],
         );
-        let v = map_value(vec![("transition", Value::String("ok".to_string()))]);
+        let v = map_value(vec![(
+            "transition",
+            Value::Concrete(ConcreteValue::String("ok".to_string())),
+        )]);
         let errors = ty.validate_collect(&v);
         assert!(
             errors.is_empty(),
@@ -2751,7 +3201,10 @@ mod validate_collect_tests {
             "Versioning",
             vec![StructField::new("status", AttributeType::String)],
         );
-        let v = map_value(vec![("statuus", Value::String("x".to_string()))]);
+        let v = map_value(vec![(
+            "statuus",
+            Value::Concrete(ConcreteValue::String("x".to_string())),
+        )]);
         let errors = ty.validate_collect(&v);
         assert_eq!(errors.len(), 1);
         match &errors[0].1 {
@@ -2828,7 +3281,9 @@ fn expected_includes_to_dsl_aliases_with_alias_flag() {
             ("Suspended".to_string(), "suspended".to_string()),
         ],
     };
-    let err = t.validate(&Value::String("zzz".to_string())).unwrap_err();
+    let err = t
+        .validate(&Value::Concrete(ConcreteValue::String("zzz".to_string())))
+        .unwrap_err();
     let TypeError::InvalidEnumVariant { expected, .. } = err else {
         panic!("expected InvalidEnumVariant, got {err:?}");
     };
@@ -2864,8 +3319,10 @@ fn custom_namespaced_string_literal_routes_validator_text_to_extra_message() {
     // byte-identical.
     fn validate_mode(v: &Value) -> Result<(), String> {
         match v {
-            Value::String(s) if s == "test.r.Mode.fast" => Ok(()),
-            Value::String(s) => Err(format!("invalid Mode '{}': expected fast", s)),
+            Value::Concrete(ConcreteValue::String(s)) if s == "test.r.Mode.fast" => Ok(()),
+            Value::Concrete(ConcreteValue::String(s)) => {
+                Err(format!("invalid Mode '{}': expected fast", s))
+            }
             _ => Err("expected String".to_string()),
         }
     }
@@ -2885,7 +3342,10 @@ fn custom_namespaced_string_literal_routes_validator_text_to_extra_message() {
         .required(),
     );
     let mut attrs = HashMap::new();
-    attrs.insert("mode".to_string(), Value::String("aaa".to_string()));
+    attrs.insert(
+        "mode".to_string(),
+        Value::Concrete(ConcreteValue::String("aaa".to_string())),
+    );
     let errs = schema
         .validate_with_origins(&attrs, &|n| n == "mode")
         .unwrap_err();
@@ -2979,7 +3439,7 @@ fn union_string_vs_string_enum_picks_enum_error_for_string_input() {
         },
     ]);
     let err = union_type
-        .validate(&Value::String("zzz".to_string()))
+        .validate(&Value::Concrete(ConcreteValue::String("zzz".to_string())))
         .unwrap_err();
     match err {
         TypeError::InvalidEnumVariant { ref expected, .. } => {
@@ -3007,9 +3467,17 @@ fn union_list_vs_list_struct_picks_inner_struct_error() {
         }),
     ]);
     let mut bad = IndexMap::new();
-    bad.insert("name".to_string(), Value::String("x".to_string()));
-    bad.insert("typo".to_string(), Value::String("y".to_string()));
-    let value = Value::List(vec![Value::Map(bad)]);
+    bad.insert(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("x".to_string())),
+    );
+    bad.insert(
+        "typo".to_string(),
+        Value::Concrete(ConcreteValue::String("y".to_string())),
+    );
+    let value = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+        ConcreteValue::Map(bad),
+    )]));
     let err = union_type.validate(&value).unwrap_err();
     let msg = err.to_string();
     assert!(
@@ -3025,7 +3493,7 @@ fn union_string_vs_custom_picks_custom_error_for_string_input() {
     // the Custom validator's message, not a generic TypeMismatch.
     fn must_be_arn(v: &Value) -> Result<(), String> {
         match v {
-            Value::String(s) if s.starts_with("arn:") => Ok(()),
+            Value::Concrete(ConcreteValue::String(s)) if s.starts_with("arn:") => Ok(()),
             _ => Err("must start with 'arn:'".to_string()),
         }
     }
@@ -3042,7 +3510,9 @@ fn union_string_vs_custom_picks_custom_error_for_string_input() {
         },
     ]);
     let err = union_type
-        .validate(&Value::String("not-an-arn".to_string()))
+        .validate(&Value::Concrete(ConcreteValue::String(
+            "not-an-arn".to_string(),
+        )))
         .unwrap_err();
     match err {
         TypeError::ValidationFailed { ref message } => {
@@ -3064,8 +3534,13 @@ fn union_falls_through_to_type_mismatch_when_no_member_matches_shape() {
     // "closer" candidate to surface.
     let union_type = AttributeType::Union(vec![AttributeType::Int, AttributeType::Bool]);
     let mut map = IndexMap::new();
-    map.insert("k".to_string(), Value::String("v".to_string()));
-    let err = union_type.validate(&Value::Map(map)).unwrap_err();
+    map.insert(
+        "k".to_string(),
+        Value::Concrete(ConcreteValue::String("v".to_string())),
+    );
+    let err = union_type
+        .validate(&Value::Concrete(ConcreteValue::Map(map)))
+        .unwrap_err();
     match err {
         TypeError::TypeMismatch { .. } => {}
         other => panic!("expected TypeMismatch, got: {other:?}"),
@@ -3082,13 +3557,13 @@ fn union_custom_with_int_base_picks_custom_error_for_int_input() {
     // `TypeMismatch` from the bare `Int` member's success path.
     fn must_be_positive(v: &Value) -> Result<(), String> {
         match v {
-            Value::Int(n) if *n > 0 => Ok(()),
+            Value::Concrete(ConcreteValue::Int(n)) if *n > 0 => Ok(()),
             _ => Err("must be positive".to_string()),
         }
     }
     // Flip the order so the bare `Int` arm doesn't accept the value
     // first — both members run validate(). Bare `Int::validate`
-    // accepts any `Value::Int`, so we have to keep it second; bind
+    // accepts any `Value::Concrete(ConcreteValue::Int)`, so we have to keep it second; bind
     // through a Custom on top so the actual reachable failure path
     // is the `Custom` one.
     let union_type = AttributeType::Union(vec![
@@ -3103,7 +3578,9 @@ fn union_custom_with_int_base_picks_custom_error_for_int_input() {
         },
         AttributeType::Bool,
     ]);
-    let err = union_type.validate(&Value::Int(-5)).unwrap_err();
+    let err = union_type
+        .validate(&Value::Concrete(ConcreteValue::Int(-5)))
+        .unwrap_err();
     match err {
         TypeError::ValidationFailed { ref message } => {
             assert!(
@@ -3132,9 +3609,17 @@ fn union_struct_member_still_wins_for_map_input_regression() {
         AttributeType::String,
     ]);
     let mut map = IndexMap::new();
-    map.insert("service".to_string(), Value::String("x".to_string()));
-    map.insert("typo".to_string(), Value::String("y".to_string()));
-    let err = union_type.validate(&Value::Map(map)).unwrap_err();
+    map.insert(
+        "service".to_string(),
+        Value::Concrete(ConcreteValue::String("x".to_string())),
+    );
+    map.insert(
+        "typo".to_string(),
+        Value::Concrete(ConcreteValue::String("y".to_string())),
+    );
+    let err = union_type
+        .validate(&Value::Concrete(ConcreteValue::Map(map)))
+        .unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("typo") && msg.contains("Principal"),
@@ -3155,8 +3640,8 @@ fn custom_validator_can_capture_external_state() {
         pattern: None,
         length: None,
         validate: validator(move |v| match v {
-            Value::String(s) if s == &allowed_region => Ok(()),
-            Value::String(s) => Err(TypeError::ValidationFailed {
+            Value::Concrete(ConcreteValue::String(s)) if s == &allowed_region => Ok(()),
+            Value::Concrete(ConcreteValue::String(s)) => Err(TypeError::ValidationFailed {
                 message: format!("expected region {}, got {}", allowed_region, s),
             }),
             other => Err(TypeError::TypeMismatch {
@@ -3168,11 +3653,15 @@ fn custom_validator_can_capture_external_state() {
         to_dsl: None,
     };
     assert!(
-        attr.validate(&Value::String("ap-northeast-1".to_string()))
-            .is_ok()
+        attr.validate(&Value::Concrete(ConcreteValue::String(
+            "ap-northeast-1".to_string()
+        )))
+        .is_ok()
     );
     let err = attr
-        .validate(&Value::String("us-east-1".to_string()))
+        .validate(&Value::Concrete(ConcreteValue::String(
+            "us-east-1".to_string(),
+        )))
         .unwrap_err();
     match err {
         TypeError::ValidationFailed { message } => {
@@ -3194,8 +3683,8 @@ fn custom_validator_returns_structured_type_error_directly() {
         pattern: None,
         length: None,
         validate: validator(|v| match v {
-            Value::String(s) if s == "fast" || s == "slow" => Ok(()),
-            Value::String(s) => Err(TypeError::InvalidEnumVariant {
+            Value::Concrete(ConcreteValue::String(s)) if s == "fast" || s == "slow" => Ok(()),
+            Value::Concrete(ConcreteValue::String(s)) => Err(TypeError::InvalidEnumVariant {
                 value: s.clone(),
                 attribute: None,
                 type_name: Some("Mode".to_string()),
@@ -3213,7 +3702,9 @@ fn custom_validator_returns_structured_type_error_directly() {
         to_dsl: None,
     };
     let err = attr
-        .validate(&Value::String("medium".to_string()))
+        .validate(&Value::Concrete(ConcreteValue::String(
+            "medium".to_string(),
+        )))
         .unwrap_err();
     match err {
         TypeError::InvalidEnumVariant {
@@ -3300,19 +3791,19 @@ fn schema_registry_has_managed_only_does_not_imply_data_source() {
 
 #[test]
 fn validate_skips_value_unknown_for_primitive_types() {
-    // `Value::Unknown` carries no concrete type at plan time, so it
+    // `Value::Deferred(DeferredValue::Unknown)` carries no concrete type at plan time, so it
     // takes the same skip path as `FunctionCall` and `Secret`. Without
     // this, a `for x in upstream.list { ... attr = x ... }` body fails
     // parse-time validation with `expected <type>, got unknown`.
     use crate::resource::{AccessPath, UnknownReason};
-    let unknown = Value::Unknown(UnknownReason::ForValue);
+    let unknown = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue));
     assert!(AttributeType::String.validate(&unknown).is_ok());
     assert!(AttributeType::Int.validate(&unknown).is_ok());
     assert!(AttributeType::Bool.validate(&unknown).is_ok());
 
-    let upstream = Value::Unknown(UnknownReason::UpstreamRef {
+    let upstream = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
         path: AccessPath::with_fields("net", "vpc", vec!["vpc_id".into()]),
-    });
+    }));
     assert!(AttributeType::String.validate(&upstream).is_ok());
     assert!(AttributeType::Int.validate(&upstream).is_ok());
 }
@@ -3321,14 +3812,15 @@ fn validate_skips_value_unknown_for_primitive_types() {
 fn walk_custom_lookup_skips_value_unknown() {
     // Custom-typed attributes (e.g. AWS resource-id types like `vpc_id`)
     // run through `walk_custom_lookup` instead of `validate`. Skip
-    // `Value::Unknown` here too, otherwise a custom-typed attribute
+    // `Value::Deferred(DeferredValue::Unknown)` here too, otherwise a custom-typed attribute
     // bound from a for-expression element fails plan with
     // `expected vpc_id, got unknown`.
     use crate::resource::UnknownReason;
 
     let always_fail = validator(|_v: &Value| {
         Err(TypeError::ValidationFailed {
-            message: "validator must not run for Value::Unknown".to_string(),
+            message: "validator must not run for Value::Deferred(DeferredValue::Unknown)"
+                .to_string(),
         })
     });
     let custom_type = AttributeType::Custom {
@@ -3344,7 +3836,7 @@ fn walk_custom_lookup_skips_value_unknown() {
     let mut errors = Vec::new();
     walk_custom_lookup(
         &custom_type,
-        &Value::Unknown(UnknownReason::ForValue),
+        &Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
         "vpc_id",
         &|_, _| {
             Err(TypeError::ValidationFailed {
@@ -3355,7 +3847,7 @@ fn walk_custom_lookup_skips_value_unknown() {
     );
     assert!(
         errors.is_empty(),
-        "Value::Unknown must not invoke the custom validator, got: {errors:?}"
+        "Value::Deferred(DeferredValue::Unknown) must not invoke the custom validator, got: {errors:?}"
     );
 }
 
@@ -3397,31 +3889,37 @@ fn dsl_aliases_validator_accepts_both_api_and_dsl_spellings() {
 
     // Bare API spelling: accepted (canonical).
     assert!(
-        t.validate(&Value::String("BucketOwnerEnforced".to_string()))
-            .is_ok()
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "BucketOwnerEnforced".to_string()
+        )))
+        .is_ok()
     );
     // Bare DSL spelling: accepted (alias).
     assert!(
-        t.validate(&Value::String("bucket_owner_enforced".to_string()))
-            .is_ok()
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "bucket_owner_enforced".to_string()
+        )))
+        .is_ok()
     );
     // Fully-qualified API spelling: accepted.
     assert!(
-        t.validate(&Value::String(
+        t.validate(&Value::Concrete(ConcreteValue::String(
             "awscc.s3.Bucket.ObjectOwnership.BucketOwnerEnforced".to_string()
-        ))
+        )))
         .is_ok()
     );
     // Fully-qualified DSL spelling: accepted (the awscc#199 case).
     assert!(
-        t.validate(&Value::String(
+        t.validate(&Value::Concrete(ConcreteValue::String(
             "awscc.s3.Bucket.ObjectOwnership.bucket_owner_enforced".to_string()
-        ))
+        )))
         .is_ok()
     );
     // An unrelated value: rejected, with both spellings listed.
     let err = t
-        .validate(&Value::String("garbage".to_string()))
+        .validate(&Value::Concrete(ConcreteValue::String(
+            "garbage".to_string(),
+        )))
         .unwrap_err();
     let msg = err.to_string();
     assert!(
@@ -3448,7 +3946,9 @@ fn dsl_aliases_diagnostic_tags_alias_entries_distinct_from_canonical() {
             ("Suspended".to_string(), "suspended".to_string()),
         ],
     };
-    let err = t.validate(&Value::String("zzz".to_string())).unwrap_err();
+    let err = t
+        .validate(&Value::Concrete(ConcreteValue::String("zzz".to_string())))
+        .unwrap_err();
     let TypeError::InvalidEnumVariant { expected, .. } = err else {
         panic!("expected InvalidEnumVariant");
     };
@@ -3478,6 +3978,14 @@ fn dsl_aliases_empty_keeps_api_only_validation() {
         namespace: Some("test.r".to_string()),
         dsl_aliases: vec![],
     };
-    assert!(t.validate(&Value::String("active".to_string())).is_ok());
-    assert!(t.validate(&Value::String("nope".to_string())).is_err());
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String(
+            "active".to_string()
+        )))
+        .is_ok()
+    );
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::String("nope".to_string())))
+            .is_err()
+    );
 }

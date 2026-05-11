@@ -20,9 +20,9 @@
 //! let config = BackendConfig {
 //!     backend_type: "s3".to_string(),
 //!     attributes: [
-//!         ("bucket".to_string(), Value::String("my-state-bucket".to_string())),
-//!         ("key".to_string(), Value::String("infra/prod/carina.state".to_string())),
-//!         ("region".to_string(), Value::String("aws.Region.ap_northeast_1".to_string())),
+//!         ("bucket".to_string(), Value::Concrete(ConcreteValue::String("my-state-bucket".to_string()))),
+//!         ("key".to_string(), Value::Concrete(ConcreteValue::String("infra/prod/carina.state".to_string()))),
+//!         ("region".to_string(), Value::Concrete(ConcreteValue::String("aws.Region.ap_northeast_1".to_string()))),
 //!     ].into_iter().collect(),
 //! };
 //!

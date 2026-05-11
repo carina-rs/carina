@@ -1,4 +1,5 @@
 use super::*;
+use crate::resource::{ConcreteValue, DeferredValue};
 
 #[test]
 fn cascade_dependent_updates_adds_update_for_dependent() {
@@ -12,7 +13,10 @@ fn cascade_dependent_updates_adds_update_for_dependent() {
     // Unresolved resources (before ref resolution)
     let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
-        .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+        );
 
     let subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
@@ -20,7 +24,10 @@ fn cascade_dependent_updates_adds_update_for_dependent() {
             "vpc_id",
             Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         )
-        .with_attribute("cidr_block", Value::String("10.1.1.0/24".to_string()));
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
+        );
 
     let unresolved_resources = vec![vpc.clone(), subnet.clone()];
 
@@ -29,19 +36,25 @@ fn cascade_dependent_updates_adds_update_for_dependent() {
     let mut vpc_attrs = HashMap::new();
     vpc_attrs.insert(
         "cidr_block".to_string(),
-        Value::String("10.0.0.0/16".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
-    vpc_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
+    vpc_attrs.insert(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+    );
     current_states.insert(
         vpc_id.clone(),
         State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
     );
 
     let mut subnet_attrs = HashMap::new();
-    subnet_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
+    subnet_attrs.insert(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+    );
     subnet_attrs.insert(
         "cidr_block".to_string(),
-        Value::String("10.1.1.0/24".to_string()),
+        Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
     );
     current_states.insert(
         subnet_id.clone(),
@@ -80,12 +93,14 @@ fn cascade_dependent_updates_adds_update_for_dependent() {
         // The `to` should have unresolved ResourceRef
         assert!(matches!(
             cascading_updates[0].to.get_attr("vpc_id"),
-            Some(Value::ResourceRef { .. })
+            Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
         ));
         // The `from` should have the current state
         assert_eq!(
             cascading_updates[0].from.attributes.get("vpc_id"),
-            Some(&Value::String("vpc-old".to_string()))
+            Some(&Value::Concrete(ConcreteValue::String(
+                "vpc-old".to_string()
+            )))
         );
     } else {
         panic!("Expected Replace effect");
@@ -102,7 +117,10 @@ fn cascade_skips_resources_already_in_plan() {
 
     let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
-        .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+        );
 
     let subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
@@ -110,7 +128,10 @@ fn cascade_skips_resources_already_in_plan() {
             "vpc_id",
             Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         )
-        .with_attribute("cidr_block", Value::String("10.1.2.0/24".to_string()));
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.2.0/24".to_string())),
+        );
 
     let unresolved_resources = vec![vpc.clone(), subnet.clone()];
 
@@ -118,17 +139,20 @@ fn cascade_skips_resources_already_in_plan() {
     let mut vpc_attrs = HashMap::new();
     vpc_attrs.insert(
         "cidr_block".to_string(),
-        Value::String("10.0.0.0/16".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
     current_states.insert(
         vpc_id.clone(),
         State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
     );
     let mut subnet_attrs = HashMap::new();
-    subnet_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
+    subnet_attrs.insert(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+    );
     subnet_attrs.insert(
         "cidr_block".to_string(),
-        Value::String("10.1.1.0/24".to_string()),
+        Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
     );
     current_states.insert(
         subnet_id.clone(),
@@ -182,7 +206,10 @@ fn cascade_no_op_without_create_before_destroy() {
 
     let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
-        .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+        );
 
     let subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
@@ -197,7 +224,7 @@ fn cascade_no_op_without_create_before_destroy() {
     let mut vpc_attrs = HashMap::new();
     vpc_attrs.insert(
         "cidr_block".to_string(),
-        Value::String("10.0.0.0/16".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
     current_states.insert(
         vpc_id.clone(),
@@ -238,7 +265,10 @@ fn cascade_transitive_dependencies() {
 
     let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
-        .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+        );
 
     let subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
@@ -260,18 +290,24 @@ fn cascade_transitive_dependencies() {
     let mut vpc_attrs = HashMap::new();
     vpc_attrs.insert(
         "cidr_block".to_string(),
-        Value::String("10.0.0.0/16".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
-    vpc_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
+    vpc_attrs.insert(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+    );
     current_states.insert(
         vpc_id.clone(),
         State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
     );
     let mut subnet_attrs = HashMap::new();
-    subnet_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
+    subnet_attrs.insert(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+    );
     subnet_attrs.insert(
         "subnet_id".to_string(),
-        Value::String("subnet-123".to_string()),
+        Value::Concrete(ConcreteValue::String("subnet-123".to_string())),
     );
     current_states.insert(
         subnet_id.clone(),
@@ -280,7 +316,7 @@ fn cascade_transitive_dependencies() {
     let mut instance_attrs = HashMap::new();
     instance_attrs.insert(
         "subnet_id".to_string(),
-        Value::String("subnet-123".to_string()),
+        Value::Concrete(ConcreteValue::String("subnet-123".to_string())),
     );
     current_states.insert(
         instance_id.clone(),
@@ -328,7 +364,10 @@ fn cascade_anonymous_resource_dependent() {
 
     let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
-        .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+        );
 
     // Anonymous subnet (no _binding) with a ResourceRef to the VPC
     let subnet = Resource::new("ec2.Subnet", "my-subnet").with_attribute(
@@ -342,16 +381,22 @@ fn cascade_anonymous_resource_dependent() {
     let mut vpc_attrs = HashMap::new();
     vpc_attrs.insert(
         "cidr_block".to_string(),
-        Value::String("10.0.0.0/16".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
-    vpc_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
+    vpc_attrs.insert(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+    );
     current_states.insert(
         vpc_id.clone(),
         State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
     );
 
     let mut subnet_attrs = HashMap::new();
-    subnet_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
+    subnet_attrs.insert(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+    );
     current_states.insert(
         subnet_id.clone(),
         State::existing(subnet_id.clone(), subnet_attrs).with_identifier("subnet-123"),
@@ -406,7 +451,10 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
     // Unresolved resources (before ref resolution)
     let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
-        .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+        );
 
     let subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
@@ -414,7 +462,10 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
             "vpc_id",
             Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         )
-        .with_attribute("cidr_block", Value::String("10.1.1.0/24".to_string()));
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
+        );
 
     let unresolved_resources = vec![vpc.clone(), subnet.clone()];
 
@@ -423,19 +474,25 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
     let mut vpc_attrs = HashMap::new();
     vpc_attrs.insert(
         "cidr_block".to_string(),
-        Value::String("10.0.0.0/16".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
-    vpc_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
+    vpc_attrs.insert(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+    );
     current_states.insert(
         vpc_id.clone(),
         State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
     );
 
     let mut subnet_attrs = HashMap::new();
-    subnet_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
+    subnet_attrs.insert(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+    );
     subnet_attrs.insert(
         "cidr_block".to_string(),
-        Value::String("10.1.1.0/24".to_string()),
+        Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
     );
     current_states.insert(
         subnet_id.clone(),
@@ -550,7 +607,10 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
     // Unresolved resources (before ref resolution)
     let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
-        .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+        );
 
     let subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
@@ -558,8 +618,14 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
             "vpc_id",
             Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         )
-        .with_attribute("availability_zone", Value::String("us-east-1b".to_string()))
-        .with_attribute("cidr_block", Value::String("10.1.1.0/24".to_string()));
+        .with_attribute(
+            "availability_zone",
+            Value::Concrete(ConcreteValue::String("us-east-1b".to_string())),
+        )
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
+        );
 
     let unresolved_resources = vec![vpc.clone(), subnet.clone()];
 
@@ -568,23 +634,29 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
     let mut vpc_attrs = HashMap::new();
     vpc_attrs.insert(
         "cidr_block".to_string(),
-        Value::String("10.0.0.0/16".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
-    vpc_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
+    vpc_attrs.insert(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+    );
     current_states.insert(
         vpc_id.clone(),
         State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
     );
 
     let mut subnet_attrs = HashMap::new();
-    subnet_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
+    subnet_attrs.insert(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+    );
     subnet_attrs.insert(
         "availability_zone".to_string(),
-        Value::String("us-east-1a".to_string()),
+        Value::Concrete(ConcreteValue::String("us-east-1a".to_string())),
     );
     subnet_attrs.insert(
         "cidr_block".to_string(),
-        Value::String("10.1.1.0/24".to_string()),
+        Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
     );
     current_states.insert(
         subnet_id.clone(),
@@ -692,7 +764,10 @@ fn auto_detect_create_before_destroy_when_resource_has_dependents() {
     // Unresolved resources (before ref resolution)
     let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
-        .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+        );
 
     let subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
@@ -700,7 +775,10 @@ fn auto_detect_create_before_destroy_when_resource_has_dependents() {
             "vpc_id",
             Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         )
-        .with_attribute("cidr_block", Value::String("10.1.1.0/24".to_string()));
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
+        );
 
     let unresolved_resources = vec![vpc.clone(), subnet.clone()];
 
@@ -709,19 +787,25 @@ fn auto_detect_create_before_destroy_when_resource_has_dependents() {
     let mut vpc_attrs = HashMap::new();
     vpc_attrs.insert(
         "cidr_block".to_string(),
-        Value::String("10.0.0.0/16".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
-    vpc_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
+    vpc_attrs.insert(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+    );
     current_states.insert(
         vpc_id.clone(),
         State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
     );
 
     let mut subnet_attrs = HashMap::new();
-    subnet_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
+    subnet_attrs.insert(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+    );
     subnet_attrs.insert(
         "cidr_block".to_string(),
-        Value::String("10.1.1.0/24".to_string()),
+        Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
     );
     current_states.insert(
         subnet_id.clone(),
@@ -797,7 +881,10 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
     // Unresolved resources (before ref resolution)
     let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
-        .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+        );
 
     let subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
@@ -805,8 +892,14 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
             "vpc_id",
             Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         )
-        .with_attribute("tags", Value::String("new-tag".to_string()))
-        .with_attribute("cidr_block", Value::String("10.1.1.0/24".to_string()));
+        .with_attribute(
+            "tags",
+            Value::Concrete(ConcreteValue::String("new-tag".to_string())),
+        )
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
+        );
 
     let unresolved_resources = vec![vpc.clone(), subnet.clone()];
 
@@ -815,20 +908,29 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
     let mut vpc_attrs = HashMap::new();
     vpc_attrs.insert(
         "cidr_block".to_string(),
-        Value::String("10.0.0.0/16".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
-    vpc_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
+    vpc_attrs.insert(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+    );
     current_states.insert(
         vpc_id.clone(),
         State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
     );
 
     let mut subnet_attrs = HashMap::new();
-    subnet_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
-    subnet_attrs.insert("tags".to_string(), Value::String("old-tag".to_string()));
+    subnet_attrs.insert(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+    );
+    subnet_attrs.insert(
+        "tags".to_string(),
+        Value::Concrete(ConcreteValue::String("old-tag".to_string())),
+    );
     subnet_attrs.insert(
         "cidr_block".to_string(),
-        Value::String("10.1.1.0/24".to_string()),
+        Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
     );
     current_states.insert(
         subnet_id.clone(),
@@ -915,7 +1017,10 @@ fn cascade_prevent_destroy_blocks_promotion_to_replace() {
 
     let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
-        .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+        );
 
     let mut subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
@@ -923,7 +1028,10 @@ fn cascade_prevent_destroy_blocks_promotion_to_replace() {
             "vpc_id",
             Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         )
-        .with_attribute("cidr_block", Value::String("10.1.1.0/24".to_string()));
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
+        );
     subnet.directives.prevent_destroy = true;
 
     let unresolved_resources = vec![vpc.clone(), subnet.clone()];
@@ -932,19 +1040,25 @@ fn cascade_prevent_destroy_blocks_promotion_to_replace() {
     let mut vpc_attrs = HashMap::new();
     vpc_attrs.insert(
         "cidr_block".to_string(),
-        Value::String("10.0.0.0/16".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
-    vpc_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
+    vpc_attrs.insert(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+    );
     current_states.insert(
         vpc_id.clone(),
         State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
     );
 
     let mut subnet_attrs = HashMap::new();
-    subnet_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
+    subnet_attrs.insert(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+    );
     subnet_attrs.insert(
         "cidr_block".to_string(),
-        Value::String("10.1.1.0/24".to_string()),
+        Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
     );
     current_states.insert(
         subnet_id.clone(),
@@ -1022,7 +1136,10 @@ fn cascade_prevent_destroy_blocks_merge_upgrade_to_replace() {
 
     let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
-        .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+        );
 
     let mut subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
@@ -1030,8 +1147,14 @@ fn cascade_prevent_destroy_blocks_merge_upgrade_to_replace() {
             "vpc_id",
             Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         )
-        .with_attribute("tags", Value::String("new-tag".to_string()))
-        .with_attribute("cidr_block", Value::String("10.1.1.0/24".to_string()));
+        .with_attribute(
+            "tags",
+            Value::Concrete(ConcreteValue::String("new-tag".to_string())),
+        )
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
+        );
     subnet.directives.prevent_destroy = true;
 
     let unresolved_resources = vec![vpc.clone(), subnet.clone()];
@@ -1040,20 +1163,29 @@ fn cascade_prevent_destroy_blocks_merge_upgrade_to_replace() {
     let mut vpc_attrs = HashMap::new();
     vpc_attrs.insert(
         "cidr_block".to_string(),
-        Value::String("10.0.0.0/16".to_string()),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
-    vpc_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
+    vpc_attrs.insert(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+    );
     current_states.insert(
         vpc_id.clone(),
         State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
     );
 
     let mut subnet_attrs = HashMap::new();
-    subnet_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
-    subnet_attrs.insert("tags".to_string(), Value::String("old-tag".to_string()));
+    subnet_attrs.insert(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+    );
+    subnet_attrs.insert(
+        "tags".to_string(),
+        Value::Concrete(ConcreteValue::String("old-tag".to_string())),
+    );
     subnet_attrs.insert(
         "cidr_block".to_string(),
-        Value::String("10.1.1.0/24".to_string()),
+        Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
     );
     current_states.insert(
         subnet_id.clone(),

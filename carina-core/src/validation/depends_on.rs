@@ -407,7 +407,7 @@ mod tests {
         // Ensures the redundant-edge check matches what `check_unused_bindings`
         // sees: dot-notation strings inside collections (e.g.
         // `principals = [role.arn]`) survive resolution as
-        // `Value::String("role.arn")`, not `Value::ResourceRef`. Without
+        // `Value::Concrete(ConcreteValue::String("role.arn"))`, not `Value::Deferred(DeferredValue::ResourceRef)`. Without
         // `collect_dot_notation_refs` here, the warning would silently
         // miss this shape.
         let src = r#"

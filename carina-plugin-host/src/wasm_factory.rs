@@ -24,7 +24,7 @@ use carina_core::provider::{
     BoxFuture, CreateRequest, DeleteRequest, Provider, ProviderError, ProviderFactory,
     ProviderNormalizer, ProviderResult, ReadRequest, SavedAttrs, UpdateRequest,
 };
-use carina_core::resource::{Resource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 use carina_core::schema::{CompletionValue, ResourceSchema};
 use carina_core::value::SerializationError;
 
@@ -1265,7 +1265,7 @@ impl ProviderFactory for WasmProviderFactory {
     }
 
     fn extract_region(&self, attributes: &IndexMap<String, Value>) -> String {
-        if let Some(Value::String(region)) = attributes.get("region") {
+        if let Some(Value::Concrete(ConcreteValue::String(region))) = attributes.get("region") {
             carina_core::utils::convert_region_value(region)
         } else {
             "ap-northeast-1".to_string()
@@ -1572,8 +1572,8 @@ impl ProviderNormalizer for WasmProviderNormalizer {
         match result {
             Ok(result) => {
                 // `PlanPreprocessor::prepare` strips every attribute that
-                // recursively contains `Value::ResourceRef` (alongside
-                // `Value::Unknown`) before this normalizer runs and
+                // recursively contains `Value::Deferred(DeferredValue::ResourceRef)` (alongside
+                // `Value::Deferred(DeferredValue::Unknown)`) before this normalizer runs and
                 // restores them afterwards (#2387), so we can blindly
                 // accept everything the WASM normalizer returns — the
                 // pre-#2387 `contains_resource_ref` overwrite-skip

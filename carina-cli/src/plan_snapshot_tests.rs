@@ -842,7 +842,7 @@ fn plan_snapshot_upstream_state_map_subscript() {
 /// dot-notation form `${X.field.key}` / bare `X.field.key`. Pre-fix the
 /// dot form passed validate but rendered the literal substring
 /// `orgs.accounts.registry_dev` into the output (the parser fell back
-/// to `Value::String` because the head wasn't a known binding in the
+/// to `Value::Concrete(ConcreteValue::String)` because the head wasn't a known binding in the
 /// current file). Symmetric with the #2435 subscript fix; both forms
 /// must now resolve to the upstream's concrete map value.
 #[test]
@@ -958,20 +958,20 @@ fn plan_snapshot_exports_multifile() {
 fn plan_snapshot_export_changes_mixed() {
     use crate::commands::plan::ExportChange;
     use carina_core::parser::TypeExpr;
-    use carina_core::resource::Value;
+    use carina_core::resource::{ConcreteValue, Value};
 
     let (plan, schemas, moved_origins) = build_plan_from_fixture("no_changes");
     let export_changes = vec![
         ExportChange::Added {
             name: "new_export".to_string(),
             type_expr: Some(TypeExpr::String),
-            new_value: Value::String("hello".to_string()),
+            new_value: Value::Concrete(ConcreteValue::String("hello".to_string())),
         },
         ExportChange::Modified {
             name: "changed".to_string(),
             type_expr: Some(TypeExpr::Int),
             old_json: serde_json::json!(42),
-            new_value: Value::Int(100),
+            new_value: Value::Concrete(ConcreteValue::Int(100)),
         },
         ExportChange::Removed {
             name: "obsolete".to_string(),
