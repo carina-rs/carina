@@ -4121,3 +4121,86 @@ mod string_enum_binding_collision {
         assert!(t.validate(&value).is_ok());
     }
 }
+
+mod dsl_map_api_for {
+    use super::*;
+
+    fn alias_table() -> Vec<(String, String)> {
+        vec![
+            ("Enabled".to_string(), "enabled".to_string()),
+            ("Suspended".to_string(), "suspended".to_string()),
+            ("VPC".to_string(), "vpc".to_string()),
+        ]
+    }
+
+    #[test]
+    fn aliases_resolves_dsl_to_api_canonical() {
+        let aliases = alias_table();
+        let map = DslMap::Aliases(&aliases);
+        assert_eq!(map.api_for("enabled"), "Enabled");
+        assert_eq!(map.api_for("suspended"), "Suspended");
+        assert_eq!(map.api_for("vpc"), "VPC");
+    }
+
+    #[test]
+    fn aliases_returns_input_when_no_match() {
+        // No alias entry for `unknown`; passthrough so callers can hand
+        // off identity-mapped values (where API spelling == DSL spelling)
+        // straight to the SDK.
+        let aliases = alias_table();
+        let map = DslMap::Aliases(&aliases);
+        assert_eq!(map.api_for("unknown"), "unknown");
+    }
+
+    #[test]
+    fn aliases_returns_input_when_given_api_canonical() {
+        // If the caller already has the API spelling, `api_for` is a
+        // no-op: the alias table is `(api, dsl)`, so an API value
+        // doesn't match any `dsl` side and falls through.
+        let aliases = alias_table();
+        let map = DslMap::Aliases(&aliases);
+        assert_eq!(map.api_for("Enabled"), "Enabled");
+    }
+
+    #[test]
+    fn aliases_empty_table_is_identity() {
+        let aliases: Vec<(String, String)> = vec![];
+        let map = DslMap::Aliases(&aliases);
+        assert_eq!(map.api_for("anything"), "anything");
+    }
+
+    #[test]
+    fn closure_some_returns_input_unchanged() {
+        // The closure is one-way (api -> dsl); reversing it is not
+        // representable, so `api_for` is documented to return the input
+        // as-is for the Closure variant. Callers that go through a
+        // `Closure` (currently only Region with hyphen↔underscore) must
+        // reverse the mapping themselves.
+        fn to_dsl(api: &str) -> String {
+            api.replace('-', "_")
+        }
+        let map = DslMap::Closure(Some(to_dsl));
+        assert_eq!(map.api_for("ap_northeast_1"), "ap_northeast_1");
+    }
+
+    #[test]
+    fn closure_none_returns_input_unchanged() {
+        let map = DslMap::Closure(None);
+        assert_eq!(map.api_for("anything"), "anything");
+    }
+
+    #[test]
+    fn aliases_duplicate_dsl_spelling_returns_first_match() {
+        // Pins the deterministic behavior when two entries share a DSL
+        // spelling: `find_map` returns the first match. Such duplicates
+        // should not exist in real codegen output, but the inverse map
+        // is intrinsically lossy and the documented contract is "first
+        // wins" rather than "panic" or "undefined".
+        let aliases = vec![
+            ("Foo".to_string(), "bar".to_string()),
+            ("Baz".to_string(), "bar".to_string()),
+        ];
+        let map = DslMap::Aliases(&aliases);
+        assert_eq!(map.api_for("bar"), "Foo");
+    }
+}
