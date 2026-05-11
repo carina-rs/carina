@@ -551,12 +551,19 @@ fn merge_with_saved_non_map() {
 fn lists_equal_large_list_correctness() {
     // Verify correctness with a list larger than HASH_THRESHOLD
     let n = 200;
-    let a: Vec<Value> = (0..n).map(Value::Int).collect();
-    let b: Vec<Value> = (0..n).rev().map(Value::Int).collect();
+    let a: Vec<Value> = (0..n)
+        .map(|i| Value::Concrete(ConcreteValue::Int(i)))
+        .collect();
+    let b: Vec<Value> = (0..n)
+        .rev()
+        .map(|i| Value::Concrete(ConcreteValue::Int(i)))
+        .collect();
     assert!(lists_equal(&a, &b));
 
     // Different content
-    let mut c: Vec<Value> = (0..n).map(Value::Int).collect();
+    let mut c: Vec<Value> = (0..n)
+        .map(|i| Value::Concrete(ConcreteValue::Int(i)))
+        .collect();
     c[n as usize - 1] = Value::Concrete(ConcreteValue::Int(n)); // change last element
     assert!(!lists_equal(&a, &c));
 }
@@ -617,8 +624,13 @@ fn lists_equal_performance_large_list() {
     // Benchmark: 1000-element list comparison should complete quickly
     // With O(n^2), 1000 elements = 1M comparisons; with hashing, ~1000.
     let n = 1000;
-    let a: Vec<Value> = (0..n).map(Value::Int).collect();
-    let b: Vec<Value> = (0..n).rev().map(Value::Int).collect();
+    let a: Vec<Value> = (0..n)
+        .map(|i| Value::Concrete(ConcreteValue::Int(i)))
+        .collect();
+    let b: Vec<Value> = (0..n)
+        .rev()
+        .map(|i| Value::Concrete(ConcreteValue::Int(i)))
+        .collect();
 
     let start = std::time::Instant::now();
     for _ in 0..100 {

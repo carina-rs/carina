@@ -34,7 +34,7 @@ pub(crate) fn builtin_env(args: &[Value]) -> Result<Value, String> {
     };
 
     std::env::var(name)
-        .map(Value::String)
+        .map(|s| Value::Concrete(ConcreteValue::String(s)))
         .map_err(|_| format!("environment variable '{}' is not set", name))
 }
 

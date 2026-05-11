@@ -915,7 +915,11 @@ pub fn format_value_pretty(value: &Value, layout: PrettyLayout<'_>) -> String {
             if inline_width(value, budget).is_some() {
                 return format_value_with_key(value, None);
             }
-            let lifted: Vec<Value> = items.iter().cloned().map(Value::String).collect();
+            let lifted: Vec<Value> = items
+                .iter()
+                .cloned()
+                .map(|s| Value::Concrete(ConcreteValue::String(s)))
+                .collect();
             format_list_of_scalars_vertical(&lifted, layout.child_indent_cols())
         }
         Value::Concrete(ConcreteValue::Map(map)) => {

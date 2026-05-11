@@ -1040,8 +1040,8 @@ fn test_format_cascading_update_diff_includes_list_with_ref() {
             ResourceId::new("ec2.Instance", "instance"),
             HashMap::from([(
                 "security_group_ids".to_string(),
-                Value::Concrete(ConcreteValue::List(vec![Value::String(
-                    "sg-old123".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::String("sg-old123".to_string()),
                 )])),
             )]),
         )),
