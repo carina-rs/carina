@@ -1323,3 +1323,72 @@ fn diff_false_positive_when_ordered_true_for_struct_list() {
         result
     );
 }
+
+/// Regression for aws#271: enum DSL alias (snake_case) and API canonical
+/// (PascalCase compound) must compare equal under StringEnum even when
+/// `eq_ignore_ascii_case` alone is not enough.
+///
+/// Scenario: BucketOwnershipControls.object_ownership — state stores
+/// `aws.s3.BucketOwnershipControls.ObjectOwnership.bucket_owner_enforced`
+/// (after normalize_state_enums applies the snake_case dsl_alias) and
+/// desired arrives as `BucketOwnerEnforced` (the API-canonical form
+/// after resolve_enum_identifiers' pass-2 api-canonicalize). The two
+/// name the same enum value, so the differ must see NoChange.
+#[test]
+fn diff_no_change_for_compound_word_dsl_alias() {
+    use crate::schema::{AttributeSchema, ResourceSchema};
+
+    let schema =
+        ResourceSchema::new("aws.s3.BucketOwnershipControls").attribute(AttributeSchema::new(
+            "object_ownership",
+            AttributeType::StringEnum {
+                name: "ObjectOwnership".to_string(),
+                values: vec![
+                    "BucketOwnerEnforced".to_string(),
+                    "BucketOwnerPreferred".to_string(),
+                    "ObjectWriter".to_string(),
+                ],
+                namespace: Some("aws.s3.BucketOwnershipControls".to_string()),
+                dsl_aliases: vec![
+                    (
+                        "BucketOwnerEnforced".to_string(),
+                        "bucket_owner_enforced".to_string(),
+                    ),
+                    (
+                        "BucketOwnerPreferred".to_string(),
+                        "bucket_owner_preferred".to_string(),
+                    ),
+                    ("ObjectWriter".to_string(), "object_writer".to_string()),
+                ],
+            },
+        ));
+
+    // Desired: API-canonical bare spelling (output of pass-2 in
+    // AwsNormalizer::resolve_enum_identifiers).
+    let desired = Resource::with_provider("aws", "s3.BucketOwnershipControls", "test")
+        .with_attribute(
+            "object_ownership",
+            Value::Concrete(ConcreteValue::String("BucketOwnerEnforced".to_string())),
+        );
+
+    // Current state: fully-qualified namespaced DSL form with snake_case
+    // alias (output of normalize_state_enums).
+    let mut attrs = HashMap::new();
+    attrs.insert(
+        "object_ownership".to_string(),
+        Value::Concrete(ConcreteValue::String(
+            "aws.s3.BucketOwnershipControls.ObjectOwnership.bucket_owner_enforced".to_string(),
+        )),
+    );
+    let current = State::existing(
+        ResourceId::with_provider("aws", "s3.BucketOwnershipControls", "test"),
+        attrs,
+    );
+
+    let result = diff(&desired, &current, None, None, Some(&schema));
+    assert!(
+        matches!(result, Diff::NoChange(_)),
+        "Expected NoChange (DSL alias must equal API canonical), got: {:?}",
+        result
+    );
+}

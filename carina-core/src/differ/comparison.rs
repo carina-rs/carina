@@ -142,14 +142,21 @@ pub(super) fn type_aware_equal(
             // enum-typed attribute whose value flowed through a provider
             // `read`. Comparison is text-based and case-insensitive on
             // the enum value, matching the existing String × String arm.
-            (a, b, AttributeType::StringEnum { values, .. })
-                if matches!(
-                    a,
-                    Value::Concrete(ConcreteValue::String(_) | ConcreteValue::EnumIdentifier(_))
-                ) && matches!(
-                    b,
-                    Value::Concrete(ConcreteValue::String(_) | ConcreteValue::EnumIdentifier(_))
-                ) =>
+            (
+                a,
+                b,
+                AttributeType::StringEnum {
+                    values,
+                    dsl_aliases,
+                    ..
+                },
+            ) if matches!(
+                a,
+                Value::Concrete(ConcreteValue::String(_) | ConcreteValue::EnumIdentifier(_))
+            ) && matches!(
+                b,
+                Value::Concrete(ConcreteValue::String(_) | ConcreteValue::EnumIdentifier(_))
+            ) =>
             {
                 let text = |v: &Value| -> Option<String> {
                     match v {
@@ -167,7 +174,25 @@ pub(super) fn type_aware_equal(
                 let valid_values: Vec<&str> = values.iter().map(String::as_str).collect();
                 let va = crate::utils::extract_enum_value_with_values(&sa, &valid_values);
                 let vb = crate::utils::extract_enum_value_with_values(&sb, &valid_values);
-                va.eq_ignore_ascii_case(vb)
+                // Map both sides through the DSL alias table to a common
+                // (API-canonical) form before comparing. `eq_ignore_ascii_case`
+                // alone suffices when the DSL alias differs only in case
+                // from the API canonical (`enabled` vs `Enabled`), but it
+                // fails on compound-word aliases like
+                // `bucket_owner_enforced` vs `BucketOwnerEnforced` — same
+                // enum value, different spelling. Aligning both sides to
+                // the API spelling closes that gap (aws#271).
+                let canonical = |trailing: &str| -> String {
+                    // dsl_aliases is `[(api, dsl)]`; if `trailing` matches
+                    // the DSL spelling, swap it for the API spelling.
+                    for (api, dsl) in dsl_aliases {
+                        if dsl.eq_ignore_ascii_case(trailing) {
+                            return api.clone();
+                        }
+                    }
+                    trailing.to_string()
+                };
+                canonical(va).eq_ignore_ascii_case(&canonical(vb))
             }
 
             // Custom types with base type: delegate to base
