@@ -4502,3 +4502,81 @@ mod dsl_map_api_for {
         assert_eq!(map.api_for("bar"), "Foo");
     }
 }
+
+// carina#2996: `Map<StringEnum, V>` bare-identifier key acceptance.
+fn condition_operator_map(value: AttributeType) -> AttributeType {
+    AttributeType::Map {
+        key: Box::new(AttributeType::StringEnum {
+            name: "ConditionOperator".to_string(),
+            values: vec![
+                "string_equals".to_string(),
+                "string_not_equals".to_string(),
+                "arn_like".to_string(),
+            ],
+            namespace: Some("aws.iam.ConditionOperator".to_string()),
+            dsl_aliases: vec![],
+        }),
+        value: Box::new(value),
+    }
+}
+
+fn map_value_with_one_key(key: &str) -> Value {
+    let mut inner: IndexMap<String, Value> = IndexMap::new();
+    inner.insert(
+        key.to_string(),
+        Value::Concrete(ConcreteValue::String("v".to_string())),
+    );
+    Value::Concrete(ConcreteValue::Map(inner))
+}
+
+#[test]
+fn validate_map_with_string_enum_key_accepts_bare_identifier_spelling() {
+    let map_t = condition_operator_map(AttributeType::String);
+    let val = map_value_with_one_key("string_equals");
+    assert!(
+        map_t.validate(&val).is_ok(),
+        "bare-identifier map key for Map<StringEnum, V> must be accepted: {:?}",
+        map_t.validate(&val)
+    );
+}
+
+#[test]
+fn validate_map_with_string_enum_key_accepts_dsl_alias_spelling() {
+    // `IpProtocol` has a `("-1", "all")` alias: DSL must accept `all`
+    // both at attribute-value position (already covered) and at
+    // map-key position when used as `Map<StringEnum<IpProtocol>, V>`.
+    let map_t = AttributeType::Map {
+        key: Box::new(AttributeType::StringEnum {
+            name: "IpProtocol".to_string(),
+            values: vec!["tcp".to_string(), "-1".to_string()],
+            namespace: Some("awscc.ec2.SecurityGroup".to_string()),
+            dsl_aliases: vec![("-1".to_string(), "all".to_string())],
+        }),
+        value: Box::new(AttributeType::String),
+    };
+    let val = map_value_with_one_key("all");
+    assert!(
+        map_t.validate(&val).is_ok(),
+        "DSL-alias map key spelling must be accepted: {:?}",
+        map_t.validate(&val)
+    );
+}
+
+#[test]
+fn validate_map_with_string_enum_key_rejects_unknown_variant() {
+    let map_t = condition_operator_map(AttributeType::String);
+    let val = map_value_with_one_key("not_a_variant");
+    // The diagnostic must surface as `MapKeyError(InvalidEnumVariant)`,
+    // not the `StringLiteralExpectedEnum` shape that misled the user
+    // in carina#2996.
+    match map_t.validate(&val).unwrap_err() {
+        TypeError::MapKeyError { key, inner } => {
+            assert_eq!(key, "not_a_variant");
+            assert!(
+                matches!(*inner, TypeError::InvalidEnumVariant { .. }),
+                "expected InvalidEnumVariant inside MapKeyError, got: {inner:?}"
+            );
+        }
+        other => panic!("expected MapKeyError, got: {other:?}"),
+    }
+}
