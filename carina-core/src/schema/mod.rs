@@ -1155,10 +1155,21 @@ impl AttributeType {
                 got: value.type_name().to_string(),
             });
         };
-        // Validate keys against key type
+        // carina#2996: map-literal grammar is `(identifier | string) "="
+        // expression`, and both shapes lower to the same `String` key by
+        // the time we see them. For `StringEnum` keys, lift the key into
+        // `EnumIdentifier` form so the strict carina#2986 validator
+        // accepts it — there is no other syntax for writing an enum-
+        // shaped map key.
+        let key_is_enum = matches!(key_type.as_ref(), AttributeType::StringEnum { .. });
         for k in map.keys() {
+            let key_value = if key_is_enum {
+                Value::Concrete(ConcreteValue::EnumIdentifier(k.clone()))
+            } else {
+                Value::Concrete(ConcreteValue::String(k.clone()))
+            };
             key_type
-                .validate(&Value::Concrete(ConcreteValue::String(k.clone())))
+                .validate(&key_value)
                 .map_err(|e| TypeError::MapKeyError {
                     key: k.clone(),
                     inner: Box::new(e),
