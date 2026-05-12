@@ -301,20 +301,27 @@ pub(crate) fn parse_for_expr(
             // Return empty — the for body produces zero concrete resources
         }
         _ => {
-            // Special case: the parser collapses bare unresolved identifiers
-            // (e.g. `for _ in org { ... }`) into `Value::Concrete(ConcreteValue::String("org"))` — the
-            // same slot a quoted literal uses. Reporting those as
-            // `iterable is string "org"` is misleading: the user wrote an
-            // identifier, not a literal, and the likely fault is a typo for
-            // a known binding. Record them as deferred for-expressions so
-            // `check_identifier_scope` (which runs on the merged
-            // directory-wide ParsedFile, so cross-file upstream_state /
-            // module bindings are visible) can emit a proper
-            // UndefinedIdentifier with the did-you-mean machinery from
-            // #2038 / #2100. See #2101 / #2138.
-            if let Value::Concrete(ConcreteValue::String(s)) = &iterable
-                && is_bare_identifier(s)
-            {
+            // Special case: the parser lowers bare unresolved identifiers
+            // (e.g. `for _ in org { ... }`) into
+            // `Value::Concrete(ConcreteValue::EnumIdentifier("org"))`
+            // (carina#2986 Phase 3 routing). Pre-Phase-3 they landed as
+            // `ConcreteValue::String`; we still accept both shapes here
+            // because a quoted literal `for _ in "org" { ... }` should
+            // also drop into this branch — reporting either as
+            // `iterable is string "org"` is misleading. Record them as
+            // deferred for-expressions so `check_identifier_scope` (which
+            // runs on the merged directory-wide ParsedFile, so cross-file
+            // upstream_state / module bindings are visible) can emit a
+            // proper UndefinedIdentifier with the did-you-mean machinery
+            // from #2038 / #2100. See #2101 / #2138.
+            let bare_ident_text: Option<String> = match &iterable {
+                Value::Concrete(ConcreteValue::EnumIdentifier(s)) => Some(s.clone()),
+                Value::Concrete(ConcreteValue::String(s)) if is_bare_identifier(s) => {
+                    Some(s.clone())
+                }
+                _ => None,
+            };
+            if let Some(s) = bare_ident_text.as_ref() {
                 let header = match &binding {
                     ForBinding::Simple(var) => format!("for {} in {}", var, s),
                     ForBinding::Indexed(idx, val) => format!("for ({}, {}) in {}", idx, val, s),
@@ -381,6 +388,9 @@ pub(crate) fn parse_for_expr(
             let iterable_type = match &iterable {
                 Value::Concrete(ConcreteValue::String(s)) => {
                     format!("string \"{}\"", if s.len() > 50 { &s[..50] } else { s })
+                }
+                Value::Concrete(ConcreteValue::EnumIdentifier(s)) => {
+                    format!("identifier `{}`", if s.len() > 50 { &s[..50] } else { s })
                 }
                 Value::Concrete(ConcreteValue::Int(i)) => format!("int {}", i),
                 Value::Concrete(ConcreteValue::Float(f)) => format!("float {}", f),

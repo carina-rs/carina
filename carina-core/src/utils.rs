@@ -217,12 +217,26 @@ fn is_intermediate_segment(s: &str) -> bool {
 /// Used by both `AttributeType::resolve_value` and the LSP diagnostic
 /// pipeline so the two paths cannot drift.
 pub fn expand_enum_shorthand(value: &Value, name: &str, namespace: Option<&str>) -> Value {
-    match value {
-        Value::Concrete(ConcreteValue::String(s)) if !s.contains('.') => match namespace {
+    // Phase 4 of carina#2986: `EnumIdentifier` carries the same textual
+    // payload as `String` (only the source-shape tag differs) and goes
+    // through the same namespace expansion. The result is materialized as
+    // `String` because every downstream consumer
+    // (`validate_string_enum`, the LSP completion helpers, the
+    // builtin-result coercion in `convert_enum_value`) reads through the
+    // `Value::Concrete(ConcreteValue::String)` arm. The `EnumIdentifier`
+    // distinction is a parser-level signal used for strict shape
+    // enforcement at the validator entry, not a wire-level form.
+    let text_form: Option<&str> = match value {
+        Value::Concrete(ConcreteValue::String(s)) => Some(s.as_str()),
+        Value::Concrete(ConcreteValue::EnumIdentifier(s)) => Some(s.as_str()),
+        _ => None,
+    };
+    match text_form {
+        Some(s) if !s.contains('.') => match namespace {
             Some(ns) => Value::Concrete(ConcreteValue::String(format!("{}.{}.{}", ns, name, s))),
-            None => value.clone(),
+            None => Value::Concrete(ConcreteValue::String(s.to_string())),
         },
-        Value::Concrete(ConcreteValue::String(s)) => {
+        Some(s) => {
             if let Some(NamespacedId::TypeQualified {
                 type_name: ident,
                 value: member,
@@ -235,10 +249,10 @@ pub fn expand_enum_shorthand(value: &Value, name: &str, namespace: Option<&str>)
                     ns, ident, member
                 )))
             } else {
-                value.clone()
+                Value::Concrete(ConcreteValue::String(s.to_string()))
             }
         }
-        other => other.clone(),
+        None => value.clone(),
     }
 }
 

@@ -52,10 +52,15 @@ fn invalid_enum_variant_namespaced_display() {
         )
         .required(),
     );
+    // Phase 4 of carina#2986: the test exercises the wrong-variant
+    // path (`InvalidEnumVariant`), which is reached only by the
+    // identifier shape. A `ConcreteValue::String` here would route to
+    // `StringLiteralExpectedEnum` instead — covered separately by
+    // `string_literal_expected_enum_string_enum_display`.
     let mut attrs = HashMap::new();
     attrs.insert(
         "versioning".to_string(),
-        Value::Concrete(ConcreteValue::String(
+        Value::Concrete(ConcreteValue::EnumIdentifier(
             "aws.s3.Bucket.VersioningStatus.NotReal".to_string(),
         )),
     );
@@ -64,6 +69,9 @@ fn invalid_enum_variant_namespaced_display() {
 
 #[test]
 fn invalid_enum_variant_bare_display() {
+    // Phase 4 of carina#2986: identifier-shape input reaches the
+    // wrong-variant matcher; a string literal goes to
+    // `StringLiteralExpectedEnum`.
     let t = AttributeType::StringEnum {
         name: "Mode".to_string(),
         values: vec!["fast".to_string(), "slow".to_string()],
@@ -71,13 +79,16 @@ fn invalid_enum_variant_bare_display() {
         dsl_aliases: vec![],
     };
     let err = t
-        .validate(&Value::Concrete(ConcreteValue::String("zzz".to_string())))
+        .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+            "zzz".to_string(),
+        )))
         .unwrap_err();
     insta::assert_snapshot!(err.to_string());
 }
 
 #[test]
 fn invalid_enum_variant_with_dsl_aliases_display() {
+    // Phase 4 of carina#2986: identifier-shape input.
     let t = AttributeType::StringEnum {
         name: "VersioningStatus".to_string(),
         values: vec!["Enabled".to_string(), "Suspended".to_string()],
@@ -88,7 +99,9 @@ fn invalid_enum_variant_with_dsl_aliases_display() {
         ],
     };
     let err = t
-        .validate(&Value::Concrete(ConcreteValue::String("zzz".to_string())))
+        .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+            "zzz".to_string(),
+        )))
         .unwrap_err();
     insta::assert_snapshot!(err.to_string());
 }

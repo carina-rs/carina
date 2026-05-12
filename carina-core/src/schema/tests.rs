@@ -41,6 +41,10 @@ fn validate_string_type() {
 
 #[test]
 fn validate_string_enum_type() {
+    // Phase 4 of carina#2986: enum attributes accept only
+    // `ConcreteValue::EnumIdentifier`. Constructed-by-hand strings are
+    // rejected as `StringLiteralExpectedEnum` — see
+    // `validate_string_enum_rejects_quoted_string_literal` for that path.
     let t = AttributeType::StringEnum {
         name: "AddressFamily".to_string(),
         values: vec!["IPv4".to_string(), "IPv6".to_string()],
@@ -48,22 +52,50 @@ fn validate_string_enum_type() {
         dsl_aliases: vec![],
     };
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::String(
+        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "awscc.ec2.ipam_pool.AddressFamily.IPv4".to_string()
         )))
         .is_ok()
     );
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::String("IPv6".to_string())))
-            .is_ok()
+        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+            "IPv6".to_string()
+        )))
+        .is_ok()
     );
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::String("ipv4".to_string())))
-            .is_ok()
+        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+            "ipv4".to_string()
+        )))
+        .is_ok()
     );
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::String("IPv5".to_string())))
-            .is_err()
+        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+            "IPv5".to_string()
+        )))
+        .is_err()
+    );
+}
+
+#[test]
+fn validate_string_enum_rejects_quoted_string_literal() {
+    // Phase 4 of carina#2986: a `String`-shaped value on a `StringEnum`
+    // attribute means the user wrote `attr = "value"`. The validator
+    // emits `StringLiteralExpectedEnum` with the full expected variant
+    // list so the LSP code action can offer "drop quotes / use
+    // identifier form" without re-deriving candidates.
+    let t = AttributeType::StringEnum {
+        name: "AddressFamily".to_string(),
+        values: vec!["IPv4".to_string(), "IPv6".to_string()],
+        namespace: Some("awscc.ec2.ipam_pool".to_string()),
+        dsl_aliases: vec![],
+    };
+    let err = t
+        .validate(&Value::Concrete(ConcreteValue::String("IPv4".to_string())))
+        .unwrap_err();
+    assert!(
+        matches!(err, TypeError::StringLiteralExpectedEnum { ref user_typed, .. } if user_typed == "IPv4"),
+        "expected StringLiteralExpectedEnum, got: {err:?}"
     );
 }
 
@@ -94,14 +126,16 @@ fn validate_string_enum_accepts_dsl_alias() {
     };
     // Canonical "-1" is rewritten to DSL "all" — the DSL surface must
     // not accept the API form when an alias is registered. Users
-    // write `all`. Updated for carina#2980.
+    // write `all`. Updated for carina#2980 / carina#2986.
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::String("-1".to_string())))
-            .is_err()
+        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+            "-1".to_string()
+        )))
+        .is_err()
     );
     // DSL alias "all" should be accepted
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::String(
+        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "awscc.ec2.SecurityGroup.IpProtocol.all".to_string()
         )))
         .is_ok()
@@ -110,12 +144,14 @@ fn validate_string_enum_accepts_dsl_alias() {
     // which is already snake_case) keep working — the API spelling
     // *is* the DSL spelling for them.
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::String("tcp".to_string())))
-            .is_ok()
+        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+            "tcp".to_string()
+        )))
+        .is_ok()
     );
     // Invalid values should still be rejected
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::String(
+        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "invalid".to_string()
         )))
         .is_err()
@@ -141,7 +177,9 @@ fn validate_string_enum_all_without_dsl_aliases_requires_explicit_variant() {
     // Without "all" in values and no dsl_aliases entry mapping to "all", it is rejected
     assert!(
         without_all
-            .validate(&Value::Concrete(ConcreteValue::String("all".to_string())))
+            .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+                "all".to_string()
+            )))
             .is_err()
     );
 
@@ -161,7 +199,9 @@ fn validate_string_enum_all_without_dsl_aliases_requires_explicit_variant() {
     };
     assert!(
         with_all
-            .validate(&Value::Concrete(ConcreteValue::String("all".to_string())))
+            .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+                "all".to_string()
+            )))
             .is_ok()
     );
 }
@@ -176,23 +216,26 @@ fn validate_string_enum_accepts_values_with_dots() {
         namespace: Some("awscc.ec2.vpn_gateway".to_string()),
         dsl_aliases: vec![],
     };
-    // Quoted string with dot should match directly
+    // Bare identifier with dot should match directly (carried as
+    // `EnumIdentifier` under strict mode — the test name still says
+    // "Quoted string" for historical reasons but values are written
+    // unquoted in real DSL).
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::String(
+        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "ipsec.1".to_string()
         )))
         .is_ok()
     );
     // Fully qualified form should also be accepted
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::String(
+        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "awscc.ec2.vpn_gateway.Type.ipsec.1".to_string()
         )))
         .is_ok()
     );
     // Invalid value should still be rejected
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::String(
+        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "ipsec.2".to_string()
         )))
         .is_err()
@@ -201,9 +244,13 @@ fn validate_string_enum_accepts_values_with_dots() {
 
 #[test]
 fn invalid_enum_error_preserves_user_typed_string_literal() {
-    // Regression for #2077. A quoted string literal like `target_type = "aaa"`
-    // should surface in the error as the typed value, not as the synthesized
-    // namespaced form `awscc.sso.Assignment.TargetType.aaa`.
+    // Regression for #2077, updated for carina#2986: a quoted string
+    // literal `target_type = "aaa"` now reaches the validator as
+    // `ConcreteValue::String("aaa")` and is rejected as
+    // `StringLiteralExpectedEnum`. The user-typed value must surface in
+    // the error verbatim (echoed inside double quotes per the
+    // `format_string_literal_expected_enum` shape) without leaking the
+    // synthesized namespaced form.
     let t = AttributeType::StringEnum {
         name: "TargetType".to_string(),
         values: vec!["AWS_ACCOUNT".to_string()],
@@ -215,8 +262,8 @@ fn invalid_enum_error_preserves_user_typed_string_literal() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("'aaa'"),
-        "error should quote the user's typed value, got: {msg}"
+        msg.contains("\"aaa\""),
+        "error should echo the user's typed value, got: {msg}"
     );
     assert!(
         !msg.contains("awscc.sso.Assignment.TargetType.aaa"),
@@ -252,15 +299,20 @@ fn invalid_enum_error_names_the_enum_type_and_fully_qualified_variants() {
 
 #[test]
 fn with_attribute_adds_attribute_name_to_enum_error() {
-    // Regression for #2098. When a caller knows which attribute produced
-    // the error, wrapping it with `with_attribute` must surface the name
-    // in the rendered message so the reader can locate it in their .crn.
+    // Regression for #2098, updated for carina#2986. The
+    // `with_attribute` plumbing routes the attribute name onto both
+    // `InvalidEnumVariant` (for genuine wrong-variant inputs) and
+    // `StringLiteralExpectedEnum` (the strict-mode quoted-string
+    // rejection). Pin both behaviors:
     let t = AttributeType::StringEnum {
         name: "TargetType".to_string(),
         values: vec!["AWS_ACCOUNT".to_string()],
         namespace: Some("awscc.sso.Assignment".to_string()),
         dsl_aliases: vec![],
     };
+    // String-literal path (strict-mode rejection): rendered as
+    // `'target_id' (TargetType) expects an enum identifier, got a
+    // string literal "aaa"...`.
     let err = t
         .validate(&Value::Concrete(ConcreteValue::String("aaa".to_string())))
         .unwrap_err()
@@ -275,8 +327,26 @@ fn with_attribute_adds_attribute_name_to_enum_error() {
         "error should still name the enum type, got: {msg}"
     );
     assert!(
+        msg.contains("\"aaa\""),
+        "error should still echo the user value, got: {msg}"
+    );
+
+    // Identifier path (`InvalidEnumVariant`): the message keeps the
+    // single-quoted form for the bare value.
+    let err = t
+        .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+            "aaa".to_string(),
+        )))
+        .unwrap_err()
+        .with_attribute("target_id");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("'target_id'"),
+        "identifier-path error should quote attribute name, got: {msg}"
+    );
+    assert!(
         msg.contains("'aaa'"),
-        "error should still quote the user value, got: {msg}"
+        "identifier-path error should single-quote the bare value, got: {msg}"
     );
 }
 
@@ -423,8 +493,12 @@ fn into_string_literal_diagnostic_without_type_name_passes_through() {
 fn schema_validate_with_origins_emits_string_literal_diagnostic_for_quoted_enum() {
     // `validate_with_origins` is the entry point the CLI/LSP wiring
     // calls once it knows which attributes were written as quoted
-    // string literals. A quoted-literal assignment to a StringEnum
-    // must reshape into `StringLiteralExpectedEnum`.
+    // string literals. Under carina#2986 strict mode the `Value`
+    // variant alone already encodes that distinction
+    // (`ConcreteValue::String` = quoted literal,
+    // `ConcreteValue::EnumIdentifier` = bare/namespaced identifier),
+    // so the diagnostic shape follows from the value's variant
+    // independently of the origin tag.
     let schema = ResourceSchema::new("test.assignment").attribute(
         AttributeSchema::new(
             "target_type",
@@ -437,13 +511,13 @@ fn schema_validate_with_origins_emits_string_literal_diagnostic_for_quoted_enum(
         )
         .required(),
     );
+
+    // Quoted literal → reshaped diagnostic, regardless of origin tag.
     let mut attrs = HashMap::new();
     attrs.insert(
         "target_type".to_string(),
         Value::Concrete(ConcreteValue::String("aaa".to_string())),
     );
-
-    // String-literal origin → reshaped diagnostic
     let errs = schema
         .validate_with_origins(&attrs, &|name| name == "target_type")
         .unwrap_err();
@@ -453,15 +527,19 @@ fn schema_validate_with_origins_emits_string_literal_diagnostic_for_quoted_enum(
         "expected StringLiteralExpectedEnum variant, got: {errs:?}"
     );
 
-    // No string-literal origin → classic InvalidEnumVariant (unchanged
-    // behaviour for bare-identifier / namespaced inputs)
+    // Bare-identifier wrong-variant → classic InvalidEnumVariant.
+    let mut attrs = HashMap::new();
+    attrs.insert(
+        "target_type".to_string(),
+        Value::Concrete(ConcreteValue::EnumIdentifier("aaa".to_string())),
+    );
     let errs = schema
         .validate_with_origins(&attrs, &|_| false)
         .unwrap_err();
     assert!(
         errs.iter()
             .any(|e| matches!(e, TypeError::InvalidEnumVariant { .. })),
-        "expected InvalidEnumVariant variant when origin is not a literal, got: {errs:?}"
+        "expected InvalidEnumVariant variant for bare identifier, got: {errs:?}"
     );
 }
 
@@ -485,7 +563,7 @@ fn schema_validate_with_origins_leaves_valid_values_alone() {
     let mut attrs = HashMap::new();
     attrs.insert(
         "target_type".to_string(),
-        Value::Concrete(ConcreteValue::String("AWS_ACCOUNT".to_string())),
+        Value::Concrete(ConcreteValue::EnumIdentifier("AWS_ACCOUNT".to_string())),
     );
     assert!(
         schema.validate_with_origins(&attrs, &|_| true).is_ok(),
@@ -3285,8 +3363,14 @@ fn expected_includes_to_dsl_aliases_with_alias_flag() {
             ("Suspended".to_string(), "suspended".to_string()),
         ],
     };
+    // Use `EnumIdentifier` so the strict-mode validator reaches the
+    // wrong-variant branch (`InvalidEnumVariant`). A `String` here would
+    // be rejected earlier as `StringLiteralExpectedEnum` — that path is
+    // covered by `validate_string_enum_rejects_quoted_string_literal`.
     let err = t
-        .validate(&Value::Concrete(ConcreteValue::String("zzz".to_string())))
+        .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+            "zzz".to_string(),
+        )))
         .unwrap_err();
     let TypeError::InvalidEnumVariant { expected, .. } = err else {
         panic!("expected InvalidEnumVariant, got {err:?}");
@@ -3429,10 +3513,17 @@ fn expected_enum_variant_serde_round_trip() {
 
 #[test]
 fn union_string_vs_string_enum_picks_enum_error_for_string_input() {
-    // Acceptance #2 from #2219: `Int | StringEnum` with a string input
-    // that doesn't match any enum variant must surface the
-    // `InvalidEnumVariant` error (so the user sees `expected one of:
-    // fast, slow`), not a generic `TypeMismatch`.
+    // Acceptance #2 from #2219: `Int | StringEnum` with an identifier
+    // input that doesn't match any enum variant must surface the
+    // `InvalidEnumVariant` error from the StringEnum member (so the
+    // user sees `expected one of: fast, slow`), not a generic
+    // `TypeMismatch` from the Int member.
+    //
+    // Updated for carina#2986 strict mode: the test input is an
+    // `EnumIdentifier`, which is the legitimate identifier-shaped path
+    // that lands in the enum-variant matcher. A `String` here would
+    // short-circuit to `StringLiteralExpectedEnum`, which is a
+    // different concern covered separately.
     let union_type = AttributeType::Union(vec![
         AttributeType::Int,
         AttributeType::StringEnum {
@@ -3443,7 +3534,9 @@ fn union_string_vs_string_enum_picks_enum_error_for_string_input() {
         },
     ]);
     let err = union_type
-        .validate(&Value::Concrete(ConcreteValue::String("zzz".to_string())))
+        .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+            "zzz".to_string(),
+        )))
         .unwrap_err();
     match err {
         TypeError::InvalidEnumVariant { ref expected, .. } => {
@@ -4027,9 +4120,13 @@ fn dsl_aliases_validator_accepts_dsl_spellings_only() {
         ],
     };
 
-    // Bare API spelling: REJECTED under strict mode.
+    // Bare API spelling: REJECTED under strict mode (the DSL alias
+    // rewrite invalidates the API spelling — users must type the DSL
+    // form `bucket_owner_enforced`). Phase 4 of carina#2986 carries the
+    // input as `EnumIdentifier` because the user wrote it as a bare
+    // identifier, not a quoted string.
     let err = t
-        .validate(&Value::Concrete(ConcreteValue::String(
+        .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "BucketOwnerEnforced".to_string(),
         )))
         .unwrap_err();
@@ -4041,21 +4138,21 @@ fn dsl_aliases_validator_accepts_dsl_spellings_only() {
 
     // Bare DSL spelling: accepted (alias).
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::String(
+        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "bucket_owner_enforced".to_string()
         )))
         .is_ok()
     );
     // Fully-qualified API spelling: REJECTED under strict mode.
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::String(
+        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "awscc.s3.Bucket.ObjectOwnership.BucketOwnerEnforced".to_string()
         )))
         .is_err()
     );
     // Fully-qualified DSL spelling: accepted (the awscc#199 case).
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::String(
+        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "awscc.s3.Bucket.ObjectOwnership.bucket_owner_enforced".to_string()
         )))
         .is_ok()
@@ -4065,7 +4162,7 @@ fn dsl_aliases_validator_accepts_dsl_spellings_only() {
     // listed for context (the API spelling is what the AWS docs show,
     // the DSL spelling is what `validate` accepts).
     let err = t
-        .validate(&Value::Concrete(ConcreteValue::String(
+        .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "garbage".to_string(),
         )))
         .unwrap_err();
@@ -4099,8 +4196,10 @@ fn enum_without_dsl_aliases_accepts_api_spelling_as_before() {
         dsl_aliases: vec![],
     };
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::String("ALL".to_string())))
-            .is_ok(),
+        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+            "ALL".to_string()
+        )))
+        .is_ok(),
         "lax mode (empty dsl_aliases) accepts API canonical"
     );
 }
@@ -4119,8 +4218,14 @@ fn dsl_aliases_diagnostic_tags_alias_entries_distinct_from_canonical() {
             ("Suspended".to_string(), "suspended".to_string()),
         ],
     };
+    // Use `EnumIdentifier` so the strict-mode validator reaches the
+    // unknown-variant branch (the alias-tagging behavior we want to
+    // pin). A `String` here would take the `StringLiteralExpectedEnum`
+    // path which is covered by sibling tests.
     let err = t
-        .validate(&Value::Concrete(ConcreteValue::String("zzz".to_string())))
+        .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+            "zzz".to_string(),
+        )))
         .unwrap_err();
     let TypeError::InvalidEnumVariant { expected, .. } = err else {
         panic!("expected InvalidEnumVariant");
@@ -4152,14 +4257,16 @@ fn dsl_aliases_empty_keeps_api_only_validation() {
         dsl_aliases: vec![],
     };
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::String(
+        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "active".to_string()
         )))
         .is_ok()
     );
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::String("nope".to_string())))
-            .is_err()
+        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+            "nope".to_string()
+        )))
+        .is_err()
     );
 }
 
@@ -4274,21 +4381,39 @@ mod string_enum_binding_collision {
     }
 
     #[test]
-    fn explicit_quoted_string_still_passes() {
-        // `attribute = 'vpc'` reaches the validator as a plain
-        // concrete string, unrelated to the binding-collision branch.
-        // Must validate as a normal DSL alias.
+    fn explicit_quoted_string_is_rejected() {
+        // Phase 4 of carina#2986: `attribute = "vpc"` reaches the
+        // validator as a `ConcreteValue::String` (the user wrote a
+        // quoted literal). Strict mode rejects it with
+        // `StringLiteralExpectedEnum` — the message must point users
+        // at the DSL identifier form.
         let t = flow_log_resource_type();
         let value = Value::Concrete(ConcreteValue::String("vpc".to_string()));
+        let err = t.validate(&value).unwrap_err();
+        assert!(
+            matches!(err, TypeError::StringLiteralExpectedEnum { ref user_typed, .. } if user_typed == "vpc"),
+            "expected StringLiteralExpectedEnum, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn bare_identifier_form_passes() {
+        // `attribute = vpc` (bare identifier; no binding in scope)
+        // reaches the validator as `ConcreteValue::EnumIdentifier("vpc")`
+        // — the validator resolves it against the `dsl_aliases` table
+        // for `ResourceType` and accepts.
+        let t = flow_log_resource_type();
+        let value = Value::Concrete(ConcreteValue::EnumIdentifier("vpc".to_string()));
         assert!(t.validate(&value).is_ok());
     }
 
     #[test]
     fn fully_qualified_form_still_passes() {
         // `attribute = awscc.ec2.FlowLog.ResourceType.vpc` reaches the
-        // validator as a concrete string in fully-qualified form.
+        // validator as `ConcreteValue::EnumIdentifier` (carina#2986
+        // Phase 3 parser routing).
         let t = flow_log_resource_type();
-        let value = Value::Concrete(ConcreteValue::String(
+        let value = Value::Concrete(ConcreteValue::EnumIdentifier(
             "awscc.ec2.FlowLog.ResourceType.vpc".to_string(),
         ));
         assert!(t.validate(&value).is_ok());

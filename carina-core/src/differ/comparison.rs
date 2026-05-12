@@ -134,15 +134,39 @@ pub(super) fn type_aware_equal(
                 }
             }
 
-            // StringEnum: extract enum values from namespaced identifiers and compare
-            (
-                Value::Concrete(ConcreteValue::String(sa)),
-                Value::Concrete(ConcreteValue::String(sb)),
-                AttributeType::StringEnum { values, .. },
-            ) if sa != sb => {
+            // StringEnum: extract enum values from namespaced identifiers
+            // and compare. Phase 5 of carina#2986: accept the cross-shape
+            // `String × EnumIdentifier` pair so the differ is stable
+            // across "state file stores plain string, desired-side parsed
+            // as identifier short form" — the steady-state shape for any
+            // enum-typed attribute whose value flowed through a provider
+            // `read`. Comparison is text-based and case-insensitive on
+            // the enum value, matching the existing String × String arm.
+            (a, b, AttributeType::StringEnum { values, .. })
+                if matches!(
+                    a,
+                    Value::Concrete(ConcreteValue::String(_) | ConcreteValue::EnumIdentifier(_))
+                ) && matches!(
+                    b,
+                    Value::Concrete(ConcreteValue::String(_) | ConcreteValue::EnumIdentifier(_))
+                ) =>
+            {
+                let text = |v: &Value| -> Option<String> {
+                    match v {
+                        Value::Concrete(ConcreteValue::String(s))
+                        | Value::Concrete(ConcreteValue::EnumIdentifier(s)) => Some(s.clone()),
+                        _ => None,
+                    }
+                };
+                let (Some(sa), Some(sb)) = (text(a), text(b)) else {
+                    return a.semantically_equal(b);
+                };
+                if sa == sb {
+                    return true;
+                }
                 let valid_values: Vec<&str> = values.iter().map(String::as_str).collect();
-                let va = crate::utils::extract_enum_value_with_values(sa, &valid_values);
-                let vb = crate::utils::extract_enum_value_with_values(sb, &valid_values);
+                let va = crate::utils::extract_enum_value_with_values(&sa, &valid_values);
+                let vb = crate::utils::extract_enum_value_with_values(&sb, &valid_values);
                 va.eq_ignore_ascii_case(vb)
             }
 
@@ -288,11 +312,10 @@ fn is_type_default(value: &Value, attr_type: Option<&AttributeType>) -> bool {
         {
             true
         }
-        (Value::Concrete(ConcreteValue::String(s)), Some(AttributeType::StringEnum { .. }))
-            if s.is_empty() =>
-        {
-            true
-        }
+        (
+            Value::Concrete(ConcreteValue::String(s) | ConcreteValue::EnumIdentifier(s)),
+            Some(AttributeType::StringEnum { .. }),
+        ) if s.is_empty() => true,
         (Value::Concrete(ConcreteValue::List(l)), Some(AttributeType::List { .. }))
             if l.is_empty() =>
         {

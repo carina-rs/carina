@@ -283,9 +283,14 @@ fn list_item_type_validation() {
         Arc::new(vec![]),
     );
 
+    // Use bare identifiers (`tcp`, `invalid_protocol`) rather than
+    // quoted strings — under carina#2986 strict mode, an enum attribute
+    // requires the identifier shape. The list is otherwise valid and
+    // the `invalid_protocol` item should surface as
+    // `InvalidEnumVariant`.
     let doc = create_document(
         r#"let r = test.list.resource {
-protocols = ["tcp", "invalid_protocol"]
+protocols = [tcp, invalid_protocol]
 }"#,
     );
 

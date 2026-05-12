@@ -296,6 +296,18 @@ pub(in crate::parser) fn extract_directives(
                                     .unwrap_or(name.as_str());
                                 names.push(bare.to_string());
                             }
+                            Value::Concrete(ConcreteValue::EnumIdentifier(name)) => {
+                                // Bare identifier reached the directives
+                                // parser before `is_resource_binding` could
+                                // catch it (e.g. forward reference in a
+                                // cycle test, or a typo flagged later by
+                                // `check_identifier_scope`). Phase 3 of
+                                // carina#2986 routes such identifiers into
+                                // `ConcreteValue::EnumIdentifier`; from the
+                                // depends_on perspective the text is still
+                                // the user's intended binding name.
+                                names.push(name.clone());
+                            }
                             other => {
                                 return Err(ParseError::InvalidExpression {
                                     line: 0,
