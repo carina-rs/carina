@@ -125,6 +125,15 @@ fn format_value(value: &Value) -> String {
                 format!("\"{}\"", s)
             }
         }
+        Value::Concrete(ConcreteValue::EnumIdentifier(s)) => {
+            // Enum identifiers render unquoted to match how the user
+            // typed them.
+            if s.len() > 50 {
+                format!("{}...", &s[..47])
+            } else {
+                s.clone()
+            }
+        }
         Value::Concrete(ConcreteValue::Int(n)) => n.to_string(),
         Value::Concrete(ConcreteValue::Float(f)) => {
             let s = f.to_string();

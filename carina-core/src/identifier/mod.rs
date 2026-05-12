@@ -162,6 +162,7 @@ pub fn reconcile_prefixed_names(
 fn deterministic_value_string(value: &Value) -> String {
     match value {
         Value::Concrete(ConcreteValue::String(s)) => format!("String({:?})", s),
+        Value::Concrete(ConcreteValue::EnumIdentifier(s)) => format!("EnumIdentifier({:?})", s),
         Value::Concrete(ConcreteValue::Int(i)) => format!("Int({})", i),
         Value::Concrete(ConcreteValue::Float(f)) => format!("Float({})", f),
         Value::Concrete(ConcreteValue::Bool(b)) => format!("Bool({})", b),

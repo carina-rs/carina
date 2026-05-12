@@ -1890,6 +1890,7 @@ impl Value {
     fn type_name(&self) -> String {
         match self {
             Value::Concrete(ConcreteValue::String(_)) => "String".to_string(),
+            Value::Concrete(ConcreteValue::EnumIdentifier(_)) => "EnumIdentifier".to_string(),
             Value::Concrete(ConcreteValue::Int(_)) => "Int".to_string(),
             Value::Concrete(ConcreteValue::Float(_)) => "Float".to_string(),
             Value::Concrete(ConcreteValue::Bool(_)) => "Bool".to_string(),
@@ -1919,6 +1920,7 @@ impl ConcreteValueRef<'_> {
     fn type_name(&self) -> &'static str {
         match self {
             ConcreteValueRef::String(_) => "String",
+            ConcreteValueRef::EnumIdentifier(_) => "EnumIdentifier",
             ConcreteValueRef::Int(_) => "Int",
             ConcreteValueRef::Float(_) => "Float",
             ConcreteValueRef::Bool(_) => "Bool",
@@ -1936,6 +1938,9 @@ impl ConcreteValueRef<'_> {
     fn to_owned_value(self) -> Value {
         match self {
             ConcreteValueRef::String(s) => Value::Concrete(ConcreteValue::String(s.to_string())),
+            ConcreteValueRef::EnumIdentifier(s) => {
+                Value::Concrete(ConcreteValue::EnumIdentifier(s.to_string()))
+            }
             ConcreteValueRef::Int(n) => Value::Concrete(ConcreteValue::Int(n)),
             ConcreteValueRef::Float(f) => Value::Concrete(ConcreteValue::Float(f)),
             ConcreteValueRef::Bool(b) => Value::Concrete(ConcreteValue::Bool(b)),

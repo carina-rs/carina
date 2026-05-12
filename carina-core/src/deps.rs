@@ -66,6 +66,7 @@ fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
             }
             Value::Deferred(DeferredValue::Secret(inner)) => walk(inner, deps),
             Value::Concrete(ConcreteValue::String(_))
+            | Value::Concrete(ConcreteValue::EnumIdentifier(_))
             | Value::Concrete(ConcreteValue::Int(_))
             | Value::Concrete(ConcreteValue::Float(_))
             | Value::Concrete(ConcreteValue::Bool(_))

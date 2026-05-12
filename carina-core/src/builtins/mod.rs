@@ -413,6 +413,7 @@ pub(crate) fn evaluate_builtin_with_config_to_value(
 fn value_type_name(value: &Value) -> &'static str {
     match value {
         Value::Concrete(ConcreteValue::String(_)) => "String",
+        Value::Concrete(ConcreteValue::EnumIdentifier(_)) => "EnumIdentifier",
         Value::Concrete(ConcreteValue::Int(_)) => "Int",
         Value::Concrete(ConcreteValue::Float(_)) => "Float",
         Value::Concrete(ConcreteValue::Bool(_)) => "Bool",

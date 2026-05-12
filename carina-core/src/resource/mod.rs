@@ -426,6 +426,15 @@ pub enum Value {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ConcreteValue {
     String(String),
+    /// An enum identifier — a value written in the DSL as a bare
+    /// identifier (`tcp`) or namespaced identifier
+    /// (`awscc.ec2.SecurityGroup.IpProtocol.tcp`), not as a quoted
+    /// string literal. The parser routes `namespaced_id` and bare
+    /// `variable_ref`s in `StringEnum` attribute positions into this
+    /// variant so the validator can distinguish "identifier value"
+    /// from "string value" without re-deriving the question from
+    /// string content. See carina#2986.
+    EnumIdentifier(String),
     Int(i64),
     Float(f64),
     Bool(bool),
@@ -487,6 +496,8 @@ pub enum DeferredValue {
 #[derive(Debug, Clone, Copy)]
 pub enum ConcreteValueRef<'a> {
     String(&'a str),
+    /// See `ConcreteValue::EnumIdentifier`.
+    EnumIdentifier(&'a str),
     Int(i64),
     Float(f64),
     Bool(bool),
@@ -494,6 +505,20 @@ pub enum ConcreteValueRef<'a> {
     List(&'a [Value]),
     StringList(&'a [String]),
     Map(&'a IndexMap<String, Value>),
+}
+
+impl<'a> ConcreteValueRef<'a> {
+    /// Return the inner `&str` for both `String` and `EnumIdentifier`
+    /// variants. The vast majority of consumers (formatter, plan
+    /// display, differ, state writer) treat the two identically —
+    /// only the validator cares about the distinction.
+    pub fn as_string_like(&self) -> Option<&'a str> {
+        match self {
+            ConcreteValueRef::String(s) => Some(s),
+            ConcreteValueRef::EnumIdentifier(s) => Some(s),
+            _ => None,
+        }
+    }
 }
 
 /// Borrowing projection of [`Value`] restricted to the **deferred** axis
@@ -532,6 +557,7 @@ impl Value {
         match self {
             Value::Concrete(c) => Some(match c {
                 ConcreteValue::String(s) => ConcreteValueRef::String(s),
+                ConcreteValue::EnumIdentifier(s) => ConcreteValueRef::EnumIdentifier(s),
                 ConcreteValue::Int(n) => ConcreteValueRef::Int(*n),
                 ConcreteValue::Float(f) => ConcreteValueRef::Float(*f),
                 ConcreteValue::Bool(b) => ConcreteValueRef::Bool(*b),
@@ -862,6 +888,7 @@ impl Value {
             }
             Value::Deferred(DeferredValue::Secret(inner)) => inner.visit_refs(f),
             Value::Concrete(ConcreteValue::String(_))
+            | Value::Concrete(ConcreteValue::EnumIdentifier(_))
             | Value::Concrete(ConcreteValue::Int(_))
             | Value::Concrete(ConcreteValue::Float(_))
             | Value::Concrete(ConcreteValue::Bool(_))
@@ -936,7 +963,8 @@ impl Value {
     fn hash_into(&self, hasher: &mut impl Hasher) {
         std::mem::discriminant(self).hash(hasher);
         match self {
-            Value::Concrete(ConcreteValue::String(s)) => s.hash(hasher),
+            Value::Concrete(ConcreteValue::String(s))
+            | Value::Concrete(ConcreteValue::EnumIdentifier(s)) => s.hash(hasher),
             Value::Concrete(ConcreteValue::Int(i)) => i.hash(hasher),
             Value::Concrete(ConcreteValue::Float(f)) => {
                 // Use bits for deterministic hashing (NaN == NaN for our purposes)

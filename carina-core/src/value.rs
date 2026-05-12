@@ -215,7 +215,14 @@ pub fn value_to_json_with_context(
 ) -> Result<serde_json::Value, SerializationError> {
     let ctx = SerializationContext::ValueToJson;
     match value {
-        Value::Concrete(ConcreteValue::String(s)) => Ok(serde_json::Value::String(s.clone())),
+        Value::Concrete(ConcreteValue::String(s))
+        | Value::Concrete(ConcreteValue::EnumIdentifier(s)) => {
+            // Both serialize as a flat JSON string. The schema-aware
+            // state loader re-classifies `EnumIdentifier` from the
+            // attribute's declared type, so the on-disk JSON stays
+            // unchanged. See carina#2986 design doc §5.
+            Ok(serde_json::Value::String(s.clone()))
+        }
         Value::Concrete(ConcreteValue::Int(n)) => Ok(serde_json::Value::Number((*n).into())),
         Value::Concrete(ConcreteValue::Duration(d)) => {
             Ok(serde_json::Value::Number((d.as_secs() as i64).into()))
@@ -463,6 +470,13 @@ pub(crate) fn format_value_into<S: FormatSink>(
             sink.write_str("\"")?;
             sink.write_str(s)?;
             sink.write_str("\"")
+        }
+        Value::Concrete(ConcreteValue::EnumIdentifier(s)) => {
+            // Enum identifiers render unquoted in plan/diff output to
+            // match how the user typed them. The resolver has already
+            // canonicalized any namespaced form, so `s` is the bare
+            // identifier ready for direct display.
+            sink.write_str(s)
         }
         Value::Concrete(ConcreteValue::Int(n)) => sink.write_str(&n.to_string()),
         Value::Concrete(ConcreteValue::Duration(d)) => sink.write_str(&render_duration(*d)),
