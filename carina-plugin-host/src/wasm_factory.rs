@@ -598,12 +598,16 @@ impl WasmBindings {
 ///
 /// * 256 MB max linear memory – the AWSCC provider uses ~45 MB for
 ///   `validate`, so this gives plenty of headroom.
-/// * 20 000 table elements.
+/// * 65 536 table elements. The aws provider's WASM table grew past
+///   the previous 20 000 ceiling once `aws-sdk-sqs` was linked in
+///   (#2993); pick a wide value so similar additions don't hit the
+///   limit again. Cost is metadata-only — wasmtime allocates table
+///   slots lazily.
 /// * 10 component instances.
 fn build_store_limits() -> StoreLimits {
     StoreLimitsBuilder::new()
         .memory_size(256 * 1024 * 1024) // 256 MB
-        .table_elements(20_000)
+        .table_elements(65_536)
         .instances(10)
         .build()
 }
@@ -1817,11 +1821,11 @@ mod tests {
                 .unwrap()
         );
 
-        // table_growing: requesting up to 20_000 elements should succeed
-        assert!(limits.table_growing(0, 20_000, None).unwrap());
+        // table_growing: requesting up to 65_536 elements should succeed
+        assert!(limits.table_growing(0, 65_536, None).unwrap());
 
-        // table_growing: requesting beyond 20_000 should be denied
-        assert!(!limits.table_growing(0, 20_001, None).unwrap());
+        // table_growing: requesting beyond 65_536 should be denied
+        assert!(!limits.table_growing(0, 65_537, None).unwrap());
 
         // instances: should be capped at 10
         assert_eq!(limits.instances(), 10);
