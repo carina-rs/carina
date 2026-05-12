@@ -117,7 +117,7 @@ fn parse_resource_with_namespaced_type() {
     );
     assert_eq!(
         resource.get_attr("region"),
-        Some(&Value::Concrete(ConcreteValue::String(
+        Some(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "aws.Region.ap_northeast_1".to_string()
         )))
     );
@@ -156,7 +156,7 @@ fn parse_variable_and_resource() {
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("region"),
-        Some(&Value::Concrete(ConcreteValue::String(
+        Some(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "aws.Region.ap_northeast_1".to_string()
         )))
     );
@@ -346,7 +346,7 @@ fn parse_and_resolve_resource_reference() {
     );
     assert_eq!(
         policy.get_attr("bucket_region"),
-        Some(&Value::Concrete(ConcreteValue::String(
+        Some(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "aws.Region.ap_northeast_1".to_string()
         )))
     );
@@ -398,9 +398,14 @@ fn parse_undefined_two_part_identifier_becomes_resource_ref() {
 }
 
 #[test]
-fn parse_bare_identifier_becomes_string() {
-    // When a bare identifier is not a known variable or binding,
-    // it becomes a String for later schema validation (enum resolution)
+fn parse_bare_identifier_becomes_enum_identifier() {
+    // Phase 3 of carina#2986: a bare identifier that is not a known
+    // variable or binding lowers to `ConcreteValue::EnumIdentifier`, the
+    // strict short-form variant. The validator performs schema-aware
+    // namespace expansion against the enclosing `StringEnum`; this is the
+    // mechanism that turns `dedicated` into
+    // `awscc.ec2.Vpc.InstanceTenancy.dedicated` at validation time without
+    // requiring schema context in the parser.
     let input = r#"
         let vpc = awscc.ec2.Vpc {
             instance_tenancy = dedicated
@@ -410,7 +415,7 @@ fn parse_bare_identifier_becomes_string() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.resources[0].get_attr("instance_tenancy"),
-        Some(&Value::Concrete(ConcreteValue::String(
+        Some(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "dedicated".to_string()
         )))
     );
@@ -429,7 +434,7 @@ fn resource_reference_preserves_namespaced_id() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.resources[0].get_attr("region"),
-        Some(&Value::Concrete(ConcreteValue::String(
+        Some(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "aws.Region.ap_northeast_1".to_string()
         )))
     );
@@ -448,7 +453,7 @@ fn namespaced_id_with_digit_segment() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.resources[0].get_attr("type"),
-        Some(&Value::Concrete(ConcreteValue::String(
+        Some(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "awscc.ec2.vpn_gateway.Type.ipsec.1".to_string()
         )))
     );
@@ -1124,7 +1129,7 @@ fn parse_backend_block() {
     );
     assert_eq!(
         backend.attributes.get("region"),
-        Some(&Value::Concrete(ConcreteValue::String(
+        Some(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "aws.Region.ap_northeast_1".to_string()
         )))
     );

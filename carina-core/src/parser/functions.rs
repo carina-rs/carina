@@ -220,15 +220,35 @@ pub fn validate_custom_type(
     config: &ProviderContext,
 ) -> Result<(), String> {
     match (type_name, value) {
-        ("ipv4_cidr", Value::Concrete(ConcreteValue::String(s))) => validate_ipv4_cidr(s),
-        ("ipv4_address", Value::Concrete(ConcreteValue::String(s))) => validate_ipv4_address(s),
-        ("ipv6_cidr", Value::Concrete(ConcreteValue::String(s))) => validate_ipv6_cidr(s),
-        ("ipv6_address", Value::Concrete(ConcreteValue::String(s))) => validate_ipv6_address(s),
+        (
+            "ipv4_cidr",
+            Value::Concrete(ConcreteValue::String(s) | ConcreteValue::EnumIdentifier(s)),
+        ) => validate_ipv4_cidr(s),
+        (
+            "ipv4_address",
+            Value::Concrete(ConcreteValue::String(s) | ConcreteValue::EnumIdentifier(s)),
+        ) => validate_ipv4_address(s),
+        (
+            "ipv6_cidr",
+            Value::Concrete(ConcreteValue::String(s) | ConcreteValue::EnumIdentifier(s)),
+        ) => validate_ipv6_cidr(s),
+        (
+            "ipv6_address",
+            Value::Concrete(ConcreteValue::String(s) | ConcreteValue::EnumIdentifier(s)),
+        ) => validate_ipv6_address(s),
         (_, Value::Deferred(DeferredValue::ResourceRef { .. })) => Ok(()), // will be resolved later
         (_, Value::Deferred(DeferredValue::FunctionCall { .. })) => Ok(()), // will be resolved later
         (_, Value::Deferred(DeferredValue::Interpolation(_))) => Ok(()), // will be resolved later
         (_, Value::Deferred(DeferredValue::Unknown(_))) => Ok(()), // resolved at upstream apply
-        (name, Value::Concrete(ConcreteValue::String(s))) => {
+        (name, Value::Concrete(ConcreteValue::String(s) | ConcreteValue::EnumIdentifier(s))) => {
+            // Both `String` (quoted-literal source) and `EnumIdentifier`
+            // (bare or namespaced identifier source) are accepted: this
+            // lookup runs from `walk_custom_lookup`, which is reached
+            // *after* `expand_enum_shorthand` has normalized the value
+            // for `validate_custom`. The strict-shape rejection for
+            // quoted literals on namespaced Custom types happens in the
+            // LSP / CLI surface code (carina#2986 Phase 4), not here —
+            // this fallback validator just needs the textual payload.
             // Check custom validators from config (schema-extracted)
             if let Some(validator) = config.validators.get(name) {
                 validator(s)?;

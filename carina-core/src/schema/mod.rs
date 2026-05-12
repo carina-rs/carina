@@ -926,16 +926,54 @@ impl AttributeType {
             unreachable!("validate_string_enum called on non-StringEnum");
         };
 
+        // Phase 4 of carina#2986: enum attributes accept only DSL
+        // identifiers (`ConcreteValue::EnumIdentifier`), never quoted
+        // string literals. A `ConcreteValueRef::String` reaching this
+        // function means the user wrote `attr = "value"` on an enum
+        // attribute — reshape into `StringLiteralExpectedEnum` with the
+        // full expected variant list so the LSP code action can offer
+        // "drop quotes / use identifier form" without re-deriving
+        // candidates.
+        if let ConcreteValueRef::String(s) = value {
+            let mut expected: Vec<ExpectedEnumVariant> = Vec::new();
+            let mut push = |variant_value: &str, is_alias: bool| {
+                let entry = ExpectedEnumVariant::from_namespaced(
+                    namespace.as_deref(),
+                    name,
+                    variant_value,
+                    is_alias,
+                );
+                if !expected.contains(&entry) {
+                    expected.push(entry);
+                }
+            };
+            for v in values {
+                push(v, false);
+            }
+            for (api, dsl) in dsl_aliases {
+                if dsl != api {
+                    push(dsl, true);
+                }
+            }
+            return Err(TypeError::StringLiteralExpectedEnum {
+                user_typed: s.to_string(),
+                attribute: None,
+                type_name: name.clone(),
+                expected,
+                extra_message: None,
+            });
+        }
+
         let resolved_value = Self::resolve_enum_input(name, namespace.as_deref(), value);
         // Capture the user's original input for diagnostics. The parser
-        // collapses both quoted literals (`"aaa"`) and bare identifiers
-        // (`dedicated`) into `Value::Concrete(ConcreteValue::String)`, and `resolve_enum_input`
-        // rewrites the non-dotted form into a synthesized namespaced
-        // string for lookup. That synthesized form must stay internal:
-        // error messages should quote what the user actually typed.
-        // See #2077.
+        // emits `ConcreteValue::EnumIdentifier` for bare identifier short
+        // forms (`dedicated`) and dotted forms (`aws.s3.Bucket.VersioningStatus.Enabled`).
+        // `resolve_enum_input` rewrites the non-dotted form into a
+        // synthesized namespaced string for lookup. That synthesized form
+        // must stay internal: error messages should quote what the user
+        // actually typed. See #2077.
         let user_input = match value {
-            ConcreteValueRef::String(s) => Some(s),
+            ConcreteValueRef::EnumIdentifier(s) => Some(s),
             _ => None,
         };
         if let Value::Concrete(ConcreteValue::String(s)) = &resolved_value {
@@ -1405,12 +1443,20 @@ fn union_member_score(member: &AttributeType, value: ConcreteValueRef<'_>) -> u3
         // generic `TypeMismatch`.
         (AT::Struct { .. }, ConcreteValueRef::Map(_)) => 100,
         // Same-constructor match — second tier.
+        //
+        // `StringEnum` matches both `String` (quoted literal form) and
+        // `EnumIdentifier` (identifier form, carina#2986). The strict
+        // validator rejects the `String` shape inside `validate_string_enum`
+        // and surfaces `StringLiteralExpectedEnum`; the union picker
+        // still routes through this member so that error reaches the
+        // caller instead of a generic `TypeMismatch`.
         (AT::Map { .. }, ConcreteValueRef::Map(_))
         | (AT::String, ConcreteValueRef::String(_))
         | (AT::Int, ConcreteValueRef::Int(_))
         | (AT::Float, ConcreteValueRef::Float(_))
         | (AT::Bool, ConcreteValueRef::Bool(_))
-        | (AT::StringEnum { .. }, ConcreteValueRef::String(_)) => 80,
+        | (AT::StringEnum { .. }, ConcreteValueRef::String(_))
+        | (AT::StringEnum { .. }, ConcreteValueRef::EnumIdentifier(_)) => 80,
         // List↔List: peek at the first element's structural match
         // against the member's inner type so `List<Struct>` outranks
         // `List<String>` for an input like `[{...}]`. The inner

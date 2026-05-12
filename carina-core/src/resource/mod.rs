@@ -654,6 +654,29 @@ impl PartialEq for Value {
                 Value::Concrete(ConcreteValue::String(a)),
                 Value::Concrete(ConcreteValue::String(b)),
             ) => a == b,
+            // `EnumIdentifier` is structurally equal to `String` (and to
+            // itself) when the carried text matches. The source-shape
+            // distinction lives on the variant tag — validator and other
+            // pattern-matching sites stay strict because they `match` on
+            // the variant directly, not through `PartialEq`. Value-tree
+            // comparison (differ, state round-trip checks, diff_tests)
+            // treats the two as the same textual payload; otherwise every
+            // provider `read` (which round-trips through plain JSON
+            // strings on the WIT boundary) would produce a phantom diff
+            // against a desired-side identifier form. See carina#2986
+            // Phase 5.
+            (
+                Value::Concrete(ConcreteValue::EnumIdentifier(a)),
+                Value::Concrete(ConcreteValue::EnumIdentifier(b)),
+            )
+            | (
+                Value::Concrete(ConcreteValue::EnumIdentifier(a)),
+                Value::Concrete(ConcreteValue::String(b)),
+            )
+            | (
+                Value::Concrete(ConcreteValue::String(a)),
+                Value::Concrete(ConcreteValue::EnumIdentifier(b)),
+            ) => a == b,
             (Value::Concrete(ConcreteValue::Int(a)), Value::Concrete(ConcreteValue::Int(b))) => {
                 a == b
             }

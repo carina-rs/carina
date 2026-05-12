@@ -168,7 +168,7 @@ fn parse_namespaced_id_value(
     }
 
     Ok(EvalValue::from_value(Value::Concrete(
-        ConcreteValue::String(full_str.to_string()),
+        ConcreteValue::EnumIdentifier(full_str.to_string()),
     )))
 }
 
@@ -366,10 +366,20 @@ pub(crate) fn parse_primary_eval(
 
             if access_steps.is_empty() {
                 // Simple variable reference (no access chain)
+                //
+                // Bare identifiers (`dedicated`, `enabled`) are emitted as
+                // `ConcreteValue::EnumIdentifier` short form. The validator
+                // performs schema-aware namespace expansion against the
+                // enclosing attribute's `StringEnum` definition; if the
+                // attribute isn't an enum, the validator surfaces a clear
+                // type mismatch with the user-typed text intact. Binding
+                // precedence is already honored by the `get_variable` arm
+                // above — we only reach the `None` branch when the parser
+                // has no in-scope variable / let-binding for this name.
                 match ctx.get_variable(first_ident) {
                     Some(val) => Ok(val.clone()),
                     None => Ok(EvalValue::from_value(Value::Concrete(
-                        ConcreteValue::String(first_ident.to_string()),
+                        ConcreteValue::EnumIdentifier(first_ident.to_string()),
                     ))),
                 }
             } else {
