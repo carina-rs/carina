@@ -676,6 +676,53 @@ pub fn convert_region_value(value: &str) -> String {
     value.to_string()
 }
 
+/// Resolve a provider config's `region` attribute to an AWS-SDK region
+/// string, falling back to `default_region` when the attribute is
+/// absent or carried in a shape that is not a region.
+///
+/// Accepts both quoted-string (`region = "us-east-1"`,
+/// `ConcreteValue::String`) and namespaced-identifier (`region =
+/// aws.Region.us_east_1`, `ConcreteValue::EnumIdentifier`) shapes —
+/// both are how the parser stores the `region` value depending on
+/// how the user wrote it. carina#3021 was an instance of this site
+/// matching only the `String` arm; namespaced identifiers silently
+/// fell through to the caller's hardcoded default region, which
+/// silently broke multi-region named provider instances.
+///
+/// This is the single source of truth for "given a provider config's
+/// attribute map, what region string should the SDK use" — every
+/// `ProviderFactory::extract_region` implementation should delegate
+/// to it.
+///
+/// # Examples
+///
+/// ```
+/// use carina_core::resource::{ConcreteValue, Value};
+/// use carina_core::utils::extract_region_from_attrs;
+/// use indexmap::IndexMap;
+///
+/// let mut attrs = IndexMap::new();
+/// attrs.insert(
+///     "region".to_string(),
+///     Value::Concrete(ConcreteValue::EnumIdentifier("aws.Region.us_east_1".into())),
+/// );
+/// assert_eq!(extract_region_from_attrs(&attrs, "ap-northeast-1"), "us-east-1");
+///
+/// let empty: IndexMap<String, Value> = IndexMap::new();
+/// assert_eq!(extract_region_from_attrs(&empty, "ap-northeast-1"), "ap-northeast-1");
+/// ```
+pub fn extract_region_from_attrs(
+    attributes: &indexmap::IndexMap<String, crate::resource::Value>,
+    default_region: &str,
+) -> String {
+    use crate::resource::{ConcreteValue, Value};
+    match attributes.get("region") {
+        Some(Value::Concrete(ConcreteValue::String(s))) => convert_region_value(s),
+        Some(Value::Concrete(ConcreteValue::EnumIdentifier(s))) => convert_region_value(s),
+        _ => default_region.to_string(),
+    }
+}
+
 /// Build the canonical address for a map-iteration key — used at every
 /// `for ... in <map>` emit site. Identifier-safe keys produce
 /// `binding.key`; everything else is single-quoted so the outer
@@ -1741,6 +1788,69 @@ mod tests {
             // even when the value would resolve for the enum directly.
             let union_t = AttributeType::Union(vec![versioning_status(), AttributeType::String]);
             assert_eq!(resolve_enum_value_recursive(&s("Enabled"), &union_t), None);
+        }
+    }
+
+    /// carina#3021: `extract_region_from_attrs` is the canonical answer
+    /// to "what SDK region does this provider config want". Every
+    /// `ProviderFactory::extract_region` implementation should
+    /// delegate to it, so a single match-arm coverage test here is
+    /// what protects every downstream caller.
+    mod extract_region_from_attrs_tests {
+        use super::super::extract_region_from_attrs;
+        use crate::resource::{ConcreteValue, Value};
+        use indexmap::IndexMap;
+
+        fn attrs_with_region(value: Value) -> IndexMap<String, Value> {
+            let mut m = IndexMap::new();
+            m.insert("region".to_string(), value);
+            m
+        }
+
+        #[test]
+        fn enum_identifier_namespaced_form() {
+            let attrs = attrs_with_region(Value::Concrete(ConcreteValue::EnumIdentifier(
+                "aws.Region.us_east_1".to_string(),
+            )));
+            assert_eq!(
+                extract_region_from_attrs(&attrs, "ap-northeast-1"),
+                "us-east-1"
+            );
+        }
+
+        #[test]
+        fn string_aws_sdk_form() {
+            let attrs = attrs_with_region(Value::Concrete(ConcreteValue::String(
+                "us-east-1".to_string(),
+            )));
+            assert_eq!(
+                extract_region_from_attrs(&attrs, "ap-northeast-1"),
+                "us-east-1"
+            );
+        }
+
+        #[test]
+        fn string_namespaced_form() {
+            // Users sometimes write `region = "aws.Region.us_east_1"` —
+            // quoted-string spelling. The canonicalizer must still
+            // reduce it to the SDK form, matching the EnumIdentifier
+            // path.
+            let attrs = attrs_with_region(Value::Concrete(ConcreteValue::String(
+                "aws.Region.us_east_1".to_string(),
+            )));
+            assert_eq!(
+                extract_region_from_attrs(&attrs, "ap-northeast-1"),
+                "us-east-1"
+            );
+        }
+
+        #[test]
+        fn missing_region_returns_default() {
+            let attrs: IndexMap<String, Value> = IndexMap::new();
+            assert_eq!(
+                extract_region_from_attrs(&attrs, "ap-northeast-1"),
+                "ap-northeast-1"
+            );
         }
     }
 }
