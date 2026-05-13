@@ -6,7 +6,7 @@
 
 Let users declare **multiple instances of the same provider kind** in a single
 Carina configuration, distinguished by a name, and route a managed resource
-to a specific instance via `provider = <binding>`.
+to a specific instance via `directives { provider = <binding> }`.
 
 The immediate driver is `carina-rs/infra` T6c (the registry usecase): AWS
 requires CloudFront viewer certificates to live in `us-east-1`, but the
@@ -134,14 +134,18 @@ let us = provider aws {
 }
 
 aws.acm.Certificate {
-  provider = us
   domain_name = 'registry.carina-rs.dev'
   validation_method = aws.acm.ValidationMethod.Dns
+  directives {
+    provider = us
+  }
 }
 
 let cert = aws.acm.Certificate {
-  provider = us
   domain_name = 'registry.carina-rs.dev'
+  directives {
+    provider = us
+  }
 }
 ```
 
@@ -149,6 +153,29 @@ let cert = aws.acm.Certificate {
 already-registered `aws` kind. `region` is an instance-level attribute;
 `source` / `version` / `revision` are **not allowed here** — they are
 kind-level (see "Errors" below).
+
+### Why the provider reference lives inside `directives { ... }`
+
+Two reasons:
+
+1. **`provider` is Carina-internal, not a provider-API attribute.** The
+   value selects which `ProviderInstance` runs the resource — it never
+   reaches the AWS / awscc API call. `directives { ... }` is already
+   defined (#2826) as the block for **directives to the Carina
+   runtime**, and existing entries (`depends_on`,
+   `create_before_destroy`, `prevent_destroy`, `force_delete`) all share
+   that same property. The provider reference fits the same category.
+2. **No attribute-name collision risk with provider schemas.** Resource
+   schemas evolve independently in `carina-provider-aws` and
+   `carina-provider-awscc`. Reserving `provider` as a top-level
+   resource attribute would require every provider to permanently keep
+   that key out of its schema. Routing it through `directives`
+   sidesteps the contract — `directives { ... }` is a closed Carina
+   vocabulary that providers do not see.
+
+The resource's `directives` block is already stripped before the
+resource attributes are passed to the provider, so no provider-plugin
+change is needed to "filter out" the `provider` key.
 
 ### Kind registration with no default instance
 
@@ -164,14 +191,21 @@ provider aws {
 let tokyo    = provider aws { region = aws.Region.ap_northeast_1 }
 let virginia = provider aws { region = aws.Region.us_east_1 }
 
-aws.acm.Certificate { provider = virginia, ... }   // OK
-aws.s3.Bucket { ... }                              // ERROR: no default
+aws.acm.Certificate {
+  domain_name = '...'
+  directives { provider = virginia }
+}   // OK
+
+aws.s3.Bucket {
+  bucket_name = '...'
+}   // ERROR: no default
 ```
 
 A kind block whose only fields are `source` / `version` / `revision`
 registers the kind but does **not** materialise a default instance.
-Resources without an explicit `provider = ...` that map to a kind with
-no default instance produce a validation error (see "Errors").
+Resources whose `directives { ... }` lacks a `provider = <instance>`
+key and whose kind has no default instance produce a validation error
+(see "Errors").
 
 ## Grammar
 
@@ -196,10 +230,12 @@ distinguished by position: a top-level statement is a `provider_block`
 `provider_expr` (named instance only). This mirrors the
 `upstream_state_expr` / `wait_expr` precedent.
 
-The `provider` attribute on resources reuses the existing `attribute`
-rule — the value is a bare identifier, just like any other binding
-reference (`provider = us`). No grammar change needed on the resource
-side.
+The `provider` reference on a resource is an attribute *inside the
+existing `directives { ... }` block*; nothing new at the grammar level.
+`directives` is already an arbitrary `attribute*` body, so
+`directives { provider = us }` parses today without any rule changes —
+all the work is post-parse in the directives-attribute validator and
+in the resolver (Phase 3).
 
 ## AST / data model
 
@@ -278,37 +314,44 @@ single-struct shape can only enforce at runtime:
    cannot accidentally read `source` from an instance.
 
 2. **A resource references a `ProviderInstance`, never a
-   `ProviderKind`.** Resolution from `provider = us` to the actual
-   instance is typed: `Resource.provider_instance: Option<InstanceRef>`
-   where `InstanceRef` resolves to a `&ProviderInstance`. The plugin
-   host loads `N` instances per kind and routes by instance.
+   `ProviderKind`.** Resolution from `directives { provider = us }` to
+   the actual instance is typed:
+   `Resource.directives.provider_instance: Option<InstanceRef>` where
+   `InstanceRef` resolves to a `&ProviderInstance`. The plugin host
+   loads `N` instances per kind and routes by instance.
 
 ### Resource side
 
+The existing `Directives` struct gains a new field. It joins
+`depends_on`, `create_before_destroy`, etc. — all Carina-runtime
+directives, none of which are passed to the provider plugin.
+
 ```rust
-pub struct Resource {
+pub struct Directives {
     // existing fields ...
-    /// Binding name of the provider instance to use. `None` means
-    /// "default instance for the resource's kind". Resolved to a
-    /// concrete `ProviderInstance` during the parser's post-resolve
-    /// phase.
+    /// Binding name of the provider instance to route this resource
+    /// to. `None` means "default instance for the resource's kind".
+    /// Resolved to a concrete `ProviderInstance` during the parser's
+    /// post-resolve phase.
     pub provider_instance: Option<String>,
 }
 ```
 
-The DSL surface `provider = <ident>` is captured as a string at parse
-time (same as any binding reference) and resolved alongside other
-forward-references in the resolver pass.
+The DSL surface `directives { provider = <ident> }` is captured as a
+string at parse time (same as any binding reference) and resolved
+alongside other forward-references in the resolver pass. From the
+parser's perspective it is just another known key on the directives
+attribute set.
 
 ## Resolution rules
 
 | Resource shape | Effective instance |
 | -------------- | ------------------ |
-| `aws.acm.Certificate { ... }` with no `provider = ...` | The default instance for kind `aws` (the instance materialised by the top-level `provider aws { ... }` block, if any). |
-| `aws.acm.Certificate { provider = us, ... }` | The instance bound to `us`. Its kind must match the resource's kind (`aws`). |
-| Kind has no default instance and resource omits `provider = ...` | Validation error: `aws.acm.Certificate requires an explicit provider = <instance>; kind 'aws' has no default instance`. |
-| `provider = <binding>` where binding is not a provider instance | Validation error: `'<binding>' is not a provider instance`. |
-| `provider = <binding>` where binding's kind ≠ resource's kind | Validation error: `provider instance '<binding>' has kind '<X>', not '<Y>'`. |
+| `aws.acm.Certificate { ... }` with no `directives.provider` | The default instance for kind `aws` (the instance materialised by the top-level `provider aws { ... }` block, if any). |
+| `aws.acm.Certificate { ..., directives { provider = us } }` | The instance bound to `us`. Its kind must match the resource's kind (`aws`). |
+| Kind has no default instance and resource omits `directives.provider` | Validation error: `aws.acm.Certificate requires an explicit directives { provider = <instance> }; kind 'aws' has no default instance`. |
+| `directives { provider = <binding> }` where binding is not a provider instance | Validation error: `'<binding>' is not a provider instance`. |
+| `directives { provider = <binding> }` where binding's kind ≠ resource's kind | Validation error: `provider instance '<binding>' has kind '<X>', not '<Y>'`. |
 
 ## Plugin host changes
 
@@ -360,10 +403,14 @@ docs.
 
 ## LSP
 
-- **Completion**: `provider = ` on a resource of kind `X` completes
-  every `ProviderInstance` whose kind is `X`.
+- **Completion**: inside `directives { ... }` on a resource of kind `X`,
+  `provider = ` completes every `ProviderInstance` whose kind is `X`.
+  `provider` itself is also a completion candidate as a directives key
+  once any named instances are declared.
 - **Semantic tokens**: `provider` in `let us = provider aws { ... }`
   gets the same token type as `provider` in the top-level statement.
+  Inside `directives { ... }` the `provider` key is a directives keyword
+  (same token class as `depends_on`).
 - **Diagnostics**: every resolution-rule error in the table above
   surfaces as an LSP diagnostic. `source` / `version` / `revision` in a
   `let x = provider <kind> { ... }` body produces a "field not allowed
@@ -408,7 +455,7 @@ issue is:
 
 1. Write the `us-east-1` named instance into the registry stack.
 2. `aws-vault exec ... carina plan ./registry/dev/registry/` succeeds
-   without "Syntax error at (provider = aws.us)" or equivalent.
+   without parser errors at the `directives { provider = us }` site.
 3. The plan correctly schedules `aws.acm.Certificate` against the
    `us-east-1` AWS endpoint and the validation `route53.RecordSet`
    against `ap-northeast-1`.
@@ -431,14 +478,31 @@ this design PR merges before any implementation PR opens.
    everything still parses as before. Acceptance: workspace nextest
    green, real-infra `carina plan` byte-identical.
 2. **Phase 2 — Grammar + parser for `let x = provider <kind> { ... }`.**
-   The parser accepts the new form; `Resource.provider_instance` field
-   added but always `None` until phase 3. Acceptance: parser tests
-   covering both forms; named instances visible in `File.provider_instances`.
-3. **Phase 3 — Resource `provider = <ident>` resolution.** The
-   resolver routes resources to instances; differ + executor consume
-   the resolved binding. Acceptance: existing real-infra unchanged
-   (every resource resolves to the default instance); a new fixture
-   under `carina-cli/tests/fixtures/plan_display/` exercises the
+   The parser accepts the new form. `ProviderConfig` gains the
+   `binding` / `is_default` fields needed to distinguish kind-default
+   from named instances. `Directives.provider_instance` field added but
+   always `None` until phase 3. Acceptance: parser tests covering both
+   forms (top-level kind block, `let` named instance); multi-file
+   directory fixture; ProviderConfig roundtrip preserves the new fields.
+
+   *Implementation note (chosen after design PR):* Phase 1 ("AST split
+   to `ProviderKind` + `ProviderInstance`") is merged into Phase 3
+   instead of running first. The split's invariants ("`source` only on
+   kinds, `Resource` only references `ProviderInstance`") are
+   load-bearing only once Phase 3 lands; pre-splitting them is 17-file
+   churn that adds zip/re-merge boilerplate downstream without paying
+   off until later. Phase 2 adds two narrow fields to `ProviderConfig`
+   that Phase 3 will replace by the full split in one move.
+3. **Phase 3 — `directives.provider` resolution + AST split.** The
+   resolver reads `directives { provider = <ident> }` and binds each
+   resource to a concrete `ProviderInstance`. At the same time,
+   `ProviderConfig` is split into `ProviderKind` + `ProviderInstance`
+   (the invariants become load-bearing here: a resource references an
+   instance, not a kind; `source` lives only on kinds). The differ +
+   executor consume the resolved instance reference. Acceptance:
+   existing real-infra unchanged (every resource resolves to the
+   default instance); a new fixture under
+   `carina-cli/tests/fixtures/plan_display/` exercises the
    multi-instance path.
 4. **Phase 4 — Plugin host multi-instance store.** `carina-plugin-host`
    manages per-instance stores. Acceptance: integration test loads two
@@ -454,11 +518,12 @@ this design PR merges before any implementation PR opens.
 
 ## Open questions
 
-1. **How does `provider = <ident>` interact with `directives { depends_on = [...] }`?**
-   Implicit dependency edge: a resource depends on its provider instance's
-   binding. The current code path treats the instance binding as a normal
-   `let` binding; this should just work, but Phase 4 needs an explicit
-   test.
+1. **How does `directives { provider = <ident> }` interact with
+   `directives { depends_on = [...] }`?** Both live in the same block
+   today. Implicit dependency edge: a resource depends on its provider
+   instance's binding. The current code path treats the instance
+   binding as a normal `let` binding; this should just work, but
+   Phase 4 needs an explicit test.
 2. **Should `let x = provider <kind> { ... }` allow inheriting attributes
    from the kind's default instance?** MVP says no — each instance is a
    complete configuration. Inheritance can be added later
@@ -478,6 +543,8 @@ this design PR merges before any implementation PR opens.
 
 - #2191 — this issue.
 - #2183 — parent (CLOSED, Direction C); supplies the 2-axis model.
+- #2826 — `directives` block design; this proposal extends its
+  vocabulary with the `provider` key.
 - #2825 / `wait` construct — precedent for "kind-labelled positional then
   attribute block as RHS of `let`".
 - `carina-rs/infra` T6c / T6d / T6e — concrete consumer; blocked on this
