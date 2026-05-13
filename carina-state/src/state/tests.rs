@@ -1286,3 +1286,38 @@ fn build_explicit_yields_per_resource_trees() {
     assert!(map.contains_key(&id));
     assert!(matches!(map[&id], ExplicitFields::Struct { .. }));
 }
+
+#[test]
+fn build_directives_keys_include_provider_instance() {
+    // ResourceState carries `directives.provider_instance` through serde
+    // (Phase 3a). The state→ResourceId reconstruction in build_directives
+    // must propagate that binding name into the ResourceId so map lookups
+    // by `ResourceId` match the freshly-parsed key. Without this, two
+    // resources with the same kind/type/name but different instances
+    // collide in `HashMap<ResourceId, _>` (Phase 3b-2a).
+    use carina_core::resource::ResourceId;
+
+    let mut state = StateFile::new();
+    let mut rs = ResourceState::new("s3.Bucket", "shared-name", "aws");
+    rs.directives.provider_instance = Some("us".to_string());
+    state.upsert_resource(rs);
+
+    let map = state.build_directives();
+    let expected = ResourceId::with_provider_and_instance(
+        "aws",
+        "s3.Bucket",
+        "shared-name",
+        Some("us".to_string()),
+    );
+    assert!(
+        map.contains_key(&expected),
+        "build_directives must construct ResourceId with provider_instance, got keys: {:?}",
+        map.keys().collect::<Vec<_>>()
+    );
+    // Without the instance, the legacy ResourceId must NOT match.
+    let legacy = ResourceId::with_provider("aws", "s3.Bucket", "shared-name");
+    assert!(
+        !map.contains_key(&legacy),
+        "ResourceId without provider_instance must not match a Some(_) entry"
+    );
+}

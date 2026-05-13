@@ -110,7 +110,12 @@ pub(crate) fn resolve_exports(
         .resources
         .iter()
         .map(|rs| {
-            let id = ResourceId::with_provider(&rs.provider, &rs.resource_type, &rs.name);
+            let id = ResourceId::with_provider_and_instance(
+                &rs.provider,
+                &rs.resource_type,
+                &rs.name,
+                rs.directives.provider_instance.clone(),
+            );
             let attrs: HashMap<String, Value> = rs
                 .attributes
                 .iter()

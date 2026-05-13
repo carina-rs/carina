@@ -1629,7 +1629,12 @@ fn resolve_import_target(
             if let Some(serde_json::Value::String(s)) = rs.attributes.get(attr)
                 && s == to.name_str()
             {
-                return ResourceId::with_provider(&rs.provider, &rs.resource_type, &rs.name);
+                return ResourceId::with_provider_and_instance(
+                    &rs.provider,
+                    &rs.resource_type,
+                    &rs.name,
+                    rs.directives.provider_instance.clone(),
+                );
             }
         }
     }

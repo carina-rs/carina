@@ -86,6 +86,12 @@ pub struct ResourceId {
     /// All downstream consumers (state, plan, providers) require
     /// `Bound`.
     pub name: ResourceName,
+    /// Binding name of the provider instance this resource is routed
+    /// to. `None` resolves to the kind's default instance.
+    /// Hash/Eq include the field so two resources differing only in
+    /// instance compare unequal (different infrastructure).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_instance: Option<String>,
 }
 
 impl ResourceId {
@@ -94,6 +100,7 @@ impl ResourceId {
             provider: String::new(),
             resource_type: resource_type.into(),
             name: ResourceName::from_string(name.into()),
+            provider_instance: None,
         }
     }
 
@@ -106,6 +113,23 @@ impl ResourceId {
             provider: provider.into(),
             resource_type: resource_type.into(),
             name: ResourceName::from_string(name.into()),
+            provider_instance: None,
+        }
+    }
+
+    /// As [`with_provider`], plus the binding name of the routed
+    /// provider instance (`None` → kind default).
+    pub fn with_provider_and_instance(
+        provider: impl Into<String>,
+        resource_type: impl Into<String>,
+        name: impl Into<String>,
+        provider_instance: Option<String>,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            resource_type: resource_type.into(),
+            name: ResourceName::from_string(name.into()),
+            provider_instance,
         }
     }
 

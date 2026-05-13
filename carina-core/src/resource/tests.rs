@@ -86,6 +86,7 @@ fn resource_id_pending_serde_round_trips_as_empty_string() {
         provider: "aws".to_string(),
         resource_type: "ec2.Subnet".to_string(),
         name: ResourceName::Pending,
+        provider_instance: None,
     };
     let json = serde_json::to_string(&id).unwrap();
     assert!(json.contains("\"name\":\"\""), "got: {json}");
@@ -118,6 +119,7 @@ fn resource_id_rename_pending_to_bound() {
         provider: "aws".to_string(),
         resource_type: "ec2.Subnet".to_string(),
         name: ResourceName::Pending,
+        provider_instance: None,
     };
     // The post-pass converts Pending → Bound with the extracted name.
     id.set_name("app-subnet".to_string());

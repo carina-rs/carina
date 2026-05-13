@@ -19,6 +19,12 @@ use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
 ///
 /// This is the shared result type used by `execute_basic_effect` to avoid
 /// duplicating effect dispatch logic across sequential and phased paths.
+///
+/// `Success` carries `Option<State>` (typically the dominant variant); the
+/// size disparity with `Failure` / `Deleted` is intentional because
+/// success is the common path and boxing it would add an allocation per
+/// effect on the hot path.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum BasicEffectResult {
     Success {
         state: Option<State>,
