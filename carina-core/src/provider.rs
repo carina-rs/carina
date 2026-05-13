@@ -771,21 +771,32 @@ pub trait ProviderFactory: Send + Sync {
 
     /// Create a provider instance from configuration attributes.
     ///
+    /// `binding` is the `let <name> = provider <kind> { ... }` binding
+    /// name when this call instantiates a named instance, or `None`
+    /// when it instantiates the kind's default instance. The host
+    /// uses it as a cache key so multiple named instances of the same
+    /// kind do not collapse onto a single shared WASM instance.
+    /// Provider implementations are free to ignore it.
+    ///
     /// Returns `Err(ProviderError)` when the provider rejects the
     /// supplied configuration (e.g., an `allowed_account_ids` mismatch
     /// detected during `init`). Callers MUST surface the inner message
     /// verbatim — it is the user-facing error text.
     fn create_provider(
         &self,
+        binding: Option<&str>,
         attributes: &IndexMap<String, Value>,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>>;
 
     /// Create a normalizer instance from configuration attributes.
     ///
-    /// Returns a [`NoopNormalizer`] by default. Providers that need
-    /// plan-time normalization or state hydration should override this.
+    /// `binding` semantics match [`create_provider`]: `Some(name)` for
+    /// a named instance, `None` for the kind's default. Returns a
+    /// [`NoopNormalizer`] by default. Providers that need plan-time
+    /// normalization or state hydration should override this.
     fn create_normalizer(
         &self,
+        _binding: Option<&str>,
         _attributes: &IndexMap<String, Value>,
     ) -> BoxFuture<'_, Box<dyn ProviderNormalizer>> {
         Box::pin(async { Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer> })
@@ -1630,6 +1641,7 @@ mod tests {
             }
             fn create_provider(
                 &self,
+                _binding: Option<&str>,
                 _attrs: &IndexMap<String, Value>,
             ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
                 Box::pin(async {
@@ -1646,7 +1658,7 @@ mod tests {
         }
 
         let factory = FailingFactory;
-        let result = factory.create_provider(&IndexMap::new()).await;
+        let result = factory.create_provider(None, &IndexMap::new()).await;
         let err = match result {
             Ok(_) => panic!("create_provider must surface the init error"),
             Err(e) => e,
@@ -1668,6 +1680,81 @@ mod tests {
         assert!(
             !msg.contains("panicked"),
             "must not surface panic framing: {msg}"
+        );
+    }
+
+    /// carina#2191 Phase 4: every `ProviderFactory::create_provider`
+    /// implementation must receive the `binding` argument and have the
+    /// opportunity to vary its returned provider per binding. The
+    /// `WasmProviderFactory` uses this as a cache key to keep one
+    /// `SharedWasmInstance` per named instance; this in-memory test
+    /// covers the trait-level contract.
+    #[tokio::test]
+    async fn provider_factory_create_provider_receives_binding() {
+        use std::sync::Arc;
+        use std::sync::Mutex as StdMutex;
+
+        use crate::schema::ResourceSchema;
+
+        #[derive(Default)]
+        struct BindingCapturingFactory {
+            calls: Arc<StdMutex<Vec<Option<String>>>>,
+        }
+
+        impl ProviderFactory for BindingCapturingFactory {
+            fn name(&self) -> &str {
+                "capture"
+            }
+            fn display_name(&self) -> &str {
+                "Capturing provider"
+            }
+            fn provider_config_attribute_types(
+                &self,
+            ) -> HashMap<String, crate::schema::AttributeType> {
+                HashMap::new()
+            }
+            fn validate_config(&self, _attrs: &IndexMap<String, Value>) -> Result<(), String> {
+                Ok(())
+            }
+            fn extract_region(&self, _attrs: &IndexMap<String, Value>) -> String {
+                "ap-northeast-1".to_string()
+            }
+            fn create_provider(
+                &self,
+                binding: Option<&str>,
+                _attrs: &IndexMap<String, Value>,
+            ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(binding.map(|s| s.to_string()));
+                Box::pin(async { Ok(Box::new(MockProvider) as Box<dyn Provider>) })
+            }
+            fn schemas(&self) -> Vec<ResourceSchema> {
+                Vec::new()
+            }
+        }
+
+        let factory = BindingCapturingFactory::default();
+        let _ = factory
+            .create_provider(None, &IndexMap::new())
+            .await
+            .unwrap();
+        let _ = factory
+            .create_provider(Some("us"), &IndexMap::new())
+            .await
+            .unwrap();
+        let _ = factory
+            .create_provider(Some("tokyo"), &IndexMap::new())
+            .await
+            .unwrap();
+
+        let calls = factory.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![None, Some("us".to_string()), Some("tokyo".to_string())],
+            "factory must observe each binding distinctly so it can key per-instance state \
+             (cache the WASM instance / hand back independent providers)"
         );
     }
 

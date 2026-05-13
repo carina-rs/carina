@@ -48,12 +48,14 @@ impl ProviderFactory for WaitTestFactory {
     }
     fn create_provider(
         &self,
+        _binding: Option<&str>,
         _attributes: &IndexMap<String, Value>,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
         Box::pin(async { Ok(Box::new(NoopProvider) as Box<dyn Provider>) })
     }
     fn create_normalizer(
         &self,
+        _binding: Option<&str>,
         _attributes: &IndexMap<String, Value>,
     ) -> BoxFuture<'_, Box<dyn ProviderNormalizer>> {
         Box::pin(async { Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer> })

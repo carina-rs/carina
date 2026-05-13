@@ -822,10 +822,16 @@ pub struct WasmProviderFactory {
     /// Reusable WASM instance from factory initialization.
     /// Used by `validate_config()` to avoid creating a throwaway instance.
     init_instance: Mutex<(Store<HostState>, WasmBindings)>,
-    /// Lazily created shared instance for provider + normalizer.
-    /// The first call to `create_provider` or `create_normalizer` creates
-    /// the instance; the second reuses it via `Arc`.
-    shared_instance: Mutex<Option<Arc<SharedWasmInstance>>>,
+    /// Lazily created shared instances for provider + normalizer, keyed
+    /// by binding name. `None` is the kind's default instance;
+    /// `Some(name)` is a named instance (`let <name> = provider <kind>
+    /// { ... }`). The first call for a given key creates the instance;
+    /// subsequent calls reuse it via `Arc`. Keeping a per-binding entry
+    /// is what makes carina#2191 routing work end-to-end — collapsing
+    /// every binding onto a single shared instance would pin each kind
+    /// to the first instance's attributes (e.g. region) regardless of
+    /// what later instances configure.
+    shared_instances: Mutex<HashMap<Option<String>, Arc<SharedWasmInstance>>>,
     /// Background thread that ticks the epoch counter for timeout enforcement.
     /// Kept alive for the lifetime of the factory; dropped automatically.
     _epoch_ticker: EpochTicker,
@@ -1017,7 +1023,7 @@ impl WasmProviderFactory {
             cached_provider_config_types,
             enable_http,
             init_instance: Mutex::new((store, bindings)),
-            shared_instance: Mutex::new(None),
+            shared_instances: Mutex::new(HashMap::new()),
             _epoch_ticker: epoch_ticker,
         })
     }
@@ -1125,7 +1131,7 @@ impl WasmProviderFactory {
             cached_provider_config_types,
             enable_http,
             init_instance: Mutex::new((store, bindings)),
-            shared_instance: Mutex::new(None),
+            shared_instances: Mutex::new(HashMap::new()),
             _epoch_ticker: epoch_ticker,
         })
     }
@@ -1164,17 +1170,23 @@ impl WasmProviderFactory {
         Ok((store, bindings))
     }
 
-    /// Get or create the shared WASM instance for provider + normalizer.
+    /// Get or create the shared WASM instance for the given binding's
+    /// provider + normalizer pair.
     ///
-    /// The first call creates and initializes a new instance; subsequent calls
-    /// return an `Arc` to the same instance. This avoids creating two separate
-    /// WASM instances for the provider and normalizer.
+    /// The first call for a `binding` key creates and initializes a new
+    /// instance; subsequent calls for the same key return an `Arc` to
+    /// the same instance. Different bindings (e.g. `None` for the kind
+    /// default and `Some("us")` for a named instance) deliberately get
+    /// distinct instances — that is what makes per-instance config
+    /// (region, credentials, etc.) survive into runtime calls.
     async fn get_or_create_shared_instance(
         &self,
+        binding: Option<&str>,
         attributes: &IndexMap<String, Value>,
     ) -> Result<Arc<SharedWasmInstance>, String> {
-        let mut guard = self.shared_instance.lock().await;
-        if let Some(ref instance) = *guard {
+        let key: Option<String> = binding.map(|s| s.to_string());
+        let mut guard = self.shared_instances.lock().await;
+        if let Some(instance) = guard.get(&key) {
             return Ok(Arc::clone(instance));
         }
         let (store, bindings) = self.create_initialized_instance(attributes).await?;
@@ -1182,7 +1194,7 @@ impl WasmProviderFactory {
             store: Mutex::new(store),
             bindings,
         });
-        *guard = Some(Arc::clone(&instance));
+        guard.insert(key, Arc::clone(&instance));
         Ok(instance)
     }
 }
@@ -1302,9 +1314,11 @@ impl ProviderFactory for WasmProviderFactory {
 
     fn create_provider(
         &self,
+        binding: Option<&str>,
         attributes: &IndexMap<String, Value>,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
         let attrs = attributes.clone();
+        let binding = binding.map(|s| s.to_string());
         Box::pin(async move {
             // Surface the inner error string verbatim — it carries the
             // user-actionable message (e.g. allowed_account_ids
@@ -1312,7 +1326,7 @@ impl ProviderFactory for WasmProviderFactory {
             // wrapper prefix here would leak the WASM hosting detail
             // into the user-facing error (see #2407).
             let instance = self
-                .get_or_create_shared_instance(&attrs)
+                .get_or_create_shared_instance(binding.as_deref(), &attrs)
                 .await
                 .map_err(ProviderError::invalid_input)?;
             Ok(Box::new(WasmProvider {
@@ -1324,11 +1338,16 @@ impl ProviderFactory for WasmProviderFactory {
 
     fn create_normalizer(
         &self,
+        binding: Option<&str>,
         attributes: &IndexMap<String, Value>,
     ) -> BoxFuture<'_, Box<dyn ProviderNormalizer>> {
         let attrs = attributes.clone();
+        let binding = binding.map(|s| s.to_string());
         Box::pin(async move {
-            match self.get_or_create_shared_instance(&attrs).await {
+            match self
+                .get_or_create_shared_instance(binding.as_deref(), &attrs)
+                .await
+            {
                 Ok(instance) => {
                     Box::new(WasmProviderNormalizer { instance }) as Box<dyn ProviderNormalizer>
                 }
