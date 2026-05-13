@@ -270,6 +270,12 @@ upstream_state_expr = {
     kw_upstream_state ~ trivia* ~ open_brace ~ block_content* ~ close_brace
 }
 
+// Provider expression: provider <kind> { ... }
+// Used as the RHS of a `let` binding to declare a named provider instance.
+provider_expr = {
+    kw_provider ~ trivia+ ~ identifier ~ trivia* ~ open_brace ~ block_content* ~ close_brace
+}
+
 // Wait expression: wait <target> { until = ..., depends_on = [...], timeout = ... }
 // Mirrors carina.pest:wait_expr. The body is a sequence of `wait_attr`
 // terms; the formatter walks them with the same one-attribute-per-line
@@ -300,6 +306,7 @@ primary = {
     read_resource_expr
   | wait_expr
   | upstream_state_expr
+  | provider_expr        // must precede module_call-like fallbacks
   | resource_expr
   | for_expr
   | if_expr

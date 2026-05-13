@@ -1035,6 +1035,8 @@ mod tests {
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
             unresolved_attributes: IndexMap::new(),
+            binding: None,
+            is_default: true,
         }
     }
 
@@ -1383,6 +1385,8 @@ sha256 = "abc"
             version: None,
             revision: None,
             unresolved_attributes: IndexMap::new(),
+            binding: None,
+            is_default: true,
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
         }];
@@ -1409,6 +1413,8 @@ sha256 = "abc"
             version: None,
             revision: None,
             unresolved_attributes: IndexMap::new(),
+            binding: None,
+            is_default: true,
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
         }];
@@ -1507,6 +1513,8 @@ sha256 = "abc"
             ),
             revision: None,
             unresolved_attributes: IndexMap::new(),
+            binding: None,
+            is_default: true,
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
         }
@@ -1679,6 +1687,8 @@ sha256 = "abc"
             version: None,
             revision: None,
             unresolved_attributes: IndexMap::new(),
+            binding: None,
+            is_default: true,
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
         };

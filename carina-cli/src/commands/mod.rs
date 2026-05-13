@@ -595,8 +595,9 @@ mod tests {
             version: None,
             revision: None,
             unresolved_attributes: IndexMap::new(),
+            binding: None,
+            is_default: true,
         });
-
         let base_dir = std::path::Path::new("/tmp/nonexistent-carina-test");
         let result = validate_and_resolve_with_config(&mut parsed, base_dir, false);
 
@@ -628,8 +629,9 @@ mod tests {
             version: None,
             revision: None,
             unresolved_attributes: IndexMap::new(),
+            binding: None,
+            is_default: true,
         });
-
         let base_dir = std::path::Path::new("/tmp/nonexistent-carina-test");
         let result = validate_and_resolve_with_config(&mut parsed, base_dir, false);
 

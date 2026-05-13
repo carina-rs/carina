@@ -169,6 +169,9 @@ impl<'a> CstBuilder<'a> {
             Rule::upstream_state_expr => Some(CstChild::Node(
                 self.build_node(NodeKind::UpstreamStateExpr, pair),
             )),
+            Rule::provider_expr => Some(CstChild::Node(
+                self.build_node(NodeKind::ProviderExpr, pair),
+            )),
             Rule::wait_expr => Some(CstChild::Node(self.build_node(NodeKind::WaitExpr, pair))),
             Rule::wait_attr => Some(CstChild::Node(self.build_node(NodeKind::WaitAttr, pair))),
             Rule::wait_until_attr => Some(CstChild::Node(

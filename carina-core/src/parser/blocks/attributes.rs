@@ -338,6 +338,7 @@ pub(in crate::parser) fn extract_directives(
                 create_before_destroy,
                 prevent_destroy,
                 depends_on,
+                ..Directives::default()
             });
         }
     }

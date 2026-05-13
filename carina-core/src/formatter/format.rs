@@ -196,6 +196,7 @@ impl Formatter {
             NodeKind::ResourceExpr => self.format_resource_expr(node),
             NodeKind::ReadResourceExpr => self.format_read_resource_expr(node),
             NodeKind::UpstreamStateExpr => self.format_upstream_state_expr(node),
+            NodeKind::ProviderExpr => self.format_provider_expr(node),
             NodeKind::FnDef => self.format_fn_def(node),
             NodeKind::FnParam => self.format_default(node),
             NodeKind::ForExpr => self.format_for_expr(node),
@@ -1687,6 +1688,29 @@ require   port >= 1 && port <= 65535  , "port must be valid"
             "discard pattern `_` must survive formatting. Got:\n{}",
             result
         );
+    }
+
+    /// `let <name> = provider <kind> { ... }` round-trips through the
+    /// formatter without losing the keyword, kind, or body, and is
+    /// idempotent on a second pass.
+    #[test]
+    fn test_format_provider_expr_named_instance() {
+        let input = "let us = provider aws {\n    region = 'us-east-1'\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert!(
+            result.contains("let us = provider aws"),
+            "named provider instance header must be preserved. Got:\n{}",
+            result
+        );
+        assert!(
+            result.contains("region = 'us-east-1'"),
+            "body attribute must be preserved. Got:\n{}",
+            result
+        );
+        // Idempotent.
+        let second = format(&result, &config).unwrap();
+        assert_eq!(result, second, "format must be idempotent");
     }
 
     /// Idempotence for both constructs above.

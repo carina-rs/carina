@@ -213,6 +213,8 @@ fn test_reconcile_anonymous_id_partial_create_only_match() {
         version: None,
         revision: None,
         unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -405,6 +407,8 @@ fn test_anonymous_resource_inside_module_keeps_instance_prefix() {
         version: None,
         revision: None,
         unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
@@ -458,6 +462,8 @@ fn test_anonymous_resource_no_create_only_properties() {
         version: None,
         revision: None,
         unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
@@ -495,6 +501,8 @@ fn test_anonymous_resource_no_create_only_deterministic() {
         version: None,
         revision: None,
         unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
@@ -530,6 +538,8 @@ fn test_anonymous_resource_no_create_only_collision() {
         version: None,
         revision: None,
         unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -577,6 +587,8 @@ fn test_identity_attribute_prevents_collision() {
         version: None,
         revision: None,
         unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -706,6 +718,8 @@ fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
         version: None,
         revision: None,
         unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
@@ -815,6 +829,8 @@ fn test_reconcile_anonymous_id_create_only_exists_but_none_set() {
         version: None,
         revision: None,
         unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1000,6 +1016,8 @@ fn test_reconcile_no_create_only_picks_closest_among_multiple_state_entries() {
         version: None,
         revision: None,
         unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1108,6 +1126,8 @@ fn test_reconcile_no_create_only_same_id_in_state_no_change() {
         version: None,
         revision: None,
         unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1171,6 +1191,8 @@ fn test_compute_anonymous_id_uses_simhash_for_no_create_only() {
         version: None,
         revision: None,
         unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1232,6 +1254,8 @@ fn test_compute_anonymous_id_simhash_vs_create_only_hash_independent() {
         version: None,
         revision: None,
         unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1330,6 +1354,8 @@ fn test_compute_anonymous_id_stable_with_prefixed_create_only_attribute() {
         version: None,
         revision: None,
         unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1373,6 +1399,8 @@ fn test_compute_anonymous_id_different_prefix_produces_different_id() {
         version: None,
         revision: None,
         unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1561,6 +1589,8 @@ fn test_reconcile_eip_tag_update_with_unset_create_only_props() {
         version: None,
         revision: None,
         unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
@@ -2212,6 +2242,8 @@ fn anonymous_identifier_includes_provider_prefix() {
         version: None,
         revision: None,
         unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -2248,6 +2280,8 @@ fn anonymous_identifier_provider_prefix_for_aws_provider() {
         version: None,
         revision: None,
         unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -2280,6 +2314,8 @@ fn reconcile_simhash_match_keeps_new_format_identifier_and_emits_rename() {
         version: None,
         revision: None,
         unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 

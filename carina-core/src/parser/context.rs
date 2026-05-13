@@ -4,7 +4,7 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
-use super::ast::{DeferredForExpression, UpstreamState, UserFunction, WaitBinding};
+use super::ast::{DeferredForExpression, ProviderConfig, UpstreamState, UserFunction, WaitBinding};
 use super::error::{ParseError, ParseWarning};
 use super::{ProviderContext, Rule};
 use crate::eval_value::EvalValue;
@@ -39,6 +39,10 @@ pub(crate) struct ParseContext<'cfg> {
     /// `wait` bindings declared via `let <name> = wait <target> { ... }`
     /// (binding_name -> WaitBinding).
     pub(super) wait_bindings: HashMap<String, WaitBinding>,
+    /// Named provider instances declared via
+    /// `let <name> = provider <kind> { ... }`. Drained into
+    /// `ParsedFile.providers` by the top-level parse loop.
+    pub(super) named_provider_instances: Vec<ProviderConfig>,
     /// Non-fatal warnings collected during parsing
     pub(super) warnings: Vec<ParseWarning>,
     /// Deferred for-expressions collected during parsing
@@ -63,6 +67,7 @@ impl<'cfg> ParseContext<'cfg> {
             structural_bindings: HashSet::new(),
             upstream_states: HashMap::new(),
             wait_bindings: HashMap::new(),
+            named_provider_instances: Vec::new(),
             warnings: Vec::new(),
             deferred_for_expressions: Vec::new(),
             seeded_bindings: HashSet::new(),

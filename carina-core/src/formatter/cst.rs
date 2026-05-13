@@ -77,6 +77,7 @@ pub enum NodeKind {
     ResourceExpr,
     ReadResourceExpr,
     UpstreamStateExpr,
+    ProviderExpr,
     WaitExpr,
     WaitAttr,
     WaitUntilAttr,
