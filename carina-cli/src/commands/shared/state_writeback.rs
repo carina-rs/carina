@@ -148,12 +148,15 @@ pub(crate) fn resolve_exports(
 ///
 /// Returns:
 /// - `Ok(Some(json))` for a representable concrete value
-/// - `Ok(None)` for `Value::Deferred(DeferredValue::Secret)` (state.exports must not embed
-///   plaintext secrets, so exports of secret-typed values are skipped)
+/// - `Ok(None)` for `Value::Deferred(DeferredValue::Secret)` only —
+///   `state.exports` must not embed plaintext secrets, so exports of
+///   secret-typed values are skipped silently. No other variant uses
+///   this skip path.
 /// - `Err(SerializationError)` for variants that should not have
 ///   reached this boundary — the resolver / canonicalize / for-expand
-///   pass should have eliminated them. Surfacing as Err names the
-///   specific resolver bug instead of silently losing the export.
+///   pass should have eliminated them — and for non-finite floats
+///   (`NonFiniteFloat`) which JSON cannot represent. Surfacing as Err
+///   names the specific bug instead of silently losing the export.
 pub(crate) fn dsl_value_to_json(
     value: &carina_core::resource::Value,
 ) -> Result<Option<serde_json::Value>, carina_core::value::SerializationError> {
@@ -168,7 +171,19 @@ pub(crate) fn dsl_value_to_json(
         Value::Concrete(ConcreteValue::Bool(b)) => Ok(Some(serde_json::Value::Bool(*b))),
         Value::Concrete(ConcreteValue::Int(i)) => Ok(Some(serde_json::Value::Number((*i).into()))),
         Value::Concrete(ConcreteValue::Float(f)) => {
-            Ok(serde_json::Number::from_f64(*f).map(serde_json::Value::Number))
+            // Non-finite floats (NaN / +inf / -inf) cannot be represented
+            // in JSON. Surface as `NonFiniteFloat` rather than mapping to
+            // `Ok(None)` — the `Ok(None)` contract is reserved for
+            // `Value::Deferred(DeferredValue::Secret)` skipping, and
+            // silently dropping a non-finite export would hide a real
+            // upstream bug. Mirrors `value_to_json_with_context` in
+            // `carina-core/src/value.rs`. (#2859)
+            let num =
+                serde_json::Number::from_f64(*f).ok_or(SerializationError::NonFiniteFloat {
+                    value: *f,
+                    context: ctx,
+                })?;
+            Ok(Some(serde_json::Value::Number(num)))
         }
         Value::Concrete(ConcreteValue::Duration(d)) => {
             Ok(Some(serde_json::Value::Number((d.as_secs() as i64).into())))
@@ -475,5 +490,45 @@ mod stage4_unknown_err_tests {
             ConcreteValue::String("password".into()),
         ))));
         assert!(matches!(dsl_value_to_json(&v), Ok(None)));
+    }
+
+    /// Non-finite floats (NaN / +inf / -inf) cannot be represented in
+    /// JSON. `dsl_value_to_json` must surface them as
+    /// `SerializationError::NonFiniteFloat` rather than mapping to
+    /// `Ok(None)`, which would silently drop the export. The
+    /// `Ok(None)` skip path is reserved for `DeferredValue::Secret`.
+    /// (#2859)
+    #[test]
+    fn non_finite_float_returns_err() {
+        for f in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let v = Value::Concrete(ConcreteValue::Float(f));
+            let err = dsl_value_to_json(&v).unwrap_err();
+            match err {
+                SerializationError::NonFiniteFloat {
+                    value,
+                    context: SerializationContext::StateWriteback,
+                } => {
+                    // NaN != NaN, so compare via classification.
+                    assert_eq!(
+                        value.is_nan(),
+                        f.is_nan(),
+                        "NaN classification mismatch for {f}"
+                    );
+                    assert_eq!(
+                        value.is_infinite(),
+                        f.is_infinite(),
+                        "infinite classification mismatch for {f}"
+                    );
+                    if f.is_infinite() {
+                        assert_eq!(
+                            value.is_sign_negative(),
+                            f.is_sign_negative(),
+                            "sign mismatch for {f}"
+                        );
+                    }
+                }
+                other => panic!("expected NonFiniteFloat/StateWriteback for {f}, got: {other:?}"),
+            }
+        }
     }
 }
