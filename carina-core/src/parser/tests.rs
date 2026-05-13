@@ -9926,3 +9926,129 @@ fn check_provider_instance_routing_rejects_non_provider_let_binding() {
         "error should clarify that `role` is not a provider instance, got: {msg}"
     );
 }
+
+#[test]
+fn parser_propagates_directives_provider_instance_to_resource_id() {
+    let src = r#"
+        provider aws {
+            source = "github.com/carina-rs/carina-provider-aws"
+            version = "0.1.0"
+            region = "ap-northeast-1"
+        }
+        let us = provider aws { region = "us-east-1" }
+        let cert = aws.acm.Certificate {
+            domain_name = "registry.carina-rs.dev"
+            directives { provider = us }
+        }
+        aws.s3.Bucket {
+            bucket_name = "x"
+            directives { provider = us }
+        }
+        aws.s3.Bucket {
+            bucket_name = "default-region"
+        }
+    "#;
+    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let cert = parsed
+        .resources
+        .iter()
+        .find(|r| r.id.name.as_str() == "cert")
+        .expect("cert binding");
+    assert_eq!(
+        cert.id.provider_instance.as_deref(),
+        Some("us"),
+        "let-bound resource must propagate `directives.provider` to ResourceId.provider_instance"
+    );
+    let anon_x = parsed
+        .resources
+        .iter()
+        .find(|r| {
+            matches!(
+                r.attributes.get("bucket_name"),
+                Some(Value::Concrete(ConcreteValue::String(s))) if s == "x"
+            )
+        })
+        .expect("anonymous bucket with provider directive");
+    assert_eq!(
+        anon_x.id.provider_instance.as_deref(),
+        Some("us"),
+        "anonymous resource must propagate `directives.provider` to ResourceId.provider_instance"
+    );
+    let anon_default = parsed
+        .resources
+        .iter()
+        .find(|r| {
+            matches!(
+                r.attributes.get("bucket_name"),
+                Some(Value::Concrete(ConcreteValue::String(s))) if s == "default-region"
+            )
+        })
+        .expect("anonymous bucket without directive");
+    assert!(
+        anon_default.id.provider_instance.is_none(),
+        "resource without directive must keep ResourceId.provider_instance = None"
+    );
+}
+
+#[test]
+fn resource_id_provider_instance_round_trips_serde() {
+    use crate::resource::{ResourceId, ResourceName};
+    let id = ResourceId {
+        provider: "aws".to_string(),
+        resource_type: "s3.Bucket".to_string(),
+        name: ResourceName::Bound("x".to_string()),
+        provider_instance: Some("us".to_string()),
+    };
+    let json = serde_json::to_string(&id).unwrap();
+    assert!(
+        json.contains("\"provider_instance\":\"us\""),
+        "Some(binding) must serialize, got: {json}"
+    );
+    let back: ResourceId = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.provider_instance.as_deref(), Some("us"));
+}
+
+#[test]
+fn resource_id_provider_instance_default_skipped_in_serde() {
+    use crate::resource::{ResourceId, ResourceName};
+    let id = ResourceId {
+        provider: "aws".to_string(),
+        resource_type: "s3.Bucket".to_string(),
+        name: ResourceName::Bound("x".to_string()),
+        provider_instance: None,
+    };
+    let json = serde_json::to_string(&id).unwrap();
+    assert!(
+        !json.contains("provider_instance"),
+        "None must be skipped to keep legacy state files clean, got: {json}"
+    );
+    // Deserialise legacy ResourceId JSON (no provider_instance field).
+    let legacy = r#"{"provider":"aws","resource_type":"s3.Bucket","name":"x"}"#;
+    let id: ResourceId = serde_json::from_str(legacy).unwrap();
+    assert!(id.provider_instance.is_none());
+}
+
+#[test]
+fn resource_id_provider_instance_makes_distinct_ids() {
+    // Same kind/type/name but different instances must compare unequal
+    // so HashMap<ResourceId, _> treats them as separate resources.
+    use crate::resource::{ResourceId, ResourceName};
+    let tokyo = ResourceId {
+        provider: "aws".to_string(),
+        resource_type: "s3.Bucket".to_string(),
+        name: ResourceName::Bound("x".to_string()),
+        provider_instance: None,
+    };
+    let us = ResourceId {
+        provider: "aws".to_string(),
+        resource_type: "s3.Bucket".to_string(),
+        name: ResourceName::Bound("x".to_string()),
+        provider_instance: Some("us".to_string()),
+    };
+    assert_ne!(tokyo, us, "instances differ → ResourceId differs");
+    use std::collections::HashMap;
+    let mut map: HashMap<ResourceId, ()> = HashMap::new();
+    map.insert(tokyo.clone(), ());
+    map.insert(us.clone(), ());
+    assert_eq!(map.len(), 2);
+}

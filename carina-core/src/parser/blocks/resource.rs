@@ -52,7 +52,12 @@ pub(in crate::parser) fn parse_anonymous_resource(
     // Extract directives block from attributes (it's a meta-argument, not a real attribute)
     let directives = extract_directives(&mut attributes)?;
 
-    let id = ResourceId::with_provider(provider, resource_type, resource_name);
+    let id = ResourceId::with_provider_and_instance(
+        provider,
+        resource_type,
+        resource_name,
+        directives.provider_instance.clone(),
+    );
 
     Ok(Resource {
         id,
@@ -219,7 +224,12 @@ pub(crate) fn parse_resource_expr(
         Value::Concrete(ConcreteValue::String(namespaced_type.clone())),
     );
 
-    let id = ResourceId::with_provider(provider, resource_type, resource_name);
+    let id = ResourceId::with_provider_and_instance(
+        provider,
+        resource_type,
+        resource_name,
+        directives.provider_instance.clone(),
+    );
 
     Ok(Resource {
         id,
@@ -271,7 +281,12 @@ pub(crate) fn parse_read_resource_expr(
         Value::Concrete(ConcreteValue::String(namespaced_type.clone())),
     );
 
-    let id = ResourceId::with_provider(provider, resource_type, resource_name);
+    let id = ResourceId::with_provider_and_instance(
+        provider,
+        resource_type,
+        resource_name,
+        directives.provider_instance.clone(),
+    );
 
     Ok(Resource {
         id,

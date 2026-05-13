@@ -359,6 +359,8 @@ fn build_plan_from_state(state: &StateFile) -> Plan {
     let mut plan = Plan::new();
     for rs in &state.resources {
         let mut resource = Resource::with_provider(&rs.provider, &rs.resource_type, &rs.name);
+        resource.id.provider_instance = rs.directives.provider_instance.clone();
+        resource.directives = rs.directives.clone();
 
         // Set typed metadata fields from state
         resource.binding = rs.binding.clone();
@@ -698,7 +700,12 @@ pub(crate) async fn run_state_refresh_locked(
             sf.resources
                 .iter()
                 .filter_map(|rs| {
-                    let id = ResourceId::with_provider(&rs.provider, &rs.resource_type, &rs.name);
+                    let id = ResourceId::with_provider_and_instance(
+                        &rs.provider,
+                        &rs.resource_type,
+                        &rs.name,
+                        rs.directives.provider_instance.clone(),
+                    );
                     if desired_ids.contains(&id) {
                         return None;
                     }

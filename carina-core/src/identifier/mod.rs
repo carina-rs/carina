@@ -535,7 +535,13 @@ pub fn compute_anonymous_identifiers(
     for (idx, identifier) in computed {
         let provider = resources[idx].id.provider.clone();
         let resource_type = resources[idx].id.resource_type.clone();
-        resources[idx].id = ResourceId::with_provider(&provider, &resource_type, identifier);
+        let provider_instance = resources[idx].id.provider_instance.clone();
+        resources[idx].id = ResourceId::with_provider_and_instance(
+            &provider,
+            &resource_type,
+            identifier,
+            provider_instance,
+        );
     }
 
     Ok(())
@@ -673,10 +679,11 @@ pub fn reconcile_anonymous_identifiers(
         // Only reconcile if there is exactly one partial match (unique best match).
         // Multiple partial matches are ambiguous - skip to avoid rebinding wrong.
         if partial_matches.len() == 1 {
-            resource.id = ResourceId::with_provider(
+            resource.id = ResourceId::with_provider_and_instance(
                 &resource.id.provider,
                 &resource.id.resource_type,
                 partial_matches[0],
+                resource.id.provider_instance.clone(),
             );
         }
     }
@@ -816,8 +823,12 @@ pub fn detect_anonymous_to_named_renames(
         };
 
         if let Some(name) = matched_name {
-            let from =
-                ResourceId::with_provider(&resource.id.provider, &resource.id.resource_type, name);
+            let from = ResourceId::with_provider_and_instance(
+                &resource.id.provider,
+                &resource.id.resource_type,
+                name,
+                resource.id.provider_instance.clone(),
+            );
             renames.push((from, resource.id.clone()));
         }
     }
