@@ -267,58 +267,7 @@ pub(in crate::parser) fn extract_directives(
                 Some(Value::Concrete(ConcreteValue::List(items))) => {
                     let mut names = Vec::with_capacity(items.len());
                     for item in items {
-                        match item {
-                            Value::Deferred(DeferredValue::BindingRef { binding }) => {
-                                // Bare binding identifier — the canonical
-                                // shape after #2847.
-                                names.push(binding.clone());
-                            }
-                            Value::Deferred(DeferredValue::ResourceRef { path }) => {
-                                // `binding.attr` — attribute selectors are
-                                // rejected in MVP (only bare bindings allowed).
-                                return Err(ParseError::InvalidExpression {
-                                    line: 0,
-                                    message: format!(
-                                        "directives.depends_on: list elements must be \
-                                         bare binding identifiers, not attribute \
-                                         selectors (got `{}`)",
-                                        path.binding()
-                                    ),
-                                });
-                            }
-                            Value::Concrete(ConcreteValue::String(name)) => {
-                                // Pre-#2847 indirection marker `${name}`.
-                                // Quoted strings are rejected upstream in
-                                // `check_directives_depends_on_elements`.
-                                let bare = name
-                                    .strip_prefix("${")
-                                    .and_then(|s| s.strip_suffix('}'))
-                                    .unwrap_or(name.as_str());
-                                names.push(bare.to_string());
-                            }
-                            Value::Concrete(ConcreteValue::EnumIdentifier(name)) => {
-                                // Bare identifier reached the directives
-                                // parser before `is_resource_binding` could
-                                // catch it (e.g. forward reference in a
-                                // cycle test, or a typo flagged later by
-                                // `check_identifier_scope`). Phase 3 of
-                                // carina#2986 routes such identifiers into
-                                // `ConcreteValue::EnumIdentifier`; from the
-                                // depends_on perspective the text is still
-                                // the user's intended binding name.
-                                names.push(name.clone());
-                            }
-                            other => {
-                                return Err(ParseError::InvalidExpression {
-                                    line: 0,
-                                    message: format!(
-                                        "directives.depends_on: list elements must be \
-                                         binding identifiers, got {:?}",
-                                        other
-                                    ),
-                                });
-                            }
-                        }
+                        names.push(value_as_binding_name(item, "depends_on: list elements")?);
                     }
                     names
                 }
@@ -333,14 +282,62 @@ pub(in crate::parser) fn extract_directives(
                     });
                 }
             };
+            let provider_instance = match map.get("provider") {
+                None => None,
+                Some(value) => Some(value_as_binding_name(value, "provider: value")?),
+            };
             return Ok(Directives {
                 force_delete,
                 create_before_destroy,
                 prevent_destroy,
                 depends_on,
-                ..Directives::default()
+                provider_instance,
             });
         }
     }
     Ok(Directives::default())
+}
+
+/// Interpret a `Value` as a bare binding-name reference. Used by every
+/// `directives { ... }` slot whose value must be `<binding>` (currently
+/// `depends_on`'s list elements and `provider`).
+///
+/// `context` is rendered into the error message as the directives slot
+/// path (e.g. `"depends_on: list elements"` or `"provider: value"`) so a
+/// shared error message template stays readable.
+///
+/// Bare-string quoted literals like `"role"` and `"us"` are rejected
+/// upstream at the pest layer (see `check_directives_depends_on_elements`
+/// / `check_directives_provider_value`), because by the time the value
+/// reaches this helper a quoted string and a `${...}` indirection are
+/// indistinguishable.
+fn value_as_binding_name(value: &Value, context: &str) -> Result<String, ParseError> {
+    match value {
+        Value::Deferred(DeferredValue::BindingRef { binding }) => Ok(binding.clone()),
+        Value::Concrete(ConcreteValue::EnumIdentifier(name)) => Ok(name.clone()),
+        Value::Concrete(ConcreteValue::String(name)) => {
+            let bare = name
+                .strip_prefix("${")
+                .and_then(|s| s.strip_suffix('}'))
+                .unwrap_or(name.as_str());
+            Ok(bare.to_string())
+        }
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+            Err(ParseError::InvalidExpression {
+                line: 0,
+                message: format!(
+                    "directives.{context} must be a bare binding identifier, not an \
+                 attribute selector (got `{}`)",
+                    path.binding()
+                ),
+            })
+        }
+        other => Err(ParseError::InvalidExpression {
+            line: 0,
+            message: format!(
+                "directives.{context} must be a binding identifier, got {:?}",
+                other
+            ),
+        }),
+    }
 }

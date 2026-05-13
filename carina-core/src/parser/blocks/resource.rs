@@ -134,6 +134,7 @@ pub(in crate::parser) fn parse_block_contents_with_quoted(
                             .to_string();
                         if block_name == "directives" {
                             check_directives_depends_on_elements(block_inner.clone())?;
+                            check_directives_provider_value(block_inner.clone())?;
                         }
                         // Recursively parse nested block contents (supports arbitrary depth)
                         let block_attrs = parse_block_contents(block_inner, &local_ctx)?;
@@ -333,6 +334,43 @@ fn check_directives_depends_on_elements(
                         .to_string(),
                 });
             }
+        }
+    }
+    Ok(())
+}
+
+/// Reject `provider = "<string>"` at the pest layer. By the time
+/// `extract_directives` sees the value, a quoted literal and a `${...}`
+/// indirection marker have collapsed to the same `ConcreteValue::String`,
+/// so the distinction can only be made before lowering.
+fn check_directives_provider_value(
+    directives_inner: pest::iterators::Pairs<Rule>,
+) -> Result<(), ParseError> {
+    for content_pair in directives_inner {
+        let attr = match content_pair.as_rule() {
+            Rule::block_content => {
+                first_inner(content_pair, "block content item", "block content")?
+            }
+            Rule::attribute => content_pair,
+            _ => continue,
+        };
+        if attr.as_rule() != Rule::attribute {
+            continue;
+        }
+        let mut attr_inner = attr.into_inner();
+        let key_pair = next_pair(&mut attr_inner, "attribute name", "directives attribute")?;
+        if key_pair.as_str() != "provider" {
+            continue;
+        }
+        let value_pair = next_pair(&mut attr_inner, "attribute value", "directives attribute")?;
+        if expression_is_plain_string_literal(value_pair) {
+            return Err(ParseError::InvalidExpression {
+                line: 0,
+                message: "directives.provider: value must be a bare binding identifier, \
+                          not a string literal (e.g., `provider = us`, not \
+                          `provider = \"us\"`)"
+                    .to_string(),
+            });
         }
     }
     Ok(())

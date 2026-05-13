@@ -9575,3 +9575,158 @@ fn provider_config_default_instance_serde_round_trip() {
     assert!(decoded.binding.is_none());
     assert!(decoded.is_default);
 }
+
+#[test]
+fn extract_directives_reads_provider_binding() {
+    let src = r#"
+        provider aws {
+            source = "github.com/carina-rs/carina-provider-aws"
+            version = "0.1.0"
+            region = "ap-northeast-1"
+        }
+        let us = provider aws {
+            region = "us-east-1"
+        }
+        let bucket = aws.s3.Bucket {
+            bucket_name = "x"
+            directives {
+                provider = us
+            }
+        }
+    "#;
+    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let bucket = parsed
+        .resources
+        .iter()
+        .find(|r| r.id.name.as_str() == "bucket")
+        .expect("bucket binding");
+    assert_eq!(
+        bucket.directives.provider_instance.as_deref(),
+        Some("us"),
+        "directives.provider = us must land on Directives.provider_instance"
+    );
+}
+
+#[test]
+fn extract_directives_provider_default_is_none() {
+    // Resources that omit `directives { provider = ... }` keep
+    // `provider_instance = None`. Phase 3b's resolver maps `None` to
+    // the kind's default instance.
+    let src = r#"
+        provider aws {
+            source = "github.com/carina-rs/carina-provider-aws"
+            version = "0.1.0"
+            region = "ap-northeast-1"
+        }
+        let bucket = aws.s3.Bucket {
+            bucket_name = "x"
+        }
+    "#;
+    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let bucket = parsed
+        .resources
+        .iter()
+        .find(|r| r.id.name.as_str() == "bucket")
+        .expect("bucket binding");
+    assert!(bucket.directives.provider_instance.is_none());
+}
+
+#[test]
+fn extract_directives_rejects_string_literal_in_provider() {
+    let src = r#"
+        provider aws {
+            source = "github.com/carina-rs/carina-provider-aws"
+            version = "0.1.0"
+        }
+        let bucket = aws.s3.Bucket {
+            bucket_name = "x"
+            directives { provider = "us" }
+        }
+    "#;
+    let result = parse(src, &ProviderContext::default());
+    assert!(
+        result.is_err(),
+        "directives.provider must reject string-literal values"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("binding identifier"),
+        "error should mention binding identifiers, got: {err}"
+    );
+}
+
+#[test]
+fn extract_directives_provider_visible_across_files() {
+    use crate::config_loader::parse_directory;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("providers.crn"),
+        r#"
+            provider aws {
+                source  = "github.com/carina-rs/carina-provider-aws"
+                version = "0.1.0"
+                region  = "ap-northeast-1"
+            }
+
+            let us = provider aws {
+                region = "us-east-1"
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("main.crn"),
+        r#"
+            let cert = aws.acm.Certificate {
+                domain_name = "registry.carina-rs.dev"
+                directives {
+                    provider = us
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
+        .expect("multi-file directory parse must succeed");
+    let cert = parsed
+        .resources
+        .iter()
+        .find(|r| r.id.name.as_str() == "cert")
+        .expect("cert binding");
+    assert_eq!(
+        cert.directives.provider_instance.as_deref(),
+        Some("us"),
+        "directives.provider declared via sibling-file binding must resolve to the binding name"
+    );
+}
+
+#[test]
+fn extract_directives_reads_provider_in_anonymous_resource() {
+    // Same code path as the depends_on counterpart
+    // (`extract_directives_rejects_string_literal_in_anonymous_resource_depends_on`):
+    // anonymous resources flow through `parse_block_contents_with_quoted`,
+    // so the directives parser must surface `provider_instance` from
+    // anonymous resources too — not just `let`-bound ones.
+    let src = r#"
+        provider aws {
+            source = "github.com/carina-rs/carina-provider-aws"
+            version = "0.1.0"
+        }
+        let us = provider aws { region = "us-east-1" }
+        aws.s3.Bucket {
+            bucket_name = "x"
+            directives { provider = us }
+        }
+    "#;
+    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let bucket = parsed
+        .resources
+        .iter()
+        .find(|r| r.id.provider == "aws" && r.id.resource_type == "s3.Bucket")
+        .expect("anonymous bucket present");
+    assert_eq!(
+        bucket.directives.provider_instance.as_deref(),
+        Some("us"),
+        "anonymous-resource directives.provider must populate provider_instance"
+    );
+}
