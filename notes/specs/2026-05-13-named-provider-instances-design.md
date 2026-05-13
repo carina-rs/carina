@@ -234,8 +234,8 @@ The `provider` reference on a resource is an attribute *inside the
 existing `directives { ... }` block*; nothing new at the grammar level.
 `directives` is already an arbitrary `attribute*` body, so
 `directives { provider = us }` parses today without any rule changes —
-all the work is post-parse in the directives-attribute validator and
-in the resolver (Phase 3).
+all the work is post-parse in the directives-attribute validator
+(Phase 3a) and in the resolver (Phase 3b).
 
 ## AST / data model
 
@@ -481,37 +481,49 @@ this design PR merges before any implementation PR opens.
    The parser accepts the new form. `ProviderConfig` gains the
    `binding` / `is_default` fields needed to distinguish kind-default
    from named instances. `Directives.provider_instance` field added but
-   always `None` until phase 3. Acceptance: parser tests covering both
+   always `None` until phase 3b. Acceptance: parser tests covering both
    forms (top-level kind block, `let` named instance); multi-file
    directory fixture; ProviderConfig roundtrip preserves the new fields.
 
    *Implementation note (chosen after design PR):* Phase 1 ("AST split
-   to `ProviderKind` + `ProviderInstance`") is merged into Phase 3
-   instead of running first. The split's invariants ("`source` only on
-   kinds, `Resource` only references `ProviderInstance`") are
-   load-bearing only once Phase 3 lands; pre-splitting them is 17-file
-   churn that adds zip/re-merge boilerplate downstream without paying
-   off until later. Phase 2 adds two narrow fields to `ProviderConfig`
-   that Phase 3 will replace by the full split in one move.
-3. **Phase 3 — `directives.provider` resolution + AST split.** The
-   resolver reads `directives { provider = <ident> }` and binds each
-   resource to a concrete `ProviderInstance`. At the same time,
-   `ProviderConfig` is split into `ProviderKind` + `ProviderInstance`
-   (the invariants become load-bearing here: a resource references an
-   instance, not a kind; `source` lives only on kinds). The differ +
-   executor consume the resolved instance reference. Acceptance:
-   existing real-infra unchanged (every resource resolves to the
-   default instance); a new fixture under
-   `carina-cli/tests/fixtures/plan_display/` exercises the
+   to `ProviderKind` + `ProviderInstance`") is deferred. The split's
+   theoretical invariants — "`source` only on kinds, `Resource` only
+   references `ProviderInstance`" — turn out to be already enforced by
+   the Phase 2 `parse_provider_expr` runtime check (kind-level
+   attributes are rejected on named instances) and by the Phase 3a
+   `Directives.provider_instance: Option<String>` binding-name slot
+   (resources never directly hold a `ProviderConfig`). With the
+   misuse cases already blocked at the parser layer, splitting the
+   type adds 17-file churn without proportional type-safety gain.
+   Keep the split as a follow-up for if/when downstream code starts
+   needing to take `&ProviderInstance` (vs `&ProviderConfig`) as a
+   typed argument.
+3. **Phase 3a — `directives.provider` parsing.** Parser recognises
+   `directives { provider = <ident> }` and stores the binding name on
+   `Directives.provider_instance`. Resolver routing is out of scope
+   here. Acceptance: parser tests covering top-level resources, the
+   anonymous-resource code path, and a multi-file directory fixture
+   (binding declared in `providers.crn`, referenced from `main.crn`).
+4. **Phase 3b — Resolver + `ProviderRouter` routing.** A new resolver
+   step validates `Directives.provider_instance` against the parsed
+   `ProviderConfig` set (`Some(binding)` matches a named instance of
+   the resource's kind; `None` resolves to the kind's default
+   instance; mismatched / missing bindings surface clear errors). The
+   `ProviderRouter` becomes keyed on `(kind, binding)` instead of
+   just `kind` so multiple instances of the same kind no longer
+   overwrite each other. The differ + executor look up by the
+   resolved routing key. Acceptance: existing real-infra unchanged
+   (every resource resolves to the default instance); a new fixture
+   under `carina-cli/tests/fixtures/plan_display/` exercises the
    multi-instance path.
-4. **Phase 4 — Plugin host multi-instance store.** `carina-plugin-host`
+5. **Phase 4 — Plugin host multi-instance store.** `carina-plugin-host`
    manages per-instance stores. Acceptance: integration test loads two
    instances of the mock provider with different configs and verifies
    the operations route correctly.
-5. **Phase 5 — LSP + validate parity.** Completion + diagnostics + error
+6. **Phase 5 — LSP + validate parity.** Completion + diagnostics + error
    messages. Acceptance: parity test (validate diagnostic ↔ LSP
    diagnostic) for every error in the "Errors" section.
-6. **Phase 6 — State schema field + docs.** Add `provider_instance` to
+7. **Phase 6 — State schema field + docs.** Add `provider_instance` to
    state v3 writer/reader, document the new construct in
    `docs/reference/dsl/syntax.md`. Acceptance: real-infra apply against
    T6c succeeds end-to-end.
@@ -523,7 +535,7 @@ this design PR merges before any implementation PR opens.
    today. Implicit dependency edge: a resource depends on its provider
    instance's binding. The current code path treats the instance
    binding as a normal `let` binding; this should just work, but
-   Phase 4 needs an explicit test.
+   Phase 3b needs an explicit test.
 2. **Should `let x = provider <kind> { ... }` allow inheriting attributes
    from the kind's default instance?** MVP says no — each instance is a
    complete configuration. Inheritance can be added later
