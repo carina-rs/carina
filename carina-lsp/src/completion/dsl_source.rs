@@ -80,19 +80,22 @@ impl<'a> DslSource<'a> {
 /// Concatenate every `.crn` file in `base_path` into one string.
 /// Duplicates with the buffer are expected — callers dedupe by
 /// binding name.
+///
+/// Files are read in lexicographic path order via
+/// [`carina_core::config_loader::find_crn_files_in_dir`], matching the
+/// canonical loader's ordering contract (#2449, #2855). Iterating
+/// `std::fs::read_dir` directly would yield filesystem-dependent order,
+/// which makes downstream merged-text scanning non-deterministic.
 pub(crate) fn read_sibling_crn(base_path: Option<&Path>) -> String {
     let Some(base) = base_path else {
         return String::new();
     };
-    let Ok(entries) = std::fs::read_dir(base) else {
+    let Ok(files) = carina_core::config_loader::find_crn_files_in_dir(base) else {
         return String::new();
     };
     let mut out = String::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "crn")
-            && let Ok(content) = std::fs::read_to_string(&path)
-        {
+    for path in files {
+        if let Ok(content) = std::fs::read_to_string(&path) {
             out.push_str(&content);
             out.push('\n');
         }
@@ -115,6 +118,30 @@ mod tests {
         let mut storage = String::new();
         let src = DslSource::resolve_directory("let a = 1\n", None, &mut storage);
         assert_eq!(src.merged_text(), "let a = 1\n");
+    }
+
+    #[test]
+    fn read_sibling_crn_orders_files_lexicographically() {
+        // Regression for #2855: read_sibling_crn previously iterated
+        // `std::fs::read_dir` directly, so the merged text reflected
+        // filesystem discovery order. Names are intentionally chosen so
+        // creation order ("z", "a", "m") differs from lexicographic order
+        // ("a", "m", "z").
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        std::fs::write(base.join("z.crn"), "let z = 26\n").unwrap();
+        std::fs::write(base.join("a.crn"), "let a = 1\n").unwrap();
+        std::fs::write(base.join("m.crn"), "let m = 13\n").unwrap();
+
+        let merged = read_sibling_crn(Some(base));
+        let pos_a = merged.find("let a = 1").expect("a.crn missing");
+        let pos_m = merged.find("let m = 13").expect("m.crn missing");
+        let pos_z = merged.find("let z = 26").expect("z.crn missing");
+        assert!(
+            pos_a < pos_m && pos_m < pos_z,
+            "sibling .crn files should be merged in lexicographic order. Got: {:?}",
+            merged
+        );
     }
 
     #[test]
