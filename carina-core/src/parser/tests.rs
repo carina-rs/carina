@@ -9730,3 +9730,199 @@ fn extract_directives_reads_provider_in_anonymous_resource() {
         "anonymous-resource directives.provider must populate provider_instance"
     );
 }
+
+#[test]
+fn check_provider_instance_routing_accepts_named_instance() {
+    let src = r#"
+        provider aws {
+            source = "github.com/carina-rs/carina-provider-aws"
+            version = "0.1.0"
+            region = "ap-northeast-1"
+        }
+        let us = provider aws { region = "us-east-1" }
+        aws.s3.Bucket {
+            bucket_name = "x"
+            directives { provider = us }
+        }
+    "#;
+    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let errs = crate::parser::check_provider_instance_routing(&parsed);
+    assert!(
+        errs.is_empty(),
+        "valid named-instance routing must not produce errors, got: {errs:?}"
+    );
+}
+
+#[test]
+fn check_provider_instance_routing_accepts_default_when_none() {
+    let src = r#"
+        provider aws {
+            source = "github.com/carina-rs/carina-provider-aws"
+            version = "0.1.0"
+            region = "ap-northeast-1"
+        }
+        aws.s3.Bucket {
+            bucket_name = "x"
+        }
+    "#;
+    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let errs = crate::parser::check_provider_instance_routing(&parsed);
+    assert!(
+        errs.is_empty(),
+        "default-instance routing must not produce errors, got: {errs:?}"
+    );
+}
+
+#[test]
+fn check_provider_instance_routing_rejects_unknown_binding() {
+    let src = r#"
+        provider aws {
+            source = "github.com/carina-rs/carina-provider-aws"
+            version = "0.1.0"
+        }
+        aws.s3.Bucket {
+            bucket_name = "x"
+            directives { provider = nope }
+        }
+    "#;
+    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let errs = crate::parser::check_provider_instance_routing(&parsed);
+    assert_eq!(
+        errs.len(),
+        1,
+        "unknown binding must produce one error, got: {errs:?}"
+    );
+    let msg = format!("{}", errs[0]);
+    assert!(
+        msg.contains("nope") && msg.contains("provider instance"),
+        "error should name the unknown binding, got: {msg}"
+    );
+}
+
+#[test]
+fn check_provider_instance_routing_rejects_kind_mismatch() {
+    let src = r#"
+        provider aws {
+            source = "github.com/carina-rs/carina-provider-aws"
+            version = "0.1.0"
+        }
+        provider awscc {
+            source = "github.com/carina-rs/carina-provider-awscc"
+            version = "0.1.0"
+        }
+        let us = provider awscc { region = "us-east-1" }
+        aws.s3.Bucket {
+            bucket_name = "x"
+            directives { provider = us }
+        }
+    "#;
+    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let errs = crate::parser::check_provider_instance_routing(&parsed);
+    assert_eq!(
+        errs.len(),
+        1,
+        "kind mismatch must produce one error, got: {errs:?}"
+    );
+    let msg = format!("{}", errs[0]);
+    assert!(
+        msg.contains("us") && msg.contains("awscc") && msg.contains("aws"),
+        "error should name the binding and both kinds, got: {msg}"
+    );
+}
+
+#[test]
+fn check_provider_instance_routing_rejects_missing_default_instance() {
+    // No top-level `provider aws { ... }` block — only a named
+    // instance is declared. A resource that omits the directive
+    // resolves to "the kind's default", which does not exist here,
+    // so the resolver must point the user at either declaring a
+    // top-level block or setting `directives { provider = ... }`.
+    let src = r#"
+        let tokyo = provider aws { region = "ap-northeast-1" }
+        aws.s3.Bucket {
+            bucket_name = "x"
+        }
+    "#;
+    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let errs = crate::parser::check_provider_instance_routing(&parsed);
+    assert_eq!(
+        errs.len(),
+        1,
+        "missing default instance must produce one error, got: {errs:?}"
+    );
+    let msg = format!("{}", errs[0]);
+    assert!(
+        msg.contains("aws") && msg.contains("default"),
+        "error should mention the kind and default-instance absence, got: {msg}"
+    );
+}
+
+#[test]
+fn check_provider_instance_routing_multi_file_named_instance() {
+    use crate::config_loader::parse_directory;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("providers.crn"),
+        r#"
+            provider aws {
+                source  = "github.com/carina-rs/carina-provider-aws"
+                version = "0.1.0"
+                region  = "ap-northeast-1"
+            }
+            let us = provider aws { region = "us-east-1" }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("main.crn"),
+        r#"
+            aws.acm.Certificate {
+                domain_name = "registry.carina-rs.dev"
+                directives { provider = us }
+            }
+        "#,
+    )
+    .unwrap();
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
+        .expect("multi-file directory parse must succeed");
+    let errs = crate::parser::check_provider_instance_routing(&parsed);
+    assert!(
+        errs.is_empty(),
+        "cross-file named-instance routing must validate cleanly, got: {errs:?}"
+    );
+}
+
+#[test]
+fn check_provider_instance_routing_rejects_non_provider_let_binding() {
+    // `provider = role` where `role` is a *resource* binding (not a
+    // provider instance) must be rejected. The parser already accepts
+    // any identifier here; the routing checker is the place that
+    // distinguishes provider-instance bindings from regular ones.
+    let src = r#"
+        provider aws {
+            source = "github.com/carina-rs/carina-provider-aws"
+            version = "0.1.0"
+            region = "ap-northeast-1"
+        }
+        let role = aws.iam.Role {
+            role_name = "r"
+            assume_role_policy_document = "{}"
+        }
+        aws.s3.Bucket {
+            bucket_name = "x"
+            directives { provider = role }
+        }
+    "#;
+    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let errs = crate::parser::check_provider_instance_routing(&parsed);
+    assert_eq!(
+        errs.len(),
+        1,
+        "non-provider let binding must produce one error, got: {errs:?}"
+    );
+    let msg = format!("{}", errs[0]);
+    assert!(
+        msg.contains("role") && msg.contains("provider instance"),
+        "error should clarify that `role` is not a provider instance, got: {msg}"
+    );
+}
