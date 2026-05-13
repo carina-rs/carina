@@ -907,46 +907,107 @@ pub async fn get_provider_with_ctx<E>(
 ) -> Result<ProviderRouter, AppError> {
     let mut router = ProviderRouter::new();
 
-    for provider_config in &parsed.providers {
-        // If the provider has a source, load it as a WASM plugin
-        if let Some(ref source) = provider_config.source {
-            try_add_source_provider(&mut router, source, provider_config, base_dir).await?;
-            continue;
-        }
+    // Two-pass build so named instances can reuse the kind's factory.
+    // Pass 1 handles every default instance (top-level `provider <kind>`
+    // blocks) — these are the entries that carry `source`/`version` and
+    // may need a WASM plugin to be loaded. Pass 2 handles each named
+    // instance (`let <name> = provider <kind> { ... }`), reusing the
+    // factory the default instance already brought in.
+    for provider_config in parsed.providers.iter().filter(|p| p.is_default) {
+        instantiate_provider_into_router(ctx, &mut router, provider_config, base_dir, None).await?;
+    }
 
-        // Otherwise, look up from the dynamic factories passed to WiringContext
-        if let Some(factory) = provider_mod::find_factory(ctx.factories(), &provider_config.name) {
-            let region = factory.extract_region(&provider_config.attributes);
-            println!(
-                "{}",
-                format!("Using {} (region: {})", factory.display_name(), region).cyan()
-            );
-            let provider = factory
-                .create_provider(&provider_config.attributes)
-                .await
-                .map_err(|e| e.for_provider(provider_config.name.clone()))?;
-            router.add_provider(provider_config.name.clone(), provider);
-            router.add_normalizer(factory.create_normalizer(&provider_config.attributes).await);
-        } else if !provider_config.name.is_empty() {
-            eprintln!(
-                "{}",
-                format!(
-                    "Provider '{}' requires 'source' and 'version' attributes.",
-                    provider_config.name
-                )
-                .red()
-            );
-        }
+    for provider_config in parsed.providers.iter().filter(|p| !p.is_default) {
+        let binding = provider_config
+            .binding
+            .clone()
+            .expect("named instance must carry its binding name (parser invariant)");
+        instantiate_provider_into_router(
+            ctx,
+            &mut router,
+            provider_config,
+            base_dir,
+            Some(binding),
+        )
+        .await?;
     }
 
     if router.is_empty() {
         // Use mock provider for other cases.
-        // Register with empty key to match resources without a provider prefix.
+        // Register the kind's default instance with empty kind to match
+        // resources without a provider prefix.
         println!("{}", "Using mock provider".cyan());
         router.add_provider(String::new(), Box::new(MockProvider::new()));
     }
 
     Ok(router)
+}
+
+/// Register a single provider instance into `router`. `binding = None`
+/// is the kind's default instance; `binding = Some(name)` is a named
+/// instance and routes resources tagged `directives { provider = name }`.
+///
+/// Source-loading (`provider <kind> { source = ... }`) is only invoked
+/// when this is the kind's default instance — named instances reuse the
+/// factory the default instance already loaded.
+async fn instantiate_provider_into_router(
+    ctx: &WiringContext,
+    router: &mut ProviderRouter,
+    provider_config: &ProviderConfig,
+    base_dir: &Path,
+    binding: Option<String>,
+) -> Result<(), AppError> {
+    // Named instances inherit `source`/`version`/`revision` from the
+    // kind's default — these fields are rejected by the parser when set
+    // on `let <name> = provider <kind> { ... }`. Only the default
+    // instance can trigger the source-loading path.
+    if binding.is_none()
+        && let Some(ref source) = provider_config.source
+    {
+        try_add_source_provider(router, source, provider_config, base_dir).await?;
+        return Ok(());
+    }
+
+    if let Some(factory) = provider_mod::find_factory(ctx.factories(), &provider_config.name) {
+        let region = factory.extract_region(&provider_config.attributes);
+        let instance_label = match &binding {
+            Some(name) => format!(" instance={}", name),
+            None => String::new(),
+        };
+        println!(
+            "{}",
+            format!(
+                "Using {} (region: {}{})",
+                factory.display_name(),
+                region,
+                instance_label
+            )
+            .cyan()
+        );
+        let provider = factory
+            .create_provider(&provider_config.attributes)
+            .await
+            .map_err(|e| e.for_provider(provider_config.name.clone()))?;
+        router.add_provider_instance(provider_config.name.clone(), binding, provider);
+        router.add_normalizer(factory.create_normalizer(&provider_config.attributes).await);
+    } else if !provider_config.name.is_empty() {
+        let message = match &binding {
+            // Named instance whose kind's default did not register a
+            // factory — usually the default instance failed to load
+            // (a separate error has already been printed for it).
+            Some(name) => format!(
+                "Named provider instance '{}' (kind '{}') cannot be loaded \
+                 because the kind's default instance is unavailable.",
+                name, provider_config.name
+            ),
+            None => format!(
+                "Provider '{}' requires 'source' and 'version' attributes.",
+                provider_config.name
+            ),
+        };
+        eprintln!("{}", message.red());
+    }
+    Ok(())
 }
 
 async fn try_add_source_provider(
@@ -1046,26 +1107,19 @@ pub async fn create_providers_from_configs(
     let ctx = WiringContext::new(factories);
     let mut router = ProviderRouter::new();
 
-    for config in configs {
-        // If the provider has a source, load it as a WASM plugin
-        if let Some(ref source) = config.source {
-            try_add_source_provider(&mut router, source, config, base_dir).await?;
-            continue;
-        }
-
-        if let Some(factory) = provider_mod::find_factory(ctx.factories(), &config.name) {
-            let region = factory.extract_region(&config.attributes);
-            println!(
-                "{}",
-                format!("Using {} (region: {})", factory.display_name(), region).cyan()
-            );
-            let provider = factory
-                .create_provider(&config.attributes)
-                .await
-                .map_err(|e| e.for_provider(config.name.clone()))?;
-            router.add_provider(config.name.clone(), provider);
-            router.add_normalizer(factory.create_normalizer(&config.attributes).await);
-        }
+    // Same two-pass shape as `get_provider_with_ctx`: default instances
+    // first (they may load the WASM plugin), then named instances reuse
+    // the factory that was just loaded.
+    for config in configs.iter().filter(|p| p.is_default) {
+        instantiate_provider_into_router(&ctx, &mut router, config, base_dir, None).await?;
+    }
+    for config in configs.iter().filter(|p| !p.is_default) {
+        let binding = config
+            .binding
+            .clone()
+            .expect("named instance must carry its binding name (parser invariant)");
+        instantiate_provider_into_router(&ctx, &mut router, config, base_dir, Some(binding))
+            .await?;
     }
 
     if router.is_empty() {

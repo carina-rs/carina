@@ -1,0 +1,4 @@
+exports {
+  tokyo_bucket_name = tokyo_bucket.bucket_name
+  us_bucket_name = us_bucket.bucket_name
+}

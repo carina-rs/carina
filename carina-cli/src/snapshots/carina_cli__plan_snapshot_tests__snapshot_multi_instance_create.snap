@@ -1,0 +1,12 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  + awscc.s3.Bucket tokyo_bucket
+      bucket_name: "multi-instance-tokyo"
+  + awscc.s3.Bucket us_bucket
+      bucket_name: "multi-instance-us"
+
+Plan: 2 to add, 0 to change, 0 to destroy.

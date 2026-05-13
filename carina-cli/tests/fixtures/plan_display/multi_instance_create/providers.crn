@@ -1,0 +1,10 @@
+# Default instance of the `awscc` provider kind.
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+# Named instance targeting a different region. Resources tagged
+# `directives { provider = us }` route to this instance, not the default.
+let us = provider awscc {
+  region = awscc.Region.us_east_1
+}
