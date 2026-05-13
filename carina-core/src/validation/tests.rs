@@ -1009,6 +1009,41 @@ fn validate_type_expr_value_float_got_bool() {
 }
 
 #[test]
+fn validate_type_expr_value_bool_got_float_is_rejected() {
+    // Regression for #2864: Float must not silently coerce into Bool.
+    let result = validate_type_expr_value(
+        &TypeExpr::Bool,
+        &Value::Concrete(ConcreteValue::Float(1.5)),
+        &ProviderContext::default(),
+    );
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("expected Bool, got float"));
+}
+
+#[test]
+fn validate_type_expr_value_int_got_float_is_rejected() {
+    // Regression for #2864: Float must not silently coerce into Int.
+    let result = validate_type_expr_value(
+        &TypeExpr::Int,
+        &Value::Concrete(ConcreteValue::Float(1.5)),
+        &ProviderContext::default(),
+    );
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("expected Int, got float"));
+}
+
+#[test]
+fn validate_type_expr_value_float_got_int_is_accepted() {
+    // Intentional one-way widening: Int flows into Float (see #2864).
+    let result = validate_type_expr_value(
+        &TypeExpr::Float,
+        &Value::Concrete(ConcreteValue::Int(42)),
+        &ProviderContext::default(),
+    );
+    assert!(result.is_none());
+}
+
+#[test]
 fn validate_type_expr_value_schema_type_accepts_string() {
     let schema_type = TypeExpr::SchemaType {
         provider: "awscc".to_string(),
