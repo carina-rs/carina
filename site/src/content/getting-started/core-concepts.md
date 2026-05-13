@@ -135,3 +135,5 @@ Available directives:
 | `force_delete` | `false` | Force-delete the resource (e.g., non-empty S3 buckets) |
 | `create_before_destroy` | `false` | Create the replacement before destroying the old resource |
 | `prevent_destroy` | `false` | Block any plan that would destroy this resource |
+| `depends_on` | `[]` | Explicit ordering edges to sibling `let` bindings |
+| `provider` | (kind default) | Route this resource to a named provider instance — see [Named provider instances](/reference/dsl/syntax#named-provider-instances) |

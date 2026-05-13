@@ -50,9 +50,9 @@ The two questions are orthogonal:
 | | kind label needed | kind label not needed |
 |---|---|---|
 | **singleton / not named-referenced** | `provider awscc { ... }`, `backend s3 { ... }` | — |
-| **named reference** | (future: named provider instances) | `let orgs = upstream_state { ... }` |
+| **named reference** | `let us = provider awscc { ... }` | `let orgs = upstream_state { ... }` |
 
-- `provider` / `backend` carry kind labels because the body schema is kind-specific; they are statements today because one instance per project is sufficient in the common case.
+- `provider` / `backend` carry kind labels because the body schema is kind-specific. A bare `provider <kind> { ... }` block declares the kind's default instance; wrapping the same expression in `let <name> = provider <kind> { ... }` declares a named instance. See [Named provider instances](#named-provider-instances) below.
 - `upstream_state` has no kind label because there is only one kind of upstream (a sibling directory); it is an expression because projects typically reference several named upstreams.
 
 When reading an unfamiliar top-level construct, work out which row and column of the table it sits in — that tells you whether to expect a kind label and whether to expect a `let` binding on the left.
@@ -100,6 +100,45 @@ provider aws {
   region = aws.Region.ap_northeast_1
 }
 ```
+
+### Named Provider Instances
+
+A `provider <kind> { ... }` block declares the kind's *default instance* — the one resources reach for when they say nothing about routing. To declare additional instances of the same kind (for example, an `awscc` provider pinned to a different region), wrap the same expression in a `let` binding:
+
+```crn
+provider awscc {
+  source  = 'github.com/carina-rs/carina-provider-awscc'
+  version = '~0.5.0'
+  region  = awscc.Region.ap_northeast_1
+}
+
+let us = provider awscc {
+  region = awscc.Region.us_east_1
+}
+```
+
+Only the kind's default instance carries `source` / `version` / `revision`. Repeating those on a named instance is rejected by the parser: they describe **how to load the provider plugin**, which is a property of the kind, not of an individual instance.
+
+Resources route by attaching `directives { provider = <binding> }`:
+
+```crn
+awscc.s3.Bucket {
+  bucket_name = 'tokyo-assets'
+  # no directive -> kind's default instance (ap-northeast-1)
+}
+
+awscc.cloudfront.Distribution {
+  # ...
+
+  directives {
+    provider = us   # routes to the `us` instance (us-east-1)
+  }
+}
+```
+
+Omitting `directives.provider` keeps the resource on the kind's default instance. The default instance is identified by the absence of a binding name; it is not surfaced as a completion candidate at the value position of `directives { provider = | }` for the same reason.
+
+State files persist the routing decision on each resource's identifier (the `provider_instance` field on `ResourceId` / `Directives`, written in state v3 and later). Existing state files written before named-instance support continue to load: the field defaults to `null` and serialises back out only when non-null.
 
 ## Resource Blocks
 
