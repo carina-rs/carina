@@ -321,7 +321,7 @@ fn test_merge_default_tags_prevents_false_diff() {
     let mut router = ProviderRouter::new();
     for factory in ctx.factories() {
         let attrs = IndexMap::new();
-        router.add_normalizer(rt.block_on(factory.create_normalizer(&attrs)));
+        router.add_normalizer(rt.block_on(factory.create_normalizer(None, &attrs)));
     }
     let mut resources_with = vec![resource];
     router.merge_default_tags(&mut resources_with, &default_tags, &schemas);

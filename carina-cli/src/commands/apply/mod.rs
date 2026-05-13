@@ -547,7 +547,9 @@ pub async fn run_apply(
                     .find(|p| p.name == backend_provider_name)
                     .map(|p| p.attributes.clone())
                     .unwrap_or_default();
-                let bucket_provider = factory.create_provider(&provider_config_attrs).await?;
+                let bucket_provider = factory
+                    .create_provider(None, &provider_config_attrs)
+                    .await?;
 
                 match bucket_provider
                     .create(

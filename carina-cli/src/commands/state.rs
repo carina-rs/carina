@@ -540,7 +540,9 @@ async fn run_state_bucket_delete(
         .find(|p| p.name == backend_provider_name)
         .map(|p| p.attributes.clone())
         .unwrap_or_default();
-    let bucket_provider = factory.create_provider(&provider_config_attrs).await?;
+    let bucket_provider = factory
+        .create_provider(None, &provider_config_attrs)
+        .await?;
 
     // First, try to empty the bucket (delete all objects and versions)
     println!();

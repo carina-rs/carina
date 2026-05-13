@@ -70,7 +70,7 @@ async fn test_wasm_mock_provider_create_and_read() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(&indexmap::IndexMap::new())
+        .create_provider(None, &indexmap::IndexMap::new())
         .await
         .expect("provider should init");
 
@@ -151,7 +151,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(&indexmap::IndexMap::new())
+        .create_provider(None, &indexmap::IndexMap::new())
         .await
         .expect("provider should init");
 
@@ -267,7 +267,9 @@ async fn test_wasm_mock_provider_update_and_delete() {
 async fn test_wasm_mock_provider_normalizer() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
-    let normalizer = factory.create_normalizer(&indexmap::IndexMap::new()).await;
+    let normalizer = factory
+        .create_normalizer(None, &indexmap::IndexMap::new())
+        .await;
 
     // normalize_desired: mock provider returns resources unchanged
     let mut resources = vec![{
@@ -309,7 +311,9 @@ async fn test_wasm_mock_provider_merge_default_tags_dispatches_through_wit() {
     // its presence proves the WIT bridge round-tripped.
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
-    let normalizer = factory.create_normalizer(&indexmap::IndexMap::new()).await;
+    let normalizer = factory
+        .create_normalizer(None, &indexmap::IndexMap::new())
+        .await;
 
     let registry = carina_core::schema::SchemaRegistry::new();
     let mut resources = vec![Resource::with_provider("mock", "test.resource", "tag-test")];
@@ -341,7 +345,9 @@ async fn test_wasm_mock_provider_merge_default_tags_empty_short_circuits() {
     // didn't, the mock guest would still write its sentinel attribute.
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
-    let normalizer = factory.create_normalizer(&indexmap::IndexMap::new()).await;
+    let normalizer = factory
+        .create_normalizer(None, &indexmap::IndexMap::new())
+        .await;
 
     let registry = carina_core::schema::SchemaRegistry::new();
     let mut resources = vec![Resource::with_provider("mock", "test.resource", "no-tags")];
@@ -363,7 +369,9 @@ async fn test_wasm_mock_provider_merge_default_tags_preserves_order() {
     // index, so the guest must return resources in input order.
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
-    let normalizer = factory.create_normalizer(&indexmap::IndexMap::new()).await;
+    let normalizer = factory
+        .create_normalizer(None, &indexmap::IndexMap::new())
+        .await;
 
     let registry = carina_core::schema::SchemaRegistry::new();
     let mut resources = vec![
@@ -401,7 +409,7 @@ async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(&indexmap::IndexMap::new())
+        .create_provider(None, &indexmap::IndexMap::new())
         .await
         .expect("provider should init");
 

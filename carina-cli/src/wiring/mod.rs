@@ -713,7 +713,7 @@ pub fn normalize_desired_with_ctx(ctx: &WiringContext, resources: &mut [Resource
     let mut router = ProviderRouter::new();
     for factory in ctx.factories() {
         let attrs = indexmap::IndexMap::new();
-        router.add_normalizer(rt.block_on(factory.create_normalizer(&attrs)));
+        router.add_normalizer(rt.block_on(factory.create_normalizer(None, &attrs)));
     }
     router.normalize_desired(resources);
 }
@@ -734,7 +734,7 @@ pub fn normalize_state_with_ctx(
     let mut router = ProviderRouter::new();
     for factory in ctx.factories() {
         let attrs = indexmap::IndexMap::new();
-        router.add_normalizer(rt.block_on(factory.create_normalizer(&attrs)));
+        router.add_normalizer(rt.block_on(factory.create_normalizer(None, &attrs)));
     }
     router.normalize_state(current_states);
 }
@@ -985,11 +985,15 @@ async fn instantiate_provider_into_router(
             .cyan()
         );
         let provider = factory
-            .create_provider(&provider_config.attributes)
+            .create_provider(binding.as_deref(), &provider_config.attributes)
             .await
             .map_err(|e| e.for_provider(provider_config.name.clone()))?;
+        router.add_normalizer(
+            factory
+                .create_normalizer(binding.as_deref(), &provider_config.attributes)
+                .await,
+        );
         router.add_provider_instance(provider_config.name.clone(), binding, provider);
-        router.add_normalizer(factory.create_normalizer(&provider_config.attributes).await);
     } else if !provider_config.name.is_empty() {
         let message = match &binding {
             // Named instance whose kind's default did not register a
@@ -1024,7 +1028,7 @@ async fn try_add_source_provider(
                 format!("Using {} (region: {}, source: {})", name, region, source).cyan()
             );
             router.add_provider(name, provider);
-            router.add_normalizer(factory.create_normalizer(&config.attributes).await);
+            router.add_normalizer(factory.create_normalizer(None, &config.attributes).await);
             Ok(())
         }
         Err(LoadSourceError::Provider(e)) => {
@@ -1093,7 +1097,7 @@ async fn load_source_provider(
         .map_err(|e| LoadSourceError::Other(format!("Config validation failed: {e}")))?;
 
     let provider = factory
-        .create_provider(&config.attributes)
+        .create_provider(None, &config.attributes)
         .await
         .map_err(LoadSourceError::Provider)?;
     Ok((factory, provider, name))
