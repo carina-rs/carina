@@ -328,6 +328,27 @@ fn snapshot_map_added_from_none() {
     insta::assert_snapshot!(output);
 }
 
+/// #2939: a Map<String, String> attribute that goes from a multi-key
+/// value in state to absent in desired must render as per-key
+/// `- key: "value"` lines, not as a single inline
+/// `tags: {...} → (removed)` line. Mirrors `snapshot_map_added_from_none`
+/// for the removal direction.
+#[test]
+fn snapshot_map_attribute_removed() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("map_attribute_removed");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+    ));
+    insta::assert_snapshot!(output);
+}
+
 #[test]
 fn snapshot_enum_display() {
     let (plan, schemas, _moved) = build_plan_from_fixture("enum_display");

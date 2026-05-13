@@ -16,6 +16,8 @@ plan-map-diff:
 	$(PLAN_FIXTURE) map_key_diff
 plan-map-added-from-none:
 	$(PLAN_FIXTURE) map_added_from_none
+plan-map-attribute-removed:
+	$(PLAN_FIXTURE) map_attribute_removed
 plan-nested-map-diff:
 	$(PLAN_FIXTURE) nested_map_diff
 plan-list-diff-added-struct:
@@ -92,6 +94,8 @@ plan-fixtures:
 	@$(MAKE) plan-map-diff
 	@echo "---"
 	@$(MAKE) plan-map-added-from-none
+	@echo "---"
+	@$(MAKE) plan-map-attribute-removed
 	@echo ""
 	@echo "=== nested_map_diff ==="
 	@$(MAKE) plan-nested-map-diff
