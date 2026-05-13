@@ -308,6 +308,101 @@ pub fn check_identifier_scope(parsed: &ParsedFile) -> Vec<ParseError> {
     errors
 }
 
+/// Validate every `directives { provider = <ident> }` reference and
+/// every implicit default-instance lookup against `parsed.providers`.
+///
+/// Emits an error for each:
+///
+/// - `provider = <binding>` whose binding is not a declared
+///   `ProviderInstance` (typo or undeclared name).
+/// - `provider = <binding>` whose binding's kind does not match the
+///   resource's kind (e.g. `aws.s3.Bucket { directives { provider =
+///   <awscc-binding> } }`).
+/// - Resource that omits `directives { provider = ... }` but whose
+///   kind has no default instance (the kind was registered via a
+///   top-level `provider <kind> { source = ..., version = ... }`
+///   block with no instance attributes, and every instance of that
+///   kind is named).
+///
+/// The check is a sibling of `check_identifier_scope` rather than
+/// folded into it: the errors are provider-specific, the inputs
+/// (`parsed.providers`) and outputs (kind-aware diagnostics) differ
+/// from the generic "is this identifier in scope" walk, and folding
+/// them together would force callers that only want one kind of
+/// validation to pay for both.
+pub fn check_provider_instance_routing(parsed: &ParsedFile) -> Vec<ParseError> {
+    let mut errors = Vec::new();
+    for resource in &parsed.resources {
+        match &resource.directives.provider_instance {
+            Some(binding) => {
+                let Some(instance) = parsed
+                    .providers
+                    .iter()
+                    .find(|p| p.binding.as_deref() == Some(binding.as_str()))
+                else {
+                    errors.push(ParseError::InvalidExpression {
+                        line: 0,
+                        message: format!(
+                            "directives.provider: `{binding}` is not a known \
+                             provider instance. Declare it with `let {binding} \
+                             = provider <kind> {{ ... }}`."
+                        ),
+                    });
+                    continue;
+                };
+                if instance.name != resource.id.provider {
+                    errors.push(ParseError::InvalidExpression {
+                        line: 0,
+                        message: format!(
+                            "directives.provider: instance `{binding}` has kind \
+                             `{}`, but resource `{}.{}` requires kind `{}`",
+                            instance.name,
+                            resource.id.provider,
+                            resource.id.resource_type,
+                            resource.id.provider,
+                        ),
+                    });
+                }
+            }
+            None => {
+                // Mock / synthetic resources (no provider prefix) have no
+                // kind to route by; skip them.
+                if resource.id.provider.is_empty() {
+                    continue;
+                }
+                let (kind_has_any, kind_has_default) =
+                    parsed
+                        .providers
+                        .iter()
+                        .fold((false, false), |(any, def), p| {
+                            let matches = p.name == resource.id.provider;
+                            (any || matches, def || (matches && p.is_default))
+                        });
+                if !kind_has_any {
+                    continue;
+                }
+                if !kind_has_default {
+                    errors.push(ParseError::InvalidExpression {
+                        line: 0,
+                        message: format!(
+                            "resource `{}.{}` has no default provider \
+                             instance for kind `{}`: either add instance \
+                             attributes to the top-level `provider {}` \
+                             block, or set `directives {{ provider = \
+                             <instance> }}` explicitly.",
+                            resource.id.provider,
+                            resource.id.resource_type,
+                            resource.id.provider,
+                            resource.id.provider,
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    errors
+}
+
 fn accumulate_undefined_reference_errors(
     parsed: &ParsedFile,
     known: &std::collections::HashSet<&str>,

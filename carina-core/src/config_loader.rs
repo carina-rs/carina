@@ -157,7 +157,8 @@ pub fn load_configuration_with_config(
         // Identifier-scope checks are accumulated rather than short-
         // circuited so `carina validate` can keep going and report every
         // static error in one pass (#2102, #2126, #2138).
-        let identifier_scope_errors = parser::check_identifier_scope(&merged);
+        let mut identifier_scope_errors = parser::check_identifier_scope(&merged);
+        identifier_scope_errors.extend(parser::check_provider_instance_routing(&merged));
 
         // Phase transition: post-resolve, run rhs-driven inference over
         // every `exports { ... }` declaration so downstream consumers
