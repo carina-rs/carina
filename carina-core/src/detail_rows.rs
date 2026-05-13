@@ -605,6 +605,15 @@ fn build_update_rows(
     removed_keys.sort();
     for key in removed_keys {
         if let Some(old_value) = from_attrs_projected.get(key.as_str()) {
+            // Mirror the addition direction (#2936): when a Map
+            // attribute is dropped entirely, route through `MapDiff`
+            // so each key renders on its own line as `- key: "value"`
+            // instead of overflowing on a single inline `{...} → (removed)`
+            // row (#2939).
+            if let Some(row) = build_map_removed_row(key, old_value) {
+                rows.push(row);
+                continue;
+            }
             rows.push(DetailRow::Removed {
                 key: key.to_string(),
                 old: format_value_with_key(old_value, Some(key)),
@@ -814,6 +823,39 @@ fn build_delete_rows(
     }
 
     rows
+}
+
+/// Build a `DetailRow::MapDiff` whose entries are all `Removed`,
+/// mirroring the addition-direction path that emits all-`Added`
+/// entries when an attribute appears for the first time (#2936).
+///
+/// Returns `None` when `old_value` is not a `Map`, or when the map
+/// is empty (single inline `tags: {} → (removed)` rendering is fine
+/// at that size). The caller falls through to the inline
+/// `DetailRow::Removed` form in both cases. Used by `build_update_rows`
+/// to fix #2939, where a multi-key map dropped from a resource used
+/// to render inline on one overflowing line.
+fn build_map_removed_row(key: &str, old_value: &Value) -> Option<DetailRow> {
+    let Value::Concrete(ConcreteValue::Map(old_map)) = old_value else {
+        return None;
+    };
+    if old_map.is_empty() {
+        return None;
+    }
+    let mut sorted_keys: Vec<&String> = old_map.keys().collect();
+    sorted_keys.sort();
+    let entries: Vec<MapDiffEntryIR> = sorted_keys
+        .into_iter()
+        .map(|k| MapDiffEntryIR::Removed {
+            key: k.clone(),
+            value: format_value_with_key(&old_map[k], Some(k)),
+        })
+        .collect();
+    let entries = NonEmptyVec::from_vec(entries)?;
+    Some(DetailRow::MapDiff {
+        key: key.to_string(),
+        entries,
+    })
 }
 
 /// Returns `None` when `compute_map_diff_entries` filters every entry

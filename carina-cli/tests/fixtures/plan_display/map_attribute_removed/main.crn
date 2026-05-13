@@ -1,0 +1,16 @@
+# Update plan: Map<String, String> attribute (tags) removed to `(none)`
+# (issue #2939). State has a multi-key `tags` map; desired drops it
+# entirely. Expected rendering: per-key `- key: "value"` lines, not a
+# single overflowing inline `tags: {...} → (removed)` line.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.Vpc {
+  cidr_block = '10.0.0.0/16'
+}
+
+exports {
+  cidr_block = vpc.cidr_block
+}
