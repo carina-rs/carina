@@ -176,6 +176,9 @@ impl CompletionProvider {
                     position,
                     base_path,
                 ),
+            CompletionContext::InsideDirectivesProviderValue => {
+                self.directives_provider_completions(provider_ctx, base_path)
+            }
             CompletionContext::InsideProviderBlock { .. } => self.provider_block_completions(),
             CompletionContext::AfterProviderRegion { provider_name } => {
                 self.region_completions_for_provider(&provider_name)
@@ -471,6 +474,15 @@ impl CompletionProvider {
                     return CompletionContext::InsideDirectivesDependsOnList {
                         current_binding: current_binding.clone(),
                     };
+                }
+            }
+            // Cursor inside `directives { provider = | }` (#2191 Phase 5).
+            // The value position takes a bare binding identifier — the name
+            // of a `let <name> = provider <kind> { ... }` instance.
+            if prefix.contains('=') {
+                let attr_name = self.extract_attr_name(&prefix);
+                if attr_name == "provider" {
+                    return CompletionContext::InsideDirectivesProviderValue;
                 }
             }
             // Cursor at attribute-name position inside `directives { | }`.
@@ -892,6 +904,11 @@ enum CompletionContext {
     InsideDirectivesDependsOnList {
         current_binding: Option<String>,
     },
+    /// Cursor is inside `directives { provider = | }` (carina#2191
+    /// Phase 5). Suggests every named provider instance binding
+    /// (`let <name> = provider <kind> { ... }`) declared anywhere in
+    /// the directory.
+    InsideDirectivesProviderValue,
     InsideImportPath {
         partial_path: String,
     },

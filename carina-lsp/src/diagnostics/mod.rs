@@ -147,6 +147,18 @@ impl DiagnosticEngine {
             diagnostics.extend(self.check_for_iterable_bindings(doc, merged, current_file_name));
         }
 
+        // carina#2191 Phase 5: surface `check_provider_instance_routing`
+        // errors as editor diagnostics. The CLI's `load_configuration`
+        // accumulates them in `identifier_scope_errors`; LSP runs the
+        // same pass against the merged parse so users see the same
+        // "unknown provider instance" / "no default instance for kind"
+        // message before they run `carina validate`.
+        if let Some(merged) = merged.as_ref() {
+            for err in carina_core::parser::check_provider_instance_routing(merged) {
+                diagnostics.push(parse_error_to_diagnostic(&err));
+            }
+        }
+
         // Prefer the directory-merged parse so cross-file binding refs
         // resolve; fall back to the buffer-only parse otherwise.
         if let Some(parsed) = merged.as_ref() {
