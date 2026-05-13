@@ -1540,3 +1540,33 @@ fn as_concrete_list_borrows_underlying_slice() {
     assert_eq!(items.as_ptr(), original.as_ptr());
     assert_eq!(items.len(), 2);
 }
+
+#[test]
+fn directives_provider_instance_round_trips_serde() {
+    let d = Directives {
+        provider_instance: Some("us".to_string()),
+        ..Directives::default()
+    };
+    let json = serde_json::to_string(&d).unwrap();
+    let back: Directives = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.provider_instance, d.provider_instance);
+}
+
+#[test]
+fn directives_serialises_without_provider_instance_when_none() {
+    let d = Directives::default();
+    let json = serde_json::to_string(&d).unwrap();
+    assert!(
+        !json.contains("provider_instance"),
+        "None provider_instance should be skipped in serialisation, got {}",
+        json
+    );
+}
+
+#[test]
+fn directives_provider_instance_deserialises_from_legacy_json_without_field() {
+    let legacy =
+        r#"{ "force_delete": false, "create_before_destroy": false, "prevent_destroy": false }"#;
+    let d: Directives = serde_json::from_str(legacy).unwrap();
+    assert!(d.provider_instance.is_none());
+}
