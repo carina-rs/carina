@@ -357,10 +357,16 @@ pub fn get_base_dir(path: &Path) -> &Path {
     path
 }
 
-/// Find all .crn files recursively in a directory, skipping hidden dirs, target, and node_modules
+/// Find all .crn files recursively in a directory, skipping hidden dirs,
+/// target, and node_modules.
+///
+/// The returned paths are sorted lexicographically by `PathBuf` ordering so
+/// callers get deterministic results across filesystems (#2851). This matches
+/// the contract of [`find_crn_files_in_dir`].
 pub fn find_crn_files_recursive(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut files = Vec::new();
     collect_crn_files_recursive(dir, &mut files)?;
+    files.sort();
     Ok(files)
 }
 
@@ -368,10 +374,14 @@ fn collect_crn_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(
     let entries = fs::read_dir(dir)
         .map_err(|e| format!("Failed to read directory {}: {}", dir.display(), e))?;
 
-    for entry in entries {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
+    // Sort directory entries before descending so traversal order is
+    // independent of the underlying filesystem's `readdir` order.
+    let mut paths: Vec<PathBuf> = entries
+        .map(|entry| entry.map(|e| e.path()).map_err(|e| e.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    paths.sort();
 
+    for path in paths {
         if path.is_dir() {
             // Skip hidden directories and common non-source directories
             let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -603,6 +613,41 @@ mod tests {
         let result = find_crn_files_recursive(&dir);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Failed to read directory"));
+    }
+
+    /// Regression test for #2851: recursive .crn discovery must return
+    /// paths in lexicographic order regardless of the underlying
+    /// filesystem's `readdir` order. We create the files in
+    /// reverse-lexicographic order to make non-deterministic ordering
+    /// more likely to surface on filesystems that return entries in
+    /// creation order.
+    #[test]
+    fn find_crn_files_recursive_returns_paths_sorted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Create sibling files and nested directories in reverse order.
+        let sub_z = root.join("z_sub");
+        let sub_a = root.join("a_sub");
+        fs::create_dir_all(&sub_z).unwrap();
+        fs::create_dir_all(&sub_a).unwrap();
+
+        fs::write(sub_z.join("z.crn"), "").unwrap();
+        fs::write(sub_z.join("a.crn"), "").unwrap();
+        fs::write(sub_a.join("z.crn"), "").unwrap();
+        fs::write(sub_a.join("a.crn"), "").unwrap();
+        fs::write(root.join("z_top.crn"), "").unwrap();
+        fs::write(root.join("a_top.crn"), "").unwrap();
+
+        let result = find_crn_files_recursive(root).unwrap();
+
+        let mut expected = result.clone();
+        expected.sort();
+        assert_eq!(
+            result, expected,
+            "find_crn_files_recursive must return paths in lexicographic order"
+        );
+        assert_eq!(result.len(), 6);
     }
 
     // ========== get_base_dir tests ==========
