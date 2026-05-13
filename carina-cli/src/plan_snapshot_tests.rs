@@ -106,6 +106,59 @@ fn snapshot_all_create() {
     insta::assert_snapshot!(output);
 }
 
+/// carina#2191 Phase 3b-2b acceptance: a directory with one default
+/// instance (`provider awscc { ... }`) and one named instance
+/// (`let us = provider awscc { ... }`), plus two resources where only
+/// the second carries `directives { provider = us }`. The snapshot
+/// pins the rendered plan output for the two-resource shape; the
+/// companion `multi_instance_create_propagates_provider_instance`
+/// test asserts the binding is carried on `ResourceId.provider_instance`
+/// so apply-time routing has it available (plan display is intentionally
+/// silent about the instance — that surface is owned by a later phase).
+#[test]
+fn snapshot_multi_instance_create() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("multi_instance_create");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+    ));
+    insta::assert_snapshot!(output);
+}
+
+/// Acceptance for the parse → plan flow on the multi-instance fixture:
+/// the `us_bucket` resource — the only one carrying
+/// `directives { provider = us }` — must reach the plan with
+/// `ResourceId.provider_instance == Some("us")`. The other bucket and
+/// the kind's default instance must remain `None`. This is what
+/// `ProviderRouter::get_provider_or_error` keys on at apply time.
+#[test]
+fn multi_instance_create_propagates_provider_instance() {
+    let (plan, _schemas, _moved) = build_plan_from_fixture("multi_instance_create");
+
+    let mut by_name: HashMap<String, Option<String>> = HashMap::new();
+    for effect in plan.effects() {
+        let id = effect.resource_id();
+        by_name.insert(id.name_str().to_string(), id.provider_instance.clone());
+    }
+
+    assert_eq!(
+        by_name.get("tokyo_bucket"),
+        Some(&None),
+        "tokyo_bucket has no directives — must route to the kind default (provider_instance = None)"
+    );
+    assert_eq!(
+        by_name.get("us_bucket"),
+        Some(&Some("us".to_string())),
+        "us_bucket has directives {{ provider = us }} — must carry the binding through to the plan"
+    );
+}
+
 /// Locks in the no-trailing-dot regression from #2516. The hash-with-
 /// instance-prefix path is covered by the unit tests in
 /// `carina-core/src/identifier/tests.rs`; fixture mode skips the hash

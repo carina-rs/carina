@@ -1,0 +1,16 @@
+# Two buckets routed to different provider instances. The
+# `directives { provider = us }` block on the second resource is the
+# only difference — exercises ResourceId.provider_instance plumbing
+# through parse -> plan rendering. Both bindings are referenced from
+# `exports.crn` so the unused-let-binding fixture check passes.
+let tokyo_bucket = awscc.s3.Bucket {
+  bucket_name = 'multi-instance-tokyo'
+}
+
+let us_bucket = awscc.s3.Bucket {
+  bucket_name = 'multi-instance-us'
+
+  directives {
+    provider = us
+  }
+}

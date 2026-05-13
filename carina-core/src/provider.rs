@@ -568,9 +568,16 @@ pub fn merge_default_tags_for_provider(
 }
 
 /// A provider that routes operations to the correct sub-provider
-/// based on the resource's provider name (`ResourceId.provider`).
+/// based on the resource's `(provider, provider_instance)` pair.
+///
+/// Each entry is keyed by `(kind, binding)`:
+/// - `binding = None` is the kind's default instance, used by resources
+///   that omit `directives { provider = ... }`.
+/// - `binding = Some(name)` is a named instance declared as
+///   `let <name> = provider <kind> { ... }` and selected via
+///   `directives { provider = <name> }`.
 pub struct ProviderRouter {
-    providers: HashMap<String, Box<dyn Provider>>,
+    providers: HashMap<(String, Option<String>), Box<dyn Provider>>,
     normalizers: Vec<Box<dyn ProviderNormalizer>>,
 }
 
@@ -588,8 +595,22 @@ impl ProviderRouter {
         }
     }
 
-    pub fn add_provider(&mut self, name: String, provider: Box<dyn Provider>) {
-        self.providers.insert(name, provider);
+    /// Register the kind's default instance (resources with
+    /// `provider_instance = None` route here).
+    pub fn add_provider(&mut self, kind: String, provider: Box<dyn Provider>) {
+        self.providers.insert((kind, None), provider);
+    }
+
+    /// Register a provider instance. `binding = None` registers the
+    /// kind's default instance; `binding = Some(name)` registers a
+    /// named instance.
+    pub fn add_provider_instance(
+        &mut self,
+        kind: String,
+        binding: Option<String>,
+        provider: Box<dyn Provider>,
+    ) {
+        self.providers.insert((kind, binding), provider);
     }
 
     pub fn add_normalizer(&mut self, ext: Box<dyn ProviderNormalizer>) {
@@ -600,11 +621,17 @@ impl ProviderRouter {
         self.providers.is_empty()
     }
 
-    fn get_provider_or_error(&self, provider_name: &str) -> ProviderResult<&dyn Provider> {
-        self.providers
-            .get(provider_name)
-            .map(|p| p.as_ref())
-            .ok_or_else(|| ProviderError::internal(format!("Unknown provider: {}", provider_name)))
+    fn get_provider_or_error(&self, id: &ResourceId) -> ProviderResult<&dyn Provider> {
+        let key = (id.provider.clone(), id.provider_instance.clone());
+        self.providers.get(&key).map(|p| p.as_ref()).ok_or_else(|| {
+            ProviderError::internal(match &id.provider_instance {
+                Some(binding) => format!(
+                    "Unknown provider instance: {} (kind={})",
+                    binding, id.provider
+                ),
+                None => format!("Unknown provider: {}", id.provider),
+            })
+        })
     }
 }
 
@@ -619,14 +646,14 @@ impl Provider for ProviderRouter {
         identifier: Option<&str>,
         request: ReadRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        match self.get_provider_or_error(&id.provider) {
+        match self.get_provider_or_error(id) {
             Ok(provider) => provider.read(id, identifier, request),
             Err(e) => Box::pin(async move { Err(e) }),
         }
     }
 
     fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-        match self.get_provider_or_error(&resource.id.provider) {
+        match self.get_provider_or_error(&resource.id) {
             Ok(provider) => provider.read_data_source(resource),
             Err(e) => Box::pin(async move { Err(e) }),
         }
@@ -637,7 +664,7 @@ impl Provider for ProviderRouter {
         id: &ResourceId,
         request: CreateRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        match self.get_provider_or_error(&id.provider) {
+        match self.get_provider_or_error(id) {
             Ok(provider) => provider.create(id, request),
             Err(e) => Box::pin(async move { Err(e) }),
         }
@@ -649,7 +676,7 @@ impl Provider for ProviderRouter {
         identifier: &str,
         request: UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        match self.get_provider_or_error(&id.provider) {
+        match self.get_provider_or_error(id) {
             Ok(provider) => provider.update(id, identifier, request),
             Err(e) => Box::pin(async move { Err(e) }),
         }
@@ -661,7 +688,7 @@ impl Provider for ProviderRouter {
         identifier: &str,
         request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
-        match self.get_provider_or_error(&id.provider) {
+        match self.get_provider_or_error(id) {
             Ok(provider) => provider.delete(id, identifier, request),
             Err(e) => Box::pin(async move { Err(e) }),
         }
@@ -1466,6 +1493,111 @@ mod tests {
         let err = result.unwrap_err();
         assert!(matches!(err, ProviderError::Internal(_)));
         assert!(err.message().contains("Unknown provider: nonexistent"));
+    }
+
+    /// A provider that records its identity in the returned state
+    /// so a routing test can tell which instance handled a call.
+    struct TaggedProvider {
+        tag: &'static str,
+    }
+    impl Provider for TaggedProvider {
+        fn name(&self) -> &str {
+            "tagged"
+        }
+        fn read(
+            &self,
+            id: &ResourceId,
+            _identifier: Option<&str>,
+            _request: ReadRequest,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            let mut attrs = HashMap::new();
+            attrs.insert(
+                "tag".to_string(),
+                Value::Concrete(ConcreteValue::String(self.tag.to_string())),
+            );
+            let state = State::existing(id.clone(), attrs);
+            Box::pin(async move { Ok(state) })
+        }
+        fn read_data_source(&self, _resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+            Box::pin(async { Err(ProviderError::internal("not supported")) })
+        }
+        fn create(
+            &self,
+            _id: &ResourceId,
+            _request: CreateRequest,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            Box::pin(async { Err(ProviderError::internal("not supported")) })
+        }
+        fn update(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _request: UpdateRequest,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            Box::pin(async { Err(ProviderError::internal("not supported")) })
+        }
+        fn delete(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _request: DeleteRequest,
+        ) -> BoxFuture<'_, ProviderResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_router_dispatches_to_named_instance() {
+        // Two instances of the same kind ("mock") routed by binding.
+        let mut router = ProviderRouter::new();
+        router.add_provider_instance(
+            "mock".to_string(),
+            None,
+            Box::new(TaggedProvider { tag: "default" }),
+        );
+        router.add_provider_instance(
+            "mock".to_string(),
+            Some("us".to_string()),
+            Box::new(TaggedProvider { tag: "us" }),
+        );
+
+        let default_id = ResourceId::with_provider("mock", "test", "a");
+        let state = router.read(&default_id, None, ReadRequest).await.unwrap();
+        assert_eq!(
+            state.attributes.get("tag"),
+            Some(&Value::Concrete(ConcreteValue::String(
+                "default".to_string()
+            ))),
+            "resources without provider_instance must route to the kind's default instance"
+        );
+
+        let us_id =
+            ResourceId::with_provider_and_instance("mock", "test", "b", Some("us".to_string()));
+        let state = router.read(&us_id, None, ReadRequest).await.unwrap();
+        assert_eq!(
+            state.attributes.get("tag"),
+            Some(&Value::Concrete(ConcreteValue::String("us".to_string()))),
+            "resources tagged with binding=Some('us') must route to that named instance"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_router_unknown_named_instance_errors_with_binding() {
+        let mut router = ProviderRouter::new();
+        router.add_provider("mock".to_string(), Box::new(MockProvider));
+
+        let id = ResourceId::with_provider_and_instance(
+            "mock",
+            "test",
+            "x",
+            Some("missing".to_string()),
+        );
+        let err = router.read(&id, None, ReadRequest).await.unwrap_err();
+        let msg = err.message();
+        assert!(
+            msg.contains("missing") && msg.contains("mock"),
+            "error must name both the binding and the kind, got: {msg}"
+        );
     }
 
     #[tokio::test]
