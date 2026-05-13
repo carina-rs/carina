@@ -2567,6 +2567,8 @@ fn provider_config_carries_unresolved_attributes_field() {
         version: None,
         revision: None,
         unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
     };
     assert!(pc.unresolved_attributes.is_empty());
 }
@@ -9241,4 +9243,335 @@ fn extract_directives_rejects_string_literal_in_anonymous_resource_depends_on() 
         "error should mention binding identifiers, got: {}",
         err
     );
+}
+
+#[test]
+fn parse_provider_expr_named_instance_in_let_binding() {
+    let input = r#"
+        provider aws {
+            source = "github.com/carina-rs/carina-provider-aws"
+            version = "0.1.0"
+        }
+
+        let us = provider aws {
+            region = "us-east-1"
+        }
+    "#;
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
+
+    // Two entries: the default kind+instance from the top-level block,
+    // plus the `let us = ...` named instance.
+    assert_eq!(
+        parsed.providers.len(),
+        2,
+        "expected default + named instance"
+    );
+
+    let default = parsed
+        .providers
+        .iter()
+        .find(|p| p.is_default)
+        .expect("default instance from top-level block");
+    assert_eq!(default.name, "aws");
+    assert!(default.binding.is_none());
+    assert_eq!(
+        default.source.as_deref(),
+        Some("github.com/carina-rs/carina-provider-aws")
+    );
+
+    let named = parsed
+        .providers
+        .iter()
+        .find(|p| !p.is_default)
+        .expect("named instance from let binding");
+    assert_eq!(named.name, "aws", "named instance carries the kind");
+    assert_eq!(named.binding.as_deref(), Some("us"));
+    // Named instances do NOT carry source/version/revision; those are kind-level.
+    assert!(named.source.is_none());
+    assert!(named.version.is_none());
+    assert!(named.revision.is_none());
+    // Instance attributes are present.
+    match named.attributes.get("region") {
+        Some(Value::Concrete(ConcreteValue::String(s))) => assert_eq!(s, "us-east-1"),
+        other => panic!("expected region string attribute, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_provider_expr_rejects_source_on_named_instance() {
+    // `source` is a kind-level attribute; declaring it on a named
+    // instance is an error.
+    let input = r#"
+        provider aws {
+            source = "github.com/carina-rs/carina-provider-aws"
+            version = "0.1.0"
+        }
+
+        let us = provider aws {
+            source = "github.com/carina-rs/carina-provider-aws"
+            region = "us-east-1"
+        }
+    "#;
+    let err = parse(input, &ProviderContext::default())
+        .expect_err("source on named instance must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("source"),
+        "error must mention the offending field, got: {msg}"
+    );
+}
+
+#[test]
+fn parse_provider_expr_rejects_version_on_named_instance() {
+    let input = r#"
+        provider aws {
+            source = "github.com/carina-rs/carina-provider-aws"
+            version = "0.1.0"
+        }
+
+        let us = provider aws {
+            version = "0.2.0"
+        }
+    "#;
+    let err = parse(input, &ProviderContext::default())
+        .expect_err("version on named instance must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("version"),
+        "error must mention the offending field, got: {msg}"
+    );
+}
+
+#[test]
+fn parse_provider_expr_rejects_revision_on_named_instance() {
+    let input = r#"
+        provider aws {
+            source = "github.com/carina-rs/carina-provider-aws"
+            version = "0.1.0"
+        }
+
+        let us = provider aws {
+            revision = "main"
+        }
+    "#;
+    let err = parse(input, &ProviderContext::default())
+        .expect_err("revision on named instance must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("revision"),
+        "error must mention the offending field, got: {msg}"
+    );
+}
+
+#[test]
+fn parse_top_level_provider_block_keeps_default_instance_flags() {
+    // The existing top-level `provider <kind> { ... }` shape continues to
+    // parse and now carries the default-instance metadata.
+    let input = r#"
+        provider mock {
+            source = "github.com/carina-rs/carina-provider-mock"
+            version = "0.1.0"
+        }
+    "#;
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    assert_eq!(parsed.providers.len(), 1);
+    let p = &parsed.providers[0];
+    assert_eq!(p.name, "mock");
+    assert!(
+        p.is_default,
+        "top-level provider block is the kind's default instance"
+    );
+    assert!(p.binding.is_none(), "default instance has no binding name");
+}
+
+#[test]
+fn parse_provider_expr_multiple_named_instances() {
+    let input = r#"
+        provider aws {
+            source = "github.com/carina-rs/carina-provider-aws"
+            version = "0.1.0"
+            region = "ap-northeast-1"
+        }
+
+        let tokyo = provider aws {
+            region = "ap-northeast-1"
+        }
+
+        let virginia = provider aws {
+            region = "us-east-1"
+        }
+    "#;
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    assert_eq!(parsed.providers.len(), 3);
+    let mut bindings: Vec<Option<&str>> = parsed
+        .providers
+        .iter()
+        .map(|p| p.binding.as_deref())
+        .collect();
+    bindings.sort();
+    assert_eq!(bindings, vec![None, Some("tokyo"), Some("virginia")]);
+}
+
+/// Directory-scoped: a named instance in one file must be visible
+/// alongside the default instance in a sibling file (mirrors the
+/// `carina-rs/infra` T6c layout where `providers.crn` registers the
+/// kind and a separate file declares a per-region named instance).
+#[test]
+fn parse_provider_expr_named_instance_visible_across_files() {
+    use crate::config_loader::parse_directory;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("providers.crn"),
+        r#"
+            provider aws {
+                source  = "github.com/carina-rs/carina-provider-aws"
+                version = "0.1.0"
+                region  = "ap-northeast-1"
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("main.crn"),
+        r#"
+            let us = provider aws {
+                region = "us-east-1"
+            }
+        "#,
+    )
+    .unwrap();
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
+        .expect("multi-file directory parse must succeed");
+
+    assert_eq!(
+        parsed.providers.len(),
+        2,
+        "expected default + named instance across sibling files"
+    );
+    let has_default = parsed
+        .providers
+        .iter()
+        .any(|p| p.name == "aws" && p.is_default && p.binding.is_none());
+    let has_named = parsed
+        .providers
+        .iter()
+        .any(|p| p.name == "aws" && !p.is_default && p.binding.as_deref() == Some("us"));
+    assert!(has_default, "default instance from providers.crn missing");
+    assert!(has_named, "named instance from main.crn missing");
+}
+
+#[test]
+fn parse_provider_expr_empty_body() {
+    let input = r#"
+        provider aws {
+            source = "github.com/carina-rs/carina-provider-aws"
+            version = "0.1.0"
+        }
+        let us = provider aws {}
+    "#;
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let named = parsed
+        .providers
+        .iter()
+        .find(|p| p.binding.as_deref() == Some("us"))
+        .expect("named instance with empty body must parse");
+    assert!(
+        named.attributes.is_empty(),
+        "empty body yields no attributes"
+    );
+}
+
+#[test]
+fn parse_provider_expr_rejects_duplicate_binding() {
+    let input = r#"
+        provider aws {
+            source = "github.com/carina-rs/carina-provider-aws"
+            version = "0.1.0"
+        }
+        let us = provider aws { region = "us-east-1" }
+        let us = provider aws { region = "eu-west-1" }
+    "#;
+    let err = parse(input, &ProviderContext::default())
+        .expect_err("duplicate let binding for a provider instance must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.to_lowercase().contains("duplicate"),
+        "error should flag duplicate binding, got: {msg}"
+    );
+}
+
+#[test]
+fn parse_provider_expr_with_discard_pattern() {
+    // `let _ = provider aws { ... }` parses successfully — the discard
+    // pattern is grammar-legal and the named instance is collected, but
+    // it is unreferenceable from `directives { provider = ... }` because
+    // `_` is not a valid binding name to refer to. Documents the current
+    // behaviour; Phase 3 will surface the unused-instance warning.
+    let input = r#"
+        provider aws {
+            source = "github.com/carina-rs/carina-provider-aws"
+            version = "0.1.0"
+        }
+        let _ = provider aws { region = "us-east-1" }
+    "#;
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    assert_eq!(parsed.providers.len(), 2);
+}
+
+#[test]
+fn provider_config_named_instance_serde_round_trip() {
+    use crate::parser::ast::ProviderConfig;
+    let original = ProviderConfig {
+        name: "aws".to_string(),
+        attributes: {
+            let mut m = IndexMap::new();
+            m.insert(
+                "region".to_string(),
+                Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
+            );
+            m
+        },
+        default_tags: IndexMap::new(),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: Some("us".to_string()),
+        is_default: false,
+    };
+    let json = serde_json::to_string(&original).expect("serialize");
+    let decoded: ProviderConfig = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(decoded.name, "aws");
+    assert_eq!(decoded.binding.as_deref(), Some("us"));
+    assert!(!decoded.is_default);
+}
+
+#[test]
+fn provider_config_default_instance_serde_round_trip() {
+    use crate::parser::ast::ProviderConfig;
+    let original = ProviderConfig {
+        name: "aws".to_string(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+        source: Some("github.com/x/y".to_string()),
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
+    };
+    let json = serde_json::to_string(&original).expect("serialize");
+    // Defaults skipped from the JSON to keep state files small.
+    assert!(
+        !json.contains("\"binding\""),
+        "binding: None should be skipped, got: {json}"
+    );
+    assert!(
+        !json.contains("\"is_default\""),
+        "is_default: true should be skipped, got: {json}"
+    );
+    // Deserialising omitted fields must still produce the default-instance shape.
+    let decoded: ProviderConfig = serde_json::from_str(&json).expect("deserialize");
+    assert!(decoded.binding.is_none());
+    assert!(decoded.is_default);
 }

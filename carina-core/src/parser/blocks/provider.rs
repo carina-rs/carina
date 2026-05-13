@@ -105,7 +105,51 @@ pub(in crate::parser) fn parse_provider_block(
         version,
         revision,
         unresolved_attributes,
+        binding: None,
+        is_default: true,
     })
+}
+
+/// Parse a `provider <kind> { ... }` expression used as the RHS of a
+/// `let` binding. `source` / `version` / `revision` describe **how to
+/// load** the provider plugin and are properties of the kind, not of
+/// an individual instance — declaring them on a named instance would
+/// invite divergent plugin versions per instance, so they are rejected
+/// here in favour of the single top-level `provider <kind>` block.
+pub(in crate::parser) fn parse_provider_expr(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+    binding_name: &str,
+) -> Result<ProviderConfig, ParseError> {
+    let mut config = parse_provider_block(pair, ctx)?;
+
+    let kind_level_present: &[(&str, bool)] = &[
+        ("source", config.source.is_some()),
+        ("version", config.version.is_some()),
+        ("revision", config.revision.is_some()),
+    ];
+    for (field, present) in kind_level_present {
+        if *present {
+            return Err(reject_kind_level_attr(field, binding_name, &config.name));
+        }
+    }
+
+    config.binding = Some(binding_name.to_string());
+    config.is_default = false;
+    Ok(config)
+}
+
+fn reject_kind_level_attr(field: &str, binding: &str, kind: &str) -> ParseError {
+    ParseError::Syntax(pest::error::Error::new_from_pos(
+        pest::error::ErrorVariant::CustomError {
+            message: format!(
+                "'{field}' is a kind-level attribute and cannot be set on \
+                 a named provider instance '{binding}'. Move it to the \
+                 top-level `provider {kind}` block."
+            ),
+        },
+        pest::Position::from_start(""),
+    ))
 }
 
 /// Parse a require statement: `require <validate_expr>, "error message"`

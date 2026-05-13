@@ -187,6 +187,13 @@ provider_block = {
     "provider" ~ identifier ~ "{" ~ attribute* ~ "}"
 }
 
+// Provider expression: `let <name> = provider <kind> { ... }`. Must be
+// listed in `primary` before `module_call`, otherwise `provider aws { ... }`
+// would silently parse as a module call whose name is `provider`.
+provider_expr = {
+    "provider" ~ identifier ~ "{" ~ attribute* ~ "}"
+}
+
 // Variable/resource definition: let name = value
 // discard_pattern allows `let _ = expr` to suppress unused binding warnings
 // `use_expr` is allowed only here (not in `expression`/`primary`) because it is
@@ -247,6 +254,7 @@ primary = {
     read_resource_expr   // Must come before resource_expr for "read aws..." parsing
   | wait_expr            // Must come before module_call so "wait <target> { ... }" is not parsed as a module call
   | upstream_state_expr  // Must come before module_call so "upstream_state { ... }" is not parsed as a module call
+  | provider_expr        // Must come before module_call so "provider <kind> { ... }" is not parsed as a module call
   | resource_expr
   | for_expr             // Must come before module_call so "for" is not parsed as module name
   | if_expr              // Must come before module_call so "if" is not parsed as module name

@@ -57,4 +57,22 @@ impl Formatter {
         self.write("}");
         self.write_newline();
     }
+
+    /// Format `provider <kind> { ... }` when it appears as the RHS of a
+    /// `let` binding. The surrounding `let` formatter has already emitted
+    /// the indent and `let name = ` prefix, so this only emits the
+    /// keyword, kind identifier, and block body.
+    pub(in crate::formatter) fn format_provider_expr(&mut self, node: &CstNode) {
+        self.write("provider ");
+        for child in &node.children {
+            if let CstChild::Token(token) = child
+                && self.is_identifier(&token.text)
+                && token.text != "provider"
+            {
+                self.write_token(&token.text);
+                break;
+            }
+        }
+        self.format_block_body_tail(node);
+    }
 }

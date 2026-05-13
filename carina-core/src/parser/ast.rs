@@ -430,6 +430,25 @@ pub struct ProviderConfig {
     /// empty after finalization. In-memory transit only — never serialized.
     #[serde(skip)]
     pub unresolved_attributes: IndexMap<String, Value>,
+    /// `let` binding name when this entry was declared as a named instance
+    /// via `let <name> = provider <kind> { ... }`. `None` for the default
+    /// instance produced by a top-level `provider <kind> { ... }` block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<String>,
+    /// True when this entry is the kind's default instance (sourced from a
+    /// top-level `provider <kind> { ... }` block). False for named instances.
+    /// Resources without an explicit provider directive resolve to the
+    /// kind's default instance.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub is_default: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 /// Backend configuration for state storage

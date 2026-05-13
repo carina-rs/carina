@@ -9,6 +9,7 @@ use super::Rule;
 use super::ast::{ModuleCall, UseStatement};
 use super::blocks::backend::parse_upstream_state_expr;
 use super::blocks::module_call::parse_module_call;
+use super::blocks::provider::parse_provider_expr;
 use super::blocks::resource::{parse_read_resource_expr, parse_resource_expr};
 use super::blocks::use_stmt::parse_use_expr;
 use super::context::{ParseContext, first_inner, next_pair};
@@ -321,6 +322,24 @@ fn parse_primary_with_resource_or_module(
                 });
             }
             ctx.upstream_states.insert(us.binding.clone(), us);
+            let ref_value =
+                Value::Concrete(ConcreteValue::String(format!("${{{}}}", binding_name)));
+            Ok((EvalValue::from_value(ref_value), vec![], vec![], None))
+        }
+        Rule::provider_expr => {
+            let (line, _) = inner.as_span().start_pos().line_col();
+            let config = parse_provider_expr(inner, ctx, binding_name)?;
+            if ctx
+                .named_provider_instances
+                .iter()
+                .any(|p| p.binding.as_deref() == Some(binding_name))
+            {
+                return Err(ParseError::DuplicateBinding {
+                    name: binding_name.to_string(),
+                    line,
+                });
+            }
+            ctx.named_provider_instances.push(config);
             let ref_value =
                 Value::Concrete(ConcreteValue::String(format!("${{{}}}", binding_name)));
             Ok((EvalValue::from_value(ref_value), vec![], vec![], None))

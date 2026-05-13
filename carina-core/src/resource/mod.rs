@@ -1359,6 +1359,12 @@ pub struct Directives {
     /// Vec to preserve source order for `carina fmt` round-tripping.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
+    /// Binding name of the provider instance to use for this resource.
+    /// `None` resolves to the kind's default instance. Phase 2 only
+    /// holds the slot; `directives { provider = ... }` reading and
+    /// routing land in Phase 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_instance: Option<String>,
 }
 
 /// Source of a resource (root or from a module)

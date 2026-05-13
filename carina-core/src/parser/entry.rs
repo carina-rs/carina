@@ -221,6 +221,10 @@ pub fn parse_with_seeded_bindings(
                                 let is_discard = name == "_";
                                 let is_upstream_state = ctx.upstream_states.contains_key(&name);
                                 let is_wait_binding = ctx.wait_bindings.contains_key(&name);
+                                let is_provider_instance = ctx
+                                    .named_provider_instances
+                                    .iter()
+                                    .any(|p| p.binding.as_deref() == Some(&name));
                                 if !is_discard {
                                     // A seeded placeholder (from a sibling-file
                                     // declaration during the directory-aware
@@ -239,15 +243,18 @@ pub fn parse_with_seeded_bindings(
                                     if shadows_seed {
                                         ctx.unmark_seeded(&name);
                                     }
-                                    if is_upstream_state || is_wait_binding {
-                                        // upstream_state and wait lets do not bind a
-                                        // user-facing value; the binding name
-                                        // resolves through `resource_bindings`
-                                        // as a forward reference. When a seed
-                                        // pre-installed a placeholder under
-                                        // this name, drop it so the ParsedFile
-                                        // we hand back doesn't leak the seeded
-                                        // `ResourceRef` into downstream walkers
+                                    if is_upstream_state || is_wait_binding || is_provider_instance
+                                    {
+                                        // upstream_state, wait, and named provider
+                                        // instance lets do not bind a user-facing
+                                        // value; the binding name is consumed by a
+                                        // dedicated side-channel (`upstream_states`,
+                                        // `wait_bindings`, `providers`) and would
+                                        // collide downstream if also stored as a
+                                        // regular variable. When a seed pre-installed
+                                        // a placeholder under this name, drop it so
+                                        // the ParsedFile we hand back doesn't leak the
+                                        // seeded `ResourceRef` into downstream walkers
                                         // (#2817).
                                         if shadows_seed {
                                             ctx.variables.shift_remove(&name);
@@ -317,6 +324,8 @@ pub fn parse_with_seeded_bindings(
             }
         }
     }
+
+    providers.extend(std::mem::take(&mut ctx.named_provider_instances));
 
     // Second pass: resolve forward references.
     // During parsing, unknown 2-part identifiers (e.g., vpc.vpc_id where vpc is
