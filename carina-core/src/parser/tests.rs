@@ -9927,6 +9927,99 @@ fn check_provider_instance_routing_rejects_non_provider_let_binding() {
     );
 }
 
+/// carina#3021 — multi-file shape with **namespaced enum identifiers**
+/// (`aws.Region.us_east_1`) for `region`. This is the form real
+/// configs use; quoted strings (`region = "us-east-1"`) are an
+/// alternate spelling that the parser stores as
+/// `Value::Concrete(ConcreteValue::String)`. Namespaced identifiers
+/// land in `EnumIdentifier`, and the bug was that downstream
+/// `extract_region` only matched the `String` arm — see
+/// [[feedback_scalar_serializer_enum_identifier]] for the class.
+/// The fix is centralised in `utils::extract_region_from_attrs`;
+/// this test pins the parse side so we know the regression test in
+/// `utils` is operating on the same `Value` shape the parser produces.
+#[test]
+fn parse_directory_named_instance_region_is_enum_identifier_namespaced() {
+    use crate::config_loader::parse_directory;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("providers.crn"),
+        r#"
+            provider aws {
+                source  = "github.com/carina-rs/carina-provider-aws"
+                version = "0.1.0"
+                region  = aws.Region.ap_northeast_1
+            }
+            let us = provider aws { region = aws.Region.us_east_1 }
+        "#,
+    )
+    .unwrap();
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
+        .expect("multi-file directory parse must succeed");
+
+    let us = parsed
+        .providers
+        .iter()
+        .find(|p| p.binding.as_deref() == Some("us"))
+        .expect("`us` named instance must exist in parsed.providers");
+    // The parser stamps namespaced region literals as
+    // `EnumIdentifier`. Any downstream `extract_region` /
+    // `convert_region_value` etc. must accept this variant *and* the
+    // plain `String` variant — earlier versions only matched
+    // `String`, silently falling back to a hardcoded default region
+    // when the user wrote `aws.Region.us_east_1`. See carina#3021.
+    let region_text = match us.attributes.get("region") {
+        Some(Value::Concrete(ConcreteValue::EnumIdentifier(s))) => Some(s.as_str()),
+        Some(Value::Concrete(ConcreteValue::String(s))) => Some(s.as_str()),
+        _ => None,
+    };
+    assert_eq!(
+        region_text,
+        Some("aws.Region.us_east_1"),
+        "named instance must carry its own region in either EnumIdentifier \
+         or String form (got {:?}). carina#3021.",
+        us.attributes.get("region")
+    );
+
+    // And the canonical conversion must round-trip the namespaced
+    // form to the AWS SDK region string regardless of which `Value`
+    // variant carried it.
+    let canonical = crate::utils::convert_region_value(region_text.unwrap());
+    assert_eq!(
+        canonical, "us-east-1",
+        "convert_region_value must reduce `aws.Region.us_east_1` to the \
+         SDK string `us-east-1`. carina#3021."
+    );
+
+    // The bug also affected the kind default — its region is also
+    // written as a namespaced identifier (`aws.Region.ap_northeast_1`).
+    // The user just happened to see the right value in the plan
+    // output because the host's hardcoded `_ => "ap-northeast-1"`
+    // fallback matched the user's intended region. Verifying the
+    // default here pins that we'd catch that latent bug too.
+    let default = parsed
+        .providers
+        .iter()
+        .find(|p| p.is_default && p.name == "aws")
+        .expect("default instance must exist");
+    let default_region_text = match default.attributes.get("region") {
+        Some(Value::Concrete(ConcreteValue::EnumIdentifier(s))) => Some(s.as_str()),
+        Some(Value::Concrete(ConcreteValue::String(s))) => Some(s.as_str()),
+        _ => None,
+    };
+    assert_eq!(
+        default_region_text,
+        Some("aws.Region.ap_northeast_1"),
+        "kind default must also carry its own region in EnumIdentifier \
+         form so the helper canonicalises it instead of falling through \
+         to the hardcoded host default. carina#3021."
+    );
+    assert_eq!(
+        crate::utils::convert_region_value(default_region_text.unwrap()),
+        "ap-northeast-1"
+    );
+}
+
 #[test]
 fn parser_propagates_directives_provider_instance_to_resource_id() {
     let src = r#"
