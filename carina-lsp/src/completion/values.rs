@@ -656,9 +656,11 @@ impl CompletionProvider {
     }
 
     /// Attribute-name candidates for `directives { | }` (#2873). The
-    /// four directives — `force_delete`, `create_before_destroy`,
-    /// `prevent_destroy`, `depends_on` — exhaustively. Order is
-    /// alphabetical to match `KEYWORDS` ordering in `keywords.rs`.
+    /// five directives — `create_before_destroy`, `depends_on`,
+    /// `force_delete`, `prevent_destroy`, `provider` — exhaustively.
+    /// Order is alphabetical to match `KEYWORDS` ordering in
+    /// `keywords.rs`. `provider` was added in carina#2191 Phase 5 for
+    /// routing to named provider instances.
     pub(super) fn directives_block_completions(&self) -> Vec<CompletionItem> {
         let trigger_suggest = Command {
             title: "Trigger Suggest".to_string(),
@@ -698,10 +700,49 @@ impl CompletionProvider {
                 kind: Some(CompletionItemKind::PROPERTY),
                 detail: Some("Block any plan that would destroy this resource".to_string()),
                 insert_text: Some("prevent_destroy = ".to_string()),
+                command: Some(trigger_suggest.clone()),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "provider".to_string(),
+                kind: Some(CompletionItemKind::PROPERTY),
+                detail: Some(
+                    "Route this resource to a named provider instance \
+                     (`let <name> = provider <kind> { ... }`)"
+                        .to_string(),
+                ),
+                insert_text: Some("provider = ".to_string()),
                 command: Some(trigger_suggest),
                 ..Default::default()
             },
         ]
+    }
+
+    /// Value candidates for `directives { provider = | }` (carina#2191
+    /// Phase 5). Suggests every named provider instance binding
+    /// declared anywhere in the directory. The kind's default
+    /// instance (a top-level `provider <kind> { ... }` block without
+    /// a `let` prefix) carries no binding name and is intentionally
+    /// not surfaced — omitting `directives.provider` routes there.
+    pub(super) fn directives_provider_completions(
+        &self,
+        provider_ctx: &carina_core::parser::ProviderContext,
+        base_path: Option<&std::path::Path>,
+    ) -> Vec<CompletionItem> {
+        let bindings = collect_named_provider_instance_bindings(provider_ctx, base_path);
+        bindings
+            .into_iter()
+            .map(|binding| CompletionItem {
+                label: binding.clone(),
+                kind: Some(CompletionItemKind::VARIABLE),
+                detail: Some(format!(
+                    "Named provider instance `let {} = provider <kind> {{ ... }}`",
+                    binding
+                )),
+                insert_text: Some(binding),
+                ..Default::default()
+            })
+            .collect()
     }
 
     /// Element candidates for `directives { depends_on = [|] }`
@@ -2050,4 +2091,43 @@ fn join_relative(up_depth: usize, parts: &[&str]) -> String {
     }
     s.push_str(&parts.join("/"));
     s
+}
+
+/// Collect every named provider instance binding declared in the
+/// directory that `base_path` lives in. A *named* instance is one
+/// declared as `let <name> = provider <kind> { ... }`; the kind's
+/// default instance (a top-level `provider <kind> { ... }` without
+/// `let`) carries no binding name and is excluded.
+///
+/// The walk is directory-scoped: a binding declared in `providers.crn`
+/// must surface as a completion candidate while the user is editing
+/// `main.crn` in the same directory ([[feedback_directory_scoped_features]]).
+/// `parse_directory` is the right entry point because it merges every
+/// sibling `.crn` regardless of whether the directory is a module
+/// (input/output shape) or a root config — `load_module` returns
+/// `None` for root configs and would miss the bindings entirely.
+fn collect_named_provider_instance_bindings(
+    provider_ctx: &carina_core::parser::ProviderContext,
+    base_path: Option<&Path>,
+) -> Vec<String> {
+    let Some(base) = base_path else {
+        return Vec::new();
+    };
+    let dir = if base.is_file() {
+        base.parent().unwrap_or(base).to_path_buf()
+    } else {
+        base.to_path_buf()
+    };
+    let parsed = match carina_core::config_loader::parse_directory(&dir, provider_ctx) {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+    let mut bindings: Vec<String> = parsed
+        .providers
+        .iter()
+        .filter_map(|p| p.binding.clone())
+        .collect();
+    bindings.sort();
+    bindings.dedup();
+    bindings
 }

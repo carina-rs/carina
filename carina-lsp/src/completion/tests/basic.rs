@@ -2395,7 +2395,7 @@ let rd = registry_deploy {
 }
 
 #[test]
-fn directives_block_completion_includes_all_four_keys() {
+fn directives_block_completion_includes_all_five_keys() {
     let provider = test_provider_single_attr();
     let doc = create_document("test.foo.bar {\n  attr = \"x\"\n  directives {\n    \n  }\n}\n");
     // Cursor inside directives block, line 3, char 4
@@ -2413,6 +2413,7 @@ fn directives_block_completion_includes_all_four_keys() {
         "create_before_destroy",
         "prevent_destroy",
         "depends_on",
+        "provider",
     ] {
         assert!(
             labels.contains(&key),
@@ -2471,5 +2472,78 @@ fn directives_depends_on_completion_excludes_already_listed_names() {
     assert!(
         labels.contains(&"kms"),
         "kms binding should still be suggested; got {labels:?}"
+    );
+}
+
+/// carina#2191 Phase 5: `directives { provider = | }` value-position
+/// completion must surface every named provider instance declared in
+/// the directory. Bindings in sibling `.crn` files count
+/// ([[feedback_directory_scoped_features]]) — the test puts the named
+/// instance in `providers.crn` while the cursor sits in `main.crn`.
+#[test]
+fn directives_provider_value_completion_lists_named_instances() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let provider = test_provider_single_attr();
+    let temp_dir = tempdir().expect("failed to create tempdir");
+    let base_path = temp_dir.path();
+
+    // Default instance + two named instances declared in a sibling
+    // file. The parser accepts arbitrary provider kinds at this stage;
+    // schema-level kind validation happens later in the pipeline.
+    let providers_crn = "provider test {\n  region = \"x\"\n}\n";
+    let named_instances_crn = "let us = provider test {\n  region = \"u\"\n}\nlet tokyo = provider test {\n  region = \"t\"\n}\n";
+    fs::write(base_path.join("providers.crn"), providers_crn).expect("write providers.crn");
+    fs::write(base_path.join("instances.crn"), named_instances_crn).expect("write instances.crn");
+
+    // main.crn on disk has a complete `directives` block so the
+    // directory parse succeeds; the buffer passed to the LSP layer
+    // (`main_content`, below) holds the in-progress edit with the
+    // cursor right after `provider = ` and no value yet.
+    fs::write(
+        base_path.join("main.crn"),
+        "test.foo.bar {\n  attr = \"r\"\n}\n",
+    )
+    .expect("write main.crn");
+
+    let main_content = "test.foo.bar {\n  attr = \"r\"\n  directives {\n    provider = \n  }\n}\n";
+
+    // Sanity: verify the directory parse sees both named instances.
+    // If this assertion ever fires the LSP completion can't possibly
+    // see them either — that's the path we're actually trying to test.
+    let parsed = carina_core::config_loader::parse_directory(
+        base_path,
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("parse_directory should accept the fixture");
+    let parsed_bindings: Vec<&str> = parsed
+        .providers
+        .iter()
+        .filter_map(|p| p.binding.as_deref())
+        .collect();
+    assert!(
+        parsed_bindings.contains(&"us") && parsed_bindings.contains(&"tokyo"),
+        "parser should see both named instances in sibling files; got {parsed_bindings:?}"
+    );
+
+    let doc = create_document(main_content);
+
+    // Cursor right after `provider = ` on line 3 (so `prefix.contains('=')`
+    // is true and `extract_attr_name` resolves to `provider`).
+    let position = Position {
+        line: 3,
+        character: 15,
+    };
+    let completions = provider.complete(&doc, position, Some(base_path));
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"us"),
+        "named instance `us` must surface as a value candidate; got {labels:?}"
+    );
+    assert!(
+        labels.contains(&"tokyo"),
+        "named instance `tokyo` must surface as a value candidate; got {labels:?}"
     );
 }
