@@ -223,12 +223,15 @@ identifier = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 // Segments after the first dot can also be digit-only (e.g., "Type.ipsec.1")
 namespaced_id = @{ identifier ~ ("." ~ (identifier | ASCII_DIGIT+))+ }
 
-// Namespaced identifier followed by one or more `[index]` subscripts:
-// `orgs.accounts[0]`, `orgs.account.children["alpha"]`. Captured as a
-// distinct rule so the namespaced_id arm doesn't have to introspect for
-// trailing subscripts and so the grammar matches the issue-#2318
-// surface (post-field index access) explicitly.
-subscripted_id = { namespaced_id ~ index_access+ }
+// Namespaced identifier followed by one or more `[index]` subscripts
+// and/or `.field` continuations: `orgs.accounts[0]`,
+// `orgs.account.children["alpha"]`,
+// `cert.domain_validation_options[0].resource_record_name` (carina#3025).
+// Captured as a distinct rule from `variable_ref` so the namespaced_id
+// head ambiguity (`a.b` could be a binding+field or a 2-part enum)
+// stays resolved by the trailing-access shape, and so the grammar
+// matches the post-field index/field access surface explicitly.
+subscripted_id = { namespaced_id ~ (index_access | field_access)+ }
 
 // Expression
 expression = { coalesce_expr }

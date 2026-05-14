@@ -255,14 +255,31 @@ impl Subscript {
     }
 }
 
+/// One step along an [`AccessPath`] past its `binding.attribute` head.
+///
+/// A path is an ordered sequence of `PathSegment`s; the grammar can
+/// produce any mix of `.field` and `[index]` continuations at any
+/// depth (e.g. `cert.foo[0].bar[1].baz`). carina#3025.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PathSegment {
+    /// A `.field` continuation.
+    Field { name: String },
+    /// A `[index]` / `["key"]` subscript.
+    Subscript {
+        #[serde(flatten)]
+        index: Subscript,
+    },
+}
+
 /// A typed access path representing a `ResourceRef` target.
 ///
-/// The path always carries a binding name and an attribute name; nested
-/// field access (e.g., `web.network.vpc_id`) is captured in
-/// `field_path`, and any trailing `[index]` subscripts in `subscripts`.
-/// The grammar accepts only `binding.field[…]…`, never `binding[…].field`,
-/// so the two chains never interleave — pre-field index access is folded
-/// into the binding name string by the parser as before.
+/// The path always carries a binding name and an attribute name; the
+/// remainder of the chain is an ordered `Vec<PathSegment>` that
+/// captures the source-form mix of `.field` and `[index]`
+/// continuations at any depth (carina#3025). Pre-attribute index
+/// access (e.g. `binding[0].x`) is still folded into the binding name
+/// string by the parser as before.
 ///
 /// The "binding + attribute is mandatory" invariant is enforced by the
 /// type system — there is no way to construct an `AccessPath` without
@@ -272,9 +289,7 @@ pub struct AccessPath {
     binding: String,
     attribute: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    field_path: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    subscripts: Vec<Subscript>,
+    segments: Vec<PathSegment>,
 }
 
 impl AccessPath {
@@ -284,23 +299,12 @@ impl AccessPath {
     /// `.attr`) is represented by [`Value::BindingRef`], not by an
     /// `AccessPath` with an empty attribute.
     pub fn new(binding: impl Into<String>, attribute: impl Into<String>) -> Self {
-        let binding = binding.into();
-        let attribute = attribute.into();
-        assert!(
-            !attribute.is_empty(),
-            "AccessPath::new with empty attribute for binding {:?}; \
-             use Value::BindingRef instead (#2847)",
-            binding
-        );
-        Self {
-            binding,
-            attribute,
-            field_path: Vec::new(),
-            subscripts: Vec::new(),
-        }
+        Self::with_segments(binding, attribute, Vec::new())
     }
 
-    /// Create an `AccessPath` with a nested field path (e.g., `web.network.vpc_id`).
+    /// Create an `AccessPath` with a nested field path (e.g.,
+    /// `web.network.vpc_id`). Equivalent to a path whose every segment
+    /// after `attribute` is a `Field`.
     ///
     /// `attribute` must be non-empty. See [`AccessPath::new`].
     pub fn with_fields(
@@ -308,20 +312,11 @@ impl AccessPath {
         attribute: impl Into<String>,
         field_path: Vec<String>,
     ) -> Self {
-        let binding = binding.into();
-        let attribute = attribute.into();
-        assert!(
-            !attribute.is_empty(),
-            "AccessPath::with_fields with empty attribute for binding {:?}; \
-             use Value::BindingRef instead (#2847)",
-            binding
-        );
-        Self {
-            binding,
-            attribute,
-            field_path,
-            subscripts: Vec::new(),
-        }
+        let segments = field_path
+            .into_iter()
+            .map(|name| PathSegment::Field { name })
+            .collect();
+        Self::with_segments(binding, attribute, segments)
     }
 
     /// Create an `AccessPath` with both a field chain and trailing
@@ -335,19 +330,39 @@ impl AccessPath {
         field_path: Vec<String>,
         subscripts: Vec<Subscript>,
     ) -> Self {
+        let mut segments: Vec<PathSegment> = Vec::with_capacity(field_path.len() + subscripts.len());
+        segments.extend(field_path.into_iter().map(|name| PathSegment::Field { name }));
+        segments.extend(
+            subscripts
+                .into_iter()
+                .map(|index| PathSegment::Subscript { index }),
+        );
+        Self::with_segments(binding, attribute, segments)
+    }
+
+    /// Create an `AccessPath` from an explicit segment list — the
+    /// canonical form. Used by the parser when source contains any
+    /// mix of `.field` and `[index]` continuations
+    /// (`cert.foo[0].bar`, `a.b.c[0]["k"].d`, …). carina#3025.
+    ///
+    /// `attribute` must be non-empty. See [`AccessPath::new`].
+    pub fn with_segments(
+        binding: impl Into<String>,
+        attribute: impl Into<String>,
+        segments: Vec<PathSegment>,
+    ) -> Self {
         let binding = binding.into();
         let attribute = attribute.into();
         assert!(
             !attribute.is_empty(),
-            "AccessPath::with_fields_and_subscripts with empty attribute for binding {:?}; \
+            "AccessPath::with_segments with empty attribute for binding {:?}; \
              use Value::BindingRef instead (#2847)",
             binding
         );
         Self {
             binding,
             attribute,
-            field_path,
-            subscripts,
+            segments,
         }
     }
 
@@ -361,36 +376,38 @@ impl AccessPath {
         &self.attribute
     }
 
-    /// Returns the nested field path (empty if the reference targets a
-    /// top-level attribute).
-    pub fn field_path(&self) -> &[String] {
-        &self.field_path
-    }
-
-    /// Returns the trailing `[index]` subscripts (empty if the
-    /// reference doesn't subscript past the field chain).
-    pub fn subscripts(&self) -> &[Subscript] {
-        &self.subscripts
+    /// Returns the ordered segments past `binding.attribute`. Empty
+    /// for a top-level attribute reference. carina#3025.
+    pub fn segments(&self) -> &[PathSegment] {
+        &self.segments
     }
 
     /// Returns the path in source-form: `binding.attribute` followed by
     /// `.field…[idx]…` segments as written.
     pub fn to_dot_string(&self) -> String {
-        let mut out = String::with_capacity(
-            self.binding.len()
-                + self.attribute.len()
-                + 1
-                + self.field_path.iter().map(|s| s.len() + 1).sum::<usize>(),
-        );
+        let segment_len: usize = self
+            .segments
+            .iter()
+            .map(|s| match s {
+                PathSegment::Field { name } => name.len() + 1,
+                PathSegment::Subscript { .. } => 4, // rough: `[xx]`
+            })
+            .sum();
+        let mut out =
+            String::with_capacity(self.binding.len() + self.attribute.len() + 1 + segment_len);
         out.push_str(&self.binding);
         out.push('.');
         out.push_str(&self.attribute);
-        for field in &self.field_path {
-            out.push('.');
-            out.push_str(field);
-        }
-        for sub in &self.subscripts {
-            sub.append_to_dot_string(&mut out);
+        for segment in &self.segments {
+            match segment {
+                PathSegment::Field { name } => {
+                    out.push('.');
+                    out.push_str(name);
+                }
+                PathSegment::Subscript { index } => {
+                    index.append_to_dot_string(&mut out);
+                }
+            }
         }
         out
     }

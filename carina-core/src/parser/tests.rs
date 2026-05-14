@@ -10145,3 +10145,36 @@ fn resource_id_provider_instance_makes_distinct_ids() {
     map.insert(us.clone(), ());
     assert_eq!(map.len(), 2);
 }
+
+/// carina#3025: `<binding>.<field>[<idx>].<field>` must parse and reach
+/// the AST. Prior to the fix, the grammar's `subscripted_id` rule
+/// accepted only trailing `[idx]+` after the namespaced head and
+/// refused any `.field` continuation; the parser produced a syntax
+/// error at the first `.` after `[<idx>]`. The bug affects every
+/// list-of-structs read pattern (e.g. ACM cert
+/// `domain_validation_options[0].resource_record_name`) where the
+/// user has to fall back to a `for` loop over a length-1 list.
+#[test]
+fn parse_chained_index_then_field_access() {
+    let src = r#"
+        let cert = aws.acm.Certificate {
+            domain_name = "x"
+        }
+        aws.route53.RecordSet {
+            name = cert.domain_validation_options[0].resource_record_name
+        }
+    "#;
+    let parsed = parse(src, &ProviderContext::default())
+        .expect("`<binding>.<field>[<idx>].<field>` must parse — carina#3025");
+
+    // Sanity: the resource exists and its `name` attribute is on the parse tree.
+    let rs = parsed
+        .resources
+        .iter()
+        .find(|r| r.id.resource_type == "route53.RecordSet")
+        .expect("RecordSet must be in parsed.resources");
+    assert!(
+        rs.attributes.contains_key("name"),
+        "RecordSet.name attribute must be present in parsed AST"
+    );
+}
