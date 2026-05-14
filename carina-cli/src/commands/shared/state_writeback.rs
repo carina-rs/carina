@@ -110,7 +110,7 @@ pub(crate) fn resolve_exports(
         .resources
         .iter()
         .map(|rs| {
-            let id = ResourceId::with_provider_and_instance(
+            let id = ResourceId::with_provider(
                 &rs.provider,
                 &rs.resource_type,
                 &rs.name,

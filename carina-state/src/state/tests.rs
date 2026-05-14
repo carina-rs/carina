@@ -157,7 +157,7 @@ fn test_get_identifier_for_resource_from_state() {
         ResourceState::new("s3.Bucket", "my-bucket", "awscc").with_identifier("my-bucket-abcd1234");
     state.upsert_resource(rs);
 
-    let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket");
+    let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
     assert_eq!(
         state.get_identifier_for_resource(&resource),
         Some("my-bucket-abcd1234".to_string())
@@ -169,7 +169,7 @@ fn test_get_identifier_for_resource_returns_none() {
     use carina_core::resource::Resource;
 
     let state = StateFile::new();
-    let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket");
+    let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
     assert_eq!(state.get_identifier_for_resource(&resource), None);
 }
 
@@ -183,7 +183,7 @@ fn test_build_directives() {
     state.upsert_resource(rs);
 
     let directives_map = state.build_directives();
-    let id = ResourceId::with_provider("awscc", "s3.Bucket", "my-bucket");
+    let id = ResourceId::with_provider("awscc", "s3.Bucket", "my-bucket", None);
     assert!(directives_map.get(&id).unwrap().force_delete);
 }
 
@@ -197,7 +197,7 @@ fn test_build_saved_attrs() {
     state.upsert_resource(rs);
 
     let saved = state.build_saved_attrs();
-    let id = ResourceId::with_provider("awscc", "s3.Bucket", "my-bucket");
+    let id = ResourceId::with_provider("awscc", "s3.Bucket", "my-bucket", None);
     let attrs = saved.get(&id).unwrap();
     assert_eq!(
         attrs.get("region"),
@@ -256,7 +256,7 @@ fn test_resource_state_deserialization_without_v3_fields() {
 fn test_from_provider_state() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
 
-    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket");
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
     resource.directives.force_delete = true;
     resource
         .prefixes
@@ -294,7 +294,7 @@ fn test_from_provider_state() {
 fn test_from_provider_state_without_existing() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
 
-    let resource = Resource::with_provider("aws", "s3.Bucket", "test");
+    let resource = Resource::with_provider("aws", "s3.Bucket", "test", None);
     let provider_state = ProviderState {
         id: resource.id.clone(),
         identifier: Some("test-id".to_string()),
@@ -339,13 +339,13 @@ fn test_multi_provider_resources_do_not_collide() {
     assert_eq!(found_awscc.identifier, Some("awscc-bucket-id".to_string()));
 
     // get_identifier_for_resource should return provider-scoped identifiers
-    let aws_res = Resource::with_provider("aws", "s3.Bucket", "main");
+    let aws_res = Resource::with_provider("aws", "s3.Bucket", "main", None);
     assert_eq!(
         state.get_identifier_for_resource(&aws_res),
         Some("aws-bucket-id".to_string())
     );
 
-    let awscc_res = Resource::with_provider("awscc", "s3.Bucket", "main");
+    let awscc_res = Resource::with_provider("awscc", "s3.Bucket", "main", None);
     assert_eq!(
         state.get_identifier_for_resource(&awscc_res),
         Some("awscc-bucket-id".to_string())
@@ -395,8 +395,8 @@ fn test_build_directives_provider_scoped() {
     state.upsert_resource(awscc_rs);
 
     let directives_map = state.build_directives();
-    let aws_id = ResourceId::with_provider("aws", "s3.Bucket", "main");
-    let awscc_id = ResourceId::with_provider("awscc", "s3.Bucket", "main");
+    let aws_id = ResourceId::with_provider("aws", "s3.Bucket", "main", None);
+    let awscc_id = ResourceId::with_provider("awscc", "s3.Bucket", "main", None);
 
     assert!(directives_map.get(&aws_id).unwrap().force_delete);
     assert!(!directives_map.get(&awscc_id).unwrap().force_delete);
@@ -416,8 +416,8 @@ fn test_build_saved_attrs_provider_scoped() {
     state.upsert_resource(awscc_rs);
 
     let saved = state.build_saved_attrs();
-    let aws_id = ResourceId::with_provider("aws", "s3.Bucket", "main");
-    let awscc_id = ResourceId::with_provider("awscc", "s3.Bucket", "main");
+    let aws_id = ResourceId::with_provider("aws", "s3.Bucket", "main", None);
+    let awscc_id = ResourceId::with_provider("awscc", "s3.Bucket", "main", None);
 
     assert_eq!(
         saved.get(&aws_id).unwrap().get("region"),
@@ -444,7 +444,7 @@ fn test_build_state_for_resource_existing() {
             .with_attribute("region".to_string(), serde_json::json!("ap-northeast-1")),
     );
 
-    let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket");
+    let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
     let result = state.build_state_for_resource(&resource);
 
     assert!(result.exists);
@@ -460,7 +460,8 @@ fn test_build_state_for_resource_existing() {
 #[test]
 fn test_build_state_for_resource_not_found() {
     let state = StateFile::new();
-    let resource = carina_core::resource::Resource::with_provider("awscc", "s3.Bucket", "missing");
+    let resource =
+        carina_core::resource::Resource::with_provider("awscc", "s3.Bucket", "missing", None);
     let result = state.build_state_for_resource(&resource);
 
     assert!(!result.exists);
@@ -477,7 +478,8 @@ fn test_build_state_for_resource_without_identifier() {
             .with_attribute("region".to_string(), serde_json::json!("us-east-1")),
     );
 
-    let resource = carina_core::resource::Resource::with_provider("awscc", "s3.Bucket", "pending");
+    let resource =
+        carina_core::resource::Resource::with_provider("awscc", "s3.Bucket", "pending", None);
     let result = state.build_state_for_resource(&resource);
 
     assert!(!result.exists);
@@ -488,7 +490,7 @@ fn test_build_state_for_resource_without_identifier() {
 fn test_from_provider_state_stores_binding_and_dependencies() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
 
-    let mut resource = Resource::with_provider("awscc", "ec2.Subnet", "my-subnet");
+    let mut resource = Resource::with_provider("awscc", "ec2.Subnet", "my-subnet", None);
     resource.binding = Some("my_subnet".to_string());
     resource.set_attr(
         "vpc_id".to_string(),
@@ -530,7 +532,7 @@ fn test_build_orphan_states_injects_binding() {
     let desired_ids = std::collections::HashSet::new();
     let orphans = state.build_orphan_states(&desired_ids);
 
-    let id = ResourceId::with_provider("awscc", "ec2.Subnet", "orphan-subnet");
+    let id = ResourceId::with_provider("awscc", "ec2.Subnet", "orphan-subnet", None);
     let orphan_state = orphans.get(&id).unwrap();
     assert!(orphan_state.exists);
     assert_eq!(
@@ -555,7 +557,7 @@ fn test_build_orphan_dependencies() {
     let desired_ids = std::collections::HashSet::new();
     let deps = state.build_orphan_dependencies(&desired_ids);
 
-    let id = ResourceId::with_provider("awscc", "ec2.Subnet", "orphan-subnet");
+    let id = ResourceId::with_provider("awscc", "ec2.Subnet", "orphan-subnet", None);
     assert_eq!(
         deps.get(&id).unwrap(),
         &BTreeSet::from(["my_vpc".to_string()])
@@ -578,7 +580,7 @@ fn test_build_orphan_dependencies_excludes_desired() {
     rs.dependency_bindings = BTreeSet::from(["my_vpc".to_string()]);
     state.upsert_resource(rs);
 
-    let id = ResourceId::with_provider("awscc", "ec2.Subnet", "kept-subnet");
+    let id = ResourceId::with_provider("awscc", "ec2.Subnet", "kept-subnet", None);
     let mut desired_ids = std::collections::HashSet::new();
     desired_ids.insert(id.clone());
 
@@ -684,7 +686,7 @@ fn test_merge_write_only_attributes() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
 
     // Simulate a VPC resource with a write-only attribute (ipv4_netmask_length)
-    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc");
+    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
     resource.set_attr(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
@@ -733,7 +735,7 @@ fn test_merge_write_only_attributes_not_in_desired() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
 
     // Resource without write-only attribute specified
-    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc");
+    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
     resource.set_attr(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
@@ -768,7 +770,7 @@ fn test_merge_write_only_skips_if_already_in_provider_state() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
 
     // Resource with a write-only attribute
-    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc");
+    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
     resource.set_attr(
         "some_attr".to_string(),
         Value::Concrete(ConcreteValue::String("desired".to_string())),
@@ -842,7 +844,7 @@ fn test_from_provider_state_secret_stored_as_hash() {
     };
     use carina_core::value::SECRET_PREFIX;
 
-    let mut resource = Resource::with_provider("awscc", "rds.db_instance", "my-db");
+    let mut resource = Resource::with_provider("awscc", "rds.db_instance", "my-db", None);
     resource.set_attr(
         "master_password".to_string(),
         Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
@@ -891,7 +893,7 @@ fn test_from_provider_state_secret_in_map_stored_as_hash() {
     };
     use carina_core::value::SECRET_PREFIX;
 
-    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc");
+    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
     let mut tags_map = IndexMap::new();
     tags_map.insert(
         "Name".to_string(),
@@ -961,7 +963,7 @@ fn test_from_provider_state_secret_in_map_preserves_provider_extra_keys() {
     use carina_core::value::SECRET_PREFIX;
 
     // User specifies only SecretTag in tags
-    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc");
+    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
     let mut tags_map = IndexMap::new();
     tags_map.insert(
         "SecretTag".to_string(),
@@ -1034,7 +1036,7 @@ fn test_from_provider_state_secret_in_list_stored_as_hash() {
     };
     use carina_core::value::SECRET_PREFIX;
 
-    let mut resource = Resource::with_provider("awscc", "test.resource", "my-res");
+    let mut resource = Resource::with_provider("awscc", "test.resource", "my-res", None);
     resource.set_attr(
         "values".to_string(),
         Value::Concrete(ConcreteValue::List(vec![
@@ -1178,7 +1180,7 @@ fn from_provider_state_rejects_resource_ref_in_provider_attributes() {
         AccessPath, DeferredValue, Resource, State as ProviderState, Value,
     };
 
-    let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket");
+    let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
     let provider_state = ProviderState {
         id: resource.id.clone(),
         identifier: Some("my-bucket".to_string()),
@@ -1282,7 +1284,7 @@ fn build_explicit_yields_per_resource_trees() {
     state.upsert_resource(rs);
 
     let map = state.build_explicit();
-    let id = ResourceId::with_provider("aws", "s3.Bucket", "my-bucket");
+    let id = ResourceId::with_provider("aws", "s3.Bucket", "my-bucket", None);
     assert!(map.contains_key(&id));
     assert!(matches!(map[&id], ExplicitFields::Struct { .. }));
 }
@@ -1303,19 +1305,15 @@ fn build_directives_keys_include_provider_instance() {
     state.upsert_resource(rs);
 
     let map = state.build_directives();
-    let expected = ResourceId::with_provider_and_instance(
-        "aws",
-        "s3.Bucket",
-        "shared-name",
-        Some("us".to_string()),
-    );
+    let expected =
+        ResourceId::with_provider("aws", "s3.Bucket", "shared-name", Some("us".to_string()));
     assert!(
         map.contains_key(&expected),
         "build_directives must construct ResourceId with provider_instance, got keys: {:?}",
         map.keys().collect::<Vec<_>>()
     );
     // Without the instance, the legacy ResourceId must NOT match.
-    let legacy = ResourceId::with_provider("aws", "s3.Bucket", "shared-name");
+    let legacy = ResourceId::with_provider("aws", "s3.Bucket", "shared-name", None);
     assert!(
         !map.contains_key(&legacy),
         "ResourceId without provider_instance must not match a Some(_) entry"

@@ -137,7 +137,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
     ParsedFile {
         providers: vec![],
         resources: vec![Resource {
-            id: ResourceId::with_provider("awscc", "iam.RolePolicy", ""),
+            id: ResourceId::with_provider("awscc", "iam.RolePolicy", "", None),
             attributes: {
                 let mut attrs = IndexMap::new();
                 attrs.insert(
@@ -276,12 +276,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
     ParsedFile {
         providers: vec![],
         resources: vec![Resource {
-            id: ResourceId::with_provider_and_instance(
-                "aws",
-                "acm.Certificate",
-                "cert",
-                Some("us".to_string()),
-            ),
+            id: ResourceId::with_provider("aws", "acm.Certificate", "cert", Some("us".to_string())),
             attributes: {
                 let mut attrs = IndexMap::new();
                 attrs.insert(
@@ -370,7 +365,7 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
     let state_name = format!("thing_{:016x}.role", state_hash);
 
     let mut resources = vec![Resource {
-        id: ResourceId::with_provider_and_instance(
+        id: ResourceId::with_provider(
             "aws",
             "iam.Role",
             format!("{}.role", current_prefix),

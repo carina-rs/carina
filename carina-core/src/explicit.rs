@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn build_from_resource_skips_underscore_attrs() {
-        let mut r = Resource::with_provider("aws", "s3.Bucket", "x");
+        let mut r = Resource::with_provider("aws", "s3.Bucket", "x", None);
         r.set_attr(
             "name".to_string(),
             Value::Concrete(ConcreteValue::String("hi".into())),

@@ -358,8 +358,12 @@ async fn run_state_lookup(
 fn build_plan_from_state(state: &StateFile) -> Plan {
     let mut plan = Plan::new();
     for rs in &state.resources {
-        let mut resource = Resource::with_provider(&rs.provider, &rs.resource_type, &rs.name);
-        resource.id.provider_instance = rs.directives.provider_instance.clone();
+        let mut resource = Resource::with_provider(
+            &rs.provider,
+            &rs.resource_type,
+            &rs.name,
+            rs.directives.provider_instance.clone(),
+        );
         resource.directives = rs.directives.clone();
 
         // Set typed metadata fields from state
@@ -549,8 +553,14 @@ async fn run_state_bucket_delete(
     println!("{}", "Emptying bucket...".cyan());
 
     // Delete the bucket resource (identifier is the bucket name)
-    let bucket_id =
-        ResourceId::with_provider(backend_provider_name, backend_resource_type, bucket_name);
+    // Backend bucket is provider-default; named-instance routing is
+    // a DSL concern that doesn't apply to the implicit state bucket.
+    let bucket_id = ResourceId::with_provider(
+        backend_provider_name,
+        backend_resource_type,
+        bucket_name,
+        None,
+    );
     match bucket_provider
         .delete(
             &bucket_id,
@@ -702,7 +712,7 @@ pub(crate) async fn run_state_refresh_locked(
             sf.resources
                 .iter()
                 .filter_map(|rs| {
-                    let id = ResourceId::with_provider_and_instance(
+                    let id = ResourceId::with_provider(
                         &rs.provider,
                         &rs.resource_type,
                         &rs.name,
@@ -911,8 +921,12 @@ fn diff_display_update_resource(
         let res = match resource {
             Some(r) => r,
             None => {
-                owned_resource =
-                    Resource::with_provider(&id.provider, &id.resource_type, id.name_str());
+                owned_resource = Resource::with_provider(
+                    &id.provider,
+                    &id.resource_type,
+                    id.name_str(),
+                    id.provider_instance.clone(),
+                );
                 &owned_resource
             }
         };

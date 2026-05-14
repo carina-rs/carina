@@ -104,22 +104,16 @@ impl ResourceId {
         }
     }
 
+    /// Construct a `ResourceId` with explicit routing.
+    ///
+    /// `provider_instance` is the binding name of the routed provider
+    /// instance — `None` resolves to the kind's default instance,
+    /// `Some(name)` to a `let <name> = provider <kind> { ... }`
+    /// declaration. Taking `Option<String>` here (instead of offering
+    /// a sibling 3-arg constructor that silently sets `None`) forces
+    /// every call site to consciously pick a routing target — the
+    /// hidden default that caused carina#3038 is no longer expressible.
     pub fn with_provider(
-        provider: impl Into<String>,
-        resource_type: impl Into<String>,
-        name: impl Into<String>,
-    ) -> Self {
-        Self {
-            provider: provider.into(),
-            resource_type: resource_type.into(),
-            name: ResourceName::from_string(name.into()),
-            provider_instance: None,
-        }
-    }
-
-    /// As [`with_provider`], plus the binding name of the routed
-    /// provider instance (`None` → kind default).
-    pub fn with_provider_and_instance(
         provider: impl Into<String>,
         resource_type: impl Into<String>,
         name: impl Into<String>,
@@ -1597,9 +1591,10 @@ impl Resource {
         provider: impl Into<String>,
         resource_type: impl Into<String>,
         name: impl Into<String>,
+        provider_instance: Option<String>,
     ) -> Self {
         Self {
-            id: ResourceId::with_provider(provider, resource_type, name),
+            id: ResourceId::with_provider(provider, resource_type, name, provider_instance),
             attributes: IndexMap::new(),
             kind: ResourceKind::Managed,
             directives: Directives::default(),

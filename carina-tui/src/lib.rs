@@ -483,13 +483,14 @@ mod tests {
     fn make_provider_prefixed_app() -> App {
         let mut plan = Plan::new();
         plan.add(Effect::Create(
-            Resource::with_provider("awscc", "ec2.Vpc", "my-vpc").with_binding("vpc"),
+            Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None).with_binding("vpc"),
         ));
         plan.add(Effect::Create(
-            Resource::with_provider("awscc", "ec2.Subnet", "my-subnet").with_binding("subnet"),
+            Resource::with_provider("awscc", "ec2.Subnet", "my-subnet", None)
+                .with_binding("subnet"),
         ));
         plan.add(Effect::Create(
-            Resource::with_provider("awscc", "s3.Bucket", "my-bucket").with_binding("bucket"),
+            Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None).with_binding("bucket"),
         ));
         App::new(&plan, &SchemaRegistry::new())
     }

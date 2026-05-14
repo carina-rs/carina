@@ -760,7 +760,7 @@ fn secret_with_context_no_change_when_hash_matches() {
     use crate::resource::{ConcreteValue, DeferredValue, ResourceId};
     use crate::value::{SecretHashContext, value_to_json_with_context};
 
-    let resource_id = ResourceId::with_provider("awscc", "rds.db_instance", "my-db");
+    let resource_id = ResourceId::with_provider("awscc", "rds.db_instance", "my-db", None);
     let ctx = SecretHashContext::new(
         resource_id.display_type(),
         resource_id.name_str(),
@@ -794,7 +794,7 @@ fn secret_with_context_detects_change() {
     use crate::resource::ResourceId;
     use crate::value::{SecretHashContext, value_to_json_with_context};
 
-    let resource_id = ResourceId::with_provider("awscc", "rds.db_instance", "my-db");
+    let resource_id = ResourceId::with_provider("awscc", "rds.db_instance", "my-db", None);
     let ctx = SecretHashContext::new(
         resource_id.display_type(),
         resource_id.name_str(),
@@ -845,7 +845,7 @@ fn secret_same_password_different_resources_produces_different_hashes() {
     );
 
     // Each hash should match its own context
-    let id1 = ResourceId::with_provider("awscc", "rds.db_instance", "db-1");
+    let id1 = ResourceId::with_provider("awscc", "rds.db_instance", "db-1", None);
     let desired1 = HashMap::from([("master_password".to_string(), secret.clone())]);
     let current1 = HashMap::from([(
         "master_password".to_string(),
@@ -858,7 +858,7 @@ fn secret_same_password_different_resources_produces_different_hashes() {
     );
 
     // But not the other resource's context
-    let id2 = ResourceId::with_provider("awscc", "rds.db_instance", "db-2");
+    let id2 = ResourceId::with_provider("awscc", "rds.db_instance", "db-2", None);
     let desired2 = HashMap::from([("master_password".to_string(), secret)]);
     let current2 = HashMap::from([(
         "master_password".to_string(),
@@ -913,7 +913,7 @@ fn secret_in_map_with_refresh_no_false_diff() {
     use crate::resource::ResourceId;
     use crate::schema::{AttributeSchema, ResourceSchema};
 
-    let resource_id = ResourceId::with_provider("awscc", "ec2.Vpc", "ec2_vpc_fb75c929");
+    let resource_id = ResourceId::with_provider("awscc", "ec2.Vpc", "ec2_vpc_fb75c929", None);
 
     // Desired: tags map with a secret value (as written in .crn)
     let desired_tags = Value::Concrete(ConcreteValue::Map(IndexMap::from([

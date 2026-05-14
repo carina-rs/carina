@@ -57,7 +57,7 @@ fn value_serde_round_trip() {
 
 #[test]
 fn resource_id_serde_round_trip() {
-    let id = ResourceId::with_provider("awscc", "ec2.Vpc", "main-vpc");
+    let id = ResourceId::with_provider("awscc", "ec2.Vpc", "main-vpc", None);
     let json = serde_json::to_string(&id).unwrap();
     let deserialized: ResourceId = serde_json::from_str(&json).unwrap();
     assert_eq!(id, deserialized);
@@ -97,7 +97,7 @@ fn resource_id_pending_serde_round_trips_as_empty_string() {
 
 #[test]
 fn resource_id_bound_serde_round_trips_as_string() {
-    let id = ResourceId::with_provider("aws", "ec2.Subnet", "my-subnet");
+    let id = ResourceId::with_provider("aws", "ec2.Subnet", "my-subnet", None);
     let json = serde_json::to_string(&id).unwrap();
     assert!(json.contains("\"name\":\"my-subnet\""), "got: {json}");
     let deserialized: ResourceId = serde_json::from_str(&json).unwrap();
@@ -129,7 +129,7 @@ fn resource_id_rename_pending_to_bound() {
     }
     // After renaming, the same string can produce an equal ResourceId
     // from any other code path (e.g. building a key for a sibling map).
-    let constructed = ResourceId::with_provider("aws", "ec2.Subnet", "app-subnet");
+    let constructed = ResourceId::with_provider("aws", "ec2.Subnet", "app-subnet", None);
     assert_eq!(id, constructed);
 }
 
@@ -146,7 +146,7 @@ fn state_serde_round_trip() {
     );
 
     let state = State::existing(
-        ResourceId::with_provider("aws", "s3.Bucket", "my-bucket"),
+        ResourceId::with_provider("aws", "s3.Bucket", "my-bucket", None),
         attrs,
     )
     .with_identifier("my-bucket");
@@ -1397,7 +1397,12 @@ fn unknown_cannot_round_trip_through_serde_json() {
 
 #[test]
 fn human_display_separates_type_from_name_with_space() {
-    let id = ResourceId::with_provider("awscc", "iam.OidcProvider", "bs.bootstrap.oidc_provider");
+    let id = ResourceId::with_provider(
+        "awscc",
+        "iam.OidcProvider",
+        "bs.bootstrap.oidc_provider",
+        None,
+    );
     assert_eq!(
         format!("{}", id.human()),
         "awscc.iam.OidcProvider bs.bootstrap.oidc_provider",
@@ -1419,7 +1424,7 @@ fn human_display_does_not_alter_logical_display() {
     // The default Display remains the canonical dotted form because state
     // files, hashmap keys, binding fallbacks, and DSL identifiers all rely
     // on it. Only the human() wrapper changes shape.
-    let id = ResourceId::with_provider("aws", "s3.Bucket", "state_bucket");
+    let id = ResourceId::with_provider("aws", "s3.Bucket", "state_bucket", None);
     assert_eq!(format!("{}", id), "aws.s3.Bucket.state_bucket");
 }
 
@@ -1427,7 +1432,7 @@ fn human_display_does_not_alter_logical_display() {
 fn human_display_handles_pending_name() {
     // ResourceName::Pending renders as empty in Display; human() should
     // still emit the separating space so callers can rely on a stable shape.
-    let mut id = ResourceId::with_provider("awscc", "ec2.Vpc", "");
+    let mut id = ResourceId::with_provider("awscc", "ec2.Vpc", "", None);
     id.name = ResourceName::Pending;
     assert_eq!(format!("{}", id.human()), "awscc.ec2.Vpc ");
 }

@@ -1263,10 +1263,10 @@ mod tests {
     /// resource(s) it references.
     #[test]
     fn build_phase_dependency_map_follows_virtual_module_binding() {
-        let mut role = Resource::with_provider("awscc", "iam.Role", "bootstrap.role");
+        let mut role = Resource::with_provider("awscc", "iam.Role", "bootstrap.role", None);
         role.binding = Some("bootstrap.role".to_string());
 
-        let mut virt = Resource::with_provider("_virtual", "_virtual", "bootstrap");
+        let mut virt = Resource::with_provider("_virtual", "_virtual", "bootstrap", None);
         virt.binding = Some("bootstrap".to_string());
         virt.kind = ResourceKind::Virtual {
             module_name: "github-oidc".to_string(),
@@ -1279,7 +1279,7 @@ mod tests {
             Value::resource_ref("bootstrap.role", "role_name", vec![]),
         );
 
-        let mut role_policy = Resource::with_provider("awscc", "iam.RolePolicy", "rp");
+        let mut role_policy = Resource::with_provider("awscc", "iam.RolePolicy", "rp", None);
         role_policy.set_attr(
             "role_name",
             Value::resource_ref("bootstrap", "role_name", vec![]),
@@ -1310,10 +1310,10 @@ mod tests {
     /// through both layers to the underlying resource.
     #[test]
     fn build_phase_dependency_map_follows_nested_virtual_module_bindings() {
-        let mut role = Resource::with_provider("awscc", "iam.Role", "outer.inner.role");
+        let mut role = Resource::with_provider("awscc", "iam.Role", "outer.inner.role", None);
         role.binding = Some("outer.inner.role".to_string());
 
-        let mut inner_virt = Resource::with_provider("_virtual", "_virtual", "outer.inner");
+        let mut inner_virt = Resource::with_provider("_virtual", "_virtual", "outer.inner", None);
         inner_virt.binding = Some("outer.inner".to_string());
         inner_virt.kind = ResourceKind::Virtual {
             module_name: "inner-mod".to_string(),
@@ -1324,7 +1324,7 @@ mod tests {
             Value::resource_ref("outer.inner.role", "role_name", vec![]),
         );
 
-        let mut outer_virt = Resource::with_provider("_virtual", "_virtual", "outer");
+        let mut outer_virt = Resource::with_provider("_virtual", "_virtual", "outer", None);
         outer_virt.binding = Some("outer".to_string());
         outer_virt.kind = ResourceKind::Virtual {
             module_name: "outer-mod".to_string(),
@@ -1335,7 +1335,7 @@ mod tests {
             Value::resource_ref("outer.inner", "role_name", vec![]),
         );
 
-        let mut caller = Resource::with_provider("awscc", "iam.RolePolicy", "rp");
+        let mut caller = Resource::with_provider("awscc", "iam.RolePolicy", "rp", None);
         caller.set_attr(
             "role_name",
             Value::resource_ref("outer", "role_name", vec![]),
@@ -1366,9 +1366,9 @@ mod tests {
     fn topological_sort_replaces_respects_depends_on() {
         use crate::resource::{Directives, State};
 
-        let mut role = Resource::with_provider("test", "iam.Role", "role");
+        let mut role = Resource::with_provider("test", "iam.Role", "role", None);
         role.binding = Some("role".to_string());
-        let mut bucket = Resource::with_provider("test", "s3.Bucket", "bucket");
+        let mut bucket = Resource::with_provider("test", "s3.Bucket", "bucket", None);
         bucket.binding = Some("bucket".to_string());
         bucket.directives = Directives {
             depends_on: vec!["role".to_string()],

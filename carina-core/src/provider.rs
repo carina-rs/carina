@@ -1254,7 +1254,8 @@ mod tests {
         let mut router = ProviderRouter::new();
         router.add_provider("input-aware".to_string(), Box::new(InputAwareProvider));
 
-        let mut resource = Resource::with_provider("input-aware", "identitystore.user", "mizzy");
+        let mut resource =
+            Resource::with_provider("input-aware", "identitystore.user", "mizzy", None);
         resource.set_attr(
             "user_name".to_string(),
             Value::Concrete(ConcreteValue::String("x".to_string())),
@@ -1285,7 +1286,7 @@ mod tests {
         let mut router = ProviderRouter::new();
         router.add_provider("mock".to_string(), Box::new(MockProvider));
 
-        let id = ResourceId::with_provider("mock", "test", "example");
+        let id = ResourceId::with_provider("mock", "test", "example", None);
         let state = router.read(&id, None, ReadRequest).await.unwrap();
         assert!(!state.exists);
     }
@@ -1295,7 +1296,7 @@ mod tests {
         let mut router = ProviderRouter::new();
         router.add_provider("mock".to_string(), Box::new(MockProvider));
 
-        let resource = Resource::with_provider("mock", "test", "example");
+        let resource = Resource::with_provider("mock", "test", "example", None);
         let id = resource.id.clone();
         let state = router
             .create(&id, CreateRequest { resource })
@@ -1474,7 +1475,7 @@ mod tests {
         let mut router = ProviderRouter::new();
         router.add_provider("mock".to_string(), Box::new(MockProvider));
 
-        let id = ResourceId::with_provider("mock", "test", "example");
+        let id = ResourceId::with_provider("mock", "test", "example", None);
         let from = State::existing(id.clone(), HashMap::new());
         let request = UpdateRequest {
             from,
@@ -1489,7 +1490,7 @@ mod tests {
         let mut router = ProviderRouter::new();
         router.add_provider("mock".to_string(), Box::new(MockProvider));
 
-        let id = ResourceId::with_provider("mock", "test", "example");
+        let id = ResourceId::with_provider("mock", "test", "example", None);
         let request = DeleteRequest::default();
         let result = router.delete(&id, "mock-id-123", request).await;
         assert!(result.is_ok());
@@ -1498,7 +1499,7 @@ mod tests {
     #[tokio::test]
     async fn provider_router_returns_error_for_unknown_provider() {
         let router = ProviderRouter::new();
-        let id = ResourceId::with_provider("nonexistent", "test", "example");
+        let id = ResourceId::with_provider("nonexistent", "test", "example", None);
         let result = router.read(&id, None, ReadRequest).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -1572,7 +1573,7 @@ mod tests {
             Box::new(TaggedProvider { tag: "us" }),
         );
 
-        let default_id = ResourceId::with_provider("mock", "test", "a");
+        let default_id = ResourceId::with_provider("mock", "test", "a", None);
         let state = router.read(&default_id, None, ReadRequest).await.unwrap();
         assert_eq!(
             state.attributes.get("tag"),
@@ -1582,8 +1583,7 @@ mod tests {
             "resources without provider_instance must route to the kind's default instance"
         );
 
-        let us_id =
-            ResourceId::with_provider_and_instance("mock", "test", "b", Some("us".to_string()));
+        let us_id = ResourceId::with_provider("mock", "test", "b", Some("us".to_string()));
         let state = router.read(&us_id, None, ReadRequest).await.unwrap();
         assert_eq!(
             state.attributes.get("tag"),
@@ -1597,12 +1597,7 @@ mod tests {
         let mut router = ProviderRouter::new();
         router.add_provider("mock".to_string(), Box::new(MockProvider));
 
-        let id = ResourceId::with_provider_and_instance(
-            "mock",
-            "test",
-            "x",
-            Some("missing".to_string()),
-        );
+        let id = ResourceId::with_provider("mock", "test", "x", Some("missing".to_string()));
         let err = router.read(&id, None, ReadRequest).await.unwrap_err();
         let msg = err.message();
         assert!(
@@ -1922,7 +1917,7 @@ mod tests {
         router.add_normalizer(Box::new(TestNormalizer));
 
         let mut resources = vec![
-            Resource::with_provider("normalizing", "test", "example").with_attribute(
+            Resource::with_provider("normalizing", "test", "example", None).with_attribute(
                 "key",
                 Value::Concrete(ConcreteValue::String("val".to_string())),
             ),

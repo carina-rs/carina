@@ -15,7 +15,7 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
     // Schema is registered with provider-prefixed key
     schemas.insert("awscc", schema);
 
-    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc");
+    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
     resource.set_attr(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
@@ -94,7 +94,7 @@ fn build_state_after_apply_preserves_block_name_attribute() {
     schemas.insert("awscc", schema);
 
     // Resource with resolved block name (policy -> policies)
-    let mut resource = Resource::with_provider("awscc", "iam.role", "test-role");
+    let mut resource = Resource::with_provider("awscc", "iam.role", "test-role", None);
     resource.set_attr(
         "role_name".to_string(),
         Value::Concrete(ConcreteValue::String("test-role".to_string())),
@@ -195,7 +195,8 @@ fn build_state_after_apply_preserves_block_name_attribute() {
 
     // Now simulate second plan: build_saved_attrs should return the policies
     let saved_attrs = state.build_saved_attrs();
-    let id = carina_core::resource::ResourceId::with_provider("awscc", "iam.role", "test-role");
+    let id =
+        carina_core::resource::ResourceId::with_provider("awscc", "iam.role", "test-role", None);
     let attrs = saved_attrs.get(&id).unwrap();
     assert!(
         attrs.contains_key("policies"),
@@ -232,7 +233,7 @@ fn block_name_attribute_no_diff_when_hydrated() {
         );
 
     // Desired resource (after resolve_block_names: "policy" -> "policies")
-    let mut resource = Resource::with_provider("awscc", "iam.role", "test-role");
+    let mut resource = Resource::with_provider("awscc", "iam.role", "test-role", None);
     resource.set_attr(
         "role_name".to_string(),
         Value::Concrete(ConcreteValue::String("test-role".to_string())),
@@ -342,7 +343,7 @@ fn block_name_attribute_state_roundtrip() {
     schemas.insert("awscc", schema);
 
     // Resource with resolved block name
-    let mut resource = Resource::with_provider("awscc", "ec2.ipam", "test-ipam");
+    let mut resource = Resource::with_provider("awscc", "ec2.ipam", "test-ipam", None);
     resource.set_attr(
         "operating_regions".to_string(),
         Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
@@ -424,7 +425,8 @@ fn block_name_attribute_state_roundtrip() {
 
     // Verify roundtrip through saved_attrs
     let saved_attrs = state.build_saved_attrs();
-    let id = carina_core::resource::ResourceId::with_provider("awscc", "ec2.ipam", "test-ipam");
+    let id =
+        carina_core::resource::ResourceId::with_provider("awscc", "ec2.ipam", "test-ipam", None);
     let attrs = saved_attrs.get(&id).unwrap();
     let operating_regions = attrs
         .get("operating_regions")
@@ -517,7 +519,7 @@ fn resolve_exports_resolves_cross_file_dot_notation_strings() {
     // with a binding; provider-returned attributes flow in via
     // `current_states` derived from `state.resources`.
     let mut registry_prod =
-        Resource::with_provider("awscc", "organizations.account", "registry-prod");
+        Resource::with_provider("awscc", "organizations.account", "registry-prod", None);
     registry_prod.binding = Some("registry_prod".to_string());
     let sorted_resources = vec![registry_prod];
 
@@ -566,7 +568,7 @@ fn resolve_exports_resolves_module_call_attribute_via_virtual_resource() {
     };
 
     let mut role_resource =
-        Resource::with_provider("awscc", "iam.Role", "github_actions_carina.role");
+        Resource::with_provider("awscc", "iam.Role", "github_actions_carina.role", None);
     role_resource.binding = Some("github_actions_carina.role".to_string());
 
     // Virtual resource as `expand_module_call` produces it: binding is
@@ -642,7 +644,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_virtuals() {
         serde_json::from_value::<StateFile>(json).unwrap()
     };
 
-    let mut role_resource = Resource::with_provider("awscc", "iam.Role", "outer.inner.role");
+    let mut role_resource = Resource::with_provider("awscc", "iam.Role", "outer.inner.role", None);
     role_resource.binding = Some("outer.inner.role".to_string());
 
     let mut inner_virtual = Resource::new("_virtual", "outer.inner");

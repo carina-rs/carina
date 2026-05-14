@@ -175,7 +175,7 @@ impl StateFile {
     pub fn build_directives(&self) -> HashMap<ResourceId, Directives> {
         let mut directives_map = HashMap::new();
         for rs in &self.resources {
-            let id = ResourceId::with_provider_and_instance(
+            let id = ResourceId::with_provider(
                 &rs.provider,
                 &rs.resource_type,
                 &rs.name,
@@ -190,7 +190,7 @@ impl StateFile {
     pub fn build_saved_attrs(&self) -> HashMap<ResourceId, HashMap<String, Value>> {
         let mut result = HashMap::new();
         for rs in &self.resources {
-            let id = ResourceId::with_provider_and_instance(
+            let id = ResourceId::with_provider(
                 &rs.provider,
                 &rs.resource_type,
                 &rs.name,
@@ -214,7 +214,7 @@ impl StateFile {
         let mut result = HashMap::new();
         for rs in &self.resources {
             if !is_empty_explicit(&rs.explicit) {
-                let id = ResourceId::with_provider_and_instance(
+                let id = ResourceId::with_provider(
                     &rs.provider,
                     &rs.resource_type,
                     &rs.name,
@@ -261,7 +261,7 @@ impl StateFile {
     ) -> HashMap<ResourceId, State> {
         let mut result = HashMap::new();
         for rs in &self.resources {
-            let id = ResourceId::with_provider_and_instance(
+            let id = ResourceId::with_provider(
                 &rs.provider,
                 &rs.resource_type,
                 &rs.name,
@@ -305,7 +305,7 @@ impl StateFile {
     ) -> HashMap<ResourceId, BTreeSet<String>> {
         let mut result = HashMap::new();
         for rs in &self.resources {
-            let id = ResourceId::with_provider_and_instance(
+            let id = ResourceId::with_provider(
                 &rs.provider,
                 &rs.resource_type,
                 &rs.name,
@@ -327,7 +327,7 @@ impl StateFile {
         let mut result = HashMap::new();
         for rs in &self.resources {
             if !rs.name_overrides.is_empty() {
-                let id = ResourceId::with_provider_and_instance(
+                let id = ResourceId::with_provider(
                     &rs.provider,
                     &rs.resource_type,
                     &rs.name,

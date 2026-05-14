@@ -564,10 +564,10 @@ fn tab_complete_with_provider_prefix() {
     // Resource types with provider prefix (e.g., "awscc.ec2.Vpc")
     let mut plan = Plan::new();
     plan.add(Effect::Create(
-        Resource::with_provider("awscc", "ec2.Vpc", "my-vpc").with_binding("vpc"),
+        Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None).with_binding("vpc"),
     ));
     plan.add(Effect::Create(
-        Resource::with_provider("awscc", "ec2.Subnet", "my-subnet").with_binding("subnet"),
+        Resource::with_provider("awscc", "ec2.Subnet", "my-subnet", None).with_binding("subnet"),
     ));
     let mut app = App::new(&plan, &SchemaRegistry::new());
     app.search_active = true;
