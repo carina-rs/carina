@@ -260,6 +260,162 @@ fn test_expand_module_call() {
     assert!(!sg.attributes.contains_key("_module_instance"));
 }
 
+/// Module whose resource targets a named provider instance via
+/// `directives.provider_instance`. Reproduces carina#3038: expansion
+/// rebuilt `id` with `with_provider(...)`, silently dropping the
+/// `provider_instance` field. `ProviderRouter` keys on
+/// `(id.provider, id.provider_instance)`, so the lost binding made
+/// `create` dispatch to the kind's default instance even though
+/// state-writeback (which reads `directives.provider_instance` from
+/// the `Resource`, not the `id`) still recorded the routing
+/// correctly. Net effect for users: an ACM cert that should live in
+/// `us-east-1` (where CloudFront viewer certs *must* live) lands in
+/// the default region instead, and subsequent `read` against the
+/// recorded `us` instance fails with `ResourceNotFoundException`.
+fn create_module_with_named_provider_instance() -> ParsedFile {
+    ParsedFile {
+        providers: vec![],
+        resources: vec![Resource {
+            id: ResourceId::with_provider_and_instance(
+                "aws",
+                "acm.Certificate",
+                "cert",
+                Some("us".to_string()),
+            ),
+            attributes: {
+                let mut attrs = IndexMap::new();
+                attrs.insert(
+                    "domain_name".to_string(),
+                    Value::Concrete(ConcreteValue::String("example.com".to_string())),
+                );
+                attrs
+            },
+            kind: ResourceKind::Managed,
+            directives: Directives {
+                provider_instance: Some("us".to_string()),
+                ..Directives::default()
+            },
+            prefixes: HashMap::new(),
+            binding: Some("cert".to_string()),
+            dependency_bindings: BTreeSet::new(),
+            module_source: None,
+            quoted_string_attrs: std::collections::HashSet::new(),
+        }],
+        variables: IndexMap::new(),
+        uses: vec![],
+        module_calls: vec![],
+        arguments: vec![],
+        attribute_params: vec![],
+        export_params: vec![],
+        backend: None,
+        state_blocks: vec![],
+        user_functions: HashMap::new(),
+        upstream_states: vec![],
+        wait_bindings: vec![],
+        requires: vec![],
+        structural_bindings: HashSet::new(),
+        warnings: vec![],
+        deferred_for_expressions: vec![],
+    }
+}
+
+#[test]
+fn test_expand_module_call_preserves_provider_instance_on_id() {
+    let resolver = {
+        let mut r = ModuleResolver::new(".");
+        r.imported_modules.insert(
+            "registry".to_string(),
+            create_module_with_named_provider_instance(),
+        );
+        r
+    };
+
+    let call = ModuleCall {
+        module_name: "registry".to_string(),
+        binding_name: Some("acme".to_string()),
+        arguments: HashMap::new(),
+    };
+
+    let expanded = resolver.expand_module_call(&call, "acme", None).unwrap();
+    assert_eq!(expanded.len(), 1);
+    let cert = &expanded[0];
+    assert_eq!(
+        cert.id.provider_instance.as_deref(),
+        Some("us"),
+        "module expansion must preserve `id.provider_instance` so \
+         ProviderRouter dispatches `create` through the named \
+         instance (carina#3038)"
+    );
+    // The directives copy stays correct (and is what state writeback
+    // already reads from) — assert it too so a regression that flips
+    // *both* sides at once is still caught.
+    assert_eq!(
+        cert.directives.provider_instance.as_deref(),
+        Some("us"),
+        "directives.provider_instance must survive module expansion"
+    );
+}
+
+#[test]
+fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
+    // The SimHash-remap path in `reconcile_anonymous_module_instances`
+    // was the second `with_provider(...)` site that dropped
+    // `provider_instance` before carina#3038. A close-but-different
+    // SimHash in state triggers a name rewrite, so this test must
+    // assert that the named-instance routing survives the rewrite.
+    use crate::resource::{ConcreteValue, Resource, ResourceId, ResourceKind, Value};
+
+    let current_prefix = format!("thing_{:016x}", 0xABCDu64);
+    let state_hash = 0xABCDu64 ^ 1; // flip one bit — within SimHash threshold
+    let state_name = format!("thing_{:016x}.role", state_hash);
+
+    let mut resources = vec![Resource {
+        id: ResourceId::with_provider_and_instance(
+            "aws",
+            "iam.Role",
+            format!("{}.role", current_prefix),
+            Some("us".to_string()),
+        ),
+        attributes: {
+            let mut attrs = IndexMap::new();
+            attrs.insert(
+                "role_name".to_string(),
+                Value::Concrete(ConcreteValue::String("r".to_string())),
+            );
+            attrs
+        },
+        kind: ResourceKind::Managed,
+        directives: Directives {
+            provider_instance: Some("us".to_string()),
+            ..Directives::default()
+        },
+        prefixes: HashMap::new(),
+        binding: Some(format!("{}.role", current_prefix)),
+        dependency_bindings: BTreeSet::new(),
+        module_source: Some(crate::resource::ModuleSource::Module {
+            name: "thing".to_string(),
+            instance: current_prefix.clone(),
+        }),
+        quoted_string_attrs: std::collections::HashSet::new(),
+    }];
+
+    let state_lookup = |_: &str, _: &str| vec![state_name.clone()];
+    reconcile_anonymous_module_instances(&mut resources, &state_lookup);
+
+    assert_eq!(
+        resources[0].id.name_str(),
+        state_name,
+        "precondition: remap must actually have rewritten the name",
+    );
+    assert_eq!(
+        resources[0].id.provider_instance.as_deref(),
+        Some("us"),
+        "reconcile_anonymous_module_instances must preserve \
+         id.provider_instance through the SimHash prefix rewrite \
+         (carina#3038)"
+    );
+}
+
 /// Module with two resources where one references the other via _binding / ResourceRef.
 fn create_module_with_intra_refs() -> ParsedFile {
     ParsedFile {
