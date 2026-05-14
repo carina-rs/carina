@@ -14,6 +14,16 @@ use crate::provider::ProviderFactory;
 use crate::resource::{ConcreteValue, DeferredValue, Resource, Value};
 use crate::schema::{AttributeType, SchemaRegistry, suggest_similar_name};
 
+/// Render the trailing `" Did you mean 'X'?"` segment for an unknown
+/// name in a diagnostic, or an empty string when nothing close enough
+/// is found. The leading space is part of the convention so callers
+/// can concat unconditionally onto an already-punctuated message.
+fn did_you_mean(unknown: &str, known: &[&str]) -> String {
+    suggest_similar_name(unknown, known)
+        .map(|s| format!(" Did you mean '{}'?", s))
+        .unwrap_or_default()
+}
+
 /// Validate resources against their schemas.
 ///
 /// Two-sided check: a `read` resource requires a `DataSource` registry entry,
@@ -155,29 +165,48 @@ pub fn validate_resource_ref_types<E>(
             let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr.as_str()) else {
                 let known_attrs: Vec<&str> =
                     ref_schema.attributes.keys().map(|s| s.as_str()).collect();
-                let suggestion = suggest_similar_name(&ref_attr, &known_attrs)
-                    .map(|s| format!(" Did you mean '{}'?", s))
-                    .unwrap_or_default();
                 all_errors.push(format!(
                     "{}: unknown attribute '{}' on '{}' in reference {}.{}{}",
-                    resource.id, ref_attr, ref_binding, ref_binding, ref_attr, suggestion,
+                    resource.id,
+                    ref_attr,
+                    ref_binding,
+                    ref_binding,
+                    ref_attr,
+                    did_you_mean(&ref_attr, &known_attrs),
                 ));
                 continue;
             };
 
             // Narrow through the path's segments — `[idx]` peels one
             // `List<T>` / `Map<_,V>` layer, `.field` descends a
-            // `Struct`. carina#3028. When a segment doesn't fit the
-            // shape (e.g. `.x` against a scalar), skip the type check
-            // rather than emit a noisy mismatch: schema-level
-            // attribute validation already reports unknown fields and
-            // resolver-time evaluation catches the shape error with
-            // location context.
-            let Some(narrowed) =
-                narrow_attribute_type(&ref_attr_schema.attr_type, ref_path.segments())
-            else {
-                continue;
-            };
+            // `Struct`. carina#3028. Unknown struct fields are a
+            // real typo (carina#3041) and get reported here with a
+            // suggestion; other shape mismatches stay silent because
+            // resolver-time evaluation catches them with full location
+            // context.
+            let narrowed =
+                match narrow_attribute_type(&ref_attr_schema.attr_type, ref_path.segments()) {
+                    Ok(t) => t,
+                    Err(NarrowError::UnknownStructField {
+                        field,
+                        struct_name,
+                        known_fields,
+                    }) => {
+                        let known: Vec<&str> = known_fields.iter().map(|s| s.as_str()).collect();
+                        all_errors.push(format!(
+                            "{}: unknown field '{}' on struct '{}' in reference {}; \
+                         known fields: {}.{}",
+                            resource.id,
+                            field,
+                            struct_name,
+                            ref_path.to_dot_string(),
+                            known.join(", "),
+                            did_you_mean(&field, &known),
+                        ));
+                        continue;
+                    }
+                    Err(NarrowError::ShapeMismatch) => continue,
+                };
             let ref_type_name = narrowed.type_name();
 
             // Directional check: source (the referenced attribute, post
@@ -1088,28 +1117,28 @@ pub(crate) fn narrow_type_expr(
 /// free mix of `.field` (descend into a `Struct`) and `[idx]` (peel one
 /// `List<T>` / `Map<_, V>` layer) continuations (carina#3025).
 ///
-/// Returns `None` when any segment doesn't fit the container shape at
-/// its position (`.x` against a scalar, `[0]` against a `Struct`, …).
-/// The caller decides whether that's a hard error or — when the path
-/// is "permissive" (chained access into a shape the checker doesn't
-/// yet narrow precisely) — silent.
-///
-/// Borrows so deep paths don't pay an O(depth) clone chain. Used by
-/// `validate_resource_ref_types` to honour the carina#3025 segments
-/// representation when type-checking cross-resource references
-/// (carina#3028).
+/// Borrows so deep paths don't pay an O(depth) clone chain. The error
+/// variant ([`NarrowError`]) distinguishes a real field typo
+/// (actionable, suggest a sibling) from a structural shape mismatch
+/// (caller decides whether resolver-time location context is enough).
 pub(crate) fn narrow_attribute_type<'a>(
     start: &'a AttributeType,
     segments: &[crate::resource::PathSegment],
-) -> Option<&'a AttributeType> {
+) -> Result<&'a AttributeType, NarrowError> {
     use crate::resource::{PathSegment, Subscript};
     let mut current = start;
     for seg in segments {
         current = match (seg, current) {
-            (PathSegment::Field { name }, AttributeType::Struct { fields, .. }) => fields
-                .iter()
-                .find(|f| f.name == *name)
-                .map(|f| &f.field_type)?,
+            (PathSegment::Field { name }, AttributeType::Struct { fields, name: sn }) => {
+                let Some(field) = fields.iter().find(|f| f.name == *name) else {
+                    return Err(NarrowError::UnknownStructField {
+                        field: name.clone(),
+                        struct_name: sn.clone(),
+                        known_fields: fields.iter().map(|f| f.name.clone()).collect(),
+                    });
+                };
+                &field.field_type
+            }
             // Dot-form key access against a `map(_, V)` projects to
             // `V`, mirroring the resolver's behaviour (carina#2447).
             (PathSegment::Field { .. }, AttributeType::Map { value, .. }) => value.as_ref(),
@@ -1125,10 +1154,26 @@ pub(crate) fn narrow_attribute_type<'a>(
                 },
                 AttributeType::Map { value, .. },
             ) => value.as_ref(),
-            _ => return None,
+            _ => return Err(NarrowError::ShapeMismatch),
         };
     }
-    Some(current)
+    Ok(current)
+}
+
+/// Reason [`narrow_attribute_type`] rejected a path.
+#[derive(Debug)]
+pub(crate) enum NarrowError {
+    /// A `.field` segment named a field that doesn't exist on the
+    /// current `Struct`. Carries the struct's declared name and the
+    /// names of its fields so the caller can render a suggestion.
+    UnknownStructField {
+        field: String,
+        struct_name: String,
+        known_fields: Vec<String>,
+    },
+    /// A segment didn't fit the container at its position
+    /// (e.g. `.x` against a scalar, `[0]` against a struct).
+    ShapeMismatch,
 }
 
 pub mod inference;

@@ -2718,3 +2718,116 @@ fn ref_with_chained_subscript_then_field_rejects_real_mismatch() {
         "expected real Int→String mismatch to be flagged, got: {err}"
     );
 }
+
+/// carina#3041: when a chained `[idx].field` references a struct
+/// field that does not exist (typically because the user is still on
+/// an older flat shape like `domain_validation_options[0].resource_record_name`
+/// while the schema has migrated to a nested
+/// `domain_validation_options[0].resource_record.name`), validation
+/// must flag the unknown field by name with a suggestion. Pre-fix
+/// `narrow_attribute_type` returned `None` silently, the caller
+/// swallowed it, and the failure only surfaced at apply time with a
+/// misleading "Add a `wait` block" message — `wait` could never have
+/// helped, because the attribute will never exist under that spelling.
+#[test]
+fn ref_with_chained_field_on_struct_flags_unknown_field() {
+    use crate::resource::{AccessPath, PathSegment, Subscript, Value};
+    use crate::schema::StructField;
+
+    let mut schemas = SchemaRegistry::new();
+    // Mirror the real `aws.acm.Certificate` shape after aws#295:
+    // `domain_validation_options[*].resource_record: Struct{name, value}`.
+    // Note: NO flat `resource_record_name` / `resource_record_value`
+    // fields on the inner struct — those were removed by the nested
+    // migration.
+    schemas.insert(
+        "aws",
+        make_schema(
+            "acm.Certificate",
+            vec![(
+                "domain_validation_options",
+                AttributeType::List {
+                    inner: Box::new(AttributeType::Struct {
+                        name: "DomainValidation".to_string(),
+                        fields: vec![
+                            StructField::new("domain_name", AttributeType::String),
+                            StructField::new(
+                                "resource_record",
+                                AttributeType::Struct {
+                                    name: "ResourceRecord".to_string(),
+                                    fields: vec![
+                                        StructField::new("name", AttributeType::String),
+                                        StructField::new("value", AttributeType::String),
+                                    ],
+                                },
+                            ),
+                        ],
+                    }),
+                    ordered: true,
+                },
+            )],
+        ),
+    );
+    schemas.insert(
+        "aws",
+        make_schema("route53.RecordSet", vec![("name", AttributeType::String)]),
+    );
+
+    let cert = Resource::with_provider("aws", "acm.Certificate", "main", None).with_binding("cert");
+
+    // User wrote `cert.domain_validation_options[0].resource_record_name`
+    // — the old flat spelling that the nested-shape migration replaced
+    // with `[0].resource_record.name`.
+    let path = AccessPath::with_segments(
+        "cert",
+        "domain_validation_options",
+        vec![
+            PathSegment::Subscript {
+                index: Subscript::Int { index: 0 },
+            },
+            PathSegment::Field {
+                name: "resource_record_name".to_string(),
+            },
+        ],
+    );
+    let record = Resource::with_provider("aws", "route53.RecordSet", "validation", None)
+        .with_attribute(
+            "name",
+            Value::Deferred(crate::resource::DeferredValue::ResourceRef { path }),
+        );
+
+    let mut parsed = empty_parsed();
+    parsed.resources.push(cert); // allow: direct — fixture test inspection
+    parsed.resources.push(record); // allow: direct — fixture test inspection
+    let err = validate_resource_ref_types(&parsed, &schemas, &HashSet::new()).unwrap_err();
+    assert!(
+        err.contains("resource_record_name"),
+        "error must name the unknown field, got: {err}",
+    );
+    // Struct name must appear (not a fuzzy "the word 'struct'" match —
+    // the diagnostic commits to naming the enclosing struct so the
+    // user knows where to look).
+    assert!(
+        err.contains("DomainValidation"),
+        "error must identify the enclosing struct, got: {err}",
+    );
+    // Sibling fields must be enumerated so the user can discover the
+    // new spelling (`resource_record.name`) even when `suggest_similar_name`'s
+    // Levenshtein threshold (3 for a 20-char identifier) doesn't fire
+    // on this specific typo distance. The `known fields:` prefix pins
+    // the list, not the path — the path also contains `resource_record`
+    // and would otherwise produce a trivially-satisfied assertion.
+    assert!(
+        err.contains("known fields:"),
+        "error must enumerate known fields, got: {err}"
+    );
+    let known_section = err.split("known fields:").nth(1).unwrap_or("");
+    assert!(
+        known_section.contains("resource_record"),
+        "known fields list must include the renamed field, got: {err}",
+    );
+    assert!(
+        known_section.contains("domain_name"),
+        "known fields list must enumerate all siblings, got: {err}",
+    );
+}
