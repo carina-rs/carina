@@ -304,6 +304,40 @@ mod tests {
     }
 
     #[test]
+    fn issue_3030_chained_index_then_field_after_namespaced_id() {
+        // The formatter's grammar used to accept `binding.attr[idx]` but
+        // reject `binding.attr[idx].field` — the same chained
+        // index-then-field shape that #3026/#3027 enabled in the main
+        // parser. Without this fix the pre-commit `carina fmt` hook
+        // blocks anyone using the now-legal form (carina#3030).
+        let input = r#"aws.route53.RecordSet {
+  name = cert.domain_validation_options[0].resource_record_name
+}
+"#;
+        let result = parse(input);
+        assert!(
+            result.is_ok(),
+            "Chained index-then-field after namespaced_id should parse (carina#3030), got: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn issue_3030_multi_step_index_field_chain_after_namespaced_id() {
+        // `binding.attr[i].sub[j].leaf` — multi-step chain after a
+        // namespaced_id. Lock the shape down so future grammar tweaks
+        // don't silently regress.
+        let input = r#"let x = orgs.accounts[0].subnets[1].id
+"#;
+        let result = parse(input);
+        assert!(
+            result.is_ok(),
+            "Multi-step chained access after namespaced_id should parse, got: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
     fn issue_2504_let_binding_with_module_call_rhs() {
         // `let X = module_call { ... }` is accepted by the main parser
         // but rejected by the formatter parser. See carina-rs/carina#2504.

@@ -1029,6 +1029,29 @@ mod tests {
     }
 
     #[test]
+    fn test_format_chained_index_then_field_after_namespaced_id() {
+        // carina#3030: chained `[idx].field` continuation after a
+        // dotted resource ref must round-trip through `carina fmt`.
+        // Pre-fix the formatter parser rejected this with
+        // "expected ... close_brace, open_bracket, ..." at the `.`
+        // that introduced the second field segment.
+        let input = "aws.route53.RecordSet {\n  name = cert.domain_validation_options[0].resource_record_name\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert!(
+            result.contains("cert.domain_validation_options[0].resource_record_name"),
+            "Chained access surface form must survive formatting, got:\n{}",
+            result
+        );
+        // Idempotency: a second pass must produce the same output.
+        let second = format(&result, &config).unwrap();
+        assert_eq!(
+            result, second,
+            "format must be idempotent for chained access"
+        );
+    }
+
+    #[test]
     fn test_format_for_expression() {
         let input = "let subnets = for subnet in subnets {\n  awscc.ec2.Subnet {\n    cidr_block = subnet.cidr\n  }\n}\n";
         let config = FormatConfig::default();

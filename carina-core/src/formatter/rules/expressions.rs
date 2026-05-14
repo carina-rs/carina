@@ -264,9 +264,11 @@ impl Formatter {
     }
 
     pub(in crate::formatter) fn format_subscripted_id(&mut self, node: &CstNode) {
-        // `binding.field[idx]…` — the namespaced_id portion is a single
-        // token (the `@{ }` rule produces no inner pairs), and each
-        // `index_access` child carries its own `[` / expression / `]`.
+        // `binding.field[idx]…`, `binding.field[idx].subfield`,
+        // `binding.field.sub[i].leaf` — the namespaced_id portion is a
+        // single token (the `@{ }` rule produces no inner pairs), and
+        // each `index_access` / `field_access` child carries its own
+        // surface form (`[idx]` / `.field`). carina#3030.
         for child in &node.children {
             match child {
                 CstChild::Token(token) => {
@@ -274,6 +276,9 @@ impl Formatter {
                 }
                 CstChild::Node(n) if n.kind == NodeKind::IndexAccess => {
                     self.format_index_access(n);
+                }
+                CstChild::Node(n) if n.kind == NodeKind::FieldAccess => {
+                    self.format_field_access(n);
                 }
                 _ => {}
             }

@@ -238,11 +238,12 @@ identifier = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 // Namespaced identifier: aws.s3_bucket, aws.Region.ap_northeast_1, Type.ipsec.1
 namespaced_id = @{ identifier ~ ("." ~ (identifier | ASCII_DIGIT+))+ }
 
-// Namespaced identifier with trailing `[index]` subscripts:
-// `orgs.accounts[0]`, `orgs.account.children["alpha"]`. Mirrors the
-// canonical parser's `subscripted_id` so post-field index access
-// formats round-trip.
-subscripted_id = { namespaced_id ~ (trivia* ~ index_access)+ }
+// Namespaced identifier with a trailing chain of `[index]` /
+// `.field` continuations: `orgs.accounts[0]`,
+// `orgs.account.children["alpha"]`, `cert.domain_validation_options[0].resource_record_name`
+// (carina#3030). Mirrors the canonical parser's `subscripted_id` so
+// every shape the main parser accepts round-trips through `carina fmt`.
+subscripted_id = { namespaced_id ~ (trivia* ~ (index_access | field_access))+ }
 
 // Expression
 expression = { pipe_expr }
