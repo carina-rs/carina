@@ -1,5 +1,6 @@
 //! Validation utilities for resources and modules
 
+pub mod deferred_populate;
 pub mod depends_on;
 pub mod wait;
 

@@ -233,6 +233,24 @@ pub fn validate_wait_bindings_with_ctx<E>(
         .collect()
 }
 
+/// Surface deferred-populate-bound chained references that lack a
+/// synchronizing `wait` block as `AppError::Validation`. Shared with
+/// the LSP via the underlying
+/// `carina_core::validation::deferred_populate::validate_deferred_populate_refs`
+/// pass. carina#3034.
+pub fn validate_deferred_populate_refs_with_ctx<E>(
+    ctx: &WiringContext,
+    parsed: &carina_core::parser::File<E>,
+) -> Vec<AppError> {
+    carina_core::validation::deferred_populate::validate_deferred_populate_refs(
+        parsed,
+        ctx.schemas(),
+    )
+    .into_iter()
+    .map(|d| AppError::Validation(d.message))
+    .collect()
+}
+
 pub fn validate_resource_ref_types_with_ctx<E>(
     ctx: &WiringContext,
     parsed: &carina_core::parser::File<E>,

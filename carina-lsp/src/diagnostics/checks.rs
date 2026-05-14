@@ -2031,6 +2031,62 @@ impl DiagnosticEngine {
             })
             .collect()
     }
+
+    /// Lint chained references to schema-flagged "deferred-populate"
+    /// attributes that lack a synchronizing `wait` block. Delegates to
+    /// `carina_core::validation::deferred_populate` so the LSP and
+    /// `carina validate` produce identical wording (carina#3034).
+    ///
+    /// Source anchor: the attribute key on the *holding* resource
+    /// (e.g. `resource_records` on the route53.RecordSet). The full
+    /// path of the offending ref (`cert.dvo[0].rrv`) appears verbatim
+    /// in the message, so the user sees both the holder and the
+    /// upstream they need to wait on.
+    pub(super) fn check_deferred_populate_refs(
+        &self,
+        doc: &Document,
+        parsed: &ParsedFile,
+    ) -> Vec<Diagnostic> {
+        let diags = carina_core::validation::deferred_populate::validate_deferred_populate_refs(
+            parsed,
+            &self.schemas,
+        );
+        if diags.is_empty() {
+            return Vec::new();
+        }
+        let text = doc.text();
+        diags
+            .into_iter()
+            .map(|d| {
+                let (line, col, end_col) =
+                    deferred_populate_anchor(&text, d.holder_binding.as_deref(), &d.attribute_key);
+                carina_diagnostic(line, col, end_col, DiagnosticSeverity::ERROR, d.message)
+            })
+            .collect()
+    }
+}
+
+/// Anchor for a deferred-populate diagnostic: the attribute key as it
+/// appears on the holding resource. Falls back to `(0, 0, 0)` so the
+/// editor still surfaces the message even without a precise span.
+fn deferred_populate_anchor(
+    text: &str,
+    holder_binding: Option<&str>,
+    attribute_key: &str,
+) -> (u32, u32, u32) {
+    let lines: Vec<&str> = text.lines().collect();
+    // Scope the forward scan to the holder binding's `let <binding> =`
+    // line when available, so identical attribute keys on different
+    // resources don't all anchor to the first occurrence.
+    let start = holder_binding
+        .and_then(|b| find_binding_line(&lines, b))
+        .unwrap_or(0);
+    for (i, line) in lines.iter().enumerate().skip(start) {
+        if let Some((col, end_col)) = find_word_on_line(line, attribute_key) {
+            return (i as u32, col, end_col);
+        }
+    }
+    (0, 0, 0)
 }
 
 /// Find the source anchor for a wait diagnostic. Returns

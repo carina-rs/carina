@@ -324,6 +324,14 @@ pub struct StructField {
     pub provider_name: Option<String>,
     /// Alternative block name for repeated block syntax (e.g., "transition" for "transitions")
     pub block_name: Option<String>,
+    /// Whether the value of this nested field is populated by the
+    /// provider asynchronously *after* the Create call returns.
+    /// Reached when a chained access traverses a `Struct` (e.g.
+    /// `cert.domain_validation_options[0].resource_record_value` —
+    /// the inner struct field is the deferred-populate one, not the
+    /// outer list attribute). See `AttributeSchema::deferred_populate`
+    /// (carina#3034).
+    pub deferred_populate: bool,
 }
 
 impl StructField {
@@ -335,6 +343,7 @@ impl StructField {
             description: None,
             provider_name: None,
             block_name: None,
+            deferred_populate: false,
         }
     }
 
@@ -355,6 +364,13 @@ impl StructField {
 
     pub fn with_block_name(mut self, name: impl Into<String>) -> Self {
         self.block_name = Some(name.into());
+        self
+    }
+
+    /// Mark this nested field as populated asynchronously by the
+    /// provider after Create. See the field doc on `deferred_populate`.
+    pub fn deferred_populate(mut self) -> Self {
+        self.deferred_populate = true;
         self
     }
 }
@@ -2111,6 +2127,21 @@ pub struct AttributeSchema {
     /// (e.g., Route 53 RecordSet `type` differentiates A vs AAAA records with the
     /// same name and hosted zone).
     pub identity: bool,
+    /// Whether the value of this attribute is populated by the provider
+    /// asynchronously *after* the Create call returns. Downstream
+    /// resources that read this attribute via a chained access
+    /// (`<binding>.<this_attr>...`) without a synchronizing `wait`
+    /// block on the binding will be rejected at validate time
+    /// (carina#3034). Examples:
+    /// - ACM `Certificate.status` (PENDING_VALIDATION → ISSUED)
+    /// - CloudFront `Distribution.domain_name`
+    /// - RDS `DBInstance.endpoint`
+    ///
+    /// Independent of `read_only`: a deferred-populate attribute may
+    /// also be `read_only` (the user cannot set it), but a `read_only`
+    /// attribute is not necessarily deferred-populate (it may be
+    /// populated synchronously, e.g. an ARN echoed back by Create).
+    pub deferred_populate: bool,
 }
 
 impl AttributeSchema {
@@ -2129,6 +2160,7 @@ impl AttributeSchema {
             block_name: None,
             write_only: false,
             identity: false,
+            deferred_populate: false,
         }
     }
 
@@ -2154,6 +2186,13 @@ impl AttributeSchema {
 
     pub fn identity(mut self) -> Self {
         self.identity = true;
+        self
+    }
+
+    /// Mark this attribute as populated asynchronously by the provider
+    /// after Create. See the field doc on `deferred_populate`.
+    pub fn deferred_populate(mut self) -> Self {
+        self.deferred_populate = true;
         self
     }
 
