@@ -106,7 +106,14 @@ pub(crate) fn parse_resource_address(
     // Split namespaced id into provider and resource_type
     let (provider, resource_type) = split_namespaced_id(&namespaced);
 
-    Ok(ResourceId::with_provider(provider, resource_type, name))
+    // `to`/`moved` addresses don't carry instance routing — the resolved
+    // resource supplies its own `provider_instance` from the DSL.
+    Ok(ResourceId::with_provider(
+        provider,
+        resource_type,
+        name,
+        None,
+    ))
 }
 
 pub(crate) fn extract_string_from_pair(

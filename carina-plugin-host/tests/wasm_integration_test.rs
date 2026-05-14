@@ -77,7 +77,7 @@ async fn test_wasm_mock_provider_create_and_read() {
     assert_eq!(provider.name(), "mock");
 
     // Read before create - should return a state with no identifier and empty attributes
-    let id = ResourceId::with_provider("mock", "test.resource", "my-resource");
+    let id = ResourceId::with_provider("mock", "test.resource", "my-resource", None);
     let state = provider
         .read(&id, None, ReadRequest)
         .await
@@ -86,7 +86,7 @@ async fn test_wasm_mock_provider_create_and_read() {
     assert!(state.attributes.is_empty());
 
     // Create a resource
-    let mut resource = Resource::with_provider("mock", "test.resource", "my-resource");
+    let mut resource = Resource::with_provider("mock", "test.resource", "my-resource", None);
     resource.attributes = indexmap::IndexMap::from([
         (
             "name".into(),
@@ -155,10 +155,10 @@ async fn test_wasm_mock_provider_update_and_delete() {
         .await
         .expect("provider should init");
 
-    let id = ResourceId::with_provider("mock", "test.resource", "updatable");
+    let id = ResourceId::with_provider("mock", "test.resource", "updatable", None);
 
     // Create first
-    let mut resource = Resource::with_provider("mock", "test.resource", "updatable");
+    let mut resource = Resource::with_provider("mock", "test.resource", "updatable", None);
     resource.attributes = indexmap::IndexMap::from([
         (
             "color".into(),
@@ -273,7 +273,7 @@ async fn test_wasm_mock_provider_normalizer() {
 
     // normalize_desired: mock provider returns resources unchanged
     let mut resources = vec![{
-        let mut r = Resource::with_provider("mock", "test.resource", "norm-test");
+        let mut r = Resource::with_provider("mock", "test.resource", "norm-test", None);
         r.attributes = indexmap::IndexMap::from([(
             "key".into(),
             Value::Concrete(ConcreteValue::String("value".into())),
@@ -285,7 +285,7 @@ async fn test_wasm_mock_provider_normalizer() {
     assert_eq!(resources[0].resolved_attributes(), original_attrs);
 
     // normalize_state: mock provider returns states unchanged
-    let id = ResourceId::with_provider("mock", "test.resource", "norm-test");
+    let id = ResourceId::with_provider("mock", "test.resource", "norm-test", None);
     let attrs = HashMap::from([(
         "key".into(),
         Value::Concrete(ConcreteValue::String("value".into())),
@@ -316,7 +316,12 @@ async fn test_wasm_mock_provider_merge_default_tags_dispatches_through_wit() {
         .await;
 
     let registry = carina_core::schema::SchemaRegistry::new();
-    let mut resources = vec![Resource::with_provider("mock", "test.resource", "tag-test")];
+    let mut resources = vec![Resource::with_provider(
+        "mock",
+        "test.resource",
+        "tag-test",
+        None,
+    )];
     let default_tags = indexmap::IndexMap::from([
         (
             "Env".to_string(),
@@ -350,7 +355,12 @@ async fn test_wasm_mock_provider_merge_default_tags_empty_short_circuits() {
         .await;
 
     let registry = carina_core::schema::SchemaRegistry::new();
-    let mut resources = vec![Resource::with_provider("mock", "test.resource", "no-tags")];
+    let mut resources = vec![Resource::with_provider(
+        "mock",
+        "test.resource",
+        "no-tags",
+        None,
+    )];
     let default_tags: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
 
     normalizer.merge_default_tags(&mut resources, &default_tags, &registry);
@@ -375,9 +385,9 @@ async fn test_wasm_mock_provider_merge_default_tags_preserves_order() {
 
     let registry = carina_core::schema::SchemaRegistry::new();
     let mut resources = vec![
-        Resource::with_provider("mock", "test.resource", "alpha"),
-        Resource::with_provider("mock", "test.resource", "beta"),
-        Resource::with_provider("mock", "test.resource", "gamma"),
+        Resource::with_provider("mock", "test.resource", "alpha", None),
+        Resource::with_provider("mock", "test.resource", "beta", None),
+        Resource::with_provider("mock", "test.resource", "gamma", None),
     ];
     let default_tags = indexmap::IndexMap::from([(
         "Env".to_string(),
@@ -413,7 +423,7 @@ async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
         .await
         .expect("provider should init");
 
-    let mut resource = Resource::with_provider("mock", "test.data_source", "example");
+    let mut resource = Resource::with_provider("mock", "test.data_source", "example", None);
     resource.attributes = indexmap::IndexMap::from([
         (
             "identity_store_id".into(),

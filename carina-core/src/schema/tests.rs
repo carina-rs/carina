@@ -3850,8 +3850,8 @@ fn schema_registry_get_picks_kind_from_resource() {
     registry.insert("aws", ResourceSchema::new("s3.Bucket"));
     registry.insert("aws", ResourceSchema::new("s3.Bucket").as_data_source());
 
-    let managed_res = Resource::with_provider("aws", "s3.Bucket", "new");
-    let data_res = Resource::with_provider("aws", "s3.Bucket", "existing")
+    let managed_res = Resource::with_provider("aws", "s3.Bucket", "new", None);
+    let data_res = Resource::with_provider("aws", "s3.Bucket", "existing", None)
         .with_kind(crate::resource::ResourceKind::DataSource);
 
     let m = registry

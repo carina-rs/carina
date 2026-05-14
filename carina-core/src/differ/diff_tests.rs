@@ -658,7 +658,7 @@ fn replace_with_provider_prefixed_schema_key() {
     // In production, schemas are keyed by "awscc.ec2.Vpc" but resource_type is "ec2.Vpc"
     // The resource must have provider set so the generic lookup works
     let resources = vec![
-        Resource::with_provider("awscc", "ec2.Vpc", "my-vpc").with_attribute(
+        Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None).with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         ),
@@ -671,9 +671,9 @@ fn replace_with_provider_prefixed_schema_key() {
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
     current_states.insert(
-        ResourceId::with_provider("awscc", "ec2.Vpc", "my-vpc"),
+        ResourceId::with_provider("awscc", "ec2.Vpc", "my-vpc", None),
         State::existing(
-            ResourceId::with_provider("awscc", "ec2.Vpc", "my-vpc"),
+            ResourceId::with_provider("awscc", "ec2.Vpc", "my-vpc", None),
             attrs,
         ),
     );
@@ -1039,51 +1039,52 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
 
     // Desired state (post-normalization, post-alias-resolution)
     // "all" -> "-1" (alias resolved), "tcp" stays as namespaced identifier
-    let desired = Resource::with_provider("awscc", "ec2.SecurityGroup", "test-sg").with_attribute(
-        "security_group_egress",
-        Value::Concrete(ConcreteValue::List(vec![
-            Value::Concrete(ConcreteValue::Map(IndexMap::from([
-                (
-                    "ip_protocol".to_string(),
-                    Value::Concrete(ConcreteValue::String(
-                        "awscc.ec2.SecurityGroup.IpProtocol.tcp".to_string(),
-                    )),
-                ),
-                (
-                    "from_port".to_string(),
-                    Value::Concrete(ConcreteValue::Int(443)),
-                ),
-                (
-                    "to_port".to_string(),
-                    Value::Concrete(ConcreteValue::Int(443)),
-                ),
-                (
-                    "cidr_ip".to_string(),
-                    Value::Concrete(ConcreteValue::String("0.0.0.0/0".to_string())),
-                ),
-                (
-                    "description".to_string(),
-                    Value::Concrete(ConcreteValue::String("Allow HTTPS outbound".to_string())),
-                ),
-            ]))),
-            Value::Concrete(ConcreteValue::Map(IndexMap::from([
-                (
-                    "ip_protocol".to_string(),
-                    Value::Concrete(ConcreteValue::String("-1".to_string())),
-                ),
-                (
-                    "cidr_ip".to_string(),
-                    Value::Concrete(ConcreteValue::String("10.0.0.0/8".to_string())),
-                ),
-                (
-                    "description".to_string(),
-                    Value::Concrete(ConcreteValue::String(
-                        "Allow all to private ranges".to_string(),
-                    )),
-                ),
-            ]))),
-        ])),
-    );
+    let desired = Resource::with_provider("awscc", "ec2.SecurityGroup", "test-sg", None)
+        .with_attribute(
+            "security_group_egress",
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                    (
+                        "ip_protocol".to_string(),
+                        Value::Concrete(ConcreteValue::String(
+                            "awscc.ec2.SecurityGroup.IpProtocol.tcp".to_string(),
+                        )),
+                    ),
+                    (
+                        "from_port".to_string(),
+                        Value::Concrete(ConcreteValue::Int(443)),
+                    ),
+                    (
+                        "to_port".to_string(),
+                        Value::Concrete(ConcreteValue::Int(443)),
+                    ),
+                    (
+                        "cidr_ip".to_string(),
+                        Value::Concrete(ConcreteValue::String("0.0.0.0/0".to_string())),
+                    ),
+                    (
+                        "description".to_string(),
+                        Value::Concrete(ConcreteValue::String("Allow HTTPS outbound".to_string())),
+                    ),
+                ]))),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                    (
+                        "ip_protocol".to_string(),
+                        Value::Concrete(ConcreteValue::String("-1".to_string())),
+                    ),
+                    (
+                        "cidr_ip".to_string(),
+                        Value::Concrete(ConcreteValue::String("10.0.0.0/8".to_string())),
+                    ),
+                    (
+                        "description".to_string(),
+                        Value::Concrete(ConcreteValue::String(
+                            "Allow all to private ranges".to_string(),
+                        )),
+                    ),
+                ]))),
+            ])),
+        );
 
     // Current state (from AWS read, post-normalization, post-alias-resolution)
     // Same as desired, but the "all" rule also has from_port: -1, to_port: -1 from AWS
@@ -1141,7 +1142,7 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
         ])),
     )]);
     let current = State::existing(
-        ResourceId::with_provider("awscc", "ec2.SecurityGroup", "test-sg"),
+        ResourceId::with_provider("awscc", "ec2.SecurityGroup", "test-sg", None),
         current_attrs,
     );
 
@@ -1288,12 +1289,13 @@ fn diff_false_positive_when_ordered_true_for_struct_list() {
         ),
     ])));
 
-    let desired = Resource::with_provider("awscc", "ec2.SecurityGroup", "test-sg").with_attribute(
-        "security_group_egress",
-        Value::Concrete(ConcreteValue::List(vec![item_a.clone(), item_b.clone()])),
-    );
+    let desired = Resource::with_provider("awscc", "ec2.SecurityGroup", "test-sg", None)
+        .with_attribute(
+            "security_group_egress",
+            Value::Concrete(ConcreteValue::List(vec![item_a.clone(), item_b.clone()])),
+        );
     let current = State::existing(
-        ResourceId::with_provider("awscc", "ec2.SecurityGroup", "test-sg"),
+        ResourceId::with_provider("awscc", "ec2.SecurityGroup", "test-sg", None),
         HashMap::from([(
             "security_group_egress".to_string(),
             // AWS returns items in reversed order
@@ -1365,7 +1367,7 @@ fn diff_no_change_for_compound_word_dsl_alias() {
 
     // Desired: API-canonical bare spelling (output of pass-2 in
     // AwsNormalizer::resolve_enum_identifiers).
-    let desired = Resource::with_provider("aws", "s3.BucketOwnershipControls", "test")
+    let desired = Resource::with_provider("aws", "s3.BucketOwnershipControls", "test", None)
         .with_attribute(
             "object_ownership",
             Value::Concrete(ConcreteValue::String("BucketOwnerEnforced".to_string())),
@@ -1381,7 +1383,7 @@ fn diff_no_change_for_compound_word_dsl_alias() {
         )),
     );
     let current = State::existing(
-        ResourceId::with_provider("aws", "s3.BucketOwnershipControls", "test"),
+        ResourceId::with_provider("aws", "s3.BucketOwnershipControls", "test", None),
         attrs,
     );
 

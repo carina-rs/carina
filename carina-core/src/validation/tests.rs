@@ -58,7 +58,7 @@ fn used_binding_no_warning() {
     let mut parsed = empty_parsed();
 
     // Resource with a binding
-    let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc")
+    let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc", None)
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
@@ -67,7 +67,7 @@ fn used_binding_no_warning() {
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
 
     // Resource that references the binding
-    let subnet = Resource::with_provider("awscc", "ec2.Subnet", "web-subnet").with_attribute(
+    let subnet = Resource::with_provider("awscc", "ec2.Subnet", "web-subnet", None).with_attribute(
         "vpc_id",
         Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
     );
@@ -80,7 +80,7 @@ fn used_binding_no_warning() {
 fn unused_binding_warns() {
     let mut parsed = empty_parsed();
 
-    let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc")
+    let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc", None)
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
@@ -97,7 +97,7 @@ fn anonymous_resource_no_warning() {
     let mut parsed = empty_parsed();
 
     // Anonymous resource (no _binding attribute)
-    let bucket = Resource::with_provider("awscc", "s3.Bucket", "my-bucket").with_attribute(
+    let bucket = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None).with_attribute(
         "bucket_name",
         Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
     );
@@ -110,7 +110,7 @@ fn anonymous_resource_no_warning() {
 fn binding_referenced_in_nested_value() {
     let mut parsed = empty_parsed();
 
-    let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc").with_binding("vpc");
+    let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc", None).with_binding("vpc");
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
 
     // Reference inside a Map inside a List
@@ -119,7 +119,7 @@ fn binding_referenced_in_nested_value() {
         "vpc_id".to_string(),
         Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
     );
-    let sg = Resource::with_provider("awscc", "ec2.SecurityGroup", "web-sg").with_attribute(
+    let sg = Resource::with_provider("awscc", "ec2.SecurityGroup", "web-sg", None).with_attribute(
         "tags",
         Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
             ConcreteValue::Map(map),
@@ -134,7 +134,7 @@ fn binding_referenced_in_nested_value() {
 fn binding_referenced_in_module_call() {
     let mut parsed = empty_parsed();
 
-    let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc").with_binding("vpc");
+    let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc", None).with_binding("vpc");
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
 
     let mut args = HashMap::new();
@@ -155,14 +155,15 @@ fn binding_referenced_in_module_call() {
 fn multiple_bindings_some_unused() {
     let mut parsed = empty_parsed();
 
-    let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc").with_binding("vpc");
+    let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc", None).with_binding("vpc");
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
 
-    let sg = Resource::with_provider("awscc", "ec2.SecurityGroup", "web-sg").with_binding("web_sg");
+    let sg = Resource::with_provider("awscc", "ec2.SecurityGroup", "web-sg", None)
+        .with_binding("web_sg");
     parsed.resources.push(sg); // allow: direct — fixture test inspection
 
     // Only vpc is referenced
-    let subnet = Resource::with_provider("awscc", "ec2.Subnet", "web-subnet").with_attribute(
+    let subnet = Resource::with_provider("awscc", "ec2.Subnet", "web-subnet", None).with_attribute(
         "vpc_id",
         Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
     );
@@ -176,7 +177,7 @@ fn multiple_bindings_some_unused() {
 fn binding_referenced_in_attributes_not_warned() {
     let mut parsed = empty_parsed();
 
-    let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc").with_binding("vpc");
+    let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc", None).with_binding("vpc");
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
 
     parsed
@@ -198,7 +199,7 @@ fn binding_referenced_in_attributes_not_warned() {
 fn binding_referenced_in_exports_not_warned() {
     let mut parsed = empty_parsed();
 
-    let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc").with_binding("vpc");
+    let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc", None).with_binding("vpc");
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
 
     parsed.export_params.push(crate::parser::ExportParameter {
@@ -440,7 +441,7 @@ fn unknown_binding_reference_reports_error() {
     );
 
     // Subnet references "vpc" binding which doesn't exist
-    let subnet = Resource::with_provider("awscc", "ec2.Subnet", "web-subnet").with_attribute(
+    let subnet = Resource::with_provider("awscc", "ec2.Subnet", "web-subnet", None).with_attribute(
         "vpc_id",
         Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
     );
@@ -467,7 +468,7 @@ fn unknown_attribute_reference_reports_error() {
     );
 
     // VPC resource with binding
-    let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc")
+    let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc", None)
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
@@ -475,7 +476,7 @@ fn unknown_attribute_reference_reports_error() {
         );
 
     // Subnet references vpc.nonexistent_attr which doesn't exist on the VPC schema
-    let subnet = Resource::with_provider("awscc", "ec2.Subnet", "web-subnet").with_attribute(
+    let subnet = Resource::with_provider("awscc", "ec2.Subnet", "web-subnet", None).with_attribute(
         "vpc_id",
         Value::resource_ref("vpc".to_string(), "nonexistent_attr".to_string(), vec![]),
     );
@@ -511,10 +512,11 @@ fn unknown_attribute_reference_suggests_similar_name() {
         ),
     );
 
-    let igw = Resource::with_provider("awscc", "ec2.internet_gateway", "igw").with_binding("igw");
+    let igw =
+        Resource::with_provider("awscc", "ec2.internet_gateway", "igw", None).with_binding("igw");
 
     // Typo: internet_gateway_idd instead of internet_gateway_id
-    let route = Resource::with_provider("awscc", "ec2.route", "main-route").with_attribute(
+    let route = Resource::with_provider("awscc", "ec2.route", "main-route", None).with_attribute(
         "gateway_id",
         Value::resource_ref(
             "igw".to_string(),
@@ -547,10 +549,10 @@ fn unknown_attribute_reference_no_suggestion_when_too_different() {
         make_schema("ec2.Subnet", vec![("vpc_id", AttributeType::String)]),
     );
 
-    let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc").with_binding("vpc");
+    let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc", None).with_binding("vpc");
 
     // Completely unrelated attribute name - no suggestion expected
-    let subnet = Resource::with_provider("awscc", "ec2.Subnet", "web-subnet").with_attribute(
+    let subnet = Resource::with_provider("awscc", "ec2.Subnet", "web-subnet", None).with_attribute(
         "vpc_id",
         Value::resource_ref(
             "vpc".to_string(),
@@ -1095,8 +1097,8 @@ fn validate_type_expr_value_schema_type_rejects_int() {
 fn discard_binding_no_warning() {
     let mut parsed = empty_parsed();
 
-    let caller =
-        Resource::with_provider("aws", "sts.caller_identity", "caller_identity").with_binding("_");
+    let caller = Resource::with_provider("aws", "sts.caller_identity", "caller_identity", None)
+        .with_binding("_");
     parsed.resources.push(caller); // allow: direct — fixture test inspection
 
     assert!(check_unused_bindings(&parsed).is_empty());
@@ -1574,7 +1576,7 @@ fn attribute_param_ref_type_mismatch_detected() {
     use crate::schema::{AttributeSchema, ResourceSchema};
 
     // Build a resource with schema: role_name is String, arn is IamRoleArn (Custom)
-    let role = Resource::with_provider("awscc", "iam.role", "github-role")
+    let role = Resource::with_provider("awscc", "iam.role", "github-role", None)
         .with_binding("role")
         .with_attribute(
             "role_name",
@@ -2022,7 +2024,7 @@ fn validate_export_param_ref_types_map_accepts_compatible_types() {
         ),
     );
 
-    let registry_prod = Resource::with_provider("awscc", "organizations.account", "prod")
+    let registry_prod = Resource::with_provider("awscc", "organizations.account", "prod", None)
         .with_binding("registry_prod")
         .with_attribute(
             "account_id",
@@ -2067,7 +2069,7 @@ fn validate_export_param_ref_types_map_rejects_type_mismatch() {
         ),
     );
 
-    let registry_prod = Resource::with_provider("awscc", "organizations.account", "prod")
+    let registry_prod = Resource::with_provider("awscc", "organizations.account", "prod", None)
         .with_binding("registry_prod")
         .with_attribute(
             "account_id",
@@ -2133,7 +2135,7 @@ fn validate_export_param_ref_types_against_inferred_inputs() {
     // Smoke test: a happy-path post-inference shape (bare TypeExpr,
     // matching attribute type) typechecks cleanly through the new
     // signature.
-    let registry_prod = Resource::with_provider("awscc", "organizations.account", "prod")
+    let registry_prod = Resource::with_provider("awscc", "organizations.account", "prod", None)
         .with_binding("registry_prod")
         .with_attribute(
             "account_id",
@@ -2188,14 +2190,15 @@ fn validate_resources_accepts_resource_ref_in_list_position() {
         ),
     );
 
-    let record_set = Resource::with_provider("aws", "route53.RecordSet", "ns").with_attribute(
-        "resource_records",
-        Value::resource_ref(
-            "registry_dev".to_string(),
-            "nameservers".to_string(),
-            vec![],
-        ),
-    );
+    let record_set = Resource::with_provider("aws", "route53.RecordSet", "ns", None)
+        .with_attribute(
+            "resource_records",
+            Value::resource_ref(
+                "registry_dev".to_string(),
+                "nameservers".to_string(),
+                vec![],
+            ),
+        );
 
     let mut known = HashSet::new();
     known.insert("aws".to_string());
@@ -2242,7 +2245,7 @@ fn validate_resources_accepts_resource_ref_in_struct_field_position() {
         Value::resource_ref("vpc".to_string(), "name".to_string(), vec![]),
     );
 
-    let holder = Resource::with_provider("aws", "test.StructHolder", "h")
+    let holder = Resource::with_provider("aws", "test.StructHolder", "h", None)
         .with_attribute("config", Value::Concrete(ConcreteValue::Map(config)));
 
     let mut known = HashSet::new();
@@ -2277,7 +2280,7 @@ fn validate_resources_accepts_resource_ref_in_map_position() {
         ),
     );
 
-    let holder = Resource::with_provider("aws", "test.MapHolder", "h").with_attribute(
+    let holder = Resource::with_provider("aws", "test.MapHolder", "h", None).with_attribute(
         "tags",
         Value::resource_ref("orgs".to_string(), "tag_map".to_string(), vec![]),
     );
@@ -2313,7 +2316,7 @@ fn validate_resources_rejects_missing_exclusive_required() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
 
-    let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc");
+    let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc", None);
 
     let mut known = HashSet::new();
     known.insert("awscc".to_string());
@@ -2623,7 +2626,7 @@ fn ref_with_chained_subscript_then_field_narrows_through_list() {
         make_schema("route53.RecordSet", vec![("name", AttributeType::String)]),
     );
 
-    let cert = Resource::with_provider("aws", "acm.Certificate", "main").with_binding("cert");
+    let cert = Resource::with_provider("aws", "acm.Certificate", "main", None).with_binding("cert");
 
     // `cert.domain_validation_options[0].resource_record_name`
     let path = AccessPath::with_segments(
@@ -2638,10 +2641,11 @@ fn ref_with_chained_subscript_then_field_narrows_through_list() {
             },
         ],
     );
-    let record = Resource::with_provider("aws", "route53.RecordSet", "validation").with_attribute(
-        "name",
-        Value::Deferred(crate::resource::DeferredValue::ResourceRef { path }),
-    );
+    let record = Resource::with_provider("aws", "route53.RecordSet", "validation", None)
+        .with_attribute(
+            "name",
+            Value::Deferred(crate::resource::DeferredValue::ResourceRef { path }),
+        );
 
     let mut parsed = empty_parsed();
     parsed.resources.push(cert); // allow: direct — fixture test inspection
@@ -2685,7 +2689,7 @@ fn ref_with_chained_subscript_then_field_rejects_real_mismatch() {
         make_schema("route53.RecordSet", vec![("name", AttributeType::String)]),
     );
 
-    let cert = Resource::with_provider("aws", "acm.Certificate", "main").with_binding("cert");
+    let cert = Resource::with_provider("aws", "acm.Certificate", "main", None).with_binding("cert");
 
     let path = AccessPath::with_segments(
         "cert",
@@ -2699,10 +2703,11 @@ fn ref_with_chained_subscript_then_field_rejects_real_mismatch() {
             },
         ],
     );
-    let record = Resource::with_provider("aws", "route53.RecordSet", "validation").with_attribute(
-        "name",
-        Value::Deferred(crate::resource::DeferredValue::ResourceRef { path }),
-    );
+    let record = Resource::with_provider("aws", "route53.RecordSet", "validation", None)
+        .with_attribute(
+            "name",
+            Value::Deferred(crate::resource::DeferredValue::ResourceRef { path }),
+        );
 
     let mut parsed = empty_parsed();
     parsed.resources.push(cert); // allow: direct — fixture test inspection

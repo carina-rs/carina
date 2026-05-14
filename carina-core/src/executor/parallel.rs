@@ -551,10 +551,10 @@ mod tests {
     /// underlying resources their attributes reference.
     #[test]
     fn build_dependency_map_follows_virtual_module_binding() {
-        let mut role = Resource::with_provider("awscc", "iam.Role", "bootstrap.role");
+        let mut role = Resource::with_provider("awscc", "iam.Role", "bootstrap.role", None);
         role.binding = Some("bootstrap.role".to_string());
 
-        let mut virt = Resource::with_provider("_virtual", "_virtual", "bootstrap");
+        let mut virt = Resource::with_provider("_virtual", "_virtual", "bootstrap", None);
         virt.binding = Some("bootstrap".to_string());
         virt.kind = ResourceKind::Virtual {
             module_name: "github-oidc".to_string(),
@@ -565,7 +565,7 @@ mod tests {
             Value::resource_ref("bootstrap.role", "role_name", vec![]),
         );
 
-        let mut role_policy = Resource::with_provider("awscc", "iam.RolePolicy", "rp");
+        let mut role_policy = Resource::with_provider("awscc", "iam.RolePolicy", "rp", None);
         role_policy.set_attr(
             "role_name",
             Value::resource_ref("bootstrap", "role_name", vec![]),

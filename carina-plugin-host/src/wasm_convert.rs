@@ -310,7 +310,12 @@ pub fn core_to_wit_resource_id(id: &CoreResourceId) -> wit::ResourceId {
 }
 
 pub fn wit_to_core_resource_id(id: &wit::ResourceId) -> CoreResourceId {
-    CoreResourceId::with_provider(&id.provider, &id.resource_type, &id.name)
+    // The WIT `resource-id` record has no `provider-instance` field
+    // yet, so this boundary cannot round-trip a named instance.
+    // Tracked as a follow-up to extend the WIT contract; until then,
+    // callers that need routing must thread it through alongside the
+    // converted id.
+    CoreResourceId::with_provider(&id.provider, &id.resource_type, &id.name, None)
 }
 
 // -- State --
@@ -348,8 +353,11 @@ pub fn core_to_wit_resource(
 
 pub fn wit_to_core_resource(resource: &wit::ResourceDef) -> CoreResource {
     let id = wit_to_core_resource_id(&resource.id);
+    // `id` came from `wit_to_core_resource_id`, which has no
+    // `provider_instance` to forward (WIT contract limitation); pass
+    // `None` explicitly to match.
     let mut core_resource =
-        CoreResource::with_provider(&id.provider, &id.resource_type, id.name_str());
+        CoreResource::with_provider(&id.provider, &id.resource_type, id.name_str(), None);
     core_resource.attributes = resource
         .attributes
         .iter()
@@ -1039,7 +1047,7 @@ mod tests {
 
     #[test]
     fn test_resource_id_roundtrip() {
-        let core = CoreResourceId::with_provider("aws", "s3.Bucket", "my-bucket");
+        let core = CoreResourceId::with_provider("aws", "s3.Bucket", "my-bucket", None);
         let wit = core_to_wit_resource_id(&core);
         assert_eq!(wit.provider, "aws");
         assert_eq!(wit.resource_type, "s3.Bucket");
@@ -1052,7 +1060,7 @@ mod tests {
 
     #[test]
     fn test_state_roundtrip() {
-        let id = CoreResourceId::with_provider("aws", "s3.Bucket", "my-bucket");
+        let id = CoreResourceId::with_provider("aws", "s3.Bucket", "my-bucket", None);
         let mut attrs = HashMap::new();
         attrs.insert(
             "name".into(),
@@ -1074,7 +1082,7 @@ mod tests {
 
     #[test]
     fn test_state_with_identifier_roundtrip() {
-        let id = CoreResourceId::with_provider("aws", "ec2.Vpc", "main");
+        let id = CoreResourceId::with_provider("aws", "ec2.Vpc", "main", None);
         let attrs = HashMap::from([(
             "cidr".into(),
             CoreValue::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
@@ -1110,7 +1118,7 @@ mod tests {
 
     #[test]
     fn test_resource_roundtrip() {
-        let mut resource = CoreResource::with_provider("aws", "s3.Bucket", "my-bucket");
+        let mut resource = CoreResource::with_provider("aws", "s3.Bucket", "my-bucket", None);
         resource.attributes = indexmap::IndexMap::from([
             (
                 "name".into(),
@@ -1191,7 +1199,7 @@ mod tests {
         // flattened to a string at the boundary because WIT cannot
         // carry `dyn std::error::Error`.
         let cause = std::io::Error::other("inner io error");
-        let id = CoreResourceId::with_provider("aws", "s3.Bucket", "my-bucket");
+        let id = CoreResourceId::with_provider("aws", "s3.Bucket", "my-bucket", None);
         let err = CoreProviderError::api_error("Failed to read")
             .with_cause(cause)
             .for_resource(id.clone())

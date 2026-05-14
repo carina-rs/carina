@@ -1057,7 +1057,7 @@ mod tests {
             .exports
             .insert("vpc_id".to_string(), serde_json::json!("vpc-12345"));
 
-        let destroyed = vec![ResourceId::with_provider("awscc", "ec2.Vpc", "main")];
+        let destroyed = vec![ResourceId::with_provider("awscc", "ec2.Vpc", "main", None)];
         apply_destroy_to_state(&mut state, &destroyed);
 
         assert!(state.resources.is_empty(), "resource should be removed");

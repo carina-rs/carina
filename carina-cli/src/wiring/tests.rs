@@ -6,7 +6,8 @@ use carina_core::parser::ParsedFile;
 fn test_resolve_enum_aliases_ip_protocol_all() {
     // After normalize_desired, ip_protocol "all" becomes a namespaced DSL value.
     // resolve_enum_aliases should resolve the alias "all" -> "-1".
-    let mut resource = Resource::with_provider("awscc", "ec2.security_group_egress", "test-rule");
+    let mut resource =
+        Resource::with_provider("awscc", "ec2.security_group_egress", "test-rule", None);
     resource.set_attr(
         "ip_protocol".to_string(),
         Value::Concrete(ConcreteValue::String(
@@ -28,7 +29,8 @@ fn test_resolve_enum_aliases_ip_protocol_all() {
 fn test_resolve_enum_aliases_no_alias() {
     // "tcp" has no alias mapping, so it should be converted from DSL enum
     // to its raw form by convert_enum_value but not further changed.
-    let mut resource = Resource::with_provider("awscc", "ec2.security_group_egress", "test-rule");
+    let mut resource =
+        Resource::with_provider("awscc", "ec2.security_group_egress", "test-rule", None);
     resource.set_attr(
         "ip_protocol".to_string(),
         Value::Concrete(ConcreteValue::String(
@@ -52,7 +54,8 @@ fn test_resolve_enum_aliases_no_alias() {
 #[ignore = "requires provider binary for enum alias resolution"]
 fn test_resolve_enum_aliases_aws_provider() {
     // Same alias resolution should work for the aws provider
-    let mut resource = Resource::with_provider("aws", "ec2.security_group_ingress", "test-rule");
+    let mut resource =
+        Resource::with_provider("aws", "ec2.security_group_ingress", "test-rule", None);
     resource.set_attr(
         "ip_protocol".to_string(),
         Value::Concrete(ConcreteValue::String(
@@ -74,7 +77,7 @@ fn test_resolve_enum_aliases_aws_provider() {
 fn test_resolve_enum_aliases_in_states() {
     // Current states should also have aliases resolved
     let ctx = WiringContext::new(vec![]);
-    let id = ResourceId::with_provider("awscc", "ec2.security_group_egress", "test-rule");
+    let id = ResourceId::with_provider("awscc", "ec2.security_group_egress", "test-rule", None);
     let mut attrs = HashMap::new();
     attrs.insert(
         "ip_protocol".to_string(),
@@ -98,7 +101,7 @@ fn test_resolve_enum_aliases_in_states() {
 #[ignore = "requires provider binary for enum alias resolution"]
 fn test_resolve_enum_aliases_in_struct_field() {
     // Aliases within struct fields (maps inside lists) should also be resolved
-    let mut resource = Resource::with_provider("awscc", "ec2.SecurityGroup", "test-sg");
+    let mut resource = Resource::with_provider("awscc", "ec2.SecurityGroup", "test-sg", None);
     let mut egress_map = IndexMap::new();
     egress_map.insert(
         "ip_protocol".to_string(),
@@ -163,7 +166,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
     let ctx = WiringContext::new(vec![]);
 
     // Desired resource with normalized DSL enum value (after normalize_desired)
-    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "test-vpc");
+    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "test-vpc", None);
     resource.set_attr(
         "instance_tenancy".to_string(),
         Value::Concrete(ConcreteValue::String(
@@ -250,7 +253,7 @@ fn test_merge_default_tags_prevents_false_diff() {
     schemas.insert("awscc", schema);
 
     // Desired resource without explicit tags
-    let resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket");
+    let resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket", None);
 
     // State already has the default tags (from a previous apply)
     let id = resource.id.clone();
@@ -346,7 +349,7 @@ fn test_merge_default_tags_prevents_false_diff() {
 #[test]
 fn test_resolve_enum_aliases_non_enum_values_unchanged() {
     // Non-DSL-enum strings should not be affected
-    let mut resource = Resource::with_provider("awscc", "ec2.SecurityGroup", "test-sg");
+    let mut resource = Resource::with_provider("awscc", "ec2.SecurityGroup", "test-sg", None);
     resource.set_attr(
         "group_description".to_string(),
         Value::Concrete(ConcreteValue::String("My security group".to_string())),
@@ -386,7 +389,7 @@ fn import_fallback_matches_anonymous_resource_by_name_attribute() {
     schemas.insert("awscc", bucket_schema);
 
     // Anonymous resource with hash name but bucket_name = "carina-rs-state"
-    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "s3_bucket_1d43a664");
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "s3_bucket_1d43a664", None);
     resource.set_attr(
         "bucket_name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs-state".to_string())),
@@ -396,7 +399,7 @@ fn import_fallback_matches_anonymous_resource_by_name_attribute() {
 
     // Import block with the logical name (not the hash)
     let state_blocks = vec![StateBlock::Import {
-        to: ResourceId::with_provider("awscc", "s3.Bucket", "carina-rs-state"),
+        to: ResourceId::with_provider("awscc", "s3.Bucket", "carina-rs-state", None),
         id: "carina-rs-state".to_string(),
     }];
 
@@ -444,7 +447,7 @@ fn import_fallback_skips_when_already_in_state_by_name_attribute() {
 
     let mut plan = Plan::new();
     let state_blocks = vec![StateBlock::Import {
-        to: ResourceId::with_provider("awscc", "s3.Bucket", "carina-rs-state"),
+        to: ResourceId::with_provider("awscc", "s3.Bucket", "carina-rs-state", None),
         id: "carina-rs-state".to_string(),
     }];
 
@@ -470,11 +473,11 @@ fn resolve_data_source_refs_replaces_resource_ref_with_concrete_value() {
     let identity_store_id = "d-9067c29a4b";
 
     // Managed resource with a binding — phase 1 would have refreshed it.
-    let mut sso = Resource::with_provider("awscc", "sso.Instance", "carina-rs");
+    let mut sso = Resource::with_provider("awscc", "sso.Instance", "carina-rs", None);
     sso.binding = Some("sso".to_string());
 
     // Data source referencing `sso.identity_store_id`.
-    let mut mizzy = Resource::with_provider("aws", "identitystore.user", "mizzy");
+    let mut mizzy = Resource::with_provider("aws", "identitystore.user", "mizzy", None);
     mizzy.kind = ResourceKind::DataSource;
     mizzy.attributes.insert(
         "identity_store_id".to_string(),
@@ -1290,7 +1293,7 @@ mod read_with_retry_identifier_tests {
     #[tokio::test]
     async fn read_with_retry_short_circuits_when_identifier_is_none() {
         let provider = RecordingProvider::new();
-        let id = ResourceId::with_provider("awscc", "iam.Role", "fresh");
+        let id = ResourceId::with_provider("awscc", "iam.Role", "fresh", None);
 
         let state = read_with_retry(&provider, &id, None).await.unwrap();
 
@@ -1309,7 +1312,7 @@ mod read_with_retry_identifier_tests {
     #[tokio::test]
     async fn read_with_retry_forwards_when_identifier_is_some() {
         let provider = RecordingProvider::new();
-        let id = ResourceId::with_provider("awscc", "iam.Role", "existing");
+        let id = ResourceId::with_provider("awscc", "iam.Role", "existing", None);
 
         let _state = read_with_retry(&provider, &id, Some("AROABC123"))
             .await

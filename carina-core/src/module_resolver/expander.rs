@@ -193,11 +193,7 @@ impl ModuleResolver<'_> {
             // story (#2516).
             if let ResourceName::Bound(name) = &new_resource.id.name {
                 let new_name = format!("{}.{}", instance_prefix, name);
-                new_resource.id = ResourceId::with_provider(
-                    &new_resource.id.provider,
-                    &new_resource.id.resource_type,
-                    new_name,
-                );
+                new_resource.id.set_name(new_name);
             }
 
             // Rewrite binding with instance path (dot-separated)
@@ -580,7 +576,7 @@ pub fn reconcile_anonymous_module_instances(
         if let Some(&target) = prefix_remap.get(&(module.to_string(), simhash)) {
             let new_prefix = format!("{}_{:016x}", module, target);
             let new_name = format!("{}.{}", new_prefix, rest);
-            r.id = ResourceId::with_provider(&r.id.provider, &r.id.resource_type, new_name.clone());
+            r.id.set_name(new_name);
             if let Some(ref binding) = r.binding
                 && let Some((_, binding_rest)) = split_instance_prefix(binding)
             {

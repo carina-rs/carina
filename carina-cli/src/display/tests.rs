@@ -1258,7 +1258,7 @@ fn test_resolved_ref_loses_dependency_for_tree_nesting() {
 #[test]
 fn format_effect_delete_uses_binding_name() {
     let effect = Effect::Delete {
-        id: ResourceId::with_provider("awscc", "ec2.Vpc", "ec2_vpc_fb75c929"),
+        id: ResourceId::with_provider("awscc", "ec2.Vpc", "ec2_vpc_fb75c929", None),
         identifier: "vpc-12345".to_string(),
         directives: Directives::default(),
         binding: Some("my_vpc".to_string()),
@@ -1271,7 +1271,7 @@ fn format_effect_delete_uses_binding_name() {
 #[test]
 fn format_effect_delete_falls_back_to_id_name() {
     let effect = Effect::Delete {
-        id: ResourceId::with_provider("awscc", "ec2.Vpc", "ec2_vpc_fb75c929"),
+        id: ResourceId::with_provider("awscc", "ec2.Vpc", "ec2_vpc_fb75c929", None),
         identifier: "vpc-12345".to_string(),
         directives: Directives::default(),
         binding: None,
@@ -1290,14 +1290,14 @@ fn format_effect_delete_falls_back_to_id_name() {
 #[test]
 fn format_effect_create_separates_type_and_name_with_space() {
     let mut r = Resource::new("s3.Bucket", "state_bucket");
-    r.id = ResourceId::with_provider("aws", "s3.Bucket", "state_bucket");
+    r.id = ResourceId::with_provider("aws", "s3.Bucket", "state_bucket", None);
     let effect = Effect::Create(r);
     assert_eq!(format_effect(&effect), "Create aws.s3.Bucket state_bucket");
 }
 
 #[test]
 fn format_effect_update_separates_type_and_name_with_space() {
-    let id = ResourceId::with_provider("awscc", "iam.Role", "bs.bootstrap.role");
+    let id = ResourceId::with_provider("awscc", "iam.Role", "bs.bootstrap.role", None);
     let mut to = Resource::new("iam.Role", "bs.bootstrap.role");
     to.id = id.clone();
     let effect = Effect::Update {
@@ -1306,6 +1306,7 @@ fn format_effect_update_separates_type_and_name_with_space() {
             "awscc",
             "iam.Role",
             "bs.bootstrap.role",
+            None,
         ))),
         to,
         changed_attributes: Vec::new(),
@@ -1318,13 +1319,13 @@ fn format_effect_update_separates_type_and_name_with_space() {
 
 #[test]
 fn format_effect_replace_separates_type_and_name_with_space() {
-    let id = ResourceId::with_provider("awscc", "ec2.Vpc", "vpc");
+    let id = ResourceId::with_provider("awscc", "ec2.Vpc", "vpc", None);
     let mut to = Resource::new("ec2.Vpc", "vpc");
     to.id = id.clone();
     let effect = Effect::Replace {
         id,
         from: Box::new(State::not_found(ResourceId::with_provider(
-            "awscc", "ec2.Vpc", "vpc",
+            "awscc", "ec2.Vpc", "vpc", None,
         ))),
         to,
         directives: Directives::default(),
@@ -1339,7 +1340,7 @@ fn format_effect_replace_separates_type_and_name_with_space() {
 #[test]
 fn format_effect_import_separates_type_and_name_with_space() {
     let effect = Effect::Import {
-        id: ResourceId::with_provider("aws", "s3.Bucket", "logs"),
+        id: ResourceId::with_provider("aws", "s3.Bucket", "logs", None),
         identifier: "my-logs-bucket".to_string(),
     };
     assert_eq!(
@@ -1351,7 +1352,7 @@ fn format_effect_import_separates_type_and_name_with_space() {
 #[test]
 fn format_effect_remove_separates_type_and_name_with_space() {
     let effect = Effect::Remove {
-        id: ResourceId::with_provider("awscc", "ec2.Vpc", "old_vpc"),
+        id: ResourceId::with_provider("awscc", "ec2.Vpc", "old_vpc", None),
     };
     assert_eq!(
         format_effect(&effect),
@@ -1362,8 +1363,8 @@ fn format_effect_remove_separates_type_and_name_with_space() {
 #[test]
 fn format_effect_move_separates_type_and_name_with_space() {
     let effect = Effect::Move {
-        from: ResourceId::with_provider("awscc", "ec2.Vpc", "vpc_a"),
-        to: ResourceId::with_provider("awscc", "ec2.Vpc", "vpc_b"),
+        from: ResourceId::with_provider("awscc", "ec2.Vpc", "vpc_a", None),
+        to: ResourceId::with_provider("awscc", "ec2.Vpc", "vpc_b", None),
     };
     assert_eq!(
         format_effect(&effect),

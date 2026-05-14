@@ -1129,7 +1129,7 @@ mod tests {
         // degrading to `NonInferableBinding`.
         use crate::parser::UpstreamState;
         use crate::resource::Resource;
-        let resource = Resource::with_provider("awscc", "ec2.Vpc", "main").with_binding("x");
+        let resource = Resource::with_provider("awscc", "ec2.Vpc", "main", None).with_binding("x");
         let upstream = UpstreamState {
             binding: "x".to_string(),
             source: std::path::PathBuf::from("../other"),
@@ -1247,7 +1247,7 @@ mod tests {
     #[test]
     fn apply_inference_fills_inferable_export_with_inferred_type() {
         let mut parsed = crate::parser::ParsedFile::default();
-        let res = crate::resource::Resource::with_provider("awscc", "ec2.Vpc", "main")
+        let res = crate::resource::Resource::with_provider("awscc", "ec2.Vpc", "main", None)
             .with_binding("main");
         parsed.resources.push(res); // allow: direct — fixture test inspection
         parsed.export_params.push(crate::parser::ParsedExportParam {
@@ -1331,6 +1331,7 @@ mod tests {
             "awscc",
             "ec2.Vpc",
             "github_actions_carina.role",
+            None,
         )
         .with_binding("github_actions_carina.role");
         parsed.resources.push(role); // allow: direct — fixture test inspection
