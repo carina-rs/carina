@@ -2582,3 +2582,133 @@ fn validate_type_expr_value_skips_value_unknown() {
     assert!(super::validate_type_expr_value(&TypeExpr::String, &upstream, &cfg).is_none());
     assert!(super::validate_type_expr_value(&struct_ty, &upstream, &cfg).is_none());
 }
+
+/// carina#3028: when a `ResourceRef` chains `[idx]` followed by
+/// `.field`, the type checker must narrow the schema type through
+/// each subscript (`List<T> → T`, `Map<_,V> → V`) before walking the
+/// following field segments. Pre-fix the checker compared the whole
+/// `List<Struct>` against the receiver `String`, ignoring the path
+/// entirely past `binding.attribute`.
+#[test]
+fn ref_with_chained_subscript_then_field_narrows_through_list() {
+    use crate::resource::{AccessPath, PathSegment, Subscript, Value};
+    use crate::schema::StructField;
+
+    let mut schemas = SchemaRegistry::new();
+    // `aws.acm.Certificate` exposes `domain_validation_options:
+    // List<Struct{resource_record_name: String, ...}>`.
+    schemas.insert(
+        "aws",
+        make_schema(
+            "acm.Certificate",
+            vec![(
+                "domain_validation_options",
+                AttributeType::List {
+                    inner: Box::new(AttributeType::Struct {
+                        name: "DomainValidationOption".to_string(),
+                        fields: vec![
+                            StructField::new("resource_record_name", AttributeType::String),
+                            StructField::new("resource_record_value", AttributeType::String),
+                        ],
+                    }),
+                    ordered: true,
+                },
+            )],
+        ),
+    );
+    // `aws.route53.RecordSet.name` is a plain String.
+    schemas.insert(
+        "aws",
+        make_schema("route53.RecordSet", vec![("name", AttributeType::String)]),
+    );
+
+    let cert = Resource::with_provider("aws", "acm.Certificate", "main").with_binding("cert");
+
+    // `cert.domain_validation_options[0].resource_record_name`
+    let path = AccessPath::with_segments(
+        "cert",
+        "domain_validation_options",
+        vec![
+            PathSegment::Subscript {
+                index: Subscript::Int { index: 0 },
+            },
+            PathSegment::Field {
+                name: "resource_record_name".to_string(),
+            },
+        ],
+    );
+    let record = Resource::with_provider("aws", "route53.RecordSet", "validation").with_attribute(
+        "name",
+        Value::Deferred(crate::resource::DeferredValue::ResourceRef { path }),
+    );
+
+    let mut parsed = empty_parsed();
+    parsed.resources.push(cert); // allow: direct — fixture test inspection
+    parsed.resources.push(record); // allow: direct — fixture test inspection
+    let result = validate_resource_ref_types(&parsed, &schemas, &HashSet::new());
+    assert!(
+        result.is_ok(),
+        "chained subscript-then-field should narrow List<Struct> → Struct → String, got: {:?}",
+        result.err(),
+    );
+}
+
+/// Sibling check for carina#3028: when the narrowed leaf is itself
+/// incompatible with the receiver, the checker must still flag it —
+/// narrowing is "honest" about the path, not a silent acceptance.
+#[test]
+fn ref_with_chained_subscript_then_field_rejects_real_mismatch() {
+    use crate::resource::{AccessPath, PathSegment, Subscript, Value};
+    use crate::schema::StructField;
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        make_schema(
+            "acm.Certificate",
+            vec![(
+                "domain_validation_options",
+                AttributeType::List {
+                    inner: Box::new(AttributeType::Struct {
+                        name: "DomainValidationOption".to_string(),
+                        fields: vec![StructField::new("rotation_count", AttributeType::Int)],
+                    }),
+                    ordered: true,
+                },
+            )],
+        ),
+    );
+    // Receiver `name` is String — the chained access yields Int.
+    schemas.insert(
+        "aws",
+        make_schema("route53.RecordSet", vec![("name", AttributeType::String)]),
+    );
+
+    let cert = Resource::with_provider("aws", "acm.Certificate", "main").with_binding("cert");
+
+    let path = AccessPath::with_segments(
+        "cert",
+        "domain_validation_options",
+        vec![
+            PathSegment::Subscript {
+                index: Subscript::Int { index: 0 },
+            },
+            PathSegment::Field {
+                name: "rotation_count".to_string(),
+            },
+        ],
+    );
+    let record = Resource::with_provider("aws", "route53.RecordSet", "validation").with_attribute(
+        "name",
+        Value::Deferred(crate::resource::DeferredValue::ResourceRef { path }),
+    );
+
+    let mut parsed = empty_parsed();
+    parsed.resources.push(cert); // allow: direct — fixture test inspection
+    parsed.resources.push(record); // allow: direct — fixture test inspection
+    let err = validate_resource_ref_types(&parsed, &schemas, &HashSet::new()).unwrap_err();
+    assert!(
+        err.contains("expected String"),
+        "expected real Int→String mismatch to be flagged, got: {err}"
+    );
+}

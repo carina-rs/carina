@@ -116,10 +116,12 @@ pub fn validate_resource_ref_types<E>(
                 continue;
             }
 
-            let (ref_binding, ref_attr) = match attr_value {
-                Value::Deferred(DeferredValue::ResourceRef { path }) => {
-                    (path.binding().to_string(), path.attribute().to_string())
-                }
+            let (ref_binding, ref_attr, ref_path) = match attr_value {
+                Value::Deferred(DeferredValue::ResourceRef { path }) => (
+                    path.binding().to_string(),
+                    path.attribute().to_string(),
+                    path,
+                ),
                 _ => continue,
             };
 
@@ -161,14 +163,26 @@ pub fn validate_resource_ref_types<E>(
                 ));
                 continue;
             };
-            let ref_type_name = ref_attr_schema.attr_type.type_name();
 
-            // Directional check: source (the referenced attribute) must be
-            // assignable to the sink (the current resource's attribute).
-            if ref_attr_schema
-                .attr_type
-                .is_assignable_to(&attr_schema.attr_type)
-            {
+            // Narrow through the path's segments — `[idx]` peels one
+            // `List<T>` / `Map<_,V>` layer, `.field` descends a
+            // `Struct`. carina#3028. When a segment doesn't fit the
+            // shape (e.g. `.x` against a scalar), skip the type check
+            // rather than emit a noisy mismatch: schema-level
+            // attribute validation already reports unknown fields and
+            // resolver-time evaluation catches the shape error with
+            // location context.
+            let Some(narrowed) =
+                narrow_attribute_type(&ref_attr_schema.attr_type, ref_path.segments())
+            else {
+                continue;
+            };
+            let ref_type_name = narrowed.type_name();
+
+            // Directional check: source (the referenced attribute, post
+            // path narrowing) must be assignable to the sink (the
+            // current resource's attribute).
+            if narrowed.is_assignable_to(&attr_schema.attr_type) {
                 continue;
             }
 
@@ -1062,6 +1076,54 @@ pub(crate) fn narrow_type_expr(
                     index: Subscript::Str { .. },
                 },
             ) => *inner,
+            _ => return None,
+        };
+    }
+    Some(current)
+}
+
+/// Narrow `start` (a schema [`AttributeType`]) through an
+/// [`AccessPath`](crate::resource::AccessPath)'s ordered segments — a
+/// free mix of `.field` (descend into a `Struct`) and `[idx]` (peel one
+/// `List<T>` / `Map<_, V>` layer) continuations (carina#3025).
+///
+/// Returns `None` when any segment doesn't fit the container shape at
+/// its position (`.x` against a scalar, `[0]` against a `Struct`, …).
+/// The caller decides whether that's a hard error or — when the path
+/// is "permissive" (chained access into a shape the checker doesn't
+/// yet narrow precisely) — silent.
+///
+/// Borrows so deep paths don't pay an O(depth) clone chain. Used by
+/// `validate_resource_ref_types` to honour the carina#3025 segments
+/// representation when type-checking cross-resource references
+/// (carina#3028).
+pub(crate) fn narrow_attribute_type<'a>(
+    start: &'a AttributeType,
+    segments: &[crate::resource::PathSegment],
+) -> Option<&'a AttributeType> {
+    use crate::resource::{PathSegment, Subscript};
+    let mut current = start;
+    for seg in segments {
+        current = match (seg, current) {
+            (PathSegment::Field { name }, AttributeType::Struct { fields, .. }) => fields
+                .iter()
+                .find(|f| f.name == *name)
+                .map(|f| &f.field_type)?,
+            // Dot-form key access against a `map(_, V)` projects to
+            // `V`, mirroring the resolver's behaviour (carina#2447).
+            (PathSegment::Field { .. }, AttributeType::Map { value, .. }) => value.as_ref(),
+            (
+                PathSegment::Subscript {
+                    index: Subscript::Int { .. },
+                },
+                AttributeType::List { inner, .. },
+            ) => inner.as_ref(),
+            (
+                PathSegment::Subscript {
+                    index: Subscript::Str { .. },
+                },
+                AttributeType::Map { value, .. },
+            ) => value.as_ref(),
             _ => return None,
         };
     }
