@@ -4,7 +4,7 @@ use crate::provider::{
     BoxFuture, CreateRequest, DeleteRequest, ProviderError, ProviderResult, ReadRequest,
     UpdateRequest,
 };
-use crate::resource::{ConcreteValue, Directives, Resource, Value};
+use crate::resource::{ConcreteValue, DeferredValue, Directives, Resource, Value};
 use parallel::{build_dependency_levels, build_dependency_map};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -20,6 +20,10 @@ struct MockProvider {
     read_results: Mutex<Vec<ProviderResult<State>>>,
     /// Records calls in order: ("create"|"delete"|"update"|"read", resource_id_string)
     call_log: Arc<Mutex<Vec<(String, String)>>>,
+    /// Resources passed in to `create()` in call order — lets a test
+    /// assert that the executor handed the provider a fully-resolved
+    /// resource (no remaining `Value::Deferred(ResourceRef)` etc.).
+    create_resources: Arc<Mutex<Vec<Resource>>>,
 }
 
 impl MockProvider {
@@ -30,6 +34,7 @@ impl MockProvider {
             update_results: Mutex::new(Vec::new()),
             read_results: Mutex::new(Vec::new()),
             call_log: Arc::new(Mutex::new(Vec::new())),
+            create_resources: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -53,6 +58,10 @@ impl MockProvider {
 
     fn calls(&self) -> Vec<(String, String)> {
         self.call_log.lock().unwrap().clone()
+    }
+
+    fn captured_create_resources(&self) -> Vec<Resource> {
+        self.create_resources.lock().unwrap().clone()
     }
 }
 
@@ -83,13 +92,14 @@ impl Provider for MockProvider {
     fn create(
         &self,
         id: &ResourceId,
-        _request: CreateRequest,
+        request: CreateRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id_str = id.to_string();
         self.call_log
             .lock()
             .unwrap()
             .push(("create".to_string(), id_str));
+        self.create_resources.lock().unwrap().push(request.resource);
         let result = self.create_results.lock().unwrap().remove(0);
         Box::pin(async move { result })
     }
@@ -215,7 +225,17 @@ fn make_resource(binding: &str, deps: &[&str]) -> Resource {
 }
 
 fn ok_state(id: &ResourceId) -> State {
-    State::existing(id.clone(), HashMap::new()).with_identifier("id-123")
+    // The `id` attribute mirrors what a real provider's read-back
+    // publishes after Create — without it, dependents created via
+    // `make_resource(name, &["dep"])` (which writes `ref_dep =
+    // ResourceRef(dep, "id")`) cannot resolve their references and
+    // post-#3032 the executor rejects them at the apply seam.
+    let mut attrs = HashMap::new();
+    attrs.insert(
+        "id".to_string(),
+        Value::Concrete(ConcreteValue::String("id-123".to_string())),
+    );
+    State::existing(id.clone(), attrs).with_identifier("id-123")
 }
 
 // -----------------------------------------------------------------------
@@ -889,7 +909,16 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
                 log.lock()
                     .unwrap()
                     .push(("create".to_string(), name, Instant::now()));
-                Ok(State::existing(id_clone, HashMap::new()).with_identifier("id-123"))
+                // Publish `id` so dependents created via
+                // `make_resource(name, &["dep"])` resolve their
+                // `ResourceRef(parent, "id")` (post-#3032 the executor
+                // rejects unresolved refs at the apply seam).
+                let mut attrs = HashMap::new();
+                attrs.insert(
+                    "id".to_string(),
+                    Value::Concrete(ConcreteValue::String("id-123".to_string())),
+                );
+                Ok(State::existing(id_clone, attrs).with_identifier("id-123"))
             })
         }
 
@@ -983,11 +1012,22 @@ async fn test_waiting_events_emitted_for_dependent_effects() {
     // Push create results for both resources
     let a_id = ResourceId::new("test", "a");
     let c_id = ResourceId::new("test", "c");
+    // Publish `id` in state.attributes so dependents resolve their
+    // `ResourceRef(parent, "id")` refs (post-#3032 the executor
+    // rejects unresolved refs at the apply seam).
+    let id_attr = |val: &str| -> HashMap<String, Value> {
+        let mut m = HashMap::new();
+        m.insert(
+            "id".to_string(),
+            Value::Concrete(ConcreteValue::String(val.to_string())),
+        );
+        m
+    };
     provider.push_create(Ok(
-        State::existing(a_id, HashMap::new()).with_identifier("id-a")
+        State::existing(a_id, id_attr("id-a")).with_identifier("id-a")
     ));
     provider.push_create(Ok(
-        State::existing(c_id, HashMap::new()).with_identifier("id-c")
+        State::existing(c_id, id_attr("id-c")).with_identifier("id-c")
     ));
     let result = execute_plan(&provider, input, &observer).await;
 
@@ -1680,5 +1720,148 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
     assert!(
         result.applied_states.contains_key(&synthetic),
         "wait should register its captured State under the __wait synthetic id"
+    );
+}
+
+/// carina#3032 — when a chained `[idx].field` access cannot be
+/// resolved at apply time (because the upstream resource has not
+/// published the referenced attribute yet — e.g. ACM
+/// `domain_validation_options` is populated asynchronously after
+/// RequestCertificate), the executor must fail with an actionable
+/// error that names the unresolved reference, **not** silently pass
+/// the literal `ResourceRef` to the provider where it surfaces as
+/// a generic "cannot serialize at WASM provider boundary" error.
+///
+/// Pre-fix: `resolve_ref_value` bails out on the missing
+/// `domain_validation_options` key (resolver.rs:254 catch-all),
+/// returns the original `ResourceRef` unchanged, the dependent's
+/// `resource_records` reaches `Provider::create()` as
+/// `Value::Concrete(List([Value::Deferred(ResourceRef { … })]))`,
+/// and the WASM serializer's `core_to_wit_value` rejects it with
+/// the unhelpful contract message.
+///
+/// Post-fix: the executor's `resolve_resource` rejects any value
+/// still containing a `ResourceRef` / `BindingRef` after resolution,
+/// with an error that points at the unresolved attribute path and
+/// suggests using `wait` to synchronize on the upstream attribute.
+#[tokio::test]
+async fn test_chained_index_then_field_unresolved_at_apply_fails_with_clear_error() {
+    use crate::resource::{AccessPath, ConcreteValue, PathSegment, Subscript};
+
+    let provider = MockProvider::new();
+
+    // The cert resource — no DSL attrs that reference DVO; the
+    // attribute would be populated only by the create's read-back
+    // state. Mirror the real ACM Certificate's user-facing shape.
+    let cert = {
+        let mut r = Resource::new("test", "cert");
+        r.binding = Some("cert".to_string());
+        r.set_attr(
+            "domain_name",
+            Value::Concrete(ConcreteValue::String("example.com".to_string())),
+        );
+        r
+    };
+    let cert_id = cert.id.clone();
+
+    // The dependent resource mirrors the failing route53 RecordSet
+    // attributes from the issue:
+    //   resource_records = [cert.domain_validation_options[0].resource_record_value]
+    let record = {
+        let mut r = Resource::new("test", "record");
+        r.binding = Some("record".to_string());
+        r.dependency_bindings = ["cert".to_string()].into_iter().collect();
+        let value_path = AccessPath::with_segments(
+            "cert",
+            "domain_validation_options",
+            vec![
+                PathSegment::Subscript {
+                    index: Subscript::Int { index: 0 },
+                },
+                PathSegment::Field {
+                    name: "resource_record_value".to_string(),
+                },
+            ],
+        );
+        r.set_attr(
+            "resource_records",
+            Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
+                DeferredValue::ResourceRef { path: value_path },
+            )])),
+        );
+        r
+    };
+    let record_id = record.id.clone();
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(cert));
+    plan.add(Effect::Create(record));
+
+    // Mirror the AWS RequestCertificate read-back race: the DVO list
+    // is populated asynchronously by ACM after RequestCertificate
+    // returns, so the create read-back surfaces zero DVO entries
+    // and the AWS provider's `read_acm_certificate` *omits* the
+    // `domain_validation_options` key entirely
+    // (carina-provider-aws::services::acm::certificate.rs:210
+    // `if !dvs.is_empty()`).
+    provider.push_create(Ok(
+        State::existing(cert_id.clone(), HashMap::new()).with_identifier("acm-cert-id")
+    ));
+    // Reserve a create slot for the record in case the executor
+    // attempts it before failing — pre-fix it would have, and the
+    // mock would otherwise panic-on-empty-queue masking the actual
+    // bug.
+    provider.push_create(Ok(
+        State::existing(record_id.clone(), HashMap::new()).with_identifier("rrset-id")
+    ));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+    };
+
+    let observer = MockObserver::new();
+    let result = execute_plan(&provider, input, &observer).await;
+
+    // Cert succeeds; the record fails at apply-time resolution
+    // *before* reaching the provider — no `create` call for the
+    // record should be recorded.
+    assert_eq!(result.success_count, 1, "events: {:?}", observer.events());
+    assert_eq!(result.failure_count, 1, "events: {:?}", observer.events());
+
+    let captured = provider.captured_create_resources();
+    assert!(
+        captured.iter().all(|r| r.id != record_id),
+        "record resource must NOT be passed to create (resolution \
+         should fail upstream); captured: {:?}",
+        captured.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+    );
+
+    // The error message must name the unresolved reference path so
+    // the user can fix it (typically by adding a `wait` block on the
+    // upstream attribute).
+    let failed_event = observer
+        .events()
+        .iter()
+        .find(|e| e.starts_with("failed:") && e.contains("record"))
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a `failed:` event for the record resource; \
+                 got events: {:?}",
+                observer.events()
+            )
+        });
+    assert!(
+        failed_event.contains("cert.domain_validation_options"),
+        "error must name the unresolved attribute path so the user \
+         knows what to wait on; got: {failed_event}",
+    );
+    assert!(
+        failed_event.contains("wait"),
+        "error must suggest `wait` as the synchronization mechanism; \
+         got: {failed_event}",
     );
 }
