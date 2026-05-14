@@ -235,6 +235,12 @@ pub fn validate_and_resolve_errors_with_factories(
     }
 
     // Check for declared providers whose plugins failed to load.
+    // Named instances (`!is_default`) deliberately omit `source` —
+    // the parser enforces that `source` is a kind-level property
+    // (carina#3023). They inherit the kind default's plugin, so
+    // they only matter to this check when the *kind default* could
+    // not be loaded, which is already reported via the
+    // `factories().iter().any(...)` lookup on the kind's name.
     if !skip_resource_validation {
         for provider in &parsed.providers {
             let loaded = ctx.factories().iter().any(|f| f.name() == provider.name);
@@ -243,7 +249,7 @@ pub fn validate_and_resolve_errors_with_factories(
             }
             if let Some(reason) = load_errors.get(&provider.name) {
                 errors.push(AppError::Validation(reason.clone()));
-            } else if provider.source.is_none() {
+            } else if provider.is_default && provider.source.is_none() {
                 errors.push(AppError::Validation(missing_provider_source_message(
                     &provider.name,
                 )));
