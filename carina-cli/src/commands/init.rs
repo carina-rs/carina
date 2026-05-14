@@ -30,11 +30,17 @@ pub fn run_init(path: &Path, upgrade: bool, locked: bool) -> Result<(), String> 
     )
     .map_err(|e| format!("Failed to load configuration: {e}"))?;
 
+    // `source` is a kind-level property — only the kind's default
+    // instance carries it. Named instances declared as
+    // `let <name> = provider <kind> { ... }` cannot set it (the
+    // parser rejects them). Restrict the pre-resolution check to
+    // default instances so a named instance's deliberate absence
+    // of `source` does not surface as a user error (carina#3023).
     let missing_source: Vec<String> = loaded
         .parsed
         .providers
         .iter()
-        .filter(|p| p.source.is_none())
+        .filter(|p| p.is_default && p.source.is_none())
         .map(|p| crate::commands::missing_provider_source_message(&p.name))
         .collect();
     if !missing_source.is_empty() {

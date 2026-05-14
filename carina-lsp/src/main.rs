@@ -47,11 +47,23 @@ fn build_factories(providers: &[(PathBuf, ProviderConfig)]) -> FactoryBuildResul
         let source = match &config.source {
             Some(s) => s,
             None => {
-                errors.insert(
-                    config.name.clone(),
-                    "no source configured. Add `source = 'github.com/...'` to the provider block."
-                        .to_string(),
-                );
+                // Named provider instances (`let <name> = provider <kind>
+                // { ... }`) inherit `source` from the kind's default;
+                // the parser forbids them from setting it themselves.
+                // Only the kind default's deliberate absence of
+                // `source` is a real user error (carina#3023). The
+                // `fingerprint` push stays outside this gate so
+                // every config in `providers` produces exactly one
+                // entry — `probe_install_fingerprint` iterates the
+                // same slice unconditionally, and the LSP's
+                // drift-poll compares the two fingerprint vectors
+                // for equality.
+                if config.is_default {
+                    errors.insert(
+                        config.name.clone(),
+                        "no source configured. Add `source = 'github.com/...'` to the provider block.".to_string(),
+                    );
+                }
                 fingerprint.push((config.name.clone(), false));
                 continue;
             }
@@ -153,4 +165,69 @@ async fn main() {
         )
     });
     Server::new(stdin, stdout, socket).serve(service).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use carina_core::parser::ProviderConfig;
+    use indexmap::IndexMap;
+    use std::path::PathBuf;
+
+    fn cfg(
+        name: &str,
+        source: Option<&str>,
+        is_default: bool,
+        binding: Option<&str>,
+    ) -> (PathBuf, ProviderConfig) {
+        (
+            PathBuf::from("/tmp"),
+            ProviderConfig {
+                name: name.to_string(),
+                attributes: IndexMap::new(),
+                default_tags: IndexMap::new(),
+                source: source.map(String::from),
+                version: None,
+                revision: None,
+                unresolved_attributes: IndexMap::new(),
+                binding: binding.map(String::from),
+                is_default,
+            },
+        )
+    }
+
+    /// carina#3023: when a named provider instance sits beside the
+    /// kind default, `build_factories` must produce a fingerprint
+    /// entry for *every* config — same length as the input — so the
+    /// LSP's drift-poll comparison against `probe_install_fingerprint`
+    /// (which iterates every config unconditionally) keeps agreeing
+    /// when nothing changed. Previously the fingerprint push was
+    /// gated behind the missing-source error path; when we silenced
+    /// that error for named instances, the push got silenced with
+    /// it and the poll detected fake drift every tick.
+    #[test]
+    fn build_factories_fingerprint_length_matches_configs_length() {
+        let providers = vec![
+            cfg("aws", Some("file:///nonexistent/fake.wasm"), true, None),
+            cfg("aws", None, false, Some("us")),
+        ];
+        let (_factories, errors, fingerprint) = build_factories(&providers);
+        assert_eq!(
+            fingerprint.len(),
+            providers.len(),
+            "fingerprint must emit one entry per config (including named instances); \
+             otherwise the drift-poll mismatch causes a perpetual rebuild loop. carina#3023."
+        );
+        // Sanity: named instance does not surface the kind-level
+        // "no source configured" error, since the parser forbids it
+        // from setting `source` in the first place.
+        assert!(
+            !errors
+                .get("aws")
+                .is_some_and(|m| m.contains("no source configured")),
+            "named instance must not trigger the kind-level missing-source diagnostic. \
+             carina#3023. errors: {:?}",
+            errors
+        );
+    }
 }
