@@ -1216,7 +1216,7 @@ impl DiagnosticEngine {
             // comparison rather than false-flag against the head's
             // outer type.
             (_, Value::Deferred(DeferredValue::ResourceRef { path }))
-                if path.field_path().is_empty() && path.subscripts().is_empty() =>
+                if path.segments().is_empty() =>
             {
                 self.check_cross_file_ref_type(
                     type_expr,

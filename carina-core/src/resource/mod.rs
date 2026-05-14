@@ -229,7 +229,10 @@ impl std::fmt::Display for ResourceId {
 /// reject `[0]` against a `map(_)` export and `["k"]` against a
 /// `list(_)` export with type-aware diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+// `index_kind` (not `kind`) so the tag cannot collide with the
+// `PathSegment` discriminator when a `Subscript` is `#[serde(flatten)]`-ed
+// into a `PathSegment::Subscript` (carina#3025).
+#[serde(tag = "index_kind", rename_all = "snake_case")]
 pub enum Subscript {
     /// Integer subscript: `[0]`. Valid against `list(_)` exports.
     Int { index: i64 },
@@ -330,8 +333,13 @@ impl AccessPath {
         field_path: Vec<String>,
         subscripts: Vec<Subscript>,
     ) -> Self {
-        let mut segments: Vec<PathSegment> = Vec::with_capacity(field_path.len() + subscripts.len());
-        segments.extend(field_path.into_iter().map(|name| PathSegment::Field { name }));
+        let mut segments: Vec<PathSegment> =
+            Vec::with_capacity(field_path.len() + subscripts.len());
+        segments.extend(
+            field_path
+                .into_iter()
+                .map(|name| PathSegment::Field { name }),
+        );
         segments.extend(
             subscripts
                 .into_iter()
@@ -380,6 +388,67 @@ impl AccessPath {
     /// for a top-level attribute reference. carina#3025.
     pub fn segments(&self) -> &[PathSegment] {
         &self.segments
+    }
+
+    /// Returns the leading run of `.field` segments before the first
+    /// `[idx]` subscript. For `cert.foo.bar[0].baz` this yields
+    /// `["foo", "bar"]`; for `cert.foo[0].bar` it yields `["foo"]`;
+    /// for `cert.foo[0]` it yields `["foo"]`; for `cert.foo` it yields
+    /// `["foo"]`. Used by cross-directory shape checkers that walk
+    /// dot-form access against an `UpstreamExports` type expression.
+    pub fn leading_field_path(&self) -> Vec<String> {
+        self.segments
+            .iter()
+            .map_while(|seg| match seg {
+                PathSegment::Field { name } => Some(name.clone()),
+                PathSegment::Subscript { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Returns the trailing run of `[idx]` subscripts after the leading
+    /// `.field` prefix. For `cert.foo.bar[0]["k"]` this yields the two
+    /// subscripts; for `cert.foo[0].bar` it yields *empty* (the
+    /// chained-access case where a `.field` follows a subscript — the
+    /// trailing run terminates because subscripts aren't contiguous at
+    /// the end). carina#3025.
+    pub fn trailing_subscripts(&self) -> Vec<Subscript> {
+        // Walk from the end; stop at the first Field encountered (going
+        // backwards). The resulting slice is reversed to restore order.
+        let mut out: Vec<Subscript> = Vec::new();
+        for seg in self.segments.iter().rev() {
+            match seg {
+                PathSegment::Subscript { index } => out.push(index.clone()),
+                PathSegment::Field { .. } => break,
+            }
+        }
+        out.reverse();
+        out
+    }
+
+    /// Returns `true` when the path's segment chain is the
+    /// "leading fields then trailing subscripts" shape — the
+    /// pre-carina#3025 grammar. Chained access (`cert.foo[0].bar`) is
+    /// the only shape that fails this check; cross-directory shape
+    /// checkers that don't yet understand chained walks can skip those
+    /// paths and let resolver-time errors surface instead.
+    pub fn is_simple_shape(&self) -> bool {
+        // Equivalent to: there is at most one transition from Field
+        // to Subscript in the chain.
+        let mut seen_subscript = false;
+        for seg in &self.segments {
+            match seg {
+                PathSegment::Field { .. } => {
+                    if seen_subscript {
+                        return false;
+                    }
+                }
+                PathSegment::Subscript { .. } => {
+                    seen_subscript = true;
+                }
+            }
+        }
+        true
     }
 
     /// Returns the path in source-form: `binding.attribute` followed by
@@ -916,10 +985,11 @@ impl Value {
         }
     }
 
-    /// If this is a `ResourceRef`, returns the field path.
-    pub fn ref_field_path(&self) -> Option<&[String]> {
+    /// If this is a `ResourceRef`, returns the ordered path segments
+    /// past `binding.attribute`. carina#3025.
+    pub fn ref_segments(&self) -> Option<&[PathSegment]> {
         match self {
-            Value::Deferred(DeferredValue::ResourceRef { path }) => Some(path.field_path()),
+            Value::Deferred(DeferredValue::ResourceRef { path }) => Some(path.segments()),
             _ => None,
         }
     }

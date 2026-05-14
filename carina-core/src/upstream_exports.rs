@@ -709,7 +709,7 @@ fn check_resource_ref_at_position(
     else {
         return;
     };
-    let Some(narrowed) = narrow_type_expr(export_type, path.field_path(), path.subscripts()) else {
+    let Some(narrowed) = narrow_type_expr(export_type, path.segments()) else {
         // Kind mismatch through the access path — already reported by
         // `check_upstream_state_attribute_access_shapes` /
         // `check_upstream_state_subscript_shapes`. Skip to avoid
@@ -741,7 +741,7 @@ fn check_resource_ref_at_position(
     });
 }
 
-use crate::validation::{narrow_type_expr, walk_type_expr_path};
+use crate::validation::{narrow_type_expr, walk_type_expr_fields};
 
 /// A `for` expression iterates an `upstream_state` field whose declared
 /// export type doesn't match the binding pattern's expected shape:
@@ -1059,8 +1059,8 @@ fn visit_attribute_access(
     errors: &mut Vec<UpstreamAttributeAccessShapeError>,
 ) {
     value.visit_refs(&mut |path| {
-        let field_path = path.field_path();
-        if field_path.is_empty() {
+        let leading: Vec<String> = path.leading_field_path();
+        if leading.is_empty() {
             return;
         }
         let binding = path.binding();
@@ -1075,14 +1075,17 @@ fn visit_attribute_access(
         else {
             return;
         };
-        if let Err((mismatched_at, bad_segment)) = walk_type_expr_path(export_type, field_path) {
+        let walk_result = walk_type_expr_fields(export_type, &leading);
+        if let Err((mismatched_at, bad_segment)) = walk_result {
+            let mismatched_at = mismatched_at.clone();
+            let bad_segment = bad_segment.to_string();
             errors.push(UpstreamAttributeAccessShapeError {
                 location: location.to_string(),
                 binding: binding.to_string(),
                 field: attribute.to_string(),
-                field_path: field_path.to_vec(),
-                mismatched_at: mismatched_at.clone(),
-                bad_segment: bad_segment.to_string(),
+                field_path: leading,
+                mismatched_at,
+                bad_segment,
             });
         }
     });
@@ -1216,7 +1219,15 @@ fn visit_subscript_access(
     errors: &mut Vec<UpstreamSubscriptShapeError>,
 ) {
     value.visit_refs(&mut |path| {
-        let subscripts = path.subscripts();
+        // Chained access (`cert.foo[0].bar`) is not yet exercised by
+        // this checker — see #3025 for the planned segments-driven
+        // walker. Skip the path here; the resolver still surfaces
+        // typos at apply time and the simple-shape paths remain
+        // covered.
+        if !path.is_simple_shape() {
+            return;
+        }
+        let subscripts = path.trailing_subscripts();
         if subscripts.is_empty() {
             return;
         }
@@ -1235,14 +1246,14 @@ fn visit_subscript_access(
         // If the field path itself doesn't resolve, the
         // attribute-access check will already report it. Skip here so
         // we don't double-fire.
-        let field_path = path.field_path();
-        let Ok(at_field_end) = walk_type_expr_path(export_type, field_path) else {
+        let field_path: Vec<String> = path.leading_field_path();
+        let Ok(at_field_end) = walk_type_expr_fields(export_type, &field_path) else {
             return;
         };
         // Step through each subscript, descending into the element
         // type when it fits and emitting at the first kind mismatch.
         let mut current = at_field_end;
-        for sub in subscripts {
+        for sub in &subscripts {
             match (current, sub) {
                 (TypeExpr::List(inner), Subscript::Int { .. }) => {
                     current = inner.as_ref();
@@ -1255,7 +1266,7 @@ fn visit_subscript_access(
                         location: location.to_string(),
                         binding: binding.to_string(),
                         field: attribute.to_string(),
-                        field_path: field_path.to_vec(),
+                        field_path: field_path.clone(),
                         mismatched_at: mismatched_at.clone(),
                         bad_subscript: bad.clone(),
                     });

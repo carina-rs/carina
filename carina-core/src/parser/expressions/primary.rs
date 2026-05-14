@@ -12,7 +12,7 @@ use crate::parser::{
     ParseContext, ParseError, Rule, evaluate_user_function, extract_key_string, first_inner,
     is_static_value, next_pair, parse_block_contents, parse_expression, parse_expression_eval,
 };
-use crate::resource::{AccessPath, ConcreteValue, DeferredValue, Subscript, Value};
+use crate::resource::{AccessPath, ConcreteValue, DeferredValue, PathSegment, Subscript, Value};
 use indexmap::IndexMap;
 
 /// Decode a duration literal (`75min`, `1h`, `30s`) into integer
@@ -89,13 +89,14 @@ fn subscript_from_value(value: Value) -> Result<Subscript, ParseError> {
 }
 
 /// Lower a `namespaced_id` pair to its `EvalValue`, attaching any
-/// trailing subscripts collected by the caller (the `subscripted_id`
-/// arm). String-form enum shorthands like `aws.Region.ap_northeast_1`
-/// have no `AccessPath` to host subscripts — those reject outright.
+/// trailing path segments collected by the caller (the `subscripted_id`
+/// arm — a mix of `.field` and `[index]` continuations). String-form
+/// enum shorthands like `aws.Region.ap_northeast_1` have no
+/// `AccessPath` to host segments — those reject outright.
 fn parse_namespaced_id_value(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
-    subscripts: Vec<Subscript>,
+    trailing_segments: Vec<PathSegment>,
 ) -> Result<EvalValue, ParseError> {
     let full_str = pair.as_str();
     let parts: Vec<&str> = full_str.split('.').collect();
@@ -108,24 +109,28 @@ fn parse_namespaced_id_value(
         full_str
     );
 
-    let as_resource_ref = |subscripts: Vec<Subscript>| {
-        let path = AccessPath::with_fields_and_subscripts(
-            parts[0].to_string(),
-            parts[1].to_string(),
-            parts[2..].iter().map(|s| s.to_string()).collect(),
-            subscripts,
-        );
+    let as_resource_ref = |trailing_segments: Vec<PathSegment>| {
+        let mut segments: Vec<PathSegment> = parts[2..]
+            .iter()
+            .map(|s| PathSegment::Field {
+                name: (*s).to_string(),
+            })
+            .collect();
+        segments.extend(trailing_segments);
+        let path = AccessPath::with_segments(parts[0].to_string(), parts[1].to_string(), segments);
         EvalValue::from_value(Value::Deferred(DeferredValue::ResourceRef { path }))
     };
 
     if ctx.is_resource_binding(parts[0]) {
-        return Ok(as_resource_ref(subscripts));
+        return Ok(as_resource_ref(trailing_segments));
     }
 
-    // Subscripts (`a.b['k']`, `a.b[0]`) unambiguously mean binding
-    // access — no enum shorthand uses `[...]`. When the head is not a
-    // resource binding in this file, emit a structured `ResourceRef`
-    // and let `check_identifier_scope` flag genuine typos post-merge.
+    // Trailing segments (`a.b['k']`, `a.b[0]`, `a.b.c[0].d`)
+    // unambiguously mean binding access — no enum shorthand uses
+    // `[...]` and the parser only generates trailing path segments for
+    // `subscripted_id`. When the head is not a resource binding in this
+    // file, emit a structured `ResourceRef` and let
+    // `check_identifier_scope` flag genuine typos post-merge.
     //
     // Under the directory-aware parse pipeline (#2817), sibling-defined
     // bindings are seeded into `ctx.resource_bindings` so the early
@@ -136,8 +141,8 @@ fn parse_namespaced_id_value(
     // ID would fall through to the enum-shorthand `Value::Concrete(ConcreteValue::String)`
     // fallback below and silently mistype as a string. Originally added
     // for #2435.
-    if !subscripts.is_empty() {
-        return Ok(as_resource_ref(subscripts));
+    if !trailing_segments.is_empty() {
+        return Ok(as_resource_ref(trailing_segments));
     }
 
     if parts.len() == 2
@@ -239,23 +244,36 @@ pub(crate) fn parse_primary_eval(
         }
         Rule::namespaced_id => parse_namespaced_id_value(inner, ctx, Vec::new()),
         Rule::subscripted_id => {
-            // `binding.field[idx]` / `binding.field.subfield[idx]…` —
-            // the namespaced_id portion behaves like a plain
-            // namespaced_id (identifier shorthand or resource ref), and
-            // any trailing `[idx]` subscripts are folded onto the
-            // resulting `AccessPath`.
+            // `binding.field[idx]`, `binding.field.subfield[idx]…`,
+            // `binding.field[idx].subfield…` — the namespaced_id portion
+            // behaves like a plain namespaced_id (identifier shorthand
+            // or resource ref), and any trailing chain of `.field` /
+            // `[idx]` continuations is folded onto the resulting
+            // `AccessPath` as an ordered `Vec<PathSegment>` so source
+            // order is preserved (carina#3025).
             let mut parts = inner.into_inner();
             let head = next_pair(&mut parts, "namespaced_id", "subscripted_id")?;
-            let mut subscripts: Vec<Subscript> = Vec::new();
-            for index_pair in parts {
-                if !matches!(index_pair.as_rule(), Rule::index_access) {
-                    continue;
+            let mut segments: Vec<PathSegment> = Vec::new();
+            for pair in parts {
+                match pair.as_rule() {
+                    Rule::index_access => {
+                        let index_expr_pair =
+                            first_inner(pair, "index expression", "index access")?;
+                        let index_value = parse_expression(index_expr_pair, ctx)?;
+                        segments.push(PathSegment::Subscript {
+                            index: subscript_from_value(index_value)?,
+                        });
+                    }
+                    Rule::field_access => {
+                        let ident = first_inner(pair, "identifier", "field access")?;
+                        segments.push(PathSegment::Field {
+                            name: ident.as_str().to_string(),
+                        });
+                    }
+                    _ => continue,
                 }
-                let index_expr_pair = first_inner(index_pair, "index expression", "index access")?;
-                let index_value = parse_expression(index_expr_pair, ctx)?;
-                subscripts.push(subscript_from_value(index_value)?);
             }
-            parse_namespaced_id_value(head, ctx, subscripts)
+            parse_namespaced_id_value(head, ctx, segments)
         }
         Rule::boolean => {
             let b = inner.as_str() == "true";
