@@ -62,6 +62,17 @@ impl ProviderFactory for DeferredPopulateTestFactory {
     }
 }
 
+/// Mirrors the post-aws#296 `acm.Certificate` schema shape:
+/// `domain_validation_options` uses the *read-side* struct
+/// (`DomainValidation` from `CertificateDetail`), with a nested
+/// `resource_record: { name, type, value }` substruct that is
+/// marked `.deferred_populate()` because ACM populates it
+/// asynchronously after `RequestCertificate` returns.
+///
+/// This is the shape that lets carina#3032's failing chained
+/// access (`cert.domain_validation_options[0].resource_record.value`)
+/// be flagged at validate time by carina#3036's deferred-populate
+/// rule.
 fn cert_schema() -> ResourceSchema {
     ResourceSchema::new("acm.Certificate")
         .attribute(AttributeSchema::new("domain_name", AttributeType::String))
@@ -73,15 +84,22 @@ fn cert_schema() -> ResourceSchema {
         .attribute(AttributeSchema::new(
             "domain_validation_options",
             AttributeType::list(AttributeType::Struct {
-                name: "DomainValidationOption".to_string(),
+                name: "DomainValidation".to_string(),
                 fields: vec![
                     StructField::new("domain_name", AttributeType::String),
-                    StructField::new("resource_record_name", AttributeType::String)
-                        .deferred_populate(),
-                    StructField::new("resource_record_type", AttributeType::String)
-                        .deferred_populate(),
-                    StructField::new("resource_record_value", AttributeType::String)
-                        .deferred_populate(),
+                    StructField::new(
+                        "resource_record",
+                        AttributeType::Struct {
+                            name: "ResourceRecord".to_string(),
+                            fields: vec![
+                                StructField::new("name", AttributeType::String),
+                                StructField::new("type", AttributeType::String),
+                                StructField::new("value", AttributeType::String),
+                            ],
+                        },
+                    )
+                    .deferred_populate(),
+                    StructField::new("validation_status", AttributeType::String),
                 ],
             }),
         ))
@@ -183,10 +201,11 @@ const ACM_CRN: &str = r#"let cert = aws.acm.Certificate {
 // ---------------------------------------------------------------------------
 
 /// The carina#3032 reproduction shape, decomposed into a multi-file
-/// fixture. The cert is in `acm.crn`, the route53 RecordSet that
-/// reads the cert's deferred-populate inner field is in
-/// `route53.crn`, and there is *no* `wait` block — validate must
-/// flag the chained reference and name `cert` as the wait target.
+/// fixture matching the post-aws#297 schema. The cert is in
+/// `acm.crn`, the route53 RecordSet that reads the cert's
+/// deferred-populate inner struct is in `route53.crn`, and there is
+/// *no* `wait` block — validate must flag the chained reference
+/// and name `cert` as the wait target.
 #[test]
 fn validate_flags_chained_ref_to_deferred_inner_field_without_wait() {
     let fixture = write_fixture(&[
@@ -196,10 +215,10 @@ fn validate_flags_chained_ref_to_deferred_inner_field_without_wait() {
             "route53.crn",
             r#"aws.route53.RecordSet {
     hosted_zone_id   = "Z1"
-    name             = cert.domain_validation_options[0].resource_record_name
+    name             = cert.domain_validation_options[0].resource_record.name
     type             = "CNAME"
     ttl              = 300
-    resource_records = [cert.domain_validation_options[0].resource_record_value]
+    resource_records = [cert.domain_validation_options[0].resource_record.value]
 }
 "#,
         ),
@@ -208,7 +227,7 @@ fn validate_flags_chained_ref_to_deferred_inner_field_without_wait() {
     let diags = cli_validate(&fixture);
     assert!(
         diags.iter().any(
-            |d| d.contains("cert.domain_validation_options[0].resource_record_value")
+            |d| d.contains("cert.domain_validation_options[0].resource_record.value")
                 && d.contains("wait cert")
         ),
         "expected a deferred-populate diagnostic naming the unresolved \
@@ -220,7 +239,8 @@ fn validate_flags_chained_ref_to_deferred_inner_field_without_wait() {
 /// rule for *any* chained access on `cert` — the LSP and CLI both
 /// merge the directory before validating, so a wait declared in
 /// `wait.crn` is visible to references in `route53.crn`. This is
-/// the load-bearing directory-scoped assertion for the feature.
+/// the load-bearing directory-scoped assertion for the feature, and
+/// the actual fix for carina#3032's failing real-infra shape.
 #[test]
 fn validate_accepts_chained_ref_when_wait_is_declared_in_sibling_file() {
     let fixture = write_fixture(&[
@@ -230,10 +250,10 @@ fn validate_accepts_chained_ref_when_wait_is_declared_in_sibling_file() {
             "route53.crn",
             r#"aws.route53.RecordSet {
     hosted_zone_id   = "Z1"
-    name             = cert.domain_validation_options[0].resource_record_name
+    name             = cert.domain_validation_options[0].resource_record.name
     type             = "CNAME"
     ttl              = 300
-    resource_records = [cert.domain_validation_options[0].resource_record_value]
+    resource_records = [cert.domain_validation_options[0].resource_record.value]
 }
 "#,
         ),
