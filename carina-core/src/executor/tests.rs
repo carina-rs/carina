@@ -1865,3 +1865,186 @@ async fn test_chained_index_then_field_unresolved_at_apply_fails_with_clear_erro
          got: {failed_event}",
     );
 }
+
+/// Regression for carina#3046.
+///
+/// Companion to `test_chained_index_then_field_unresolved_at_apply_fails_with_clear_error`
+/// above: when the upstream's post-create state *does* publish the
+/// chained-access attribute (the AWS ACM case where the provider's
+/// `read_acm_certificate` returns `domain_validation_options` populated),
+/// the downstream's chained reference
+/// `cert.domain_validation_options[0].resource_record.name` must
+/// resolve into a concrete value before the downstream's `create()`
+/// is invoked. The provider must see a fully-resolved literal, not a
+/// `Value::Deferred(ResourceRef)`.
+///
+/// Pre-fix (the bug this issue captures) the executor errored out
+/// with the "has not been published yet" message even though the
+/// value was structurally present in the upstream's binding map.
+#[tokio::test]
+async fn test_chained_index_then_nested_field_resolves_from_post_create_state() {
+    use crate::resource::{AccessPath, ConcreteValue, PathSegment, Subscript};
+    use indexmap::IndexMap;
+
+    let provider = RecordingMockProvider::new();
+
+    // Upstream: ACM Certificate. No DSL attrs that mention DVO; the
+    // attribute appears only via the create's post-read state, exactly
+    // as `carina-provider-aws::services::acm::certificate.rs::read_acm_certificate`
+    // inserts it.
+    let cert = {
+        let mut r = Resource::new("test", "cert");
+        r.binding = Some("cert".to_string());
+        r.set_attr(
+            "domain_name",
+            Value::Concrete(ConcreteValue::String("example.com".to_string())),
+        );
+        r
+    };
+    let cert_id = cert.id.clone();
+
+    // Downstream: route53 RecordSet referencing the cert's
+    // chained-access path. Uses the post-aws#295 *nested* shape:
+    // `resource_record` is a struct with `name`/`type`/`value`.
+    let record = {
+        let mut r = Resource::new("test", "record");
+        r.binding = Some("record".to_string());
+        r.dependency_bindings = ["cert".to_string()].into_iter().collect();
+        let chained_dvo = |leaf: &str| {
+            AccessPath::with_segments(
+                "cert",
+                "domain_validation_options",
+                vec![
+                    PathSegment::Subscript {
+                        index: Subscript::Int { index: 0 },
+                    },
+                    PathSegment::Field {
+                        name: "resource_record".to_string(),
+                    },
+                    PathSegment::Field {
+                        name: leaf.to_string(),
+                    },
+                ],
+            )
+        };
+        let name_path = chained_dvo("name");
+        let value_path = chained_dvo("value");
+        r.set_attr(
+            "name",
+            Value::Deferred(DeferredValue::ResourceRef { path: name_path }),
+        );
+        r.set_attr(
+            "resource_records",
+            Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
+                DeferredValue::ResourceRef { path: value_path },
+            )])),
+        );
+        r
+    };
+    let record_id = record.id.clone();
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(cert));
+    plan.add(Effect::Create(record));
+
+    // Cert create returns post-read state with DVO populated. Shape
+    // mirrors what `read_acm_certificate` inserts after aws#295.
+    let mut rr: IndexMap<String, Value> = IndexMap::new();
+    rr.insert(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("_abc.example.com.".to_string())),
+    );
+    rr.insert(
+        "type".to_string(),
+        Value::Concrete(ConcreteValue::String("CNAME".to_string())),
+    );
+    rr.insert(
+        "value".to_string(),
+        Value::Concrete(ConcreteValue::String(
+            "_xyz.acm-validations.aws.".to_string(),
+        )),
+    );
+    let mut dvo_entry: IndexMap<String, Value> = IndexMap::new();
+    dvo_entry.insert(
+        "domain_name".to_string(),
+        Value::Concrete(ConcreteValue::String("example.com".to_string())),
+    );
+    dvo_entry.insert(
+        "resource_record".to_string(),
+        Value::Concrete(ConcreteValue::Map(rr)),
+    );
+    let cert_state = State::existing(
+        cert_id.clone(),
+        vec![(
+            "domain_validation_options".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(dvo_entry),
+            )])),
+        )]
+        .into_iter()
+        .collect(),
+    )
+    .with_identifier("acm-cert-id");
+    provider.push_create(Ok(cert_state));
+
+    let record_state =
+        State::existing(record_id.clone(), HashMap::new()).with_identifier("rrset-id");
+    provider.push_create(Ok(record_state));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+    };
+
+    let observer = MockObserver::new();
+    let result = execute_plan(&provider, input, &observer).await;
+
+    assert_eq!(
+        result.failure_count,
+        0,
+        "no failures expected; events: {:?}",
+        observer.events()
+    );
+    assert_eq!(
+        result.success_count,
+        2,
+        "both cert and record must succeed; events: {:?}",
+        observer.events()
+    );
+
+    // The downstream `create()` call must have received concrete
+    // values resolved from the upstream's post-create state, not the
+    // original `Value::Deferred(ResourceRef)`.
+    let calls = provider.create_calls();
+    assert_eq!(calls.len(), 2, "expected 2 create calls");
+    assert_eq!(
+        calls[0].0,
+        cert_id.to_string(),
+        "cert must be created before record (dependency order)",
+    );
+    let (record_call_id, record_attrs) = &calls[1];
+    assert_eq!(record_call_id, &record_id.to_string());
+
+    assert_eq!(
+        record_attrs.get("name"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "_abc.example.com.".to_string()
+        ))),
+        "record's `name` must resolve from chained access; got: {:?}",
+        record_attrs.get("name"),
+    );
+
+    let resource_records = record_attrs
+        .get("resource_records")
+        .expect("record must carry `resource_records` attribute");
+    assert_eq!(
+        resource_records,
+        &Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("_xyz.acm-validations.aws.".to_string())
+        )])),
+        "`resource_records` list element must resolve from chained \
+         access into the post-create state; got: {resource_records:?}",
+    );
+}
