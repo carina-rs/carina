@@ -364,11 +364,10 @@ pub(super) fn rewrite_intra_module_refs(
             if intra_module_bindings.contains(path.binding()) =>
         {
             Value::Deferred(DeferredValue::ResourceRef {
-                path: crate::resource::AccessPath::with_fields_and_subscripts(
+                path: crate::resource::AccessPath::with_segments(
                     format!("{}.{}", instance_prefix, path.binding()),
                     path.attribute().to_string(),
-                    path.field_path().to_vec(),
-                    path.subscripts().to_vec(),
+                    path.segments().to_vec(),
                 ),
             })
         }
@@ -627,11 +626,10 @@ fn rewrite_ref_prefixes(
             {
                 let new_binding = format!("{}_{:016x}.{}", module, target, rest);
                 return Value::Deferred(DeferredValue::ResourceRef {
-                    path: crate::resource::AccessPath::with_fields_and_subscripts(
+                    path: crate::resource::AccessPath::with_segments(
                         new_binding,
                         path.attribute().to_string(),
-                        path.field_path().to_vec(),
-                        path.subscripts().to_vec(),
+                        path.segments().to_vec(),
                     ),
                 });
             }

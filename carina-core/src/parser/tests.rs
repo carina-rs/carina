@@ -377,8 +377,8 @@ fn parse_undefined_two_part_identifier_becomes_resource_ref() {
         Some(Value::Deferred(DeferredValue::ResourceRef { path })) => {
             assert_eq!(path.binding(), "nonexistent");
             assert_eq!(path.attribute(), "name");
-            assert!(path.field_path().is_empty());
-            assert!(path.subscripts().is_empty());
+            assert!(path.leading_field_path().is_empty());
+            assert!(path.trailing_subscripts().is_empty());
         }
         other => panic!("expected ResourceRef, got {other:?}"),
     }
@@ -3512,7 +3512,7 @@ fn test_chained_field_access_two_levels() {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             let binding_name = path.binding();
             let attribute_name = path.attribute();
-            let field_path = path.field_path();
+            let field_path = path.leading_field_path();
             assert_eq!(binding_name, "vpc");
             assert_eq!(attribute_name, "network");
             assert_eq!(field_path, vec!["vpc_id"]);
@@ -3542,7 +3542,7 @@ fn test_chained_field_access_three_levels() {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             let binding_name = path.binding();
             let attribute_name = path.attribute();
-            let field_path = path.field_path();
+            let field_path = path.leading_field_path();
             assert_eq!(binding_name, "web");
             assert_eq!(attribute_name, "output");
             assert_eq!(field_path, vec!["network", "vpc_id"]);
@@ -3574,7 +3574,7 @@ fn parse_index_access_with_integer() {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             let binding_name = path.binding();
             let attribute_name = path.attribute();
-            let field_path = path.field_path();
+            let field_path = path.leading_field_path();
             assert_eq!(binding_name, "subnets[0]");
             assert_eq!(attribute_name, "subnet_id");
             assert!(field_path.is_empty());
@@ -3614,7 +3614,7 @@ fn parse_index_access_with_string_key() {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             let binding_name = path.binding();
             let attribute_name = path.attribute();
-            let field_path = path.field_path();
+            let field_path = path.leading_field_path();
             assert_eq!(binding_name, "networks.prod");
             assert_eq!(attribute_name, "vpc_id");
             assert!(field_path.is_empty());
@@ -3651,7 +3651,7 @@ fn parse_index_access_with_chained_fields() {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             let binding_name = path.binding();
             let attribute_name = path.attribute();
-            let field_path = path.field_path();
+            let field_path = path.leading_field_path();
             assert_eq!(binding_name, "webs.prod");
             assert_eq!(attribute_name, "security_group");
             assert_eq!(field_path, vec!["id"]);
@@ -3679,9 +3679,9 @@ fn parse_subscript_after_field_access_with_integer() {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             assert_eq!(path.binding(), "orgs");
             assert_eq!(path.attribute(), "accounts");
-            assert!(path.field_path().is_empty());
+            assert!(path.leading_field_path().is_empty());
             assert_eq!(
-                path.subscripts(),
+                path.trailing_subscripts(),
                 [crate::resource::Subscript::Int { index: 0 }]
             );
             assert_eq!(path.to_dot_string(), "orgs.accounts[0]");
@@ -3709,9 +3709,9 @@ fn parse_subscript_after_field_access_with_string_key() {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             assert_eq!(path.binding(), "orgs");
             assert_eq!(path.attribute(), "accounts");
-            assert!(path.field_path().is_empty());
+            assert!(path.leading_field_path().is_empty());
             assert_eq!(
-                path.subscripts(),
+                path.trailing_subscripts(),
                 [crate::resource::Subscript::Str {
                     key: "alpha".to_string()
                 }]
@@ -3742,9 +3742,9 @@ fn parse_chained_subscripts_after_field_access() {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             assert_eq!(path.binding(), "orgs");
             assert_eq!(path.attribute(), "matrix");
-            assert!(path.field_path().is_empty());
+            assert!(path.leading_field_path().is_empty());
             assert_eq!(
-                path.subscripts(),
+                path.trailing_subscripts(),
                 [
                     crate::resource::Subscript::Int { index: 0 },
                     crate::resource::Subscript::Int { index: 1 },
@@ -3777,10 +3777,11 @@ fn parse_negative_subscript_is_rejected() {
 }
 
 #[test]
-fn parse_field_after_subscript_after_field_is_rejected() {
-    // `a.b[0].c` — once a subscript appears after a field, no more
-    // fields are allowed. Runtime list-indexing of arbitrary structs
-    // isn't representable today.
+fn parse_field_after_subscript_after_field_is_accepted() {
+    // `a.b[0].c` — chained index-then-field access (carina#3025).
+    // The grammar accepts any mix of `.field` / `[idx]` continuations
+    // and the AST stores them as an ordered `Vec<PathSegment>`, so
+    // source order survives end-to-end.
     let input = r#"
         let orgs = upstream_state { source = "../organizations" }
 
@@ -3789,15 +3790,28 @@ fn parse_field_after_subscript_after_field_is_rejected() {
             cidr_block = orgs.accounts[0].id
         }
     "#;
-    let err = parse(input, &ProviderContext::default()).unwrap_err();
-    let msg = format!("{:?}", err);
-    assert!(
-        msg.contains("field access after index access")
-            || msg.contains("field_access after index_access")
-            || msg.contains("InvalidExpression")
-            || msg.contains("Syntax"),
-        "expected rejection of `a.b[0].c`, got: {msg}"
-    );
+    let result = parse(input, &ProviderContext::default()).unwrap();
+    let subnet = result.resources.last().expect("subnet");
+    let value = subnet.get_attr("cidr_block").expect("cidr_block");
+    match value {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+            use crate::resource::{PathSegment, Subscript};
+            assert_eq!(path.binding(), "orgs");
+            assert_eq!(path.attribute(), "accounts");
+            assert_eq!(
+                path.segments(),
+                &[
+                    PathSegment::Subscript {
+                        index: Subscript::Int { index: 0 }
+                    },
+                    PathSegment::Field {
+                        name: "id".to_string()
+                    },
+                ]
+            );
+        }
+        other => panic!("expected ResourceRef, got: {other:?}"),
+    }
 }
 
 #[test]
@@ -3820,9 +3834,9 @@ fn parse_subscript_after_nested_field_access() {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             assert_eq!(path.binding(), "orgs");
             assert_eq!(path.attribute(), "account");
-            assert_eq!(path.field_path(), vec!["accounts"]);
+            assert_eq!(path.leading_field_path(), vec!["accounts"]);
             assert_eq!(
-                path.subscripts(),
+                path.trailing_subscripts(),
                 [crate::resource::Subscript::Int { index: 0 }]
             );
         }
@@ -6382,7 +6396,7 @@ fn parse_upstream_state_registers_binding() {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             assert_eq!(path.binding(), "network");
             assert_eq!(path.attribute(), "vpc");
-            assert_eq!(path.field_path(), vec!["vpc_id"]);
+            assert_eq!(path.leading_field_path(), vec!["vpc_id"]);
         }
         other => panic!("Expected ResourceRef, got: {:?}", other),
     }
@@ -8377,9 +8391,9 @@ fn parse_subscript_on_upstream_state_in_sibling_file() {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             assert_eq!(path.binding(), "orgs");
             assert_eq!(path.attribute(), "accounts");
-            assert!(path.field_path().is_empty());
+            assert!(path.leading_field_path().is_empty());
             assert_eq!(
-                path.subscripts(),
+                path.trailing_subscripts(),
                 [crate::resource::Subscript::Str {
                     key: "registry_dev".to_string()
                 }]
@@ -8442,7 +8456,7 @@ fn parse_subscript_on_upstream_state_inside_string_interpolation_sibling_file() 
                     assert_eq!(path.binding(), "orgs");
                     assert_eq!(path.attribute(), "accounts");
                     assert_eq!(
-                        path.subscripts(),
+                        path.trailing_subscripts(),
                         [crate::resource::Subscript::Str {
                             key: "registry_dev".to_string()
                         }]
@@ -8508,8 +8522,8 @@ fn parse_dot_notation_on_upstream_state_in_sibling_file() {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             assert_eq!(path.binding(), "orgs");
             assert_eq!(path.attribute(), "accounts");
-            assert_eq!(path.field_path(), ["registry_dev".to_string()]);
-            assert!(path.subscripts().is_empty());
+            assert_eq!(path.leading_field_path(), ["registry_dev".to_string()]);
+            assert!(path.trailing_subscripts().is_empty());
         }
         other => panic!("expected ResourceRef with field_path, got {other:?}"),
     }
@@ -8565,7 +8579,7 @@ fn parse_dot_notation_on_upstream_state_inside_string_interpolation_sibling_file
                 {
                     assert_eq!(path.binding(), "orgs");
                     assert_eq!(path.attribute(), "accounts");
-                    assert_eq!(path.field_path(), ["registry_dev".to_string()]);
+                    assert_eq!(path.leading_field_path(), ["registry_dev".to_string()]);
                     found_ref = true;
                 }
             }
@@ -10144,4 +10158,125 @@ fn resource_id_provider_instance_makes_distinct_ids() {
     map.insert(tokyo.clone(), ());
     map.insert(us.clone(), ());
     assert_eq!(map.len(), 2);
+}
+
+/// carina#3025: `<binding>.<field>[<idx>].<field>` must parse and reach
+/// the AST. Prior to the fix, the grammar's `subscripted_id` rule
+/// accepted only trailing `[idx]+` after the namespaced head and
+/// refused any `.field` continuation; the parser produced a syntax
+/// error at the first `.` after `[<idx>]`. The bug affects every
+/// list-of-structs read pattern (e.g. ACM cert
+/// `domain_validation_options[0].resource_record_name`) where the
+/// user has to fall back to a `for` loop over a length-1 list.
+#[test]
+fn parse_chained_index_then_field_access() {
+    let src = r#"
+        let cert = aws.acm.Certificate {
+            domain_name = "x"
+        }
+        aws.route53.RecordSet {
+            name = cert.domain_validation_options[0].resource_record_name
+        }
+    "#;
+    let parsed = parse(src, &ProviderContext::default())
+        .expect("`<binding>.<field>[<idx>].<field>` must parse — carina#3025");
+
+    // The resource exists and its `name` attribute carries the
+    // expected ordered segment chain.
+    let rs = parsed
+        .resources
+        .iter()
+        .find(|r| r.id.resource_type == "route53.RecordSet")
+        .expect("RecordSet must be in parsed.resources");
+    let name_value = rs.get_attr("name").expect("RecordSet.name");
+    match name_value {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+            use crate::resource::{PathSegment, Subscript};
+            assert_eq!(path.binding(), "cert");
+            assert_eq!(path.attribute(), "domain_validation_options");
+            assert_eq!(
+                path.segments(),
+                &[
+                    PathSegment::Subscript {
+                        index: Subscript::Int { index: 0 }
+                    },
+                    PathSegment::Field {
+                        name: "resource_record_name".to_string()
+                    },
+                ]
+            );
+        }
+        other => panic!("expected ResourceRef, got: {other:?}"),
+    }
+}
+
+#[test]
+fn parse_multi_step_index_then_field_chain() {
+    // `a.b[0].c[1].d` — out-of-scope per the spec but the segment
+    // representation already supports it. Lock the shape down so future
+    // grammar tweaks don't silently drop a leg.
+    let src = r#"
+        let orgs = upstream_state { source = "../organizations" }
+
+        awscc.ec2.Subnet {
+            name = "test"
+            cidr_block = orgs.accounts[0].subnets[1].id
+        }
+    "#;
+    let result = parse(src, &ProviderContext::default()).unwrap();
+    let subnet = result.resources.last().expect("subnet");
+    let value = subnet.get_attr("cidr_block").expect("cidr_block");
+    match value {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+            use crate::resource::{PathSegment, Subscript};
+            assert_eq!(path.binding(), "orgs");
+            assert_eq!(path.attribute(), "accounts");
+            assert_eq!(
+                path.segments(),
+                &[
+                    PathSegment::Subscript {
+                        index: Subscript::Int { index: 0 }
+                    },
+                    PathSegment::Field {
+                        name: "subnets".to_string()
+                    },
+                    PathSegment::Subscript {
+                        index: Subscript::Int { index: 1 }
+                    },
+                    PathSegment::Field {
+                        name: "id".to_string()
+                    },
+                ]
+            );
+        }
+        other => panic!("expected ResourceRef, got: {other:?}"),
+    }
+}
+
+#[test]
+fn access_path_serde_round_trips_mixed_segments() {
+    // State files persist `AccessPath` as JSON. A path with mixed
+    // segments (the chained-access shape) must round-trip structurally
+    // so reloaded state preserves source-order semantics.
+    use crate::resource::{AccessPath, PathSegment, Subscript};
+    let original = AccessPath::with_segments(
+        "cert",
+        "domain_validation_options",
+        vec![
+            PathSegment::Subscript {
+                index: Subscript::Int { index: 0 },
+            },
+            PathSegment::Field {
+                name: "resource_record_name".to_string(),
+            },
+            PathSegment::Subscript {
+                index: Subscript::Str {
+                    key: "primary".to_string(),
+                },
+            },
+        ],
+    );
+    let json = serde_json::to_string(&original).unwrap();
+    let reloaded: AccessPath = serde_json::from_str(&json).unwrap();
+    assert_eq!(original, reloaded);
 }

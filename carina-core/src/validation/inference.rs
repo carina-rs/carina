@@ -313,8 +313,7 @@ fn infer_type_from_value_with_visiting(
         Value::Deferred(DeferredValue::ResourceRef { path }) => infer_resource_ref_with_visiting(
             path.binding(),
             path.attribute(),
-            path.field_path(),
-            path.subscripts(),
+            path.segments(),
             bindings,
             schemas,
             visiting,
@@ -377,8 +376,7 @@ where
 fn infer_resource_ref_with_visiting(
     binding: &str,
     attribute: &str,
-    field_path: &[String],
-    subscripts: &[crate::resource::Subscript],
+    segments: &[crate::resource::PathSegment],
     bindings: &InferenceBindings,
     schemas: &SchemaRegistry,
     visiting: &mut indexmap::IndexSet<String>,
@@ -426,7 +424,7 @@ fn infer_resource_ref_with_visiting(
                 infer_type_from_value_with_visiting(inner, bindings, schemas, visiting);
             visiting.shift_remove(binding);
             let inner_type = inner_type_result?;
-            return super::narrow_type_expr(&inner_type, field_path, subscripts).ok_or_else(|| {
+            return super::narrow_type_expr(&inner_type, segments).ok_or_else(|| {
                 InferenceError::UnknownAttribute {
                     binding: binding.to_string(),
                     attribute: attribute.to_string(),
@@ -450,32 +448,40 @@ fn infer_resource_ref_with_visiting(
             attribute: attribute.to_string(),
         });
     };
+    // Walk the path's ordered segments — a free mix of `.field` and
+    // `[idx]` continuations (carina#3025). A `.field` descends into the
+    // current struct; an `[idx]` peels one collection layer (`list(T)
+    // → T`, `map(_, V) → V`). Any mismatch surfaces a typed error
+    // rather than silently dropping the path.
+    use crate::resource::{PathSegment, Subscript};
     let mut current = &attr_schema.attr_type;
-    for segment in field_path {
-        current = match descend_struct_field(current, segment) {
-            Some(t) => t,
-            None => {
-                return Err(InferenceError::UnknownAttribute {
-                    binding: binding.to_string(),
-                    attribute: format!("{}.{}", attribute, segment),
-                });
-            }
-        };
-    }
-    // Peel one collection layer per trailing subscript: `[0]` against a
-    // `List<T>` projects to `T`; `["k"]` against a `Map<_, V>` projects
-    // to `V`. The grammar already enforces matching subscript shapes,
-    // but inference still has to descend so the resulting `TypeExpr`
-    // reflects the post-projection element type rather than the
-    // collection itself.
-    for sub in subscripts {
-        current = match (sub, current) {
-            (crate::resource::Subscript::Int { .. }, AttributeType::List { inner, .. }) => inner,
-            (crate::resource::Subscript::Str { .. }, AttributeType::Map { value, .. }) => value,
+    for seg in segments {
+        current = match (seg, current) {
+            (PathSegment::Field { name }, attr) => match descend_struct_field(attr, name) {
+                Some(t) => t,
+                None => {
+                    return Err(InferenceError::UnknownAttribute {
+                        binding: binding.to_string(),
+                        attribute: format!("{}.{}", attribute, name),
+                    });
+                }
+            },
+            (
+                PathSegment::Subscript {
+                    index: Subscript::Int { .. },
+                },
+                AttributeType::List { inner, .. },
+            ) => inner,
+            (
+                PathSegment::Subscript {
+                    index: Subscript::Str { .. },
+                },
+                AttributeType::Map { value, .. },
+            ) => value,
             _ => {
                 return Err(InferenceError::UnknownType {
                     reason: format!(
-                        "subscript on `{}.{}` does not match the attribute's collection shape",
+                        "access path on `{}.{}` does not match the attribute's shape",
                         binding, attribute
                     ),
                 });

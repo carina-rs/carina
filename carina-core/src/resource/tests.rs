@@ -921,7 +921,7 @@ fn access_path_new() {
     let path = AccessPath::new("vpc", "id");
     assert_eq!(path.binding(), "vpc");
     assert_eq!(path.attribute(), "id");
-    assert!(path.field_path().is_empty());
+    assert!(path.leading_field_path().is_empty());
     assert_eq!(path.to_dot_string(), "vpc.id");
 }
 
@@ -930,7 +930,7 @@ fn access_path_with_fields() {
     let path = AccessPath::with_fields("web", "network", vec!["vpc_id".to_string()]);
     assert_eq!(path.binding(), "web");
     assert_eq!(path.attribute(), "network");
-    assert_eq!(path.field_path(), ["vpc_id".to_string()]);
+    assert_eq!(path.leading_field_path(), ["vpc_id".to_string()]);
     assert_eq!(path.to_dot_string(), "web.network.vpc_id");
 }
 
@@ -956,8 +956,13 @@ fn value_ref_helpers() {
     assert_eq!(value.ref_binding(), Some("vpc"));
     assert_eq!(value.ref_attribute(), Some("vpc_id"));
     assert_eq!(
-        value.ref_field_path(),
-        Some(["nested".to_string()].as_slice())
+        value.ref_segments(),
+        Some(
+            [PathSegment::Field {
+                name: "nested".to_string()
+            }]
+            .as_slice()
+        )
     );
 
     let non_ref = Value::Concrete(ConcreteValue::String("hello".to_string()));

@@ -180,7 +180,6 @@ pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<V
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             let binding_name = path.binding();
             let attribute_name = path.attribute();
-            let field_path = path.field_path();
             if let Some(attrs) = bindings.get(binding_name)
                 && let Some(attr_value) = attrs.get(attribute_name)
             {
@@ -196,16 +195,18 @@ pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<V
                     bindings.source(binding_name),
                     Some(crate::binding_index::BindingValueSource::Upstream)
                 );
-                for field in field_path {
-                    // Peel `Secret` wrappers so dot-form key access
-                    // (`creds.db_pwd` against a `Secret(Map)` upstream)
-                    // descends into the inner map and re-wraps the
-                    // leaf — symmetric with the subscript walk below
-                    // (#2439). Pre-fix the wildcard arm dropped any
-                    // `Secret(Map)` ref silently.
+                use crate::resource::{PathSegment, Subscript};
+                for segment in path.segments() {
+                    // Peel `Secret` wrappers so dot-form / subscript
+                    // access descends into the inner container, then
+                    // re-wraps the leaf so the secret tag survives
+                    // end-to-end. #2439.
                     let (peeled, secret_depth) = peel_secrets(resolved);
-                    let next = match peeled {
-                        Value::Concrete(ConcreteValue::Map(ref map)) => match map.get(field) {
+                    let next = match (peeled, segment) {
+                        (
+                            Value::Concrete(ConcreteValue::Map(ref map)),
+                            PathSegment::Field { name: field },
+                        ) => match map.get(field) {
                             Some(nested) => resolve_ref_value(nested, bindings)?,
                             None if is_upstream && secret_depth > 0 => {
                                 return Err(missing_map_key_error_redacted(path, map.len()));
@@ -215,37 +216,33 @@ pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<V
                             }
                             None => return Ok(value.clone()),
                         },
-                        _ => return Ok(value.clone()),
-                    };
-                    resolved = rewrap_secrets(next, secret_depth);
-                }
-
-                use crate::resource::Subscript;
-                for sub in path.subscripts() {
-                    // Peel `Secret` wrappers so the subscript addresses
-                    // the inner container, then re-wrap so the secret
-                    // tag survives end-to-end. #2439.
-                    let (peeled, secret_depth) = peel_secrets(resolved);
-                    let next = match (peeled, sub) {
-                        (Value::Concrete(ConcreteValue::List(items)), Subscript::Int { index }) => {
+                        (
+                            Value::Concrete(ConcreteValue::List(items)),
+                            PathSegment::Subscript {
+                                index: Subscript::Int { index },
+                            },
+                        ) => {
                             let idx = usize::try_from(*index).ok().filter(|i| *i < items.len());
                             match idx {
                                 Some(i) => resolve_ref_value(&items[i], bindings)?,
                                 None => return Ok(value.clone()),
                             }
                         }
-                        (Value::Concrete(ConcreteValue::Map(map)), Subscript::Str { key }) => {
-                            match map.get(key) {
-                                Some(nested) => resolve_ref_value(nested, bindings)?,
-                                None if is_upstream && secret_depth > 0 => {
-                                    return Err(missing_map_key_error_redacted(path, map.len()));
-                                }
-                                None if is_upstream => {
-                                    return Err(missing_map_key_error(path, &map));
-                                }
-                                None => return Ok(value.clone()),
+                        (
+                            Value::Concrete(ConcreteValue::Map(map)),
+                            PathSegment::Subscript {
+                                index: Subscript::Str { key },
+                            },
+                        ) => match map.get(key) {
+                            Some(nested) => resolve_ref_value(nested, bindings)?,
+                            None if is_upstream && secret_depth > 0 => {
+                                return Err(missing_map_key_error_redacted(path, map.len()));
                             }
-                        }
+                            None if is_upstream => {
+                                return Err(missing_map_key_error(path, &map));
+                            }
+                            None => return Ok(value.clone()),
+                        },
                         _ => return Ok(value.clone()),
                     };
                     resolved = rewrap_secrets(next, secret_depth);
@@ -432,6 +429,56 @@ mod tests {
             "accounts",
             Vec::new(),
             vec![crate::resource::Subscript::Int { index: 0 }],
+        );
+        let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
+        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        assert_eq!(
+            resolved,
+            Value::Concrete(ConcreteValue::String("alpha".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_resolve_chained_subscript_then_field_descends_into_struct() {
+        // carina#3025 reproduction: `cert.list[0].name` against
+        // `list: [ { name = "alpha" }, { name = "beta" } ]` resolves
+        // to `"alpha"`. The resolver walks segments in source order
+        // (Subscript then Field), so the post-subscript field access
+        // descends into the inner map.
+        use crate::resource::{AccessPath, PathSegment, Subscript};
+        let inner_alpha: indexmap::IndexMap<String, Value> = vec![(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("alpha".to_string())),
+        )]
+        .into_iter()
+        .collect();
+        let inner_beta: indexmap::IndexMap<String, Value> = vec![(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("beta".to_string())),
+        )]
+        .into_iter()
+        .collect();
+        let bindings = bindings_from(vec![(
+            "cert",
+            vec![(
+                "list",
+                Value::Concrete(ConcreteValue::List(vec![
+                    Value::Concrete(ConcreteValue::Map(inner_alpha)),
+                    Value::Concrete(ConcreteValue::Map(inner_beta)),
+                ])),
+            )],
+        )]);
+        let path = AccessPath::with_segments(
+            "cert",
+            "list",
+            vec![
+                PathSegment::Subscript {
+                    index: Subscript::Int { index: 0 },
+                },
+                PathSegment::Field {
+                    name: "name".to_string(),
+                },
+            ],
         );
         let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
         let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();

@@ -997,6 +997,13 @@ fn validate_struct_fields(
 /// for the diagnostic builder's "use iteration / subscript / nothing"
 /// suggestion.
 ///
+/// Walk `start` through a chain of `.field` segments (the leading
+/// `PathSegment::Field` prefix of an [`AccessPath`]). Stops at the first
+/// non-`Field` segment and returns the type at that position together
+/// with the index of the segment that stopped descent — callers that
+/// need to continue with subscripts use [`narrow_type_expr`], callers
+/// that only care about the field-path leg use [`walk_type_expr_fields`].
+///
 /// Walks by reference so deep struct paths don't pay an O(depth) clone
 /// chain — the caller clones once at the return site if it needs an
 /// owned copy.
@@ -1004,7 +1011,7 @@ fn validate_struct_fields(
 /// `Map` segments unwrap to the value type so dot-form key access
 /// (`accounts.k → T`) is symmetric with the subscript form
 /// (`accounts['k']`). #2447.
-pub(crate) fn walk_type_expr_path<'a, 'b>(
+pub(crate) fn walk_type_expr_fields<'a, 'b>(
     start: &'a TypeExpr,
     field_path: &'b [String],
 ) -> Result<&'a TypeExpr, (&'a TypeExpr, &'b str)> {
@@ -1022,26 +1029,39 @@ pub(crate) fn walk_type_expr_path<'a, 'b>(
     Ok(current)
 }
 
-/// Narrow `start` through a chain of `field_path` segments and trailing
-/// `subscripts`. Returns `None` when a step doesn't fit the container
+/// Narrow `start` through an `AccessPath`'s ordered segments — a free
+/// mix of `.field` and `[index]` continuations at any depth
+/// (carina#3025). Returns `None` when a step doesn't fit the container
 /// kind; those mismatches are reported by the dedicated shape checkers
 /// and a duplicate here would be noise.
 ///
-/// The field-path leg delegates to [`walk_type_expr_path`] to keep the
-/// dot-form descent rules in one place. Used by both upstream-export
-/// type-checking and module-call attribute-export inference.
+/// Used by both upstream-export type-checking and module-call
+/// attribute-export inference.
 pub(crate) fn narrow_type_expr(
     start: &TypeExpr,
-    field_path: &[String],
-    subscripts: &[crate::resource::Subscript],
+    segments: &[crate::resource::PathSegment],
 ) -> Option<TypeExpr> {
-    let after_fields = walk_type_expr_path(start, field_path).ok()?;
-    let mut current = after_fields.clone();
-    use crate::resource::Subscript;
-    for sub in subscripts {
-        current = match (current, sub) {
-            (TypeExpr::List(inner), Subscript::Int { .. }) => *inner,
-            (TypeExpr::Map(inner), Subscript::Str { .. }) => *inner,
+    use crate::resource::{PathSegment, Subscript};
+    let mut current = start.clone();
+    for seg in segments {
+        current = match (current, seg) {
+            (TypeExpr::Struct { fields }, PathSegment::Field { name }) => {
+                let (_, ty) = fields.into_iter().find(|(n, _)| n == name)?;
+                ty
+            }
+            (TypeExpr::Map(inner), PathSegment::Field { .. }) => *inner,
+            (
+                TypeExpr::List(inner),
+                PathSegment::Subscript {
+                    index: Subscript::Int { .. },
+                },
+            ) => *inner,
+            (
+                TypeExpr::Map(inner),
+                PathSegment::Subscript {
+                    index: Subscript::Str { .. },
+                },
+            ) => *inner,
             _ => return None,
         };
     }
