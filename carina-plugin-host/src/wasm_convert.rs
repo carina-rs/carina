@@ -650,6 +650,10 @@ fn proto_attr_schema_to_core(a: &proto::AttributeSchema) -> CoreAttributeSchema 
         block_name: a.block_name.clone(),
         write_only: a.write_only,
         identity: a.identity,
+        // The WIT contract does not transmit `deferred_populate` —
+        // the annotation lives entirely in the host-side schema; see
+        // `proto_struct_field_to_core` for the rationale.
+        deferred_populate: false,
     }
 }
 
@@ -713,6 +717,13 @@ fn proto_struct_field_to_core(f: &proto::StructField) -> CoreStructField {
         description: f.description.clone(),
         provider_name: f.provider_name.clone(),
         block_name: f.block_name.clone(),
+        // The WIT contract does not transmit `deferred_populate` —
+        // the annotation lives entirely in the host-side schema (set
+        // by the provider's codegen output in
+        // `carina-provider-{aws,awscc}/.../schemas/generated/`),
+        // which is loaded directly via the SchemaRegistry rather
+        // than crossing the WASM boundary. carina#3034.
+        deferred_populate: false,
     }
 }
 

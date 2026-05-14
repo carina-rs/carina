@@ -412,6 +412,7 @@ fn make_schema(resource_type: &str, attrs: Vec<(&str, AttributeType)>) -> Resour
                 block_name: None,
                 write_only: false,
                 identity: false,
+                deferred_populate: false,
             },
         );
     }

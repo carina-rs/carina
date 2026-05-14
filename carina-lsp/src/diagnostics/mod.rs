@@ -164,9 +164,11 @@ impl DiagnosticEngine {
         if let Some(parsed) = merged.as_ref() {
             diagnostics.extend(self.check_depends_on(doc, parsed));
             diagnostics.extend(self.check_wait_bindings(doc, parsed));
+            diagnostics.extend(self.check_deferred_populate_refs(doc, parsed));
         } else if let Some(parsed) = doc.parsed() {
             diagnostics.extend(self.check_depends_on(doc, parsed));
             diagnostics.extend(self.check_wait_bindings(doc, parsed));
+            diagnostics.extend(self.check_deferred_populate_refs(doc, parsed));
         }
 
         // Provider-attribute finalize diagnostic (#2717 / #2753): if a
