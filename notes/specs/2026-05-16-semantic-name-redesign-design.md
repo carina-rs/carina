@@ -1,205 +1,175 @@
 # Semantic Name Redesign — Design
 
-Status: **Format decided** — Option C (dotted, PascalCase tail:
-`aws.iam.Role.Arn`). Projection-owner design is the open implementation
-question.
+Status: **Direction decided** — structured type-identity keyed on
+`provider + service + resource + kind`. User-facing surface stays a
+dotted string (`aws.iam.Role.Arn`). Implementation-architecture detail
+(exact struct shape, WIT contract, generic-type wildcard handling) is
+the open question for the implementation phase.
 Date: 2026-05-16
 
 <!-- constrained-by ./2026-05-12-strict-enum-identifier-design.md -->
 
-## Problem
+> **Revision note.** Earlier drafts of this doc framed the problem as
+> *display-string inconsistency* and proposed renaming the flat
+> PascalCase `semantic_name` to a dotted string. That framing
+> mistook the motivation. The real driver (clarified by the user,
+> 2026-05-16) is **multi-provider type-identity collision**. The
+> display-only analysis and the "Option A–D / projection-owner"
+> sections are superseded by what follows.
 
-`carina-aws-types` attaches a flat PascalCase `semantic_name` to every
-`AttributeType::Custom` it produces — `IamRoleArn`, `IamPolicyArn`,
-`KmsKeyArn`, `VpcId`, `SubnetId`, … The name conflates two unrelated
-axes into one undifferentiated token:
+## Problem (corrected)
 
-- **Resource the value points at** — `IamRole`, `Vpc`, `Subnet`.
-- **Kind of reference** — an ARN, an ID, an Effect enum, etc.
+`carina-aws-types` attaches a flat PascalCase `semantic_name`
+(`Region`, `IamRoleArn`, `VpcId`, …) to every
+`AttributeType::Custom`. That string is **both** the internal
+type-identity key and the user-facing display name. The type-identity
+half is the problem.
 
-There is no namespacing and no relationship to the DSL's existing
-dotted-identifier convention (`aws.iam.Role`, `aws.s3.Bucket`). The
-user's prompting question — *"should these be renamed, e.g.
-`aws.iam.Role.ARN`?"* — is the trigger for this document.
+Type compatibility is decided by `semantic_name` string equality:
+`carina-core/src/schema/mod.rs:1303` — *Custom→Custom with both
+`semantic_name: Some` and names differ ⇒ NG*. The contrapositive is
+the bug: **same `semantic_name` ⇒ treated as the same type.**
 
-This document records the **facts and constraints** so a naming format
-can be chosen with the trade-offs visible. It does **not** pick a
-format yet (per the decision to defer until the survey is in hand).
+Today every provider is AWS, so this is latent. It stops being latent
+the moment a second provider lands. Concrete example (user's): add a
+Google Cloud provider and both define a `region` attribute:
+
+- `aws` region: `"ap-northeast-1"` (hyphen-segmented pattern)
+- `gcp` region: `"asia-northeast1"` (different pattern)
+
+If both carry `semantic_name = "Region"`, the type system declares
+them the **same type**. An `aws` region value would validate as
+acceptable where a `gcp` region is expected, and the pattern checks
+cross-contaminate. `region` is just the first instance; any
+cross-provider concept with a shared noun but a provider-specific
+format (ARNs, resource IDs, account/project identifiers, zones) has
+the same failure.
+
+This is a **type-safety correctness** problem, not a presentation
+problem. The fix must put provider (and service/resource) into the
+type-identity key so that `aws`'s `Region` and `gcp`'s `Region` are
+**distinct types**.
 
 ## Inventory (as of 2026-05-16)
 
 Both provider repos carry an independent copy of `carina-aws-types`
 (triplicated; see project memory `project_aws_types_triplicated_copies`).
-Counts below are from
-`carina-provider-aws/carina-aws-types/src/lib.rs` and
-`carina-provider-awscc/carina-aws-types/src/lib.rs`.
+From `carina-provider-aws/carina-aws-types/src/lib.rs` (35 names) and
+`carina-provider-awscc/carina-aws-types/src/lib.rs` (41 names) — the
+two copies are **asymmetric**, so any change is per-repo and
+reconciled, not mechanically diffed.
 
-### ID family (largest group)
+- **ID family (~31):** `VpcId`, `SubnetId`, `IamRoleId`,
+  `AwsAccountId`, `KmsKeyId`, … (awscc adds `IdentityStoreId`).
+- **ARN family (4–7):** `Arn` (generic), `IamRoleArn`, `IamPolicyArn`,
+  `KmsKeyArn` (awscc adds `SsoInstanceArn`, `SsoPermissionSetArn`,
+  `IamOidcProviderArn`).
+- **enum-ish:** `IamPolicyEffect`, `IamPolicyVersion`,
+  `PolicyConditionValue` (last one in `carina-core/src/value.rs:2975`).
 
-`AwsResourceId`, `VpcId`, `SubnetId`, `SecurityGroupId`,
-`InternetGatewayId`, `RouteTableId`, `NatGatewayId`,
-`VpcPeeringConnectionId`, `TransitGatewayId`,
-`VpcCidrBlockAssociationId`, `TgwRouteTableId`, `VpnGatewayId`,
-`EgressOnlyInternetGatewayId`, `VpcEndpointId`, `InstanceId`,
-`NetworkInterfaceId`, `AllocationId`, `PrefixListId`,
-`CarrierGatewayId`, `LocalGatewayId`, `NetworkAclId`,
-`TransitGatewayAttachmentId`, `FlowLogId`, `IpamId`,
-`SubnetRouteTableAssociationId`, `SecurityGroupRuleId`, `IamRoleId`,
-`AwsAccountId`, `KmsKeyId`, `IpamPoolId`, `AvailabilityZoneId`
-(awscc adds `IdentityStoreId`).
+Scope of the eventual change is the **whole surface** (all families,
+both aws and awscc copies), not an ARN-only or Region-only slice — the
+collision class is general.
 
-### ARN family
+## Where `semantic_name` is load-bearing
 
-`Arn` (generic), `IamRoleArn`, `IamPolicyArn`, `KmsKeyArn`
-(awscc adds `SsoInstanceArn`, `SsoPermissionSetArn`,
-`IamOidcProviderArn`).
+It is consumed in two distinct roles:
 
-### Enum family (awscc only, currently)
+1. **Type-identity key.** `schema/mod.rs:1303` Custom→Custom
+   assignability; `validation/inference.rs:561-564`
+   (`semantic_name → TypeExpr::Simple(pascal_to_snake(name))`);
+   `parser/util.rs:31` defines the inverse so the strings line up.
+2. **User-facing display.** `schema/mod.rs:1306` `type_name()` →
+   `custom_display_name(semantic_name, …)` surfaces it verbatim in
+   validate errors and LSP diagnostics
+   (`carina-lsp/src/diagnostics/mod.rs:535`,
+   `completion/values.rs:608-629`).
 
-`IamPolicyEffect`, `IamPolicyVersion`, plus `SsoPrincipalId` and
-`PolicyConditionValue` (the latter is defined in
-`carina-core/src/value.rs:2975`, not in the aws-types copy).
+The redesign must fix role 1 while keeping role 2's output a clean
+dotted string. **These two are separable** (see Decision).
 
-### Asymmetry note
+## Decision
 
-aws and awscc copies are **not** identical: awscc has 41 semantic
-names, aws has 35; the SSO/Identity-Store and OIDC entries exist only
-in awscc. Any rename must be applied per-repo and reconciled, not
-diffed mechanically.
+### What the user sees: unchanged in shape, dotted string
 
-## The load-bearing constraint: `semantic_name` is a type-identity key
+The display surface is a dotted identifier consistent with the DSL's
+existing namespaced identifiers (`aws.iam.Role`,
+`aws.s3.Bucket.VersioningStatus.enabled`): e.g. `aws.iam.Role.Arn`,
+`aws.Region`, `gcp.Region`. Tail casing is PascalCase (`Arn`, not
+`ARN`) to match the existing namespaced-identifier tail register
+(see strict-enum-identifier design). This satisfies the secondary
+benefits (disambiguation + namespace consistency) for free — but they
+are *consequences*, not the goal. The goal is collision-free identity.
 
-`semantic_name` is **not** a display-only label. It participates in
-type-compatibility checking through a PascalCase ⇄ snake_case
-round-trip:
+### Internal representation: structured, not a string
 
-- `carina-core/src/validation/inference.rs:561-564` —
-  `Custom { semantic_name: Some(name), .. }` →
-  `TypeExpr::Simple(pascal_to_snake(name))`. The DSL annotation arm
-  matches by `pascal_to_snake` equality, so the token **must** survive
-  a `PascalCase → snake_case` projection that lines up with what the
-  user writes in a type annotation.
-- `carina-core/src/parser/util.rs:31` — snake→Pascal conversion is
-  defined so its result *matches* `semantic_name` values.
-- `carina-lsp/src/completion/values.rs:1947,1981-1987` and
-  `top_level.rs:975,994` — LSP carries the PascalCase form as
-  `semantic_name` and assumes single-token PascalCase.
-- `carina-lsp/src/diagnostics/mod.rs:535,552` — diagnostics read
-  `semantic_name` for editor warnings (ARN family branch at
-  `completion/values.rs:608-629`).
-- `carina-core/src/upstream_exports.rs:2094-2151` and
-  `value.rs:2975` — hand-written sites embed literal semantic names
-  (`KmsKeyArn`, `Arn`, `AwsAccountId`, `PolicyConditionValue`); these
-  must move in lockstep.
+`semantic_name: Option<String>` becomes a **structured type identity**
+keyed on `provider + service + resource + kind` (exact field shape is
+implementation-phase work). Identity comparison is field equality;
+the user-facing dotted string is *derived* from the structure via a
+`Display`-style projection. The string is an output, never the source
+of truth, and is never re-parsed to recover the axes.
 
-**Implication:** the format choice is bounded by this pipeline. A flat
-PascalCase token (`IamRoleArn`) round-trips today. A dotted namespaced
-form (`aws.iam.Role.ARN`) does **not** survive `pascal_to_snake`
-unchanged and would require redesigning the projection in
-`inference.rs` / `parser/util.rs` / LSP completion — i.e. it is not a
-rename, it is a type-identity-representation change.
+Identity axis depth (user decision, 2026-05-16):
+**provider + service/resource.** `aws.iam.Role.Arn` and
+`aws.acm.Certificate.Arn` are distinct types; `aws.Region` and
+`gcp.Region` are distinct types.
 
-## Naming format options (NOT yet decided)
+### Why structured over a dotted string (rationale)
 
-| Option | Example | Round-trips through current pipeline? | Cost |
-| --- | --- | --- | --- |
-| A. Status quo | `IamRoleArn` | Yes | **Rejected** — gives neither disambiguation nor namespace consistency |
-| B. PascalCase, lowercase tail | `IamRoleArn` (documented) | Yes | **Rejected** — same reason as A |
-| C. Dotted namespaced, Pascal tail | `aws.iam.Role.Arn` | **No** — needs new projection owner | redesign inference/parser/LSP + 3-repo sweep |
-| D. Dotted namespaced, upper tail | `aws.iam.Role.ARN` (user's original) | **No** | as C, plus `ARN` all-caps diverges from the existing namespaced-identifier tail convention (`enabled`, lowercase) — see strict-enum-identifier design |
+A dotted-string key (`semantic_name = "aws.iam.Role.Arn"`) would also
+make `aws.Region ≠ gcp.Region`, so on the collision requirement alone
+the two are equivalent. The structure wins on long-term type-safety
+grounds (consistent with project memory
+`feedback_type_safety_over_runtime_checks`,
+`feedback_long_term_and_type_safety`, `feedback_strict_typing`):
 
-A and B are struck because the resolved goal requires **both**
-disambiguation and namespace consistency (next section).
+1. **The motivation is type safety itself.** Provider-keyed identity
+   is the requirement. A struct makes "different `provider` ⇒
+   different type" self-evident at the type level; a string defers it
+   to equality semantics that a reader must reconstruct.
+2. **A string re-introduces the exact anti-pattern this redesign
+   removes.** Collapsing axes into `"aws.iam.Role.Arn"` and recovering
+   them with `split('.')` is the same implicit, fragile round-trip as
+   today's `pascal_to_snake`. `split` cannot reject malformed
+   `"aws..Role"`; a struct cannot represent it.
+3. **Extensibility under more providers.** Each new provider (GCP,
+   then Azure, …) is a *data* addition to a named field, not a new
+   "which dotted segment is the provider" convention duplicated across
+   every consumer site.
+4. **Cost is necessary, not waste.** The WIT-contract / aws / awscc
+   blast radius is the price of enforcing the collision boundary in
+   the type system. An earlier draft's "don't change the internal
+   key" conclusion mistook the motivation and is withdrawn.
 
-**Decided (user, 2026-05-16): Option C — `aws.iam.Role.Arn`.** The
-PascalCase tail (`Arn`, not `ARN`) is chosen because the existing
-namespaced-identifier convention keeps tails in a lower/PascalCase
-register (`enabled`), and an all-caps `ARN` segment visually diverges
-from that convention (see strict-enum-identifier design). The
-acronym-uppercasing question is closed; the remaining open item is
-purely the projection-owner architecture below.
+## Open question for the implementation phase
 
-### Resolved direction (user, 2026-05-16)
-
-- **Goal: both.** The format must simultaneously give
-  *disambiguation* (the resource × kind axes must be separately
-  readable in the name) **and** *namespace consistency* with the DSL's
-  existing dotted identifiers (`aws.iam.Role`,
-  `aws.s3.Bucket.VersioningStatus.enabled`). A format that satisfies
-  only one is rejected. This eliminates options A and B (flat
-  PascalCase gives neither cleanly) and points at a dotted,
-  axis-structured form — i.e. the work is in option C/D territory and
-  the projection redesign below is unavoidable, not optional.
-- **Scope: the whole `semantic_name` surface, not just ARNs.** All
-  families — ID (31), ARN (4–7), and the enum-ish entries
-  (`IamPolicyEffect`, `IamPolicyVersion`, `PolicyConditionValue`, …) —
-  across both the aws and awscc copies. The rename is uniform; there
-  is no "ARN-only" partial rollout.
-
-### The real design work: who owns the projection?
-
-"Projection" = the step that converts a schema-side type identity
-(`semantic_name`) into the declaration-side form a user writes in a DSL
-type annotation, so the two can be matched.
-
-Today this projection is trivial and **owned implicitly by
-`pascal_to_snake`**:
-
-```
-schema side                         declaration side (user's DSL)
-Custom { semantic_name:             let x: iam_role_arn = ...
-  "IamRoleArn" }            ←──────────────  ^^^^^^^^^^^^
-        │ pascal_to_snake
-        ▼
-   "iam_role_arn"  ── string-equality compare ──┘
-```
-
-`validation/inference.rs:561-564` maps
-`Custom { semantic_name: Some(name) }` →
-`TypeExpr::Simple(pascal_to_snake(name))`; `parser/util.rs` defines the
-inverse so the strings line up. No component "owns" the type-name
-representation — it is an emergent property of one string transform.
-
-A dotted, axis-structured name (`aws.iam.Role.Arn`) breaks this,
-raising the questions that are the actual design:
-
-1. **What does the user write?** Is the DSL annotation literally
-   `aws.iam.Role.Arn`, or a shorter alias? The dotted form already
-   means *resource reference* (`aws.iam.Role`) and *enum value*
-   (`aws.s3.Bucket.VersioningStatus.enabled`) in the grammar — a third
-   meaning (type name) needs a disambiguation rule the parser can
-   apply.
-2. **Which component resolves it?** The parser
-   (`parser/carina.pest` + `parser/util.rs`), type inference
-   (`inference.rs`), or a *new* explicit type-name registry that owns
-   the mapping rather than leaving it emergent? This is the
-   architectural decision the implementation PR cannot avoid.
-3. **How do LSP completion/diagnostics
-   (`completion/values.rs:1947`, `diagnostics/mod.rs:535`) consume the
-   new identity?** They currently hard-assume single-token PascalCase.
-
-The recommendation of this doc is that the implementation phase must
-**introduce an explicit owner for type-name representation** (a
-registry / dedicated `TypeExpr` variant) rather than extend the
-implicit `pascal_to_snake` round-trip. Renaming the strings without
-this is the failure mode that turns a "rename PR" into an unscoped
-type-system change mid-flight.
+**Generic / provider-agnostic types.** Some Custom types should NOT be
+provider-partitioned: a bare `String`-based wrapper, a truly generic
+`Arn`. Partitioning those by provider would wrongly reject valid
+cross-provider assignment. The struct must express "this identity has
+no provider axis / matches across providers" explicitly — e.g.
+`provider: Option<…>` or an explicit `Generic` variant. A string key
+would face the same question implicitly and worse; the struct makes it
+a first-class, designed decision. Resolving the exact shape (and the
+WIT-contract change it implies for aws/awscc) is the implementation
+PR's job; this doc only fixes the *direction*.
 
 ## Scope / sequencing (per project memory)
 
-- Design doc PR must merge **before** any implementation PR
+- This design doc PR merges **before** any implementation PR
   (`feedback_design_before_implementation_in_pr`).
-- 1 PR = 1 topic (`feedback_scope_discipline`); the eventual
-  implementation spans 3 repos (carina + aws + awscc copies) and must
-  be sequenced, not bundled.
+- Implementation spans 3 repos (carina + aws + awscc copies) plus the
+  WIT contract; sequenced, not bundled (`feedback_scope_discipline`).
+- The aws/awscc `carina-aws-types` copies are asymmetric and must each
+  be migrated and reconciled (`project_aws_types_triplicated_copies`).
 - Real-infra smoke against `carina-rs/infra` is user-driven, not part
   of this doc.
 
 ## Non-goals
 
-- Designing the projection-owner architecture in detail (registry vs
-  `TypeExpr` variant vs parser rule) — that is the implementation
-  PR's job; this doc only mandates that an explicit owner exist.
-- Any code change in this PR — documentation only. Scope is resolved
-  as the **whole `semantic_name` surface** (ID + ARN + enum-ish,
-  aws + awscc); no partial ARN-only rollout.
+- The exact struct field shape / WIT contract / generic-type wildcard
+  mechanism — implementation-phase work; this doc fixes direction only.
+- Any code change in this PR — documentation only.
+- A partial (ARN-only / Region-only) rollout — the collision class is
+  general; scope is the whole `semantic_name` surface.
