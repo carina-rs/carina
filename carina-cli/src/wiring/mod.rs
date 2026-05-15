@@ -1191,6 +1191,21 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
         .as_ref()
         .map(|sf| sf.build_saved_attrs())
         .unwrap_or_default();
+    // awscc#251: state files written before a provider promoted an
+    // attribute from `Custom` to `StringEnum` (e.g. awscc#250 for IAM
+    // policy `version`/`effect`) store enum values as plain JSON
+    // strings. `build_saved_attrs` bridges those through the
+    // schema-blind `json_to_dsl_value` into `ConcreteValue::String`,
+    // which the strict carina#2986 Phase 4 validator then rejects at
+    // the now-`StringEnum` position. Lift recognized members to
+    // `ConcreteValue::EnumIdentifier` against each resource's current
+    // schema before any diff/validation consumes the loaded state.
+    // carina-state stays schema-free; the registry only exists here.
+    carina_core::utils::lift_saved_state_string_enums(
+        &mut saved_attrs,
+        &parsed.resources,
+        ctx.schemas(),
+    );
     let mut prev_explicit = state_file
         .as_ref()
         .map(|sf| sf.build_explicit())

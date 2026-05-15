@@ -740,10 +740,17 @@ pub(crate) async fn run_state_refresh_locked(
     }
 
     // Restore unreturned attributes from state file (CloudControl doesn't always return them)
-    let saved_attrs = state_file
+    let mut saved_attrs = state_file
         .as_ref()
         .map(|sf| sf.build_saved_attrs())
         .unwrap_or_default();
+    // awscc#251: lift pre-StringEnum-migration state before
+    // `hydrate_read_state` carries it forward into read state.
+    carina_core::utils::lift_saved_state_string_enums(
+        &mut saved_attrs,
+        &parsed.resources,
+        ctx.schemas(),
+    );
     provider.hydrate_read_state(&mut current_states, &saved_attrs);
 
     let mut state = state_file.take().unwrap();

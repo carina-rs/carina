@@ -4580,3 +4580,195 @@ fn validate_map_with_string_enum_key_rejects_unknown_variant() {
         other => panic!("expected MapKeyError, got: {other:?}"),
     }
 }
+
+// awscc#251: persisted state files written before awscc#250 made IAM
+// policy `version`/`effect` into `StringEnum` store these as plain JSON
+// strings. On load they become `ConcreteValue::String`. The carina#2986
+// Phase 4 strict validator then rejects them at the `StringEnum`
+// position because it demands `ConcreteValue::EnumIdentifier`. The
+// schema-aware state-migration lift in
+// `crate::utils::lift_state_string_enums_to_identifiers` walks loaded
+// attributes against their schema and lifts recognized API-canonical /
+// alias strings to `EnumIdentifier` so old state validates again.
+#[test]
+fn lift_state_string_enums_to_identifiers_fixes_awscc251() {
+    use crate::utils::lift_state_string_enums_to_identifiers;
+    use indexmap::IndexMap;
+
+    let version_enum = AttributeType::StringEnum {
+        name: "Version".to_string(),
+        values: vec!["2012-10-17".to_string(), "2008-10-17".to_string()],
+        namespace: Some("aws.iam.PolicyDocument".to_string()),
+        dsl_aliases: vec![
+            ("2012-10-17".to_string(), "2012_10_17".to_string()),
+            ("2008-10-17".to_string(), "2008_10_17".to_string()),
+        ],
+    };
+    let effect_enum = AttributeType::StringEnum {
+        name: "Effect".to_string(),
+        values: vec!["Allow".to_string(), "Deny".to_string()],
+        namespace: Some("aws.iam.PolicyDocument".to_string()),
+        dsl_aliases: vec![
+            ("Allow".to_string(), "allow".to_string()),
+            ("Deny".to_string(), "deny".to_string()),
+        ],
+    };
+    let statement_struct = AttributeType::Struct {
+        name: "Statement".to_string(),
+        fields: vec![StructField::new("effect", effect_enum)],
+    };
+    let policy_struct = AttributeType::Struct {
+        name: "PolicyDocument".to_string(),
+        fields: vec![
+            StructField::new("version", version_enum),
+            StructField::new(
+                "statement",
+                AttributeType::List {
+                    inner: Box::new(statement_struct),
+                    ordered: false,
+                },
+            ),
+        ],
+    };
+    let schema = ResourceSchema::new("aws.iam.role_policy")
+        .attribute(AttributeSchema::new("policy", policy_struct));
+
+    // Attributes exactly as loaded from persisted state JSON: enum
+    // positions hold `ConcreteValue::String`, not `EnumIdentifier`.
+    let mut statement = IndexMap::new();
+    statement.insert(
+        "effect".to_string(),
+        Value::Concrete(ConcreteValue::String("Allow".to_string())),
+    );
+    let mut policy = IndexMap::new();
+    policy.insert(
+        "version".to_string(),
+        Value::Concrete(ConcreteValue::String("2012-10-17".to_string())),
+    );
+    policy.insert(
+        "statement".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(statement),
+        )])),
+    );
+    let mut attrs: HashMap<String, Value> = HashMap::new();
+    attrs.insert(
+        "policy".to_string(),
+        Value::Concrete(ConcreteValue::Map(policy)),
+    );
+
+    // BEFORE the lift: strict validator rejects the loaded String.
+    let before = schema.validate(&attrs);
+    let errs = before.expect_err("loaded state String must fail strict StringEnum validation");
+    fn has_string_literal_expected_enum(errs: &[TypeError]) -> bool {
+        errs.iter().any(|e| match e {
+            TypeError::StringLiteralExpectedEnum { .. } => true,
+            TypeError::StructFieldError { inner, .. }
+            | TypeError::ListItemError { inner, .. }
+            | TypeError::MapValueError { inner, .. } => {
+                has_string_literal_expected_enum(std::slice::from_ref(inner))
+            }
+            _ => false,
+        })
+    }
+    assert!(
+        has_string_literal_expected_enum(&errs),
+        "expected StringLiteralExpectedEnum, got: {errs:?}"
+    );
+
+    // Apply the lift.
+    lift_state_string_enums_to_identifiers(&mut attrs, &schema);
+
+    // AFTER the lift: validation passes.
+    schema
+        .validate(&attrs)
+        .expect("lifted state must pass strict StringEnum validation");
+
+    // The lifted values are EnumIdentifier in the DSL spelling: the
+    // strict carina#2986 validator requires the alias form when a
+    // `dsl_aliases` entry rewrites the API value (carina#2980).
+    let Value::Concrete(ConcreteValue::Map(policy)) = &attrs["policy"] else {
+        panic!("policy should be a Map");
+    };
+    assert_eq!(
+        policy["version"],
+        Value::Concrete(ConcreteValue::EnumIdentifier("2012_10_17".to_string()))
+    );
+    let Value::Concrete(ConcreteValue::List(stmts)) = &policy["statement"] else {
+        panic!("statement should be a List");
+    };
+    let Value::Concrete(ConcreteValue::Map(stmt)) = &stmts[0] else {
+        panic!("statement[0] should be a Map");
+    };
+    assert_eq!(
+        stmt["effect"],
+        Value::Concrete(ConcreteValue::EnumIdentifier("allow".to_string()))
+    );
+}
+
+#[test]
+fn lift_state_string_enums_is_idempotent_and_preserves_invalid() {
+    use crate::utils::lift_state_string_enums_to_identifiers;
+    use indexmap::IndexMap;
+
+    let version_enum = AttributeType::StringEnum {
+        name: "Version".to_string(),
+        values: vec!["2012-10-17".to_string()],
+        namespace: Some("aws.iam.PolicyDocument".to_string()),
+        dsl_aliases: vec![("2012-10-17".to_string(), "2012_10_17".to_string())],
+    };
+    let policy_struct = AttributeType::Struct {
+        name: "PolicyDocument".to_string(),
+        fields: vec![StructField::new("version", version_enum)],
+    };
+    let schema = ResourceSchema::new("aws.iam.role_policy")
+        .attribute(AttributeSchema::new("policy", policy_struct));
+
+    // Case 1: already an EnumIdentifier (post-fix re-plan) — no-op.
+    let mut already = IndexMap::new();
+    already.insert(
+        "version".to_string(),
+        Value::Concrete(ConcreteValue::EnumIdentifier("2012_10_17".to_string())),
+    );
+    let mut attrs: HashMap<String, Value> = HashMap::new();
+    attrs.insert(
+        "policy".to_string(),
+        Value::Concrete(ConcreteValue::Map(already.clone())),
+    );
+    lift_state_string_enums_to_identifiers(&mut attrs, &schema);
+    let Value::Concrete(ConcreteValue::Map(p)) = &attrs["policy"] else {
+        panic!("map");
+    };
+    assert_eq!(
+        p["version"],
+        Value::Concrete(ConcreteValue::EnumIdentifier("2012_10_17".to_string())),
+        "already-lifted EnumIdentifier must pass through unchanged"
+    );
+
+    // Case 2: unrecognized string — left as String so the strict
+    // validator still rejects genuinely-invalid persisted state rather
+    // than masking it.
+    let mut bad = IndexMap::new();
+    bad.insert(
+        "version".to_string(),
+        Value::Concrete(ConcreteValue::String("1999-01-01".to_string())),
+    );
+    let mut attrs2: HashMap<String, Value> = HashMap::new();
+    attrs2.insert(
+        "policy".to_string(),
+        Value::Concrete(ConcreteValue::Map(bad)),
+    );
+    lift_state_string_enums_to_identifiers(&mut attrs2, &schema);
+    let Value::Concrete(ConcreteValue::Map(p2)) = &attrs2["policy"] else {
+        panic!("map");
+    };
+    assert_eq!(
+        p2["version"],
+        Value::Concrete(ConcreteValue::String("1999-01-01".to_string())),
+        "unrecognized member must stay String (validator still rejects it)"
+    );
+    assert!(
+        schema.validate(&attrs2).is_err(),
+        "invalid persisted state must still fail validation, not be masked"
+    );
+}
