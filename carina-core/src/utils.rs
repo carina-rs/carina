@@ -473,32 +473,46 @@ pub fn validate_enum_namespace(s: &str, type_name: &str, namespace: &str) -> Res
 /// - TypeName.value shorthand: `"VersioningStatus.Enabled"` -> `"aws.s3.Bucket.VersioningStatus.Enabled"`
 /// - Already-qualified values pass through unchanged (via the `_` arm)
 ///
-/// Returns `None` if the value doesn't need resolution (non-String or already qualified).
+/// Returns `None` if the value doesn't need resolution (non-text or already qualified).
+///
+/// Phase 4 of carina#2986: bare DSL enum values arrive as
+/// `ConcreteValue::EnumIdentifier`, not `ConcreteValue::String`, when
+/// they come straight from the parser. Both carry the same textual
+/// payload and resolve identically — only the source-shape tag differs —
+/// so this matches the [`expand_enum_shorthand`] convention: extract the
+/// text from either variant and materialize the resolved value as
+/// `String` (every downstream consumer reads through the `String` arm;
+/// the `EnumIdentifier` tag is a parser-level strict-shape signal, not a
+/// wire form). Without the `EnumIdentifier` arm, bare struct-field enums
+/// (e.g. `effect = allow`) were left unresolved and diverged from the
+/// AWS-read side, which produces the fully-qualified form (aws#313).
 pub fn resolve_enum_value(value: &Value, parts: &NamespacedEnumParts<'_>) -> Option<Value> {
     let (type_name, ns, dsl_map) = parts;
-    match value {
-        Value::Concrete(ConcreteValue::String(s)) if !s.contains('.') => {
-            // bare identifier: "Enabled" -> ns.TypeName.Enabled
-            let dsl_val = dsl_map.dsl_for(s);
-            Some(Value::Concrete(ConcreteValue::String(format!(
-                "{}.{}.{}",
-                ns, type_name, dsl_val
-            ))))
-        }
-        Value::Concrete(ConcreteValue::String(s))
-            if s.split_once('.')
-                .is_some_and(|(ident, member)| ident == *type_name && !member.contains('.')) =>
-        {
-            // TypeName.value: "VersioningStatus.Enabled" -> ns.TypeName.Enabled
-            let member = s.split_once('.').unwrap().1;
-            let dsl_val = dsl_map.dsl_for(member);
-            Some(Value::Concrete(ConcreteValue::String(format!(
-                "{}.{}.{}",
-                ns, type_name, dsl_val
-            ))))
-        }
-        _ => None,
+    let s = match value {
+        Value::Concrete(ConcreteValue::String(s)) => s.as_str(),
+        Value::Concrete(ConcreteValue::EnumIdentifier(s)) => s.as_str(),
+        _ => return None,
+    };
+    if !s.contains('.') {
+        // bare identifier: "Enabled" -> ns.TypeName.Enabled
+        let dsl_val = dsl_map.dsl_for(s);
+        return Some(Value::Concrete(ConcreteValue::String(format!(
+            "{}.{}.{}",
+            ns, type_name, dsl_val
+        ))));
     }
+    if let Some((ident, member)) = s.split_once('.')
+        && ident == *type_name
+        && !member.contains('.')
+    {
+        // TypeName.value: "VersioningStatus.Enabled" -> ns.TypeName.Enabled
+        let dsl_val = dsl_map.dsl_for(member);
+        return Some(Value::Concrete(ConcreteValue::String(format!(
+            "{}.{}.{}",
+            ns, type_name, dsl_val
+        ))));
+    }
+    None
 }
 
 /// Resolve every enum value reachable from `value` through `attr_type` to
@@ -1589,6 +1603,40 @@ mod tests {
 
         fn s(s: &str) -> Value {
             Value::Concrete(ConcreteValue::String(s.to_string()))
+        }
+
+        fn ei(s: &str) -> Value {
+            Value::Concrete(ConcreteValue::EnumIdentifier(s.to_string()))
+        }
+
+        /// Regression for aws#313: post-carina#2986 the parser emits
+        /// bare DSL enum values as `EnumIdentifier`, not `String`.
+        /// `resolve_enum_value` must resolve them identically (and
+        /// materialize the result as the fully-qualified `String`
+        /// form), otherwise bare struct-field enums like
+        /// `effect = allow` are left unresolved and diverge from the
+        /// AWS-read side which produces the namespaced spelling.
+        #[test]
+        fn leaf_enum_identifier_resolves_like_string() {
+            let aliased = AttributeType::StringEnum {
+                name: "Effect".to_string(),
+                values: vec!["Allow".to_string(), "Deny".to_string()],
+                namespace: Some("aws.iam.PolicyDocument".to_string()),
+                dsl_aliases: vec![
+                    ("Allow".to_string(), "allow".to_string()),
+                    ("Deny".to_string(), "deny".to_string()),
+                ],
+            };
+            // Bare EnumIdentifier resolves to the fully-qualified String
+            // form — identical to what the String input would produce.
+            let from_ei = resolve_enum_value_recursive(&ei("allow"), &aliased).unwrap();
+            assert_eq!(from_ei, s("aws.iam.PolicyDocument.Effect.allow"));
+            let from_str = resolve_enum_value_recursive(&s("allow"), &aliased).unwrap();
+            assert_eq!(from_ei, from_str);
+
+            // TypeName.value shorthand as an EnumIdentifier resolves too.
+            let from_tn = resolve_enum_value_recursive(&ei("Effect.deny"), &aliased).unwrap();
+            assert_eq!(from_tn, s("aws.iam.PolicyDocument.Effect.deny"));
         }
 
         #[test]
