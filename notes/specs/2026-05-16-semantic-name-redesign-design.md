@@ -1,10 +1,12 @@
 # Semantic Name Redesign — Design
 
-Status: **Direction decided** — structured type-identity keyed on
-`provider + service + resource + kind`. User-facing surface stays a
-dotted string (`aws.iam.Role.Arn`). Implementation-architecture detail
-(exact struct shape, WIT contract, generic-type wildcard handling) is
-the open question for the implementation phase.
+Status: **Direction + boundary principle decided.** Structured
+type-identity keyed on `provider + service/resource + kind`;
+user-facing surface stays a dotted string (`aws.iam.Role.Arn`); the
+generic/anonymous boundary is per-axis emptiness (no new flag), generic
+ARN is `aws.Arn` (AWS-scoped, not provider-agnostic). Only mechanism
+(exact struct shape, WIT wire encoding, projection) is open for the
+implementation phase.
 Date: 2026-05-16
 
 <!-- constrained-by ./2026-05-12-strict-enum-identifier-design.md -->
@@ -142,18 +144,76 @@ grounds (consistent with project memory
    the type system. An earlier draft's "don't change the internal
    key" conclusion mistook the motivation and is withdrawn.
 
+## Boundary principle (the "what is generic" line)
+
+The question "`Region` must be provider-distinct, but a bare `String`
+wrapper must not be" turns out **not** to need a new classification
+flag. The existing type system already encodes the line, and the
+struct generalizes it:
+
+### The line is per-axis emptiness, not a generic/specific flag
+
+`semantic_name: None` already means "no identity — anonymous wrapper"
+(`schema/mod.rs:1303` anonymous-source rule). `Some(name)` means
+"named identity". The struct generalizes this binary into per-axis
+emptiness:
+
+| Type | provider | service/resource | Meaning |
+| --- | --- | --- | --- |
+| bare `String` wrapper | — (none) | — | no identity at all (existing `semantic_name: None`) — unchanged, no new work |
+| generic `Arn` → **`aws.Arn`** | `aws` | empty | AWS-scoped, resource-agnostic base |
+| `aws.Region` | `aws` | empty/Region | provider-distinct from `gcp.Region` |
+| `aws.iam.Role.Arn` | `aws` | iam/Role | fully specified, narrowest |
+
+**Principle: two types are the same type iff every *populated* axis is
+equal. An empty axis means "not distinguished on this axis" — it is
+not a wildcard; it places the type *higher in the base chain* (wider).**
+The truly anonymous wrapper (all axes empty) is exactly today's
+`semantic_name: None` behavior, preserved for free.
+
+### Generic `Arn` is `aws.Arn`, not provider-agnostic (user, 2026-05-16)
+
+The generic `arn()` carries `pattern: ^arn:(aws|aws-cn|aws-us-gov):` —
+it is **AWS-specific**, not provider-neutral. GCP has no ARN concept;
+`gcp.Arn` does not exist. So the generic ARN is **`aws.Arn`**:
+`provider = aws`, service/resource axes empty. Its "generic" quality is
+*resource-agnostic within AWS*, not *provider-agnostic*. This makes the
+base chain provider-axis-monotone:
+
+```
+aws.iam.Role.Arn  →  aws.Arn  →  String
+{aws, iam, Role}     {aws, —}     (no identity)
+provider stays `aws` down the chain, then relaxes to none.
+```
+
+**Base-chain invariant:** descending `base` the provider axis is
+monotone — it never *changes* provider, only stays equal or relaxes to
+empty. Rule 4's recursive `base` check must preserve this; an
+implementation that lets provider flip mid-chain is a bug.
+
+### What rule 3 becomes
+
+Today rule 3 is raw string inequality ⇒ NG. Under the struct it
+becomes: **same type iff all populated identity axes are equal**, which
+yields exactly the required distinctions —
+`aws.iam.Role.Arn ≠ aws.acm.Certificate.Arn` (service/resource differ),
+`aws.Region ≠ gcp.Region` (provider differs), bare wrapper stays
+identity-free. No separate generic/specific flag is introduced; the
+`Some/None` binary is simply generalized per axis.
+
 ## Open question for the implementation phase
 
-**Generic / provider-agnostic types.** Some Custom types should NOT be
-provider-partitioned: a bare `String`-based wrapper, a truly generic
-`Arn`. Partitioning those by provider would wrongly reject valid
-cross-provider assignment. The struct must express "this identity has
-no provider axis / matches across providers" explicitly — e.g.
-`provider: Option<…>` or an explicit `Generic` variant. A string key
-would face the same question implicitly and worse; the struct makes it
-a first-class, designed decision. Resolving the exact shape (and the
-WIT-contract change it implies for aws/awscc) is the implementation
-PR's job; this doc only fixes the *direction*.
+The boundary principle above is **decided**. What remains for the
+implementation PR is mechanism, not policy:
+
+- Exact struct field shape and the WIT-contract change it implies for
+  the aws/awscc copies.
+- How an empty axis is encoded on the wire (e.g. `Option` per axis vs
+  a sentinel) — must make the base-chain monotone invariant
+  un-violable, not merely conventional.
+- LSP/diagnostics projection from struct → dotted display string.
+
+This doc fixes *policy/direction*; the above is *mechanism*.
 
 ## Scope / sequencing (per project memory)
 
