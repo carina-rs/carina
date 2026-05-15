@@ -460,6 +460,55 @@ fn namespaced_id_with_digit_segment() {
 }
 
 #[test]
+fn namespaced_id_with_numeric_tail() {
+    // Digit-led tails with underscores (e.g. `2012_10_17`) parse as the
+    // trailing segment of a namespaced enum value — the shape needed for
+    // IAM policy version identifiers (`aws.iam.PolicyDocument.Version.2012_10_17`,
+    // carina#3051). Subsumes the previous `ASCII_DIGIT+`-only rule.
+    let input = r#"
+        let role = aws.iam.Role {
+            assume_role_policy_document = {
+                version = aws.iam.PolicyDocument.Version.2012_10_17
+            }
+        }
+    "#;
+
+    let result = parse(input, &ProviderContext::default()).unwrap();
+    let policy = result.resources[0]
+        .get_attr("assume_role_policy_document")
+        .expect("policy doc attr");
+    let Value::Concrete(ConcreteValue::Map(map)) = policy else {
+        panic!("expected map, got {:?}", policy);
+    };
+    assert_eq!(
+        map.get("version"),
+        Some(&Value::Concrete(ConcreteValue::EnumIdentifier(
+            "aws.iam.PolicyDocument.Version.2012_10_17".to_string()
+        )))
+    );
+}
+
+#[test]
+fn namespaced_id_numeric_tail_preserves_pure_digits() {
+    // The new `numeric_tail` rule must not regress the prior `ASCII_DIGIT+`
+    // behavior. Pure-digit tails (e.g. `.1`) still parse and surface as
+    // `EnumIdentifier` exactly as before.
+    let input = r#"
+        let gw = awscc.ec2.vpn_gateway {
+            kind = Type.1
+        }
+    "#;
+
+    let result = parse(input, &ProviderContext::default()).unwrap();
+    assert_eq!(
+        result.resources[0].get_attr("kind"),
+        Some(&Value::Concrete(ConcreteValue::EnumIdentifier(
+            "Type.1".to_string()
+        )))
+    );
+}
+
+#[test]
 fn parse_nested_blocks_terraform_style() {
     let input = r#"
         let web_sg = aws.security_group {

@@ -1036,6 +1036,38 @@ mod tests {
             )
             .is_ok()
         );
+        // 5-part with digit-led tail (`2012_10_17`) — used for IAM policy
+        // version identifiers (carina#3051). TypeName at index 3 is preserved.
+        assert!(
+            validate_enum_namespace(
+                "aws.iam.PolicyDocument.Version.2012_10_17",
+                "Version",
+                "aws.iam.PolicyDocument"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_namespaced_id_parse_numeric_tail() {
+        // Digit-led tail with underscores parses through the 5-part shape
+        // and flows into `value` verbatim (carina#3051).
+        let id =
+            NamespacedId::parse("aws.iam.PolicyDocument.Version.2012_10_17").expect("should parse");
+        match id {
+            NamespacedId::FullyQualified {
+                provider,
+                segments_str,
+                type_name,
+                value,
+            } => {
+                assert_eq!(provider, "aws");
+                assert_eq!(segments_str, "iam.PolicyDocument");
+                assert_eq!(type_name, "Version");
+                assert_eq!(value, "2012_10_17");
+            }
+            other => panic!("expected FullyQualified, got {:?}", other),
+        }
     }
 
     #[test]

@@ -236,7 +236,13 @@ attribute = { (identifier | string) ~ trivia* ~ equals ~ trivia* ~ expression }
 identifier = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 
 // Namespaced identifier: aws.s3_bucket, aws.Region.ap_northeast_1, Type.ipsec.1
-namespaced_id = @{ identifier ~ ("." ~ (identifier | ASCII_DIGIT+))+ }
+// Trailing segments accept `identifier`, or `numeric_tail` (digit-led with
+// optional alphanumerics/underscores) for date-like enum values such as
+// `aws.iam.PolicyDocument.Version.2012_10_17` (carina#3051). Mirrors the
+// main parser's `namespaced_id` for round-trip parity.
+namespaced_id = @{ identifier ~ ("." ~ (identifier | numeric_tail))+ }
+// Silent rule (`_{...}`): not surfaced as a `Rule` variant.
+numeric_tail = _{ ASCII_DIGIT ~ (ASCII_ALPHANUMERIC | "_")* }
 
 // Namespaced identifier with a trailing chain of `[index]` /
 // `.field` continuations: `orgs.accounts[0]`,

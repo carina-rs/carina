@@ -382,6 +382,12 @@ impl<'a> CstBuilder<'a> {
             // `use_keyword` is a negative-predicate helper used inside
             // `module_call`; it never produces a child node here.
             Rule::use_keyword => None,
+
+            // `numeric_tail` is a silent rule (`_{...}`) used inside the
+            // atomic `namespaced_id`. Pest still generates the `Rule` variant
+            // but suppresses its output, so this arm should be unreachable
+            // in practice. Exists only so the exhaustive match compiles.
+            Rule::numeric_tail => None,
         }
     }
 
