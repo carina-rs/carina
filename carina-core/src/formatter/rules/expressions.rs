@@ -314,4 +314,163 @@ impl Formatter {
         }
         self.write("]");
     }
+
+    /// `wait <target> { until = ..., depends_on = [...], timeout = ... }`.
+    ///
+    /// carina#3049: without this handler the node fell through to
+    /// `format_default`, which strips trivia and concatenates tokens —
+    /// producing `waitcert{until=...}` and silently corrupting source.
+    /// Shape mirrors `format_for_expr`: keyword + target on one line,
+    /// each attribute on its own indented line, closing brace at the
+    /// caller's current indent.
+    pub(in crate::formatter) fn format_wait_expr(&mut self, node: &CstNode) {
+        self.write("wait");
+
+        let attrs: Vec<&CstNode> = node
+            .children
+            .iter()
+            .filter_map(|child| match child {
+                CstChild::Node(n) if n.kind == NodeKind::WaitAttr => Some(n),
+                _ => None,
+            })
+            .collect();
+
+        let max_key_len = if self.config.align_attributes {
+            attrs
+                .iter()
+                .filter_map(|n| Self::wait_attr_key(n))
+                .map(|k| k.len())
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        let mut wrote_target = false;
+        let mut wrote_open_brace = false;
+
+        for child in &node.children {
+            match child {
+                CstChild::Token(token) => {
+                    if token.text == "wait" {
+                        continue;
+                    }
+                    if token.text == "{" {
+                        self.write(" {");
+                        self.write_newline();
+                        self.current_indent += 1;
+                        wrote_open_brace = true;
+                        continue;
+                    }
+                    if token.text == "}" {
+                        self.current_indent -= 1;
+                        self.write_indent();
+                        self.write("}");
+                        continue;
+                    }
+                    if !wrote_target && self.is_identifier(&token.text) {
+                        self.write(" ");
+                        self.write_token(&token.text);
+                        wrote_target = true;
+                    }
+                }
+                CstChild::Node(n) if n.kind == NodeKind::WaitAttr => {
+                    if !wrote_open_brace {
+                        continue;
+                    }
+                    self.format_wait_attr(n, max_key_len);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn wait_attr_key(node: &CstNode) -> Option<&'static str> {
+        for child in &node.children {
+            if let CstChild::Node(n) = child {
+                return match n.kind {
+                    NodeKind::WaitUntilAttr => Some("until"),
+                    NodeKind::WaitTimeoutAttr => Some("timeout"),
+                    NodeKind::WaitDependsOnAttr => Some("depends_on"),
+                    _ => None,
+                };
+            }
+        }
+        None
+    }
+
+    fn format_wait_attr(&mut self, node: &CstNode, align_to: usize) {
+        for child in &node.children {
+            if let CstChild::Node(n) = child {
+                match n.kind {
+                    NodeKind::WaitUntilAttr => self.format_wait_kv_attr(n, "until", align_to),
+                    NodeKind::WaitTimeoutAttr => self.format_wait_kv_attr(n, "timeout", align_to),
+                    NodeKind::WaitDependsOnAttr => {
+                        self.format_wait_depends_on_attr(n, align_to);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn format_wait_kv_attr(&mut self, node: &CstNode, key: &str, align_to: usize) {
+        self.write_indent();
+        self.write(key);
+        self.write_alignment_padding(key.len(), align_to);
+        self.write(" = ");
+
+        // The grammar guarantees exactly one RHS — either a duration
+        // literal (timeout, emitted as a Token) or a validate_expr (until,
+        // emitted as a Node). Iterate over both shapes.
+        for child in &node.children {
+            match child {
+                CstChild::Token(token) => {
+                    if token.text == key || token.text == "=" {
+                        continue;
+                    }
+                    self.write_token(&token.text);
+                }
+                CstChild::Node(n) => {
+                    self.format_node(n);
+                }
+                CstChild::Trivia(_) => {}
+            }
+        }
+        self.write_newline();
+    }
+
+    fn format_wait_depends_on_attr(&mut self, node: &CstNode, align_to: usize) {
+        self.write_indent();
+        let key = "depends_on";
+        self.write(key);
+        self.write_alignment_padding(key.len(), align_to);
+        self.write(" = [");
+
+        let mut first = true;
+        for child in &node.children {
+            if let CstChild::Token(token) = child {
+                match token.text.as_str() {
+                    "depends_on" | "=" | "[" | "]" | "," => continue,
+                    s if self.is_identifier(s) => {
+                        if !first {
+                            self.write(", ");
+                        }
+                        self.write_token(s);
+                        first = false;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.write("]");
+        self.write_newline();
+    }
+
+    fn write_alignment_padding(&mut self, key_len: usize, align_to: usize) {
+        if align_to > 0 && key_len < align_to {
+            let padding = align_to - key_len;
+            self.write(&" ".repeat(padding));
+        }
+    }
 }
