@@ -163,6 +163,66 @@ fn fmt_idempotent_on_carina_state_fixture() {
     }
 }
 
+// `wait-cert-issued/` mirrors the directory layout of an ACM-DNS-validation
+// stack (`carina-rs/infra` pattern): `main.crn` declares the cert + DNS
+// record, `wait.crn` declares a `let X = wait <target> { ... }` binding.
+//
+// carina#3049: before this fix, `format_node` had no arm for `WaitExpr`,
+// so the node fell through to `format_default` — which strips trivia
+// and concatenates tokens, producing `waitcert{until=...}timeout=75min}`
+// (unparseable). The pre-commit hook in `carina-rs/infra` then silently
+// corrupted the file. This fixture guards the directory-scoped shape.
+#[test]
+fn fmt_accepts_wait_cert_issued_fixture() {
+    let dir = fixture_dir("wait-cert-issued");
+    let result = format_all_crn_files(&dir);
+    assert!(
+        result.is_ok(),
+        "`carina fmt` must parse every .crn file in {}. Failures:\n{}",
+        dir.display(),
+        result.unwrap_err()
+    );
+}
+
+#[test]
+fn fmt_idempotent_on_wait_cert_issued_fixture() {
+    let dir = fixture_dir("wait-cert-issued");
+    let config = FormatConfig::default();
+    let entries = fs::read_dir(&dir).expect("read_dir");
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "crn") {
+            let source = fs::read_to_string(&path).expect("read file");
+            let first = format(&source, &config)
+                .unwrap_or_else(|e| panic!("{}: format failed: {}", path.display(), e));
+            let second = format(&first, &config)
+                .unwrap_or_else(|e| panic!("{}: second format failed: {}", path.display(), e));
+            assert_eq!(
+                first,
+                second,
+                "format must be idempotent on {}",
+                path.display()
+            );
+        }
+    }
+}
+
+// Fixture must already be in canonical fmt — any drift here means the
+// formatter's wait-block emitter changed shape and a reviewer should see
+// the snapshot move explicitly.
+#[test]
+fn fmt_wait_cert_issued_fixture_is_canonical() {
+    let dir = fixture_dir("wait-cert-issued");
+    let config = FormatConfig::default();
+    let path = dir.join("wait.crn");
+    let source = fs::read_to_string(&path).expect("read wait.crn");
+    let formatted = format(&source, &config).expect("format must succeed");
+    assert_eq!(
+        source, formatted,
+        "wait-block fixture has drifted from canonical fmt — re-format and update the fixture"
+    );
+}
+
 #[test]
 fn fmt_preserves_comments_in_carina_state_fixture() {
     let dir = fixture_dir("carina-state");

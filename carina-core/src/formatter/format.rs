@@ -214,6 +214,7 @@ impl Formatter {
             NodeKind::FunctionCall => self.format_function_call(node),
             NodeKind::VariableRef => self.format_variable_ref(node),
             NodeKind::SubscriptedId => self.format_subscripted_id(node),
+            NodeKind::WaitExpr => self.format_wait_expr(node),
             NodeKind::List => self.format_list(node),
             NodeKind::Map => self.format_map(node),
             NodeKind::MapEntry => self.format_map_entry(node),
@@ -2231,5 +2232,83 @@ aws.s3.Bucket {
         let first = format(input, &config).unwrap();
         let second = format(&first, &config).unwrap();
         assert_eq!(first, second, "depends_on sort must be idempotent");
+    }
+
+    // carina#3049 — `wait <target> { ... }` had no `format_node` arm, so
+    // it fell through to `format_default`. That handler skips Trivia and
+    // joins tokens with no whitespace, producing unparseable output like
+    // `waitcert{until=...issueddepends_on=[...]timeout=75min}`.
+    #[test]
+    fn issue_3049_wait_block_is_idempotent_and_parseable() {
+        let input = "let cert_issued = wait cert {\n  until      = cert.status == aws.acm.Certificate.Status.Issued\n  depends_on = [validation_record]\n  timeout    = 75min\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+
+        assert!(
+            result.contains("let cert_issued = wait cert {"),
+            "header must preserve spaces between wait/target/brace, got:\n{}",
+            result
+        );
+        assert!(
+            result.contains("until"),
+            "until attribute must be preserved, got:\n{}",
+            result
+        );
+        assert!(
+            result.contains("depends_on = [validation_record]"),
+            "depends_on attribute must keep `=` and brackets, got:\n{}",
+            result
+        );
+        assert!(
+            result.contains("timeout"),
+            "timeout attribute must be preserved, got:\n{}",
+            result
+        );
+        // The corruption signature from the issue: collapsed identifiers.
+        assert!(
+            !result.contains("waitcert"),
+            "wait/target must not be collapsed, got:\n{}",
+            result
+        );
+        assert!(
+            !result.contains("issueddepends_on"),
+            "attribute boundary must not be collapsed, got:\n{}",
+            result
+        );
+
+        let second = format(&result, &config).unwrap();
+        assert_eq!(result, second, "wait-block formatting must be idempotent");
+    }
+
+    #[test]
+    fn issue_3049_wait_block_collapses_unformatted_source() {
+        // Unformatted single-line source must produce the canonical
+        // multi-line shape, with proper spacing in the header and around
+        // every `=`.
+        let input = "let cert_issued=wait cert{until=cert.status == aws.acm.Certificate.Status.Issued\ndepends_on=[validation_record]\ntimeout=75min}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+
+        assert!(
+            result.contains("let cert_issued = wait cert {"),
+            "header should be canonical, got:\n{}",
+            result
+        );
+        assert!(
+            result.contains("  until      = cert.status == aws.acm.Certificate.Status.Issued")
+                || result.contains("  until = cert.status == aws.acm.Certificate.Status.Issued"),
+            "until attribute should be indented and aligned, got:\n{}",
+            result
+        );
+        assert!(
+            result.contains("  depends_on = [validation_record]"),
+            "depends_on attribute should be indented, got:\n{}",
+            result
+        );
+        assert!(
+            result.contains("  timeout") && result.contains("= 75min"),
+            "timeout attribute should be indented, got:\n{}",
+            result
+        );
     }
 }
