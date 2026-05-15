@@ -1,6 +1,8 @@
 # Semantic Name Redesign — Design
 
-Status: **Draft / discussion** (naming format intentionally NOT yet decided)
+Status: **Format decided** — Option C (dotted, PascalCase tail:
+`aws.iam.Role.Arn`). Projection-owner design is the open implementation
+question.
 Date: 2026-05-16
 
 <!-- constrained-by ./2026-05-12-strict-enum-identifier-design.md -->
@@ -107,9 +109,15 @@ rename, it is a type-identity-representation change.
 | D. Dotted namespaced, upper tail | `aws.iam.Role.ARN` (user's original) | **No** | as C, plus `ARN` all-caps diverges from the existing namespaced-identifier tail convention (`enabled`, lowercase) — see strict-enum-identifier design |
 
 A and B are struck because the resolved goal requires **both**
-disambiguation and namespace consistency (next section). The live
-choice is between C and D (tail casing), conditional on the projection
-owner being designed explicitly.
+disambiguation and namespace consistency (next section).
+
+**Decided (user, 2026-05-16): Option C — `aws.iam.Role.Arn`.** The
+PascalCase tail (`Arn`, not `ARN`) is chosen because the existing
+namespaced-identifier convention keeps tails in a lower/PascalCase
+register (`enabled`), and an all-caps `ARN` segment visually diverges
+from that convention (see strict-enum-identifier design). The
+acronym-uppercasing question is closed; the remaining open item is
+purely the projection-owner architecture below.
 
 ### Resolved direction (user, 2026-05-16)
 
@@ -189,8 +197,9 @@ type-system change mid-flight.
 
 ## Non-goals
 
-- Picking the exact tail casing (C vs D) — deferred; the goal and
-  scope are resolved, the string spelling is not.
+- Designing the projection-owner architecture in detail (registry vs
+  `TypeExpr` variant vs parser rule) — that is the implementation
+  PR's job; this doc only mandates that an explicit owner exist.
 - Any code change in this PR — documentation only. Scope is resolved
   as the **whole `semantic_name` surface** (ID + ARN + enum-ish,
   aws + awscc); no partial ARN-only rollout.
