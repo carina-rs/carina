@@ -1,12 +1,15 @@
 # Semantic Name Redesign — Design
 
-Status: **Direction + boundary principle decided.** Structured
-type-identity keyed on `provider + service/resource + kind`;
-user-facing surface stays a dotted string (`aws.iam.Role.Arn`); the
-generic/anonymous boundary is per-axis emptiness (no new flag), generic
-ARN is `aws.Arn` (AWS-scoped, not provider-agnostic). Only mechanism
-(exact struct shape, WIT wire encoding, projection) is open for the
-implementation phase.
+Status: **Direction + boundary + cross-cutting policy decided; ONE
+open question (E) needs user input.** Structured type-identity keyed on
+`provider + service/resource + kind`; generic/anonymous boundary is
+per-axis emptiness (no new flag); generic ARN is `aws.Arn`
+(AWS-scoped). The string round-trip is killed at all three boundaries
+(WIT contract / `ExpectedEnumVariant` / `type_name()` API) in one
+effort, not partially. **Open: E — whether the dotted identifier is
+also *input* (grammar change) or *display-only*.** Mechanism details
+(struct shape, WIT wire encoding, projection) deferred to
+implementation.
 Date: 2026-05-16
 
 <!-- constrained-by ./2026-05-12-strict-enum-identifier-design.md -->
@@ -201,19 +204,108 @@ yields exactly the required distinctions —
 identity-free. No separate generic/specific flag is introduced; the
 `Some/None` binary is simply generalized per axis.
 
-## Open question for the implementation phase
+## Cross-cutting principle: kill the string round-trip everywhere
 
-The boundary principle above is **decided**. What remains for the
-implementation PR is mechanism, not policy:
+The "collapse a structure into a string, then `split`/`pascal_to_snake`
+it back" anti-pattern this redesign removes is **not localized to
+`semantic_name`**. Code inspection (2026-05-16) found it already
+present in three places:
 
-- Exact struct field shape and the WIT-contract change it implies for
-  the aws/awscc copies.
-- How an empty axis is encoded on the wire (e.g. `Option` per axis vs
-  a sentinel) — must make the base-chain monotone invariant
-  un-violable, not merely conventional.
-- LSP/diagnostics projection from struct → dotted display string.
+1. **WIT boundary** — `validate-custom-type(type-name: string)`
+   (`provider.wit:114`) is called with `pascal_to_snake(type_name)`
+   (`parser/functions.rs:205,350,452`); the plugin re-keys off that
+   string.
+2. **`ExpectedEnumVariant::from_namespaced`** — recovers axes via
+   `ns.split('.')` (`schema/mod.rs:~1762`).
+3. **Internal `type_name()` API** — used for type comparison in 6+
+   `validation/mod.rs` sites, including the double round-trip
+   `pascal_to_snake(&current.type_name())` at `mod.rs:471`.
 
-This doc fixes *policy/direction*; the above is *mechanism*.
+**Principle: structure the identity at all three boundaries in the
+same effort. A partial migration that keeps any one of them
+string-keyed just relocates the anti-pattern** (project memory
+`feedback_root_cause_over_per_site_patch`). The per-boundary policy:
+
+### A. WIT contract — restructure, do not pass a string
+
+`validate-custom-type`'s `type-name: string` parameter must become a
+structured record carrying the identity axes. Passing the dotted
+string and having the aws/awscc plugin `split('.')` it merely exports
+the anti-pattern across the plugin boundary. This is a **breaking WIT
+contract change** (`carina-plugin-wit` + aws + awscc), a policy
+decision, not a mechanism detail. Safety valve: the mock provider does
+**not** implement `validate-custom-type`, so `carina-plugin-host`
+tests are insulated; blast radius is the aws/awscc plugins only.
+
+### B/F. Unify the three existing provider-axis representations
+
+The provider/service axis is **already** represented three times, all
+string-encoded:
+
+- `ExpectedEnumVariant { provider: Option<String>, segments:
+  Vec<String>, type_name: String }` (`schema/mod.rs`) — nearly the
+  exact target shape, plus enum-only `value`/`is_alias`, and a
+  `Display` that already does struct→dotted projection.
+- `Custom { namespace: Option<String> }` — e.g. `"aws.vpc"`, a
+  provider+service string used for enum-shorthand resolution.
+- the flat `semantic_name` itself.
+
+**Policy: extract the axis structure
+(`provider` + `segments` + `type_name`) as one shared identity base.**
+`ExpectedEnumVariant` becomes that base plus `value`/`is_alias`;
+`Custom.namespace` folds into the same structure. Do **not** introduce
+a fourth, parallel struct — that re-creates the dispersion this
+redesign exists to remove. `from_namespaced`'s `split('.')` is
+replaced by carrying the structure directly.
+
+### D. `type_name()` becomes display-only
+
+`type_name() -> String` is consumed for **type comparison** in 6+
+sites; comparison must move to a structure-based predicate
+(`is_same_identity(&TypeIdentity)` or similar). `type_name()` is
+demoted to **display-only**, and using it for comparison becomes a
+documented invariant violation. `accepts_type_name(&str)` takes the
+structured identity or is removed.
+
+### C. State persistence — verified safe, no migration
+
+`carina-state/src/` does **not** persist `semantic_name` / `type_name`
+/ `TypeExpr`. Type identity is not baked into state v3, so the
+restructure needs **no state migration** and breaks no existing state
+files. Recorded here so the implementation PR does not invent a
+migration.
+
+## Open question requiring user input
+
+### E. Is the dotted identifier *input* syntax, or *display-only*?
+
+The grammar (`parser/carina.pest:124`) defines the type-annotation
+atom as `type_simple = @{ identifier }` — a **single identifier, no
+dots**. `type_ref = resource_type_path` (`identifier(.identifier)+`)
+*is* dotted but is reserved for **resource-type references**. So
+"user-facing dotted string" is currently ambiguous on one point this
+doc has not resolved:
+
+- **E-1: input too.** Users may write
+  `fn f(x: aws.iam.Role.Arn)` in a type annotation. Requires extending
+  `type_simple` to accept dots **and** disambiguating it from
+  `type_ref` — this widens the design scope into the grammar/parser.
+- **E-2: display-only.** The dotted form appears only in validate
+  errors / LSP; type annotations keep a non-dotted spelling (or the
+  feature is not annotation-writable at all). No grammar change; but
+  "user-facing surface" then means *output presentation only*.
+
+This changes what "the user-facing surface stays a dotted string"
+means and whether the parser is in scope. **Unresolved — needs a user
+decision before the doc is final.**
+
+## Remaining mechanism (implementation phase, not policy)
+
+- Exact struct field shape and the WIT record layout it implies.
+- How an empty axis is encoded on the wire (`Option` per axis vs
+  sentinel) — must make the base-chain monotone invariant
+  un-violable by construction, not by convention.
+- The struct → dotted display projection implementation.
 
 ## Scope / sequencing (per project memory)
 
