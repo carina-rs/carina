@@ -101,19 +101,81 @@ rename, it is a type-identity-representation change.
 
 | Option | Example | Round-trips through current pipeline? | Cost |
 | --- | --- | --- | --- |
-| A. Status quo | `IamRoleArn` | Yes | none |
-| B. PascalCase, lowercase tail | `IamRoleArn` → keep, document convention | Yes | docs only |
-| C. Dotted namespaced, Pascal tail | `aws.iam.Role.Arn` | **No** — needs new projection | redesign inference/parser/LSP + 3-repo sweep |
+| A. Status quo | `IamRoleArn` | Yes | **Rejected** — gives neither disambiguation nor namespace consistency |
+| B. PascalCase, lowercase tail | `IamRoleArn` (documented) | Yes | **Rejected** — same reason as A |
+| C. Dotted namespaced, Pascal tail | `aws.iam.Role.Arn` | **No** — needs new projection owner | redesign inference/parser/LSP + 3-repo sweep |
 | D. Dotted namespaced, upper tail | `aws.iam.Role.ARN` (user's original) | **No** | as C, plus `ARN` all-caps diverges from the existing namespaced-identifier tail convention (`enabled`, lowercase) — see strict-enum-identifier design |
 
-Open sub-questions to resolve before picking:
+A and B are struck because the resolved goal requires **both**
+disambiguation and namespace consistency (next section). The live
+choice is between C and D (tail casing), conditional on the projection
+owner being designed explicitly.
 
-1. Is the goal **disambiguation** (resource × kind) or **namespace
-   consistency** with DSL identifiers? They imply different formats.
-2. Does the ID family need the same treatment as the ARN family, or
-   only ARNs? (31 ID names vs 4–7 ARN names — scope differs hugely.)
-3. If dotted: who owns the projection that maps the dotted identity to
-   a `TypeExpr`? This is the real design work, not the string.
+### Resolved direction (user, 2026-05-16)
+
+- **Goal: both.** The format must simultaneously give
+  *disambiguation* (the resource × kind axes must be separately
+  readable in the name) **and** *namespace consistency* with the DSL's
+  existing dotted identifiers (`aws.iam.Role`,
+  `aws.s3.Bucket.VersioningStatus.enabled`). A format that satisfies
+  only one is rejected. This eliminates options A and B (flat
+  PascalCase gives neither cleanly) and points at a dotted,
+  axis-structured form — i.e. the work is in option C/D territory and
+  the projection redesign below is unavoidable, not optional.
+- **Scope: the whole `semantic_name` surface, not just ARNs.** All
+  families — ID (31), ARN (4–7), and the enum-ish entries
+  (`IamPolicyEffect`, `IamPolicyVersion`, `PolicyConditionValue`, …) —
+  across both the aws and awscc copies. The rename is uniform; there
+  is no "ARN-only" partial rollout.
+
+### The real design work: who owns the projection?
+
+"Projection" = the step that converts a schema-side type identity
+(`semantic_name`) into the declaration-side form a user writes in a DSL
+type annotation, so the two can be matched.
+
+Today this projection is trivial and **owned implicitly by
+`pascal_to_snake`**:
+
+```
+schema side                         declaration side (user's DSL)
+Custom { semantic_name:             let x: iam_role_arn = ...
+  "IamRoleArn" }            ←──────────────  ^^^^^^^^^^^^
+        │ pascal_to_snake
+        ▼
+   "iam_role_arn"  ── string-equality compare ──┘
+```
+
+`validation/inference.rs:561-564` maps
+`Custom { semantic_name: Some(name) }` →
+`TypeExpr::Simple(pascal_to_snake(name))`; `parser/util.rs` defines the
+inverse so the strings line up. No component "owns" the type-name
+representation — it is an emergent property of one string transform.
+
+A dotted, axis-structured name (`aws.iam.Role.Arn`) breaks this,
+raising the questions that are the actual design:
+
+1. **What does the user write?** Is the DSL annotation literally
+   `aws.iam.Role.Arn`, or a shorter alias? The dotted form already
+   means *resource reference* (`aws.iam.Role`) and *enum value*
+   (`aws.s3.Bucket.VersioningStatus.enabled`) in the grammar — a third
+   meaning (type name) needs a disambiguation rule the parser can
+   apply.
+2. **Which component resolves it?** The parser
+   (`parser/carina.pest` + `parser/util.rs`), type inference
+   (`inference.rs`), or a *new* explicit type-name registry that owns
+   the mapping rather than leaving it emergent? This is the
+   architectural decision the implementation PR cannot avoid.
+3. **How do LSP completion/diagnostics
+   (`completion/values.rs:1947`, `diagnostics/mod.rs:535`) consume the
+   new identity?** They currently hard-assume single-token PascalCase.
+
+The recommendation of this doc is that the implementation phase must
+**introduce an explicit owner for type-name representation** (a
+registry / dedicated `TypeExpr` variant) rather than extend the
+implicit `pascal_to_snake` round-trip. Renaming the strings without
+this is the failure mode that turns a "rename PR" into an unscoped
+type-system change mid-flight.
 
 ## Scope / sequencing (per project memory)
 
@@ -127,6 +189,8 @@ Open sub-questions to resolve before picking:
 
 ## Non-goals
 
-- Picking the final format (deferred by explicit instruction).
-- Touching the ID family unless the resolved scope includes it.
-- Any code change in this PR — documentation only.
+- Picking the exact tail casing (C vs D) — deferred; the goal and
+  scope are resolved, the string spelling is not.
+- Any code change in this PR — documentation only. Scope is resolved
+  as the **whole `semantic_name` surface** (ID + ARN + enum-ish,
+  aws + awscc); no partial ARN-only rollout.
