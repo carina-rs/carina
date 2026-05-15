@@ -632,6 +632,181 @@ pub fn resolve_enum_value_recursive(value: &Value, attr_type: &AttributeType) ->
     }
 }
 
+/// Lift every `ConcreteValue::String` that sits at a `StringEnum`-typed
+/// position to `ConcreteValue::EnumIdentifier`, descending into struct
+/// fields, list elements, and map values, when (and only when) the
+/// string is a recognized member of that enum.
+///
+/// # Why this exists (awscc#251)
+///
+/// carina#2986 Phase 4 made the schema validator *strict*: a
+/// `StringEnum` position only accepts `ConcreteValue::EnumIdentifier`,
+/// never `ConcreteValue::String` (a bare quoted string at an enum
+/// position is a form error — see the `StringLiteralExpectedEnum`
+/// diagnostic). awscc#250 then promoted IAM policy `version`/`effect`
+/// from `Custom` to `StringEnum`.
+///
+/// Persisted state files (S3/local JSON) written *before* that schema
+/// change store these values as plain JSON strings. On load the
+/// schema-blind bridge `json_to_dsl_value` (carina-state) turns them
+/// into `ConcreteValue::String`. `carina validate`/`plan` then
+/// re-validate upstream-state-referenced resources against the *new*
+/// schema, and the loaded `String` is rejected at the now-`StringEnum`
+/// position even though the stored value is perfectly valid.
+///
+/// This function is the read/state-load counterpart to
+/// [`resolve_enum_value_recursive`] (which handles the desired-side,
+/// parser-fed direction). It is intentionally schema-aware and general:
+/// it does not name IAM, `version`, or `effect` anywhere, so any
+/// current or future `Custom`→`StringEnum` migration is covered without
+/// further changes. It is *not* a validator carve-out — the validator
+/// stays strict; old state is migrated in memory before validation.
+///
+/// Only recognized members are lifted. A string is recognized when it
+/// equals one of the enum's API-canonical `values` or appears on either
+/// side of a `dsl_aliases` pair. Unrecognized strings are left as
+/// `ConcreteValue::String` so the strict validator still rejects
+/// genuinely-invalid state instead of silently masking it.
+///
+/// The variant tag changes from `String` to `EnumIdentifier` (mirroring
+/// the carina#2996 map-key precedent in `AttributeType::validate_map`,
+/// schema/mod.rs). The text is normalized to the **DSL spelling** via
+/// `DslMap::dsl_for` because the strict validator rejects the
+/// API-canonical form whenever a `dsl_aliases` entry rewrites it (the
+/// DSL surface convention is the alias spelling — see
+/// `feedback_dsl_enum_snake_case_convention.md` and carina#2980). For
+/// enums with no rewriting alias the DSL spelling equals the API
+/// spelling, so the text is unchanged in that case.
+///
+/// `Union` types are not recursed into, matching
+/// [`resolve_enum_value_recursive`]'s documented contract.
+pub fn lift_state_string_enums_to_identifiers(
+    attributes: &mut std::collections::HashMap<String, Value>,
+    schema: &crate::schema::ResourceSchema,
+) {
+    for (name, attr) in &schema.attributes {
+        if let Some(value) = attributes.get(name)
+            && let Some(lifted) = lift_string_enum_leaves(value, &attr.attr_type)
+        {
+            attributes.insert(name.clone(), lifted);
+        }
+    }
+}
+
+/// Apply [`lift_state_string_enums_to_identifiers`] to every resource's
+/// loaded prior-state attributes, resolving each resource's schema from
+/// `registry`.
+///
+/// This is the single entry point every persisted-state load seam must
+/// call before the state reaches the differ or the validator. There are
+/// three such seams in the CLI — `carina plan`, `carina apply`, and
+/// `carina state` — each builds its own `saved_attrs` map from
+/// `StateFile::build_saved_attrs`. Wiring this helper at all three keeps
+/// the migration uniform: fixing only the plan seam (awscc#251's first
+/// cut) left `apply` carrying un-lifted `String` state, which the
+/// already-lifted desired side then diffed against as a spurious
+/// `String` vs `EnumIdentifier` change on every apply.
+///
+/// Resources whose schema is not in `registry` (or that have no saved
+/// attributes) are skipped.
+pub fn lift_saved_state_string_enums(
+    saved_attrs: &mut std::collections::HashMap<
+        crate::resource::ResourceId,
+        std::collections::HashMap<String, Value>,
+    >,
+    resources: &[crate::resource::Resource],
+    registry: &crate::schema::SchemaRegistry,
+) {
+    for resource in resources {
+        if let Some(schema) = registry.get_for(resource)
+            && let Some(attrs) = saved_attrs.get_mut(&resource.id)
+        {
+            lift_state_string_enums_to_identifiers(attrs, schema);
+        }
+    }
+}
+
+/// Value-level worker for [`lift_state_string_enums_to_identifiers`].
+///
+/// Returns `Some(new_value)` when at least one nested value was lifted,
+/// `None` when nothing changed — mirroring
+/// [`resolve_enum_value_recursive`]'s "rewrite only on diff" contract so
+/// callers can skip cloning.
+pub fn lift_string_enum_leaves(value: &Value, attr_type: &AttributeType) -> Option<Value> {
+    // Leaf case: this position is itself a StringEnum.
+    if let Some((_, values, _, dsl_map)) = attr_type.string_enum_parts() {
+        if let Value::Concrete(ConcreteValue::String(s)) = value {
+            let is_member = values.iter().any(|v| v == s)
+                || match dsl_map {
+                    crate::schema::DslMap::Aliases(pairs) => {
+                        pairs.iter().any(|(api, dsl)| api == s || dsl == s)
+                    }
+                    crate::schema::DslMap::Closure(_) => false,
+                };
+            if is_member {
+                // Normalize to the DSL spelling: the strict validator
+                // requires the alias form when one rewrites the API
+                // value. `dsl_for` is identity for non-aliased members
+                // and idempotent when the stored value is already the
+                // DSL spelling.
+                let dsl = dsl_map.dsl_for(s);
+                return Some(Value::Concrete(ConcreteValue::EnumIdentifier(dsl)));
+            }
+        }
+        // Recognized-or-not, a StringEnum leaf has no children.
+        return None;
+    }
+
+    match attr_type {
+        AttributeType::Struct { fields, .. } => {
+            let Value::Concrete(ConcreteValue::Map(map)) = value else {
+                return None;
+            };
+            let mut rewritten = map.clone();
+            let mut changed = false;
+            for field in fields {
+                if let Some(field_value) = map.get(&field.name)
+                    && let Some(new_field) = lift_string_enum_leaves(field_value, &field.field_type)
+                {
+                    rewritten.insert(field.name.clone(), new_field);
+                    changed = true;
+                }
+            }
+            changed.then_some(Value::Concrete(ConcreteValue::Map(rewritten)))
+        }
+        AttributeType::List { inner, .. } => {
+            let Value::Concrete(ConcreteValue::List(items)) = value else {
+                return None;
+            };
+            let mut rewritten = items.clone();
+            let mut changed = false;
+            for (i, item) in items.iter().enumerate() {
+                if let Some(new_item) = lift_string_enum_leaves(item, inner) {
+                    rewritten[i] = new_item;
+                    changed = true;
+                }
+            }
+            changed.then_some(Value::Concrete(ConcreteValue::List(rewritten)))
+        }
+        AttributeType::Map { value: inner, .. } => {
+            let Value::Concrete(ConcreteValue::Map(map)) = value else {
+                return None;
+            };
+            let mut rewritten = map.clone();
+            let mut changed = false;
+            for (k, v) in map {
+                if let Some(new_v) = lift_string_enum_leaves(v, inner) {
+                    rewritten.insert(k.clone(), new_v);
+                    changed = true;
+                }
+            }
+            changed.then_some(Value::Concrete(ConcreteValue::Map(rewritten)))
+        }
+        // Scalars and Union: nothing to descend into.
+        _ => None,
+    }
+}
+
 /// Normalize a single state enum value to its fully-qualified namespaced DSL format.
 ///
 /// Unlike `resolve_enum_value`, this also handles values that contain dots but are
@@ -1932,5 +2107,77 @@ mod tests {
                 "ap-northeast-1"
             );
         }
+    }
+
+    /// awscc#251: pin the wiring-level helper, not just the leaf walker.
+    /// Proves registry resolution + per-`ResourceId` keying work end to
+    /// end — the part the isolated `ResourceSchema::validate` test in
+    /// schema/tests.rs does not exercise. A resource whose schema is in
+    /// the registry gets its loaded `String` state lifted; a resource
+    /// absent from the registry is skipped without panic.
+    #[test]
+    fn lift_saved_state_string_enums_resolves_schema_per_resource() {
+        use crate::resource::{ConcreteValue, Resource, ResourceId, Value};
+        use crate::schema::{
+            AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
+        };
+        use std::collections::HashMap;
+
+        let version_enum = AttributeType::StringEnum {
+            name: "Version".to_string(),
+            values: vec!["2012-10-17".to_string()],
+            namespace: Some("aws.iam.PolicyDocument".to_string()),
+            dsl_aliases: vec![("2012-10-17".to_string(), "2012_10_17".to_string())],
+        };
+        let policy_struct = AttributeType::Struct {
+            name: "PolicyDocument".to_string(),
+            fields: vec![StructField::new("version", version_enum)],
+        };
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "awscc",
+            ResourceSchema::new("iam.RolePolicy")
+                .attribute(AttributeSchema::new("policy_document", policy_struct)),
+        );
+
+        let known = Resource::with_provider("awscc", "iam.RolePolicy", "rp", None);
+        let unknown = Resource::with_provider("awscc", "iam.Unknown", "x", None);
+
+        let mut pd = indexmap::IndexMap::new();
+        pd.insert(
+            "version".to_string(),
+            Value::Concrete(ConcreteValue::String("2012-10-17".to_string())),
+        );
+        let mut known_attrs = HashMap::new();
+        known_attrs.insert(
+            "policy_document".to_string(),
+            Value::Concrete(ConcreteValue::Map(pd)),
+        );
+        let mut unknown_attrs = HashMap::new();
+        unknown_attrs.insert(
+            "whatever".to_string(),
+            Value::Concrete(ConcreteValue::String("Allow".to_string())),
+        );
+
+        let mut saved: HashMap<ResourceId, HashMap<String, Value>> = HashMap::new();
+        saved.insert(known.id.clone(), known_attrs);
+        saved.insert(unknown.id.clone(), unknown_attrs);
+
+        lift_saved_state_string_enums(&mut saved, &[known.clone(), unknown.clone()], &registry);
+
+        let Value::Concrete(ConcreteValue::Map(pd)) = &saved[&known.id]["policy_document"] else {
+            panic!("policy_document map");
+        };
+        assert_eq!(
+            pd["version"],
+            Value::Concrete(ConcreteValue::EnumIdentifier("2012_10_17".to_string())),
+            "resource present in registry must have its state lifted"
+        );
+        // Schema-less resource: untouched, no panic.
+        assert_eq!(
+            saved[&unknown.id]["whatever"],
+            Value::Concrete(ConcreteValue::String("Allow".to_string())),
+            "resource absent from registry is skipped unchanged"
+        );
     }
 }
