@@ -978,6 +978,17 @@ async fn run_apply_locked(
         &remote_bindings,
     );
 
+    // awscc#251: lift the provider-read `current_states` (not just
+    // `saved_attrs` above) — a refresh whose `provider.read()` returns
+    // plain-`String` IAM enum values must be lifted before the differ
+    // consumes it, same as the plan path. Both refresh phases have
+    // populated `current_states` by here.
+    carina_core::utils::lift_current_state_string_enums(
+        &mut current_states,
+        &parsed.resources,
+        ctx.schemas(),
+    );
+
     // Resolve references and enum identifiers, then create initial plan for display
     let mut resources_for_plan = sorted_resources.clone();
     resolve_refs_with_state_and_remote(&mut resources_for_plan, &current_states, &remote_bindings)?;

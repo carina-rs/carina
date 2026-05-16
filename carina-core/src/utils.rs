@@ -761,6 +761,42 @@ pub fn lift_saved_state_string_enums(
     }
 }
 
+/// Apply [`lift_state_string_enums_to_identifiers`] to every resource's
+/// **read-back** state attributes (`current_states`), resolving each
+/// resource's schema from `registry`.
+///
+/// [`lift_saved_state_string_enums`] only migrates the cached
+/// `saved_attrs` map (state-file JSON). On a refresh, the live value is
+/// produced by `provider.read()` and lands in `current_states`, a
+/// *different* map the saved-attrs lift never touches. A provider that
+/// returns an IAM policy document with plain `String` `version` /
+/// `effect` (the on-the-wire shape for a field that was `Custom` when
+/// the resource was created, now `StringEnum` after awscc#250) then
+/// flows un-lifted into the differ, where the strict carina#2986
+/// validator rejects it — the exact failure awscc#251's first cut
+/// (#3055) did not fix because it only covered `saved_attrs`. Call this
+/// once after both refresh branches have populated `current_states`,
+/// before the differ / resolver consume it.
+///
+/// Resources whose schema is not in `registry` (or that have no state)
+/// are skipped.
+pub fn lift_current_state_string_enums(
+    current_states: &mut std::collections::HashMap<
+        crate::resource::ResourceId,
+        crate::resource::State,
+    >,
+    resources: &[crate::resource::Resource],
+    registry: &crate::schema::SchemaRegistry,
+) {
+    for resource in resources {
+        if let Some(schema) = registry.get_for(resource)
+            && let Some(state) = current_states.get_mut(&resource.id)
+        {
+            lift_state_string_enums_to_identifiers(&mut state.attributes, schema);
+        }
+    }
+}
+
 /// Value-level worker for [`lift_state_string_enums_to_identifiers`].
 ///
 /// Returns `Some(new_value)` when at least one nested value was lifted,
@@ -2213,6 +2249,67 @@ mod tests {
             saved[&unknown.id]["whatever"],
             Value::Concrete(ConcreteValue::String("Allow".to_string())),
             "resource absent from registry is skipped unchanged"
+        );
+    }
+
+    /// awscc#251 follow-up: the read-back map (`current_states`) must be
+    /// lifted too — #3055 only covered `saved_attrs`, so a refresh whose
+    /// `provider.read()` returns plain-String IAM enum values still
+    /// failed the strict validator.
+    #[test]
+    fn lift_current_state_string_enums_lifts_provider_read_state() {
+        use crate::resource::{ConcreteValue, Resource, ResourceId, State, Value};
+        use crate::schema::{
+            AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
+        };
+        use std::collections::HashMap;
+
+        let version_enum = AttributeType::StringEnum {
+            name: "Version".to_string(),
+            values: vec!["2012-10-17".to_string()],
+            namespace: Some("aws.iam.PolicyDocument".to_string()),
+            dsl_aliases: vec![("2012-10-17".to_string(), "2012_10_17".to_string())],
+        };
+        let policy_struct = AttributeType::Struct {
+            name: "PolicyDocument".to_string(),
+            fields: vec![StructField::new("version", version_enum)],
+        };
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "awscc",
+            ResourceSchema::new("iam.Role").attribute(AttributeSchema::new(
+                "assume_role_policy_document",
+                policy_struct,
+            )),
+        );
+
+        let role = Resource::with_provider("awscc", "iam.Role", "bs.bootstrap.role", None);
+
+        let mut pd = indexmap::IndexMap::new();
+        pd.insert(
+            "version".to_string(),
+            Value::Concrete(ConcreteValue::String("2012-10-17".to_string())),
+        );
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "assume_role_policy_document".to_string(),
+            Value::Concrete(ConcreteValue::Map(pd)),
+        );
+
+        let mut current: HashMap<ResourceId, State> = HashMap::new();
+        current.insert(role.id.clone(), State::existing(role.id.clone(), attrs));
+
+        lift_current_state_string_enums(&mut current, std::slice::from_ref(&role), &registry);
+
+        let Value::Concrete(ConcreteValue::Map(pd)) =
+            &current[&role.id].attributes["assume_role_policy_document"]
+        else {
+            panic!("assume_role_policy_document map");
+        };
+        assert_eq!(
+            pd["version"],
+            Value::Concrete(ConcreteValue::EnumIdentifier("2012_10_17".to_string())),
+            "provider-read state String must be lifted to EnumIdentifier"
         );
     }
 }

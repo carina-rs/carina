@@ -752,6 +752,15 @@ pub(crate) async fn run_state_refresh_locked(
         ctx.schemas(),
     );
     provider.hydrate_read_state(&mut current_states, &saved_attrs);
+    // awscc#251: also lift the provider-read `current_states` (not just
+    // `saved_attrs`) — the values read at the refresh loop above arrive
+    // as plain `String` for IAM enum fields and must be lifted before
+    // they are written back / compared.
+    carina_core::utils::lift_current_state_string_enums(
+        &mut current_states,
+        &parsed.resources,
+        ctx.schemas(),
+    );
 
     let mut state = state_file.take().unwrap();
 
