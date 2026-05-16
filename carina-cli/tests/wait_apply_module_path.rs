@@ -423,6 +423,11 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         bindings: ResolvedBindings::default(),
         current_states,
         normalizer: &NoopNormalizer,
+        // carina#3063 (#3069): the executor re-applies the full
+        // plan-time normalization pipeline on the apply path. Pass the
+        // same factories/schemas the apply path threads through.
+        factories: ctx.factories(),
+        schemas: ctx.schemas(),
     };
     let result = execute_plan(&provider, input, &observer).await;
     let failures = observer.failures.lock().unwrap().clone();
