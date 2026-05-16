@@ -34,7 +34,8 @@ use carina_core::executor::{ExecutionInput, ExecutionObserver, execute_plan};
 use carina_core::module_resolver::resolve_modules;
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{
-    BoxFuture, CreateRequest, DeleteRequest, Provider, ProviderResult, ReadRequest, UpdateRequest,
+    BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer, Provider, ProviderResult, ReadRequest,
+    UpdateRequest,
 };
 use carina_core::resolver::resolve_refs_with_state_and_remote;
 use carina_core::resource::{ConcreteValue, ResourceId, State, Value};
@@ -243,6 +244,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         unresolved_resources: &unresolved_resources,
         bindings: carina_core::binding_index::ResolvedBindings::default(),
         current_states,
+        normalizer: &NoopNormalizer,
     };
 
     let result = execute_plan(&provider, input, &observer).await;
@@ -355,6 +357,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         unresolved_resources: &unresolved_resources,
         bindings: carina_core::binding_index::ResolvedBindings::default(),
         current_states,
+        normalizer: &NoopNormalizer,
     };
 
     let result = execute_plan(&provider, input, &observer).await;

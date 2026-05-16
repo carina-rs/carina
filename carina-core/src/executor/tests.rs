@@ -2057,6 +2057,7 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
         unresolved_resources: &HashMap::new(),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
     };
 
     let observer = MockObserver::new();
