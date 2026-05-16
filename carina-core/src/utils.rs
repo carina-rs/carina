@@ -340,6 +340,41 @@ pub fn extract_enum_value_with_values<'a>(s: &'a str, valid_values: &[&str]) -> 
     extract_enum_value(s)
 }
 
+/// Canonicalize one `StringEnum` value to its API spelling: strip any
+/// namespace prefix ([`extract_enum_value_with_values`]) then map the
+/// DSL alias to the API form via [`crate::schema::DslMap::api_for`].
+///
+/// This is the exact-match canonicalization used by the plan renderer's
+/// `StringEnum`-list diff (carina#3075) and the carina-provider
+/// `api_canonicalize` normalizers. (The differ's `StringEnum` equality
+/// arm uses a deliberately *case-insensitive* alias fold for comparison
+/// — a different operation — and is intentionally not routed here.)
+///
+/// ```
+/// use carina_core::schema::DslMap;
+/// use carina_core::utils::canonicalize_enum_to_api;
+///
+/// let aliases = [("Allow".to_string(), "allow".to_string())];
+/// let dsl_map = DslMap::Aliases(&aliases);
+/// let valid = &["Allow", "Deny"];
+/// // DSL alias → API spelling
+/// assert_eq!(canonicalize_enum_to_api("allow", valid, &dsl_map), "Allow");
+/// // Already-canonical round-trips to itself
+/// assert_eq!(canonicalize_enum_to_api("Allow", valid, &dsl_map), "Allow");
+/// // Namespaced form is stripped, then canonicalized
+/// assert_eq!(
+///     canonicalize_enum_to_api("aws.x.Mode.allow", valid, &dsl_map),
+///     "Allow"
+/// );
+/// ```
+pub fn canonicalize_enum_to_api(
+    s: &str,
+    valid_values: &[&str],
+    dsl_map: &crate::schema::DslMap<'_>,
+) -> String {
+    dsl_map.api_for(extract_enum_value_with_values(s, valid_values))
+}
+
 /// Strip the namespace prefix from a DSL enum identifier and return the raw value.
 ///
 /// Handles the following patterns:
