@@ -1064,9 +1064,10 @@ fn carina3080_principal_scalar_vs_singleton_is_no_change_via_pipeline() {
         AttributeType::String,
     ]);
     let mut schema = ResourceSchema::new("iam.policy");
-    schema
-        .attributes
-        .insert("principal".to_string(), AttributeSchema::new("principal", principal));
+    schema.attributes.insert(
+        "principal".to_string(),
+        AttributeSchema::new("principal", principal),
+    );
     let mut registry = crate::schema::SchemaRegistry::new();
     registry.insert("aws", schema.clone());
 
@@ -1074,7 +1075,9 @@ fn carina3080_principal_scalar_vs_singleton_is_no_change_via_pipeline() {
     let mut desired_inner = IndexMap::new();
     desired_inner.insert(
         "service".to_string(),
-        Value::Concrete(ConcreteValue::String("cloudfront.amazonaws.com".to_string())),
+        Value::Concrete(ConcreteValue::String(
+            "cloudfront.amazonaws.com".to_string(),
+        )),
     );
     let mut resources = vec![Resource::new("iam.policy", "p1").with_attribute(
         "principal",

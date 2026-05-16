@@ -3066,7 +3066,9 @@ mod tests {
         let mut map = IndexMap::new();
         map.insert(
             "service".to_string(),
-            Value::Concrete(ConcreteValue::String("cloudfront.amazonaws.com".to_string())),
+            Value::Concrete(ConcreteValue::String(
+                "cloudfront.amazonaws.com".to_string(),
+            )),
         );
         let v = Value::Concrete(ConcreteValue::Map(map));
         let canon = canonicalize_with_type(v, &t);
@@ -3598,7 +3600,9 @@ mod tests {
         let mut desired_inner = IndexMap::new();
         desired_inner.insert(
             "service".to_string(),
-            Value::Concrete(ConcreteValue::String("cloudfront.amazonaws.com".to_string())),
+            Value::Concrete(ConcreteValue::String(
+                "cloudfront.amazonaws.com".to_string(),
+            )),
         );
         let mut resources = vec![make_resource(vec![(
             "principal",

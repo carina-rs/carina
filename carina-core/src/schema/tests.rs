@@ -4803,7 +4803,9 @@ fn select_union_member_picks_struct_for_map_value() {
     let mut map = IndexMap::new();
     map.insert(
         "service".to_string(),
-        Value::Concrete(ConcreteValue::String("cloudfront.amazonaws.com".to_string())),
+        Value::Concrete(ConcreteValue::String(
+            "cloudfront.amazonaws.com".to_string(),
+        )),
     );
     let v = Value::Concrete(ConcreteValue::Map(map));
     let chosen = select_union_member(&members, &v).expect("a Map must select a member");
@@ -4841,7 +4843,10 @@ fn select_union_member_map_never_picks_string_member() {
         },
     ];
     assert!(
-        matches!(select_union_member(&b, &v), Some(AttributeType::Struct { .. })),
+        matches!(
+            select_union_member(&b, &v),
+            Some(AttributeType::Struct { .. })
+        ),
         "a Map must select Struct even when String is declared first"
     );
 }
@@ -4854,7 +4859,9 @@ fn select_union_member_scalar_selects_string_or_list() {
         AttributeType::String,
         AttributeType::list(AttributeType::String),
     ];
-    let v = Value::Concrete(ConcreteValue::String("cloudfront.amazonaws.com".to_string()));
+    let v = Value::Concrete(ConcreteValue::String(
+        "cloudfront.amazonaws.com".to_string(),
+    ));
     assert!(
         select_union_member(&members, &v).is_some(),
         "a scalar must select the String member, not fall to None"
