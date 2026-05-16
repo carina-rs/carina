@@ -1,0 +1,19 @@
+# Middle module: instantiates `inner`. Its own expansion must
+# re-prefix the (already inner-prefixed) wait binding so the
+# two-level-deep `wait` still reaches the root caller's plan.
+
+arguments {
+  domain_name: String
+}
+
+attributes {
+  certificate_arn = c.certificate_arn
+}
+
+let inner = use {
+  source = "../inner"
+}
+
+let c = inner {
+  domain_name = domain_name
+}

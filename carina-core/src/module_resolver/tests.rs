@@ -192,7 +192,8 @@ fn test_expand_anonymous_resource_in_named_module_keeps_name_pending() {
 
     let expanded = resolver
         .expand_module_call(&call, "bootstrap", None)
-        .unwrap();
+        .unwrap()
+        .resources;
     assert_eq!(expanded.len(), 1);
     let policy = &expanded[0];
     assert!(
@@ -237,7 +238,8 @@ fn test_expand_module_call() {
 
     let expanded = resolver
         .expand_module_call(&call, "my_instance", None)
-        .unwrap();
+        .unwrap()
+        .resources;
     assert_eq!(expanded.len(), 1);
 
     let sg = &expanded[0];
@@ -331,7 +333,10 @@ fn test_expand_module_call_preserves_provider_instance_on_id() {
         arguments: HashMap::new(),
     };
 
-    let expanded = resolver.expand_module_call(&call, "acme", None).unwrap();
+    let expanded = resolver
+        .expand_module_call(&call, "acme", None)
+        .unwrap()
+        .resources;
     assert_eq!(expanded.len(), 1);
     let cert = &expanded[0];
     assert_eq!(
@@ -513,10 +518,14 @@ fn test_multiple_module_instances_no_collision() {
         },
     };
 
-    let expanded_a = resolver.expand_module_call(&call_a, "prod", None).unwrap();
+    let expanded_a = resolver
+        .expand_module_call(&call_a, "prod", None)
+        .unwrap()
+        .resources;
     let expanded_b = resolver
         .expand_module_call(&call_b, "staging", None)
-        .unwrap();
+        .unwrap()
+        .resources;
 
     // binding must be prefixed so they don't collide (using dot notation)
     assert_eq!(
@@ -634,7 +643,10 @@ fn test_expand_module_call_creates_virtual_resource() {
         arguments: HashMap::new(),
     };
 
-    let expanded = resolver.expand_module_call(&call, "web", None).unwrap();
+    let expanded = resolver
+        .expand_module_call(&call, "web", None)
+        .unwrap()
+        .resources;
     // 1 real resource + 1 virtual resource
     assert_eq!(expanded.len(), 2);
 
@@ -685,7 +697,8 @@ fn test_expand_module_call_without_binding_no_virtual() {
 
     let expanded = resolver
         .expand_module_call(&call, "web_tier", None)
-        .unwrap();
+        .unwrap()
+        .resources;
     // Only real resources, no virtual
     let virtual_count = expanded.iter().filter(|r| r.is_virtual()).count();
     assert_eq!(virtual_count, 0);
@@ -1196,7 +1209,8 @@ fn test_expand_module_call_uses_dot_path_addressing() {
 
     let expanded = resolver
         .expand_module_call(&call, "my_instance", None)
-        .unwrap();
+        .unwrap()
+        .resources;
     assert_eq!(expanded.len(), 1);
 
     let sg = &expanded[0];
@@ -1226,7 +1240,10 @@ fn test_module_dot_path_bindings_and_refs() {
         },
     };
 
-    let expanded = resolver.expand_module_call(&call, "prod", None).unwrap();
+    let expanded = resolver
+        .expand_module_call(&call, "prod", None)
+        .unwrap()
+        .resources;
 
     // Resource names should use dot notation
     assert_eq!(expanded[0].id.name_str(), "prod.main_vpc");
@@ -1247,6 +1264,113 @@ fn test_module_dot_path_bindings_and_refs() {
     );
 }
 
+/// carina#3061: a `wait` block declared inside a module must survive
+/// expansion. Every binding-name field is instance-prefixed, and a
+/// module resource that references the wait binding has that reference
+/// prefixed too (so the dependency edge to the `Effect::Wait` forms).
+#[test]
+fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
+    use crate::parser::{UntilPredicateAst, WaitBinding};
+
+    let module = {
+        let mut m = create_module_with_intra_refs();
+        // A resource that consumes the wait binding the same way the
+        // real CloudFront Distribution consumes `cert_issued`.
+        m.resources.push(Resource {
+            id: ResourceId::new("cloudfront.Distribution", "distribution"),
+            attributes: {
+                let mut attrs = HashMap::new();
+                attrs.insert(
+                    "acm_certificate_arn".to_string(),
+                    Value::resource_ref(
+                        "cert_issued".to_string(),
+                        "certificate_arn".to_string(),
+                        vec![],
+                    ),
+                );
+                attrs.into_iter().collect()
+            },
+            kind: ResourceKind::Managed,
+            directives: Directives::default(),
+            prefixes: HashMap::new(),
+            binding: Some("distribution".to_string()),
+            dependency_bindings: BTreeSet::new(),
+            module_source: None,
+            quoted_string_attrs: std::collections::HashSet::new(),
+        });
+        m.wait_bindings.push(WaitBinding {
+            binding: "cert_issued".into(),
+            target: "main_vpc".into(),
+            until_raw: "main_vpc.state == \"available\"".to_string(),
+            until_predicate: UntilPredicateAst {
+                lhs_segments: vec!["main_vpc".to_string(), "state".to_string()],
+                rhs: Value::Concrete(ConcreteValue::String("available".to_string())),
+            },
+            timeout_secs: Some(300),
+            depends_on: vec!["subnet".into()],
+            line: 1,
+        });
+        m
+    };
+
+    let resolver = {
+        let mut r = ModuleResolver::new(".");
+        r.imported_modules.insert("net".to_string(), module);
+        r
+    };
+
+    let call = ModuleCall {
+        module_name: "net".to_string(),
+        binding_name: Some("prod".to_string()),
+        arguments: {
+            let mut args = HashMap::new();
+            args.insert(
+                "cidr".to_string(),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            );
+            args
+        },
+    };
+
+    let expanded = resolver.expand_module_call(&call, "prod", None).unwrap();
+
+    // The wait binding survived expansion and every binding-name field
+    // is instance-prefixed.
+    assert_eq!(expanded.wait_bindings.len(), 1);
+    let wb = &expanded.wait_bindings[0];
+    assert_eq!(wb.binding, "prod.cert_issued");
+    assert_eq!(wb.target, "prod.main_vpc");
+    assert_eq!(
+        wb.until_predicate.lhs_segments,
+        vec!["prod.main_vpc".to_string(), "state".to_string()]
+    );
+    assert_eq!(wb.depends_on, vec!["prod.subnet".to_string()]);
+    // RHS value and surface text are not binding names — unchanged.
+    assert_eq!(
+        wb.until_predicate.rhs,
+        Value::Concrete(ConcreteValue::String("available".to_string()))
+    );
+    assert_eq!(wb.timeout_secs, Some(300));
+
+    // The downstream resource's reference to the wait binding was
+    // rewritten to the prefixed name, so the dependency edge to the
+    // Effect::Wait can form at plan time.
+    let dist = expanded
+        .resources
+        .iter()
+        .find(|r| r.id.resource_type == "cloudfront.Distribution")
+        .expect("distribution resource present");
+    assert_eq!(
+        dist.get_attr("acm_certificate_arn"),
+        Some(&Value::resource_ref(
+            "prod.cert_issued".to_string(),
+            "certificate_arn".to_string(),
+            vec![]
+        )),
+        "the module resource's `cert_issued` ref must be instance-prefixed"
+    );
+}
+
 #[test]
 fn test_module_virtual_resource_dot_path_refs() {
     let resolver = {
@@ -1262,7 +1386,10 @@ fn test_module_virtual_resource_dot_path_refs() {
         arguments: HashMap::new(),
     };
 
-    let expanded = resolver.expand_module_call(&call, "web", None).unwrap();
+    let expanded = resolver
+        .expand_module_call(&call, "web", None)
+        .unwrap()
+        .resources;
 
     let virtual_res = expanded
         .iter()
@@ -1480,7 +1607,10 @@ fn test_expand_module_call_with_interpolation() {
         },
     };
 
-    let expanded = resolver.expand_module_call(&call, "dev_vpc", None).unwrap();
+    let expanded = resolver
+        .expand_module_call(&call, "dev_vpc", None)
+        .unwrap()
+        .resources;
     assert_eq!(expanded.len(), 1);
 
     let vpc = &expanded[0];
@@ -1630,7 +1760,10 @@ fn test_expand_module_call_with_function_call_argument() {
         },
     };
 
-    let expanded = resolver.expand_module_call(&call, "dev_vpc", None).unwrap();
+    let expanded = resolver
+        .expand_module_call(&call, "dev_vpc", None)
+        .unwrap()
+        .resources;
     assert_eq!(expanded.len(), 1);
 
     let vpc = &expanded[0];

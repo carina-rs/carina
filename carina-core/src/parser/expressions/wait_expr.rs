@@ -4,7 +4,7 @@
 //! design. The grammar piece lives in `carina.pest::wait_expr`.
 
 use super::primary::parse_duration_secs;
-use crate::parser::ast::{UntilPredicateAst, WaitBinding};
+use crate::parser::ast::{BindingName, UntilPredicateAst, WaitBinding};
 use crate::parser::error::ParseError;
 use crate::parser::{Rule, first_inner};
 use crate::resource::{ConcreteValue, Value};
@@ -113,12 +113,12 @@ pub(crate) fn parse_wait_expr(
     };
 
     Ok(WaitBinding {
-        binding: binding_name.to_string(),
-        target,
+        binding: BindingName::from(binding_name),
+        target: BindingName::from(target),
         until_raw,
         until_predicate,
         timeout_secs,
-        depends_on,
+        depends_on: depends_on.into_iter().map(BindingName::from).collect(),
         line,
     })
 }

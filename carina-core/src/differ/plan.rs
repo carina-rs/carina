@@ -391,7 +391,7 @@ pub fn create_plan(
             .or_else(|| desired.iter().find(|r| r.id.name.as_str() == wb.target));
         let Some(target_resource) = resolved else {
             plan.add_error(PlanError {
-                resource_id: ResourceId::new("__wait", &wb.binding),
+                resource_id: ResourceId::new("__wait", wb.binding.as_str()),
                 message: format!(
                     "wait `{}`: target binding `{}` is not a known resource",
                     wb.binding, wb.target
@@ -427,14 +427,21 @@ pub fn create_plan(
             .unwrap_or(WAIT_DEFAULT_TIMEOUT);
         let interval = schema_interval.unwrap_or(WAIT_DEFAULT_INTERVAL);
         plan.add(Effect::Wait {
-            binding: wb.binding.clone(),
+            // Lower BindingName -> String at the AST→Effect seam: the
+            // executor IR (Effect) is string-keyed and is the separate
+            // type tracked for its own newtype migration (carina#3066).
+            binding: wb.binding.as_str().to_string(),
             target_id,
             target_identifier,
             until,
             until_surface: wb.until_raw.clone(),
             timeout,
             interval,
-            explicit_dependencies: wb.depends_on.iter().cloned().collect(),
+            explicit_dependencies: wb
+                .depends_on
+                .iter()
+                .map(|d| d.as_str().to_string())
+                .collect(),
         });
     }
 

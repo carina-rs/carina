@@ -196,7 +196,11 @@ impl<'cfg> ModuleResolver<'cfg> {
             let instance_prefix = instance_prefix_for_call(call);
 
             match self.expand_module_call(call, &instance_prefix, Some(enclosing_args)) {
-                Ok(expanded) => parsed.resources.extend(expanded), // allow: direct — module expansion, handled separately
+                Ok(expanded) => {
+                    parsed.resources.extend(expanded.resources); // allow: direct — module expansion, handled separately
+                    // Propagate instance-prefixed wait bindings (carina#3061).
+                    parsed.wait_bindings.extend(expanded.wait_bindings);
+                }
                 Err(e) => {
                     self.base_dir = original_base_dir;
                     self.imported_modules = original_imported;
@@ -242,7 +246,9 @@ pub fn resolve_modules_with_config<E>(
     for call in &parsed.module_calls {
         let instance_prefix = instance_prefix_for_call(call);
         let expanded = resolver.expand_module_call(call, &instance_prefix, None)?;
-        parsed.resources.extend(expanded); // allow: direct — module expansion, handled separately
+        parsed.resources.extend(expanded.resources); // allow: direct — module expansion, handled separately
+        // Propagate instance-prefixed wait bindings (carina#3061).
+        parsed.wait_bindings.extend(expanded.wait_bindings);
     }
 
     Ok(())

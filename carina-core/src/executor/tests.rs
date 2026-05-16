@@ -1939,6 +1939,161 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
     assert_eq!(calls[4], ("create".to_string(), dist_id.to_string()));
 }
 
+/// carina#3061 — a downstream resource that references
+/// `<wait_binding>.<attr>` **nested inside a Map attribute** (the real
+/// `awscc.cloudfront.Distribution` shape:
+/// `distribution_config.viewer_certificate.acm_certificate_arn =
+/// cert_issued.certificate_arn`) must resolve to the wait target's
+/// post-`until` attribute value at apply time.
+///
+/// The regression: `dependency_bindings` is populated by the real
+/// resolver helper (`get_resource_value_ref_dependencies`), exactly as
+/// the apply pipeline does — *not* hand-set as in
+/// `test_wait_effect_polls_then_unblocks_downstream`. If the nested-map
+/// `ResourceRef` to the wait binding does not produce a scheduler edge
+/// to the `Effect::Wait`, the Distribution is dispatched before the
+/// wait records `cert_issued`'s attributes and `assert_fully_resolved`
+/// rejects the still-`Deferred` ref with the self-contradicting
+/// "add a `wait` block" error.
+#[tokio::test]
+async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
+    use crate::wait::predicate::{AttrPath, WaitPredicate};
+
+    let provider = MockProvider::new();
+
+    let cert = make_resource("cert", &[]);
+    let cert_id = cert.id.clone();
+
+    // `dist` references the wait binding from *inside a nested Map*,
+    // mirroring `viewer_certificate = { acm_certificate_arn =
+    // cert_issued.certificate_arn }`.
+    let mut dist = Resource::new("test", "dist");
+    dist.binding = Some("dist".to_string());
+    let mut viewer_certificate = indexmap::IndexMap::new();
+    viewer_certificate.insert(
+        "acm_certificate_arn".to_string(),
+        Value::resource_ref(
+            "cert_issued".to_string(),
+            "certificate_arn".to_string(),
+            vec![],
+        ),
+    );
+    let mut distribution_config = indexmap::IndexMap::new();
+    distribution_config.insert(
+        "viewer_certificate".to_string(),
+        Value::Concrete(ConcreteValue::Map(viewer_certificate)),
+    );
+    dist.set_attr(
+        "distribution_config".to_string(),
+        Value::Concrete(ConcreteValue::Map(distribution_config)),
+    );
+    // Populate dependency_bindings the way the real apply pipeline does
+    // (resolver.rs:70 -> get_resource_value_ref_dependencies), instead
+    // of hand-setting the set. This is the load-bearing difference from
+    // the existing flat-ref test.
+    dist.dependency_bindings = crate::deps::get_resource_value_ref_dependencies(&dist)
+        .into_iter()
+        .collect();
+    let dist_id = dist.id.clone();
+
+    // Sanity: the resolver helper must have recovered the wait binding
+    // from the *nested* ref. If this fails the scheduler can never link
+    // the Distribution to the wait.
+    assert!(
+        dist.dependency_bindings.contains("cert_issued"),
+        "get_resource_value_ref_dependencies must recover the nested \
+         `cert_issued` ref; got {:?}",
+        dist.dependency_bindings
+    );
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(cert));
+    plan.add(Effect::Wait {
+        binding: "cert_issued".to_string(),
+        target_id: cert_id.clone(),
+        target_identifier: None,
+        until: WaitPredicate::Equals {
+            attr: AttrPath::single("status"),
+            value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+        },
+        until_surface: "cert.status == ISSUED".to_string(),
+        timeout: std::time::Duration::from_secs(60),
+        interval: std::time::Duration::from_millis(1),
+        explicit_dependencies: std::collections::HashSet::new(),
+    });
+    plan.add(Effect::Create(dist));
+
+    // create cert → PENDING; wait polls read → PENDING → ISSUED+arn.
+    let mut create_attrs = HashMap::new();
+    create_attrs.insert(
+        "status".to_string(),
+        Value::Concrete(ConcreteValue::String("PENDING_VALIDATION".to_string())),
+    );
+    provider.push_create(Ok(
+        State::existing(cert_id.clone(), create_attrs).with_identifier("acm-cert-id")
+    ));
+    let mut pending = HashMap::new();
+    pending.insert(
+        "status".to_string(),
+        Value::Concrete(ConcreteValue::String("PENDING_VALIDATION".to_string())),
+    );
+    let mut issued = HashMap::new();
+    issued.insert(
+        "status".to_string(),
+        Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+    );
+    issued.insert(
+        "certificate_arn".to_string(),
+        Value::Concrete(ConcreteValue::String(
+            "arn:aws:acm:us-east-1:111:certificate/abc".to_string(),
+        )),
+    );
+    provider.push_read(Ok(State::existing(cert_id.clone(), pending)));
+    provider.push_read(Ok(State::existing(cert_id.clone(), issued)));
+    provider.push_create(Ok(ok_state(&dist_id)));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+    };
+
+    let observer = MockObserver::new();
+    let result = execute_plan(&provider, input, &observer).await;
+
+    assert_eq!(
+        result.failure_count,
+        0,
+        "no effect should fail; events: {:?}",
+        observer.events()
+    );
+    assert_eq!(
+        result.success_count,
+        3,
+        "cert create + wait + dist create must all succeed; events: {:?}",
+        observer.events()
+    );
+
+    // The Distribution's create must have run after the wait and seen
+    // the resolved `certificate_arn` nested in the Map.
+    let calls = provider.calls();
+    let dist_create_pos = calls
+        .iter()
+        .position(|(op, id)| op == "create" && id == &dist_id.to_string())
+        .expect("dist create must have happened");
+    let last_read_pos = calls
+        .iter()
+        .rposition(|(op, _)| op == "read")
+        .expect("wait must have polled via read");
+    assert!(
+        dist_create_pos > last_read_pos,
+        "dist create ({dist_create_pos}) must follow the wait's last \
+         poll ({last_read_pos}); calls: {calls:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_wait_state_writeback_skips_synthetic_wait_id() {
     use crate::wait::predicate::{AttrPath, WaitPredicate};

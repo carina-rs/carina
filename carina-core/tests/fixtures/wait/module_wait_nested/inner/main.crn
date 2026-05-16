@@ -1,0 +1,30 @@
+# Innermost module: declares the `wait` and a resource that consumes
+# the wait binding from a nested Map (the carina#3061 shape), so we can
+# assert the wait survives *two* levels of instance-prefixing.
+
+arguments {
+  domain_name: String
+}
+
+attributes {
+  certificate_arn = cert_issued.certificate_arn
+}
+
+let cert = aws.acm.Certificate {
+  domain_name       = domain_name
+  validation_method = "DNS"
+}
+
+let cert_issued = wait cert {
+  until   = cert.status == "ISSUED"
+  timeout = 75min
+}
+
+let distribution = awscc.cloudfront.Distribution {
+  distribution_config = {
+    enabled = true
+    viewer_certificate = {
+      acm_certificate_arn = cert_issued.certificate_arn
+    }
+  }
+}

@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use indexmap::IndexMap;
 
-use crate::parser::{ArgumentParameter, ModuleCall};
+use crate::parser::{ArgumentParameter, BindingName, ModuleCall, WaitBinding};
 use crate::resource::{
     ConcreteValue, DeferredValue, Directives, Resource, ResourceId, ResourceKind, ResourceName,
     Value,
@@ -15,6 +15,23 @@ use super::error::ModuleError;
 use super::resolver::ModuleResolver;
 use super::typecheck::check_module_arg_type;
 use super::validation::{evaluate_require_expr, evaluate_validate_expr, format_value_for_error};
+
+/// Result of expanding a single module call.
+///
+/// A module call contributes both resources and `wait` declarations to
+/// the caller; both must reach the caller for a module-internal `wait`
+/// to keep synchronizing its downstream consumers (carina#3061).
+#[derive(Debug)]
+pub struct ExpandedModule {
+    /// Expanded, instance-prefixed resources (plus the virtual
+    /// attribute proxy when the module declares `attributes`).
+    pub resources: Vec<Resource>,
+    /// The module's `wait` declarations, with every binding-name field
+    /// (`binding`, `target`, the predicate LHS root, `depends_on`)
+    /// rewritten with the call's `instance_prefix` so they match the
+    /// prefixed resource bindings and the prefixed downstream refs.
+    pub wait_bindings: Vec<WaitBinding>,
+}
 
 impl ModuleResolver<'_> {
     /// Expand a module call into resources.
@@ -34,7 +51,7 @@ impl ModuleResolver<'_> {
         call: &ModuleCall,
         instance_prefix: &str,
         enclosing_args: Option<&[ArgumentParameter]>,
-    ) -> Result<Vec<Resource>, ModuleError> {
+    ) -> Result<ExpandedModule, ModuleError> {
         let module = self
             .imported_modules
             .get(&call.module_name)
@@ -174,11 +191,22 @@ impl ModuleResolver<'_> {
             }
         }
 
-        // Collect intra-module binding names so we can rewrite ResourceRefs
+        // Collect intra-module binding names so we can rewrite
+        // ResourceRefs. Wait-binding names are included alongside
+        // resource bindings so a downstream resource referencing
+        // `<wait_binding>.<attr>` is instance-prefixed the same way —
+        // otherwise its dependency edge to the wait is lost
+        // (carina#3061; see `prefix_wait_binding`).
         let intra_module_bindings: HashSet<String> = module
             .resources
             .iter()
             .filter_map(|r| r.binding.clone())
+            .chain(
+                module
+                    .wait_bindings
+                    .iter()
+                    .map(|w| w.binding.as_str().to_string()),
+            )
             .collect();
 
         // Expand resources with substituted values
@@ -192,14 +220,13 @@ impl ModuleResolver<'_> {
             // `identifier::compute_anonymous_identifiers` for the full
             // story (#2516).
             if let ResourceName::Bound(name) = &new_resource.id.name {
-                let new_name = format!("{}.{}", instance_prefix, name);
+                let new_name = apply_instance_prefix(instance_prefix, name);
                 new_resource.id.set_name(new_name);
             }
 
             // Rewrite binding with instance path (dot-separated)
             if let Some(ref binding) = new_resource.binding {
-                let prefixed = format!("{}.{}", instance_prefix, binding);
-                new_resource.binding = Some(prefixed);
+                new_resource.binding = Some(apply_instance_prefix(instance_prefix, binding));
             }
 
             // Set typed module source info
@@ -273,7 +300,90 @@ impl ModuleResolver<'_> {
             expanded_resources.push(virtual_resource);
         }
 
-        Ok(expanded_resources)
+        // Propagate the module's `wait` declarations, instance-prefixed
+        // (see `prefix_wait_binding`), so a module-internal `wait`
+        // reaches the caller's plan (carina#3061).
+        let expanded_wait_bindings: Vec<WaitBinding> = module
+            .wait_bindings
+            .iter()
+            .map(|wb| prefix_wait_binding(wb, instance_prefix))
+            .collect();
+
+        Ok(ExpandedModule {
+            resources: expanded_resources,
+            wait_bindings: expanded_wait_bindings,
+        })
+    }
+}
+
+/// Join a module-call `instance_prefix` to an intra-module binding name
+/// (`<prefix>.<name>`, dot-separated instance path).
+///
+/// This is the *single* definition of the instance-prefix spelling.
+/// Every site that prefixes a binding — resource ids, resource
+/// bindings, `rewrite_intra_module_refs`, and [`prefix_wait_binding`] —
+/// routes through here so the format can never drift between binding
+/// kinds (the carina#3061 class of bug was a binding kind that was
+/// *not* prefixed at all; keeping one spelling makes "is this kind
+/// prefixed?" a single, greppable call site per kind).
+fn apply_instance_prefix(instance_prefix: &str, name: &str) -> String {
+    format!("{instance_prefix}.{name}")
+}
+
+/// `BindingName`-typed instance-prefix: the wait path's binding-name
+/// fields are `BindingName`, so prefixing them is a typed
+/// `BindingName -> BindingName` transition (a raw `String` can't slip
+/// into a binding-name position). Delegates to [`apply_instance_prefix`]
+/// for the single spelling.
+fn prefix_binding_name(instance_prefix: &str, name: &BindingName) -> BindingName {
+    BindingName::new(apply_instance_prefix(instance_prefix, name.as_str()))
+}
+
+/// Instance-prefix every binding-name field of a [`WaitBinding`] so a
+/// module-internal `wait` keeps referring to the same (now prefixed)
+/// target / dependencies after expansion.
+///
+/// The `WaitBinding` is **destructured exhaustively** rather than
+/// field-accessed: if a future field is added, this stops compiling
+/// until someone decides whether that field is a binding name (prefix
+/// it) or value/provenance (pass through). That compile-time forcing
+/// function is the carina#3061 guard — the original bug was a
+/// binding-carrying structure whose propagation silently skipped a
+/// part. Today: `binding`, `target`, the predicate LHS root segment
+/// (`lhs_segments[0]`, pinned to the target binding by
+/// `parse_wait_expr`), and every `depends_on` entry are prefixed;
+/// `until_raw` (verbatim user surface text), `until_predicate.rhs` (a
+/// comparison value), `timeout_secs`, and `line` are not binding names
+/// and pass through unchanged.
+fn prefix_wait_binding(wb: &WaitBinding, instance_prefix: &str) -> WaitBinding {
+    let WaitBinding {
+        binding,
+        target,
+        until_raw,
+        until_predicate,
+        timeout_secs,
+        depends_on,
+        line,
+    } = wb;
+    let prefixed_name = |n: &BindingName| prefix_binding_name(instance_prefix, n);
+
+    let mut until_predicate = until_predicate.clone();
+    // `lhs_segments[0]` is the (string) target-binding segment of a
+    // mixed path `[target, attr, ...]`; only that head is a binding
+    // name, so it takes the string-level prefix spelling, not the
+    // `BindingName` wrapper (the rest are attribute path segments).
+    if let Some(root) = until_predicate.lhs_segments.first_mut() {
+        *root = apply_instance_prefix(instance_prefix, root);
+    }
+
+    WaitBinding {
+        binding: prefixed_name(binding),
+        target: prefixed_name(target),
+        until_raw: until_raw.clone(),
+        until_predicate,
+        timeout_secs: *timeout_secs,
+        depends_on: depends_on.iter().map(prefixed_name).collect(),
+        line: *line,
     }
 }
 
@@ -353,7 +463,7 @@ pub(super) fn rewrite_intra_module_refs(
             if intra_module_bindings.contains(binding) =>
         {
             Value::Deferred(DeferredValue::BindingRef {
-                binding: format!("{}.{}", instance_prefix, binding),
+                binding: apply_instance_prefix(instance_prefix, binding),
             })
         }
         Value::Deferred(DeferredValue::ResourceRef { path })
@@ -361,7 +471,7 @@ pub(super) fn rewrite_intra_module_refs(
         {
             Value::Deferred(DeferredValue::ResourceRef {
                 path: crate::resource::AccessPath::with_segments(
-                    format!("{}.{}", instance_prefix, path.binding()),
+                    apply_instance_prefix(instance_prefix, path.binding()),
                     path.attribute().to_string(),
                     path.segments().to_vec(),
                 ),

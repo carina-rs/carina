@@ -1207,8 +1207,8 @@ fn wait_binding_lowers_to_wait_effect() {
     let resources = vec![cert];
 
     let wait = WaitBinding {
-        binding: "cert_issued".to_string(),
-        target: "cert".to_string(),
+        binding: "cert_issued".into(),
+        target: "cert".into(),
         until_raw: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
         until_predicate: UntilPredicateAst {
             lhs_segments: vec!["cert".to_string(), "status".to_string()],
@@ -1288,8 +1288,8 @@ fn wait_uses_schema_default_timeout_when_omitted() {
     );
 
     let wait = WaitBinding {
-        binding: "cert_issued".to_string(),
-        target: "cert".to_string(),
+        binding: "cert_issued".into(),
+        target: "cert".into(),
         until_raw: "cert.status == ISSUED".to_string(),
         until_predicate: UntilPredicateAst {
             lhs_segments: vec!["cert".to_string(), "status".to_string()],
@@ -1331,8 +1331,8 @@ fn wait_with_unknown_target_emits_plan_error() {
     let resources: Vec<Resource> = vec![];
 
     let wait = WaitBinding {
-        binding: "cert_issued".to_string(),
-        target: "nonexistent".to_string(),
+        binding: "cert_issued".into(),
+        target: "nonexistent".into(),
         until_raw: "nonexistent.status == ISSUED".to_string(),
         until_predicate: UntilPredicateAst {
             lhs_segments: vec!["nonexistent".to_string(), "status".to_string()],

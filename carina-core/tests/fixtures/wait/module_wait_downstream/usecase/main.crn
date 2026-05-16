@@ -1,0 +1,11 @@
+# Mirrors carina-rs/infra usecases/registry/main.crn: a module that
+# only declares arguments + attributes; resources/wait live in sibling
+# files merged into the module.
+
+arguments {
+  domain_name: String
+}
+
+attributes {
+  certificate_arn = cert_issued.certificate_arn
+}

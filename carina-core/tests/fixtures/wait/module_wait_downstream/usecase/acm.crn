@@ -1,0 +1,22 @@
+# Mirrors usecases/registry/acm.crn (the wait construct's intended
+# use case). The wait binding `cert_issued` is the synchronized alias
+# downstream resources read.
+
+let cert = aws.acm.Certificate {
+  domain_name       = domain_name
+  validation_method = "DNS"
+}
+
+let validation_record = aws.route53.RecordSet {
+  hosted_zone_id   = "Z123"
+  name             = "_acme.example.com"
+  type             = "CNAME"
+  ttl              = 300
+  resource_records = ["validation.example.com"]
+}
+
+let cert_issued = wait cert {
+  until      = cert.status == "ISSUED"
+  depends_on = [validation_record]
+  timeout    = 75min
+}
