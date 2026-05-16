@@ -35,7 +35,7 @@
         "constant.character.escape.crn",
         "meta.embedded.expression.crn"
       ],
-      "settings": { "foreground": "#cbd5e1" }
+      "settings": { "foreground": "#94a3b8" }
     },
 
     {
@@ -79,7 +79,7 @@
         "storage.type",
         "storage.type.crn"
       ],
-      "settings": { "foreground": "#cbd5e1" }
+      "settings": { "foreground": "#94a3b8" }
     },
 
     {
@@ -96,7 +96,7 @@
         "variable.other",
         "variable.other.crn"
       ],
-      "settings": { "foreground": "#cbd5e1" }
+      "settings": { "foreground": "#94a3b8" }
     },
 
     {
