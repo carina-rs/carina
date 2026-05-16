@@ -8,11 +8,11 @@ use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
 
-use crate::diff_helpers::{compute_map_diff, compute_unchanged_count};
+use crate::diff_helpers::{compute_map_diff, compute_unchanged_count, schema_aware_equal};
 use crate::effect::Effect;
 use crate::non_empty::NonEmptyVec;
 use crate::resource::{ConcreteValue, DeferredValue, ResourceId, Value};
-use crate::schema::SchemaRegistry;
+use crate::schema::{AttributeType, ResourceSchema, SchemaRegistry};
 use crate::value::{format_value, format_value_with_key, is_list_of_maps, map_similarity};
 
 /// Controls how much detail is shown in plan output.
@@ -308,6 +308,43 @@ pub struct CascadingUpdateAttr {
     pub new: String,
 }
 
+/// Resolve the subtype for map entry `key`: a `Map`'s `value` type, a
+/// `Struct` field's type, or `None`. `List`/`Union` are unwrapped so a
+/// nested `List<Map>`/`List<Struct>` still resolves its entries
+/// (carina#3073). Uses the canonical `build_accepted_field_map` so a
+/// `block_name`-aliased struct field resolves like `validate_struct`.
+fn map_entry_subtype<'a>(
+    attr_type: Option<&'a AttributeType>,
+    key: &str,
+) -> Option<&'a AttributeType> {
+    let mut t = attr_type?;
+    loop {
+        match t {
+            AttributeType::List { inner, .. } => t = inner,
+            AttributeType::Map { value, .. } => return Some(value),
+            AttributeType::Struct { fields, .. } => {
+                // Canonical field accessor — resolves `block_name`
+                // aliases too, matching `validate_struct` /
+                // `collect_struct` (#2214).
+                return crate::schema::build_accepted_field_map(fields)
+                    .get(key)
+                    .map(|f| &f.field_type);
+            }
+            AttributeType::Union(members) => {
+                t = members.iter().find(|m| {
+                    matches!(
+                        m,
+                        AttributeType::Struct { .. }
+                            | AttributeType::Map { .. }
+                            | AttributeType::List { .. }
+                    )
+                })?;
+            }
+            _ => return None,
+        }
+    }
+}
+
 /// Build detail rows for an effect.
 ///
 /// This function encapsulates ALL the logic for deciding what detail rows to
@@ -339,7 +376,8 @@ pub fn build_detail_rows(
             ..
         } => {
             let explicit = prev_explicit.and_then(|map| map.get(&to.id));
-            build_update_rows(from, to, changed_attributes, detail, explicit)
+            let schema = registry.and_then(|r| r.get_for(to));
+            build_update_rows(from, to, changed_attributes, schema, detail, explicit)
         }
         Effect::Replace {
             from,
@@ -351,6 +389,7 @@ pub fn build_detail_rows(
             ..
         } => {
             let explicit = prev_explicit.and_then(|map| map.get(&to.id));
+            let schema = registry.and_then(|r| r.get_for(to));
             build_replace_rows(
                 from,
                 to,
@@ -358,6 +397,7 @@ pub fn build_detail_rows(
                 cascading_updates,
                 temporary_name,
                 cascade_ref_hints,
+                schema,
                 detail,
                 explicit,
             )
@@ -519,6 +559,7 @@ fn build_update_rows(
     from: &crate::resource::State,
     to: &crate::resource::Resource,
     changed_attributes: &[String],
+    schema: Option<&ResourceSchema>,
     detail: DetailLevel,
     explicit: Option<&crate::explicit::ExplicitFields>,
 ) -> Vec<DetailRow> {
@@ -558,8 +599,16 @@ fn build_update_rows(
         // field that's "unchanged after projection" is also "unchanged
         // for display".
         let old_value = from_attrs_projected.get(key);
+        let attr_type = schema
+            .and_then(|s| s.attributes.get(key.as_str()))
+            .map(|a| &a.attr_type);
+        // Site 1 (carina#3073): schema-aware top-level equality. When
+        // the only diffs inside this attribute are enum-equal leaves
+        // (the IAM-policy phantom), `type_aware_equal` recurses
+        // Struct/List/Map internally and returns true, so no row is
+        // built at all and sites 3/4/5 never run for this attribute.
         let is_same = old_value
-            .map(|ov| ov.semantically_equal(new_value))
+            .map(|ov| schema_aware_equal(ov, new_value, attr_type))
             .unwrap_or(false);
 
         if is_same {
@@ -567,12 +616,12 @@ fn build_update_rows(
         }
 
         if is_list_of_maps(new_value) {
-            match build_list_of_maps_diff_row(key, old_value, new_value, detail) {
+            match build_list_of_maps_diff_row(key, old_value, new_value, attr_type, detail) {
                 Some(row) => rows.push(row),
                 None => effectively_unchanged += 1,
             }
         } else if should_render_as_map_diff(old_value, new_value) {
-            match build_map_diff_row(key, old_value, new_value, detail) {
+            match build_map_diff_row(key, old_value, new_value, attr_type, detail) {
                 Some(row) => rows.push(row),
                 None => effectively_unchanged += 1,
             }
@@ -623,9 +672,12 @@ fn build_update_rows(
 
     // In Full mode, show count of unchanged attributes hidden
     if detail == DetailLevel::Full {
-        let unchanged_count =
-            compute_unchanged_count(&from_attrs_projected, &to.resolved_attributes(), None)
-                + effectively_unchanged;
+        let unchanged_count = compute_unchanged_count(
+            &from_attrs_projected,
+            &to.resolved_attributes(),
+            None,
+            schema,
+        ) + effectively_unchanged;
         if unchanged_count > 0 {
             rows.push(DetailRow::HiddenUnchanged {
                 count: unchanged_count,
@@ -644,6 +696,7 @@ fn build_replace_rows(
     cascading_updates: &[crate::effect::CascadingUpdate],
     temporary_name: &Option<crate::effect::TemporaryName>,
     cascade_ref_hints: &[(String, String)],
+    schema: Option<&ResourceSchema>,
     detail: DetailLevel,
     explicit: Option<&crate::explicit::ExplicitFields>,
 ) -> Vec<DetailRow> {
@@ -659,8 +712,12 @@ fn build_replace_rows(
     for key in keys {
         let new_value = &to.attributes[key.as_str()];
         let old_value = from.attributes.get(key.as_str());
+        let attr_type = schema
+            .and_then(|s| s.attributes.get(key.as_str()))
+            .map(|a| &a.attr_type);
+        // Site 2 (carina#3073): schema-aware, mirrors site 1.
         let is_same = old_value
-            .map(|ov| ov.semantically_equal(new_value))
+            .map(|ov| schema_aware_equal(ov, new_value, attr_type))
             .unwrap_or(false);
 
         if is_same {
@@ -680,7 +737,7 @@ fn build_replace_rows(
             });
         } else if is_list_of_maps(new_value) {
             let (unchanged, modified, added, removed) =
-                compute_list_of_maps_diff_parts(old_value, new_value, detail);
+                compute_list_of_maps_diff_parts(old_value, new_value, attr_type, detail);
             rows.push(DetailRow::ReplaceListOfMapsDiff {
                 key: key.to_string(),
                 unchanged,
@@ -689,7 +746,7 @@ fn build_replace_rows(
                 removed,
             });
         } else if should_render_as_map_diff(old_value, new_value) {
-            let entries = compute_map_diff_entries(old_value, new_value, detail);
+            let entries = compute_map_diff_entries(old_value, new_value, attr_type, detail);
             rows.push(DetailRow::ReplaceMapDiff {
                 key: key.to_string(),
                 entries,
@@ -736,6 +793,7 @@ fn build_replace_rows(
             &from_attrs_projected,
             &to.resolved_attributes(),
             Some(&changed_set),
+            schema,
         );
         if unchanged_count > 0 {
             rows.push(DetailRow::HiddenUnchanged {
@@ -866,9 +924,12 @@ fn build_map_diff_row(
     key: &str,
     old_value: Option<&Value>,
     new_value: &Value,
+    attr_type: Option<&AttributeType>,
     detail: DetailLevel,
 ) -> Option<DetailRow> {
-    let entries = NonEmptyVec::from_vec(compute_map_diff_entries(old_value, new_value, detail))?;
+    let entries = NonEmptyVec::from_vec(compute_map_diff_entries(
+        old_value, new_value, attr_type, detail,
+    ))?;
     Some(DetailRow::MapDiff {
         key: key.to_string(),
         entries,
@@ -878,6 +939,7 @@ fn build_map_diff_row(
 fn compute_map_diff_entries(
     old_value: Option<&Value>,
     new_value: &Value,
+    attr_type: Option<&AttributeType>,
     detail: DetailLevel,
 ) -> Vec<MapDiffEntryIR> {
     let new_map = match new_value {
@@ -906,11 +968,36 @@ fn compute_map_diff_entries(
     for item in diff.iter_by_key() {
         match item {
             crate::diff_helpers::MapDiffItem::Changed(e) => {
+                let entry_type = map_entry_subtype(attr_type, &e.key);
+                // Site 5 (carina#3073): `compute_map_diff` flagged this
+                // entry as changed via schema-blind `semantically_equal`.
+                // For a scalar/leaf entry, re-test schema-aware: an
+                // enum-equal leaf (`EnumIdentifier("allow")` vs
+                // `String("Allow")`) is not a real change — skip its
+                // phantom row. Containers (nested Map / list-of-maps)
+                // are not filtered here; they recurse and self-filter
+                // below. (No `entry_type.is_some()` guard: with no
+                // type, `schema_aware_equal` is `semantically_equal`,
+                // which `compute_map_diff` already used to classify
+                // this entry as changed, so the branch is never taken.)
+                let is_recursed_container =
+                    matches!(&e.new_value, Value::Concrete(ConcreteValue::Map(_)))
+                        || is_list_of_maps(&e.new_value);
+                if !is_recursed_container
+                    && schema_aware_equal(&e.old_value, &e.new_value, entry_type)
+                {
+                    continue;
+                }
                 // If both old and new are maps, recursively diff
                 if matches!(&e.old_value, Value::Concrete(ConcreteValue::Map(_)))
                     && matches!(&e.new_value, Value::Concrete(ConcreteValue::Map(_)))
                 {
-                    let nested = compute_map_diff_entries(Some(&e.old_value), &e.new_value, detail);
+                    let nested = compute_map_diff_entries(
+                        Some(&e.old_value),
+                        &e.new_value,
+                        entry_type,
+                        detail,
+                    );
                     // #2910: `from_vec` returns None for the all-empty
                     // recursive case (every grandchild was itself
                     // suppressed). Skip pushing so the parent header
@@ -923,8 +1010,12 @@ fn compute_map_diff_entries(
                     }
                 } else if is_list_of_maps(&e.new_value) {
                     // List-of-maps: compute per-item field-level diffs
-                    let (_, modified, added, removed) =
-                        compute_list_of_maps_diff_parts(Some(&e.old_value), &e.new_value, detail);
+                    let (_, modified, added, removed) = compute_list_of_maps_diff_parts(
+                        Some(&e.old_value),
+                        &e.new_value,
+                        entry_type,
+                        detail,
+                    );
                     // #2910: `from_parts` returns None when every
                     // paired element was dropped per #2886 and there
                     // are no wholly-added / wholly-removed elements
@@ -973,10 +1064,11 @@ fn build_list_of_maps_diff_row(
     key: &str,
     old_value: Option<&Value>,
     new_value: &Value,
+    attr_type: Option<&AttributeType>,
     detail: DetailLevel,
 ) -> Option<DetailRow> {
     let (unchanged, modified, added, removed) =
-        compute_list_of_maps_diff_parts(old_value, new_value, detail);
+        compute_list_of_maps_diff_parts(old_value, new_value, attr_type, detail);
     if unchanged.is_empty() && modified.is_empty() && added.is_empty() && removed.is_empty() {
         return None;
     }
@@ -992,6 +1084,7 @@ fn build_list_of_maps_diff_row(
 fn compute_list_of_maps_diff_parts(
     old_value: Option<&Value>,
     new_value: &Value,
+    attr_type: Option<&AttributeType>,
     detail: DetailLevel,
 ) -> (
     Vec<String>,
@@ -1008,13 +1101,25 @@ fn compute_list_of_maps_diff_parts(
         _ => &vec![] as &Vec<Value>,
     };
 
+    // The element type for the list (e.g. the IAM policy `statement`
+    // `Struct`); used for schema-aware item/field equality below.
+    let item_type = match attr_type {
+        Some(AttributeType::List { inner, .. }) => Some(inner.as_ref()),
+        // The attribute itself may already be the element type when
+        // this is reached recursively from a Map value.
+        other => other,
+    };
+
     let mut old_matched = vec![false; old_items.len()];
     let mut new_matched = vec![false; new_items.len()];
 
-    // Phase 1: Find exact matches
+    // Phase 1: Find exact matches. Site 3 (carina#3073): schema-aware
+    // so two statements differing only by enum spelling
+    // (`effect: allow` vs `Allow`) match as identical instead of
+    // being reported as removed+added.
     for (ni, new_item) in new_items.iter().enumerate() {
         for (oi, old_item) in old_items.iter().enumerate() {
-            if !old_matched[oi] && old_item.semantically_equal(new_item) {
+            if !old_matched[oi] && schema_aware_equal(old_item, new_item, item_type) {
                 old_matched[oi] = true;
                 new_matched[ni] = true;
                 break;
@@ -1101,9 +1206,15 @@ fn compute_list_of_maps_diff_parts(
             let mut fields: Vec<ListOfMapsDiffField> = Vec::new();
             let mut unchanged_count: usize = 0;
             for k in keys {
+                // Site 4 (carina#3073): resolve the struct field's
+                // type so an enum-equal field (`effect: allow` vs
+                // `Allow`) is treated as unchanged instead of emitting
+                // a phantom `~ effect` sub-row under a sibling-changed
+                // statement.
+                let field_type = map_entry_subtype(item_type, k);
                 let field_same = old_map
                     .get(k)
-                    .map(|ov| ov.semantically_equal(&new_map[k]))
+                    .map(|ov| schema_aware_equal(ov, &new_map[k], field_type))
                     .unwrap_or(false);
                 if field_same {
                     // #2881: drop unchanged fields from the IR; renderers
@@ -1116,7 +1227,7 @@ fn compute_list_of_maps_diff_parts(
                 if matches!(old_val, Some(Value::Concrete(ConcreteValue::Map(_))))
                     && matches!(&new_map[k], Value::Concrete(ConcreteValue::Map(_)))
                 {
-                    let nested = compute_map_diff_entries(old_val, &new_map[k], detail);
+                    let nested = compute_map_diff_entries(old_val, &new_map[k], field_type, detail);
                     fields.push(ListOfMapsDiffField::NestedMapChanged {
                         key: k.to_string(),
                         entries: nested,
@@ -1861,5 +1972,438 @@ mod tests {
             )),
             "empty list should also emit PrettyAttribute, got: {rows:?}"
         );
+    }
+
+    // --- carina#3073: schema-aware Update/Replace renderer ---
+
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+    /// Build a registry whose `iam.Role.policy` attribute is the
+    /// IAM-policy-doc shape: a Struct with a StringEnum `version` and a
+    /// `List<Struct{ effect: StringEnum }>` `statement`. `dsl_aliases`
+    /// map the API spelling to the DSL alias, mirroring the real
+    /// provider schema (`Allow`↔`allow`, `2012-10-17`↔`2012_10_17`).
+    fn iam_policy_registry() -> SchemaRegistry {
+        let effect = AttributeType::StringEnum {
+            name: "Effect".to_string(),
+            values: vec!["Allow".to_string(), "Deny".to_string()],
+            namespace: None,
+            dsl_aliases: vec![
+                ("Allow".to_string(), "allow".to_string()),
+                ("Deny".to_string(), "deny".to_string()),
+            ],
+        };
+        let version = AttributeType::StringEnum {
+            name: "Version".to_string(),
+            values: vec!["2012-10-17".to_string(), "2008-10-17".to_string()],
+            namespace: None,
+            dsl_aliases: vec![
+                ("2012-10-17".to_string(), "2012_10_17".to_string()),
+                ("2008-10-17".to_string(), "2008_10_17".to_string()),
+            ],
+        };
+        let statement = AttributeType::List {
+            inner: Box::new(AttributeType::Struct {
+                name: "Statement".to_string(),
+                fields: vec![
+                    StructField::new("effect", effect),
+                    StructField::new("action", AttributeType::String),
+                ],
+            }),
+            ordered: false,
+        };
+        let policy = AttributeType::Struct {
+            name: "PolicyDocument".to_string(),
+            fields: vec![
+                StructField::new("version", version),
+                StructField::new("statement", statement),
+            ],
+        };
+        let schema = ResourceSchema::new("iam.Role")
+            .attribute(AttributeSchema::new("policy", policy))
+            .attribute(AttributeSchema::new("description", AttributeType::String))
+            .attribute(AttributeSchema::new("region", AttributeType::String));
+        let mut registry = SchemaRegistry::new();
+        registry.insert("", schema);
+        registry
+    }
+
+    fn iam_policy_value(effect: ConcreteValue, version: ConcreteValue) -> Value {
+        let mut stmt = indexmap::IndexMap::new();
+        stmt.insert("effect".to_string(), Value::Concrete(effect));
+        stmt.insert(
+            "action".to_string(),
+            Value::Concrete(ConcreteValue::String("s3:GetObject".to_string())),
+        );
+        let mut policy = indexmap::IndexMap::new();
+        policy.insert("version".to_string(), Value::Concrete(version));
+        policy.insert(
+            "statement".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(stmt),
+            )])),
+        );
+        Value::Concrete(ConcreteValue::Map(policy))
+    }
+
+    /// carina#3073: state holds the DSL-alias spelling
+    /// (`EnumIdentifier("allow")`/`("2012_10_17")`), desired resolves to
+    /// the API-canonical `String("Allow")`/`String("2012-10-17")`. The
+    /// schema types both as `StringEnum` with `dsl_aliases`, so
+    /// `type_aware_equal` considers them equal — the renderer must emit
+    /// **zero** rows, not a phantom `~ policy` / `~ effect: "allow" →
+    /// "Allow"`.
+    #[test]
+    fn update_with_only_enum_equal_leaves_emits_no_phantom_row() {
+        let from = State::existing(
+            ResourceId::new("iam.Role", "r"),
+            [(
+                "policy".to_string(),
+                iam_policy_value(
+                    ConcreteValue::EnumIdentifier("allow".to_string()),
+                    ConcreteValue::EnumIdentifier("2012_10_17".to_string()),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let to = Resource::new("iam.Role", "r").with_attribute(
+            "policy",
+            iam_policy_value(
+                ConcreteValue::String("Allow".to_string()),
+                ConcreteValue::String("2012-10-17".to_string()),
+            ),
+        );
+        let effect = Effect::Update {
+            id: ResourceId::new("iam.Role", "r"),
+            from: Box::new(from),
+            to,
+            changed_attributes: vec!["policy".to_string()],
+        };
+        let registry = iam_policy_registry();
+        let rows = build_detail_rows(&effect, Some(&registry), DetailLevel::Explicit, None, None);
+        assert!(
+            rows.is_empty(),
+            "enum-equal-only policy must produce no phantom row, got: {rows:?}"
+        );
+    }
+
+    /// A genuinely-changed sibling (`description`) must still render,
+    /// and the enum-equal `policy` must NOT add a phantom row alongside
+    /// it. Guards against the fix over-suppressing.
+    #[test]
+    fn update_real_sibling_change_still_renders_without_enum_phantom() {
+        let from = State::existing(
+            ResourceId::new("iam.Role", "r"),
+            [
+                (
+                    "policy".to_string(),
+                    iam_policy_value(
+                        ConcreteValue::EnumIdentifier("allow".to_string()),
+                        ConcreteValue::EnumIdentifier("2012_10_17".to_string()),
+                    ),
+                ),
+                (
+                    "description".to_string(),
+                    Value::Concrete(ConcreteValue::String("old".to_string())),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let to = Resource::new("iam.Role", "r")
+            .with_attribute(
+                "policy",
+                iam_policy_value(
+                    ConcreteValue::String("Allow".to_string()),
+                    ConcreteValue::String("2012-10-17".to_string()),
+                ),
+            )
+            .with_attribute(
+                "description",
+                Value::Concrete(ConcreteValue::String("new".to_string())),
+            );
+        let effect = Effect::Update {
+            id: ResourceId::new("iam.Role", "r"),
+            from: Box::new(from),
+            to,
+            changed_attributes: vec!["policy".to_string(), "description".to_string()],
+        };
+        let registry = iam_policy_registry();
+        let rows = build_detail_rows(&effect, Some(&registry), DetailLevel::Explicit, None, None);
+        assert_eq!(
+            rows.len(),
+            1,
+            "only description should render, got: {rows:?}"
+        );
+        assert!(
+            matches!(&rows[0], DetailRow::Changed { key, .. } if key == "description"),
+            "expected description Changed row, got: {rows:?}"
+        );
+    }
+
+    /// Negative: with no registry the renderer must behave exactly as
+    /// before (schema-blind fallback) — the enum leaves are PartialEq
+    /// unequal, so the phantom row is still produced. Pins the
+    /// fallback so embedded/test callers are unaffected.
+    #[test]
+    fn update_without_registry_keeps_schema_blind_behavior() {
+        let from = State::existing(
+            ResourceId::new("iam.Role", "r"),
+            [(
+                "policy".to_string(),
+                iam_policy_value(
+                    ConcreteValue::EnumIdentifier("allow".to_string()),
+                    ConcreteValue::EnumIdentifier("2012_10_17".to_string()),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let to = Resource::new("iam.Role", "r").with_attribute(
+            "policy",
+            iam_policy_value(
+                ConcreteValue::String("Allow".to_string()),
+                ConcreteValue::String("2012-10-17".to_string()),
+            ),
+        );
+        let effect = Effect::Update {
+            id: ResourceId::new("iam.Role", "r"),
+            from: Box::new(from),
+            to,
+            changed_attributes: vec!["policy".to_string()],
+        };
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
+        assert!(
+            !rows.is_empty(),
+            "no-registry fallback must still show the (schema-blind) diff"
+        );
+    }
+
+    /// Count/row consistency (carina#3073 Risk): in Full mode the
+    /// enum-equal `policy` produces no `~` row, so it must be folded
+    /// into the `HiddenUnchanged` tally instead of vanishing. A
+    /// schema-blind count would treat `policy` as changed (PartialEq
+    /// unequal) and the attribute would be neither rendered nor
+    /// counted — the displayed total would not add up.
+    #[test]
+    fn update_full_mode_counts_enum_equal_attr_as_unchanged() {
+        let from = State::existing(
+            ResourceId::new("iam.Role", "r"),
+            [(
+                "policy".to_string(),
+                iam_policy_value(
+                    ConcreteValue::EnumIdentifier("allow".to_string()),
+                    ConcreteValue::EnumIdentifier("2012_10_17".to_string()),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let to = Resource::new("iam.Role", "r").with_attribute(
+            "policy",
+            iam_policy_value(
+                ConcreteValue::String("Allow".to_string()),
+                ConcreteValue::String("2012-10-17".to_string()),
+            ),
+        );
+        let effect = Effect::Update {
+            id: ResourceId::new("iam.Role", "r"),
+            from: Box::new(from),
+            to,
+            changed_attributes: vec!["policy".to_string()],
+        };
+        let registry = iam_policy_registry();
+        let rows = build_detail_rows(&effect, Some(&registry), DetailLevel::Full, None, None);
+        // No `~ policy` row, and `policy` is counted as 1 hidden
+        // unchanged attribute — the tally adds up.
+        assert!(
+            !rows
+                .iter()
+                .any(|r| matches!(r, DetailRow::Changed { .. } | DetailRow::MapDiff { .. })),
+            "no phantom policy row in Full mode, got: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| matches!(
+                r,
+                DetailRow::HiddenUnchanged { count } if *count == 1
+            )),
+            "policy must be counted as 1 hidden unchanged attr, got: {rows:?}"
+        );
+    }
+
+    /// MapDiff shape (carina#3073 Risk): the IAM fixture exercises the
+    /// *list-of-maps* path (sites 3/4). This pins the *Map* path (site
+    /// 5 / `compute_map_diff`): a `Map<String, StringEnum>` attribute
+    /// whose only change is an enum-equal value must produce no row.
+    #[test]
+    fn update_map_of_string_enum_enum_equal_value_no_phantom() {
+        let enum_t = AttributeType::StringEnum {
+            name: "Mode".to_string(),
+            values: vec!["On".to_string(), "Off".to_string()],
+            namespace: None,
+            dsl_aliases: vec![
+                ("On".to_string(), "on".to_string()),
+                ("Off".to_string(), "off".to_string()),
+            ],
+        };
+        let map_t = AttributeType::Map {
+            key: Box::new(AttributeType::String),
+            value: Box::new(enum_t),
+        };
+        let schema = ResourceSchema::new("x.Thing").attribute(AttributeSchema::new("modes", map_t));
+        let mut registry = SchemaRegistry::new();
+        registry.insert("", schema);
+
+        let mk = |v: ConcreteValue| {
+            let mut m = indexmap::IndexMap::new();
+            m.insert("a".to_string(), Value::Concrete(v));
+            Value::Concrete(ConcreteValue::Map(m))
+        };
+        let from = State::existing(
+            ResourceId::new("x.Thing", "t"),
+            [(
+                "modes".to_string(),
+                mk(ConcreteValue::EnumIdentifier("on".to_string())),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let to = Resource::new("x.Thing", "t")
+            .with_attribute("modes", mk(ConcreteValue::String("On".to_string())));
+        let effect = Effect::Update {
+            id: ResourceId::new("x.Thing", "t"),
+            from: Box::new(from),
+            to,
+            changed_attributes: vec!["modes".to_string()],
+        };
+        let rows = build_detail_rows(&effect, Some(&registry), DetailLevel::Explicit, None, None);
+        assert!(
+            rows.is_empty(),
+            "enum-equal Map<String,StringEnum> value must produce no row, got: {rows:?}"
+        );
+    }
+
+    /// Over-suppression guard (carina#3073): a *genuine* enum change
+    /// (`Allow` → `Deny`) under the registry must still render. Proves
+    /// the schema-aware path equalizes only enum-equal spellings, not
+    /// real enum-value changes.
+    #[test]
+    fn update_real_enum_change_still_renders_with_registry() {
+        let from = State::existing(
+            ResourceId::new("iam.Role", "r"),
+            [(
+                "policy".to_string(),
+                iam_policy_value(
+                    ConcreteValue::EnumIdentifier("allow".to_string()),
+                    ConcreteValue::EnumIdentifier("2012_10_17".to_string()),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        // Desired flips effect to the API-canonical `Deny` — a real
+        // change, not a spelling alias of `allow`.
+        let to = Resource::new("iam.Role", "r").with_attribute(
+            "policy",
+            iam_policy_value(
+                ConcreteValue::String("Deny".to_string()),
+                ConcreteValue::String("2012-10-17".to_string()),
+            ),
+        );
+        let effect = Effect::Update {
+            id: ResourceId::new("iam.Role", "r"),
+            from: Box::new(from),
+            to,
+            changed_attributes: vec!["policy".to_string()],
+        };
+        let registry = iam_policy_registry();
+        let rows = build_detail_rows(&effect, Some(&registry), DetailLevel::Explicit, None, None);
+        assert!(
+            !rows.is_empty(),
+            "a real enum change (allow → Deny) must still render a row"
+        );
+    }
+
+    /// Count/row consistency, multi-attribute (carina#3073 Risk,
+    /// round-2 hardening). One real change (`description`), one
+    /// enum-phantom (`policy`), one truly-unchanged (`region`) → in
+    /// Full mode exactly 1 rendered `~` row and a `HiddenUnchanged`
+    /// of 2 (policy + region), so rendered + hidden == 3 total
+    /// non-internal attributes. Guards the full tally invariant, not
+    /// just `count == 1` in isolation.
+    #[test]
+    fn update_full_mode_multi_attr_tally_balances() {
+        let from = State::existing(
+            ResourceId::new("iam.Role", "r"),
+            [
+                (
+                    "policy".to_string(),
+                    iam_policy_value(
+                        ConcreteValue::EnumIdentifier("allow".to_string()),
+                        ConcreteValue::EnumIdentifier("2012_10_17".to_string()),
+                    ),
+                ),
+                (
+                    "description".to_string(),
+                    Value::Concrete(ConcreteValue::String("old".to_string())),
+                ),
+                (
+                    "region".to_string(),
+                    Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let to = Resource::new("iam.Role", "r")
+            .with_attribute(
+                "policy",
+                iam_policy_value(
+                    ConcreteValue::String("Allow".to_string()),
+                    ConcreteValue::String("2012-10-17".to_string()),
+                ),
+            )
+            .with_attribute(
+                "description",
+                Value::Concrete(ConcreteValue::String("new".to_string())),
+            )
+            .with_attribute(
+                "region",
+                Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
+            );
+        let effect = Effect::Update {
+            id: ResourceId::new("iam.Role", "r"),
+            from: Box::new(from),
+            to,
+            changed_attributes: vec!["policy".to_string(), "description".to_string()],
+        };
+        let registry = iam_policy_registry();
+        let rows = build_detail_rows(&effect, Some(&registry), DetailLevel::Full, None, None);
+
+        let changed_rows = rows
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    DetailRow::Changed { .. }
+                        | DetailRow::MapDiff { .. }
+                        | DetailRow::ListOfMapsDiff { .. }
+                )
+            })
+            .count();
+        let hidden = rows.iter().find_map(|r| match r {
+            DetailRow::HiddenUnchanged { count } => Some(*count),
+            _ => None,
+        });
+        assert_eq!(changed_rows, 1, "only description should render: {rows:?}");
+        assert_eq!(
+            hidden,
+            Some(2),
+            "policy (phantom) + region (unchanged) must be hidden: {rows:?}"
+        );
+        // The displayed tally adds up: 1 rendered + 2 hidden == 3
+        // total non-internal attributes.
+        assert_eq!(changed_rows + hidden.unwrap(), 3);
     }
 }

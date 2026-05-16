@@ -250,6 +250,25 @@ implementation, see Risks).
    plan_snapshot`. Add the Makefile target (CI "Check Plan Fixtures"
    requires it). Review snapshots before accepting (verify the phantom
    row is gone and nothing legitimate was suppressed).
+
+   > **Implementation note (carina#3073, infeasible as specified):**
+   > the `plan_display` fixture harness
+   > (`carina-cli/src/fixture_plan.rs`) builds its `SchemaRegistry`
+   > solely from provider factories, and fixture tests run with
+   > `WiringContext::new(vec![])` → an **empty** registry
+   > (`provider_mod::collect_schemas(&[])`). `build_detail_rows` then
+   > receives `Some(&empty_registry)`, `get_for` returns `None`, and
+   > the schema-aware path is **structurally unreachable** from the
+   > snapshot harness — a fixture would only exercise the schema-blind
+   > fallback (still showing the phantom, i.e. it would pin the *bug*,
+   > not the fix). This design step assumed snapshots have provider
+   > schemas; they do not. The regression is instead pinned by the
+   > carina-core unit tests in step 1 (which construct a real
+   > `SchemaRegistry`): they cover all five sites, the no-registry
+   > fallback, count/row consistency, the MapDiff shape, and an
+   > over-suppression guard. No `plan_display` fixture/Makefile target
+   > is added; the existing snapshot suite is confirmed unchanged
+   > (the fix is a no-op when the registry is empty).
 3. **Repro confirmation:** the carina#3073 reproduction (an
    IAM-policy-shaped resource whose state holds the DSL alias and whose
    desired resolves to API-canonical) plans clean on the second run.
