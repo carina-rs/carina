@@ -6,8 +6,8 @@ use std::time::Instant;
 use crate::binding_index::ResolvedBindings;
 use crate::effect::Effect;
 use crate::provider::{
-    CreateRequest, DeleteRequest, PatchOp, PatchOpKind, Provider, UpdatePatch, UpdateRequest,
-    build_update_patch,
+    CreateRequest, DeleteRequest, PatchOp, PatchOpKind, Provider, ProviderNormalizer, UpdatePatch,
+    UpdateRequest, build_update_patch,
 };
 use crate::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 
@@ -88,6 +88,7 @@ pub(super) struct ReplaceContext<'a> {
     pub(super) temporary_name: Option<&'a crate::effect::TemporaryName>,
     pub(super) bindings: &'a ResolvedBindings,
     pub(super) unresolved: &'a HashMap<ResourceId, Resource>,
+    pub(super) normalizer: &'a dyn ProviderNormalizer,
     pub(super) started: Instant,
     pub(super) progress: ProgressInfo,
 }
@@ -115,7 +116,7 @@ pub(super) async fn execute_cbd_replace_parallel(
     ctx: &ReplaceContext<'_>,
     observer: &dyn ExecutionObserver,
 ) -> SingleEffectResult {
-    let resolved = match resolve_resource(ctx.to, ctx.bindings) {
+    let resolved = match resolve_resource(ctx.to, ctx.bindings, ctx.normalizer) {
         Ok(r) => r,
         Err(e) => {
             observer.on_event(&ExecutionEvent::EffectFailed {
@@ -153,19 +154,21 @@ pub(super) async fn execute_cbd_replace_parallel(
             // Execute cascading updates
             let mut cascade_failed = false;
             for cascade in ctx.cascading_updates {
-                let resolved_to = match resolve_resource(&cascade.to, &local_bindings) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        observer.on_event(&ExecutionEvent::CascadeUpdateFailed {
-                            id: &cascade.id,
-                            error: &e,
-                        });
-                        let cascade_identifier = cascade.from.identifier.as_deref().unwrap_or("");
-                        refreshes.push((cascade.id.clone(), cascade_identifier.to_string()));
-                        cascade_failed = true;
-                        break;
-                    }
-                };
+                let resolved_to =
+                    match resolve_resource(&cascade.to, &local_bindings, ctx.normalizer) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            observer.on_event(&ExecutionEvent::CascadeUpdateFailed {
+                                id: &cascade.id,
+                                error: &e,
+                            });
+                            let cascade_identifier =
+                                cascade.from.identifier.as_deref().unwrap_or("");
+                            refreshes.push((cascade.id.clone(), cascade_identifier.to_string()));
+                            cascade_failed = true;
+                            break;
+                        }
+                    };
                 let cascade_identifier = cascade.from.identifier.as_deref().unwrap_or("");
                 let cascade_patch = compute_full_diff_patch(&cascade.from, &resolved_to);
                 let cascade_request = UpdateRequest {
@@ -377,8 +380,12 @@ pub(super) async fn execute_dbd_replace_parallel(
     {
         Ok(()) => {
             let resolve_source = ctx.unresolved.get(&ctx.to.id).unwrap_or(ctx.to);
-            let resolved = match resolve_resource_with_source(ctx.to, resolve_source, ctx.bindings)
-            {
+            let resolved = match resolve_resource_with_source(
+                ctx.to,
+                resolve_source,
+                ctx.bindings,
+                ctx.normalizer,
+            ) {
                 Ok(r) => r,
                 Err(e) => {
                     observer.on_event(&ExecutionEvent::EffectFailed {

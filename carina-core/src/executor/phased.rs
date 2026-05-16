@@ -12,9 +12,9 @@ use crate::provider::{CreateRequest, DeleteRequest, Provider, UpdateRequest};
 use crate::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 
 use super::basic::{
-    BasicEffectResult, ExecutionState, count_actionable_effects, execute_basic_effect,
-    process_basic_result, queue_state_refresh, refresh_pending_states, resolve_resource,
-    resolve_resource_with_source,
+    BasicEffectCtx, BasicEffectResult, ExecutionState, count_actionable_effects,
+    execute_basic_effect, process_basic_result, queue_state_refresh, refresh_pending_states,
+    resolve_resource, resolve_resource_with_source,
 };
 use super::replace::{compute_full_diff_patch, single_attribute_patch};
 use super::{ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, ProgressInfo};
@@ -373,16 +373,20 @@ pub(super) async fn execute_effects_phased(
 
                 let binding_snapshot = input.bindings.clone();
                 let unresolved = &input.unresolved_resources;
+                let normalizer = input.normalizer;
                 let completed_ref = &completed;
 
                 in_flight.push(async move {
                     let basic = execute_basic_effect(
                         effect,
-                        provider,
-                        &binding_snapshot,
-                        unresolved,
-                        completed_ref,
-                        total,
+                        &BasicEffectCtx {
+                            provider,
+                            bindings: &binding_snapshot,
+                            unresolved,
+                            normalizer,
+                            completed: completed_ref,
+                            total,
+                        },
                         observer,
                     )
                     .await;
@@ -492,6 +496,7 @@ pub(super) async fn execute_effects_phased(
 
                 let binding_snapshot = input.bindings.clone();
                 let unresolved = &input.unresolved_resources;
+                let normalizer = input.normalizer;
 
                 in_flight.push(async move {
                     if let Effect::Replace {
@@ -508,6 +513,7 @@ pub(super) async fn execute_effects_phased(
                             to,
                             resolve_source,
                             &binding_snapshot,
+                            normalizer,
                         ) {
                             Ok(r) => r,
                             Err(e) => {
@@ -549,29 +555,29 @@ pub(super) async fn execute_effects_phased(
                                 let mut refreshes = Vec::new();
                                 let mut cascade_states = Vec::new();
                                 for cascade in cascading_updates {
-                                    let resolved_to =
-                                        match resolve_resource(&cascade.to, &local_bindings) {
-                                            Ok(r) => r,
-                                            Err(e) => {
-                                                observer.on_event(
-                                                    &ExecutionEvent::CascadeUpdateFailed {
-                                                        id: &cascade.id,
-                                                        error: &e,
-                                                    },
-                                                );
-                                                let cascade_identifier = cascade
-                                                    .from
-                                                    .identifier
-                                                    .as_deref()
-                                                    .unwrap_or("");
-                                                refreshes.push((
-                                                    cascade.id.clone(),
-                                                    cascade_identifier.to_string(),
-                                                ));
-                                                cascade_failed = true;
-                                                break;
-                                            }
-                                        };
+                                    let resolved_to = match resolve_resource(
+                                        &cascade.to,
+                                        &local_bindings,
+                                        normalizer,
+                                    ) {
+                                        Ok(r) => r,
+                                        Err(e) => {
+                                            observer.on_event(
+                                                &ExecutionEvent::CascadeUpdateFailed {
+                                                    id: &cascade.id,
+                                                    error: &e,
+                                                },
+                                            );
+                                            let cascade_identifier =
+                                                cascade.from.identifier.as_deref().unwrap_or("");
+                                            refreshes.push((
+                                                cascade.id.clone(),
+                                                cascade_identifier.to_string(),
+                                            ));
+                                            cascade_failed = true;
+                                            break;
+                                        }
+                                    };
                                     let cascade_identifier =
                                         cascade.from.identifier.as_deref().unwrap_or("");
                                     let cascade_patch =
@@ -968,6 +974,7 @@ pub(super) async fn execute_effects_phased(
 
                 let binding_snapshot = input.bindings.clone();
                 let unresolved = &input.unresolved_resources;
+                let normalizer = input.normalizer;
 
                 if let Effect::Replace {
                     id,
@@ -1102,6 +1109,7 @@ pub(super) async fn execute_effects_phased(
                                     to,
                                     resolve_source,
                                     &binding_snapshot,
+                                    normalizer,
                                 ) {
                                     Ok(r) => r,
                                     Err(e) => {
