@@ -1441,6 +1441,20 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
     // `resolve_refs_with_state_and_remote` and still errors on
     // unresolved upstream references.
     let mut resources = sorted_resources.clone();
+    // awscc#251 (follow-up to #3055): #3055 lifted only `saved_attrs`.
+    // On a refresh the live value comes from `provider.read()` into
+    // `current_states`, a different map. A provider returning an IAM
+    // policy doc with plain `String` `version`/`effect` (the wire shape
+    // for a field that was `Custom` at create time, now `StringEnum`
+    // after awscc#250) flows un-lifted into the differ and the strict
+    // carina#2986 validator rejects it. Lift `current_states` here —
+    // both refresh branches have populated it by now, before the
+    // resolver / differ consume it.
+    carina_core::utils::lift_current_state_string_enums(
+        &mut current_states,
+        &parsed.resources,
+        ctx.schemas(),
+    );
     resolve_refs_for_plan(&mut resources, &current_states, remote_bindings)?;
 
     // Type-level canonicalization for `Union[String, list(String)]`
