@@ -625,7 +625,7 @@ fn build_update_rows(
                 Some(row) => rows.push(row),
                 None => effectively_unchanged += 1,
             }
-        } else if let Some(diff) = compute_string_list_change(old_value, new_value) {
+        } else if let Some(diff) = compute_string_list_change(old_value, new_value, attr_type) {
             rows.push(DetailRow::StringListDiff {
                 key: key.to_string(),
                 unchanged: diff.unchanged,
@@ -751,7 +751,7 @@ fn build_replace_rows(
                 key: key.to_string(),
                 entries,
             });
-        } else if let Some(diff) = compute_string_list_change(old_value, new_value) {
+        } else if let Some(diff) = compute_string_list_change(old_value, new_value, attr_type) {
             rows.push(DetailRow::ReplaceStringListDiff {
                 key: key.to_string(),
                 unchanged: diff.unchanged,
@@ -1232,7 +1232,9 @@ fn compute_list_of_maps_diff_parts(
                         key: k.to_string(),
                         entries: nested,
                     });
-                } else if let Some(diff) = compute_string_list_change(old_val, &new_map[k]) {
+                } else if let Some(diff) =
+                    compute_string_list_change(old_val, &new_map[k], field_type)
+                {
                     fields.push(ListOfMapsDiffField::StringListChanged {
                         key: k.to_string(),
                         unchanged: diff.unchanged,
@@ -1355,17 +1357,45 @@ fn should_render_as_map_diff(old_value: Option<&Value>, new_value: &Value) -> bo
 fn compute_string_list_change(
     old_value: Option<&Value>,
     new_value: &Value,
+    attr_type: Option<&AttributeType>,
 ) -> Option<crate::diff_helpers::StringListDiff> {
-    let new_list = crate::value::as_string_list(new_value)?;
-    let old_list = match old_value {
+    let mut new_list = crate::value::as_string_list(new_value)?;
+    let mut old_list = match old_value {
         Some(ov) => crate::value::as_string_list(ov)?,
         None => Vec::new(),
     };
+    // carina#3075: when the element type is a `StringEnum`, the set-diff
+    // must compare enum *values*, not raw spellings — otherwise a
+    // DSL-alias element (`"allow"`) vs its API-canonical form
+    // (`"Allow"`) is reported as a phantom `- allow / + Allow` pair
+    // alongside any genuine add/remove. Canonicalize every element to
+    // the API spelling first, mirroring the differ's `StringEnum` arm
+    // (`extract_enum_value_with_values` → `DslMap::api_for`).
+    if let Some((_, values, _, dsl_map)) = attr_type
+        .and_then(string_list_inner_type)
+        .and_then(|t| t.string_enum_parts())
+    {
+        let valid: Vec<&str> = values.iter().map(String::as_str).collect();
+        for s in old_list.iter_mut().chain(new_list.iter_mut()) {
+            *s = crate::utils::canonicalize_enum_to_api(s, &valid, &dsl_map);
+        }
+    }
     let diff = crate::diff_helpers::compute_string_list_diff(&old_list, &new_list);
     if diff.added.is_empty() && diff.removed.is_empty() {
         return None;
     }
     Some(diff)
+}
+
+/// Return a `List`'s element type, descending recursively through
+/// `Union` members to find the first `List` arm. Returns `None` when
+/// `attr_type` resolves to nothing list-shaped.
+fn string_list_inner_type(attr_type: &AttributeType) -> Option<&AttributeType> {
+    match attr_type {
+        AttributeType::List { inner, .. } => Some(inner),
+        AttributeType::Union(members) => members.iter().find_map(string_list_inner_type),
+        _ => None,
+    }
 }
 
 /// Check whether a Value references the given binding name.
@@ -2405,5 +2435,128 @@ mod tests {
         // The displayed tally adds up: 1 rendered + 2 hidden == 3
         // total non-internal attributes.
         assert_eq!(changed_rows + hidden.unwrap(), 3);
+    }
+
+    fn modes_registry() -> SchemaRegistry {
+        let mode = AttributeType::StringEnum {
+            name: "Mode".to_string(),
+            values: vec!["Allow".to_string(), "Deny".to_string()],
+            namespace: None,
+            dsl_aliases: vec![
+                ("Allow".to_string(), "allow".to_string()),
+                ("Deny".to_string(), "deny".to_string()),
+            ],
+        };
+        let schema = ResourceSchema::new("x.Thing").attribute(AttributeSchema::new(
+            "modes",
+            AttributeType::List {
+                inner: Box::new(mode),
+                ordered: false,
+            },
+        ));
+        let mut registry = SchemaRegistry::new();
+        registry.insert("", schema);
+        registry
+    }
+
+    /// Real apply/plan-path element shape for a `List<StringEnum>`:
+    /// both state (lifted by `lift_saved_state_string_enums`) and
+    /// desired (parser-emitted per carina#2986) carry
+    /// `ConcreteValue::EnumIdentifier`, NOT `String`. Tests must use
+    /// this shape — a `String`-element test passes while the real path
+    /// is broken (unit-test-path ≠ apply-path).
+    fn enum_list(items: &[&str]) -> Value {
+        Value::Concrete(ConcreteValue::List(
+            items
+                .iter()
+                .map(|s| Value::Concrete(ConcreteValue::EnumIdentifier(s.to_string())))
+                .collect(),
+        ))
+    }
+
+    /// carina#3075: a `List<StringEnum>` attribute whose state holds the
+    /// DSL-alias spelling (`["allow"]`) and whose desired resolves to
+    /// API-canonical (`["Allow", "Deny"]`) — a genuine add of `Deny`
+    /// co-occurring with an enum-spelling-only element. The
+    /// `compute_string_list_change` set-diff was schema-blind, so it
+    /// reported a phantom `- allow / + Allow` alongside the real
+    /// `+ Deny`. Schema-aware: only the genuine add must render.
+    /// Elements are `EnumIdentifier` (the real runtime shape).
+    #[test]
+    fn update_string_list_of_string_enum_only_genuine_add_renders() {
+        let registry = modes_registry();
+        let from = State::existing(
+            ResourceId::new("x.Thing", "t"),
+            [("modes".to_string(), enum_list(&["allow"]))]
+                .into_iter()
+                .collect(),
+        );
+        let to =
+            Resource::new("x.Thing", "t").with_attribute("modes", enum_list(&["Allow", "Deny"]));
+        let effect = Effect::Update {
+            id: ResourceId::new("x.Thing", "t"),
+            from: Box::new(from),
+            to,
+            changed_attributes: vec!["modes".to_string()],
+        };
+        let rows = build_detail_rows(&effect, Some(&registry), DetailLevel::Explicit, None, None);
+        // Exactly one StringListDiff row, adding only the genuine
+        // `Deny` (the `allow`↔`Allow` element is enum-equal → not a
+        // phantom add/remove).
+        assert_eq!(rows.len(), 1, "expected one row, got: {rows:?}");
+        let DetailRow::StringListDiff { added, removed, .. } = &rows[0] else {
+            panic!("expected StringListDiff, got: {rows:?}");
+        };
+        assert!(
+            removed.is_empty(),
+            "no phantom removal of `allow`, got removed: {removed:?}"
+        );
+        assert_eq!(
+            added.len(),
+            1,
+            "only the genuine `Deny` add, got added: {added:?}"
+        );
+        assert!(
+            added[0].eq_ignore_ascii_case("deny"),
+            "the genuine add is Deny, got: {added:?}"
+        );
+    }
+
+    /// Negative (carina#3075, mirrors the carina#3073 fallback
+    /// convention): with no registry, `compute_string_list_change`
+    /// stays schema-blind — the raw-spelling set-diff still reports the
+    /// phantom `- allow` + `+ Allow` alongside the genuine `+ Deny`.
+    /// Pins that the canonicalization only engages when a schema is
+    /// available. Same real `EnumIdentifier` element shape.
+    #[test]
+    fn update_string_list_of_string_enum_no_registry_keeps_schema_blind() {
+        let from = State::existing(
+            ResourceId::new("x.Thing", "t"),
+            [("modes".to_string(), enum_list(&["allow"]))]
+                .into_iter()
+                .collect(),
+        );
+        let to =
+            Resource::new("x.Thing", "t").with_attribute("modes", enum_list(&["Allow", "Deny"]));
+        let effect = Effect::Update {
+            id: ResourceId::new("x.Thing", "t"),
+            from: Box::new(from),
+            to,
+            changed_attributes: vec!["modes".to_string()],
+        };
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
+        assert_eq!(rows.len(), 1, "expected one row, got: {rows:?}");
+        let DetailRow::StringListDiff { added, removed, .. } = &rows[0] else {
+            panic!("expected StringListDiff, got: {rows:?}");
+        };
+        // Schema-blind: `allow` (state) is not in the new raw set
+        // {`Allow`,`Deny`} → removed; both `Allow` and `Deny` are not
+        // in the old raw set {`allow`} → added.
+        assert_eq!(removed, &vec!["allow".to_string()], "schema-blind removal");
+        assert_eq!(
+            added,
+            &vec!["Allow".to_string(), "Deny".to_string()],
+            "schema-blind additions"
+        );
     }
 }

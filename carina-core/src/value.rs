@@ -1083,18 +1083,29 @@ pub fn is_list_of_maps(value: &Value) -> bool {
 }
 
 /// Extract a `Vec<String>` from a `Value::Concrete(ConcreteValue::StringList)` or a `Value::Concrete(ConcreteValue::List)`
-/// whose every element is `Value::Concrete(ConcreteValue::String)`. Returns `None` for other
-/// shapes. Empty lists return `Some(vec![])` so callers can distinguish
-/// "empty string list" from "not a string list" — needed by #2943's
-/// diff path so a list shrinking to empty still routes through
-/// per-element `-` lines instead of the inline `[a, b] → []` form.
+/// whose every element is a string-bearing scalar — `String` **or**
+/// `EnumIdentifier`. Returns `None` for other shapes. Empty lists
+/// return `Some(vec![])` so callers can distinguish "empty string
+/// list" from "not a string list" — needed by #2943's diff path so a
+/// list shrinking to empty still routes through per-element `-` lines
+/// instead of the inline `[a, b] → []` form.
+///
+/// `EnumIdentifier` is accepted (carina#3075): a `List<StringEnum>`
+/// reaches the renderer with `EnumIdentifier` elements on both sides
+/// (state lifted by `lift_saved_state_string_enums`, desired emitted
+/// by the parser per carina#2986). Treating it as its string payload —
+/// the same `String`/`EnumIdentifier` interchangeability the differ's
+/// `StringEnum` arm already relies on — lets the string-list diff path
+/// (and its schema-aware enum canonicalization) engage instead of the
+/// value falling to a coarse inline `Changed` row.
 pub fn as_string_list(value: &Value) -> Option<Vec<String>> {
     match value {
         Value::Concrete(ConcreteValue::StringList(items)) => Some(items.clone()),
         Value::Concrete(ConcreteValue::List(items)) => items
             .iter()
             .map(|v| match v {
-                Value::Concrete(ConcreteValue::String(s)) => Some(s.clone()),
+                Value::Concrete(ConcreteValue::String(s))
+                | Value::Concrete(ConcreteValue::EnumIdentifier(s)) => Some(s.clone()),
                 _ => None,
             })
             .collect(),
