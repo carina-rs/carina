@@ -1,0 +1,14 @@
+# Mirrors usecases/registry/acm.crn — the wait lives inside the module.
+let cert = aws.acm.Certificate {
+  domain_name       = domain_name
+  validation_method = "DNS"
+
+  directives {
+    provider = us
+  }
+}
+
+let cert_issued = wait cert {
+  until   = cert.status == "ISSUED"
+  timeout = 75min
+}

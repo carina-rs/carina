@@ -1,0 +1,9 @@
+provider aws {
+  region = "ap-northeast-1"
+}
+
+# Named instance the module's cert routes to via
+# `directives { provider = us }` — mirrors registry/dev/registry/providers.crn.
+let us = provider aws {
+  region = "us-east-1"
+}

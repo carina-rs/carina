@@ -1,0 +1,14 @@
+# Caller (mirrors registry/dev/registry/main.crn): instantiates the
+# usecase as a module. The wait binding lives two levels in: it must
+# survive apply-path module expansion as `r.cert_issued`.
+let registry = use {
+  source = "../usecase"
+}
+
+let r = registry {
+  domain_name = "registry-dev.example.com"
+}
+
+exports {
+  certificate_arn = r.certificate_arn
+}

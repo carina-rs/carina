@@ -1,0 +1,8 @@
+# Module: only arguments + attributes (mirrors usecases/registry/main.crn).
+arguments {
+  domain_name: String
+}
+
+attributes {
+  certificate_arn = cert_issued.certificate_arn
+}

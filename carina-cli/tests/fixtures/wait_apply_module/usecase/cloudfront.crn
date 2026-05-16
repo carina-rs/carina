@@ -1,0 +1,10 @@
+# Mirrors usecases/registry/cloudfront.crn — Distribution reads the
+# wait binding from a nested Map, in a sibling file from the wait.
+let distribution = aws.cloudfront.Distribution {
+  distribution_config = {
+    enabled = true
+    viewer_certificate = {
+      acm_certificate_arn = cert_issued.certificate_arn
+    }
+  }
+}
