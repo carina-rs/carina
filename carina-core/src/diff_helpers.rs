@@ -8,16 +8,53 @@ use std::collections::HashMap;
 use indexmap::IndexMap;
 
 use crate::resource::Value;
+use crate::schema::{AttributeType, ResourceSchema};
 
-/// Count non-internal attributes that are semantically equal in both `from` and `to`.
+/// Schema-aware value equality shared by the plan renderer
+/// (`detail_rows`) and the unchanged-count helper below (carina#3073).
+///
+/// With a resolved `attr_type`, delegate to the differ's exact
+/// `type_aware_equal` (its `StringEnum` arm alias-folds
+/// `EnumIdentifier("allow")` vs `String("Allow")`), so the rendered
+/// rows and the hidden-count agree with `find_changed_attributes`.
+/// Without one (no registry — embedded / test callers) fall back to
+/// the schema-blind `Value::semantically_equal`, leaving that path's
+/// behavior unchanged. `secret_ctx` is `None`: a
+/// `Value::Deferred(Secret(_))` would short-circuit
+/// `type_aware_equal`'s secret arm and compare unequal, which only ever
+/// *over*-reports a diff (safe-by-default) — it never hides a real
+/// change.
+pub(crate) fn schema_aware_equal(
+    old: &Value,
+    new: &Value,
+    attr_type: Option<&AttributeType>,
+) -> bool {
+    match attr_type {
+        Some(t) => crate::differ::type_aware_equal(old, new, Some(t), None),
+        None => old.semantically_equal(new),
+    }
+}
+
+/// Count non-internal attributes that are equal in both `from` and `to`.
 ///
 /// Internal attributes (prefixed with `_`) are excluded from the count.
 /// An optional `exclude` set can be provided to skip additional attribute names
 /// (e.g., `changed_create_only` attributes in Replace effects).
+///
+/// When `schema` is provided, equality is schema-aware (carina#3073):
+/// an attribute whose only difference is an enum-equal leaf
+/// (`EnumIdentifier("allow")` vs `String("Allow")`) is counted as
+/// **unchanged** — matching the renderer, which now suppresses its
+/// phantom row via the same `type_aware_equal`. Without that, such an
+/// attribute would render no row *and* not be counted, so the Full-mode
+/// `# (n unchanged attributes hidden)` tally would not add up. With
+/// `schema = None`, behavior is the schema-blind `semantically_equal`
+/// path (unchanged for embedded / test callers).
 pub fn compute_unchanged_count(
     from_attrs: &HashMap<String, Value>,
     to_attrs: &HashMap<String, Value>,
     exclude: Option<&std::collections::HashSet<&str>>,
+    schema: Option<&ResourceSchema>,
 ) -> usize {
     from_attrs
         .iter()
@@ -26,7 +63,12 @@ pub fn compute_unchanged_count(
                 && exclude.is_none_or(|set| !set.contains(k.as_str()))
                 && to_attrs
                     .get(k.as_str())
-                    .map(|nv| nv.semantically_equal(v))
+                    .map(|nv| {
+                        let attr_type = schema
+                            .and_then(|s| s.attributes.get(k.as_str()))
+                            .map(|a| &a.attr_type);
+                        schema_aware_equal(nv, v, attr_type)
+                    })
                     .unwrap_or(false)
         })
         .count()
@@ -214,7 +256,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        assert_eq!(compute_unchanged_count(&from, &to, None), 2);
+        assert_eq!(compute_unchanged_count(&from, &to, None, None), 2);
     }
 
     #[test]
@@ -245,7 +287,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        assert_eq!(compute_unchanged_count(&from, &to, None), 1);
+        assert_eq!(compute_unchanged_count(&from, &to, None, None), 1);
     }
 
     #[test]
@@ -277,7 +319,7 @@ mod tests {
         .collect();
 
         let exclude: std::collections::HashSet<&str> = ["region"].into_iter().collect();
-        assert_eq!(compute_unchanged_count(&from, &to, Some(&exclude)), 1);
+        assert_eq!(compute_unchanged_count(&from, &to, Some(&exclude), None), 1);
     }
 
     #[test]

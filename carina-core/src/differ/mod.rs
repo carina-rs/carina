@@ -24,8 +24,12 @@ use crate::resource::Directives;
 use crate::schema::{AttributeType, SchemaRegistry};
 #[cfg(test)]
 use comparison::find_changed_attributes;
-#[cfg(test)]
-use comparison::type_aware_equal;
+
+// Re-exported for the plan detail-row renderer (carina#3073): the
+// renderer must reuse the differ's own type-aware equality so the
+// rendered rows agree with `find_changed_attributes`. Also covers
+// the differ's own tests, which previously imported it under cfg(test).
+pub(crate) use comparison::type_aware_equal;
 
 /// Result of a diff operation
 #[derive(Debug, Clone, PartialEq)]

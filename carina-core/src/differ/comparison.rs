@@ -45,7 +45,12 @@ use crate::value::{SECRET_PREFIX, SecretHashContext, argon2id_hash, value_to_jso
 /// non-canonical shape, so plan diffs would keep firing on the next
 /// run — exactly the phantom-diff regression that #2481 set out to
 /// eliminate.
-pub(super) fn type_aware_equal(
+// `pub(crate)` (not `pub(super)`): the plan detail-row renderer
+// (`crate::detail_rows`) reuses this exact function so the rendered
+// rows agree with `find_changed_attributes`' own verdict. Reusing it
+// — never reimplementing — is the carina#3073 fix; a second equality
+// notion is precisely the drift this avoids.
+pub(crate) fn type_aware_equal(
     a: &Value,
     b: &Value,
     attr_type: Option<&AttributeType>,
