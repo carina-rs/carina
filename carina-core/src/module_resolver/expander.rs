@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use indexmap::IndexMap;
 
-use crate::parser::{ArgumentParameter, ModuleCall};
+use crate::parser::{ArgumentParameter, ModuleCall, WaitBinding};
 use crate::resource::{
     ConcreteValue, DeferredValue, Directives, Resource, ResourceId, ResourceKind, ResourceName,
     Value,
@@ -15,6 +15,27 @@ use super::error::ModuleError;
 use super::resolver::ModuleResolver;
 use super::typecheck::check_module_arg_type;
 use super::validation::{evaluate_require_expr, evaluate_validate_expr, format_value_for_error};
+
+/// Result of expanding a single module call.
+///
+/// A module call contributes both resources and `wait` declarations to
+/// the caller. Wait bindings were silently dropped before carina#3061
+/// because the expander only returned resources — any `wait` block
+/// inside a `use`d module vanished, so a downstream resource that
+/// referenced `<wait_binding>.<attr>` lost its synchronization edge and
+/// failed at apply with the self-contradicting "add a `wait` block"
+/// error.
+#[derive(Debug)]
+pub struct ExpandedModule {
+    /// Expanded, instance-prefixed resources (plus the virtual
+    /// attribute proxy when the module declares `attributes`).
+    pub resources: Vec<Resource>,
+    /// The module's `wait` declarations, with every binding-name field
+    /// (`binding`, `target`, the predicate LHS root, `depends_on`)
+    /// rewritten with the call's `instance_prefix` so they match the
+    /// prefixed resource bindings and the prefixed downstream refs.
+    pub wait_bindings: Vec<WaitBinding>,
+}
 
 impl ModuleResolver<'_> {
     /// Expand a module call into resources.
@@ -34,7 +55,7 @@ impl ModuleResolver<'_> {
         call: &ModuleCall,
         instance_prefix: &str,
         enclosing_args: Option<&[ArgumentParameter]>,
-    ) -> Result<Vec<Resource>, ModuleError> {
+    ) -> Result<ExpandedModule, ModuleError> {
         let module = self
             .imported_modules
             .get(&call.module_name)
@@ -174,11 +195,19 @@ impl ModuleResolver<'_> {
             }
         }
 
-        // Collect intra-module binding names so we can rewrite ResourceRefs
+        // Collect intra-module binding names so we can rewrite
+        // ResourceRefs. Wait-binding names are included alongside
+        // resource bindings: a downstream resource that references
+        // `<wait_binding>.<attr>` (e.g. the CloudFront Distribution's
+        // `cert_issued.certificate_arn`) must be instance-prefixed the
+        // same way, otherwise the rewritten resource points at an
+        // unprefixed `cert_issued` that no longer exists post-expansion
+        // and the dependency edge to the wait is lost (carina#3061).
         let intra_module_bindings: HashSet<String> = module
             .resources
             .iter()
             .filter_map(|r| r.binding.clone())
+            .chain(module.wait_bindings.iter().map(|w| w.binding.clone()))
             .collect();
 
         // Expand resources with substituted values
@@ -273,7 +302,50 @@ impl ModuleResolver<'_> {
             expanded_resources.push(virtual_resource);
         }
 
-        Ok(expanded_resources)
+        // Propagate the module's `wait` declarations to the caller,
+        // instance-prefixing every binding-name field so they line up
+        // with the prefixed resource bindings and the prefixed
+        // downstream refs (carina#3061). The predicate RHS and
+        // `until_raw` surface text are value/display data, not binding
+        // names, and are carried through unchanged.
+        let expanded_wait_bindings: Vec<WaitBinding> = module
+            .wait_bindings
+            .iter()
+            .map(|wb| prefix_wait_binding(wb, instance_prefix))
+            .collect();
+
+        Ok(ExpandedModule {
+            resources: expanded_resources,
+            wait_bindings: expanded_wait_bindings,
+        })
+    }
+}
+
+/// Instance-prefix every binding-name field of a [`WaitBinding`] so a
+/// module-internal `wait` keeps referring to the same (now prefixed)
+/// target / dependencies after expansion.
+///
+/// Prefixed: `binding`, `target`, the predicate LHS root segment
+/// (`lhs_segments[0]`, which `parse_wait_expr` pins to the target
+/// binding), and every `depends_on` entry. `until_predicate.rhs` is a
+/// comparison value, not a binding, and `line` is source provenance —
+/// both pass through unchanged.
+fn prefix_wait_binding(wb: &WaitBinding, instance_prefix: &str) -> WaitBinding {
+    let prefixed = |name: &str| format!("{}.{}", instance_prefix, name);
+
+    let mut until_predicate = wb.until_predicate.clone();
+    if let Some(root) = until_predicate.lhs_segments.first_mut() {
+        *root = prefixed(root);
+    }
+
+    WaitBinding {
+        binding: prefixed(&wb.binding),
+        target: prefixed(&wb.target),
+        until_raw: wb.until_raw.clone(),
+        until_predicate,
+        timeout_secs: wb.timeout_secs,
+        depends_on: wb.depends_on.iter().map(|d| prefixed(d)).collect(),
+        line: wb.line,
     }
 }
 

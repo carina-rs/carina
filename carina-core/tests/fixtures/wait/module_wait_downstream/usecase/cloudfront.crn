@@ -1,0 +1,14 @@
+# Mirrors usecases/registry/cloudfront.crn: the Distribution reads the
+# wait binding (`cert_issued.certificate_arn`) from a nested Map
+# attribute, in a sibling file from where the wait is declared.
+
+let distribution = awscc.cloudfront.Distribution {
+  distribution_config = {
+    enabled = true
+    viewer_certificate = {
+      acm_certificate_arn      = cert_issued.certificate_arn
+      ssl_support_method       = "sni-only"
+      minimum_protocol_version = "TLSv1.2_2021"
+    }
+  }
+}

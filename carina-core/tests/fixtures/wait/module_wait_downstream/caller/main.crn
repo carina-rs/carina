@@ -1,0 +1,17 @@
+# Mirrors carina-rs/infra registry/dev/registry/main.crn: a thin
+# wrapper that instantiates the usecase module via `use`. The wait
+# binding lives *inside* the module — module expansion must propagate
+# (and instance-prefix) it, otherwise the Distribution loses its
+# synchronization edge (carina#3061).
+
+let registry = use {
+  source = "../usecase"
+}
+
+let r = registry {
+  domain_name = "registry-dev.example.com"
+}
+
+exports {
+  certificate_arn = r.certificate_arn
+}
