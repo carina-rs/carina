@@ -259,3 +259,112 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         "no effect should be skipped. Failures: {failures:?}"
     );
 }
+
+/// carina#3061, nested case: a `wait` declared *two module levels deep*
+/// (root → outer → inner, where `inner` holds the wait + the
+/// downstream Distribution) must survive both expansions, with the
+/// binding doubly instance-prefixed (`o.c.cert_issued`), in lockstep
+/// with the doubly-prefixed downstream ref. This guards the
+/// `resolve_nested_modules` propagation path that re-prefixes an
+/// already-prefixed wait binding.
+#[tokio::test]
+async fn nested_module_wait_binding_survives_two_expansions() {
+    let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    root.push("tests/fixtures/wait/module_wait_nested/root");
+
+    let mut parsed = parse_directory(&root, &ProviderContext::default())
+        .expect("parse_directory should succeed for the nested root fixture");
+
+    resolve_modules(&mut parsed, &root).expect("nested module resolution should succeed");
+
+    // The two-level-deep wait binding survived, doubly instance-prefixed
+    // (outer call binding `o`, inner call binding `c`).
+    assert_eq!(
+        parsed.wait_bindings.len(),
+        1,
+        "the `wait` two modules deep must reach the root caller; got {:?}",
+        parsed
+            .wait_bindings
+            .iter()
+            .map(|w| (&w.binding, &w.target))
+            .collect::<Vec<_>>()
+    );
+    let wb = &parsed.wait_bindings[0];
+    assert_eq!(wb.binding, "o.c.cert_issued");
+    assert_eq!(wb.target, "o.c.cert");
+    assert_eq!(
+        wb.until_predicate.lhs_segments.first().map(String::as_str),
+        Some("o.c.cert"),
+        "until LHS root must be doubly-prefixed; got {:?}",
+        wb.until_predicate.lhs_segments
+    );
+
+    // The inner Distribution's nested ref was doubly-rewritten to match.
+    let dist = parsed
+        .resources
+        .iter()
+        .find(|r| r.id.resource_type == "cloudfront.Distribution")
+        .expect("expanded Distribution must be present");
+    assert!(
+        carina_core::deps::get_resource_value_ref_dependencies(dist).contains("o.c.cert_issued"),
+        "Distribution must depend on the doubly-prefixed wait binding \
+         `o.c.cert_issued`; deps were {:?}",
+        carina_core::deps::get_resource_value_ref_dependencies(dist)
+    );
+
+    // End-to-end apply: the Distribution must wait, not fail/skip.
+    let sorted_resources =
+        sort_resources_by_dependencies(&parsed.resources).expect("topological sort should succeed");
+    let current_states: HashMap<ResourceId, State> = HashMap::new();
+    let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+
+    let mut resources_for_plan = sorted_resources.clone();
+    resolve_refs_with_state_and_remote(&mut resources_for_plan, &current_states, &remote_bindings)
+        .expect("resolve_refs should succeed");
+
+    let registry = SchemaRegistry::new();
+    let plan = create_plan(
+        &resources_for_plan,
+        &current_states,
+        &HashMap::new(),
+        &registry,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &parsed.wait_bindings,
+    );
+    assert!(
+        plan.effects().iter().any(|e| matches!(
+            e,
+            carina_core::effect::Effect::Wait { binding, .. } if binding == "o.c.cert_issued"
+        )),
+        "create_plan must emit Effect::Wait for the doubly-prefixed binding"
+    );
+
+    let unresolved_resources: HashMap<ResourceId, _> = sorted_resources
+        .iter()
+        .map(|r| (r.id.clone(), r.clone()))
+        .collect();
+
+    let provider = MockProvider;
+    let observer = CollectingObserver {
+        failures: Mutex::new(Vec::new()),
+    };
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &unresolved_resources,
+        bindings: carina_core::binding_index::ResolvedBindings::default(),
+        current_states,
+    };
+
+    let result = execute_plan(&provider, input, &observer).await;
+    let failures = observer.failures.lock().unwrap().clone();
+    assert_eq!(
+        result.failure_count, 0,
+        "nested-module wait must synchronize the Distribution. Failures: {failures:?}"
+    );
+    assert_eq!(
+        result.skip_count, 0,
+        "no effect should be skipped. Failures: {failures:?}"
+    );
+}

@@ -19,12 +19,8 @@ use super::validation::{evaluate_require_expr, evaluate_validate_expr, format_va
 /// Result of expanding a single module call.
 ///
 /// A module call contributes both resources and `wait` declarations to
-/// the caller. Wait bindings were silently dropped before carina#3061
-/// because the expander only returned resources — any `wait` block
-/// inside a `use`d module vanished, so a downstream resource that
-/// referenced `<wait_binding>.<attr>` lost its synchronization edge and
-/// failed at apply with the self-contradicting "add a `wait` block"
-/// error.
+/// the caller; both must reach the caller for a module-internal `wait`
+/// to keep synchronizing its downstream consumers (carina#3061).
 #[derive(Debug)]
 pub struct ExpandedModule {
     /// Expanded, instance-prefixed resources (plus the virtual
@@ -197,12 +193,10 @@ impl ModuleResolver<'_> {
 
         // Collect intra-module binding names so we can rewrite
         // ResourceRefs. Wait-binding names are included alongside
-        // resource bindings: a downstream resource that references
-        // `<wait_binding>.<attr>` (e.g. the CloudFront Distribution's
-        // `cert_issued.certificate_arn`) must be instance-prefixed the
-        // same way, otherwise the rewritten resource points at an
-        // unprefixed `cert_issued` that no longer exists post-expansion
-        // and the dependency edge to the wait is lost (carina#3061).
+        // resource bindings so a downstream resource referencing
+        // `<wait_binding>.<attr>` is instance-prefixed the same way —
+        // otherwise its dependency edge to the wait is lost
+        // (carina#3061; see `prefix_wait_binding`).
         let intra_module_bindings: HashSet<String> = module
             .resources
             .iter()
@@ -302,12 +296,9 @@ impl ModuleResolver<'_> {
             expanded_resources.push(virtual_resource);
         }
 
-        // Propagate the module's `wait` declarations to the caller,
-        // instance-prefixing every binding-name field so they line up
-        // with the prefixed resource bindings and the prefixed
-        // downstream refs (carina#3061). The predicate RHS and
-        // `until_raw` surface text are value/display data, not binding
-        // names, and are carried through unchanged.
+        // Propagate the module's `wait` declarations, instance-prefixed
+        // (see `prefix_wait_binding`), so a module-internal `wait`
+        // reaches the caller's plan (carina#3061).
         let expanded_wait_bindings: Vec<WaitBinding> = module
             .wait_bindings
             .iter()

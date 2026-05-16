@@ -1,0 +1,15 @@
+# Root caller: instantiates `outer`, which itself instantiates
+# `inner`. The wait declared two levels deep must survive both
+# expansions.
+
+let outer = use {
+  source = "../outer"
+}
+
+let o = outer {
+  domain_name = "registry-dev.example.com"
+}
+
+exports {
+  certificate_arn = o.certificate_arn
+}

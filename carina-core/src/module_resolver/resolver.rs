@@ -198,10 +198,7 @@ impl<'cfg> ModuleResolver<'cfg> {
             match self.expand_module_call(call, &instance_prefix, Some(enclosing_args)) {
                 Ok(expanded) => {
                     parsed.resources.extend(expanded.resources); // allow: direct — module expansion, handled separately
-                    // Propagate the module's (instance-prefixed) wait
-                    // declarations so a nested module's `wait` block is
-                    // not lost when its enclosing module is itself
-                    // expanded (carina#3061).
+                    // Propagate instance-prefixed wait bindings (carina#3061).
                     parsed.wait_bindings.extend(expanded.wait_bindings);
                 }
                 Err(e) => {
@@ -250,9 +247,7 @@ pub fn resolve_modules_with_config<E>(
         let instance_prefix = instance_prefix_for_call(call);
         let expanded = resolver.expand_module_call(call, &instance_prefix, None)?;
         parsed.resources.extend(expanded.resources); // allow: direct — module expansion, handled separately
-        // carina#3061: a `wait` block declared inside the `use`d module
-        // must reach the caller's plan, instance-prefixed, or the
-        // downstream consumer loses its synchronization edge.
+        // Propagate instance-prefixed wait bindings (carina#3061).
         parsed.wait_bindings.extend(expanded.wait_bindings);
     }
 
