@@ -50,14 +50,14 @@ pub fn validate_wait_bindings<E>(
     }
 
     for wb in &parsed.wait_bindings {
-        let Some((provider, resource_type)) = by_binding.get(&wb.target) else {
+        let Some((provider, resource_type)) = by_binding.get(wb.target.as_str()) else {
             out.push(WaitDiagnostic {
                 message: format!(
                     "wait `{}`: target binding `{}` is not a known resource",
                     wb.binding, wb.target
                 ),
-                binding_name: wb.binding.clone(),
-                target: wb.target.clone(),
+                binding_name: wb.binding.as_str().to_string(),
+                target: wb.target.as_str().to_string(),
                 attribute: None,
             });
             continue;
@@ -80,8 +80,8 @@ pub fn validate_wait_bindings<E>(
                     "wait `{}`: `until` references unknown attribute `{}.{}` on `{}.{}`",
                     wb.binding, wb.target, attr_name, provider, resource_type
                 ),
-                binding_name: wb.binding.clone(),
-                target: wb.target.clone(),
+                binding_name: wb.binding.as_str().to_string(),
+                target: wb.target.as_str().to_string(),
                 attribute: Some(attr_name.clone()),
             });
         }

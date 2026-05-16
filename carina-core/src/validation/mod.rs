@@ -836,9 +836,9 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
     // LHS is rooted at the target (enforced by parser), so the target
     // covers the LHS path too.
     for wb in &parsed.wait_bindings {
-        referenced.insert(wb.target.clone());
+        referenced.insert(wb.target.as_str().to_string());
         for dep in &wb.depends_on {
-            referenced.insert(dep.clone());
+            referenced.insert(dep.as_str().to_string());
         }
     }
 

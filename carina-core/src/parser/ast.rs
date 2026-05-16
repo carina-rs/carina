@@ -504,6 +504,101 @@ pub struct UntilPredicateAst {
     pub rhs: crate::resource::Value,
 }
 
+/// A binding identifier (a `let`/`wait`/`depends_on` name such as
+/// `cert_issued` or its instance-prefixed form `r.cert_issued`).
+///
+/// This newtype exists so a binding name cannot be confused with an
+/// arbitrary `String` at a binding-expecting position, and so the
+/// instance-prefix operation is typed as `BindingName -> BindingName`
+/// (see `module_resolver::apply_instance_prefix`). It deliberately does
+/// **not** encode prefix state (Raw vs Prefixed): the wait-binding list
+/// mixes top-level (never-prefixed) and module-derived (prefixed)
+/// entries in one `Vec`, so a state-in-the-type distinction is not
+/// expressible here — that larger data-flow reshape is tracked
+/// separately (carina#3066).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BindingName(String);
+
+impl BindingName {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl std::ops::Deref for BindingName {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for BindingName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for BindingName {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for BindingName {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
+/// Compare a `BindingName` directly against a string slice so existing
+/// `wb.target == some_str` / lookup sites don't need `.as_str()`
+/// ceremony. The newtype's value is preventing *accidental* String
+/// substitution at construction/parameter boundaries, not forbidding
+/// equality checks.
+impl PartialEq<str> for BindingName {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for BindingName {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<BindingName> for str {
+    fn eq(&self, other: &BindingName) -> bool {
+        self == other.0
+    }
+}
+
+impl PartialEq<BindingName> for &str {
+    fn eq(&self, other: &BindingName) -> bool {
+        *self == other.0
+    }
+}
+
+impl PartialEq<String> for BindingName {
+    fn eq(&self, other: &String) -> bool {
+        &self.0 == other
+    }
+}
+
+impl PartialEq<BindingName> for String {
+    fn eq(&self, other: &BindingName) -> bool {
+        self == &other.0
+    }
+}
+
 /// A `wait <target> { ... }` declaration captured during parse.
 ///
 /// Carries the parsed surface form of the `until` predicate so plan
@@ -516,9 +611,9 @@ pub struct UntilPredicateAst {
 #[derive(Debug, Clone)]
 pub struct WaitBinding {
     /// The wait's binding name (e.g. `cert_issued`).
-    pub binding: String,
+    pub binding: BindingName,
     /// Identifier of the target resource binding (e.g. `cert`).
-    pub target: String,
+    pub target: BindingName,
     /// Surface form of the `until` expression as the user wrote it
     /// (e.g. `"cert.status == aws.acm.Certificate.Status.Issued"`).
     pub until_raw: String,
@@ -530,7 +625,7 @@ pub struct WaitBinding {
     /// Additional ordering edges declared via `depends_on = [...]`. The
     /// ordering machinery itself is shared with the per-resource
     /// `directives.depends_on` (carina#2823).
-    pub depends_on: Vec<String>,
+    pub depends_on: Vec<BindingName>,
     /// Source line of the `wait` keyword. Used by diagnostics.
     pub line: usize,
 }

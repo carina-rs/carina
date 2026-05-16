@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use indexmap::IndexMap;
 
-use crate::parser::{ArgumentParameter, ModuleCall, WaitBinding};
+use crate::parser::{ArgumentParameter, BindingName, ModuleCall, WaitBinding};
 use crate::resource::{
     ConcreteValue, DeferredValue, Directives, Resource, ResourceId, ResourceKind, ResourceName,
     Value,
@@ -201,7 +201,12 @@ impl ModuleResolver<'_> {
             .resources
             .iter()
             .filter_map(|r| r.binding.clone())
-            .chain(module.wait_bindings.iter().map(|w| w.binding.clone()))
+            .chain(
+                module
+                    .wait_bindings
+                    .iter()
+                    .map(|w| w.binding.as_str().to_string()),
+            )
             .collect();
 
         // Expand resources with substituted values
@@ -325,6 +330,15 @@ fn apply_instance_prefix(instance_prefix: &str, name: &str) -> String {
     format!("{instance_prefix}.{name}")
 }
 
+/// `BindingName`-typed instance-prefix: the wait path's binding-name
+/// fields are `BindingName`, so prefixing them is a typed
+/// `BindingName -> BindingName` transition (a raw `String` can't slip
+/// into a binding-name position). Delegates to [`apply_instance_prefix`]
+/// for the single spelling.
+fn prefix_binding_name(instance_prefix: &str, name: &BindingName) -> BindingName {
+    BindingName::new(apply_instance_prefix(instance_prefix, name.as_str()))
+}
+
 /// Instance-prefix every binding-name field of a [`WaitBinding`] so a
 /// module-internal `wait` keeps referring to the same (now prefixed)
 /// target / dependencies after expansion.
@@ -351,20 +365,24 @@ fn prefix_wait_binding(wb: &WaitBinding, instance_prefix: &str) -> WaitBinding {
         depends_on,
         line,
     } = wb;
-    let prefixed = |name: &str| apply_instance_prefix(instance_prefix, name);
+    let prefixed_name = |n: &BindingName| prefix_binding_name(instance_prefix, n);
 
     let mut until_predicate = until_predicate.clone();
+    // `lhs_segments[0]` is the (string) target-binding segment of a
+    // mixed path `[target, attr, ...]`; only that head is a binding
+    // name, so it takes the string-level prefix spelling, not the
+    // `BindingName` wrapper (the rest are attribute path segments).
     if let Some(root) = until_predicate.lhs_segments.first_mut() {
-        *root = prefixed(root);
+        *root = apply_instance_prefix(instance_prefix, root);
     }
 
     WaitBinding {
-        binding: prefixed(binding),
-        target: prefixed(target),
+        binding: prefixed_name(binding),
+        target: prefixed_name(target),
         until_raw: until_raw.clone(),
         until_predicate,
         timeout_secs: *timeout_secs,
-        depends_on: depends_on.iter().map(|d| prefixed(d)).collect(),
+        depends_on: depends_on.iter().map(prefixed_name).collect(),
         line: *line,
     }
 }

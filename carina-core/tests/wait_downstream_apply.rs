@@ -177,7 +177,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         wb.until_predicate.lhs_segments
     );
     assert!(
-        wb.depends_on.contains(&"r.validation_record".to_string()),
+        wb.depends_on.iter().any(|d| d == "r.validation_record"),
         "depends_on entries must be instance-prefixed; got {:?}",
         wb.depends_on
     );

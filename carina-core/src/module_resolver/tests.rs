@@ -1299,15 +1299,15 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
             quoted_string_attrs: std::collections::HashSet::new(),
         });
         m.wait_bindings.push(WaitBinding {
-            binding: "cert_issued".to_string(),
-            target: "main_vpc".to_string(),
+            binding: "cert_issued".into(),
+            target: "main_vpc".into(),
             until_raw: "main_vpc.state == \"available\"".to_string(),
             until_predicate: UntilPredicateAst {
                 lhs_segments: vec!["main_vpc".to_string(), "state".to_string()],
                 rhs: Value::Concrete(ConcreteValue::String("available".to_string())),
             },
             timeout_secs: Some(300),
-            depends_on: vec!["subnet".to_string()],
+            depends_on: vec!["subnet".into()],
             line: 1,
         });
         m

@@ -347,13 +347,14 @@ fn parse_primary_with_resource_or_module(
         Rule::wait_expr => {
             let (line, _) = inner.as_span().start_pos().line_col();
             let wb = parse_wait_expr(inner, binding_name)?;
-            if ctx.wait_bindings.contains_key(&wb.binding) {
+            if ctx.wait_bindings.contains_key(wb.binding.as_str()) {
                 return Err(ParseError::DuplicateBinding {
-                    name: wb.binding,
+                    name: wb.binding.into_string(),
                     line,
                 });
             }
-            ctx.wait_bindings.insert(wb.binding.clone(), wb);
+            ctx.wait_bindings
+                .insert(wb.binding.as_str().to_string(), wb);
             // The wait binding's value is a forward reference to the
             // captured target snapshot; downstream resolution treats
             // `<wait-binding>.<attr>` as passthrough of `<target>.<attr>`.

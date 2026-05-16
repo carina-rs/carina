@@ -17,8 +17,8 @@ mod types;
 mod util;
 
 pub use ast::{
-    ArgumentParameter, AttributeParameter, BackendConfig, DeferredForExpression, ExportParamLike,
-    ExportParameter, File, FnParam, InferredExportParam, InferredFile, ModuleCall,
+    ArgumentParameter, AttributeParameter, BackendConfig, BindingName, DeferredForExpression,
+    ExportParamLike, ExportParameter, File, FnParam, InferredExportParam, InferredFile, ModuleCall,
     ParsedExportParam, ParsedFile, ProviderConfig, RequireBlock, ResourceContext, ResourceTypePath,
     StateBlock, TypeExpr, UntilPredicateAst, UpstreamState, UseStatement, UserFunction,
     UserFunctionBody, ValidateExpr, ValidationBlock, WaitBinding,

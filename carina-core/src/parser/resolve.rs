@@ -181,7 +181,9 @@ pub fn resolve_resource_refs_with_config(
     // Register `wait` bindings the same way: downstream `<wait>.<attr>`
     // refs are passthrough of the target's snapshot, resolved at apply time.
     for wb in &parsed.wait_bindings {
-        binding_map.entry(wb.binding.clone()).or_default();
+        binding_map
+            .entry(wb.binding.as_str().to_string())
+            .or_default();
     }
 
     // Build a `ParseContext` once, populated with the merged
@@ -671,7 +673,9 @@ pub fn resolve_provider_unresolved_attributes<E>(
         binding_map.entry(us.binding.clone()).or_default();
     }
     for wb in &parsed.wait_bindings {
-        binding_map.entry(wb.binding.clone()).or_default();
+        binding_map
+            .entry(wb.binding.as_str().to_string())
+            .or_default();
     }
     let mut fn_ctx = super::ParseContext::new(config);
     fn_ctx.user_functions = parsed.user_functions.clone();

@@ -401,8 +401,8 @@ mod tests {
         // A wait on the cert binding — predicate text is irrelevant
         // for this pass; presence is the contract.
         parsed.wait_bindings.push(WaitBinding {
-            binding: "cert_issued".to_string(),
-            target: "cert".to_string(),
+            binding: "cert_issued".into(),
+            target: "cert".into(),
             until_raw: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
             until_predicate: crate::parser::UntilPredicateAst {
                 lhs_segments: vec!["cert".to_string(), "status".to_string()],
