@@ -8,7 +8,8 @@ use std::time::Instant;
 use crate::binding_index::ResolvedBindings;
 use crate::effect::Effect;
 use crate::provider::{
-    CreateRequest, DeleteRequest, Provider, ReadRequest, UpdateRequest, build_update_patch,
+    CreateRequest, DeleteRequest, Provider, ProviderNormalizer, ReadRequest, UpdateRequest,
+    build_update_patch,
 };
 use crate::resolver::resolve_ref_value;
 use crate::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, State, Value};
@@ -124,6 +125,7 @@ pub(super) async fn refresh_pending_states(
 pub(super) fn resolve_resource(
     resource: &Resource,
     bindings: &ResolvedBindings,
+    normalizer: &dyn ProviderNormalizer,
 ) -> Result<Resource, String> {
     let mut resolved = resource.clone();
     for (key, expr) in &resource.attributes {
@@ -131,7 +133,7 @@ pub(super) fn resolve_resource(
         assert_fully_resolved(&resolved_value, key)?;
         resolved.attributes.insert(key.clone(), resolved_value);
     }
-    Ok(resolved)
+    renormalize(resolved, normalizer)
 }
 
 /// Resolve a resource, preferring unresolved source for re-resolution.
@@ -143,6 +145,7 @@ pub(super) fn resolve_resource_with_source(
     target: &Resource,
     source: &Resource,
     bindings: &ResolvedBindings,
+    normalizer: &dyn ProviderNormalizer,
 ) -> Result<Resource, String> {
     let mut resolved = target.clone();
     for (key, expr) in &source.attributes {
@@ -150,6 +153,41 @@ pub(super) fn resolve_resource_with_source(
         assert_fully_resolved(&resolved_value, key)?;
         resolved.attributes.insert(key.clone(), resolved_value);
     }
+    renormalize(resolved, normalizer)
+}
+
+/// Re-apply the provider normalizer to a freshly resolved resource.
+///
+/// carina#3060: reference re-resolution rebuilds attributes from the
+/// un-normalized source, undoing the plan-time `normalize_desired`. Both
+/// resolve helpers funnel through here so apply-path resolution and
+/// plan-time `normalize_desired` can never diverge again — "resolved"
+/// always means "resolved and re-normalized" by construction.
+///
+/// Scope: this re-applies only `ProviderNormalizer::normalize_desired`.
+/// The plan-time pipeline (`PlanPreprocessor::prepare` + `apply/mod.rs`)
+/// also runs `carina_core::value::canonicalize_resources_with_schemas`
+/// (string/list-union coercion; carina-core, but needs the
+/// `SchemaRegistry` the executor is not given) and the carina-cli
+/// `resolve_enum_aliases_with_ctx` (enum-alias → canonical, e.g.
+/// `IpProtocol.all` → `"-1"`; `WiringContext`/factory-bound, genuinely
+/// unreachable from carina-core). Neither is re-applied here, so the
+/// alias/union axis of the same apply/plan divergence is intentionally
+/// out of scope and tracked in carina#3063 — closing it requires
+/// unifying the plan and apply resolve→normalize pipelines, a layering
+/// change beyond this fix.
+///
+/// Infallible today (`normalize_desired` returns `()`); the `Result` only
+/// mirrors the caller's signature — `resolve_resource{,_with_source}`
+/// fail-fast earlier on still-`Deferred` values — so this stays the tail
+/// expression without forcing `Ok(...)` at every call site.
+fn renormalize(
+    resolved: Resource,
+    normalizer: &dyn ProviderNormalizer,
+) -> Result<Resource, String> {
+    let mut one = [resolved];
+    normalizer.normalize_desired(&mut one);
+    let [resolved] = one;
     Ok(resolved)
 }
 
@@ -268,6 +306,18 @@ pub(super) fn count_actionable_effects(effects: &[Effect]) -> usize {
         .count()
 }
 
+/// Resolution + dispatch context for a basic effect, bundled to keep
+/// `execute_basic_effect`'s arity in check (clippy `too_many_arguments`)
+/// and mirroring `ReplaceContext`'s shape.
+pub(super) struct BasicEffectCtx<'a> {
+    pub(super) provider: &'a dyn Provider,
+    pub(super) bindings: &'a ResolvedBindings,
+    pub(super) unresolved: &'a HashMap<ResourceId, Resource>,
+    pub(super) normalizer: &'a dyn ProviderNormalizer,
+    pub(super) completed: &'a AtomicUsize,
+    pub(super) total: usize,
+}
+
 /// Execute a single Create, Update, or Delete effect.
 ///
 /// This helper encapsulates the shared dispatch logic: increment progress counter,
@@ -278,13 +328,15 @@ pub(super) fn count_actionable_effects(effects: &[Effect]) -> usize {
 /// Panics if called with a Replace, Read, Import, Remove, or Move effect.
 pub(super) async fn execute_basic_effect<'a>(
     effect: &'a Effect,
-    provider: &'a dyn Provider,
-    bindings: &'a ResolvedBindings,
-    unresolved: &'a HashMap<ResourceId, Resource>,
-    completed: &'a AtomicUsize,
-    total: usize,
+    ctx: &BasicEffectCtx<'a>,
     observer: &'a dyn ExecutionObserver,
 ) -> BasicEffectResult {
+    let provider = ctx.provider;
+    let bindings = ctx.bindings;
+    let unresolved = ctx.unresolved;
+    let normalizer = ctx.normalizer;
+    let completed = ctx.completed;
+    let total = ctx.total;
     let c = completed.fetch_add(1, Ordering::Relaxed) + 1;
     let started = Instant::now();
     let progress = ProgressInfo {
@@ -295,7 +347,7 @@ pub(super) async fn execute_basic_effect<'a>(
 
     match effect {
         Effect::Create(resource) => {
-            let resolved = match resolve_resource(resource, bindings) {
+            let resolved = match resolve_resource(resource, bindings, normalizer) {
                 Ok(r) => r,
                 Err(e) => {
                     observer.on_event(&ExecutionEvent::EffectFailed {
@@ -355,21 +407,22 @@ pub(super) async fn execute_basic_effect<'a>(
             changed_attributes,
         } => {
             let resolve_source = unresolved.get(id).unwrap_or(to);
-            let resolved_to = match resolve_resource_with_source(to, resolve_source, bindings) {
-                Ok(r) => r,
-                Err(e) => {
-                    observer.on_event(&ExecutionEvent::EffectFailed {
-                        effect,
-                        error: &e,
-                        duration: started.elapsed(),
-                        progress,
-                    });
-                    return BasicEffectResult::Failure {
-                        binding: effect.binding_name(),
-                        refresh: None,
-                    };
-                }
-            };
+            let resolved_to =
+                match resolve_resource_with_source(to, resolve_source, bindings, normalizer) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        observer.on_event(&ExecutionEvent::EffectFailed {
+                            effect,
+                            error: &e,
+                            duration: started.elapsed(),
+                            progress,
+                        });
+                        return BasicEffectResult::Failure {
+                            binding: effect.binding_name(),
+                            refresh: None,
+                        };
+                    }
+                };
             let identifier = from.identifier.as_deref().unwrap_or("");
             // Augment plan-time `changed_attributes` with any
             // ResourceRef-derived attributes whose resolved value at

@@ -57,6 +57,7 @@ pub type ApplyResult = ExecutionResult;
 pub async fn execute_effects(
     plan: &Plan,
     provider: &dyn Provider,
+    normalizer: &dyn ProviderNormalizer,
     bindings: &mut ResolvedBindings,
     current_states: &mut HashMap<ResourceId, State>,
     unresolved_resources: &HashMap<ResourceId, Resource>,
@@ -66,6 +67,7 @@ pub async fn execute_effects(
         unresolved_resources,
         bindings: std::mem::take(bindings),
         current_states: std::mem::take(current_states),
+        normalizer,
     };
 
     let observer = CliObserver::new(plan);
@@ -1147,8 +1149,13 @@ async fn run_apply_locked(
         .map(|r| (r.id.clone(), r.clone()))
         .collect();
 
+    // `provider` is a `ProviderRouter`, which impls both `Provider` and
+    // `ProviderNormalizer`; the same object is passed in both positions
+    // so apply re-normalizes with exactly the plan-time normalizer
+    // (carina#3060). They must stay the same object.
     let mut result = execute_effects(
         &plan,
+        &provider,
         &provider,
         &mut bindings,
         &mut current_states,
@@ -1458,8 +1465,12 @@ async fn run_apply_from_plan_locked(
         .map(|r| (r.id.clone(), r.clone()))
         .collect();
 
+    // Same object in both positions: `ProviderRouter` is both the
+    // `Provider` and the `ProviderNormalizer`, so apply re-normalizes
+    // with the plan-time normalizer (carina#3060).
     let mut result = execute_effects(
         plan,
+        &provider,
         &provider,
         &mut bindings,
         &mut current_states,

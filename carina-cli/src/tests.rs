@@ -1833,6 +1833,7 @@ async fn rename_failure_in_create_before_destroy_counts_as_failure() {
     let result = execute_effects(
         &plan,
         &provider,
+        &carina_core::provider::NoopNormalizer,
         &mut bindings,
         &mut current_states,
         &unresolved_resources,
@@ -1995,6 +1996,7 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
     let result = execute_effects(
         &plan,
         &provider,
+        &carina_core::provider::NoopNormalizer,
         &mut bindings,
         &mut current_states,
         &unresolved_resources,

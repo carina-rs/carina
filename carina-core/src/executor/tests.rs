@@ -1,8 +1,8 @@
 use super::*;
 use crate::plan::Plan;
 use crate::provider::{
-    BoxFuture, CreateRequest, DeleteRequest, ProviderError, ProviderResult, ReadRequest,
-    UpdateRequest,
+    BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer, ProviderError, ProviderResult,
+    ReadRequest, UpdateRequest,
 };
 use crate::resource::{ConcreteValue, DeferredValue, Directives, Resource, Value};
 use parallel::{build_dependency_levels, build_dependency_map};
@@ -24,6 +24,9 @@ struct MockProvider {
     /// assert that the executor handed the provider a fully-resolved
     /// resource (no remaining `Value::Deferred(ResourceRef)` etc.).
     create_resources: Arc<Mutex<Vec<Resource>>>,
+    /// `UpdateRequest`s passed in to `update()` in call order — lets a
+    /// test assert the patch carries re-normalized attribute values.
+    update_requests: Arc<Mutex<Vec<UpdateRequest>>>,
 }
 
 impl MockProvider {
@@ -35,6 +38,7 @@ impl MockProvider {
             read_results: Mutex::new(Vec::new()),
             call_log: Arc::new(Mutex::new(Vec::new())),
             create_resources: Arc::new(Mutex::new(Vec::new())),
+            update_requests: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -46,12 +50,10 @@ impl MockProvider {
         self.delete_results.lock().unwrap().push(result);
     }
 
-    #[allow(dead_code)]
     fn push_update(&self, result: ProviderResult<State>) {
         self.update_results.lock().unwrap().push(result);
     }
 
-    #[allow(dead_code)]
     fn push_read(&self, result: ProviderResult<State>) {
         self.read_results.lock().unwrap().push(result);
     }
@@ -62,6 +64,10 @@ impl MockProvider {
 
     fn captured_create_resources(&self) -> Vec<Resource> {
         self.create_resources.lock().unwrap().clone()
+    }
+
+    fn captured_update_requests(&self) -> Vec<UpdateRequest> {
+        self.update_requests.lock().unwrap().clone()
     }
 }
 
@@ -108,13 +114,14 @@ impl Provider for MockProvider {
         &self,
         id: &ResourceId,
         _identifier: &str,
-        _request: UpdateRequest,
+        request: UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id_str = id.to_string();
         self.call_log
             .lock()
             .unwrap()
             .push(("update".to_string(), id_str));
+        self.update_requests.lock().unwrap().push(request);
         let result = self.update_results.lock().unwrap().remove(0);
         Box::pin(async move { result })
     }
@@ -205,6 +212,72 @@ impl ExecutionObserver for MockObserver {
 }
 
 // -----------------------------------------------------------------------
+// Mock Normalizer
+// -----------------------------------------------------------------------
+
+/// Rewrites any string `"raw_dsl"` to `"CANONICAL"`, recursing into
+/// Map / List containers. Models a real provider normalizer that
+/// canonicalizes a DSL spelling nested under a struct field (the
+/// aws#315 IAM-policy `version`/`effect` shape). Used to prove the
+/// apply path re-runs `normalize_desired` after reference
+/// re-resolution (carina#3060).
+struct CanonicalizingNormalizer;
+
+fn canonicalize_value(v: &Value) -> Option<Value> {
+    match v {
+        Value::Concrete(ConcreteValue::String(s)) if s == "raw_dsl" => Some(Value::Concrete(
+            ConcreteValue::String("CANONICAL".to_string()),
+        )),
+        Value::Concrete(ConcreteValue::Map(m)) => {
+            let mut out = m.clone();
+            let mut changed = false;
+            for (k, val) in m {
+                if let Some(nv) = canonicalize_value(val) {
+                    out.insert(k.clone(), nv);
+                    changed = true;
+                }
+            }
+            changed.then_some(Value::Concrete(ConcreteValue::Map(out)))
+        }
+        Value::Concrete(ConcreteValue::List(items)) => {
+            let mut out = items.clone();
+            let mut changed = false;
+            for (i, item) in items.iter().enumerate() {
+                if let Some(nv) = canonicalize_value(item) {
+                    out[i] = nv;
+                    changed = true;
+                }
+            }
+            changed.then_some(Value::Concrete(ConcreteValue::List(out)))
+        }
+        _ => None,
+    }
+}
+
+impl crate::provider::ProviderNormalizer for CanonicalizingNormalizer {
+    fn normalize_desired(&self, resources: &mut [Resource]) {
+        for r in resources.iter_mut() {
+            let keys: Vec<String> = r.attributes.keys().cloned().collect();
+            for k in keys {
+                if let Some(v) = r.get_attr(&k)
+                    && let Some(nv) = canonicalize_value(v)
+                {
+                    r.set_attr(k, nv);
+                }
+            }
+        }
+    }
+
+    fn merge_default_tags(
+        &self,
+        _resources: &mut [Resource],
+        _default_tags: &indexmap::IndexMap<String, Value>,
+        _registry: &crate::schema::SchemaRegistry,
+    ) {
+    }
+}
+
+// -----------------------------------------------------------------------
 // Helper functions
 // -----------------------------------------------------------------------
 
@@ -258,6 +331,7 @@ async fn test_simple_create() {
         unresolved_resources: &HashMap::new(),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
     };
 
     let observer = MockObserver::new();
@@ -270,6 +344,185 @@ async fn test_simple_create() {
             .events()
             .iter()
             .any(|e| e.starts_with("succeeded:"))
+    );
+}
+
+/// carina#3060: the apply execution path must re-apply the provider
+/// normalizer after reference re-resolution, before building the
+/// provider request. Plan-time normalization is undone when the
+/// executor rebuilds attributes from the (un-normalized) source, so
+/// without a re-normalize the provider receives the raw DSL spelling.
+///
+/// This exercises the *apply path* (`execute_plan`), not
+/// `normalize_desired` in isolation — the gap the prior
+/// carina-provider-aws#316 unit test missed.
+#[tokio::test]
+async fn test_apply_renormalizes_after_resolution() {
+    let provider = MockProvider::new();
+    let mut resource = make_resource("a", &[]);
+    // The DSL spelling a provider normalizer would canonicalize at
+    // plan time. The executor must re-canonicalize it on the apply
+    // path so the provider never sees `"raw_dsl"`.
+    resource.set_attr(
+        "marker",
+        Value::Concrete(ConcreteValue::String("raw_dsl".to_string())),
+    );
+    let rid = resource.id.clone();
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(resource));
+    provider.push_create(Ok(ok_state(&rid)));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &CanonicalizingNormalizer,
+    };
+
+    let observer = MockObserver::new();
+    let result = execute_plan(&provider, input, &observer).await;
+    assert_eq!(result.success_count, 1);
+
+    let captured = provider.captured_create_resources();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(
+        captured[0].get_attr("marker"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "CANONICAL".to_string()
+        ))),
+        "apply path must re-run normalize_desired so the provider \
+         receives the canonical value, not the raw DSL spelling"
+    );
+}
+
+/// carina#3060, Update path (the path closest to the aws#315 symptom —
+/// `aws.s3.BucketPolicy` failed on *Update*, not Create). The
+/// `UpdateRequest.patch` is built from the re-resolved `to`; without
+/// the apply-path re-normalize the patch would carry the raw DSL
+/// spelling and the provider would reject it (`MalformedPolicy`).
+#[tokio::test]
+async fn test_apply_renormalizes_update_path() {
+    let provider = MockProvider::new();
+    let mut to_resource = make_resource("a", &[]);
+    to_resource.set_attr(
+        "marker",
+        Value::Concrete(ConcreteValue::String("raw_dsl".to_string())),
+    );
+    let rid = to_resource.id.clone();
+
+    let mut from_attrs = HashMap::new();
+    from_attrs.insert(
+        "marker".to_string(),
+        Value::Concrete(ConcreteValue::String("old".to_string())),
+    );
+    let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        id: rid.clone(),
+        from: Box::new(from_state),
+        to: to_resource,
+        changed_attributes: vec!["marker".to_string()],
+    });
+    provider.push_update(Ok(ok_state(&rid)));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &CanonicalizingNormalizer,
+    };
+
+    let observer = MockObserver::new();
+    let result = execute_plan(&provider, input, &observer).await;
+    assert_eq!(result.success_count, 1);
+
+    let reqs = provider.captured_update_requests();
+    assert_eq!(reqs.len(), 1);
+    let marker_op = reqs[0]
+        .patch
+        .ops
+        .iter()
+        .find(|op| op.key == "marker")
+        .expect("patch must contain the changed `marker` attribute");
+    assert_eq!(
+        marker_op.value,
+        Some(Value::Concrete(ConcreteValue::String(
+            "CANONICAL".to_string()
+        ))),
+        "Update patch must carry the re-normalized value, not raw DSL"
+    );
+}
+
+/// carina#3060 acceptance, exact shape: a normalizable value nested
+/// under a struct attribute *on a resource that also has a
+/// ResourceRef*. This is the real aws#315 regression shape — the ref
+/// forces `resolve_resource` to rebuild attributes from the
+/// un-normalized source, so the nested `marker` would revert to
+/// `"raw_dsl"` without the apply-path re-normalize. Exercises the real
+/// `execute_plan` path (Create `a` → state → Create `b` resolves
+/// `ref_a` from `a`'s post-create state).
+#[tokio::test]
+async fn test_apply_renormalizes_nested_value_under_ref_bearing_resource() {
+    let provider = MockProvider::new();
+    let ra = make_resource("a", &[]);
+    let ra_id = ra.id.clone();
+
+    // `b` depends on `a` (ResourceRef `ref_a`) AND carries a
+    // normalizable value nested inside a Map attribute `config`.
+    let mut rb = make_resource("b", &["a"]);
+    let mut config = indexmap::IndexMap::new();
+    config.insert(
+        "marker".to_string(),
+        Value::Concrete(ConcreteValue::String("raw_dsl".to_string())),
+    );
+    rb.set_attr("config", Value::Concrete(ConcreteValue::Map(config)));
+    let rb_id = rb.id.clone();
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(ra));
+    plan.add(Effect::Create(rb));
+    provider.push_create(Ok(ok_state(&ra_id)));
+    provider.push_create(Ok(ok_state(&rb_id)));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &CanonicalizingNormalizer,
+    };
+
+    let observer = MockObserver::new();
+    let result = execute_plan(&provider, input, &observer).await;
+    assert_eq!(result.success_count, 2, "both creates should succeed");
+
+    let captured = provider.captured_create_resources();
+    let b = captured
+        .iter()
+        .find(|r| r.id == rb_id)
+        .expect("resource b must have been created");
+    let Some(Value::Concrete(ConcreteValue::Map(cfg))) = b.get_attr("config") else {
+        panic!("expected config Map on b, got {:?}", b.get_attr("config"));
+    };
+    assert_eq!(
+        cfg.get("marker"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "CANONICAL".to_string()
+        ))),
+        "nested value under a ref-bearing resource must be \
+         re-normalized at apply, not reverted to raw DSL"
+    );
+    // The ref itself must still have resolved correctly.
+    assert_eq!(
+        b.get_attr("ref_a"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "id-123".to_string()
+        ))),
+        "ResourceRef must resolve from a's post-create state"
     );
 }
 
@@ -295,6 +548,7 @@ async fn test_simple_delete() {
         unresolved_resources: &HashMap::new(),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
     };
 
     let observer = MockObserver::new();
@@ -323,6 +577,7 @@ async fn test_failed_effect_propagates_to_dependent() {
         unresolved_resources: &HashMap::new(),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
     };
 
     let observer = MockObserver::new();
@@ -370,6 +625,7 @@ async fn test_cbd_creates_before_deletes() {
         unresolved_resources: &HashMap::new(),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
     };
 
     let observer = MockObserver::new();
@@ -411,6 +667,7 @@ async fn test_dbd_deletes_before_creates() {
         unresolved_resources: &HashMap::new(),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
     };
 
     let observer = MockObserver::new();
@@ -485,6 +742,7 @@ async fn test_phased_cbd_creates_in_forward_order_deletes_in_reverse() {
         unresolved_resources: &HashMap::new(),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
     };
 
     let observer = MockObserver::new();
@@ -558,6 +816,7 @@ async fn test_phased_noncbd_creates_after_deletes() {
         unresolved_resources: &HashMap::new(),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
     };
 
     let observer = MockObserver::new();
@@ -591,6 +850,7 @@ async fn test_observer_events_emitted_correctly() {
         unresolved_resources: &HashMap::new(),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
     };
 
     let observer = MockObserver::new();
@@ -615,6 +875,7 @@ async fn test_read_effect_is_no_op() {
         unresolved_resources: &HashMap::new(),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
     };
 
     let observer = MockObserver::new();
@@ -652,6 +913,7 @@ async fn test_independent_effects_run_in_parallel() {
         unresolved_resources: &HashMap::new(),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
     };
 
     let observer = MockObserver::new();
@@ -699,6 +961,7 @@ async fn test_parallel_failure_skips_dependents() {
         unresolved_resources: &HashMap::new(),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
     };
 
     let observer = MockObserver::new();
@@ -743,6 +1006,7 @@ async fn test_dependency_levels_sequential_chain() {
         unresolved_resources: &HashMap::new(),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
     };
 
     let observer = MockObserver::new();
@@ -966,6 +1230,7 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
         unresolved_resources: &HashMap::new(),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
     };
 
     let observer = MockObserver::new();
@@ -1005,6 +1270,7 @@ async fn test_waiting_events_emitted_for_dependent_effects() {
         unresolved_resources: &HashMap::new(),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
     };
 
     let observer = MockObserver::new();
@@ -1176,6 +1442,7 @@ async fn test_update_effect_binding_map_propagation() {
         unresolved_resources: &HashMap::new(),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
     };
 
     let observer = MockObserver::new();
@@ -1291,6 +1558,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
         unresolved_resources: &HashMap::new(),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
     };
 
     let observer = MockObserver::new();
@@ -1471,6 +1739,7 @@ async fn test_delete_waits_for_replace_cbd_of_dependent() {
         unresolved_resources: &HashMap::new(),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
     };
 
     let observer = MockObserver::new();
@@ -1557,6 +1826,7 @@ async fn test_delete_waits_for_replace_cbd_even_when_delete_binding_is_none() {
         unresolved_resources: &HashMap::new(),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
     };
 
     let observer = MockObserver::new();
@@ -1644,6 +1914,7 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
         unresolved_resources: &HashMap::new(),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
     };
 
     let observer = MockObserver::new();
@@ -1707,6 +1978,7 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
         unresolved_resources: &HashMap::new(),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
     };
 
     let observer = MockObserver::new();
@@ -1820,6 +2092,7 @@ async fn test_chained_index_then_field_unresolved_at_apply_fails_with_clear_erro
         unresolved_resources: &HashMap::new(),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
     };
 
     let observer = MockObserver::new();
@@ -1996,6 +2269,7 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
         unresolved_resources: &HashMap::new(),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
     };
 
     let observer = MockObserver::new();

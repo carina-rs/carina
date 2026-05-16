@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use crate::binding_index::ResolvedBindings;
 use crate::effect::Effect;
-use crate::provider::Provider;
+use crate::provider::{Provider, ProviderNormalizer};
 use crate::resource::{ResourceId, State};
 
 use parallel::execute_effects_sequential;
@@ -34,6 +34,13 @@ pub struct ExecutionInput<'a> {
     pub unresolved_resources: &'a HashMap<ResourceId, crate::resource::Resource>,
     pub bindings: ResolvedBindings,
     pub current_states: HashMap<ResourceId, State>,
+    /// The same provider normalizer that ran at plan time
+    /// (`PlanPreprocessor`). Apply-time reference re-resolution rebuilds
+    /// attributes from the un-normalized source, so the executor must
+    /// re-apply this after each resolution and before constructing the
+    /// provider request — otherwise plan-time normalization is silently
+    /// undone (carina#3060).
+    pub normalizer: &'a dyn ProviderNormalizer,
 }
 
 /// Result of executing a plan's effects.
