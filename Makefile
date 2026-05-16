@@ -185,6 +185,9 @@ plan-fixtures:
 	@echo ""
 	@echo "=== multi_instance_create ==="
 	@$(MAKE) plan-multi-instance-create
+	@echo ""
+	@echo "=== multi_instance_module ==="
+	@$(MAKE) plan-multi-instance-module
 
 plan-upstream-state:
 	$(PLAN_FIXTURE) upstream_state
@@ -220,6 +223,8 @@ plan-server-default-struct-leaf:
 	$(PLAN_FIXTURE) server_default_struct_leaf
 plan-multi-instance-create:
 	$(PLAN_FIXTURE) multi_instance_create
+plan-multi-instance-module:
+	$(PLAN_FIXTURE) multi_instance_module
 .PHONY: plan-all-create plan-no-changes plan-no-changes-enum plan-mixed plan-delete plan-compact \
         plan-map-diff plan-list-diff-added-struct plan-list-diff-removed-struct \
         plan-list-diff-modified-with-unchanged \
@@ -233,7 +238,7 @@ plan-multi-instance-create:
         plan-policy-pretty-nested plan-policy-pretty-dynamic-key-list \
         plan-pretty-long-string-list plan-pretty-short-string-list plan-provider-prefix \
         plan-module-anonymous-resource plan-server-default-struct-leaf \
-        plan-multi-instance-create \
+        plan-multi-instance-create plan-multi-instance-module \
         plan-map-diff-tui plan-all-create-tui plan-mixed-tui plan-delete-tui \
         plan-moved-with-changes-tui plan-moved-pure-tui plan-fixtures
 

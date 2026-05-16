@@ -1,0 +1,12 @@
+# Default instance of the `awscc` provider kind.
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+# Named instance targeting a different region. The module-internal
+# resource tagged `directives { provider = us }` must route here, not
+# the default — reproduces carina#3040 (module-expanded resource lost
+# its provider-instance routing on the way to the plan/create call).
+let us = provider awscc {
+  region = awscc.Region.us_east_1
+}

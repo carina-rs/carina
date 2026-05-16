@@ -1,0 +1,14 @@
+# Reproduces carina#3040: a named provider instance (`us`) is passed
+# implicitly to a module, and the module-internal resource carries
+# `directives { provider = us }`. After module expansion the resource
+# must still reach the plan with `ResourceId.provider_instance ==
+# Some("us")` so apply-time `ProviderRouter` routing sends the create
+# call to the `us` instance (us-east-1), not the kind default
+# (ap-northeast-1).
+let registry = use {
+  source = './reg-module'
+}
+
+let reg = registry {
+  cert_name = 'multi-instance-module-cert'
+}

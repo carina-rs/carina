@@ -1,0 +1,3 @@
+exports {
+  cert_bucket_name = reg.cert.bucket_name
+}

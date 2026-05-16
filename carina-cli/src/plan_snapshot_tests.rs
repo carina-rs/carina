@@ -159,6 +159,47 @@ fn multi_instance_create_propagates_provider_instance() {
     );
 }
 
+/// carina#3040 regression: when a named provider instance routes a
+/// resource that lives *inside an expanded module* (the real-infra
+/// shape — `usecases/registry/acm.crn` consumed via `use { source =
+/// ... }`, with `directives { provider = us }` on the module-internal
+/// resource), the directive must survive module expansion onto
+/// `ResourceId.provider_instance`. Before the fix the create call
+/// routed to the kind default (ap-northeast-1) even though the state
+/// row recorded `provider_instance: "us"`, leaving an ACM cert in the
+/// wrong region. The companion `multi_instance_create_propagates_
+/// provider_instance` test covers the non-module shape; this one
+/// covers the module-expanded shape specifically.
+#[test]
+fn module_routed_instance_propagates_provider_instance() {
+    let (plan, _schemas, _moved) = build_plan_from_fixture("multi_instance_module");
+
+    let routed: Vec<(String, Option<String>)> = plan
+        .effects()
+        .iter()
+        .map(|e| {
+            let id = e.resource_id();
+            (id.name_str().to_string(), id.provider_instance.clone())
+        })
+        .collect();
+
+    let cert = routed
+        .iter()
+        .find(|(name, _)| name.ends_with("cert"))
+        .unwrap_or_else(|| {
+            panic!("expected a module-expanded `cert` resource in the plan, got {routed:?}")
+        });
+
+    assert_eq!(
+        cert.1,
+        Some("us".to_string()),
+        "module-internal resource carries `directives {{ provider = us }}` — it must reach \
+         the plan with ResourceId.provider_instance == Some(\"us\") so apply-time \
+         ProviderRouter routing sends the create call to the `us` instance, not the \
+         kind default. Got {routed:?}"
+    );
+}
+
 /// Locks in the no-trailing-dot regression from #2516. The hash-with-
 /// instance-prefix path is covered by the unit tests in
 /// `carina-core/src/identifier/tests.rs`; fixture mode skips the hash
