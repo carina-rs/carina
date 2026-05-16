@@ -4772,3 +4772,117 @@ fn lift_state_string_enums_is_idempotent_and_preserves_invalid() {
         "invalid persisted state must still fail validation, not be masked"
     );
 }
+
+// carina#3080 type-safety guard: `select_union_member` must pick the
+// same member `validate_union` would, so the canonicalizer and the
+// validator never disagree on which member a value is. These tests
+// pin the property that makes the `None` (identity) arm unreachable
+// for the carina#3080 schema, so a future scorer/schema change that
+// breaks selection fails loudly here instead of silently skipping the
+// canonicalization fold and re-introducing the phantom diff.
+
+fn principal_union_schema() -> Vec<AttributeType> {
+    vec![
+        AttributeType::Struct {
+            name: "PrincipalStruct".to_string(),
+            fields: vec![StructField::new(
+                "service",
+                AttributeType::Union(vec![
+                    AttributeType::String,
+                    AttributeType::list(AttributeType::String),
+                ]),
+            )],
+        },
+        AttributeType::String,
+    ]
+}
+
+#[test]
+fn select_union_member_picks_struct_for_map_value() {
+    let members = principal_union_schema();
+    let mut map = IndexMap::new();
+    map.insert(
+        "service".to_string(),
+        Value::Concrete(ConcreteValue::String("cloudfront.amazonaws.com".to_string())),
+    );
+    let v = Value::Concrete(ConcreteValue::Map(map));
+    let chosen = select_union_member(&members, &v).expect("a Map must select a member");
+    assert!(
+        matches!(chosen, AttributeType::Struct { .. }),
+        "a Map value must select the Struct member, got {chosen:?}"
+    );
+}
+
+/// The negative the design calls out: a `Map` value must NEVER select
+/// the `String` member of `Union[Struct, String]`, regardless of
+/// declaration order.
+#[test]
+fn select_union_member_map_never_picks_string_member() {
+    let mut map = IndexMap::new();
+    map.insert(
+        "service".to_string(),
+        Value::Concrete(ConcreteValue::String("x".to_string())),
+    );
+    let v = Value::Concrete(ConcreteValue::Map(map));
+
+    // Struct-before-String (the real `string_or_principal_struct` order).
+    let a = principal_union_schema();
+    assert!(matches!(
+        select_union_member(&a, &v),
+        Some(AttributeType::Struct { .. })
+    ));
+
+    // String-before-Struct: still must not pick String for a Map.
+    let b = vec![
+        AttributeType::String,
+        AttributeType::Struct {
+            name: "PrincipalStruct".to_string(),
+            fields: vec![StructField::new("service", AttributeType::String)],
+        },
+    ];
+    assert!(
+        matches!(select_union_member(&b, &v), Some(AttributeType::Struct { .. })),
+        "a Map must select Struct even when String is declared first"
+    );
+}
+
+/// Scalar string under `string_or_list_of_strings` selects a member
+/// (so the nested fold is reachable, never the `None` identity arm).
+#[test]
+fn select_union_member_scalar_selects_string_or_list() {
+    let members = vec![
+        AttributeType::String,
+        AttributeType::list(AttributeType::String),
+    ];
+    let v = Value::Concrete(ConcreteValue::String("cloudfront.amazonaws.com".to_string()));
+    assert!(
+        select_union_member(&members, &v).is_some(),
+        "a scalar must select the String member, not fall to None"
+    );
+    let list = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+        ConcreteValue::String("cloudfront.amazonaws.com".to_string()),
+    )]));
+    assert!(
+        select_union_member(&members, &list).is_some(),
+        "a singleton list must select the List member, not fall to None"
+    );
+}
+
+/// No member shares the value's shape → `None` (identity at call site).
+#[test]
+fn select_union_member_no_match_is_none() {
+    let members = vec![AttributeType::Int, AttributeType::Bool];
+    let v = Value::Concrete(ConcreteValue::String("not-an-int".to_string()));
+    assert!(select_union_member(&members, &v).is_none());
+}
+
+/// Deferred values have no concrete shape → `None` (the canonicalizer
+/// leaves them for a later post-resolution pass).
+#[test]
+fn select_union_member_deferred_value_is_none() {
+    let members = principal_union_schema();
+    let v = Value::Deferred(DeferredValue::BindingRef {
+        binding: "some_ref".to_string(),
+    });
+    assert!(select_union_member(&members, &v).is_none());
+}
