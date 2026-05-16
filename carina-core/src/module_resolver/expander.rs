@@ -215,14 +215,13 @@ impl ModuleResolver<'_> {
             // `identifier::compute_anonymous_identifiers` for the full
             // story (#2516).
             if let ResourceName::Bound(name) = &new_resource.id.name {
-                let new_name = format!("{}.{}", instance_prefix, name);
+                let new_name = apply_instance_prefix(instance_prefix, name);
                 new_resource.id.set_name(new_name);
             }
 
             // Rewrite binding with instance path (dot-separated)
             if let Some(ref binding) = new_resource.binding {
-                let prefixed = format!("{}.{}", instance_prefix, binding);
-                new_resource.binding = Some(prefixed);
+                new_resource.binding = Some(apply_instance_prefix(instance_prefix, binding));
             }
 
             // Set typed module source info
@@ -312,31 +311,61 @@ impl ModuleResolver<'_> {
     }
 }
 
+/// Join a module-call `instance_prefix` to an intra-module binding name
+/// (`<prefix>.<name>`, dot-separated instance path).
+///
+/// This is the *single* definition of the instance-prefix spelling.
+/// Every site that prefixes a binding — resource ids, resource
+/// bindings, `rewrite_intra_module_refs`, and [`prefix_wait_binding`] —
+/// routes through here so the format can never drift between binding
+/// kinds (the carina#3061 class of bug was a binding kind that was
+/// *not* prefixed at all; keeping one spelling makes "is this kind
+/// prefixed?" a single, greppable call site per kind).
+fn apply_instance_prefix(instance_prefix: &str, name: &str) -> String {
+    format!("{instance_prefix}.{name}")
+}
+
 /// Instance-prefix every binding-name field of a [`WaitBinding`] so a
 /// module-internal `wait` keeps referring to the same (now prefixed)
 /// target / dependencies after expansion.
 ///
-/// Prefixed: `binding`, `target`, the predicate LHS root segment
-/// (`lhs_segments[0]`, which `parse_wait_expr` pins to the target
-/// binding), and every `depends_on` entry. `until_predicate.rhs` is a
-/// comparison value, not a binding, and `line` is source provenance —
-/// both pass through unchanged.
+/// The `WaitBinding` is **destructured exhaustively** rather than
+/// field-accessed: if a future field is added, this stops compiling
+/// until someone decides whether that field is a binding name (prefix
+/// it) or value/provenance (pass through). That compile-time forcing
+/// function is the carina#3061 guard — the original bug was a
+/// binding-carrying structure whose propagation silently skipped a
+/// part. Today: `binding`, `target`, the predicate LHS root segment
+/// (`lhs_segments[0]`, pinned to the target binding by
+/// `parse_wait_expr`), and every `depends_on` entry are prefixed;
+/// `until_raw` (verbatim user surface text), `until_predicate.rhs` (a
+/// comparison value), `timeout_secs`, and `line` are not binding names
+/// and pass through unchanged.
 fn prefix_wait_binding(wb: &WaitBinding, instance_prefix: &str) -> WaitBinding {
-    let prefixed = |name: &str| format!("{}.{}", instance_prefix, name);
+    let WaitBinding {
+        binding,
+        target,
+        until_raw,
+        until_predicate,
+        timeout_secs,
+        depends_on,
+        line,
+    } = wb;
+    let prefixed = |name: &str| apply_instance_prefix(instance_prefix, name);
 
-    let mut until_predicate = wb.until_predicate.clone();
+    let mut until_predicate = until_predicate.clone();
     if let Some(root) = until_predicate.lhs_segments.first_mut() {
         *root = prefixed(root);
     }
 
     WaitBinding {
-        binding: prefixed(&wb.binding),
-        target: prefixed(&wb.target),
-        until_raw: wb.until_raw.clone(),
+        binding: prefixed(binding),
+        target: prefixed(target),
+        until_raw: until_raw.clone(),
         until_predicate,
-        timeout_secs: wb.timeout_secs,
-        depends_on: wb.depends_on.iter().map(|d| prefixed(d)).collect(),
-        line: wb.line,
+        timeout_secs: *timeout_secs,
+        depends_on: depends_on.iter().map(|d| prefixed(d)).collect(),
+        line: *line,
     }
 }
 
@@ -416,7 +445,7 @@ pub(super) fn rewrite_intra_module_refs(
             if intra_module_bindings.contains(binding) =>
         {
             Value::Deferred(DeferredValue::BindingRef {
-                binding: format!("{}.{}", instance_prefix, binding),
+                binding: apply_instance_prefix(instance_prefix, binding),
             })
         }
         Value::Deferred(DeferredValue::ResourceRef { path })
@@ -424,7 +453,7 @@ pub(super) fn rewrite_intra_module_refs(
         {
             Value::Deferred(DeferredValue::ResourceRef {
                 path: crate::resource::AccessPath::with_segments(
-                    format!("{}.{}", instance_prefix, path.binding()),
+                    apply_instance_prefix(instance_prefix, path.binding()),
                     path.attribute().to_string(),
                     path.segments().to_vec(),
                 ),
