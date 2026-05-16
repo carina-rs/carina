@@ -1,15 +1,17 @@
 # Semantic Name Redesign — Design
 
-Status: **Direction + boundary + cross-cutting policy decided; ONE
-open question (E) needs user input.** Structured type-identity keyed on
-`provider + service/resource + kind`; generic/anonymous boundary is
-per-axis emptiness (no new flag); generic ARN is `aws.Arn`
-(AWS-scoped). The string round-trip is killed at all three boundaries
-(WIT contract / `ExpectedEnumVariant` / `type_name()` API) in one
-effort, not partially. **Open: E — whether the dotted identifier is
-also *input* (grammar change) or *display-only*.** Mechanism details
-(struct shape, WIT wire encoding, projection) deferred to
-implementation.
+Status: **All policy decided — no open questions.** Structured
+type-identity keyed on `provider + service/resource + kind`;
+generic/anonymous boundary is per-axis emptiness (no new flag); generic
+ARN is `aws.Arn` (AWS-scoped). The dotted identifier is **input
+syntax** (E-1) and rides the **existing** `TypeExpr::SchemaType`
+mechanism — no grammar change. The string round-trip is killed at all
+boundaries (WIT contract / `ExpectedEnumVariant` / `Custom.namespace` /
+`type_name()` API) in one effort by collapsing the **four** existing
+provider-axis representations onto one shared axis-struct, with a
+single owner for identity + `is_schema_type` resolution + projection.
+Only mechanism (struct shape, WIT wire encoding, registry concrete
+form) is left to the implementation phase.
 Date: 2026-05-16
 
 <!-- constrained-by ./2026-05-12-strict-enum-identifier-design.md -->
@@ -237,26 +239,55 @@ decision, not a mechanism detail. Safety valve: the mock provider does
 **not** implement `validate-custom-type`, so `carina-plugin-host`
 tests are insulated; blast radius is the aws/awscc plugins only.
 
-### B/F. Unify the three existing provider-axis representations
+### B/F/E. Unify the FOUR existing provider-axis representations
 
-The provider/service axis is **already** represented three times, all
-string-encoded:
+The provider/service axis is **already** represented four times. The
+fourth one resolves E.
 
+- `semantic_name: String` — flat, schema side (the headline target).
 - `ExpectedEnumVariant { provider: Option<String>, segments:
   Vec<String>, type_name: String }` (`schema/mod.rs`) — nearly the
   exact target shape, plus enum-only `value`/`is_alias`, and a
-  `Display` that already does struct→dotted projection.
+  `Display` that already does struct→dotted projection. Its
+  `from_namespaced` recovers axes via `split('.')`.
 - `Custom { namespace: Option<String> }` — e.g. `"aws.vpc"`, a
   provider+service string used for enum-shorthand resolution.
-- the flat `semantic_name` itself.
+- **`TypeExpr::SchemaType { provider, path, type_name }`**
+  (`parser/ast.rs:111`) — the **input-side** representation. Users
+  **already** write `fn f(x: awscc.ec2.VpcId)`; `parser/types.rs:142`
+  parses the dotted annotation and, when the tail is PascalCase and
+  `config.is_schema_type(provider, path, type_name)` is true, produces
+  `SchemaType`, else falls back to `Ref` (resource-type reference).
 
-**Policy: extract the axis structure
-(`provider` + `segments` + `type_name`) as one shared identity base.**
-`ExpectedEnumVariant` becomes that base plus `value`/`is_alias`;
-`Custom.namespace` folds into the same structure. Do **not** introduce
-a fourth, parallel struct — that re-creates the dispersion this
-redesign exists to remove. `from_namespaced`'s `split('.')` is
-replaced by carrying the structure directly.
+**E is resolved by this, not open.** E-1 ("dotted name is also input
+syntax") needs **no grammar extension** — the `SchemaType` atom and
+its `Ref`-vs-`SchemaType` disambiguation already exist. An earlier
+draft's claim that `type_simple` is a dotless identifier and a grammar
+change is required was **wrong** (it overlooked `type_ref` →
+`SchemaType`) and is withdrawn. E-1 is satisfied by riding the
+existing `SchemaType` mechanism.
+
+**Policy: collapse all four onto one shared axis-struct identity.**
+`SchemaType` is the input-syntax face of that identity;
+`semantic_name`'s structured form is the identity itself;
+`ExpectedEnumVariant` is the identity + `value`/`is_alias`;
+`Custom.namespace` carries the same axes. Do **not** add a fifth
+parallel struct. Consequence: the input→identity match
+(`SchemaType` annotation vs the attribute's `semantic_name`), today
+routed through `type_name()` string comparison in `validation/mod.rs`
+(the very anti-pattern D removes), becomes a **structural** comparison
+with no string in the path. `from_namespaced`'s `split('.')` and
+`Custom.namespace`'s string form are replaced by the structure
+directly.
+
+**Ownership: the `is_schema_type(provider, path, type_name)`
+resolver** (`parser/types.rs` disambiguation) and the identity
+registry are the **same owner**. Whatever component owns "is this a
+registered schema type" must also own identity comparison and the
+struct→dotted projection — one owner for the axis-struct, not the
+current split between parser context and schema. This is a
+*policy* (single ownership) decision; the registry's concrete form is
+mechanism.
 
 ### D. `type_name()` becomes display-only
 
@@ -275,29 +306,18 @@ restructure needs **no state migration** and breaks no existing state
 files. Recorded here so the implementation PR does not invent a
 migration.
 
-## Open question requiring user input
+### E. Dotted identifier is input syntax — RESOLVED (rides existing `SchemaType`)
 
-### E. Is the dotted identifier *input* syntax, or *display-only*?
-
-The grammar (`parser/carina.pest:124`) defines the type-annotation
-atom as `type_simple = @{ identifier }` — a **single identifier, no
-dots**. `type_ref = resource_type_path` (`identifier(.identifier)+`)
-*is* dotted but is reserved for **resource-type references**. So
-"user-facing dotted string" is currently ambiguous on one point this
-doc has not resolved:
-
-- **E-1: input too.** Users may write
-  `fn f(x: aws.iam.Role.Arn)` in a type annotation. Requires extending
-  `type_simple` to accept dots **and** disambiguating it from
-  `type_ref` — this widens the design scope into the grammar/parser.
-- **E-2: display-only.** The dotted form appears only in validate
-  errors / LSP; type annotations keep a non-dotted spelling (or the
-  feature is not annotation-writable at all). No grammar change; but
-  "user-facing surface" then means *output presentation only*.
-
-This changes what "the user-facing surface stays a dotted string"
-means and whether the parser is in scope. **Unresolved — needs a user
-decision before the doc is final.**
+Decided E-1 (user, 2026-05-16): the dotted name is writable in type
+annotations, not display-only. Critically, this needs **no grammar
+extension**: `parser/ast.rs:111` `TypeExpr::SchemaType { provider,
+path, type_name }` and the `parser/types.rs:142` `Ref`-vs-`SchemaType`
+disambiguation (PascalCase tail + `config.is_schema_type(...)`)
+**already implement input-side dotted type annotations**
+(`fn f(x: awscc.ec2.VpcId)` parses today). E-1 is satisfied by
+unifying the new identity with `SchemaType` (see B/F/E above), not by
+touching the grammar. The earlier "grammar change required" framing
+was a mistake and is withdrawn.
 
 ## Remaining mechanism (implementation phase, not policy)
 
