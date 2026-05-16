@@ -239,12 +239,15 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     let observer = CollectingObserver {
         failures: Mutex::new(Vec::new()),
     };
+    let schemas = carina_core::schema::SchemaRegistry::new();
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &unresolved_resources,
         bindings: carina_core::binding_index::ResolvedBindings::default(),
         current_states,
         normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &schemas,
     };
 
     let result = execute_plan(&provider, input, &observer).await;
@@ -352,12 +355,15 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     let observer = CollectingObserver {
         failures: Mutex::new(Vec::new()),
     };
+    let schemas = carina_core::schema::SchemaRegistry::new();
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &unresolved_resources,
         bindings: carina_core::binding_index::ResolvedBindings::default(),
         current_states,
         normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &schemas,
     };
 
     let result = execute_plan(&provider, input, &observer).await;

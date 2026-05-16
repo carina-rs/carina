@@ -125,7 +125,7 @@ pub(super) async fn refresh_pending_states(
 pub(super) fn resolve_resource(
     resource: &Resource,
     bindings: &ResolvedBindings,
-    normalizer: &dyn ProviderNormalizer,
+    pipeline: &RenormalizePipeline<'_>,
 ) -> Result<Resource, String> {
     let mut resolved = resource.clone();
     for (key, expr) in &resource.attributes {
@@ -133,7 +133,7 @@ pub(super) fn resolve_resource(
         assert_fully_resolved(&resolved_value, key)?;
         resolved.attributes.insert(key.clone(), resolved_value);
     }
-    renormalize(resolved, normalizer)
+    renormalize(resolved, pipeline)
 }
 
 /// Resolve a resource, preferring unresolved source for re-resolution.
@@ -145,7 +145,7 @@ pub(super) fn resolve_resource_with_source(
     target: &Resource,
     source: &Resource,
     bindings: &ResolvedBindings,
-    normalizer: &dyn ProviderNormalizer,
+    pipeline: &RenormalizePipeline<'_>,
 ) -> Result<Resource, String> {
     let mut resolved = target.clone();
     for (key, expr) in &source.attributes {
@@ -153,40 +153,60 @@ pub(super) fn resolve_resource_with_source(
         assert_fully_resolved(&resolved_value, key)?;
         resolved.attributes.insert(key.clone(), resolved_value);
     }
-    renormalize(resolved, normalizer)
+    renormalize(resolved, pipeline)
 }
 
-/// Re-apply the provider normalizer to a freshly resolved resource.
+/// The full plan-time normalization pipeline, threaded into the apply
+/// executor so reference re-resolution cannot undo it.
 ///
-/// carina#3060: reference re-resolution rebuilds attributes from the
-/// un-normalized source, undoing the plan-time `normalize_desired`. Both
-/// resolve helpers funnel through here so apply-path resolution and
-/// plan-time `normalize_desired` can never diverge again — "resolved"
-/// always means "resolved and re-normalized" by construction.
+/// Bundled into one struct (rather than three separate args) so the
+/// resolve helpers and `BasicEffectCtx` carry a single field.
+pub(super) struct RenormalizePipeline<'a> {
+    pub(super) normalizer: &'a dyn ProviderNormalizer,
+    pub(super) factories: &'a [Box<dyn crate::provider::ProviderFactory>],
+    pub(super) schemas: &'a crate::schema::SchemaRegistry,
+}
+
+/// Re-apply the full plan-time normalization pipeline to a freshly
+/// resolved resource.
 ///
-/// Scope: this re-applies only `ProviderNormalizer::normalize_desired`.
-/// The plan-time pipeline (`PlanPreprocessor::prepare` + `apply/mod.rs`)
-/// also runs `carina_core::value::canonicalize_resources_with_schemas`
-/// (string/list-union coercion; carina-core, but needs the
-/// `SchemaRegistry` the executor is not given) and the carina-cli
-/// `resolve_enum_aliases_with_ctx` (enum-alias → canonical, e.g.
-/// `IpProtocol.all` → `"-1"`; `WiringContext`/factory-bound, genuinely
-/// unreachable from carina-core). Neither is re-applied here, so the
-/// alias/union axis of the same apply/plan divergence is intentionally
-/// out of scope and tracked in carina#3063 — closing it requires
-/// unifying the plan and apply resolve→normalize pipelines, a layering
-/// change beyond this fix.
+/// carina#3060 / carina#3063: reference re-resolution rebuilds
+/// attributes from the un-normalized source, undoing every plan-time
+/// normalization stage. Both resolve helpers funnel through here so
+/// apply-path resolution and the plan-time pipeline can never diverge
+/// again — "resolved" always means "resolved and fully re-normalized"
+/// by construction.
 ///
-/// Infallible today (`normalize_desired` returns `()`); the `Result` only
+/// The three desired-side stages, in the same order the plan path runs
+/// them (`canonicalize_resources_with_schemas` at `apply/mod.rs` then
+/// `PlanPreprocessor::prepare`):
+/// 1. `canonicalize_resources_with_schemas` — `Union[String,
+///    list(String)]` coercion (#2481, #2511).
+/// 2. `ProviderNormalizer::normalize_desired` — enum-identifier
+///    resolution (carina#3060).
+/// 3. `resolve_enum_aliases_for_resources` — enum-alias → AWS canonical
+///    (e.g. `IpProtocol.all` → `"-1"`), per-resource factory dispatch
+///    (carina#3063).
+///
+/// Stage 3's *function* is the single core helper the plan path now
+/// calls too, so the alias logic cannot diverge. The *ordering* of the
+/// three stages is, however, still hand-mirrored here vs. the plan
+/// path's own inline sequence (split across `apply/mod.rs` and
+/// `PlanPreprocessor::prepare`, which also interleaves plan-only
+/// state-side passes). Extracting one shared sequencing primitive so a
+/// future reorder of either side cannot desync is tracked in
+/// carina#3068 — it requires restructuring `PlanPreprocessor::prepare`,
+/// a plan-pipeline refactor beyond this fix's scope.
+///
+/// Infallible today (no stage returns an error); the `Result` only
 /// mirrors the caller's signature — `resolve_resource{,_with_source}`
 /// fail-fast earlier on still-`Deferred` values — so this stays the tail
 /// expression without forcing `Ok(...)` at every call site.
-fn renormalize(
-    resolved: Resource,
-    normalizer: &dyn ProviderNormalizer,
-) -> Result<Resource, String> {
+fn renormalize(resolved: Resource, pipeline: &RenormalizePipeline<'_>) -> Result<Resource, String> {
     let mut one = [resolved];
-    normalizer.normalize_desired(&mut one);
+    crate::value::canonicalize_resources_with_schemas(&mut one, pipeline.schemas);
+    pipeline.normalizer.normalize_desired(&mut one);
+    crate::value::resolve_enum_aliases_for_resources(&mut one, pipeline.factories);
     let [resolved] = one;
     Ok(resolved)
 }
@@ -313,7 +333,7 @@ pub(super) struct BasicEffectCtx<'a> {
     pub(super) provider: &'a dyn Provider,
     pub(super) bindings: &'a ResolvedBindings,
     pub(super) unresolved: &'a HashMap<ResourceId, Resource>,
-    pub(super) normalizer: &'a dyn ProviderNormalizer,
+    pub(super) pipeline: &'a RenormalizePipeline<'a>,
     pub(super) completed: &'a AtomicUsize,
     pub(super) total: usize,
 }
@@ -334,7 +354,7 @@ pub(super) async fn execute_basic_effect<'a>(
     let provider = ctx.provider;
     let bindings = ctx.bindings;
     let unresolved = ctx.unresolved;
-    let normalizer = ctx.normalizer;
+    let pipeline = ctx.pipeline;
     let completed = ctx.completed;
     let total = ctx.total;
     let c = completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -347,7 +367,7 @@ pub(super) async fn execute_basic_effect<'a>(
 
     match effect {
         Effect::Create(resource) => {
-            let resolved = match resolve_resource(resource, bindings, normalizer) {
+            let resolved = match resolve_resource(resource, bindings, pipeline) {
                 Ok(r) => r,
                 Err(e) => {
                     observer.on_event(&ExecutionEvent::EffectFailed {
@@ -408,7 +428,7 @@ pub(super) async fn execute_basic_effect<'a>(
         } => {
             let resolve_source = unresolved.get(id).unwrap_or(to);
             let resolved_to =
-                match resolve_resource_with_source(to, resolve_source, bindings, normalizer) {
+                match resolve_resource_with_source(to, resolve_source, bindings, pipeline) {
                     Ok(r) => r,
                     Err(e) => {
                         observer.on_event(&ExecutionEvent::EffectFailed {

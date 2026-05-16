@@ -12,9 +12,9 @@ use crate::provider::{CreateRequest, DeleteRequest, Provider, UpdateRequest};
 use crate::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 
 use super::basic::{
-    BasicEffectCtx, BasicEffectResult, ExecutionState, count_actionable_effects,
-    execute_basic_effect, process_basic_result, queue_state_refresh, refresh_pending_states,
-    resolve_resource, resolve_resource_with_source,
+    BasicEffectCtx, BasicEffectResult, ExecutionState, RenormalizePipeline,
+    count_actionable_effects, execute_basic_effect, process_basic_result, queue_state_refresh,
+    refresh_pending_states, resolve_resource, resolve_resource_with_source,
 };
 use super::replace::{compute_full_diff_patch, single_attribute_patch};
 use super::{ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, ProgressInfo};
@@ -373,7 +373,11 @@ pub(super) async fn execute_effects_phased(
 
                 let binding_snapshot = input.bindings.clone();
                 let unresolved = &input.unresolved_resources;
-                let normalizer = input.normalizer;
+                let pipeline = RenormalizePipeline {
+                    normalizer: input.normalizer,
+                    factories: input.factories,
+                    schemas: input.schemas,
+                };
                 let completed_ref = &completed;
 
                 in_flight.push(async move {
@@ -383,7 +387,7 @@ pub(super) async fn execute_effects_phased(
                             provider,
                             bindings: &binding_snapshot,
                             unresolved,
-                            normalizer,
+                            pipeline: &pipeline,
                             completed: completed_ref,
                             total,
                         },
@@ -496,7 +500,11 @@ pub(super) async fn execute_effects_phased(
 
                 let binding_snapshot = input.bindings.clone();
                 let unresolved = &input.unresolved_resources;
-                let normalizer = input.normalizer;
+                let pipeline = RenormalizePipeline {
+                    normalizer: input.normalizer,
+                    factories: input.factories,
+                    schemas: input.schemas,
+                };
 
                 in_flight.push(async move {
                     if let Effect::Replace {
@@ -513,7 +521,7 @@ pub(super) async fn execute_effects_phased(
                             to,
                             resolve_source,
                             &binding_snapshot,
-                            normalizer,
+                            &pipeline,
                         ) {
                             Ok(r) => r,
                             Err(e) => {
@@ -558,7 +566,7 @@ pub(super) async fn execute_effects_phased(
                                     let resolved_to = match resolve_resource(
                                         &cascade.to,
                                         &local_bindings,
-                                        normalizer,
+                                        &pipeline,
                                     ) {
                                         Ok(r) => r,
                                         Err(e) => {
@@ -974,7 +982,11 @@ pub(super) async fn execute_effects_phased(
 
                 let binding_snapshot = input.bindings.clone();
                 let unresolved = &input.unresolved_resources;
-                let normalizer = input.normalizer;
+                let pipeline = RenormalizePipeline {
+                    normalizer: input.normalizer,
+                    factories: input.factories,
+                    schemas: input.schemas,
+                };
 
                 if let Effect::Replace {
                     id,
@@ -1109,7 +1121,7 @@ pub(super) async fn execute_effects_phased(
                                     to,
                                     resolve_source,
                                     &binding_snapshot,
-                                    normalizer,
+                                    &pipeline,
                                 ) {
                                     Ok(r) => r,
                                     Err(e) => {

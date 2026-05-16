@@ -54,10 +54,13 @@ pub type ApplyResult = ExecutionResult;
 ///
 /// This delegates to `carina_core::executor::execute_plan()` with a `CliObserver`
 /// for colored progress output.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_effects(
     plan: &Plan,
     provider: &dyn Provider,
     normalizer: &dyn ProviderNormalizer,
+    factories: &[Box<dyn carina_core::provider::ProviderFactory>],
+    schemas: &carina_core::schema::SchemaRegistry,
     bindings: &mut ResolvedBindings,
     current_states: &mut HashMap<ResourceId, State>,
     unresolved_resources: &HashMap<ResourceId, Resource>,
@@ -68,6 +71,8 @@ pub async fn execute_effects(
         bindings: std::mem::take(bindings),
         current_states: std::mem::take(current_states),
         normalizer,
+        factories,
+        schemas,
     };
 
     let observer = CliObserver::new(plan);
@@ -1157,6 +1162,8 @@ async fn run_apply_locked(
         &plan,
         &provider,
         &provider,
+        ctx.factories(),
+        ctx.schemas(),
         &mut bindings,
         &mut current_states,
         &unresolved_resources,
@@ -1358,7 +1365,8 @@ async fn run_apply_from_plan_locked(
         .collect();
 
     // Create provider early for drift detection
-    let provider = create_providers_from_configs(&plan_file.provider_configs, base_dir).await?;
+    let (provider, ctx) =
+        create_providers_from_configs(&plan_file.provider_configs, base_dir).await?;
 
     // Drift detection: re-read actual infrastructure state and compare against planned states
     println!("{}", "Checking for infrastructure drift...".cyan());
@@ -1472,6 +1480,8 @@ async fn run_apply_from_plan_locked(
         plan,
         &provider,
         &provider,
+        ctx.factories(),
+        ctx.schemas(),
         &mut bindings,
         &mut current_states,
         &unresolved_resources,

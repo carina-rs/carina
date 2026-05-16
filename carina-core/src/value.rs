@@ -1328,6 +1328,74 @@ pub fn canonicalize_states_with_schemas(
     }
 }
 
+/// Resolve a single value's enum alias (DSL spelling → AWS canonical,
+/// e.g. `IpProtocol.all` → `"-1"`), recursing into lists and maps.
+///
+/// Moved here from carina-cli (`resolve_value_alias`) so the apply
+/// executor can re-apply it post reference-resolution — it is plan-time
+/// pipeline stage 3 and, like `normalize_desired`, undone by apply-time
+/// re-resolution (carina#3063). Pure: depends only on
+/// `crate::utils` + the `ProviderFactory` trait (already carina-core).
+/// Public so the carina-cli state-side alias pass
+/// (`resolve_enum_aliases_in_states`) reuses this exact implementation
+/// rather than keeping a divergent copy.
+pub fn resolve_value_alias(
+    value: &mut Value,
+    resource_type: &str,
+    attr_name: &str,
+    factory: &dyn crate::provider::ProviderFactory,
+) {
+    match value {
+        Value::Concrete(ConcreteValue::String(s)) if is_dsl_enum_format(s) => {
+            let raw = convert_enum_value(s);
+            if let Some(canonical) = factory.get_enum_alias_reverse(resource_type, attr_name, raw) {
+                *s = canonical;
+            }
+        }
+        Value::Concrete(ConcreteValue::List(items)) => {
+            for item in items.iter_mut() {
+                resolve_value_alias(item, resource_type, attr_name, factory);
+            }
+        }
+        Value::Concrete(ConcreteValue::Map(map)) => {
+            let map_keys: Vec<String> = map.keys().cloned().collect();
+            for map_key in map_keys {
+                if let Some(v) = map.get_mut(&map_key) {
+                    resolve_value_alias(v, resource_type, &map_key, factory);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Re-apply enum-alias resolution to every resource, looking up the
+/// factory per resource by `id.provider` (the same `find_factory`
+/// dispatch the plan path uses). Single source of truth shared by the
+/// plan path (carina-cli `resolve_enum_aliases_with_ctx`) and the apply
+/// path (`executor::renormalize`) so the two cannot diverge on this
+/// stage again (carina#3063).
+pub fn resolve_enum_aliases_for_resources(
+    resources: &mut [crate::resource::Resource],
+    factories: &[Box<dyn crate::provider::ProviderFactory>],
+) {
+    for resource in resources.iter_mut() {
+        if resource.id.provider.is_empty() {
+            continue;
+        }
+        let Some(factory) = crate::provider::find_factory(factories, &resource.id.provider) else {
+            continue;
+        };
+        let resource_type = resource.id.resource_type.clone();
+        let keys: Vec<String> = resource.attributes.keys().cloned().collect();
+        for key in keys {
+            if let Some(value) = resource.attributes.get_mut(&key) {
+                resolve_value_alias(value, &resource_type, &key, factory);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
