@@ -278,6 +278,80 @@ impl crate::provider::ProviderNormalizer for CanonicalizingNormalizer {
 }
 
 // -----------------------------------------------------------------------
+// Mock ProviderFactory + shared test fixtures
+// -----------------------------------------------------------------------
+
+use crate::provider::ProviderFactory;
+use crate::schema::SchemaRegistry;
+use std::sync::LazyLock;
+
+/// Empty schema registry shared by tests that don't exercise the
+/// canonicalize stage. `'static` so it can back `&` in `ExecutionInput`.
+static TEST_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(SchemaRegistry::new);
+
+/// Registry whose `test`-provider `sg` resource declares `subject` as
+/// `Union[String, list(String)]` (the `string_or_list_of_strings`
+/// shape), so the apply-path canonicalize stage (#2481/#2511) has a
+/// schema to act on. carina#3063: this stage is plan pipeline stage 1
+/// and must also be re-applied at apply time.
+static CANON_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    let mut reg = SchemaRegistry::new();
+    let schema = ResourceSchema::new("sg").attribute(AttributeSchema::new(
+        "subject",
+        AttributeType::Union(vec![
+            AttributeType::String,
+            AttributeType::list(AttributeType::String),
+        ]),
+    ));
+    reg.insert("test", schema);
+    reg
+});
+
+/// Factory that maps the enum DSL alias `all` → AWS canonical `"-1"`
+/// for the `ip_protocol` attribute, modeling plan-time stage 3
+/// (`resolve_enum_aliases`). carina#3063: apply must re-apply this.
+struct AliasFactory;
+impl ProviderFactory for AliasFactory {
+    fn name(&self) -> &str {
+        "test"
+    }
+    fn display_name(&self) -> &str {
+        "Test"
+    }
+    fn provider_config_attribute_types(&self) -> HashMap<String, crate::schema::AttributeType> {
+        HashMap::new()
+    }
+    fn validate_config(
+        &self,
+        _attributes: &indexmap::IndexMap<String, Value>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
+        String::new()
+    }
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _attributes: &indexmap::IndexMap<String, Value>,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn crate::provider::Provider>>> {
+        unreachable!("test factory does not create providers")
+    }
+    fn schemas(&self) -> Vec<crate::schema::ResourceSchema> {
+        Vec::new()
+    }
+    fn get_enum_alias_reverse(
+        &self,
+        _resource_type: &str,
+        attr_name: &str,
+        value: &str,
+    ) -> Option<String> {
+        (attr_name == "ip_protocol" && value == "all").then(|| "-1".to_string())
+    }
+}
+
+// -----------------------------------------------------------------------
 // Helper functions
 // -----------------------------------------------------------------------
 
@@ -332,6 +406,8 @@ async fn test_simple_create() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
     };
 
     let observer = MockObserver::new();
@@ -379,6 +455,8 @@ async fn test_apply_renormalizes_after_resolution() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &CanonicalizingNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
     };
 
     let observer = MockObserver::new();
@@ -394,6 +472,170 @@ async fn test_apply_renormalizes_after_resolution() {
         ))),
         "apply path must re-run normalize_desired so the provider \
          receives the canonical value, not the raw DSL spelling"
+    );
+}
+
+/// carina#3063: the apply path must also re-apply plan-time stage 3
+/// (enum-alias resolution, `get_enum_alias_reverse`), not just
+/// `normalize_desired` (stage 2). After plan-time normalization the
+/// value is the namespaced DSL form (`...IpProtocol.all`); apply
+/// re-resolves from the un-normalized source, so without re-applying
+/// the alias stage the provider receives the namespaced/aliased form
+/// instead of the AWS canonical `"-1"`.
+#[tokio::test]
+async fn test_apply_reapplies_enum_alias_stage() {
+    let provider = MockProvider::new();
+    // `id.provider = "test"` so the per-resource factory lookup finds
+    // `AliasFactory` (whose `name()` is `"test"`).
+    let mut resource = Resource::with_provider("test", "sg", "a", None);
+    resource.binding = Some("a".to_string());
+    // Post-normalize_desired shape: namespaced DSL enum identifier.
+    resource.set_attr(
+        "ip_protocol",
+        Value::Concrete(ConcreteValue::String(
+            "test.ec2.SecurityGroup.IpProtocol.all".to_string(),
+        )),
+    );
+    let rid = resource.id.clone();
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(resource));
+    provider.push_create(Ok(ok_state(&rid)));
+
+    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(AliasFactory)];
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        factories: &factories,
+        schemas: &TEST_SCHEMAS,
+    };
+
+    let observer = MockObserver::new();
+    let result = execute_plan(&provider, input, &observer).await;
+    assert_eq!(result.success_count, 1);
+
+    let captured = provider.captured_create_resources();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(
+        captured[0].get_attr("ip_protocol"),
+        Some(&Value::Concrete(ConcreteValue::String("-1".to_string()))),
+        "apply path must re-apply the enum-alias stage so the provider \
+         receives the AWS canonical value, not the namespaced DSL form"
+    );
+}
+
+/// carina#3063, Update path: the enum-alias stage must be re-applied on
+/// Update too, not just Create (carina#3060's lesson — aws#315 was an
+/// Update bug). The `UpdateRequest.patch` is built from the re-resolved
+/// `to`; without the apply-path enum-alias re-resolution the patch
+/// would carry the namespaced DSL form instead of the AWS canonical.
+#[tokio::test]
+async fn test_apply_reapplies_enum_alias_stage_update_path() {
+    let provider = MockProvider::new();
+    let mut to_resource = Resource::with_provider("test", "sg", "a", None);
+    to_resource.binding = Some("a".to_string());
+    to_resource.set_attr(
+        "ip_protocol",
+        Value::Concrete(ConcreteValue::String(
+            "test.ec2.SecurityGroup.IpProtocol.all".to_string(),
+        )),
+    );
+    let rid = to_resource.id.clone();
+
+    let mut from_attrs = HashMap::new();
+    from_attrs.insert(
+        "ip_protocol".to_string(),
+        Value::Concrete(ConcreteValue::String("tcp".to_string())),
+    );
+    let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        id: rid.clone(),
+        from: Box::new(from_state),
+        to: to_resource,
+        changed_attributes: vec!["ip_protocol".to_string()],
+    });
+    provider.push_update(Ok(ok_state(&rid)));
+
+    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(AliasFactory)];
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        factories: &factories,
+        schemas: &TEST_SCHEMAS,
+    };
+
+    let observer = MockObserver::new();
+    let result = execute_plan(&provider, input, &observer).await;
+    assert_eq!(result.success_count, 1);
+
+    let reqs = provider.captured_update_requests();
+    assert_eq!(reqs.len(), 1);
+    let op = reqs[0]
+        .patch
+        .ops
+        .iter()
+        .find(|op| op.key == "ip_protocol")
+        .expect("patch must contain the changed `ip_protocol` attribute");
+    assert_eq!(
+        op.value,
+        Some(Value::Concrete(ConcreteValue::String("-1".to_string()))),
+        "Update patch must carry the enum-alias-canonical value, not \
+         the namespaced DSL form"
+    );
+}
+
+/// carina#3063, canonicalize stage (plan pipeline stage 1): the apply
+/// path must also re-apply `canonicalize_resources_with_schemas`. With
+/// a schema declaring `subject` as `Union[String, list(String)]`, a
+/// scalar string must reach the provider canonicalized to a
+/// single-element `StringList` — the same coercion the plan path does
+/// (#2481/#2511), undone by apply-time re-resolution without this.
+#[tokio::test]
+async fn test_apply_reapplies_canonicalize_stage() {
+    let provider = MockProvider::new();
+    let mut resource = Resource::with_provider("test", "sg", "a", None);
+    resource.binding = Some("a".to_string());
+    resource.set_attr(
+        "subject",
+        Value::Concrete(ConcreteValue::String("repo:foo:*".to_string())),
+    );
+    let rid = resource.id.clone();
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(resource));
+    provider.push_create(Ok(ok_state(&rid)));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &CANON_SCHEMAS,
+    };
+
+    let observer = MockObserver::new();
+    let result = execute_plan(&provider, input, &observer).await;
+    assert_eq!(result.success_count, 1);
+
+    let captured = provider.captured_create_resources();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(
+        captured[0].get_attr("subject"),
+        Some(&Value::Concrete(ConcreteValue::StringList(vec![
+            "repo:foo:*".to_string()
+        ]))),
+        "apply path must re-apply the canonicalize stage so a scalar in \
+         a Union[String,list] field reaches the provider as StringList"
     );
 }
 
@@ -434,6 +676,8 @@ async fn test_apply_renormalizes_update_path() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &CanonicalizingNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
     };
 
     let observer = MockObserver::new();
@@ -494,6 +738,8 @@ async fn test_apply_renormalizes_nested_value_under_ref_bearing_resource() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &CanonicalizingNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
     };
 
     let observer = MockObserver::new();
@@ -549,6 +795,8 @@ async fn test_simple_delete() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
     };
 
     let observer = MockObserver::new();
@@ -578,6 +826,8 @@ async fn test_failed_effect_propagates_to_dependent() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
     };
 
     let observer = MockObserver::new();
@@ -626,6 +876,8 @@ async fn test_cbd_creates_before_deletes() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
     };
 
     let observer = MockObserver::new();
@@ -668,6 +920,8 @@ async fn test_dbd_deletes_before_creates() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
     };
 
     let observer = MockObserver::new();
@@ -743,6 +997,8 @@ async fn test_phased_cbd_creates_in_forward_order_deletes_in_reverse() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
     };
 
     let observer = MockObserver::new();
@@ -817,6 +1073,8 @@ async fn test_phased_noncbd_creates_after_deletes() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
     };
 
     let observer = MockObserver::new();
@@ -851,6 +1109,8 @@ async fn test_observer_events_emitted_correctly() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
     };
 
     let observer = MockObserver::new();
@@ -876,6 +1136,8 @@ async fn test_read_effect_is_no_op() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
     };
 
     let observer = MockObserver::new();
@@ -914,6 +1176,8 @@ async fn test_independent_effects_run_in_parallel() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
     };
 
     let observer = MockObserver::new();
@@ -962,6 +1226,8 @@ async fn test_parallel_failure_skips_dependents() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
     };
 
     let observer = MockObserver::new();
@@ -1007,6 +1273,8 @@ async fn test_dependency_levels_sequential_chain() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
     };
 
     let observer = MockObserver::new();
@@ -1231,6 +1499,8 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
     };
 
     let observer = MockObserver::new();
@@ -1271,6 +1541,8 @@ async fn test_waiting_events_emitted_for_dependent_effects() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
     };
 
     let observer = MockObserver::new();
@@ -1443,6 +1715,8 @@ async fn test_update_effect_binding_map_propagation() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
     };
 
     let observer = MockObserver::new();
@@ -1559,6 +1833,8 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
     };
 
     let observer = MockObserver::new();
@@ -1740,6 +2016,8 @@ async fn test_delete_waits_for_replace_cbd_of_dependent() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
     };
 
     let observer = MockObserver::new();
@@ -1827,6 +2105,8 @@ async fn test_delete_waits_for_replace_cbd_even_when_delete_binding_is_none() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
     };
 
     let observer = MockObserver::new();
@@ -1915,6 +2195,8 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
     };
 
     let observer = MockObserver::new();
@@ -2058,6 +2340,8 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
     };
 
     let observer = MockObserver::new();
@@ -2134,6 +2418,8 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
     };
 
     let observer = MockObserver::new();
@@ -2248,6 +2534,8 @@ async fn test_chained_index_then_field_unresolved_at_apply_fails_with_clear_erro
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
     };
 
     let observer = MockObserver::new();
@@ -2425,6 +2713,8 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
     };
 
     let observer = MockObserver::new();

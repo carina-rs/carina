@@ -41,6 +41,19 @@ pub struct ExecutionInput<'a> {
     /// provider request — otherwise plan-time normalization is silently
     /// undone (carina#3060).
     pub normalizer: &'a dyn ProviderNormalizer,
+    /// Provider factories, looked up per-resource by `id.provider`
+    /// (same `find_factory` dispatch the plan path uses) to re-apply
+    /// enum-alias resolution (`get_enum_alias_reverse`, e.g.
+    /// `IpProtocol.all` → `"-1"`) on the apply path. carina#3063:
+    /// plan-time pipeline stage 3 — like `normalize_desired`, undone by
+    /// apply-time re-resolution. A multi-provider plan needs the slice,
+    /// not a single factory.
+    pub factories: &'a [Box<dyn crate::provider::ProviderFactory>],
+    /// Schema registry used to re-apply `Union[String, list(String)]`
+    /// canonicalization (`canonicalize_resources_with_schemas`) — plan
+    /// pipeline stage 1, also undone by apply-time re-resolution
+    /// (carina#3063).
+    pub schemas: &'a crate::schema::SchemaRegistry,
 }
 
 /// Result of executing a plan's effects.

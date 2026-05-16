@@ -25,7 +25,6 @@ use carina_core::resource::{
     ConcreteValue, DeferredValue, Resource, ResourceId, State, Value, contains_resource_ref,
 };
 use carina_core::schema::{SchemaRegistry, resolve_block_names};
-use carina_core::utils;
 use carina_core::validation;
 use carina_provider_mock::MockProvider;
 use carina_state::StateFile;
@@ -767,21 +766,13 @@ pub fn normalize_state_with_ctx(
 /// This must be called on both desired resources and current states to ensure
 /// the differ sees consistent values and produces no false diffs.
 pub fn resolve_enum_aliases_with_ctx(ctx: &WiringContext, resources: &mut [Resource]) {
-    for resource in resources.iter_mut() {
-        if resource.id.provider.is_empty() {
-            continue;
-        }
-        let factory = match provider_mod::find_factory(ctx.factories(), &resource.id.provider) {
-            Some(f) => f,
-            None => continue,
-        };
-        let mut value_attrs = resource.resolved_attributes();
-        resolve_attrs_aliases(&mut value_attrs, &resource.id.resource_type, factory);
-        // `value_attrs` is `HashMap`-shaped, so the source order written
-        // by the user does not survive alias resolution. Re-rendering the
-        // attributes after this point can produce a different key order.
-        resource.attributes = value_attrs.into_iter().collect();
-    }
+    // Single source of truth shared with the apply path
+    // (`executor::renormalize`) so plan and apply cannot diverge on the
+    // enum-alias stage again (carina#3063). The core helper mutates
+    // `resource.attributes` in place (IndexMap), so unlike the previous
+    // `resolved_attributes()` round-trip it also preserves source key
+    // order.
+    carina_core::value::resolve_enum_aliases_for_resources(resources, ctx.factories());
 }
 
 /// Resolve enum alias values in current states to their canonical AWS form.
@@ -800,52 +791,14 @@ pub fn resolve_enum_aliases_in_states(
             Some(f) => f,
             None => continue,
         };
-        resolve_attrs_aliases(&mut state.attributes, &id.resource_type, factory);
-    }
-}
-
-/// Resolve enum aliases in an attribute map.
-fn resolve_attrs_aliases(
-    attrs: &mut HashMap<String, Value>,
-    resource_type: &str,
-    factory: &dyn ProviderFactory,
-) {
-    let keys: Vec<String> = attrs.keys().cloned().collect();
-    for key in keys {
-        if let Some(value) = attrs.get_mut(&key) {
-            resolve_value_alias(value, resource_type, &key, factory);
-        }
-    }
-}
-
-/// Resolve a single value's enum alias, recursing into lists and maps.
-fn resolve_value_alias(
-    value: &mut Value,
-    resource_type: &str,
-    attr_name: &str,
-    factory: &dyn ProviderFactory,
-) {
-    match value {
-        Value::Concrete(ConcreteValue::String(s)) if utils::is_dsl_enum_format(s) => {
-            let raw = utils::convert_enum_value(s);
-            if let Some(canonical) = factory.get_enum_alias_reverse(resource_type, attr_name, raw) {
-                *s = canonical;
+        // Reuse the core per-value alias resolver (single source of
+        // truth shared with the resource path, carina#3063).
+        let keys: Vec<String> = state.attributes.keys().cloned().collect();
+        for key in keys {
+            if let Some(value) = state.attributes.get_mut(&key) {
+                carina_core::value::resolve_value_alias(value, &id.resource_type, &key, factory);
             }
         }
-        Value::Concrete(ConcreteValue::List(items)) => {
-            for item in items.iter_mut() {
-                resolve_value_alias(item, resource_type, attr_name, factory);
-            }
-        }
-        Value::Concrete(ConcreteValue::Map(map)) => {
-            let map_keys: Vec<String> = map.keys().cloned().collect();
-            for map_key in map_keys {
-                if let Some(v) = map.get_mut(&map_key) {
-                    resolve_value_alias(v, resource_type, &map_key, factory);
-                }
-            }
-        }
-        _ => {}
     }
 }
 
@@ -1121,10 +1074,15 @@ async fn load_source_provider(
     Ok((factory, provider, name))
 }
 
+/// Returns the wired router **and** the `WiringContext` it was built
+/// from. The apply-from-saved-plan path needs the context's factories
+/// and schemas to re-apply the full normalization pipeline after
+/// apply-time reference re-resolution (carina#3063) — without it the
+/// from-plan path would silently undo enum-alias / canonicalize stages.
 pub async fn create_providers_from_configs(
     configs: &[ProviderConfig],
     base_dir: &Path,
-) -> Result<ProviderRouter, AppError> {
+) -> Result<(ProviderRouter, WiringContext), AppError> {
     let (factories, _) = build_factories_from_providers(configs, base_dir);
     let ctx = WiringContext::new(factories);
     let mut router = ProviderRouter::new();
@@ -1149,7 +1107,7 @@ pub async fn create_providers_from_configs(
         router.add_provider(String::new(), Box::new(MockProvider::new()));
     }
 
-    Ok(router)
+    Ok((router, ctx))
 }
 
 /// Create a plan from parsed configuration (without upstream state bindings).

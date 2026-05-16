@@ -12,8 +12,8 @@ use crate::provider::Provider;
 use crate::resource::{Resource, ResourceId, State, Value};
 
 use super::basic::{
-    BasicEffectCtx, ExecutionState, count_actionable_effects, execute_basic_effect,
-    process_basic_result, refresh_pending_states,
+    BasicEffectCtx, ExecutionState, RenormalizePipeline, count_actionable_effects,
+    execute_basic_effect, process_basic_result, refresh_pending_states,
 };
 use super::phased::DepResolver;
 use super::replace::{ReplaceContext, SingleEffectResult, execute_replace_parallel};
@@ -293,7 +293,11 @@ pub(super) async fn execute_effects_sequential(
             // Snapshot bindings for this effect's resolution
             let binding_snapshot = input.bindings.clone();
             let unresolved = &input.unresolved_resources;
-            let normalizer = input.normalizer;
+            let pipeline = RenormalizePipeline {
+                normalizer: input.normalizer,
+                factories: input.factories,
+                schemas: input.schemas,
+            };
             let completed_ref = &completed;
 
             in_flight.push(async move {
@@ -306,7 +310,7 @@ pub(super) async fn execute_effects_sequential(
                                     provider,
                                     bindings: &binding_snapshot,
                                     unresolved,
-                                    normalizer,
+                                    pipeline: &pipeline,
                                     completed: completed_ref,
                                     total,
                                 },
@@ -344,7 +348,7 @@ pub(super) async fn execute_effects_sequential(
                                 temporary_name: temporary_name.as_ref(),
                                 bindings: &binding_snapshot,
                                 unresolved,
-                                normalizer,
+                                pipeline: &pipeline,
                                 started,
                                 progress,
                             },
