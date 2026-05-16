@@ -1,0 +1,250 @@
+---
+// Ported verbatim from the approved VariantConstellation
+// (site/handoff-bundle-404/404-variants.jsx). Inline style objects
+// became scoped CSS; every value still resolves through a var(--*)
+// token. The only raw hex are the two Canopus-star cream values,
+// kept identical to Hero.astro on purpose.
+interface Props {
+  requestedPath?: string;
+}
+const { requestedPath = '/404' } = Astro.props;
+
+// Deterministic star scatter so the canvas is stable (positions
+// preserved from the source JSX). `b` = bright (gold-100 + glow).
+const stars = [
+  { t: 8, l: 12 }, { t: 14, l: 78, b: 1 },
+  { t: 22, l: 30 }, { t: 28, l: 64 },
+  { t: 42, l: 8, b: 1 }, { t: 48, l: 88 },
+  { t: 60, l: 18 }, { t: 68, l: 72, b: 1 },
+  { t: 78, l: 42 }, { t: 84, l: 26 },
+  { t: 88, l: 82 }, { t: 18, l: 48 },
+  { t: 90, l: 14 }, { t: 6, l: 62 },
+  { t: 36, l: 52 }, { t: 72, l: 92 },
+];
+---
+
+<div class="ff-root">
+  <div class="ff-horizon ff-horizon-gold" aria-hidden="true"></div>
+
+  <div class="ff-stage">
+    <div class="ff-halo" aria-hidden="true"></div>
+    {stars.map((s) => (
+      <span
+        class:list={['ff-star', { 'ff-star-bright': s.b }]}
+        style={`top:${s.t}%;left:${s.l}%`}
+        aria-hidden="true"
+      ></span>
+    ))}
+
+    <div class="ff-canopus" aria-hidden="true"></div>
+    <p class="ff-eyebrow">Lost in the constellation</p>
+    <h1 class="ff-title">404 — <span class="ff-accent">Off the chart</span></h1>
+    <p class="ff-sub">
+      This star is not on our map. The page may have drifted to another
+      orbit, or it may never have existed in this catalog.
+    </p>
+    <code class="ff-path">
+      <span class="ff-accent">GET</span>{'  '}{requestedPath}
+    </code>
+    <div class="ff-actions">
+      <a href="/" class="ff-btn-primary">Back to Carina</a>
+      <a href="/getting-started/installation/" class="ff-btn-secondary">Open the docs</a>
+    </div>
+    <p class="ff-mono">
+      CARINA · α <span class="ff-accent">CANOPUS</span> · MAG −0.74 · ARGO NAVIS
+    </p>
+  </div>
+
+  <div class="ff-horizon ff-horizon-cyan" aria-hidden="true"></div>
+</div>
+
+<style>
+  .ff-root {
+    position: relative;
+    width: 100%;
+    min-height: calc(100vh - 64px);
+    background: var(--bg);
+    color: var(--fg2);
+    font-family: var(--font-sans);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .ff-horizon {
+    height: 1px;
+    margin: 0 auto;
+    width: min(52rem, 80%);
+    opacity: var(--hero-horizon-opacity);
+    flex-shrink: 0;
+  }
+  .ff-horizon-gold {
+    margin-top: var(--space-6);
+    background: linear-gradient(
+      90deg,
+      transparent 0%,
+      var(--hero-divider-gold) 50%,
+      transparent 100%
+    );
+  }
+  .ff-horizon-cyan {
+    margin-bottom: var(--space-6);
+    background: linear-gradient(
+      90deg,
+      transparent 0%,
+      var(--hero-divider-cyan) 50%,
+      transparent 100%
+    );
+  }
+
+  .ff-stage {
+    flex: 1;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 0 var(--space-6);
+  }
+
+  .ff-halo {
+    position: absolute;
+    top: 20%;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 520px;
+    height: 320px;
+    max-width: 80vw;
+    background: radial-gradient(
+      ellipse at center,
+      color-mix(in oklab, var(--accent) 14%, transparent) 0%,
+      color-mix(in oklab, var(--cyan-600) 8%, transparent) 35%,
+      transparent 70%
+    );
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .ff-star {
+    position: absolute;
+    width: 2px;
+    height: 2px;
+    border-radius: 50%;
+    background: var(--fg4);
+    z-index: 0;
+  }
+  .ff-star-bright {
+    width: 3px;
+    height: 3px;
+    background: var(--gold-100);
+    box-shadow: 0 0 6px color-mix(in oklab, var(--accent) 55%, transparent);
+  }
+
+  /* Canopus: the one deliberate raw-hex exception, identical to Hero. */
+  .ff-canopus {
+    position: relative;
+    z-index: 1;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #fef3c7;
+    box-shadow: 0 0 16px #fde68a, 0 0 40px rgba(253, 230, 138, 0.45);
+    margin: 0 auto var(--space-4);
+  }
+
+  .ff-eyebrow {
+    position: relative;
+    z-index: 1;
+    font-family: var(--font-sans);
+    font-weight: 600;
+    font-size: var(--text-xs);
+    letter-spacing: var(--track-eyebrow);
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 var(--space-3);
+  }
+
+  .ff-title {
+    position: relative;
+    z-index: 1;
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: clamp(var(--text-4xl), 5vw, var(--text-6xl));
+    letter-spacing: -0.02em;
+    color: var(--fg1);
+    line-height: var(--lh-tight);
+    margin: 0 0 var(--space-4);
+  }
+
+  .ff-accent {
+    color: var(--accent);
+  }
+
+  .ff-sub {
+    position: relative;
+    z-index: 1;
+    font-size: var(--text-base);
+    color: var(--fg3);
+    max-width: 34rem;
+    margin: 0 auto var(--space-6);
+  }
+
+  .ff-path {
+    position: relative;
+    z-index: 1;
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    color: var(--fg4);
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 0.25rem var(--space-3);
+    margin: 0 auto var(--space-6);
+    display: inline-block;
+    white-space: pre;
+  }
+
+  .ff-actions {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    gap: var(--space-3);
+    justify-content: center;
+    flex-wrap: wrap;
+  }
+
+  .ff-btn-primary,
+  .ff-btn-secondary {
+    padding: var(--space-2) var(--space-5);
+    border-radius: var(--radius-sm);
+    font-size: var(--text-sm);
+    font-weight: 600;
+    text-decoration: none;
+    font-family: var(--font-sans);
+  }
+  .ff-btn-primary {
+    background: var(--btn-primary-bg);
+    color: var(--btn-primary-text);
+  }
+  .ff-btn-primary:hover {
+    background: var(--btn-primary-bg-hover);
+  }
+  .ff-btn-secondary {
+    border: 1px solid var(--btn-secondary-border);
+    color: var(--btn-secondary-text);
+  }
+  .ff-btn-secondary:hover {
+    color: var(--btn-secondary-text-hover);
+  }
+
+  .ff-mono {
+    position: relative;
+    z-index: 1;
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--fg4);
+    letter-spacing: 0.1em;
+    margin-top: var(--space-8);
+  }
+</style>
