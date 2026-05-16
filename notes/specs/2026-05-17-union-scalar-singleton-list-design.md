@@ -64,30 +64,47 @@ canonicalizer simply never reaches it.)
 ## Chosen design
 
 Add a `Union` arm to `canonicalize_with_type` that recurses into the
-member whose **declared shape matches the value's shape**, then lets
-the existing arms do their job:
+member whose **declared shape best matches the value's shape**, then
+lets the existing arms do their job. **Member selection reuses the
+existing, already-tested `union_member_score` (`schema/mod.rs:1465`,
+#2219)** rather than introducing a second, parallel shape predicate:
 
 ```rust
-// Union: the value conforms to exactly one member shape (Cargo/IAM
-// unions are shape-disjoint — Struct vs String, String vs List).
-// Recurse into the member that matches the value's concrete shape so
-// nested string_or_list_of_strings fields are still canonicalized.
+// Union: the value conforms to one member shape (IAM/Cargo unions are
+// shape-disjoint — Struct vs String, String vs List). Pick the
+// structurally-closest member with the SAME ranking validate_union
+// already uses, then re-dispatch so nested string_or_list_of_strings
+// fields are still canonicalized. Reusing union_member_score keeps the
+// canonicalizer's member choice and the validator's error-attribution
+// member choice provably identical (one ranking, one source of truth).
 (val, AttributeType::Union(members)) => {
-    let chosen = members.iter().find(|m| value_shape_matches(&val, peel_custom(m)));
-    match chosen {
-        Some(m) => canonicalize_with_type(val, m),  // re-dispatch on the member
-        None => val,
+    match select_union_member(members, &val) {  // wraps union_member_score
+        Some(m) => canonicalize_with_type(val, m),  // re-dispatch
+        None => val,                                 // identity (safe)
     }
 }
 ```
 
-`value_shape_matches(&Value, &AttributeType) -> bool` — a cheap
-structural predicate (no recursion): `Map` ↔ `Struct`/`Map`; `List` ↔
-`List`; `String`/`Int`/`Float`/`Bool`/`EnumIdentifier`/`StringList` ↔
-the corresponding scalar/`String`/`StringEnum`; nested `Union` →
-recurse the predicate over its members. It only picks a member to
-re-dispatch into; the actual canonicalization is still the existing
-`is_string_or_list_of_strings` / Struct / List / Map arms.
+**Why reuse `union_member_score` instead of a new
+`value_shape_matches`.** The first cut of this design proposed a fresh
+`value_shape_matches(&Value, &AttributeType) -> bool` predicate. The
+codebase already owns the exact judgement that predicate would
+re-implement: `union_member_score(member, ConcreteValueRef)` ranks a
+Union member's structural distance from a runtime value
+(Map↔Struct=100, same-constructor=80, List↔List with inner peek,
+`Custom` defers to `base`, nested `Union` recurses) and `validate_union`
+uses it to pick which member a value "is". A second predicate with the
+same job is a **drift hazard**: the canonicalizer could fold a value
+into member *X* while the validator attributes it to member *Y*, and
+the two would silently disagree — the same class of split-source bug
+(`feedback_state_enum_phantom_diff_is_core_not_provider`,
+`feedback_unit_test_path_is_not_apply_path`) this project has been
+burned by. `select_union_member` is a thin total wrapper over the
+existing scorer: project `val` through the existing `as_concrete()`
+(the same projection `validate_union` uses), score every member, return
+the strict-max member (declaration order breaks ties, exactly as
+`validate_union`), or `None` when no member shares any structure. No
+new shape table is invented.
 
 For carina#3080: `principal` value is a `Map` → matches the `Struct`
 member → re-dispatch → existing `Struct` arm recurses fields →
@@ -118,16 +135,19 @@ Union is the one missing nesting kind).
 
 | Approach | Verdict |
 |---|---|
-| **A: Union arm in `canonicalize_with_type` (chosen)** | Fixes the root, upholds the #2481 invariant, provider-agnostic, mirrors the existing List/Map/Struct recursion. |
+| **A: Union arm reusing `union_member_score` for selection (chosen)** | Fixes the root, upholds the #2481 invariant, provider-agnostic, mirrors the existing List/Map/Struct recursion, and reuses the validator's existing member-ranking so canonicalizer and validator can't drift. |
+| A′: Union arm with a *new* `value_shape_matches` predicate | **Rejected** (was the first cut of A) — duplicates `union_member_score`'s judgement; two predicates with the same job drift silently (canonicalizer folds into member X, validator attributes Y). Single-source the ranking instead. |
 | B: Comparator `"x"==["x"]` special-case in `type_aware_equal` Union arm | **Rejected** — explicitly prohibited by `comparison.rs:28-47`; masks the phantom, state stays non-canonical, re-fires next run. |
 | C: aws read path emits scalar when AWS returned scalar | **Rejected** — per-provider carve-out; `Union[String,list]` legitimately accepts either shape; doesn't fix awscc or future providers. |
 | D: Canonicalize *all* Union members unconditionally then pick | **Rejected** — wasteful and ambiguous (which canonicalized form wins?); shape-directed re-dispatch is precise. |
 
 ## Blast radius
 
-- **One function changed:** `canonicalize_with_type` (`value.rs`) gains
-  a `Union` arm + a private `value_shape_matches` helper. No signature
-  change → `canonicalize_resources_with_schemas` /
+- **One function changed + one thin wrapper:** `canonicalize_with_type`
+  (`value.rs`) gains a `Union` arm; `select_union_member` is a small
+  total wrapper over the **already-existing** `union_member_score`
+  (`schema/mod.rs`, #2219) — no new shape-matching logic is authored.
+  No signature change → `canonicalize_resources_with_schemas` /
   `canonicalize_states_with_schemas` and their ~5 pipeline call sites
   (`wiring/mod.rs`, `commands/apply/mod.rs`, `fixture_plan.rs`) are
   unchanged.
@@ -143,11 +163,65 @@ Union is the one missing nesting kind).
   phantom now correctly shows no change. A *genuine* difference still
   shows (both sides canonicalize to `StringList`, then compare by
   value).
-- **Risk of over-canonicalization:** `value_shape_matches` must not
-  pick a member that would *wrongly* coerce (e.g. a `Map` value must
-  not match a `String` member). Disjoint-by-shape selection + the
-  existing arms' own type guards bound this; the `None` (no match) arm
-  is identity (safe fallthrough, today's behavior).
+- **Risk of over-canonicalization:** member selection must not pick a
+  member that would *wrongly* coerce (e.g. a `Map` value must not
+  select a `String` member). This is bounded by reusing
+  `union_member_score`, which already scores `(String, Map)` and other
+  cross-constructor pairs as `0` (the `_ => 0` arm) — a `Map` value can
+  never out-score its way into a `String` member. The `None` (all
+  members score 0) arm is identity (safe fallthrough, today's
+  behavior). No new coercion surface is introduced because no new
+  predicate is authored.
+
+## Type safety
+
+This section is load-bearing, not a footnote: the project's standing
+guidance is to prove invariants in the type system and single-source
+shared judgements rather than re-deriving them with parallel runtime
+predicates.
+
+1. **One ranking, one source of truth (no drift by construction).**
+   The canonicalizer's "which member is this value?" decision and the
+   validator's "which member's error do I surface?" decision are now
+   the *same function call* (`union_member_score`). It is structurally
+   impossible for `canonicalize_with_type` to fold a value into member
+   *X* while `validate_union` believes it is member *Y* — there is one
+   ranking, not two that must be kept in sync by review. The rejected
+   A′ (`value_shape_matches`) reintroduced exactly the split-source
+   shape this project has repeatedly been burned by
+   (`feedback_state_enum_phantom_diff_is_core_not_provider`); A closes
+   that off at the type level by not creating the second predicate.
+
+2. **Total over `AttributeType`, no `unreachable!`/`panic!`.**
+   `select_union_member` returns `Option<&AttributeType>`; the `None`
+   case is a real, handled value (identity re-dispatch), not a
+   `debug_assert!`/`unreachable!` escape
+   (`feedback_type_safety_over_runtime_checks`). Every `AttributeType`
+   member variant is already exhaustively handled by
+   `union_member_score`'s `match` (compiler-enforced exhaustiveness);
+   adding a future `AttributeType` variant forces an update there, and
+   the canonicalizer inherits it for free.
+
+3. **`None` is observable, not silent.** The non-canonicalizing path
+   (no member shares structure with the value) is the *same* condition
+   `validate_union` already treats as `TypeError::TypeMismatch`. The
+   implementation must add a `debug_assert!`-free invariant test (Test
+   plan item 5) asserting that for the carina#3080 schema the value
+   *does* select a member — so a regression where the value stops
+   matching surfaces as a failing canonicalization-invariant test, not
+   a silently-skipped fold that reappears as a phantom diff months
+   later. (`feedback_unit_test_path_is_not_apply_path`: the test must
+   exercise the real `canonicalize_*_with_schemas` entry, not call the
+   `Union` arm directly.)
+
+4. **Termination is type-structural, not runtime-guarded.** Re-dispatch
+   recursion (`Union → member → possibly inner Union`) terminates
+   because each step strips one `AttributeType` constructor — the
+   recursion is well-founded on the strictly-decreasing type structure,
+   the same argument the existing List/Map/Struct arms rely on. No
+   depth counter or visited-set runtime guard is needed; if a future
+   change could introduce a cyclic `AttributeType`, that is a type-level
+   defect to fix at the schema, not to paper over here.
 
 ## Test plan
 
@@ -171,36 +245,56 @@ Union is the one missing nesting kind).
    that after `canonicalize_*_with_schemas` the carina#3080 value is
    `StringList` on both sides (the invariant holds), so the
    `comparison.rs:28-47` "non-canonical reaching the differ is a bug"
-   contract is satisfied rather than worked around.
+   contract is satisfied rather than worked around. Must call the real
+   `canonicalize_*_with_schemas` pipeline entry, not the `Union` arm
+   directly (`feedback_unit_test_path_is_not_apply_path`).
+5. **Member-selection invariant (type-safety guard):** assert
+   `select_union_member` picks the `Struct` member for the carina#3080
+   `principal` `Map` value and the list/string member for `service`,
+   and the *negative*: a `Map` value never selects the `String` member
+   of `Union[Struct, String]` regardless of declaration order. This
+   pins the property that makes `None` truly unreachable for the real
+   schema, so a future schema/scorer change that breaks selection fails
+   loudly here instead of silently skipping the fold.
 
 ## PR sequence (design-before-implementation)
 
 1. **This design PR** (`notes/specs/…` only) — merges first.
-2. **Implementation PR** — the `Union` arm + `value_shape_matches` +
-   tests, `Closes #3080`.
+2. **Implementation PR** — the `Union` arm + `select_union_member`
+   (thin wrapper over the existing `union_member_score`) + tests,
+   `Closes #3080`.
 3. carina-provider-aws / -awscc: routine carina-core pin bump (the
    pin-staleness guard added in carina-provider-aws#332 /
    carina-provider-awscc#256 enforces the minimum rev).
 
 ## Risks / open questions (resolve in implementation)
 
-- **`value_shape_matches` precision.** Must be shape-disjoint and
-  conservative: prefer the most specific member; on ambiguity or no
-  match, identity (never guess-coerce). Enumerate the
-  Value→AttributeType shape table explicitly; unit-test the negative
-  (Map must not select a String member).
+- **Selection precision is inherited, not re-derived.** Because
+  selection reuses `union_member_score`, the "shape-disjoint, prefer
+  most specific, identity on no match" properties are the scorer's
+  existing, tested behavior (Map↔Struct=100 > same-constructor=80 >
+  unrelated=0). The implementation does **not** author a new
+  Value→AttributeType table; it adds the negative test (Test plan
+  item 5) against the scorer's behavior for the carina#3080 schema.
 - **Member ordering.** `string_or_principal_struct` deliberately puts
   `Struct` before `String` (serializer ordering, see its comment).
-  `value_shape_matches` is shape-directed so order-independent, but
-  confirm a `Map` value never matches the `String` member regardless
-  of order.
-- **`peel_custom` on members.** `canonicalize_with_type` already peels
-  `Custom`; apply `peel_custom` to each Union member before the shape
-  test so `Custom`-wrapped members are handled consistently.
-- **Nested `Union[…, Union[…]]`.** The predicate recurses over inner
-  Union members; the re-dispatch into `canonicalize_with_type` then
-  re-enters the Union arm — confirm termination (members are strictly
-  smaller types; no cycle).
+  `union_member_score` already breaks ties by declaration order via
+  `validate_union`'s strict `>`; `select_union_member` MUST use the
+  same strict-`>` tie-break so canonicalizer and validator pick the
+  identical member. Confirm a `Map` value scores 0 against the
+  `String` member regardless of order (it does — `(String, Map)` hits
+  `_ => 0`).
+- **`Custom` members.** `union_member_score` already defers `Custom` to
+  its declared `base` (`(AT::Custom { base, .. }, v) => …`), so
+  `Custom`-wrapped members are handled consistently *without* a
+  separate `peel_custom` pass in the new arm — another duplication
+  avoided by reuse. Re-dispatch still calls `canonicalize_with_type`,
+  which peels `Custom` at entry as today.
+- **Nested `Union[…, Union[…]]`.** `union_member_score` already
+  recurses over inner Union members (`(AT::Union(inner), v) => …`); the
+  re-dispatch into `canonicalize_with_type` then re-enters the Union
+  arm — termination is type-structural (each step strips one
+  constructor; see Type safety §4), no runtime cycle guard needed.
 - **Interaction with the differ invariant.** This change *restores*
   the #2481 invariant for Union nesting; it must not be paired with any
   comparator change. The implementation PR must explicitly NOT touch
