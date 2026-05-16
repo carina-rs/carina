@@ -1,0 +1,14 @@
+arguments {
+  cert_name: String
+}
+
+# This resource routes to the named `us` instance declared in the
+# parent stack's providers.crn. The directive must survive module
+# expansion onto ResourceId.provider_instance.
+let cert = awscc.s3.Bucket {
+  bucket_name = cert_name
+
+  directives {
+    provider = us
+  }
+}
