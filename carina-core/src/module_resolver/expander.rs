@@ -219,55 +219,13 @@ impl ModuleResolver<'_> {
         // Expand resources with substituted values
         let mut expanded_resources = Vec::new();
         for resource in &module.resources {
-            let mut new_resource = resource.clone();
-
-            // Only Bound names take the prefix here. Pending names stay
-            // Pending so `compute_anonymous_identifiers` can later attach
-            // both the hash and the instance prefix in one shot — see
-            // `identifier::compute_anonymous_identifiers` for the full
-            // story (#2516).
-            if let ResourceName::Bound(name) = &new_resource.id.name {
-                let new_name = apply_instance_prefix(instance_prefix, name);
-                new_resource.id.set_name(new_name);
-            }
-
-            // Rewrite binding with instance path (dot-separated)
-            if let Some(ref binding) = new_resource.binding {
-                new_resource.binding = Some(apply_instance_prefix(instance_prefix, binding));
-            }
-
-            // Set typed module source info
-            new_resource.module_source = Some(crate::resource::ModuleSource::Module {
-                name: call.module_name.clone(),
-                instance: instance_prefix.to_string(),
-            });
-
-            // Rewrite intra-module ResourceRefs BEFORE substituting inputs.
-            // This ensures that caller-provided ResourceRef values (which may
-            // coincidentally share a binding name with a module-internal binding)
-            // are not incorrectly prefixed.
-            // Preserve user-authored attribute order across the
-            // module-call expansion (#2222) — `IndexMap`, not `HashMap`.
-            let mut substituted_attrs: IndexMap<String, Value> = IndexMap::new();
-            for (key, expr) in &new_resource.attributes {
-                let rewritten =
-                    rewrite_intra_module_refs(expr, instance_prefix, &intra_module_bindings);
-                let mut substituted = substitute_arguments(&rewritten, &argument_values);
-                // After substitution, an `Interpolation` whose `${...}`
-                // parts collapsed to literal scalars must canonicalize
-                // back to a flat `String`. Without this, `role_name =
-                // "test-role-${env}"` keeps a single-arg `Interpolation`
-                // with `Expr(String("dev"))` instead of
-                // `String("test-role-dev")`, and downstream consumers
-                // that match on `Value::Concrete(ConcreteValue::String)` (state diff, plan
-                // rendering) miss the resolved value. Symmetric with
-                // the default-evaluation path above. #2815 / #2817.
-                substituted.canonicalize_in_place();
-                substituted_attrs.insert(key.clone(), substituted);
-            }
-            new_resource.attributes = substituted_attrs;
-
-            expanded_resources.push(new_resource);
+            expanded_resources.push(prefix_module_resource(
+                resource,
+                instance_prefix,
+                &call.module_name,
+                &intra_module_bindings,
+                &argument_values,
+            ));
         }
 
         // Create a virtual resource if the module has attributes and the call has a binding
@@ -317,13 +275,23 @@ impl ModuleResolver<'_> {
             .collect();
 
         // carina#3126: propagate the module's deferred for-expressions
-        // (previously dropped at this boundary). PR-A passes them
-        // through; PR-B fills in the instance-prefixing classified in
-        // `prefix_deferred_for_expression`.
+        // (previously dropped at this boundary). Each entry is
+        // instance-prefixed the same way `module.resources` are, so
+        // the loop resolves against the prefixed module bindings and
+        // its generated resources are isolated per module instance
+        // (carina#3126 PR-B).
         let expanded_deferred_for_expressions: Vec<DeferredForExpression> = module
             .deferred_for_expressions
             .iter()
-            .map(|d| prefix_deferred_for_expression(d, instance_prefix))
+            .map(|d| {
+                prefix_deferred_for_expression(
+                    d,
+                    instance_prefix,
+                    &call.module_name,
+                    &intra_module_bindings,
+                    &argument_values,
+                )
+            })
             .collect();
 
         // The contribution is a full `ParsedFile` built with an
@@ -444,27 +412,122 @@ fn prefix_wait_binding(wb: &WaitBinding, instance_prefix: &str) -> WaitBinding {
     }
 }
 
+/// Expand one attribute value crossing the module boundary:
+/// `rewrite_intra_module_refs` (prefix intra-module refs; a
+/// caller-provided ref that coincidentally shares a binding name is
+/// left alone) → `substitute_arguments` → `canonicalize_in_place`
+/// (collapse a fully-literal `Interpolation` back to a flat `String`,
+/// #2815 / #2817).
+///
+/// The single definition of "expand a module attribute value", shared
+/// by [`prefix_module_resource`] (a module resource's attrs) and
+/// [`prefix_deferred_for_expression`] (a loop body's attrs) so the two
+/// carriers can never drift — the exact carina#3126 bug class.
+fn prefix_attr_value(
+    value: &Value,
+    instance_prefix: &str,
+    intra_module_bindings: &HashSet<String>,
+    argument_values: &HashMap<String, Value>,
+) -> Value {
+    let rewritten = rewrite_intra_module_refs(value, instance_prefix, intra_module_bindings);
+    let mut substituted = substitute_arguments(&rewritten, argument_values);
+    substituted.canonicalize_in_place();
+    substituted
+}
+
+/// Instance-prefix one module resource: `Bound` id name + binding take
+/// the instance prefix, typed module-source is stamped, and every
+/// attribute is `rewrite_intra_module_refs` → `substitute_arguments`
+/// → `canonicalize_in_place` (the #2222 / #2815 / #2817 sequence).
+///
+/// The single definition of "expand a module resource", shared by the
+/// `module.resources` loop and `prefix_deferred_for_expression`'s
+/// `template_resource` so a loop body inside a module is prefixed
+/// identically to a top-level module resource (carina#3126 PR-B).
+fn prefix_module_resource(
+    resource: &Resource,
+    instance_prefix: &str,
+    module_name: &str,
+    intra_module_bindings: &HashSet<String>,
+    argument_values: &HashMap<String, Value>,
+) -> Resource {
+    let mut new_resource = resource.clone();
+
+    // Only Bound names take the prefix here. Pending names stay
+    // Pending so `compute_anonymous_identifiers` can later attach both
+    // the hash and the instance prefix in one shot (#2516).
+    if let ResourceName::Bound(name) = &new_resource.id.name {
+        let new_name = apply_instance_prefix(instance_prefix, name);
+        new_resource.id.set_name(new_name);
+    }
+
+    if let Some(ref binding) = new_resource.binding {
+        new_resource.binding = Some(apply_instance_prefix(instance_prefix, binding));
+    }
+
+    new_resource.module_source = Some(crate::resource::ModuleSource::Module {
+        name: module_name.to_string(),
+        instance: instance_prefix.to_string(),
+    });
+
+    // `IndexMap` preserves authored attribute order across expansion
+    // (#2222); each value goes through the shared `prefix_attr_value`.
+    let mut substituted_attrs: IndexMap<String, Value> = IndexMap::new();
+    for (key, expr) in &new_resource.attributes {
+        substituted_attrs.insert(
+            key.clone(),
+            prefix_attr_value(
+                expr,
+                instance_prefix,
+                intra_module_bindings,
+                argument_values,
+            ),
+        );
+    }
+    new_resource.attributes = substituted_attrs;
+
+    new_resource
+}
+
 /// Instance-prefix a [`DeferredForExpression`] crossing a module
-/// boundary, mirroring [`prefix_wait_binding`].
+/// boundary, expanding its loop body the same way the
+/// `module.resources` expansion ([`prefix_module_resource`]) does.
 ///
-/// The struct is **destructured exhaustively** — the same carina#3061
-/// compile-time forcing function: if a field is added to
-/// `DeferredForExpression`, this stops compiling until someone
+/// The struct is **destructured exhaustively** — the carina#3061 /
+/// carina#3126 compile-time forcing function: a new
+/// `DeferredForExpression` field stops this compiling until someone
 /// classifies it as binding-name (prefix), value/provenance (pass
-/// through), or loop-local (pass through). That guard is the whole
-/// point of carina#3126's single merge surface — a new field cannot
-/// be silently dropped at the module boundary.
+/// through), or loop-local (pass through).
 ///
-/// **PR-A scope:** every field is passed through *unchanged*. This
-/// already fixes the carina#3126 silent-drop (the entry now reaches
-/// the caller). The binding-name fields that still need
-/// instance-prefixing for a *correct* expansion under a module
-/// instance are called out per-field below and are PR-B's payload;
-/// each is marked `// PR-B:` so the follow-up is mechanical and the
-/// classification is recorded at the type level now.
+/// carina#3126 PR-B: the loop body declared inside a module must be
+/// expanded *as if it were a module resource* — otherwise its
+/// generated resources collide across module instances and its
+/// iterable resolves against the wrong (unprefixed) binding. Per
+/// field:
+/// - `binding_name` (the generated-resource address prefix, e.g.
+///   `_domain_validation_options`) → instance-prefixed
+///   unconditionally, exactly like `Resource.binding`, so each module
+///   instance's loop resources are uniquely addressed.
+/// - `iterable_binding` (the iterable's root binding, e.g. `cert`) →
+///   instance-prefixed **only when it is a module-internal binding**,
+///   the same caller-collision guard [`rewrite_intra_module_refs`]
+///   applies to a `ResourceRef` head (a caller-provided binding that
+///   coincidentally shares a name must not be prefixed). This is a
+///   deliberate, more-correct divergence from the design doc's PR-B
+///   table (which prescribed an unconditional prefix); see the
+///   per-field comment in the body for why the design's cited
+///   `prefix_wait_binding` mirror is unsafe to copy here.
+/// - `attributes` and `template_resource` → the full module-resource
+///   treatment via [`prefix_module_resource`] / the same
+///   ref-rewrite + arg-substitute + canonicalize as `module.resources`.
+/// - `file`/`line`/`header`/`resource_type`/`iterable_attr`/`binding`
+///   → provenance / display / non-binding / loop-local: pass through.
 fn prefix_deferred_for_expression(
     d: &DeferredForExpression,
-    _instance_prefix: &str,
+    instance_prefix: &str,
+    module_name: &str,
+    intra_module_bindings: &HashSet<String>,
+    argument_values: &HashMap<String, Value>,
 ) -> DeferredForExpression {
     let DeferredForExpression {
         file,
@@ -488,24 +551,61 @@ fn prefix_deferred_for_expression(
         header: header.clone(),
         // provider-qualified type — not a binding
         resource_type: resource_type.clone(),
-        // PR-B: `Value`s may carry ResourceRef/BindingRef into
-        // module-internal bindings — must run rewrite_intra_module_refs
-        // + substitute_arguments like module.resources attributes.
-        attributes: attributes.clone(),
-        // PR-B: generated-resource binding prefix — must
-        // apply_instance_prefix (mirrors Resource.binding prefixing).
-        binding_name: binding_name.clone(),
-        // PR-B: iterable root binding — must apply_instance_prefix
-        // (mirrors prefix_wait_binding's lhs_segments[0] head).
-        iterable_binding: iterable_binding.clone(),
+        // The loop body's attrs may reference module-internal bindings
+        // / module arguments — same shared `prefix_attr_value` the
+        // module resource attrs get.
+        attributes: attributes
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    prefix_attr_value(v, instance_prefix, intra_module_bindings, argument_values),
+                )
+            })
+            .collect(),
+        // Generated-resource address prefix — `binding_name` is a name
+        // the loop *synthesizes* for its own resources (e.g.
+        // `_domain_validation_options`), NOT a reference to a
+        // pre-existing binding, so the caller-collision concern does
+        // not apply: prefix it unconditionally (same as
+        // `Resource.binding`) to isolate each module instance's loop
+        // resources.
+        binding_name: apply_instance_prefix(instance_prefix, binding_name),
+        // Iterable root binding — this IS a reference to an existing
+        // binding (`cert` in `for _, opt in cert.dvo`), so it takes
+        // the same caller-collision guard as a `ResourceRef` head in
+        // `rewrite_intra_module_refs`: prefix only when it names a
+        // module-internal binding. A caller-passed binding that
+        // coincidentally shares the name must NOT be prefixed.
+        //
+        // NB: this is a *deliberate, more-correct* divergence from the
+        // design doc's PR-B table, which prescribed an *unconditional*
+        // prefix "mirroring `prefix_wait_binding`'s lhs_segments[0]".
+        // That mirror is wrong: `prefix_wait_binding` prefixes the
+        // `until` LHS root unconditionally (a known pre-existing
+        // looseness, safe only because that root is virtually always
+        // the module-internal wait/resource binding). Copying it here
+        // would silently break a module that iterates a caller-passed
+        // binding. The `rewrite_intra_module_refs` model is the right
+        // one — do not "simplify" this back to unconditional.
+        iterable_binding: if intra_module_bindings.contains(iterable_binding) {
+            apply_instance_prefix(instance_prefix, iterable_binding)
+        } else {
+            iterable_binding.clone()
+        },
         // attribute path tail — not a binding
         iterable_attr: iterable_attr.clone(),
         // loop-var pattern kind — loop-local, not a module binding
         binding: binding.clone(),
-        // PR-B: full Resource — must get the same treatment as a
-        // module.resources entry (id/binding prefix + ref-rewrite +
-        // arg-substitute + canonicalize).
-        template_resource: template_resource.clone(),
+        // Full module-resource treatment — identical to a
+        // `module.resources` entry.
+        template_resource: prefix_module_resource(
+            template_resource,
+            instance_prefix,
+            module_name,
+            intra_module_bindings,
+            argument_values,
+        ),
     }
 }
 
