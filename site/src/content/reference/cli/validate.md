@@ -33,6 +33,30 @@ Validating...
   • aws.ec2.Subnet.public
 ```
 
+### Resources inside a `for` loop over an unresolved value
+
+<!-- derived-from ../../../../../notes/specs/2026-05-17-for-loop-same-config-read-iterable-design.md -->
+
+When a `for` loop iterates a value that is not known until plan/apply
+time (for example a provider-computed attribute such as
+`cert.domain_validation_options`), the loop body is enumerated as a
+single **deferred placeholder** entry rather than expanded:
+
+```
+✓ 2 resources validated successfully.
+  • aws.acm.Certificate.cert
+  • aws.route53.RecordSet._domain_validation_options[?] (deferred: for _, opt in cert.domain_validation_options @ records.crn:1)
+```
+
+The `[?]` marks an address the planner will assign once the iterable
+resolves, and the `(deferred: <for header> @ <file>:<line>)` suffix
+identifies the loop (`<file>` is the path as passed to
+`carina validate`; shortened to a basename above for readability). These entries are **not** resolvable resource
+addresses -- they describe a loop body, not a single resource. The
+count includes one entry per deferred loop (its element count is
+unknowable at validate time). The same entries appear in the
+`resources` array of `--json` output.
+
 Warnings are printed after the success message:
 
 ```

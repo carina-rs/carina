@@ -8,7 +8,8 @@ use carina_core::config_loader::{
     find_crn_files_in_dir, get_base_dir, load_configuration_with_config,
 };
 use carina_core::lint::find_duplicate_attrs;
-use carina_core::parser::{ProviderContext, UpstreamState};
+use carina_core::parser::{File, ProviderContext, ResourceContext, UpstreamState};
+use carina_core::resource::{ResourceId, ResourceName};
 
 use super::validate_and_resolve_errors;
 use crate::error::AppError;
@@ -92,6 +93,48 @@ pub fn validate_with_factories(
     error_reports
 }
 
+/// Test-support twin of [`validate_with_factories`] that returns the
+/// rendered resource list `run_validate` would display, instead of
+/// the error strings. Runs the identical load + resolve pipeline, then
+/// derives the list via `validated_entries` and renders each through
+/// the same `Display` boundary the CLI uses — so e2e tests assert on
+/// exactly what the user sees (including deferred-for loop bodies,
+/// carina#3121).
+///
+/// Not used outside test code.
+pub fn validated_resource_ids_with_factories(
+    path: &Path,
+    factories: Vec<Box<dyn carina_core::provider::ProviderFactory>>,
+) -> Vec<String> {
+    let provider_context = ProviderContext::default();
+    let loaded = match load_configuration_with_config(
+        path,
+        &provider_context,
+        &carina_core::schema::SchemaRegistry::new(),
+    ) {
+        Ok(l) => l,
+        Err(e) => panic!("fixture failed to load: {e}"),
+    };
+    let mut parsed = loaded.parsed;
+    let base_dir = get_base_dir(path);
+
+    // Run the same resolve/validate pass as the CLI so the parsed tree
+    // (and its `deferred_for_expressions`) is in the post-validation
+    // state the display path observes.
+    let _ = super::validate_and_resolve_errors_with_factories(
+        &mut parsed,
+        base_dir,
+        false,
+        factories,
+        std::collections::HashMap::new(),
+    );
+
+    validated_entries(&parsed)
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+}
+
 /// Format `LoadedConfig.inference_errors` into "export '<name>': type
 /// annotation required: <reason>" strings via the shared
 /// `inference::format_inference_error` helper so the CLI and LSP keep
@@ -102,6 +145,97 @@ fn format_inference_errors(
     errors
         .iter()
         .map(|(name, err)| carina_core::validation::inference::format_inference_error(name, err))
+        .collect()
+}
+
+/// One entry in `validate`'s resource enumeration, kept as a typed
+/// value until the output boundary so a non-address placeholder can
+/// never be mistaken for a resolvable resource id, and a not-yet-named
+/// resource can never silently render as a trailing-dot string
+/// (carina#3121). `Display` is the *only* place an entry becomes text.
+enum ValidatedEntry<'a> {
+    /// A direct resource whose name is already bound — the common
+    /// case, renders exactly as its [`ResourceId`].
+    Resolved(&'a ResourceId),
+    /// A direct resource still carrying a `Pending` name (anonymous,
+    /// `name` attribute not yet promoted at the point validate
+    /// enumerates). Rendering its `ResourceId` directly would emit a
+    /// meaningless trailing-dot string; this variant makes the
+    /// not-yet-named state explicit instead of relying on the empty
+    /// string `ResourceName::Pending` produces.
+    PendingDirect(&'a ResourceId),
+    /// The body of a `for` loop whose iterable is unresolved at parse
+    /// time (e.g. a same-config provider-read attribute). It is a
+    /// loop template, not a single resource — never a resolvable
+    /// address. The source location keeps two distinct anonymous
+    /// loops over the *same* iterable distinguishable (`binding` +
+    /// `header` alone are identical for `for _, opt in cert.dvo { … }`
+    /// repeated twice).
+    DeferredLoop {
+        resource_type: &'a str,
+        binding_name: &'a str,
+        header: &'a str,
+        file: Option<&'a str>,
+        line: usize,
+    },
+}
+
+impl std::fmt::Display for ValidatedEntry<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ValidatedEntry::Resolved(id) => write!(f, "{id}"),
+            ValidatedEntry::PendingDirect(id) => {
+                // `id.display_type()` is provider+type without the
+                // (empty) name — explicit `<pending>` beats a bare
+                // trailing dot.
+                write!(f, "{}.<pending>", id.display_type())
+            }
+            ValidatedEntry::DeferredLoop {
+                resource_type,
+                binding_name,
+                header,
+                file,
+                line,
+            } => {
+                let location = match file {
+                    Some(file) => format!("{file}:{line}"),
+                    None => line.to_string(),
+                };
+                write!(
+                    f,
+                    "{resource_type}.{binding_name}[?] (deferred: {header} @ {location})"
+                )
+            }
+        }
+    }
+}
+
+/// The resources `validate` enumerates, derived from
+/// [`File::iter_all_resources`] so it stays in sync with every other
+/// resource-walking checker (the unified-walk invariant from
+/// `notes/specs/2026-04-19-unify-resource-walk-design.md`).
+///
+/// Returns typed [`ValidatedEntry`] values, not pre-rendered strings:
+/// the json `resources` array and the human list both stringify these
+/// at their own boundary, so a deferred placeholder is structurally
+/// distinct from a resolved id rather than a string that happens to
+/// contain `[?]`.
+fn validated_entries<E>(parsed: &File<E>) -> Vec<ValidatedEntry<'_>> {
+    parsed
+        .iter_all_resources()
+        .map(|(ctx, resource)| match ctx {
+            ResourceContext::Direct => match resource.id.name {
+                ResourceName::Bound(_) => ValidatedEntry::Resolved(&resource.id),
+                ResourceName::Pending => ValidatedEntry::PendingDirect(&resource.id),
+            },
+            ResourceContext::Deferred(d) => ValidatedEntry::DeferredLoop {
+                resource_type: &d.resource_type,
+                binding_name: &d.binding_name,
+                header: &d.header,
+                file: d.file.as_deref(),
+                line: d.line,
+            },
+        })
         .collect()
 }
 
@@ -196,10 +330,11 @@ pub fn run_validate(
                 file: Some(file_path.display().to_string()),
             });
         }
+        let entries = validated_entries(&parsed);
         let output = ValidateOutput {
             status: "ok",
-            resource_count: parsed.resources.len(), // allow: direct — display/reporting
-            resources: parsed.resources.iter().map(|r| r.id.to_string()).collect(), // allow: direct — display/reporting
+            resource_count: entries.len(),
+            resources: entries.iter().map(ToString::to_string).collect(),
             warnings,
         };
         println!(
@@ -210,18 +345,16 @@ pub fn run_validate(
         return Ok(());
     }
 
+    let entries = validated_entries(&parsed);
     println!(
         "{}",
-        format!(
-            "✓ {} resources validated successfully.",
-            parsed.resources.len() // allow: direct — display/reporting
-        )
-        .green()
-        .bold()
+        format!("✓ {} resources validated successfully.", entries.len())
+            .green()
+            .bold()
     );
 
-    for resource in &parsed.resources {
-        println!("  • {}", resource.id);
+    for entry in &entries {
+        println!("  • {}", entry);
     }
 
     for binding in &unused_warnings {
@@ -293,6 +426,103 @@ mod tests {
         assert_eq!(parsed["resources"].as_array().unwrap().len(), 2);
         // warnings should be omitted when empty
         assert!(parsed.get("warnings").is_none());
+    }
+
+    /// carina#3121 fix A: the `--json` output must enumerate a `for`
+    /// loop body over an unresolved (deferred) iterable, not just the
+    /// human-readable list. Builds `ValidateOutput` exactly as the
+    /// `if json` branch of `run_validate` does — `resource_count` and
+    /// `resources` both derived from `validated_entries` rendered at
+    /// the `Display` boundary — and asserts the serialized JSON
+    /// contains the deferred placeholder entry and a count that
+    /// includes it. This pins the `--json` path the e2e test reaches
+    /// only through the shared helper.
+    #[test]
+    fn json_output_enumerates_deferred_for_body() {
+        let src = r#"
+            let cert = aws.acm.Certificate {
+                domain_name       = "registry.example.com"
+                validation_method = "DNS"
+            }
+
+            for _, opt in cert.domain_validation_options {
+                aws.route53.RecordSet {
+                    hosted_zone_id   = "Z123"
+                    name             = opt.resource_record.name
+                    type             = "CNAME"
+                    ttl              = 300
+                    resource_records = [opt.resource_record.value]
+                }
+            }
+        "#;
+        let parsed =
+            carina_core::parser::parse(src, &ProviderContext::default()).expect("fixture parses");
+        // The loop is deferred (iterable is a same-config provider-read
+        // attribute), so it is not in `parsed.resources` but is in
+        // `deferred_for_expressions` — exactly the carina#3121 shape.
+        assert_eq!(parsed.deferred_for_expressions.len(), 1);
+
+        let entries = validated_entries(&parsed);
+        let output = ValidateOutput {
+            status: "ok",
+            resource_count: entries.len(),
+            resources: entries.iter().map(ToString::to_string).collect(),
+            warnings: vec![],
+        };
+        let json = serde_json::to_string(&output).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        // cert (direct) + the deferred RecordSet body.
+        assert_eq!(value["resource_count"], 2);
+        let listed = value["resources"].as_array().unwrap();
+        assert!(
+            listed
+                .iter()
+                .any(|r| r.as_str().unwrap().contains("acm.Certificate")),
+            "json must list the let-bound certificate; got: {listed:?}"
+        );
+        assert!(
+            listed.iter().any(|r| {
+                let s = r.as_str().unwrap();
+                s.contains("route53.RecordSet") && s.contains("[?]") && s.contains("(deferred:")
+            }),
+            "json must list the deferred for-loop body as a placeholder \
+             entry; got: {listed:?}"
+        );
+    }
+
+    /// Type-safety guarantee: a direct resource still carrying a
+    /// `Pending` name must NOT render as a trailing-dot string
+    /// (`aws.s3.Bucket.`). The `ValidatedEntry::PendingDirect` variant
+    /// makes the not-yet-named state explicit at the type level
+    /// instead of leaking the empty string `ResourceName::Pending`
+    /// produces. Guards the [[feedback_type_safety_over_runtime_checks]]
+    /// concern raised reviewing carina#3128.
+    #[test]
+    fn pending_named_direct_resource_does_not_render_trailing_dot() {
+        use carina_core::parser::ParsedFile;
+        use carina_core::resource::Resource;
+
+        let mut parsed = ParsedFile::default();
+        let mut res = Resource::new("s3.Bucket", "placeholder");
+        res.id.provider = "aws".to_string();
+        // Force the anonymous/not-yet-promoted state explicitly.
+        res.id.name = ResourceName::Pending;
+        parsed.resources.push(res); // allow: direct — fixture test inspection
+
+        let entries = validated_entries(&parsed);
+        assert_eq!(entries.len(), 1);
+        assert!(
+            matches!(entries[0], ValidatedEntry::PendingDirect(_)),
+            "a Pending-named direct resource must classify as PendingDirect"
+        );
+
+        let rendered = entries[0].to_string();
+        assert!(
+            !rendered.ends_with('.'),
+            "rendered Pending entry must not be a trailing-dot string; got: {rendered:?}"
+        );
+        assert_eq!(rendered, "aws.s3.Bucket.<pending>");
     }
 
     fn upstream(binding: &str, source: &str) -> UpstreamState {
