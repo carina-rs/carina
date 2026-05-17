@@ -96,8 +96,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: bash scripts/check-example-warnings.sh
 
+  # The WASM-heavy carina-plugin-host tests (~125s, the nextest critical
+  # path on the slow CI runner) are split into their own job so they run
+  # in parallel with the rest of the workspace. CI wall time is max(job),
+  # so isolating this critical path off the main test job shortens overall
+  # CI without changing per-test cost (spike for #3089).
   test:
     name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --workspace --all-features -E 'not package(carina-plugin-host)'
+      # nextest does not run doctests; cover them with cargo test --doc.
+      - run: cargo test --workspace --doc --all-features
+
+  test-plugin-host:
+    name: Test (plugin-host / WASM)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -112,9 +131,7 @@ jobs:
       # instead of silently skipping. Without this step a stale or missing
       # fixture leaves the wasm_integration_test suite as a no-op in CI.
       - run: cargo build -p carina-provider-mock --target wasm32-wasip2
-      - run: cargo nextest run --workspace --all-features
-      # nextest does not run doctests; cover them with cargo test --doc.
-      - run: cargo test --workspace --doc --all-features
+      - run: cargo nextest run -p carina-plugin-host --all-features
 
   binary-build:
     name: Binary Build (linux-x86_64)
