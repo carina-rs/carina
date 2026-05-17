@@ -1207,9 +1207,10 @@ fn wait_binding_lowers_to_wait_effect() {
     // A downstream consumer that references the wait binding and is
     // itself a pending change (Create) — carina#3101: the wait is
     // emitted only when it gates a real downstream change.
-    let mut consumer =
-        Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
-    consumer.dependency_bindings.insert("cert_issued".to_string());
+    let mut consumer = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
+    consumer
+        .dependency_bindings
+        .insert("cert_issued".to_string());
     let resources = vec![cert, consumer];
 
     let wait = WaitBinding {
@@ -1284,9 +1285,10 @@ fn wait_uses_schema_default_timeout_when_omitted() {
     let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
     // Downstream consumer with a pending change so the wait gates
     // something (carina#3101).
-    let mut consumer =
-        Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
-    consumer.dependency_bindings.insert("cert_issued".to_string());
+    let mut consumer = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
+    consumer
+        .dependency_bindings
+        .insert("cert_issued".to_string());
     let resources = vec![cert, consumer];
 
     let mut schemas = SchemaRegistry::new();
@@ -1386,8 +1388,7 @@ fn wait_omitted_when_all_consumers_unchanged() {
     use crate::parser::{UntilPredicateAst, WaitBinding};
 
     let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
-    let mut dist =
-        Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
+    let mut dist = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
     dist.dependency_bindings.insert("cert_issued".to_string());
     let resources = vec![cert, dist];
 
@@ -1452,8 +1453,7 @@ fn wait_emitted_when_a_consumer_has_a_pending_change() {
 
     let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
     // `dist` is new (absent from current_states) → Create → mutating.
-    let mut dist =
-        Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
+    let mut dist = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
     dist.dependency_bindings.insert("cert_issued".to_string());
     let resources = vec![cert, dist];
 
