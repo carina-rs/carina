@@ -112,7 +112,11 @@ jobs:
       # instead of silently skipping. Without this step a stale or missing
       # fixture leaves the wasm_integration_test suite as a no-op in CI.
       - run: cargo build -p carina-provider-mock --target wasm32-wasip2
+      # Spike (#3089): exercise the Winch baseline compiler for WASM tests
+      # to cut per-process precompile_component time on the slow runner.
       - run: cargo nextest run --workspace --all-features
+        env:
+          CARINA_WASM_WINCH: "1"
       # nextest does not run doctests; cover them with cargo test --doc.
       - run: cargo test --workspace --doc --all-features
 

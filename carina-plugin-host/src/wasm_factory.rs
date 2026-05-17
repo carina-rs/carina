@@ -91,6 +91,16 @@ fn build_engine_config() -> wasmtime::Config {
     let mut config = wasmtime::Config::new();
     config.wasm_component_model(true);
     config.epoch_interruption(true);
+    // Spike (#3089): when CARINA_WASM_WINCH=1, use Wasmtime's Winch
+    // baseline compiler instead of Cranelift. Winch trades slower
+    // generated code for much faster compilation — the right trade for
+    // CI test runs dominated by per-process precompile_component time.
+    // Production (env unset) stays on Cranelift. Both precompile and
+    // from_precompiled funnel through this fn, so the strategy stays
+    // consistent between produce and load.
+    if std::env::var("CARINA_WASM_WINCH").as_deref() == Ok("1") {
+        config.strategy(wasmtime::Strategy::Winch);
+    }
     config
 }
 
