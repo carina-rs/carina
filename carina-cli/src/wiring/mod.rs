@@ -20,6 +20,7 @@ use carina_core::provider::{
     self as provider_mod, Provider, ProviderError, ProviderFactory, ProviderNormalizer,
     ProviderRouter,
 };
+use carina_core::binding_index::WaitAliasSpec;
 use carina_core::resolver::{resolve_refs_for_plan, resolve_refs_with_state_and_remote};
 use carina_core::resource::{
     ConcreteValue, DeferredValue, Resource, ResourceId, State, Value, contains_resource_ref,
@@ -1311,11 +1312,14 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
 
         // Phase 2: resolve data source refs against the consolidated
         // `current_states`, then refresh each via `read_data_source`.
+        let ds_wait_aliases: Vec<WaitAliasSpec> =
+            parsed.wait_bindings.iter().map(WaitAliasSpec::from).collect();
         let resolved_data_sources = resolve_data_source_refs_for_refresh(
             &sorted_resources,
             &current_states,
             remote_bindings,
             ctx.schemas(),
+            &ds_wait_aliases,
         )?;
         let phase2_results: Vec<Result<(ResourceId, State), AppError>> =
             stream::iter(resolved_data_sources.iter())
@@ -1413,7 +1417,14 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
         &parsed.resources,
         ctx.schemas(),
     );
-    resolve_refs_for_plan(&mut resources, &current_states, remote_bindings)?;
+    let wait_aliases: Vec<WaitAliasSpec> =
+        parsed.wait_bindings.iter().map(WaitAliasSpec::from).collect();
+    resolve_refs_for_plan(
+        &mut resources,
+        &current_states,
+        remote_bindings,
+        &wait_aliases,
+    )?;
 
     // Type-level canonicalization for `Union[String, list(String)]`
     // fields (IAM-style `string_or_list_of_strings`). Done after refs
@@ -1792,10 +1803,16 @@ pub(crate) fn resolve_data_source_refs_for_refresh(
     current_states: &HashMap<ResourceId, State>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     schemas: &carina_core::schema::SchemaRegistry,
+    wait_aliases: &[WaitAliasSpec],
 ) -> Result<Vec<Resource>, AppError> {
     let mut resolved = sorted_resources.to_vec();
-    resolve_refs_with_state_and_remote(&mut resolved, current_states, remote_bindings)
-        .map_err(AppError::Validation)?;
+    resolve_refs_with_state_and_remote(
+        &mut resolved,
+        current_states,
+        remote_bindings,
+        wait_aliases,
+    )
+    .map_err(AppError::Validation)?;
     carina_core::value::canonicalize_resources_with_schemas(&mut resolved, schemas);
     Ok(resolved
         .into_iter()

@@ -207,8 +207,18 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
     let mut resources_for_plan = sorted_resources.clone();
-    resolve_refs_with_state_and_remote(&mut resources_for_plan, &current_states, &remote_bindings)
-        .expect("resolve_refs should succeed");
+    let wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
+        .wait_bindings
+        .iter()
+        .map(carina_core::binding_index::WaitAliasSpec::from)
+        .collect();
+    resolve_refs_with_state_and_remote(
+        &mut resources_for_plan,
+        &current_states,
+        &remote_bindings,
+        &wait_aliases,
+    )
+    .expect("resolve_refs should succeed");
 
     let registry = SchemaRegistry::new();
     let plan = create_plan(
@@ -324,8 +334,18 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
     let mut resources_for_plan = sorted_resources.clone();
-    resolve_refs_with_state_and_remote(&mut resources_for_plan, &current_states, &remote_bindings)
-        .expect("resolve_refs should succeed");
+    let wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
+        .wait_bindings
+        .iter()
+        .map(carina_core::binding_index::WaitAliasSpec::from)
+        .collect();
+    resolve_refs_with_state_and_remote(
+        &mut resources_for_plan,
+        &current_states,
+        &remote_bindings,
+        &wait_aliases,
+    )
+    .expect("resolve_refs should succeed");
 
     let registry = SchemaRegistry::new();
     let plan = create_plan(
@@ -375,5 +395,112 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     assert_eq!(
         result.skip_count, 0,
         "no effect should be skipped. Failures: {failures:?}"
+    );
+}
+
+/// carina#3085 repro (design Test plan item 4): the Distribution's
+/// `acm_certificate_arn = cert_issued.certificate_arn` must **resolve
+/// through the wait binding to the target `cert`'s value** during the
+/// real `resolve_refs_*` pipeline, so it no longer renders as a
+/// never-converging phantom diff (`… → r.cert_issued.certificate_arn`)
+/// — AND the `Effect::Wait` dependency edge must still be emitted. Both
+/// asserted together so a future change cannot fix the value half by
+/// breaking the dependency half (the two-faced invariant).
+///
+/// Mirrors the `carina-rs/infra` registry usecase that produced the
+/// reported phantom. Uses the directory fixture (multi-file caller +
+/// module), not a single-string unit test, per the repo's
+/// directory-scoped rule.
+#[tokio::test]
+async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline() {
+    let mut caller = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    caller.push("tests/fixtures/wait/module_wait_downstream/caller");
+
+    let mut parsed = parse_directory(&caller, &ProviderContext::default())
+        .expect("parse_directory should succeed");
+    resolve_modules(&mut parsed, &caller).expect("module resolution should succeed");
+
+    let sorted_resources =
+        sort_resources_by_dependencies(&parsed.resources).expect("topological sort");
+
+    // State holds the resolved ARN for the wait target `r.cert` — the
+    // value `cert_issued.certificate_arn` must passthrough to.
+    let cert = sorted_resources
+        .iter()
+        .find(|r| r.id.resource_type == "acm.Certificate")
+        .expect("expanded Certificate must be present");
+    let arn = "arn:aws:acm:us-east-1:151116838382:certificate/3fc2dbff";
+    let mut cert_attrs = HashMap::new();
+    cert_attrs.insert(
+        "certificate_arn".to_string(),
+        Value::Concrete(ConcreteValue::String(arn.to_string())),
+    );
+    let mut current_states: HashMap<ResourceId, State> = HashMap::new();
+    current_states.insert(cert.id.clone(), State::existing(cert.id.clone(), cert_attrs));
+    let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+
+    let wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
+        .wait_bindings
+        .iter()
+        .map(carina_core::binding_index::WaitAliasSpec::from)
+        .collect();
+
+    let mut resources_for_plan = sorted_resources.clone();
+    resolve_refs_with_state_and_remote(
+        &mut resources_for_plan,
+        &current_states,
+        &remote_bindings,
+        &wait_aliases,
+    )
+    .expect("resolve_refs should succeed");
+
+    // ---- The phantom is gone: the Distribution's nested
+    // `acm_certificate_arn` is the *resolved ARN string*, not a
+    // surviving `ResourceRef` to `r.cert_issued.certificate_arn`.
+    let dist = resources_for_plan
+        .iter()
+        .find(|r| r.id.resource_type == "cloudfront.Distribution")
+        .expect("Distribution must be present");
+    let dc = dist
+        .attributes
+        .get("distribution_config")
+        .expect("distribution_config present");
+    let arn_value = match dc {
+        Value::Concrete(ConcreteValue::Map(m)) => m
+            .get("viewer_certificate")
+            .and_then(|vc| match vc {
+                Value::Concrete(ConcreteValue::Map(vcm)) => vcm.get("acm_certificate_arn"),
+                _ => None,
+            })
+            .expect("viewer_certificate.acm_certificate_arn present"),
+        other => panic!("distribution_config must be a Map, got {other:?}"),
+    };
+    assert_eq!(
+        arn_value,
+        &Value::Concrete(ConcreteValue::String(arn.to_string())),
+        "carina#3085: acm_certificate_arn must resolve through the wait \
+         binding to cert's ARN, not stay an unresolved ResourceRef \
+         (got {arn_value:?})"
+    );
+
+    // ---- The dependency edge is intact: Effect::Wait still emitted.
+    let registry = SchemaRegistry::new();
+    let plan = create_plan(
+        &resources_for_plan,
+        &current_states,
+        &HashMap::new(),
+        &registry,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &parsed.wait_bindings,
+    );
+    assert!(
+        plan.effects().iter().any(|e| matches!(
+            e,
+            carina_core::effect::Effect::Wait { binding, .. } if binding == "r.cert_issued"
+        )),
+        "the value-layer alias fix must NOT remove the Effect::Wait \
+         dependency edge — both halves of the wait binding must hold"
     );
 }

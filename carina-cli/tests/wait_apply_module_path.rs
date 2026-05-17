@@ -372,10 +372,16 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
     let mut resources_for_plan = sorted_resources.clone();
+    let wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
+        .wait_bindings
+        .iter()
+        .map(carina_core::binding_index::WaitAliasSpec::from)
+        .collect();
     carina_core::resolver::resolve_refs_with_state_and_remote(
         &mut resources_for_plan,
         &current_states,
         &remote_bindings,
+        &wait_aliases,
     )
     .expect("resolve_refs");
 

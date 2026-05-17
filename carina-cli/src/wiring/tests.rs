@@ -508,6 +508,7 @@ fn resolve_data_source_refs_replaces_resource_ref_with_concrete_value() {
         &current_states,
         &HashMap::new(),
         &empty_registry,
+        &[],
     )
     .expect("resolution should succeed");
 

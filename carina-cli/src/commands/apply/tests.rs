@@ -523,7 +523,7 @@ fn resolve_exports_resolves_cross_file_dot_notation_strings() {
     registry_prod.binding = Some("registry_prod".to_string());
     let sorted_resources = vec![registry_prod];
 
-    let exports = resolve_exports(&export_params, &sorted_resources, &state).unwrap();
+    let exports = resolve_exports(&export_params, &sorted_resources, &state, &[]).unwrap();
 
     assert_eq!(
         exports.get("account_id"),
@@ -596,7 +596,7 @@ fn resolve_exports_resolves_module_call_attribute_via_virtual_resource() {
         })),
     }];
 
-    let exports = resolve_exports(&export_params, &sorted_resources, &state).unwrap();
+    let exports = resolve_exports(&export_params, &sorted_resources, &state, &[]).unwrap();
 
     assert_eq!(
         exports.get("role_arn"),
@@ -683,7 +683,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_virtuals() {
         })),
     }];
 
-    let exports = resolve_exports(&export_params, &sorted_resources, &state).unwrap();
+    let exports = resolve_exports(&export_params, &sorted_resources, &state, &[]).unwrap();
 
     assert_eq!(
         exports.get("role_arn"),
