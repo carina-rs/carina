@@ -150,11 +150,29 @@ fn is_epoch_trap_message(msg: &str) -> bool {
 /// This wraps the whole operation — both acquiring the store lock and the
 /// guest call — in a `tokio::time::timeout` so a stuck host-side wait is
 /// converted into a [`ProviderError::timeout`] instead of hanging
-/// indefinitely. The budget is slightly longer than the epoch budget so
-/// that genuine WASM-computation overruns still surface as the more
-/// specific epoch-trap message rather than racing this backstop.
-const WASM_OPERATION_HARD_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(WASM_OPERATION_TIMEOUT_SECS + 15);
+/// indefinitely.
+///
+/// # Sizing — why this is 20 minutes, not the ~30s epoch budget
+///
+/// This is a wall-clock bound on a *whole provider operation*, not a
+/// single API call. A provider `create`/`delete` legitimately embeds its
+/// own multi-minute poll-until-ready loop inside one WASM call (e.g. the
+/// AWS provider's NAT Gateway delete waits ~7.5 min and Organizations
+/// account creation waits up to 10 min — host-side `sleep` + HTTP that
+/// the 30s epoch budget deliberately does not count because epochs only
+/// tick on WASM compute). A backstop sized near the epoch budget would
+/// falsely time out — and then poison (see [`SharedWasmInstance`]) — the
+/// entire provider on every such resource.
+///
+/// 20 min is ~2× the longest known legitimate single-call provider
+/// waiter, so it never trips a healthy operation, while still converting
+/// the carina#3106 *unbounded* hang into a bounded, recoverable error.
+///
+/// **Provider contract:** a single provider operation must complete
+/// within this budget. A waiter that needs longer must be expressed as
+/// the carina `wait` construct (separate short reads the executor drives)
+/// rather than a blocking loop inside one `create`/`delete` call.
+const WASM_OPERATION_HARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
 
 /// If `poisoned` is set, return the fail-fast error a poisoned instance
 /// must give for `operation`; otherwise `None` and the caller may proceed.
@@ -205,6 +223,31 @@ async fn with_operation_timeout<T>(
         Ok(result) => result,
         Err(_elapsed) => Err(poison_and_timeout_error(&instance.poisoned, operation)),
     }
+}
+
+/// Acquire the store lock for `operation`, re-checking the poison flag
+/// *after* the lock is held, then arm the epoch deadline.
+///
+/// The pre-flight [`poisoned_guard`] in [`with_operation_timeout`] only
+/// rejects operations that *start* after a prior timeout. An operation
+/// that was already queued on the store `Mutex` when a sibling operation
+/// timed out passed that pre-flight check while the flag was still clear;
+/// without this second check it would acquire the freed-but-poisoned lock
+/// and call into the unreusable store. Re-checking once the lock is held
+/// closes that window — the poisoning sibling sets the flag *before*
+/// releasing the lock (it is set on the timeout path, and the guard's
+/// future is only dropped after), so any waiter that subsequently
+/// acquires the lock observes it.
+async fn lock_store_checked<'a>(
+    instance: &'a SharedWasmInstance,
+    operation: &str,
+) -> ProviderResult<tokio::sync::MutexGuard<'a, Store<HostState>>> {
+    let mut store = instance.store.lock().await;
+    if let Some(err) = poisoned_guard(&instance.poisoned, operation) {
+        return Err(err);
+    }
+    store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
+    Ok(store)
 }
 
 /// Strip port from authority (e.g., "s3.amazonaws.com:443" -> "s3.amazonaws.com").
@@ -1475,8 +1518,7 @@ impl Provider for WasmProvider {
         let identifier = identifier.map(|s| s.to_string());
         let id = id.clone();
         Box::pin(with_operation_timeout(&self.instance, "read", async move {
-            let mut store = self.instance.store.lock().await;
-            store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
+            let mut store = lock_store_checked(&self.instance, "read").await?;
             let result = self
                 .instance
                 .bindings
@@ -1510,8 +1552,7 @@ impl Provider for WasmProvider {
             &self.instance,
             "read_data_source",
             async move {
-                let mut store = self.instance.store.lock().await;
-                store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
+                let mut store = lock_store_checked(&self.instance, "read_data_source").await?;
                 let result = self
                     .instance
                     .bindings
@@ -1551,8 +1592,7 @@ impl Provider for WasmProvider {
             &self.instance,
             "create",
             async move {
-                let mut store = self.instance.store.lock().await;
-                store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
+                let mut store = lock_store_checked(&self.instance, "create").await?;
                 let result = self
                 .instance
                 .bindings
@@ -1594,8 +1634,7 @@ impl Provider for WasmProvider {
             &self.instance,
             "update",
             async move {
-                let mut store = self.instance.store.lock().await;
-                store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
+                let mut store = lock_store_checked(&self.instance, "update").await?;
                 let result = self
                 .instance
                 .bindings
@@ -1633,8 +1672,7 @@ impl Provider for WasmProvider {
             &self.instance,
             "delete",
             async move {
-                let mut store = self.instance.store.lock().await;
-                store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
+                let mut store = lock_store_checked(&self.instance, "delete").await?;
                 let result = self
                 .instance
                 .bindings
@@ -2208,14 +2246,29 @@ mod tests {
         );
     }
 
-    /// The hard timeout must be strictly greater than the epoch budget so
-    /// genuine WASM-computation overruns surface as the more specific
-    /// epoch-trap message instead of racing this host-I/O backstop.
+    /// The hard timeout must outlast the epoch budget (so genuine
+    /// WASM-computation overruns surface as the more specific epoch-trap
+    /// message) and, more importantly, must be far longer than the
+    /// longest *legitimate* single-call provider waiter — a provider
+    /// `create`/`delete` can embed a multi-minute poll-until-ready loop
+    /// (the AWS provider's Organizations account waiter is ~10 min). A
+    /// backstop near the epoch budget would falsely time out and poison
+    /// the provider on every such resource.
     #[test]
-    fn hard_timeout_outlasts_the_epoch_budget() {
+    fn hard_timeout_outlasts_epoch_budget_and_longest_legitimate_waiter() {
         assert!(
             WASM_OPERATION_HARD_TIMEOUT.as_secs() > WASM_OPERATION_TIMEOUT_SECS,
             "hard timeout must outlast the epoch budget so epoch traps win the race"
+        );
+        // Longest known legitimate single-call provider waiter is ~10 min
+        // (AWS Organizations account creation). The backstop must clear it
+        // with margin so a healthy long operation is never poisoned.
+        const LONGEST_LEGITIMATE_WAITER_SECS: u64 = 10 * 60;
+        assert!(
+            WASM_OPERATION_HARD_TIMEOUT.as_secs() >= 2 * LONGEST_LEGITIMATE_WAITER_SECS,
+            "hard timeout must be >= 2x the longest legitimate single-call \
+             provider waiter so a healthy long operation is never falsely \
+             timed out and poisoned"
         );
     }
 }
