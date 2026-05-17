@@ -135,6 +135,156 @@ fn is_epoch_trap_message(msg: &str) -> bool {
     msg.contains("interrupt") || msg.contains("epoch")
 }
 
+/// Wall-clock backstop for a single WASM provider operation.
+///
+/// Epoch interruption ([`WASM_OPERATION_TIMEOUT_SECS`] via
+/// `store.set_epoch_deadline`) can only trap WASM *computation* — it does
+/// not fire while the guest is parked in a host-side I/O wait such as a
+/// `wasi:http` request whose response never completes (see the
+/// [`WASM_OPERATION_TIMEOUT_SECS`] doc-comment). When that happens the
+/// future hangs forever, the per-provider store `Mutex` stays held, every
+/// other concurrent operation on the same provider blocks behind it, and
+/// `Ctrl+C` cannot unwind a future parked inside a `wasmtime` call
+/// (carina#3106).
+///
+/// This wraps the whole operation — both acquiring the store lock and the
+/// guest call — in a `tokio::time::timeout` so a stuck host-side wait is
+/// converted into a [`ProviderError::timeout`] instead of hanging
+/// indefinitely.
+///
+/// # Sizing — why this is 20 minutes, not the ~30s epoch budget
+///
+/// This is a wall-clock bound on a *whole provider operation*, not a
+/// single API call. A provider `create`/`delete` legitimately embeds its
+/// own multi-minute poll-until-ready loop inside one WASM call (e.g. the
+/// AWS provider's NAT Gateway delete waits ~7.5 min and Organizations
+/// account creation waits up to 10 min — host-side `sleep` + HTTP that
+/// the 30s epoch budget deliberately does not count because epochs only
+/// tick on WASM compute). A backstop sized near the epoch budget would
+/// falsely time out — and then poison (see [`SharedWasmInstance`]) — the
+/// entire provider on every such resource.
+///
+/// 20 min is ~2× the longest known legitimate single-call provider
+/// waiter, so it never trips a healthy operation, while still converting
+/// the carina#3106 *unbounded* hang into a bounded, recoverable error.
+///
+/// **Provider contract:** a single provider operation must complete
+/// within this budget. A waiter that needs longer must be expressed as
+/// the carina `wait` construct (separate short reads the executor drives)
+/// rather than a blocking loop inside one `create`/`delete` call.
+const WASM_OPERATION_HARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// If `poisoned` is set, return the fail-fast error a poisoned instance
+/// must give for `operation`; otherwise `None` and the caller may proceed.
+fn poisoned_guard(poisoned: &AtomicBool, operation: &str) -> Option<ProviderError> {
+    poisoned.load(Ordering::Acquire).then(|| {
+        ProviderError::internal(format!(
+            "WASM provider is unusable: a prior operation timed out and left \
+             the plugin instance in an undefined state (operation \
+             '{operation}'); re-run the command"
+        ))
+    })
+}
+
+/// Run `op` against `instance` under [`WASM_OPERATION_HARD_TIMEOUT`].
+///
+/// `operation` names the call for the error message (e.g. `"create"`).
+///
+/// Three outcomes:
+/// - `instance` already poisoned by a prior timeout → fail fast without
+///   touching the store (a cancelled wasmtime async call leaves the
+///   shared `Store` unreusable; see [`SharedWasmInstance::poisoned`]).
+/// - `op` completes within budget → its result, untouched.
+/// - the deadline elapses → `op` is dropped; the poisoning is done by
+///   [`LockedStore`]'s drop while it still holds the store lock (not
+///   here), so a waiter cannot acquire the freed-but-not-yet-flagged
+///   lock. Returns [`ProviderError::timeout`].
+async fn with_operation_timeout<T>(
+    instance: &SharedWasmInstance,
+    operation: &str,
+    op: impl std::future::Future<Output = ProviderResult<T>>,
+) -> ProviderResult<T> {
+    if let Some(err) = poisoned_guard(&instance.poisoned, operation) {
+        return Err(err);
+    }
+    match tokio::time::timeout(WASM_OPERATION_HARD_TIMEOUT, op).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(ProviderError::timeout(format!(
+            "WASM plugin operation '{operation}' exceeded {}s (host-side I/O \
+             wait that epoch interruption cannot reach; check network/AWS \
+             connectivity)",
+            WASM_OPERATION_HARD_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
+/// A held store lock that poisons its instance on drop **unless
+/// [`disarm`](Self::disarm)ed** after the guest call completed.
+///
+/// Field order is load-bearing: Rust drops fields in declaration order,
+/// so `poison` (the [`PoisonOnDrop`] guard) drops *before* `store` (the
+/// `MutexGuard`). When `tokio::time::timeout` cancels the in-flight
+/// operation it drops this whole value; the flag is therefore set
+/// **while the store `Mutex` is still held**, closing the window where a
+/// sibling operation already queued on the lock could otherwise acquire
+/// the freed-but-not-yet-flagged store and call into the unusable
+/// wasmtime `Store` (carina#3106). A normal completion calls
+/// [`disarm`](Self::disarm) so a successful op does not poison.
+struct LockedStore<'a> {
+    poison: PoisonOnDrop<'a>,
+    store: tokio::sync::MutexGuard<'a, Store<HostState>>,
+}
+
+/// Sets `poisoned` on drop unless disarmed. Separate from [`LockedStore`]
+/// only so the drop-order guarantee is expressed by field ordering.
+struct PoisonOnDrop<'a> {
+    poisoned: &'a AtomicBool,
+    armed: bool,
+}
+
+impl Drop for PoisonOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.poisoned.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl<'a> LockedStore<'a> {
+    /// Acquire the store lock for `operation`, re-checking the poison
+    /// flag *after* the lock is held (an op queued on the `Mutex` when a
+    /// sibling timed out passed [`with_operation_timeout`]'s pre-flight
+    /// check while the flag was still clear), then arm the epoch
+    /// deadline.
+    async fn acquire(
+        instance: &'a SharedWasmInstance,
+        operation: &str,
+    ) -> ProviderResult<LockedStore<'a>> {
+        let mut store = instance.store.lock().await;
+        if let Some(err) = poisoned_guard(&instance.poisoned, operation) {
+            return Err(err);
+        }
+        store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
+        Ok(LockedStore {
+            poison: PoisonOnDrop {
+                poisoned: &instance.poisoned,
+                armed: true,
+            },
+            store,
+        })
+    }
+
+    /// The guest call completed (success *or* a clean provider error, not
+    /// a cancellation); do not poison the instance.
+    fn disarm(&mut self) {
+        self.poison.armed = false;
+    }
+
+    fn store(&mut self) -> &mut Store<HostState> {
+        &mut self.store
+    }
+}
+
 /// Strip port from authority (e.g., "s3.amazonaws.com:443" -> "s3.amazonaws.com").
 fn host_without_port(host: &str) -> &str {
     host.split(':').next().unwrap_or(host)
@@ -792,6 +942,16 @@ fn format_dual_instantiation_error(http_err: &str, basic_err: &str) -> String {
 struct SharedWasmInstance {
     store: Mutex<Store<HostState>>,
     bindings: WasmBindings,
+    /// Set once an operation against this instance times out. A
+    /// `tokio::time::timeout` that fires drops the in-flight future while
+    /// it is suspended *inside* a `wasmtime` async call; that does not
+    /// unwind the WASM guest, so the shared `Store` is left holding a
+    /// half-executed call frame. wasmtime does not guarantee such a
+    /// `Store` is reusable, so once this is set every subsequent
+    /// operation fails fast with a clear error instead of touching the
+    /// poisoned store and producing silent, non-deterministic corruption
+    /// across the remaining resources in the plan/apply (carina#3106).
+    poisoned: AtomicBool,
 }
 
 // Safety: The Store is behind a Mutex, so concurrent access is serialized.
@@ -1193,6 +1353,7 @@ impl WasmProviderFactory {
         let instance = Arc::new(SharedWasmInstance {
             store: Mutex::new(store),
             bindings,
+            poisoned: AtomicBool::new(false),
         });
         guard.insert(key, Arc::clone(&instance));
         Ok(instance)
@@ -1391,30 +1552,33 @@ impl Provider for WasmProvider {
         let wit_request = wasm_convert::core_to_wit_read_request(&request);
         let identifier = identifier.map(|s| s.to_string());
         let id = id.clone();
-        Box::pin(async move {
-            let mut store = self.instance.store.lock().await;
-            store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
-            let result = self
+        Box::pin(with_operation_timeout(&self.instance, "read", async move {
+            let mut locked = LockedStore::acquire(&self.instance, "read").await?;
+            let call = self
                 .instance
                 .bindings
-                .call_read(&mut store, &wit_id, identifier.as_deref(), wit_request)
-                .await
-                .map_err(|e| {
-                    let msg = format!("{e}");
-                    if is_epoch_trap_message(&msg) {
-                        ProviderError::timeout(format!(
-                            "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in read \
-                             (check AWS credentials)"
-                        ))
-                    } else {
-                        ProviderError::internal(format!("WASM trap in read: {e}"))
-                    }
-                })?;
+                .call_read(locked.store(), &wit_id, identifier.as_deref(), wit_request)
+                .await;
+            // The guest call returned (success or trap, not a
+            // cancellation): the store is in a defined state, so do not
+            // poison it.
+            locked.disarm();
+            let result = call.map_err(|e| {
+                let msg = format!("{e}");
+                if is_epoch_trap_message(&msg) {
+                    ProviderError::timeout(format!(
+                        "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in read \
+                         (check AWS credentials)"
+                    ))
+                } else {
+                    ProviderError::internal(format!("WASM trap in read: {e}"))
+                }
+            })?;
             match result {
                 Ok(wit_state) => Ok(wasm_convert::wit_to_core_state(&wit_state, &id)),
                 Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
             }
-        })
+        }))
     }
 
     fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
@@ -1423,15 +1587,18 @@ impl Provider for WasmProvider {
             Err(e) => return early_provider_err(e),
         };
         let id = resource.id.clone();
-        Box::pin(async move {
-            let mut store = self.instance.store.lock().await;
-            store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
-            let result = self
-                .instance
-                .bindings
-                .call_read_data_source(&mut store, &wit_resource)
-                .await
-                .map_err(|e| {
+        Box::pin(with_operation_timeout(
+            &self.instance,
+            "read_data_source",
+            async move {
+                let mut locked = LockedStore::acquire(&self.instance, "read_data_source").await?;
+                let call = self
+                    .instance
+                    .bindings
+                    .call_read_data_source(locked.store(), &wit_resource)
+                    .await;
+                locked.disarm();
+                let result = call.map_err(|e| {
                     let msg = format!("{e}");
                     if is_epoch_trap_message(&msg) {
                         ProviderError::timeout(format!(
@@ -1442,11 +1609,12 @@ impl Provider for WasmProvider {
                         ProviderError::internal(format!("WASM trap in read_data_source: {e}"))
                     }
                 })?;
-            match result {
-                Ok(wit_state) => Ok(wasm_convert::wit_to_core_state(&wit_state, &id)),
-                Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
-            }
-        })
+                match result {
+                    Ok(wit_state) => Ok(wasm_convert::wit_to_core_state(&wit_state, &id)),
+                    Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
+                }
+            },
+        ))
     }
 
     fn create(
@@ -1460,15 +1628,18 @@ impl Provider for WasmProvider {
             Err(e) => return early_provider_err(e),
         };
         let id = id.clone();
-        Box::pin(async move {
-            let mut store = self.instance.store.lock().await;
-            store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
-            let result = self
-                .instance
-                .bindings
-                .call_create(&mut store, &wit_id, &wit_request)
-                .await
-                .map_err(|e| {
+        Box::pin(with_operation_timeout(
+            &self.instance,
+            "create",
+            async move {
+                let mut locked = LockedStore::acquire(&self.instance, "create").await?;
+                let call = self
+                    .instance
+                    .bindings
+                    .call_create(locked.store(), &wit_id, &wit_request)
+                    .await;
+                locked.disarm();
+                let result = call.map_err(|e| {
                     let msg = format!("{e}");
                     if is_epoch_trap_message(&msg) {
                         ProviderError::timeout(format!(
@@ -1479,11 +1650,12 @@ impl Provider for WasmProvider {
                         ProviderError::internal(format!("WASM trap in create: {e}"))
                     }
                 })?;
-            match result {
-                Ok(wit_state) => Ok(wasm_convert::wit_to_core_state(&wit_state, &id)),
-                Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
-            }
-        })
+                match result {
+                    Ok(wit_state) => Ok(wasm_convert::wit_to_core_state(&wit_state, &id)),
+                    Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
+                }
+            },
+        ))
     }
 
     fn update(
@@ -1499,15 +1671,18 @@ impl Provider for WasmProvider {
             Err(e) => return early_provider_err(e),
         };
         let id = id.clone();
-        Box::pin(async move {
-            let mut store = self.instance.store.lock().await;
-            store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
-            let result = self
-                .instance
-                .bindings
-                .call_update(&mut store, &wit_id, &identifier, &wit_request)
-                .await
-                .map_err(|e| {
+        Box::pin(with_operation_timeout(
+            &self.instance,
+            "update",
+            async move {
+                let mut locked = LockedStore::acquire(&self.instance, "update").await?;
+                let call = self
+                    .instance
+                    .bindings
+                    .call_update(locked.store(), &wit_id, &identifier, &wit_request)
+                    .await;
+                locked.disarm();
+                let result = call.map_err(|e| {
                     let msg = format!("{e}");
                     if is_epoch_trap_message(&msg) {
                         ProviderError::timeout(format!(
@@ -1518,11 +1693,12 @@ impl Provider for WasmProvider {
                         ProviderError::internal(format!("WASM trap in update: {e}"))
                     }
                 })?;
-            match result {
-                Ok(wit_state) => Ok(wasm_convert::wit_to_core_state(&wit_state, &id)),
-                Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
-            }
-        })
+                match result {
+                    Ok(wit_state) => Ok(wasm_convert::wit_to_core_state(&wit_state, &id)),
+                    Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
+                }
+            },
+        ))
     }
 
     fn delete(
@@ -1534,15 +1710,18 @@ impl Provider for WasmProvider {
         let wit_id = wasm_convert::core_to_wit_resource_id(id);
         let identifier = identifier.to_string();
         let wit_request = wasm_convert::core_to_wit_delete_request(&request);
-        Box::pin(async move {
-            let mut store = self.instance.store.lock().await;
-            store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
-            let result = self
-                .instance
-                .bindings
-                .call_delete(&mut store, &wit_id, &identifier, wit_request)
-                .await
-                .map_err(|e| {
+        Box::pin(with_operation_timeout(
+            &self.instance,
+            "delete",
+            async move {
+                let mut locked = LockedStore::acquire(&self.instance, "delete").await?;
+                let call = self
+                    .instance
+                    .bindings
+                    .call_delete(locked.store(), &wit_id, &identifier, wit_request)
+                    .await;
+                locked.disarm();
+                let result = call.map_err(|e| {
                     let msg = format!("{e}");
                     if is_epoch_trap_message(&msg) {
                         ProviderError::timeout(format!(
@@ -1553,11 +1732,12 @@ impl Provider for WasmProvider {
                         ProviderError::internal(format!("WASM trap in delete: {e}"))
                     }
                 })?;
-            match result {
-                Ok(()) => Ok(()),
-                Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
-            }
-        })
+                match result {
+                    Ok(()) => Ok(()),
+                    Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
+                }
+            },
+        ))
     }
 }
 
@@ -2065,5 +2245,98 @@ mod tests {
         assert!(msg.contains("BASIC cause: wasi:http/types not in linker"));
         assert!(msg.contains("HTTP-enabled world failed"));
         assert!(msg.contains("basic fallback also failed"));
+    }
+
+    /// A fresh (un-poisoned) instance lets an operation proceed: the
+    /// guard returns `None`.
+    #[test]
+    fn poisoned_guard_allows_a_fresh_instance() {
+        let flag = AtomicBool::new(false);
+        assert!(poisoned_guard(&flag, "create").is_none());
+    }
+
+    /// Dropping an *armed* `PoisonOnDrop` (the carina#3106 cancellation
+    /// path: `tokio::time::timeout` drops the in-flight operation while it
+    /// is suspended inside a `wasmtime` async call, leaving the shared
+    /// `Store` unreusable) poisons the instance, and every subsequent
+    /// operation then fails fast instead of touching the poisoned store.
+    #[test]
+    fn armed_drop_poisons_then_guard_fails_fast_naming_the_operation() {
+        let flag = AtomicBool::new(false);
+
+        // Operation cancelled before completion: the armed guard is
+        // dropped and must poison the instance.
+        {
+            let _armed = PoisonOnDrop {
+                poisoned: &flag,
+                armed: true,
+            };
+        }
+        assert!(
+            flag.load(Ordering::Acquire),
+            "an armed PoisonOnDrop must poison the instance when dropped"
+        );
+
+        // A later operation on the same (now poisoned) instance fails fast.
+        let guard_err = poisoned_guard(&flag, "delete")
+            .expect("a poisoned instance must reject subsequent operations");
+        assert!(
+            matches!(guard_err, ProviderError::Internal(_)),
+            "poisoned fail-fast must be a hard error, got {guard_err:?}"
+        );
+        let msg = format!("{guard_err:?}");
+        assert!(
+            msg.contains("delete") && msg.contains("re-run"),
+            "fail-fast error should name the rejected op and tell the user to re-run, got: {msg}"
+        );
+    }
+
+    /// A completed guest call disarms the guard, so a normal operation
+    /// (success *or* a clean provider error — both mean the wasmtime call
+    /// returned, not a cancellation) must NOT poison the instance.
+    #[test]
+    fn disarmed_drop_does_not_poison() {
+        let flag = AtomicBool::new(false);
+        {
+            let mut guard = PoisonOnDrop {
+                poisoned: &flag,
+                armed: true,
+            };
+            guard.armed = false; // mirrors LockedStore::disarm()
+        }
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "a disarmed PoisonOnDrop must not poison the instance"
+        );
+        assert!(
+            poisoned_guard(&flag, "read").is_none(),
+            "an un-poisoned instance must keep accepting operations"
+        );
+    }
+
+    /// The hard timeout must outlast the epoch budget (so genuine
+    /// WASM-computation overruns surface as the more specific epoch-trap
+    /// message) and, more importantly, must be far longer than the
+    /// longest *legitimate* single-call provider waiter — a provider
+    /// `create`/`delete` can embed a multi-minute poll-until-ready loop
+    /// (the AWS provider's Organizations account waiter is ~10 min). A
+    /// backstop near the epoch budget would falsely time out and poison
+    /// the provider on every such resource.
+    #[test]
+    fn hard_timeout_outlasts_epoch_budget_and_longest_legitimate_waiter() {
+        assert!(
+            WASM_OPERATION_HARD_TIMEOUT.as_secs() > WASM_OPERATION_TIMEOUT_SECS,
+            "hard timeout must outlast the epoch budget so epoch traps win the race"
+        );
+        // Longest known legitimate single-call provider waiter is ~10 min
+        // (AWS Organizations account creation). The backstop must clear it
+        // with margin so a healthy long operation is never poisoned.
+        const LONGEST_LEGITIMATE_WAITER_SECS: u64 = 10 * 60;
+        assert!(
+            WASM_OPERATION_HARD_TIMEOUT.as_secs() >= 2 * LONGEST_LEGITIMATE_WAITER_SECS,
+            "hard timeout must be >= 2x the longest legitimate single-call \
+             provider waiter so a healthy long operation is never falsely \
+             timed out and poisoned"
+        );
     }
 }
