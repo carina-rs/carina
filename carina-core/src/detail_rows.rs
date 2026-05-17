@@ -861,7 +861,17 @@ fn build_delete_rows(
         keys.sort();
         for key in keys {
             let value = &attrs[key];
-            if let Value::Concrete(ConcreteValue::Map(map)) = value {
+            // Route lists through PrettyAttribute so `format_value_pretty`
+            // applies its 80-col threshold and YAML-style vertical layout,
+            // mirroring `build_create_rows`. Without this, a list-of-maps
+            // like `domain_validation_options` renders on one long,
+            // unreadable line (the Delete path was asymmetric with Create).
+            if let Value::Concrete(ConcreteValue::List(_)) = value {
+                rows.push(DetailRow::PrettyAttribute {
+                    key: key.to_string(),
+                    value: value.clone(),
+                });
+            } else if let Value::Concrete(ConcreteValue::Map(map)) = value {
                 rows.push(build_expanded_map_row(key, map));
             } else {
                 let ref_binding = match value {
@@ -1827,6 +1837,64 @@ mod tests {
             }
             other => panic!("expected MapExpanded, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn delete_row_list_of_maps_emits_pretty_attribute() {
+        // Regression: the Delete path used to stringify list attributes onto
+        // one long line (asymmetric with build_create_rows). A list-of-maps
+        // like `domain_validation_options` must route through
+        // PrettyAttribute so format_value_pretty's vertical layout applies.
+        let id = ResourceId::new("acm.Certificate", "cert");
+        let effect = Effect::Delete {
+            id: id.clone(),
+            identifier: "cert".to_string(),
+            directives: crate::resource::Directives::default(),
+            binding: None,
+            dependencies: HashSet::new(),
+            explicit_dependencies: std::collections::HashSet::new(),
+        };
+        let mut entry = IndexMap::new();
+        entry.insert(
+            "domain_name".to_string(),
+            Value::Concrete(ConcreteValue::String(
+                "registry-dev.carina-rs.dev".to_string(),
+            )),
+        );
+        entry.insert(
+            "validation_method".to_string(),
+            Value::Concrete(ConcreteValue::String("DNS".to_string())),
+        );
+        let dvo = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(entry),
+        )]));
+        let mut delete_attrs: HashMap<ResourceId, HashMap<String, Value>> = HashMap::new();
+        delete_attrs.insert(
+            id.clone(),
+            [("domain_validation_options".to_string(), dvo)]
+                .into_iter()
+                .collect(),
+        );
+
+        let rows = build_detail_rows(&effect, None, DetailLevel::Full, Some(&delete_attrs), None);
+
+        let pretty_value = rows.iter().find_map(|row| match row {
+            DetailRow::PrettyAttribute { key, value } if key == "domain_validation_options" => {
+                Some(value)
+            }
+            _ => None,
+        });
+        assert!(
+            pretty_value.is_some(),
+            "expected PrettyAttribute row for domain_validation_options, got: {rows:?}"
+        );
+        assert!(
+            matches!(
+                pretty_value.unwrap(),
+                Value::Concrete(ConcreteValue::List(_))
+            ),
+            "PrettyAttribute should carry the raw Value::Concrete(ConcreteValue::List)"
+        );
     }
 
     #[test]

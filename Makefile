@@ -8,6 +8,8 @@ plan-mixed:
 	$(PLAN_FIXTURE) mixed_operations
 plan-delete:
 	$(PLAN_FIXTURE) delete_orphan
+plan-delete-list-of-maps:
+	$(PLAN_FIXTURE) delete_orphan_list_of_maps
 plan-state-blocks:
 	$(PLAN_FIXTURE) state_blocks
 plan-compact:
@@ -86,6 +88,9 @@ plan-fixtures:
 	@echo ""
 	@echo "=== delete_orphan ==="
 	@$(MAKE) plan-delete
+	@echo ""
+	@echo "=== delete_orphan_list_of_maps ==="
+	@$(MAKE) plan-delete-list-of-maps
 	@echo ""
 	@echo "=== compact ==="
 	@$(MAKE) plan-compact
@@ -225,7 +230,7 @@ plan-multi-instance-create:
 	$(PLAN_FIXTURE) multi_instance_create
 plan-multi-instance-module:
 	$(PLAN_FIXTURE) multi_instance_module
-.PHONY: plan-all-create plan-no-changes plan-no-changes-enum plan-mixed plan-delete plan-compact \
+.PHONY: plan-all-create plan-no-changes plan-no-changes-enum plan-mixed plan-delete plan-delete-list-of-maps plan-compact \
         plan-map-diff plan-list-diff-added-struct plan-list-diff-removed-struct \
         plan-list-diff-modified-with-unchanged \
         plan-list-diff-modified-with-unchanged-nested \

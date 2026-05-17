@@ -1,0 +1,50 @@
+{
+  "version": 6,
+  "serial": 1,
+  "lineage": "test-lineage-delete-orphan-list-of-maps",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "acm.Certificate",
+      "name": "orphan_cert",
+      "provider": "aws",
+      "identifier": "arn:aws:acm:us-east-1:151116838382:certificate/3fc2dbff-d965-4533-aeac-9e9d85ac527a",
+      "attributes": {
+        "certificate_arn": "arn:aws:acm:us-east-1:151116838382:certificate/3fc2dbff-d965-4533-aeac-9e9d85ac527a",
+        "domain_name": "registry-dev.carina-rs.dev",
+        "domain_validation_options": [
+          {
+            "domain_name": "registry-dev.carina-rs.dev",
+            "resource_record": {
+              "name": "_b799e8cef71fc960510b85f44c464976.registry-dev.carina-rs.dev.",
+              "type": "CNAME",
+              "value": "_914ec1412ad1bbde685f236a55c98d23.jkddzztszm.acm-validations.aws."
+            },
+            "validation_method": "DNS",
+            "validation_status": "SUCCESS"
+          }
+        ]
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "orphan_cert",
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "certificate_arn": {
+            "kind": "leaf"
+          },
+          "domain_name": {
+            "kind": "leaf"
+          },
+          "domain_validation_options": {
+            "kind": "leaf"
+          }
+        }
+      }
+    }
+  ]
+}

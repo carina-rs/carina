@@ -371,6 +371,42 @@ fn snapshot_delete_orphan() {
     insta::assert_snapshot!(output);
 }
 
+/// A deleted orphan whose state carries a list-of-maps attribute
+/// (`domain_validation_options`) must render that attribute vertically
+/// (multi-line), not on one long unreadable line. Regression for the
+/// Delete path being asymmetric with the Create path in
+/// `build_detail_rows` / `build_delete_rows`.
+#[test]
+fn snapshot_delete_orphan_list_of_maps() {
+    use carina_core::resource::Value;
+    let (plan, current_states, schemas, _moved) =
+        build_plan_and_states_from_fixture("delete_orphan_list_of_maps");
+    let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = plan
+        .effects()
+        .iter()
+        .filter_map(|e| {
+            if let carina_core::effect::Effect::Delete { id, .. } = e {
+                current_states
+                    .get(id)
+                    .map(|s| (id.clone(), s.attributes.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &delete_attributes,
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+    ));
+    insta::assert_snapshot!(output);
+}
+
 #[test]
 fn snapshot_compact() {
     let (plan, _schemas, _moved) = build_plan_from_fixture("compact");
