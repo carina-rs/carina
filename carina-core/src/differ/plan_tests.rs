@@ -1204,7 +1204,14 @@ fn wait_binding_lowers_to_wait_effect() {
     use crate::wait::predicate::{AttrPath, WaitPredicate};
 
     let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
-    let resources = vec![cert];
+    // A downstream consumer that references the wait binding and is
+    // itself a pending change (Create) — carina#3101: the wait is
+    // emitted only when it gates a real downstream change.
+    let mut consumer = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
+    consumer
+        .dependency_bindings
+        .insert("cert_issued".to_string());
+    let resources = vec![cert, consumer];
 
     let wait = WaitBinding {
         binding: "cert_issued".into(),
@@ -1276,7 +1283,13 @@ fn wait_uses_schema_default_timeout_when_omitted() {
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
-    let resources = vec![cert];
+    // Downstream consumer with a pending change so the wait gates
+    // something (carina#3101).
+    let mut consumer = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
+    consumer
+        .dependency_bindings
+        .insert("cert_issued".to_string());
+    let resources = vec![cert, consumer];
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -1361,5 +1374,120 @@ fn wait_with_unknown_target_emits_plan_error() {
         plan.errors()[0].message.contains("nonexistent"),
         "error message should mention the missing target, got: {}",
         plan.errors()[0].message
+    );
+}
+
+/// carina#3101: a `wait` gates nothing when every downstream consumer
+/// is unchanged — no `Effect::Wait` (no lone `> binding (until …)`
+/// header on a 0-change plan, no apply-time poll). Mirrors the real
+/// `carina-rs/infra registry/dev/registry` shape: cert (unchanged) +
+/// distribution (unchanged) referencing `cert_issued`.
+#[test]
+fn wait_omitted_when_all_consumers_unchanged() {
+    use crate::effect::Effect;
+    use crate::parser::{UntilPredicateAst, WaitBinding};
+
+    let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
+    let mut dist = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
+    dist.dependency_bindings.insert("cert_issued".to_string());
+    let resources = vec![cert, dist];
+
+    // Both resources already exist with identical state → NoChange,
+    // so neither produces a mutating effect.
+    let mut current_states = HashMap::new();
+    current_states.insert(
+        ResourceId::new("acm.Certificate", "cert"),
+        State::existing(ResourceId::new("acm.Certificate", "cert"), HashMap::new()),
+    );
+    current_states.insert(
+        ResourceId::new("cloudfront.Distribution", "dist"),
+        State::existing(
+            ResourceId::new("cloudfront.Distribution", "dist"),
+            HashMap::new(),
+        ),
+    );
+
+    let wait = WaitBinding {
+        binding: "cert_issued".into(),
+        target: "cert".into(),
+        until_raw: "cert.status == ISSUED".to_string(),
+        until_predicate: UntilPredicateAst {
+            lhs_segments: vec!["cert".to_string(), "status".to_string()],
+            rhs: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+        },
+        timeout_secs: Some(60),
+        depends_on: vec![],
+        line: 1,
+    };
+
+    let plan = create_plan(
+        &resources,
+        &current_states,
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &[wait],
+    );
+
+    assert!(
+        !plan
+            .effects()
+            .iter()
+            .any(|e| matches!(e, Effect::Wait { .. })),
+        "carina#3101: no Effect::Wait when every consumer is unchanged; \
+         effects were {:?}",
+        plan.effects()
+    );
+}
+
+/// carina#3101 counterpart (two-faced invariant, like carina#3085):
+/// the wait IS emitted when a downstream consumer has a pending change
+/// — the dependency-edge behavior (carina#3085 / carina#3061) must not
+/// regress just because the no-op case is now suppressed.
+#[test]
+fn wait_emitted_when_a_consumer_has_a_pending_change() {
+    use crate::effect::Effect;
+    use crate::parser::{UntilPredicateAst, WaitBinding};
+
+    let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
+    // `dist` is new (absent from current_states) → Create → mutating.
+    let mut dist = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
+    dist.dependency_bindings.insert("cert_issued".to_string());
+    let resources = vec![cert, dist];
+
+    let wait = WaitBinding {
+        binding: "cert_issued".into(),
+        target: "cert".into(),
+        until_raw: "cert.status == ISSUED".to_string(),
+        until_predicate: UntilPredicateAst {
+            lhs_segments: vec!["cert".to_string(), "status".to_string()],
+            rhs: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+        },
+        timeout_secs: Some(60),
+        depends_on: vec![],
+        line: 1,
+    };
+
+    let plan = create_plan(
+        &resources,
+        &HashMap::new(),
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &[wait],
+    );
+
+    assert!(
+        plan.effects()
+            .iter()
+            .any(|e| matches!(e, Effect::Wait { binding, .. } if binding == "cert_issued")),
+        "carina#3101: the wait must still be emitted when a consumer \
+         has a pending change (carina#3085/#3061 not regressed); \
+         effects were {:?}",
+        plan.effects()
     );
 }

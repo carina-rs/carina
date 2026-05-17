@@ -1,6 +1,11 @@
 # Plan-display fixture exercising the `wait` construct (carina#2825).
-# `cert_issued` blocks downstream resources until ACM marks the cert
-# ISSUED; the snapshot pins how plan tree renders the wait line.
+# No resource here references `cert_issued`, so per carina#3101 the
+# wait gates nothing and is intentionally NOT rendered (it would
+# otherwise be a lone `> cert_issued (until …)` line that polls on
+# apply for no reason). The snapshot pins that suppression. The
+# wait-IS-rendered path (a consumer with a pending change) is covered
+# by `wait_emitted_when_a_consumer_has_a_pending_change` in
+# differ/plan_tests.rs.
 
 provider aws {
     region = "us-east-1"
