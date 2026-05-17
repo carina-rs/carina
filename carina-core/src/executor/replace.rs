@@ -118,7 +118,7 @@ pub(super) async fn execute_cbd_replace_parallel(
     ctx: &ReplaceContext<'_>,
     observer: &dyn ExecutionObserver,
 ) -> SingleEffectResult {
-    let resolved = match resolve_resource(ctx.to, ctx.bindings, ctx.pipeline) {
+    let resolved = match resolve_resource(ctx.to, ctx.bindings, ctx.pipeline).await {
         Ok(r) => r,
         Err(e) => {
             observer.on_event(&ExecutionEvent::EffectFailed {
@@ -157,6 +157,7 @@ pub(super) async fn execute_cbd_replace_parallel(
             let mut cascade_failed = false;
             for cascade in ctx.cascading_updates {
                 let resolved_to = match resolve_resource(&cascade.to, &local_bindings, ctx.pipeline)
+                    .await
                 {
                     Ok(r) => r,
                     Err(e) => {
@@ -386,7 +387,9 @@ pub(super) async fn execute_dbd_replace_parallel(
                 resolve_source,
                 ctx.bindings,
                 ctx.pipeline,
-            ) {
+            )
+            .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     observer.on_event(&ExecutionEvent::EffectFailed {

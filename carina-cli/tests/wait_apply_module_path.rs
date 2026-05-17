@@ -390,11 +390,13 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
 
     let provider = NoopProvider { cert_publishes_arn };
     let preprocessor = PlanPreprocessor::new(&NoopNormalizer, &ctx);
-    preprocessor.prepare(
-        &mut resources_for_plan,
-        &mut current_states,
-        &parsed.providers,
-    );
+    preprocessor
+        .prepare(
+            &mut resources_for_plan,
+            &mut current_states,
+            &parsed.providers,
+        )
+        .await;
 
     let plan = create_plan(
         &resources_for_plan,

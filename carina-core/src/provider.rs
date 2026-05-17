@@ -423,20 +423,40 @@ pub trait Provider: Send + Sync {
     ) -> BoxFuture<'_, ProviderResult<()>>;
 }
 
+/// Convenience for a `ProviderNormalizer` method that does nothing.
+///
+/// Returns an immediately-ready future. A `BoxFuture`-returning trait
+/// method cannot have an empty `{}` default body, so every "I don't
+/// normalize this" implementation returns this explicitly — keeping the
+/// no-op a deliberate, visible choice rather than a silent default
+/// (the hazard that caused carina-rs/carina-provider-awscc#192).
+pub fn ready_noop<'a>() -> BoxFuture<'a, ()> {
+    Box::pin(async {})
+}
+
 /// Plan-time normalizer for a provider.
 ///
 /// Normalizes desired state and read state so that diffs produce correct
 /// plans. Uses provider-specific schema knowledge. Separated from `Provider`
-/// because these operations are synchronous, plan-time concerns rather
-/// than runtime CRUD.
+/// because these are normalization concerns rather than runtime CRUD.
+///
+/// The methods are **async** (returning [`BoxFuture`], mirroring the
+/// [`Provider`] trait) so a host implementation that drives an async
+/// backend — e.g. `WasmProviderNormalizer` `.await`ing the WASM guest's
+/// store lock — does so directly, without a synchronous method bridging
+/// to async via a nested `block_on` (the self-deadlock fixed by
+/// carina#3112). Each method mutates its arguments in place and returns
+/// nothing; the returned future borrows the arguments for `'a`, so
+/// callers must `.await` it before the borrow ends (they always do —
+/// the futures are never run concurrently).
 pub trait ProviderNormalizer: Send + Sync {
     /// Normalize desired resource state before diffing.
     ///
     /// For example, resolves bare enum identifiers like `advanced` or
     /// `Tier.advanced` into fully-qualified DSL format like
     /// `awscc.ec2_ipam.Tier.advanced` based on schema definitions.
-    /// Default implementation is a no-op for providers without enum types.
-    fn normalize_desired(&self, _resources: &mut [Resource]) {}
+    /// Providers without enum types return [`ready_noop`].
+    fn normalize_desired<'a>(&'a self, resources: &'a mut [Resource]) -> BoxFuture<'a, ()>;
 
     /// Normalize current state values before diffing.
     ///
@@ -445,8 +465,11 @@ pub trait ProviderNormalizer: Send + Sync {
     /// (e.g., `"awscc.ec2.Subnet.AvailabilityZone.ap_northeast_1a"`).
     /// This prevents false diffs when state stores raw AWS values but
     /// desired state has been normalized.
-    /// Default implementation is a no-op.
-    fn normalize_state(&self, _current_states: &mut HashMap<ResourceId, State>) {}
+    /// Providers without enum types return [`ready_noop`].
+    fn normalize_state<'a>(
+        &'a self,
+        current_states: &'a mut HashMap<ResourceId, State>,
+    ) -> BoxFuture<'a, ()>;
 
     /// Hydrate read state with saved attributes that APIs don't return.
     ///
@@ -454,13 +477,12 @@ pub trait ProviderNormalizer: Send + Sync {
     /// responses (create-only properties, or normal properties like `description`
     /// on some resources). This method carries them forward from previously
     /// saved attribute values.
-    /// Default implementation is a no-op.
-    fn hydrate_read_state(
-        &self,
-        _current_states: &mut HashMap<ResourceId, State>,
-        _saved_attrs: &SavedAttrs,
-    ) {
-    }
+    /// Providers that don't hydrate return [`ready_noop`].
+    fn hydrate_read_state<'a>(
+        &'a self,
+        current_states: &'a mut HashMap<ResourceId, State>,
+        saved_attrs: &'a SavedAttrs,
+    ) -> BoxFuture<'a, ()>;
 
     /// Merge default tags from provider configuration into resources that support tags.
     ///
@@ -471,29 +493,49 @@ pub trait ProviderNormalizer: Send + Sync {
     /// Records which tag keys came from defaults in the `_default_tag_keys` internal
     /// metadata attribute.
     ///
-    /// No default: an implicit no-op silently swallowed
+    /// No default body: an implicit no-op silently swallowed
     /// `WasmProviderNormalizer`'s missing dispatch in
     /// carina-rs/carina-provider-awscc#192. Every implementation now picks
     /// explicitly between [`merge_default_tags_for_provider`], a custom
-    /// merge, or [`NoopNormalizer`]'s deliberate no-op.
-    fn merge_default_tags(
-        &self,
-        resources: &mut [Resource],
-        default_tags: &IndexMap<String, Value>,
-        registry: &SchemaRegistry,
-    );
+    /// merge, or [`ready_noop`]'s deliberate no-op.
+    fn merge_default_tags<'a>(
+        &'a self,
+        resources: &'a mut [Resource],
+        default_tags: &'a IndexMap<String, Value>,
+        registry: &'a SchemaRegistry,
+    ) -> BoxFuture<'a, ()>;
 }
 
 /// A no-op normalizer for providers that don't need plan-time normalization.
 #[derive(Debug, Clone, Copy)]
 pub struct NoopNormalizer;
 impl ProviderNormalizer for NoopNormalizer {
-    fn merge_default_tags(
-        &self,
-        _resources: &mut [Resource],
-        _default_tags: &IndexMap<String, Value>,
-        _registry: &SchemaRegistry,
-    ) {
+    fn normalize_desired<'a>(&'a self, _resources: &'a mut [Resource]) -> BoxFuture<'a, ()> {
+        ready_noop()
+    }
+
+    fn normalize_state<'a>(
+        &'a self,
+        _current_states: &'a mut HashMap<ResourceId, State>,
+    ) -> BoxFuture<'a, ()> {
+        ready_noop()
+    }
+
+    fn hydrate_read_state<'a>(
+        &'a self,
+        _current_states: &'a mut HashMap<ResourceId, State>,
+        _saved_attrs: &'a SavedAttrs,
+    ) -> BoxFuture<'a, ()> {
+        ready_noop()
+    }
+
+    fn merge_default_tags<'a>(
+        &'a self,
+        _resources: &'a mut [Resource],
+        _default_tags: &'a IndexMap<String, Value>,
+        _registry: &'a SchemaRegistry,
+    ) -> BoxFuture<'a, ()> {
+        ready_noop()
     }
 }
 
@@ -696,37 +738,52 @@ impl Provider for ProviderRouter {
 }
 
 impl ProviderNormalizer for ProviderRouter {
-    fn normalize_desired(&self, resources: &mut [Resource]) {
-        for ext in &self.normalizers {
-            ext.normalize_desired(resources);
-        }
+    fn normalize_desired<'a>(&'a self, resources: &'a mut [Resource]) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            // Sequential, never concurrent: normalizers are not
+            // commutative, and `resources` is re-borrowed per iteration
+            // across the `.await`.
+            for ext in &self.normalizers {
+                ext.normalize_desired(resources).await;
+            }
+        })
     }
 
-    fn normalize_state(&self, current_states: &mut HashMap<ResourceId, State>) {
-        for ext in &self.normalizers {
-            ext.normalize_state(current_states);
-        }
+    fn normalize_state<'a>(
+        &'a self,
+        current_states: &'a mut HashMap<ResourceId, State>,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            for ext in &self.normalizers {
+                ext.normalize_state(current_states).await;
+            }
+        })
     }
 
-    fn hydrate_read_state(
-        &self,
-        current_states: &mut HashMap<ResourceId, State>,
-        saved_attrs: &SavedAttrs,
-    ) {
-        for ext in &self.normalizers {
-            ext.hydrate_read_state(current_states, saved_attrs);
-        }
+    fn hydrate_read_state<'a>(
+        &'a self,
+        current_states: &'a mut HashMap<ResourceId, State>,
+        saved_attrs: &'a SavedAttrs,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            for ext in &self.normalizers {
+                ext.hydrate_read_state(current_states, saved_attrs).await;
+            }
+        })
     }
 
-    fn merge_default_tags(
-        &self,
-        resources: &mut [Resource],
-        default_tags: &IndexMap<String, Value>,
-        registry: &SchemaRegistry,
-    ) {
-        for ext in &self.normalizers {
-            ext.merge_default_tags(resources, default_tags, registry);
-        }
+    fn merge_default_tags<'a>(
+        &'a self,
+        resources: &'a mut [Resource],
+        default_tags: &'a IndexMap<String, Value>,
+        registry: &'a SchemaRegistry,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            for ext in &self.normalizers {
+                ext.merge_default_tags(resources, default_tags, registry)
+                    .await;
+            }
+        })
     }
 }
 
@@ -1753,48 +1810,60 @@ mod tests {
         );
     }
 
-    #[test]
-    fn provider_normalizer_separate_from_runtime() {
+    #[tokio::test]
+    async fn provider_normalizer_separate_from_runtime() {
         // Verify that ProviderNormalizer can be implemented independently from Provider.
         // A provider implementing both traits should have its schema extension
         // methods callable without going through the Provider trait.
         struct SchemaOnlyProvider;
 
         impl ProviderNormalizer for SchemaOnlyProvider {
-            fn normalize_desired(&self, resources: &mut [Resource]) {
-                // Prefix all string attribute values with "normalized:"
-                for resource in resources.iter_mut() {
-                    for value in resource.attributes.values_mut() {
-                        if let Value::Concrete(ConcreteValue::String(s)) = value {
-                            *s = format!("normalized:{}", s);
+            fn normalize_desired<'a>(&'a self, resources: &'a mut [Resource]) -> BoxFuture<'a, ()> {
+                Box::pin(async move {
+                    // Prefix all string attribute values with "normalized:"
+                    for resource in resources.iter_mut() {
+                        for value in resource.attributes.values_mut() {
+                            if let Value::Concrete(ConcreteValue::String(s)) = value {
+                                *s = format!("normalized:{}", s);
+                            }
                         }
                     }
-                }
+                })
             }
 
-            fn hydrate_read_state(
-                &self,
-                states: &mut HashMap<ResourceId, State>,
-                saved: &SavedAttrs,
-            ) {
-                for (id, saved_attrs) in saved {
-                    if let Some(state) = states.get_mut(id) {
-                        for (key, value) in saved_attrs {
-                            state
-                                .attributes
-                                .entry(key.clone())
-                                .or_insert_with(|| value.clone());
+            fn normalize_state<'a>(
+                &'a self,
+                _current_states: &'a mut HashMap<ResourceId, State>,
+            ) -> BoxFuture<'a, ()> {
+                ready_noop()
+            }
+
+            fn hydrate_read_state<'a>(
+                &'a self,
+                states: &'a mut HashMap<ResourceId, State>,
+                saved: &'a SavedAttrs,
+            ) -> BoxFuture<'a, ()> {
+                Box::pin(async move {
+                    for (id, saved_attrs) in saved {
+                        if let Some(state) = states.get_mut(id) {
+                            for (key, value) in saved_attrs {
+                                state
+                                    .attributes
+                                    .entry(key.clone())
+                                    .or_insert_with(|| value.clone());
+                            }
                         }
                     }
-                }
+                })
             }
 
-            fn merge_default_tags(
-                &self,
-                _resources: &mut [Resource],
-                _default_tags: &IndexMap<String, Value>,
-                _registry: &SchemaRegistry,
-            ) {
+            fn merge_default_tags<'a>(
+                &'a self,
+                _resources: &'a mut [Resource],
+                _default_tags: &'a IndexMap<String, Value>,
+                _registry: &'a SchemaRegistry,
+            ) -> BoxFuture<'a, ()> {
+                ready_noop()
             }
         }
 
@@ -1804,7 +1873,7 @@ mod tests {
             "key",
             Value::Concrete(ConcreteValue::String("value".to_string())),
         )];
-        ext.normalize_desired(&mut resources);
+        ext.normalize_desired(&mut resources).await;
         assert_eq!(
             resources[0].get_attr("key"),
             Some(&Value::Concrete(ConcreteValue::String(
@@ -1824,15 +1893,15 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("data".to_string())),
             )]),
         );
-        ext.hydrate_read_state(&mut states, &saved);
+        ext.hydrate_read_state(&mut states, &saved).await;
         assert_eq!(
             states.get(&id).unwrap().attributes.get("restored"),
             Some(&Value::Concrete(ConcreteValue::String("data".to_string())))
         );
     }
 
-    #[test]
-    fn provider_router_delegates_normalizer() {
+    #[tokio::test]
+    async fn provider_router_delegates_normalizer() {
         // Test that ProviderRouter delegates ProviderNormalizer methods to sub-providers
         struct NormalizingProvider;
 
@@ -1891,24 +1960,42 @@ mod tests {
         // Separate schema ext struct for the router
         struct TestNormalizer;
         impl ProviderNormalizer for TestNormalizer {
-            fn normalize_desired(&self, resources: &mut [Resource]) {
-                for resource in resources.iter_mut() {
-                    if resource.id.provider == "normalizing" {
-                        for value in resource.attributes.values_mut() {
-                            if let Value::Concrete(ConcreteValue::String(s)) = value {
-                                *s = format!("norm:{}", s);
+            fn normalize_desired<'a>(&'a self, resources: &'a mut [Resource]) -> BoxFuture<'a, ()> {
+                Box::pin(async move {
+                    for resource in resources.iter_mut() {
+                        if resource.id.provider == "normalizing" {
+                            for value in resource.attributes.values_mut() {
+                                if let Value::Concrete(ConcreteValue::String(s)) = value {
+                                    *s = format!("norm:{}", s);
+                                }
                             }
                         }
                     }
-                }
+                })
             }
 
-            fn merge_default_tags(
-                &self,
-                _resources: &mut [Resource],
-                _default_tags: &IndexMap<String, Value>,
-                _registry: &SchemaRegistry,
-            ) {
+            fn normalize_state<'a>(
+                &'a self,
+                _current_states: &'a mut HashMap<ResourceId, State>,
+            ) -> BoxFuture<'a, ()> {
+                ready_noop()
+            }
+
+            fn hydrate_read_state<'a>(
+                &'a self,
+                _current_states: &'a mut HashMap<ResourceId, State>,
+                _saved_attrs: &'a SavedAttrs,
+            ) -> BoxFuture<'a, ()> {
+                ready_noop()
+            }
+
+            fn merge_default_tags<'a>(
+                &'a self,
+                _resources: &'a mut [Resource],
+                _default_tags: &'a IndexMap<String, Value>,
+                _registry: &'a SchemaRegistry,
+            ) -> BoxFuture<'a, ()> {
+                ready_noop()
             }
         }
 
@@ -1922,7 +2009,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("val".to_string())),
             ),
         ];
-        router.normalize_desired(&mut resources);
+        router.normalize_desired(&mut resources).await;
         assert_eq!(
             resources[0].get_attr("key"),
             Some(&Value::Concrete(ConcreteValue::String(

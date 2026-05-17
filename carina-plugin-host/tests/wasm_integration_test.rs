@@ -281,7 +281,7 @@ async fn test_wasm_mock_provider_normalizer() {
         r
     }];
     let original_attrs = resources[0].resolved_attributes();
-    normalizer.normalize_desired(&mut resources);
+    normalizer.normalize_desired(&mut resources).await;
     assert_eq!(resources[0].resolved_attributes(), original_attrs);
 
     // normalize_state: mock provider returns states unchanged
@@ -292,7 +292,7 @@ async fn test_wasm_mock_provider_normalizer() {
     )]);
     let state = carina_core::resource::State::existing(id.clone(), attrs.clone());
     let mut states = HashMap::from([(id.clone(), state)]);
-    normalizer.normalize_state(&mut states);
+    normalizer.normalize_state(&mut states).await;
     let result_state = states.values().next().unwrap();
     assert_eq!(
         result_state.attributes.get("key"),
@@ -333,7 +333,9 @@ async fn test_wasm_mock_provider_merge_default_tags_dispatches_through_wit() {
         ),
     ]);
 
-    normalizer.merge_default_tags(&mut resources, &default_tags, &registry);
+    normalizer
+        .merge_default_tags(&mut resources, &default_tags, &registry)
+        .await;
 
     let echoed = resources[0]
         .get_attr("__mock_merged_default_tags__")
@@ -363,7 +365,9 @@ async fn test_wasm_mock_provider_merge_default_tags_empty_short_circuits() {
     )];
     let default_tags: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
 
-    normalizer.merge_default_tags(&mut resources, &default_tags, &registry);
+    normalizer
+        .merge_default_tags(&mut resources, &default_tags, &registry)
+        .await;
 
     assert!(
         resources[0]
@@ -394,7 +398,9 @@ async fn test_wasm_mock_provider_merge_default_tags_preserves_order() {
         Value::Concrete(ConcreteValue::String("dev".to_string())),
     )]);
 
-    normalizer.merge_default_tags(&mut resources, &default_tags, &registry);
+    normalizer
+        .merge_default_tags(&mut resources, &default_tags, &registry)
+        .await;
 
     assert_eq!(resources[0].id.name.as_str(), "alpha");
     assert_eq!(resources[1].id.name.as_str(), "beta");

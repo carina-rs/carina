@@ -1752,191 +1752,204 @@ unsafe impl Send for WasmProviderNormalizer {}
 unsafe impl Sync for WasmProviderNormalizer {}
 
 impl ProviderNormalizer for WasmProviderNormalizer {
-    fn normalize_desired(&self, resources: &mut [Resource]) {
-        let wit_resources: Vec<_> = expect_unresolvable_absent(
-            resources
-                .iter()
-                .map(wasm_convert::core_to_wit_resource)
-                .collect::<Result<Vec<_>, _>>(),
-            "normalize_desired",
-        );
+    fn normalize_desired<'a>(
+        &'a self,
+        resources: &'a mut [Resource],
+    ) -> carina_core::provider::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let wit_resources: Vec<_> = expect_unresolvable_absent(
+                resources
+                    .iter()
+                    .map(wasm_convert::core_to_wit_resource)
+                    .collect::<Result<Vec<_>, _>>(),
+                "normalize_desired",
+            );
 
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
+            // Plain `.await` on the store lock, not a nested `block_on`:
+            // the guard is acquired and dropped within this one polled
+            // future, so the apply-path `renormalize` calling this once
+            // per resource cannot self-deadlock (carina#3112).
+            let result = {
                 let mut store = self.instance.store.lock().await;
                 store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
                 self.instance
                     .bindings
                     .call_normalize_desired(&mut store, &wit_resources)
                     .await
-            })
-        });
+            };
 
-        match result {
-            Ok(result) => {
-                // `PlanPreprocessor::prepare` strips every attribute that
-                // recursively contains `Value::Deferred(DeferredValue::ResourceRef)` (alongside
-                // `Value::Deferred(DeferredValue::Unknown)`) before this normalizer runs and
-                // restores them afterwards (#2387), so we can blindly
-                // accept everything the WASM normalizer returns — the
-                // pre-#2387 `contains_resource_ref` overwrite-skip
-                // workaround is no longer reachable.
-                for (core_res, wit_res) in resources.iter_mut().zip(result.iter()) {
-                    let resolved = wasm_convert::wit_to_core_value_map(&wit_res.attributes);
-                    for (key, value) in resolved {
-                        core_res.attributes.insert(key, value);
+            match result {
+                Ok(result) => {
+                    // `PlanPreprocessor::prepare` strips every attribute that
+                    // recursively contains `Value::Deferred(DeferredValue::ResourceRef)` (alongside
+                    // `Value::Deferred(DeferredValue::Unknown)`) before this normalizer runs and
+                    // restores them afterwards (#2387), so we can blindly
+                    // accept everything the WASM normalizer returns — the
+                    // pre-#2387 `contains_resource_ref` overwrite-skip
+                    // workaround is no longer reachable.
+                    for (core_res, wit_res) in resources.iter_mut().zip(result.iter()) {
+                        let resolved = wasm_convert::wit_to_core_value_map(&wit_res.attributes);
+                        for (key, value) in resolved {
+                            core_res.attributes.insert(key, value);
+                        }
                     }
                 }
+                Err(e) => log::error!("WASM trap in normalize_desired: {e}"),
             }
-            Err(e) => log::error!("WASM trap in normalize_desired: {e}"),
-        }
+        })
     }
 
-    fn normalize_state(&self, current_states: &mut HashMap<ResourceId, State>) {
-        let wit_states: Vec<(String, _)> = current_states
-            .iter()
-            .map(|(id, state)| {
-                let wit = expect_unresolvable_absent(
-                    wasm_convert::core_to_wit_state(state),
-                    "normalize_state",
-                );
-                (id.to_string(), wit)
-            })
-            .collect();
+    fn normalize_state<'a>(
+        &'a self,
+        current_states: &'a mut HashMap<ResourceId, State>,
+    ) -> carina_core::provider::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let wit_states: Vec<(String, _)> = current_states
+                .iter()
+                .map(|(id, state)| {
+                    let wit = expect_unresolvable_absent(
+                        wasm_convert::core_to_wit_state(state),
+                        "normalize_state",
+                    );
+                    (id.to_string(), wit)
+                })
+                .collect();
 
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
+            // Plain `.await`, not a nested `block_on` — see `normalize_desired`.
+            let result = {
                 let mut store = self.instance.store.lock().await;
                 store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
                 self.instance
                     .bindings
                     .call_normalize_state(&mut store, &wit_states)
                     .await
-            })
-        });
+            };
 
-        match result {
-            Ok(result) => {
-                for state in current_states.values_mut() {
-                    let key = state.id.to_string();
-                    if let Some((_, wit_state)) = result.iter().find(|(k, _)| k == &key) {
-                        state.attributes =
-                            wasm_convert::wit_to_core_value_map(&wit_state.attributes);
+            match result {
+                Ok(result) => {
+                    for state in current_states.values_mut() {
+                        let key = state.id.to_string();
+                        if let Some((_, wit_state)) = result.iter().find(|(k, _)| k == &key) {
+                            state.attributes =
+                                wasm_convert::wit_to_core_value_map(&wit_state.attributes);
+                        }
                     }
                 }
+                Err(e) => log::error!("WASM trap in normalize_state: {e}"),
             }
-            Err(e) => log::error!("WASM trap in normalize_state: {e}"),
-        }
+        })
     }
 
-    fn hydrate_read_state(
-        &self,
-        current_states: &mut HashMap<ResourceId, State>,
-        saved_attrs: &SavedAttrs,
-    ) {
-        let wit_states: Vec<(String, _)> = current_states
-            .iter()
-            .map(|(id, state)| {
-                let wit = expect_unresolvable_absent(
-                    wasm_convert::core_to_wit_state(state),
-                    "hydrate_read_state (current_states)",
-                );
-                (id.to_string(), wit)
-            })
-            .collect();
+    fn hydrate_read_state<'a>(
+        &'a self,
+        current_states: &'a mut HashMap<ResourceId, State>,
+        saved_attrs: &'a SavedAttrs,
+    ) -> carina_core::provider::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let wit_states: Vec<(String, _)> = current_states
+                .iter()
+                .map(|(id, state)| {
+                    let wit = expect_unresolvable_absent(
+                        wasm_convert::core_to_wit_state(state),
+                        "hydrate_read_state (current_states)",
+                    );
+                    (id.to_string(), wit)
+                })
+                .collect();
 
-        let wit_saved: Vec<(String, Vec<(String, _)>)> = saved_attrs
-            .iter()
-            .map(|(id, attrs)| {
-                let wit = expect_unresolvable_absent(
-                    wasm_convert::core_to_wit_value_map(attrs),
-                    "hydrate_read_state (saved_attrs)",
-                );
-                (id.to_string(), wit)
-            })
-            .collect();
+            let wit_saved: Vec<(String, Vec<(String, _)>)> = saved_attrs
+                .iter()
+                .map(|(id, attrs)| {
+                    let wit = expect_unresolvable_absent(
+                        wasm_convert::core_to_wit_value_map(attrs),
+                        "hydrate_read_state (saved_attrs)",
+                    );
+                    (id.to_string(), wit)
+                })
+                .collect();
 
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
+            // Plain `.await`, not a nested `block_on` — see `normalize_desired`.
+            let result = {
                 let mut store = self.instance.store.lock().await;
                 store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
                 self.instance
                     .bindings
                     .call_hydrate_read_state(&mut store, &wit_states, &wit_saved)
                     .await
-            })
-        });
+            };
 
-        match result {
-            Ok(result) => {
-                for state in current_states.values_mut() {
-                    let key = state.id.to_string();
-                    if let Some((_, wit_state)) = result.iter().find(|(k, _)| k == &key) {
-                        state.attributes =
-                            wasm_convert::wit_to_core_value_map(&wit_state.attributes);
+            match result {
+                Ok(result) => {
+                    for state in current_states.values_mut() {
+                        let key = state.id.to_string();
+                        if let Some((_, wit_state)) = result.iter().find(|(k, _)| k == &key) {
+                            state.attributes =
+                                wasm_convert::wit_to_core_value_map(&wit_state.attributes);
+                        }
                     }
                 }
+                Err(e) => log::error!("WASM trap in hydrate_read_state: {e}"),
             }
-            Err(e) => log::error!("WASM trap in hydrate_read_state: {e}"),
-        }
+        })
     }
 
-    fn merge_default_tags(
-        &self,
-        resources: &mut [Resource],
-        default_tags: &IndexMap<String, Value>,
-        _registry: &carina_core::schema::SchemaRegistry,
-    ) {
-        if default_tags.is_empty() {
-            return;
-        }
+    fn merge_default_tags<'a>(
+        &'a self,
+        resources: &'a mut [Resource],
+        default_tags: &'a IndexMap<String, Value>,
+        _registry: &'a carina_core::schema::SchemaRegistry,
+    ) -> carina_core::provider::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if default_tags.is_empty() {
+                return;
+            }
 
-        let wit_resources: Vec<_> = expect_unresolvable_absent(
-            resources
+            let wit_resources: Vec<_> = expect_unresolvable_absent(
+                resources
+                    .iter()
+                    .map(wasm_convert::core_to_wit_resource)
+                    .collect::<Result<Vec<_>, _>>(),
+                "merge_default_tags",
+            );
+
+            // Per-key skip on serialize failure (vs. `core_to_wit_value_map`'s
+            // all-or-nothing) — one bad default tag must not nuke the whole
+            // merge for a multi-resource plan.
+            let wit_default_tags: Vec<(String, wit_types::Value)> = default_tags
                 .iter()
-                .map(wasm_convert::core_to_wit_resource)
-                .collect::<Result<Vec<_>, _>>(),
-            "merge_default_tags",
-        );
+                .filter_map(|(k, v)| match wasm_convert::core_to_wit_value(v) {
+                    Ok(wit_value) => Some((k.clone(), wit_value)),
+                    Err(e) => {
+                        log::error!("Skipping default_tag '{k}' with unresolvable value: {e}");
+                        None
+                    }
+                })
+                .collect();
 
-        // Per-key skip on serialize failure (vs. `core_to_wit_value_map`'s
-        // all-or-nothing) — one bad default tag must not nuke the whole
-        // merge for a multi-resource plan.
-        let wit_default_tags: Vec<(String, wit_types::Value)> = default_tags
-            .iter()
-            .filter_map(|(k, v)| match wasm_convert::core_to_wit_value(v) {
-                Ok(wit_value) => Some((k.clone(), wit_value)),
-                Err(e) => {
-                    log::error!("Skipping default_tag '{k}' with unresolvable value: {e}");
-                    None
-                }
-            })
-            .collect();
-
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
+            // Plain `.await`, not a nested `block_on` — see `normalize_desired`.
+            let result = {
                 let mut store = self.instance.store.lock().await;
                 store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
                 self.instance
                     .bindings
                     .call_merge_default_tags(&mut store, &wit_resources, &wit_default_tags)
                     .await
-            })
-        });
+            };
 
-        match result {
-            Ok(result) => {
-                // Guest preserves resource order; zip and overwrite
-                // attributes (merge may add `tags` and `_default_tag_keys`).
-                for (core_res, wit_res) in resources.iter_mut().zip(result.iter()) {
-                    let resolved = wasm_convert::wit_to_core_value_map(&wit_res.attributes);
-                    for (key, value) in resolved {
-                        core_res.attributes.insert(key, value);
+            match result {
+                Ok(result) => {
+                    // Guest preserves resource order; zip and overwrite
+                    // attributes (merge may add `tags` and `_default_tag_keys`).
+                    for (core_res, wit_res) in resources.iter_mut().zip(result.iter()) {
+                        let resolved = wasm_convert::wit_to_core_value_map(&wit_res.attributes);
+                        for (key, value) in resolved {
+                            core_res.attributes.insert(key, value);
+                        }
                     }
                 }
+                Err(e) => log::error!("WASM trap in merge_default_tags: {e}"),
             }
-            Err(e) => log::error!("WASM trap in merge_default_tags: {e}"),
-        }
+        })
     }
 }
 

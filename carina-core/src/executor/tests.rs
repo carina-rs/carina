@@ -255,25 +255,46 @@ fn canonicalize_value(v: &Value) -> Option<Value> {
 }
 
 impl crate::provider::ProviderNormalizer for CanonicalizingNormalizer {
-    fn normalize_desired(&self, resources: &mut [Resource]) {
-        for r in resources.iter_mut() {
-            let keys: Vec<String> = r.attributes.keys().cloned().collect();
-            for k in keys {
-                if let Some(v) = r.get_attr(&k)
-                    && let Some(nv) = canonicalize_value(v)
-                {
-                    r.set_attr(k, nv);
+    fn normalize_desired<'a>(
+        &'a self,
+        resources: &'a mut [Resource],
+    ) -> crate::provider::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            for r in resources.iter_mut() {
+                let keys: Vec<String> = r.attributes.keys().cloned().collect();
+                for k in keys {
+                    if let Some(v) = r.get_attr(&k)
+                        && let Some(nv) = canonicalize_value(v)
+                    {
+                        r.set_attr(k, nv);
+                    }
                 }
             }
-        }
+        })
     }
 
-    fn merge_default_tags(
-        &self,
-        _resources: &mut [Resource],
-        _default_tags: &indexmap::IndexMap<String, Value>,
-        _registry: &crate::schema::SchemaRegistry,
-    ) {
+    fn normalize_state<'a>(
+        &'a self,
+        _current_states: &'a mut HashMap<ResourceId, State>,
+    ) -> crate::provider::BoxFuture<'a, ()> {
+        crate::provider::ready_noop()
+    }
+
+    fn hydrate_read_state<'a>(
+        &'a self,
+        _current_states: &'a mut HashMap<ResourceId, State>,
+        _saved_attrs: &'a crate::provider::SavedAttrs,
+    ) -> crate::provider::BoxFuture<'a, ()> {
+        crate::provider::ready_noop()
+    }
+
+    fn merge_default_tags<'a>(
+        &'a self,
+        _resources: &'a mut [Resource],
+        _default_tags: &'a indexmap::IndexMap<String, Value>,
+        _registry: &'a crate::schema::SchemaRegistry,
+    ) -> crate::provider::BoxFuture<'a, ()> {
+        crate::provider::ready_noop()
     }
 }
 
@@ -769,6 +790,145 @@ async fn test_apply_renormalizes_nested_value_under_ref_bearing_resource() {
             "id-123".to_string()
         ))),
         "ResourceRef must resolve from a's post-create state"
+    );
+}
+
+/// carina#3112 regression: the apply-path `renormalize` (carina#3060)
+/// invokes `ProviderNormalizer::normalize_desired` from inside the
+/// async apply execution loop, multiple times in sequence (once per
+/// resource). The WASM normalizer host impl drives the async guest by
+/// `.await`ing a `tokio::sync::Mutex<Store>` lock.
+///
+/// While the trait was *synchronous*, `WasmProviderNormalizer` bridged
+/// sync→async with `block_in_place` + a nested
+/// `Handle::current().block_on(async { store.lock().await })`. A
+/// `tokio::sync::MutexGuard` from one nested `block_on` was not
+/// released before the next nested `block_on` re-acquired the same
+/// `Mutex` — a self-deadlock observed deterministically on the second
+/// `normalize_desired` of an apply.
+///
+/// This test models that exact shape with a normalizer that acquires a
+/// `tokio::sync::Mutex` *across an `.await`* inside `normalize_desired`,
+/// driven through the real `execute_plan` apply path over two
+/// resources (so `normalize_desired` runs twice in sequence). It only
+/// compiles once `ProviderNormalizer` is async (the impl `.await`s),
+/// and it only completes (rather than hanging) once the nested
+/// `block_on` is gone — `#[tokio::test(flavor = "current_thread")]`
+/// reproduces the single-runtime contention the real apply hits.
+#[tokio::test(flavor = "current_thread")]
+async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
+    use tokio::sync::Mutex as AsyncMutex;
+
+    /// Holds an async `Mutex` and acquires it across an `.await` inside
+    /// `normalize_desired` — the same lock-across-await shape the WASM
+    /// store lock has. A nested `block_on` around this would deadlock
+    /// the second time it runs.
+    struct LockHoldingNormalizer {
+        store: AsyncMutex<u32>,
+    }
+
+    impl crate::provider::ProviderNormalizer for LockHoldingNormalizer {
+        fn normalize_desired<'a>(
+            &'a self,
+            resources: &'a mut [Resource],
+        ) -> crate::provider::BoxFuture<'a, ()> {
+            Box::pin(async move {
+                let mut guard = self.store.lock().await;
+                *guard += 1;
+                let n = *guard;
+                drop(guard);
+                for r in resources.iter_mut() {
+                    r.set_attr(
+                        "normalize_count",
+                        Value::Concrete(ConcreteValue::String(n.to_string())),
+                    );
+                }
+            })
+        }
+
+        fn normalize_state<'a>(
+            &'a self,
+            _current_states: &'a mut HashMap<ResourceId, State>,
+        ) -> crate::provider::BoxFuture<'a, ()> {
+            crate::provider::ready_noop()
+        }
+
+        fn hydrate_read_state<'a>(
+            &'a self,
+            _current_states: &'a mut HashMap<ResourceId, State>,
+            _saved_attrs: &'a crate::provider::SavedAttrs,
+        ) -> crate::provider::BoxFuture<'a, ()> {
+            crate::provider::ready_noop()
+        }
+
+        fn merge_default_tags<'a>(
+            &'a self,
+            _resources: &'a mut [Resource],
+            _default_tags: &'a indexmap::IndexMap<String, Value>,
+            _registry: &'a crate::schema::SchemaRegistry,
+        ) -> crate::provider::BoxFuture<'a, ()> {
+            crate::provider::ready_noop()
+        }
+    }
+
+    let provider = MockProvider::new();
+    let ra = make_resource("a", &[]);
+    let ra_id = ra.id.clone();
+    // `b` carries a ResourceRef to `a`, forcing `resolve_resource` to
+    // rebuild attributes — the exact path that runs `renormalize`.
+    let rb = make_resource("b", &["a"]);
+    let rb_id = rb.id.clone();
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(ra));
+    plan.add(Effect::Create(rb));
+    provider.push_create(Ok(ok_state(&ra_id)));
+    provider.push_create(Ok(ok_state(&rb_id)));
+
+    let normalizer = LockHoldingNormalizer {
+        store: AsyncMutex::new(0),
+    };
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &normalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+    };
+
+    let observer = MockObserver::new();
+    // This guards the structural property the fix establishes: the
+    // apply path drives a lock-across-await normalizer to completion
+    // once per resource, in sequence, without re-acquiring the lock
+    // before the prior guard dropped. The literal WASM self-deadlock
+    // required the old *sync* trait + a nested `block_on` and can only
+    // be reproduced with a real WASM guest (the issue's user-driven
+    // real-infra smoke); this test cannot even express the old shape
+    // because the trait is now async — that is the point.
+    let result = execute_plan(&provider, input, &observer).await;
+    assert_eq!(
+        result.success_count, 2,
+        "both creates must complete — no self-deadlock acquiring the \
+         normalizer's async lock a second time"
+    );
+
+    // Each resource's `normalize_desired` acquired the lock exactly
+    // once and ran in sequence (counts 1 and 2), proving the futures
+    // were driven to completion sequentially, not concurrently.
+    let counts: std::collections::HashSet<String> = provider
+        .captured_create_resources()
+        .iter()
+        .filter_map(|r| match r.get_attr("normalize_count") {
+            Some(Value::Concrete(ConcreteValue::String(s))) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        counts,
+        ["1".to_string(), "2".to_string()].into_iter().collect(),
+        "normalize_desired must have run once per resource, in sequence"
     );
 }
 
