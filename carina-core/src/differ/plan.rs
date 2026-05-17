@@ -399,6 +399,29 @@ pub fn create_plan(
             });
             continue;
         };
+        // A `wait`'s only purpose is to gate downstream resources that
+        // reference `<wait-binding>.<attr>` until the `until` predicate
+        // holds (design value semantics: consumers that don't need the
+        // wait reference the target directly and skip it). So emit the
+        // `Effect::Wait` only when at least one resource that depends
+        // on this wait binding has a pending infrastructure change in
+        // this plan. If every consumer is unchanged (or there is no
+        // consumer at all), the wait gates nothing — emitting it would
+        // render a lone `> <binding> (until …)` header on a no-change
+        // plan and poll the target on `apply` for no reason
+        // (carina#3101). A genuinely pending consumer change still
+        // produces the wait + its dependency edge (carina#3085 /
+        // carina#3061 behavior preserved).
+        let gates_a_pending_change = desired.iter().any(|r| {
+            get_resource_dependencies(r).contains(wb.binding.as_str())
+                && plan
+                    .effects()
+                    .iter()
+                    .any(|e| e.resource_id() == &r.id && e.is_mutating())
+        });
+        if !gates_a_pending_change {
+            continue;
+        }
         // `lhs_segments` is guaranteed non-empty and the first segment
         // equals `wb.target` (enforced by `parse_wait_expr`). The
         // predicate attribute path is therefore `lhs_segments[1..]`.

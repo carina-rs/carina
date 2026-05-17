@@ -7,8 +7,6 @@ Execution Plan:
   + aws.acm.Certificate cert
       domain_name: "registry.example.com"
       validation_method: "DNS"
-        │
-        └─ > cert_issued (until cert.status == aws.acm.Certificate.Status.Issued)
   + aws.route53.RecordSet validation_record
       hosted_zone_id: "Z123"
       name: "_acme.registry.example.com"
