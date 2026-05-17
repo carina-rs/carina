@@ -6,7 +6,7 @@ use colored::Colorize;
 
 use futures::stream::{self, StreamExt};
 
-use carina_core::binding_index::ResolvedBindings;
+use carina_core::binding_index::{ResolvedBindings, WaitAliasSpec};
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
@@ -298,7 +298,8 @@ pub(crate) async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), 
     // no source-side view of which exports the user intends — see the
     // `FinalizeApplyInput::export_params` doc-comment.
     if let Some(params) = input.export_params {
-        state.exports = resolve_exports(params, input.sorted_resources, &state)?;
+        state.exports =
+            resolve_exports(params, input.sorted_resources, &state, input.wait_aliases)?;
     }
 
     if let Some(lock) = input.lock {
@@ -352,9 +353,10 @@ pub(crate) async fn persist_exports_only(
     state_file: Option<StateFile>,
     sorted_resources: &[Resource],
     export_params: &[carina_core::parser::InferredExportParam],
+    wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
 ) -> Result<(), AppError> {
     let mut state = state_file.unwrap_or_default();
-    let exports = resolve_exports(export_params, sorted_resources, &state)?;
+    let exports = resolve_exports(export_params, sorted_resources, &state, wait_aliases)?;
     state.exports = exports;
     if let Some(lk) = lock {
         save_state_locked(backend, lk, &mut state).await?;
@@ -939,6 +941,16 @@ async fn run_apply_locked(
         pairs
     };
 
+    // Wait bindings become passthrough aliases to their targets
+    // (carina#3085). Built once here so every resolution phase below
+    // (data-source refresh, initial bindings, ref resolution, exports)
+    // applies the same passthrough.
+    let wait_aliases: Vec<WaitAliasSpec> = parsed
+        .wait_bindings
+        .iter()
+        .map(WaitAliasSpec::from)
+        .collect();
+
     // Phase 2: resolve data source inputs against the consolidated state
     // and refresh them via `read_data_source` (#1683, #1685).
     let resolved_data_sources = resolve_data_source_refs_for_refresh(
@@ -946,6 +958,7 @@ async fn run_apply_locked(
         &current_states,
         &remote_bindings,
         ctx.schemas(),
+        &wait_aliases,
     )?;
     let phase2_results: Vec<Result<(ResourceId, State), AppError>> =
         stream::iter(resolved_data_sources.iter())
@@ -971,11 +984,13 @@ async fn run_apply_locked(
         current_states.insert(id, state);
     }
 
-    // Build initial bindings for reference resolution
+    // Build initial bindings for reference resolution (wait_aliases
+    // defined above before Phase 2).
     let mut bindings = ResolvedBindings::from_resources_with_state(
         &sorted_resources,
         &current_states,
         &remote_bindings,
+        &wait_aliases,
     );
 
     // awscc#251: lift the provider-read `current_states` (not just
@@ -991,7 +1006,12 @@ async fn run_apply_locked(
 
     // Resolve references and enum identifiers, then create initial plan for display
     let mut resources_for_plan = sorted_resources.clone();
-    resolve_refs_with_state_and_remote(&mut resources_for_plan, &current_states, &remote_bindings)?;
+    resolve_refs_with_state_and_remote(
+        &mut resources_for_plan,
+        &current_states,
+        &remote_bindings,
+        &wait_aliases,
+    )?;
 
     // Type-level canonicalization for `Union[String, list(String)]`
     // fields (IAM-style `string_or_list_of_strings`). See #2481, #2511.
@@ -1054,6 +1074,7 @@ async fn run_apply_locked(
             &parsed.export_params,
             &sorted_resources,
             &current_states,
+            &wait_aliases,
         );
         let empty_exports = HashMap::new();
         let current_exports = state_file
@@ -1101,6 +1122,7 @@ async fn run_apply_locked(
             state_file,
             &sorted_resources,
             &parsed.export_params,
+            &wait_aliases,
         )
         .await?;
         return Ok(());
@@ -1130,6 +1152,7 @@ async fn run_apply_locked(
         &parsed.export_params,
         &sorted_resources,
         &current_states,
+        &wait_aliases,
     );
     let current_exports = state_file
         .as_ref()
@@ -1202,6 +1225,7 @@ async fn run_apply_locked(
         lock,
         schemas,
         export_params: Some(&parsed.export_params),
+        wait_aliases: &wait_aliases,
     })
     .await?;
 
@@ -1469,10 +1493,25 @@ async fn run_apply_from_plan_locked(
     if !plan_file.upstream_sources.is_empty() {
         verify_upstream_snapshot(&plan_file.upstream_sources, &upstream_snapshot, base_dir).await?;
     }
+    // Rebuild the wait passthrough aliases from the persisted
+    // `(binding, target)` pairs so `apply --plan`'s cascade
+    // re-resolution resolves `<wait-binding>.<attr>` exactly as the
+    // plan path did (carina#3085). `PlanWaitBinding` (String) →
+    // `WaitAliasSpec` (typed `BindingName`); the parser `WaitBinding`
+    // is not serializable so it is reconstructed here, not deserialized.
+    let wait_aliases: Vec<WaitAliasSpec> = plan_file
+        .wait_bindings
+        .iter()
+        .map(|wb| WaitAliasSpec {
+            binding: carina_core::parser::BindingName::new(wb.binding.clone()),
+            target: carina_core::parser::BindingName::new(wb.target.clone()),
+        })
+        .collect();
     let mut bindings = ResolvedBindings::from_resources_with_state(
         sorted_resources,
         &current_states,
         &upstream_snapshot,
+        &wait_aliases,
     );
 
     println!("{}", "Applying changes...".cyan().bold());
@@ -1523,6 +1562,10 @@ async fn run_apply_from_plan_locked(
         // Source-driven `carina apply` reconciles exports from the
         // `.crn` directly (#2932).
         export_params: None,
+        // No export resolution runs here (export_params is None), but
+        // the field is required; pass the reconstructed aliases so the
+        // value is correct if a future plan file persists export_params.
+        wait_aliases: &wait_aliases,
     })
     .await?;
 

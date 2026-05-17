@@ -804,10 +804,16 @@ pub(crate) async fn run_state_refresh_locked(
 
     // Re-resolve exports using refreshed state
     if !parsed.export_params.is_empty() {
+        let wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
+            .wait_bindings
+            .iter()
+            .map(carina_core::binding_index::WaitAliasSpec::from)
+            .collect();
         state.exports = crate::commands::shared::state_writeback::resolve_exports(
             &parsed.export_params,
             &sorted_resources,
             &state,
+            &wait_aliases,
         )?;
     }
 

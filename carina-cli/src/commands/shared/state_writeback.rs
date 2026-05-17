@@ -80,6 +80,15 @@ pub(crate) struct FinalizeApplyInput<'a> {
     /// intact for the next source-driven `carina apply` to
     /// reconcile.
     pub export_params: Option<&'a [carina_core::parser::InferredExportParam]>,
+    /// Wait-binding aliases (carina#3085). When export expressions
+    /// reference a `wait` binding (`exports { x = cert_issued.arn }`),
+    /// these make `<wait-binding>.<attr>` resolve to `<target>.<attr>`
+    /// at writeback, the same passthrough the plan path now applies.
+    /// Empty when the configuration declares no `wait` bindings, or
+    /// for the `apply --plan` path that has no source-side wait view
+    /// (paired with `export_params: None`, so no export resolution
+    /// runs there anyway).
+    pub wait_aliases: &'a [carina_core::binding_index::WaitAliasSpec],
 }
 
 /// Resolve export expressions using bindings built from applied state.
@@ -96,6 +105,7 @@ pub(crate) fn resolve_exports(
     export_params: &[carina_core::parser::InferredExportParam],
     sorted_resources: &[Resource],
     state: &StateFile,
+    wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
 ) -> Result<HashMap<String, serde_json::Value>, carina_core::value::SerializationError> {
     use carina_core::binding_index::ResolvedBindings;
     use carina_core::resource::Value;
@@ -133,6 +143,7 @@ pub(crate) fn resolve_exports(
         sorted_resources,
         &current_states,
         &HashMap::new(),
+        wait_aliases,
     );
 
     let mut exports = HashMap::new();

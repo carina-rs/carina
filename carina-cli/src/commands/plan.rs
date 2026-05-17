@@ -68,6 +68,32 @@ pub struct PlanFile {
     /// `apply --plan` can re-load each upstream and compare against
     /// `upstream_snapshot`.
     pub upstream_sources: Vec<UpstreamSource>,
+    /// `wait` binding → target binding pairs as declared in the
+    /// original `.crn` config (carina#3085). Persisted so `apply
+    /// --plan`'s cascade re-resolution can rebuild the wait
+    /// passthrough aliases (`<wait-binding>.<attr>` →
+    /// `<target>.<attr>`) without the parser `WaitBinding` (which is
+    /// not `Serialize` — same constraint that motivated
+    /// [`UpstreamSource`]). Only the `(binding, target)` pair is
+    /// persisted: the `until` predicate / timeout / `depends_on` are
+    /// effect-layer concerns already encoded in the serialized `plan`'s
+    /// `Effect::Wait`, not needed to rebuild the value-layer alias.
+    /// Empty when the configuration declares no `wait` bindings.
+    #[serde(default)]
+    pub wait_bindings: Vec<PlanWaitBinding>,
+}
+
+/// Serializable `(binding, target)` pair for a `wait` declaration —
+/// the value-layer half of a wait binding (carina#3085). The parser
+/// `carina_core::parser::WaitBinding` is not `Serialize`/`Deserialize`
+/// (pulling serde into `carina-core::parser::ast` has wider blast
+/// radius than warranted), so the plan file persists this minimal
+/// projection, mirroring [`UpstreamSource`]'s rationale. Converted to
+/// `carina_core::binding_index::WaitAliasSpec` at apply-from-plan time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanWaitBinding {
+    pub binding: String,
+    pub target: String,
 }
 
 /// Serializable representation of an `upstream_state` declaration's
@@ -127,6 +153,14 @@ fn build_plan_file<E>(
             .map(|us| UpstreamSource {
                 binding: us.binding.clone(),
                 source: us.source.clone(),
+            })
+            .collect(),
+        wait_bindings: parsed
+            .wait_bindings
+            .iter()
+            .map(|wb| PlanWaitBinding {
+                binding: wb.binding.as_str().to_string(),
+                target: wb.target.as_str().to_string(),
             })
             .collect(),
     })
@@ -357,10 +391,16 @@ pub async fn run_plan(
             .map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
     } else {
         // Resolve export values for display
+        let export_wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
+            .wait_bindings
+            .iter()
+            .map(carina_core::binding_index::WaitAliasSpec::from)
+            .collect();
         let resolved_exports = resolve_export_values_for_display(
             &parsed.export_params,
             &ctx.sorted_resources,
             &ctx.current_states,
+            &export_wait_aliases,
         );
         let current_exports = state_file
             .as_ref()
@@ -418,11 +458,13 @@ pub(crate) fn resolve_export_values_for_display(
     export_params: &[carina_core::parser::InferredExportParam],
     resources: &[Resource],
     current_states: &HashMap<ResourceId, State>,
+    wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
 ) -> Vec<carina_core::parser::InferredExportParam> {
     let bindings = carina_core::binding_index::ResolvedBindings::from_resources_with_state(
         resources,
         current_states,
         &HashMap::new(),
+        wait_aliases,
     );
 
     export_params

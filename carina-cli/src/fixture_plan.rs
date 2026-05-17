@@ -137,8 +137,18 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     // loader is already lenient about missing upstream state files (see
     // the loop above that silently skips them).
     let mut resources = sorted_resources.clone();
-    resolve_refs_for_plan(&mut resources, &current_states, &remote_bindings)
-        .expect("Failed to resolve refs with state");
+    let wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
+        .wait_bindings
+        .iter()
+        .map(carina_core::binding_index::WaitAliasSpec::from)
+        .collect();
+    resolve_refs_for_plan(
+        &mut resources,
+        &current_states,
+        &remote_bindings,
+        &wait_aliases,
+    )
+    .expect("Failed to resolve refs with state");
 
     // Type-level canonicalization for `Union[String, list(String)]`
     // fields. See #2481, #2511, #2513.

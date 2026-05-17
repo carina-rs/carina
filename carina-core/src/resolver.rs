@@ -29,16 +29,25 @@ pub fn resolve_refs_with_state(
     resources: &mut [Resource],
     current_states: &HashMap<ResourceId, State>,
 ) -> Result<(), String> {
-    resolve_refs_with_state_and_remote(resources, current_states, &HashMap::new())
+    resolve_refs_with_state_and_remote(resources, current_states, &HashMap::new(), &[])
 }
 
-/// Resolve all ResourceRef values in resources using current state and upstream state bindings.
+/// Resolve all ResourceRef values in resources using current state and
+/// upstream state bindings. `wait_aliases` makes `<wait-binding>.<attr>`
+/// resolve to `<target>.<attr>` (carina#3085 passthrough).
 pub fn resolve_refs_with_state_and_remote(
     resources: &mut [Resource],
     current_states: &HashMap<ResourceId, State>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    wait_aliases: &[crate::binding_index::WaitAliasSpec],
 ) -> Result<(), String> {
-    resolve_refs_inner(resources, current_states, remote_bindings, false)
+    resolve_refs_inner(
+        resources,
+        current_states,
+        remote_bindings,
+        wait_aliases,
+        false,
+    )
 }
 
 /// Plan-only counterpart used when an upstream's state file is missing or
@@ -53,14 +62,22 @@ pub fn resolve_refs_for_plan(
     resources: &mut [Resource],
     current_states: &HashMap<ResourceId, State>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    wait_aliases: &[crate::binding_index::WaitAliasSpec],
 ) -> Result<(), String> {
-    resolve_refs_inner(resources, current_states, remote_bindings, true)
+    resolve_refs_inner(
+        resources,
+        current_states,
+        remote_bindings,
+        wait_aliases,
+        true,
+    )
 }
 
 fn resolve_refs_inner(
     resources: &mut [Resource],
     current_states: &HashMap<ResourceId, State>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    wait_aliases: &[crate::binding_index::WaitAliasSpec],
     mark_unresolved_upstream: bool,
 ) -> Result<(), String> {
     // Save dependency bindings before resolution destroys ResourceRef values.
@@ -73,8 +90,12 @@ fn resolve_refs_inner(
         }
     }
 
-    let bindings =
-        ResolvedBindings::from_resources_with_state(resources, current_states, remote_bindings);
+    let bindings = ResolvedBindings::from_resources_with_state(
+        resources,
+        current_states,
+        remote_bindings,
+        wait_aliases,
+    );
 
     let upstream_binding_names: std::collections::HashSet<&str> = if mark_unresolved_upstream {
         remote_bindings.keys().map(String::as_str).collect()
@@ -408,7 +429,12 @@ mod tests {
                 make_resource(&format!("{}-resource", binding), Some(binding), attrs)
             })
             .collect();
-        ResolvedBindings::from_resources_with_state(&resources, &HashMap::new(), &HashMap::new())
+        ResolvedBindings::from_resources_with_state(
+            &resources,
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+        )
     }
 
     #[test]
@@ -1432,7 +1458,7 @@ mod tests {
         );
         remote_bindings.insert("network".to_string(), network_map);
 
-        resolve_refs_with_state_and_remote(&mut resources, &current_states, &remote_bindings)
+        resolve_refs_with_state_and_remote(&mut resources, &current_states, &remote_bindings, &[])
             .unwrap();
 
         assert_eq!(
@@ -1485,7 +1511,7 @@ mod tests {
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
-        resolve_refs_with_state_and_remote(&mut resources, &HashMap::new(), &remote_bindings)
+        resolve_refs_with_state_and_remote(&mut resources, &HashMap::new(), &remote_bindings, &[])
             .unwrap();
 
         assert_eq!(
@@ -1538,9 +1564,13 @@ mod tests {
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
-        let err =
-            resolve_refs_with_state_and_remote(&mut resources, &HashMap::new(), &remote_bindings)
-                .expect_err("missing key in concrete upstream map must error");
+        let err = resolve_refs_with_state_and_remote(
+            &mut resources,
+            &HashMap::new(),
+            &remote_bindings,
+            &[],
+        )
+        .expect_err("missing key in concrete upstream map must error");
         assert!(
             err.contains("orgs.accounts") && err.contains("registry_qa"),
             "error must name the upstream path and the missing key, got: {err}"
@@ -1582,9 +1612,13 @@ mod tests {
                 }),
             )],
         )];
-        let err =
-            resolve_refs_with_state_and_remote(&mut resources, &HashMap::new(), &remote_bindings)
-                .expect_err("empty map subscript must error");
+        let err = resolve_refs_with_state_and_remote(
+            &mut resources,
+            &HashMap::new(),
+            &remote_bindings,
+            &[],
+        )
+        .expect_err("empty map subscript must error");
         assert!(
             err.contains("<no keys>"),
             "empty-map error must say '<no keys>', got: {err}"
@@ -1618,7 +1652,7 @@ mod tests {
         )];
 
         let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
-        resolve_refs_with_state_and_remote(&mut resources, &HashMap::new(), &remote_bindings)
+        resolve_refs_with_state_and_remote(&mut resources, &HashMap::new(), &remote_bindings, &[])
             .expect("unloaded upstream subscript must not error");
         assert!(
             matches!(
@@ -1667,7 +1701,7 @@ mod tests {
                 }),
             )],
         )];
-        resolve_refs_with_state_and_remote(&mut resources, &HashMap::new(), &remote_bindings)
+        resolve_refs_with_state_and_remote(&mut resources, &HashMap::new(), &remote_bindings, &[])
             .unwrap();
         assert_eq!(
             resources[0].get_attr("az"),
@@ -1715,9 +1749,13 @@ mod tests {
                 }),
             )],
         )];
-        let err =
-            resolve_refs_with_state_and_remote(&mut resources, &HashMap::new(), &remote_bindings)
-                .expect_err("chained subscript with missing key must error");
+        let err = resolve_refs_with_state_and_remote(
+            &mut resources,
+            &HashMap::new(),
+            &remote_bindings,
+            &[],
+        )
+        .expect_err("chained subscript with missing key must error");
         assert!(
             err.contains("eu") && err.contains("us"),
             "error must mention the missing key and known keys, got: {err}"
@@ -1744,7 +1782,7 @@ mod tests {
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         remote_bindings.insert("network".to_string(), HashMap::new());
 
-        resolve_refs_with_state_and_remote(&mut resources, &current_states, &remote_bindings)
+        resolve_refs_with_state_and_remote(&mut resources, &current_states, &remote_bindings, &[])
             .unwrap();
 
         // Should remain as ResourceRef since "nonexistent" binding is not found
@@ -1775,7 +1813,7 @@ mod tests {
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         remote_bindings.insert("network".to_string(), HashMap::new());
 
-        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings).unwrap();
+        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings, &[]).unwrap();
 
         match resources[0].get_attr("vpc_id") {
             Some(Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef { path }))) => {
@@ -1806,7 +1844,7 @@ mod tests {
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         remote_bindings.insert("network".to_string(), HashMap::new());
 
-        resolve_refs_with_state_and_remote(&mut resources, &HashMap::new(), &remote_bindings)
+        resolve_refs_with_state_and_remote(&mut resources, &HashMap::new(), &remote_bindings, &[])
             .unwrap();
 
         assert!(matches!(
@@ -1838,7 +1876,7 @@ mod tests {
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         remote_bindings.insert("bootstrap".to_string(), HashMap::new());
 
-        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings).unwrap();
+        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings, &[]).unwrap();
 
         match resources[0].get_attr("raw") {
             Some(Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamBareRef {
@@ -1876,7 +1914,7 @@ mod tests {
         remote_bindings.insert("bootstrap".to_string(), HashMap::new());
         remote_bindings.insert("secondary".to_string(), HashMap::new());
 
-        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings).unwrap();
+        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings, &[]).unwrap();
 
         match resources[0].get_attr("raws") {
             Some(Value::Concrete(ConcreteValue::List(items))) => {
@@ -1910,7 +1948,7 @@ mod tests {
         )];
         let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
-        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings).unwrap();
+        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings, &[]).unwrap();
 
         assert!(matches!(
             resources[0].get_attr("vpc_id"),
@@ -1940,7 +1978,7 @@ mod tests {
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         remote_bindings.insert("network".to_string(), HashMap::new());
 
-        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings).unwrap();
+        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings, &[]).unwrap();
 
         match resources[0].get_attr("security_group_ids") {
             Some(Value::Concrete(ConcreteValue::List(items))) => {
@@ -1979,7 +2017,7 @@ mod tests {
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         remote_bindings.insert("network".to_string(), HashMap::new());
 
-        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings).unwrap();
+        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings, &[]).unwrap();
 
         assert!(
             resources[0].dependency_bindings.contains("network"),
@@ -2007,7 +2045,7 @@ mod tests {
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         remote_bindings.insert("network".to_string(), HashMap::new());
 
-        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings).unwrap();
+        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings, &[]).unwrap();
 
         match resources[0].get_attr("tags") {
             Some(Value::Concrete(ConcreteValue::Map(m))) => match m.get("VpcId") {
@@ -2016,5 +2054,67 @@ mod tests {
             },
             other => panic!("expected Map, got {:?}", other),
         }
+    }
+
+    /// carina#3085 design Test plan item 3: `resolve_ref_value` on a
+    /// `<wait-binding>.<attr>` ResourceRef resolves through the
+    /// materialised wait alias to the target's value — not left as an
+    /// unresolved ref. Exercises the resolver layer directly (the
+    /// real-pipeline E2E lives in `tests/wait_downstream_apply.rs`).
+    #[test]
+    fn resolve_ref_value_resolves_wait_binding_passthrough() {
+        let cert = make_resource(
+            "cert",
+            Some("cert"),
+            vec![(
+                "certificate_arn",
+                Value::Concrete(ConcreteValue::String(
+                    "arn:aws:acm:us-east-1:1:certificate/abc".to_string(),
+                )),
+            )],
+        );
+        let bindings = ResolvedBindings::from_resources_with_state(
+            &[cert],
+            &HashMap::new(),
+            &HashMap::new(),
+            &[crate::binding_index::WaitAliasSpec {
+                binding: crate::parser::BindingName::new("cert_issued"),
+                target: crate::parser::BindingName::new("cert"),
+            }],
+        );
+        let path = crate::resource::AccessPath::new("cert_issued", "certificate_arn");
+        let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
+        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        assert_eq!(
+            resolved,
+            Value::Concrete(ConcreteValue::String(
+                "arn:aws:acm:us-east-1:1:certificate/abc".to_string()
+            )),
+            "cert_issued.certificate_arn must resolve through the wait \
+             alias to cert's value, not stay an unresolved ResourceRef"
+        );
+    }
+
+    /// A wait binding whose target is absent: the ref is left intact
+    /// (the existing `Ok(value.clone())` fallthrough), so the existing
+    /// PlanError path — not a panic — surfaces it.
+    #[test]
+    fn resolve_ref_value_wait_binding_absent_target_left_intact() {
+        let bindings = ResolvedBindings::from_resources_with_state(
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &[crate::binding_index::WaitAliasSpec {
+                binding: crate::parser::BindingName::new("cert_issued"),
+                target: crate::parser::BindingName::new("nonexistent"),
+            }],
+        );
+        let path = crate::resource::AccessPath::new("cert_issued", "certificate_arn");
+        let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
+        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        assert_eq!(
+            resolved, ref_value,
+            "no alias when target absent → ref stays intact (existing PlanError surfaces it)"
+        );
     }
 }

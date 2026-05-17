@@ -39,6 +39,7 @@
 //! }
 //! ```
 
+use crate::parser::BindingName;
 use crate::resource::{Resource, ResourceId, State, Value};
 use crate::schema::{ResourceSchema, SchemaRegistry};
 use std::collections::HashMap;
@@ -151,7 +152,13 @@ impl<'a> BindingIndex<'a> {
 ///
 /// `#[non_exhaustive]` so adding a new declaration form (a future
 /// `data` block, etc.) does not break downstream `match` arms.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Not `Copy`: `Wait` carries an owned `BindingName` (the wait→target
+/// edge is a typed value, carina#3085 — not a string convention). The
+/// enum is read out by reference (`kind()` / `iter()`); the only
+/// in-crate consumers are within this module, so dropping `Copy` is
+/// contained.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum BindingNameKind {
     /// `let <name> = ...` resource binding.
@@ -173,6 +180,15 @@ pub enum BindingNameKind {
     /// addressable by `ResourceRef` (see the module doc for the
     /// pre-existing invariant).
     Structural,
+    /// `let <name> = wait <target> { ... }` wait binding (carina#3085).
+    /// Unlike `Structural`, a wait binding **is** addressable by
+    /// `ResourceRef`: `<name>.<attr>` is a passthrough to
+    /// `<target>.<attr>` (see `notes/specs/2026-05-09-wait-construct-design.md`
+    /// value semantics). The `target` is the binding name of the
+    /// resource the wait observes; carried here as a typed
+    /// [`BindingName`] so the wait→target edge cannot be confused with
+    /// an arbitrary string or point at a non-existent name undetected.
+    Wait { target: BindingName },
 }
 
 /// Name-only scope view: every identifier a parsed Carina configuration
@@ -222,6 +238,19 @@ impl BindingNameSet {
                     .or_insert(BindingNameKind::Resource);
             }
         }
+        // Wait bindings register right after resources: a wait binding
+        // is addressable by `ResourceRef` (passthrough to its target),
+        // so it belongs with the addressable forms, not with
+        // `Structural`. The parser enforces distinct binding names, so
+        // a name is a wait binding xor a resource binding — ordering
+        // here is documentation, not correctness-critical (carina#3085).
+        for wb in &parsed.wait_bindings {
+            by_name
+                .entry(wb.binding.as_str().to_string())
+                .or_insert(BindingNameKind::Wait {
+                    target: wb.target.clone(),
+                });
+        }
         for call in &parsed.module_calls {
             if let Some(name) = call.binding_name.as_deref() {
                 by_name
@@ -270,8 +299,8 @@ impl BindingNameSet {
 
     /// Declaration kind for `name`, or `None` if the name is not
     /// in scope.
-    pub fn kind(&self, name: &str) -> Option<BindingNameKind> {
-        self.by_name.get(name).copied()
+    pub fn kind(&self, name: &str) -> Option<&BindingNameKind> {
+        self.by_name.get(name)
     }
 
     /// Iterate every in-scope name. Order is unspecified.
@@ -280,8 +309,8 @@ impl BindingNameSet {
     }
 
     /// Iterate every (name, kind) pair. Order is unspecified.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, BindingNameKind)> {
-        self.by_name.iter().map(|(k, v)| (k.as_str(), *v))
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &BindingNameKind)> {
+        self.by_name.iter().map(|(k, v)| (k.as_str(), v))
     }
 
     pub fn len(&self) -> usize {
@@ -293,6 +322,38 @@ impl BindingNameSet {
     }
 }
 
+/// A `wait` binding's value-layer contract: `binding`'s
+/// `<binding>.<attr>` is a passthrough to `<target>.<attr>`
+/// (carina#3085). Both sides are the typed [`BindingName`] newtype so
+/// the wait→target edge cannot be confused with an arbitrary string.
+///
+/// This is the *only* thing `ResolvedBindings` needs from a wait
+/// declaration — deliberately **not** the full parser
+/// [`crate::parser::WaitBinding`] (which also carries the `until`
+/// predicate, timeout, `depends_on`, source line — all effect-layer /
+/// diagnostics concerns irrelevant to value resolution). Decoupling
+/// here means: (a) carina-core resolution does not depend on the
+/// parser AST shape, and (b) the apply-from-plan-file path — which
+/// reconstructs from a serialized `PlanFile` and has no `WaitBinding`
+/// — can supply the same typed spec without resurrecting the AST.
+/// `WaitBinding` provides a `From` conversion (the plan path); the
+/// plan-file path builds it from its serialized `(binding, target)`
+/// pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitAliasSpec {
+    pub binding: BindingName,
+    pub target: BindingName,
+}
+
+impl From<&crate::parser::WaitBinding> for WaitAliasSpec {
+    fn from(wb: &crate::parser::WaitBinding) -> Self {
+        Self {
+            binding: wb.binding.clone(),
+            target: wb.target.clone(),
+        }
+    }
+}
+
 /// Where the values for a binding came from. `Local` means a `let` binding
 /// in the current configuration; `Upstream` means an `upstream_state` data
 /// source bringing values in from another state file.
@@ -301,11 +362,30 @@ impl BindingNameSet {
 /// sources (`for` / `if` / module) — flagging the intent now keeps
 /// downstream `match` arms from becoming exhaustive against the current
 /// two variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Copy`: `WaitAlias` carries an owned `BindingName` (the
+/// wait→target edge is a typed value, carina#3085). `source()` returns
+/// a borrow; the only in-crate value-position use is a `matches!`
+/// (`Copy`-independent), so dropping `Copy` is contained.
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BindingValueSource {
     Local,
     Upstream,
+    /// The binding is a `wait` binding whose `<name>.<attr>` is a
+    /// passthrough to `target`'s attributes (carina#3085). The
+    /// attributes stored alongside this source are a snapshot of the
+    /// target's resolved attributes at construction time (see
+    /// `notes/specs/2026-05-09-wait-construct-design.md` value
+    /// semantics — "snapshot of the target captured by the read() that
+    /// satisfied until"). Retained as a distinct source (not flattened
+    /// to `Local`) so "did this value come *through* a wait?" stays
+    /// observable — the dependency edge is handled separately by
+    /// `Effect::Wait` lowering and is not affected by this value-layer
+    /// alias.
+    WaitAlias {
+        target: BindingName,
+    },
 }
 
 /// One entry in [`ResolvedBindings`]: the merged attribute map and the
@@ -338,12 +418,22 @@ impl ResolvedBindings {
     ///
     /// DSL keys win over state keys on conflict. Upstream bindings are
     /// inserted last and overwrite any local binding of the same name.
-    /// Both rules match the pre-existing resolver behaviour so this
-    /// refactor is a pure internal change.
+    ///
+    /// `wait_aliases` materialises each `wait` binding as a passthrough
+    /// alias to its target: an entry whose attributes are a snapshot of
+    /// the target's resolved attributes and whose source is
+    /// [`BindingValueSource::WaitAlias`] (carina#3085). Materialising
+    /// the alias here — rather than via a second lookup in
+    /// `resolve_ref_value` — means a wait binding is resolved by exactly
+    /// the same code path as a resource binding (it simply *has* an
+    /// entry). The wait's *dependency edge* is independent and handled
+    /// separately by `Effect::Wait` lowering; this only restores the
+    /// value-identity half (design value semantics).
     pub fn from_resources_with_state(
         resources: &[Resource],
         current_states: &HashMap<ResourceId, State>,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
+        wait_aliases: &[WaitAliasSpec],
     ) -> Self {
         let mut by_name: HashMap<String, ResolvedBinding> = HashMap::new();
 
@@ -378,6 +468,33 @@ impl ResolvedBindings {
             );
         }
 
+        // Wait aliases materialise last, after both local and upstream
+        // entries exist, so a wait whose target is *either* a resource
+        // or an upstream binding sees the target's resolved attributes.
+        // The alias attributes are an independent snapshot (clone), not
+        // a shared reference: a later `set("target", …)` write-back
+        // must not mutate the alias and vice versa (design: the alias
+        // is a read-time snapshot). If the target has no entry (typo /
+        // scoped-out — the same condition `create_plan` reports as a
+        // `PlanError`), no alias is created: the ref stays unresolved
+        // and that existing error surfaces it, rather than a panic or a
+        // phantom.
+        for spec in wait_aliases {
+            let Some(target_entry) = by_name.get(spec.target.as_str()) else {
+                continue;
+            };
+            let snapshot = target_entry.attributes.clone();
+            by_name.insert(
+                spec.binding.as_str().to_string(),
+                ResolvedBinding {
+                    attributes: snapshot,
+                    source: BindingValueSource::WaitAlias {
+                        target: spec.target.clone(),
+                    },
+                },
+            );
+        }
+
         Self { by_name }
     }
 
@@ -385,8 +502,8 @@ impl ResolvedBindings {
         self.by_name.get(name).map(|b| &b.attributes)
     }
 
-    pub fn source(&self, name: &str) -> Option<BindingValueSource> {
-        self.by_name.get(name).map(|b| b.source)
+    pub fn source(&self, name: &str) -> Option<&BindingValueSource> {
+        self.by_name.get(name).map(|b| &b.source)
     }
 
     /// Record (or refresh) a binding after a `Create` / `Update` effect
@@ -617,7 +734,8 @@ mod resolved_bindings_tests {
         let states: HashMap<ResourceId, State> = HashMap::new();
         let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
-        let resolved = ResolvedBindings::from_resources_with_state(&resources, &states, &remote);
+        let resolved =
+            ResolvedBindings::from_resources_with_state(&resources, &states, &remote, &[]);
 
         let attrs = resolved.get("vpc").expect("vpc binding present");
         assert_eq!(
@@ -626,7 +744,7 @@ mod resolved_bindings_tests {
                 "10.0.0.0/16".to_string()
             )))
         );
-        assert_eq!(resolved.source("vpc"), Some(BindingValueSource::Local));
+        assert_eq!(resolved.source("vpc"), Some(&BindingValueSource::Local));
     }
 
     #[test]
@@ -665,7 +783,8 @@ mod resolved_bindings_tests {
         );
         let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
-        let resolved = ResolvedBindings::from_resources_with_state(&resources, &states, &remote);
+        let resolved =
+            ResolvedBindings::from_resources_with_state(&resources, &states, &remote, &[]);
 
         let attrs = resolved.get("vpc").expect("vpc binding present");
         assert_eq!(
@@ -698,7 +817,8 @@ mod resolved_bindings_tests {
         );
         remote.insert("network".to_string(), network_attrs);
 
-        let resolved = ResolvedBindings::from_resources_with_state(&resources, &states, &remote);
+        let resolved =
+            ResolvedBindings::from_resources_with_state(&resources, &states, &remote, &[]);
 
         let attrs = resolved.get("network").expect("upstream binding present");
         assert_eq!(
@@ -709,7 +829,7 @@ mod resolved_bindings_tests {
         );
         assert_eq!(
             resolved.source("network"),
-            Some(BindingValueSource::Upstream)
+            Some(&BindingValueSource::Upstream)
         );
     }
 
@@ -726,7 +846,8 @@ mod resolved_bindings_tests {
         let states: HashMap<ResourceId, State> = HashMap::new();
         let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
-        let resolved = ResolvedBindings::from_resources_with_state(&resources, &states, &remote);
+        let resolved =
+            ResolvedBindings::from_resources_with_state(&resources, &states, &remote, &[]);
         assert!(resolved.get("anonymous").is_none());
     }
 
@@ -756,7 +877,8 @@ mod resolved_bindings_tests {
             .collect(),
         );
 
-        let resolved = ResolvedBindings::from_resources_with_state(&resources, &states, &remote);
+        let resolved =
+            ResolvedBindings::from_resources_with_state(&resources, &states, &remote, &[]);
         let attrs = resolved.get("shared").expect("shared binding present");
         assert_eq!(
             attrs.get("kind"),
@@ -767,7 +889,7 @@ mod resolved_bindings_tests {
         );
         assert_eq!(
             resolved.source("shared"),
-            Some(BindingValueSource::Upstream),
+            Some(&BindingValueSource::Upstream),
         );
     }
 
@@ -803,7 +925,8 @@ mod resolved_bindings_tests {
         );
         let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
-        let resolved = ResolvedBindings::from_resources_with_state(&resources, &states, &remote);
+        let resolved =
+            ResolvedBindings::from_resources_with_state(&resources, &states, &remote, &[]);
         let attrs = resolved.get("vpc").expect("vpc binding present");
         assert!(
             attrs.get("id").is_none(),
@@ -875,7 +998,7 @@ mod resolved_bindings_tests {
                 "10.0.0.0/16".to_string()
             ))),
         );
-        assert_eq!(resolved.source("vpc"), Some(BindingValueSource::Local));
+        assert_eq!(resolved.source("vpc"), Some(&BindingValueSource::Local));
     }
 
     #[test]
@@ -911,7 +1034,7 @@ mod resolved_bindings_tests {
         )];
         let states: HashMap<ResourceId, State> = HashMap::new();
         let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
-        let parent = ResolvedBindings::from_resources_with_state(&resources, &states, &remote);
+        let parent = ResolvedBindings::from_resources_with_state(&resources, &states, &remote, &[]);
 
         let mut child = parent.clone();
         let extra_state = State {
@@ -951,7 +1074,7 @@ mod resolved_bindings_tests {
         resolved.set("registry", initial, BindingValueSource::Upstream);
         assert_eq!(
             resolved.source("registry"),
-            Some(BindingValueSource::Upstream)
+            Some(&BindingValueSource::Upstream)
         );
         assert_eq!(
             resolved.get("registry").and_then(|a| a.get("kind")),
@@ -967,13 +1090,178 @@ mod resolved_bindings_tests {
         resolved.set("registry", replacement, BindingValueSource::Local);
         assert_eq!(
             resolved.source("registry"),
-            Some(BindingValueSource::Local),
+            Some(&BindingValueSource::Local),
             "set must replace the source as well as the attributes",
         );
         assert_eq!(
             resolved.get("registry").and_then(|a| a.get("kind")),
             Some(&Value::Concrete(ConcreteValue::String(
                 "second".to_string()
+            )))
+        );
+    }
+
+    // ---- carina#3085: wait-binding passthrough alias ----
+
+    fn wait_spec(binding: &str, target: &str) -> WaitAliasSpec {
+        WaitAliasSpec {
+            binding: BindingName::new(binding),
+            target: BindingName::new(target),
+        }
+    }
+
+    /// Test plan item 1: a wait binding resolves to its target's
+    /// attribute map, sourced as `WaitAlias { target }`.
+    #[test]
+    fn wait_alias_resolves_to_target_attributes() {
+        let cert = make_resource(
+            "cert",
+            Some("cert"),
+            vec![(
+                "certificate_arn",
+                Value::Concrete(ConcreteValue::String(
+                    "arn:aws:acm:us-east-1:1:certificate/abc".to_string(),
+                )),
+            )],
+        );
+        let resolved = ResolvedBindings::from_resources_with_state(
+            &[cert],
+            &HashMap::new(),
+            &HashMap::new(),
+            &[wait_spec("cert_issued", "cert")],
+        );
+        assert_eq!(
+            resolved
+                .get("cert_issued")
+                .and_then(|a| a.get("certificate_arn")),
+            Some(&Value::Concrete(ConcreteValue::String(
+                "arn:aws:acm:us-east-1:1:certificate/abc".to_string()
+            ))),
+            "cert_issued.certificate_arn must passthrough to cert's value"
+        );
+        assert_eq!(
+            resolved.source("cert_issued"),
+            Some(&BindingValueSource::WaitAlias {
+                target: BindingName::new("cert")
+            }),
+            "source must record the wait→target edge, not flatten to Local"
+        );
+    }
+
+    /// Test plan item 1 (negative): a wait whose target has no entry
+    /// (typo / scoped-out) creates no alias — the ref stays unresolved
+    /// and the existing PlanError path (not a panic) surfaces it.
+    #[test]
+    fn wait_alias_absent_target_creates_no_entry() {
+        let resolved = ResolvedBindings::from_resources_with_state(
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &[wait_spec("cert_issued", "nonexistent")],
+        );
+        assert!(
+            resolved.get("cert_issued").is_none(),
+            "no alias when target is absent (ref stays unresolved → existing PlanError)"
+        );
+    }
+
+    /// The target may be an upstream binding, not just a resource —
+    /// the alias must still mirror it (aliases materialise after both
+    /// local and upstream entries exist).
+    #[test]
+    fn wait_alias_target_can_be_upstream() {
+        let mut remote = HashMap::new();
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "id".to_string(),
+            Value::Concrete(ConcreteValue::String("up-1".to_string())),
+        );
+        remote.insert("up".to_string(), attrs);
+        let resolved = ResolvedBindings::from_resources_with_state(
+            &[],
+            &HashMap::new(),
+            &remote,
+            &[wait_spec("waited", "up")],
+        );
+        assert_eq!(
+            resolved.get("waited").and_then(|a| a.get("id")),
+            Some(&Value::Concrete(ConcreteValue::String("up-1".to_string())))
+        );
+    }
+
+    /// Test plan item 5: the alias is an independent snapshot — a
+    /// later `set("cert", …)` write-back must not mutate the alias,
+    /// and vice versa (design: read-time snapshot).
+    #[test]
+    fn wait_alias_is_independent_snapshot() {
+        let cert = make_resource(
+            "cert",
+            Some("cert"),
+            vec![(
+                "certificate_arn",
+                Value::Concrete(ConcreteValue::String("arn:old".to_string())),
+            )],
+        );
+        let mut resolved = ResolvedBindings::from_resources_with_state(
+            &[cert],
+            &HashMap::new(),
+            &HashMap::new(),
+            &[wait_spec("cert_issued", "cert")],
+        );
+        let mut new_attrs = HashMap::new();
+        new_attrs.insert(
+            "certificate_arn".to_string(),
+            Value::Concrete(ConcreteValue::String("arn:new".to_string())),
+        );
+        resolved.set("cert", new_attrs, BindingValueSource::Local);
+        assert_eq!(
+            resolved
+                .get("cert_issued")
+                .and_then(|a| a.get("certificate_arn")),
+            Some(&Value::Concrete(ConcreteValue::String(
+                "arn:old".to_string()
+            ))),
+            "wait alias is a snapshot: a later set('cert', …) must not mutate it"
+        );
+    }
+
+    /// Design Risks (multiple downstream consumers): the single wait
+    /// alias entry resolves consistently for every consumer that reads
+    /// it — there is one `cert_issued` entry, so N downstream resources
+    /// referencing `cert_issued.*` all see the same value. (The single
+    /// `Effect::Wait` fan-out to all consumers is the dependency-graph
+    /// machinery's job, unchanged by this value-layer alias and
+    /// covered by the wait_downstream_apply E2E.)
+    #[test]
+    fn wait_alias_resolves_consistently_for_repeated_lookups() {
+        let cert = make_resource(
+            "cert",
+            Some("cert"),
+            vec![(
+                "certificate_arn",
+                Value::Concrete(ConcreteValue::String("arn:shared".to_string())),
+            )],
+        );
+        let resolved = ResolvedBindings::from_resources_with_state(
+            &[cert],
+            &HashMap::new(),
+            &HashMap::new(),
+            &[wait_spec("cert_issued", "cert")],
+        );
+        // Two independent consumers both resolve the same value.
+        let a = resolved
+            .get("cert_issued")
+            .and_then(|m| m.get("certificate_arn"))
+            .cloned();
+        let b = resolved
+            .get("cert_issued")
+            .and_then(|m| m.get("certificate_arn"))
+            .cloned();
+        assert_eq!(a, b);
+        assert_eq!(
+            a,
+            Some(Value::Concrete(ConcreteValue::String(
+                "arn:shared".to_string()
             )))
         );
     }
@@ -1000,7 +1288,7 @@ let vpc = aws.ec2.Vpc {
         let names = BindingNameSet::from_parsed(&parsed);
 
         assert!(names.contains("vpc"));
-        assert_eq!(names.kind("vpc"), Some(BindingNameKind::Resource));
+        assert_eq!(names.kind("vpc"), Some(&BindingNameKind::Resource));
     }
 
     #[test]
@@ -1014,7 +1302,7 @@ let network = upstream_state {
         let names = BindingNameSet::from_parsed(&parsed);
 
         assert!(names.contains("network"));
-        assert_eq!(names.kind("network"), Some(BindingNameKind::UpstreamState));
+        assert_eq!(names.kind("network"), Some(&BindingNameKind::UpstreamState));
     }
 
     #[test]
@@ -1028,7 +1316,7 @@ let region = "ap-northeast-1"
         let names = BindingNameSet::from_parsed(&parsed);
 
         assert!(names.contains("region"));
-        assert_eq!(names.kind("region"), Some(BindingNameKind::Variable));
+        assert_eq!(names.kind("region"), Some(&BindingNameKind::Variable));
     }
 
     #[test]
@@ -1042,7 +1330,7 @@ arguments {
         let names = BindingNameSet::from_parsed(&parsed);
 
         assert!(names.contains("env"));
-        assert_eq!(names.kind("env"), Some(BindingNameKind::Argument));
+        assert_eq!(names.kind("env"), Some(&BindingNameKind::Argument));
     }
 
     #[test]
@@ -1056,7 +1344,7 @@ fn double(x: Int) {
         let names = BindingNameSet::from_parsed(&parsed);
 
         assert!(names.contains("double"));
-        assert_eq!(names.kind("double"), Some(BindingNameKind::UserFunction));
+        assert_eq!(names.kind("double"), Some(&BindingNameKind::UserFunction));
     }
 
     #[test]
@@ -1074,7 +1362,7 @@ let cluster = module {
             "module-call binding must be in scope; got {:?}",
             names.iter_names().collect::<Vec<_>>()
         );
-        assert_eq!(names.kind("cluster"), Some(BindingNameKind::ModuleCall));
+        assert_eq!(names.kind("cluster"), Some(&BindingNameKind::ModuleCall));
     }
 
     #[test]
@@ -1134,7 +1422,7 @@ let chosen = if true { "primary" } else { "fallback" }
             "structural binding must be in scope; got {:?}",
             names.iter_names().collect::<Vec<_>>()
         );
-        assert_eq!(names.kind("chosen"), Some(BindingNameKind::Structural));
+        assert_eq!(names.kind("chosen"), Some(&BindingNameKind::Structural));
 
         // Value-side: `ResolvedBindings` does NOT carry an entry for
         // `chosen`, so a `ResourceRef` to `chosen.foo` cannot resolve.
@@ -1142,10 +1430,46 @@ let chosen = if true { "primary" } else { "fallback" }
             &parsed.resources,
             &HashMap::new(),
             &HashMap::new(),
+            &[],
         );
         assert!(
             resolved.get("chosen").is_none(),
             "structural bindings must stay invisible to ResourceRef resolution",
         );
+    }
+
+    /// carina#3085 Test plan item 2: a `wait` binding registers as
+    /// `BindingNameKind::Wait { target }` and — unlike `Structural` —
+    /// **is** addressable (`contains` is true), because
+    /// `<wait-binding>.<attr>` is a passthrough to its target.
+    #[test]
+    fn wait_binding_registers_as_wait_kind_and_is_addressable() {
+        let src = r#"
+let cert = aws.acm.Certificate {
+    domain_name       = "registry.example.com"
+    validation_method = "DNS"
+}
+
+let cert_issued = wait cert {
+    until = cert.status == aws.acm.Certificate.Status.Issued
+}
+"#;
+        let parsed = parsed_with(src);
+        let names = BindingNameSet::from_parsed(&parsed);
+
+        assert!(
+            names.contains("cert_issued"),
+            "a wait binding is addressable (passthrough), unlike Structural; got {:?}",
+            names.iter_names().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            names.kind("cert_issued"),
+            Some(&BindingNameKind::Wait {
+                target: BindingName::new("cert")
+            }),
+            "wait binding must carry its typed target edge"
+        );
+        // The target itself is still a plain resource binding.
+        assert_eq!(names.kind("cert"), Some(&BindingNameKind::Resource));
     }
 }

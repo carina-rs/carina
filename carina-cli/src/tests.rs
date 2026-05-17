@@ -342,6 +342,7 @@ fn plan_file_serde_round_trip() {
         current_states,
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
+        wait_bindings: vec![],
     };
 
     let json = serde_json::to_string_pretty(&plan_file).unwrap();
@@ -1481,6 +1482,7 @@ async fn lock_released_on_write_state_failure() {
         lock: Some(&lock),
         schemas: &SchemaRegistry::new(),
         export_params: Some(&[]),
+        wait_aliases: &[],
     })
     .await;
 
@@ -1614,6 +1616,7 @@ async fn finalize_apply_uses_write_state_locked() {
         lock: Some(&lock),
         schemas: &SchemaRegistry::new(),
         export_params: Some(&[]),
+        wait_aliases: &[],
     })
     .await;
 
@@ -2203,6 +2206,7 @@ async fn finalize_apply_without_lock_uses_write_state() {
         lock: None, // No lock
         schemas: &SchemaRegistry::new(),
         export_params: Some(&[]),
+        wait_aliases: &[],
     })
     .await;
 
@@ -2790,6 +2794,7 @@ fn plan_file_serialization_redacts_secrets() {
         }],
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
+        wait_bindings: vec![],
     };
 
     let json = serde_json::to_string_pretty(&plan_file).unwrap();
@@ -2885,6 +2890,7 @@ async fn persist_exports_only_clears_state_exports_when_params_empty() {
         Some(state_in),
         &[],
         &[],
+        &[],
     )
     .await;
 
@@ -2924,6 +2930,7 @@ async fn persist_exports_only_writes_state_with_new_exports() {
         Some(StateFile::new()),
         &[],
         &export_params,
+        &[],
     )
     .await;
 
@@ -2986,6 +2993,7 @@ async fn finalize_apply_clears_state_exports_when_params_empty() {
         lock: Some(&lock),
         schemas: &SchemaRegistry::new(),
         export_params: Some(&[]),
+        wait_aliases: &[],
     })
     .await;
 
@@ -3041,6 +3049,7 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
         lock: Some(&lock),
         schemas: &SchemaRegistry::new(),
         export_params: None,
+        wait_aliases: &[],
     })
     .await;
 
