@@ -632,28 +632,11 @@ pub fn apply_inference(
     schemas: &SchemaRegistry,
 ) -> (crate::parser::InferredFile, Vec<(String, InferenceError)>) {
     let (inferred_exports, errors) = infer_export_params(&parsed, schemas);
-    (
-        crate::parser::InferredFile {
-            providers: parsed.providers,
-            resources: parsed.resources,
-            variables: parsed.variables,
-            uses: parsed.uses,
-            module_calls: parsed.module_calls,
-            arguments: parsed.arguments,
-            attribute_params: parsed.attribute_params,
-            export_params: inferred_exports,
-            backend: parsed.backend,
-            state_blocks: parsed.state_blocks,
-            user_functions: parsed.user_functions,
-            upstream_states: parsed.upstream_states,
-            wait_bindings: parsed.wait_bindings,
-            requires: parsed.requires,
-            structural_bindings: parsed.structural_bindings,
-            warnings: parsed.warnings,
-            deferred_for_expressions: parsed.deferred_for_expressions,
-        },
-        errors,
-    )
+    // Single phase-axis surface (carina#3126): only `export_params`
+    // changes phase; every other field moves through `map_export_params`
+    // so a new `File<E>` field cannot be silently dropped on the
+    // parser→inferred relabel.
+    (parsed.map_export_params(|_| inferred_exports), errors)
 }
 
 /// Borrowing variant of [`apply_inference`] that returns just the

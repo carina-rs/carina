@@ -730,6 +730,61 @@ impl<E> Default for File<E> {
 }
 
 impl<E> File<E> {
+    /// Transform only the export-param phase (`File<E>` → `File<B>`),
+    /// applying `f` to the export params and moving every other field
+    /// through unchanged.
+    ///
+    /// This is the **single** place the "every non-export field passes
+    /// a phase change untouched" knowledge lives. The struct is
+    /// **destructured exhaustively** — the carina#3126 / carina#3061
+    /// compile-time forcing function for the *phase axis*: a new
+    /// `File<E>` field cannot compile until it is moved through here
+    /// too. Both [`relabel_export_phase`](crate::config_loader) (module
+    /// contribution → caller phase, export params asserted empty) and
+    /// `apply_inference` (parser → inferred, export params type-inferred)
+    /// delegate here instead of hand-listing every field each.
+    pub fn map_export_params<B>(self, f: impl FnOnce(Vec<E>) -> Vec<B>) -> File<B> {
+        let File {
+            providers,
+            resources,
+            variables,
+            uses,
+            module_calls,
+            arguments,
+            attribute_params,
+            export_params,
+            backend,
+            state_blocks,
+            user_functions,
+            upstream_states,
+            wait_bindings,
+            requires,
+            structural_bindings,
+            warnings,
+            deferred_for_expressions,
+        } = self;
+
+        File {
+            providers,
+            resources,
+            variables,
+            uses,
+            module_calls,
+            arguments,
+            attribute_params,
+            export_params: f(export_params),
+            backend,
+            state_blocks,
+            user_functions,
+            upstream_states,
+            wait_bindings,
+            requires,
+            structural_bindings,
+            warnings,
+            deferred_for_expressions,
+        }
+    }
+
     /// Iterate every resource reachable from the parsed file — both
     /// top-level `resources` and the `template_resource` of each deferred
     /// for-expression — tagged with its origin context.

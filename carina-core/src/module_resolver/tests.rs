@@ -3970,3 +3970,188 @@ m { foo = 'x' }
         "expected DuplicateBinding for `foo`; got {msg}"
     );
 }
+
+/// carina#3126 / PR-A structural invariant: a `for` over an
+/// unresolved iterable declared **inside a module** must survive
+/// `expand_module_call` and reach the caller. Before the single
+/// merge surface, the expansion result carried only `resources` +
+/// `wait_bindings`, so a module-internal `deferred_for_expressions`
+/// entry was silently dropped — invisible to validate/plan/apply
+/// (the real `carina-rs/infra usecases/registry/acm.crn` case).
+///
+/// PR-A only asserts the entry is *propagated* (no longer dropped).
+/// Instance-prefixing of its binding-name fields is PR-B; this test
+/// deliberately does not assert prefixing so it stays green across
+/// the PR-A → PR-B boundary.
+#[test]
+fn test_expand_module_call_propagates_deferred_for_expressions() {
+    use crate::parser::{DeferredForExpression, ForBinding};
+
+    let module = {
+        let mut m = create_module_with_intra_refs();
+        m.deferred_for_expressions.push(DeferredForExpression {
+            file: None,
+            line: 7,
+            header: "for _, opt in cert.domain_validation_options".to_string(),
+            resource_type: "aws.route53.RecordSet".to_string(),
+            attributes: vec![],
+            binding_name: "_domain_validation_options".to_string(),
+            iterable_binding: "cert".to_string(),
+            iterable_attr: "domain_validation_options".to_string(),
+            binding: ForBinding::Map("_".to_string(), "opt".to_string()),
+            template_resource: Resource {
+                id: ResourceId::new("route53.RecordSet", "placeholder"),
+                attributes: HashMap::new().into_iter().collect(),
+                kind: ResourceKind::Managed,
+                directives: Directives::default(),
+                prefixes: HashMap::new(),
+                binding: None,
+                dependency_bindings: BTreeSet::new(),
+                module_source: None,
+                quoted_string_attrs: std::collections::HashSet::new(),
+            },
+        });
+        m
+    };
+
+    let resolver = {
+        let mut r = ModuleResolver::new(".");
+        r.imported_modules.insert("registry".to_string(), module);
+        r
+    };
+
+    let call = ModuleCall {
+        module_name: "registry".to_string(),
+        binding_name: Some("r".to_string()),
+        arguments: {
+            let mut args = HashMap::new();
+            args.insert(
+                "cidr".to_string(),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            );
+            args
+        },
+    };
+
+    let expanded = resolver.expand_module_call(&call, "r", None).unwrap();
+
+    // The structural invariant: the module-internal deferred-for
+    // reached the caller instead of vanishing at the expansion
+    // boundary.
+    assert_eq!(
+        expanded.deferred_for_expressions.len(),
+        1,
+        "module-internal deferred-for must survive expand_module_call (carina#3126)"
+    );
+    let d = &expanded.deferred_for_expressions[0];
+    assert_eq!(d.resource_type, "aws.route53.RecordSet");
+    assert_eq!(d.iterable_attr, "domain_validation_options");
+    // PR-A contract: binding-name fields pass through *unchanged*
+    // (call instance is "r"). PR-B will instance-prefix these — this
+    // is exactly the assertion PR-B must flip, so it locks PR-A's
+    // pass-through behavior and pre-stages the PR-B boundary.
+    assert_eq!(
+        d.binding_name, "_domain_validation_options",
+        "PR-A must NOT prefix binding_name (PR-B owes that)"
+    );
+    assert_eq!(
+        d.iterable_binding, "cert",
+        "PR-A must NOT prefix iterable_binding (PR-B owes that)"
+    );
+}
+
+/// carina#3126 / PR-A end-to-end: `wait_bindings` AND
+/// `deferred_for_expressions` declared inside an **imported module
+/// directory** must survive the *full* `resolve_modules` pipeline —
+/// i.e. through the new single merge surface (`relabel_export_phase`
+/// + `merge_parsed_file`), not just `expand_module_call` in isolation.
+///
+/// The other module tests call `expand_module_call` directly and so
+/// bypass the merge surface this PR introduces; a classified-but-
+/// mis-merged field (destructured then forgotten in the rebuild)
+/// still compiles and those tests would not catch it. This test
+/// drives `resolve_modules` so the merge path is actually exercised
+/// — the [[feedback_unit_test_path_is_not_apply_path]] guard.
+///
+/// Mirrors the real `carina-rs/infra usecases/registry` shape: a
+/// module with a `wait` (carina#3061) and a `for` over a provider-read
+/// attribute (carina#3126), consumed via a module call.
+#[test]
+fn resolve_modules_propagates_module_wait_and_deferred_for_through_merge() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let module_dir = tmp.path().join("modules/registry");
+    fs::create_dir_all(&module_dir).unwrap();
+    fs::write(
+        module_dir.join("main.crn"),
+        r#"
+arguments {
+  domain_name: String
+}
+
+let cert = aws.acm.Certificate {
+  domain_name       = domain_name
+  validation_method = dns
+}
+
+for _, opt in cert.domain_validation_options {
+  aws.route53.RecordSet {
+    hosted_zone_id   = "Z123"
+    name             = opt.resource_record.name
+    type             = cname
+    ttl              = 300
+    resource_records = [opt.resource_record.value]
+  }
+}
+
+let cert_issued = wait cert {
+  until   = cert.status == "ISSUED"
+  timeout = 75min
+}
+"#,
+    )
+    .unwrap();
+
+    let root_dir = tmp.path().join("root");
+    fs::create_dir_all(&root_dir).unwrap();
+    let root_body = r#"
+let registry = use {
+  source = "../modules/registry"
+}
+
+let r = registry {
+  domain_name = "registry-dev.example.com"
+}
+"#;
+    fs::write(root_dir.join("main.crn"), root_body).unwrap();
+
+    let mut parsed = crate::parser::parse(root_body, &ProviderContext::default()).unwrap();
+    resolve_modules(&mut parsed, &root_dir).expect("resolve_modules should succeed");
+
+    // carina#3126: the module-internal deferred-for survived the full
+    // resolve_modules pipeline (through relabel_export_phase +
+    // merge_parsed_file), not just expand_module_call.
+    assert_eq!(
+        parsed.deferred_for_expressions.len(),
+        1,
+        "module-internal deferred-for must reach the caller through the \
+         single merge surface (carina#3126); got: {:?}",
+        parsed.deferred_for_expressions
+    );
+    let d = &parsed.deferred_for_expressions[0];
+    assert_eq!(d.resource_type, "aws.route53.RecordSet");
+    assert_eq!(d.iterable_attr, "domain_validation_options");
+
+    // carina#3061: the module-internal wait binding still survives the
+    // same pipeline and is instance-prefixed (the existing invariant,
+    // now exercised *through* the shared merge, not bypassing it).
+    assert_eq!(
+        parsed.wait_bindings.len(),
+        1,
+        "module-internal wait must reach the caller through the single \
+         merge surface (carina#3061); got: {:?}",
+        parsed.wait_bindings
+    );
+    assert_eq!(parsed.wait_bindings[0].binding, "r.cert_issued");
+    assert_eq!(parsed.wait_bindings[0].target, "r.cert");
+}
