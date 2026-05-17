@@ -945,8 +945,11 @@ async fn run_apply_locked(
     // (carina#3085). Built once here so every resolution phase below
     // (data-source refresh, initial bindings, ref resolution, exports)
     // applies the same passthrough.
-    let wait_aliases: Vec<WaitAliasSpec> =
-        parsed.wait_bindings.iter().map(WaitAliasSpec::from).collect();
+    let wait_aliases: Vec<WaitAliasSpec> = parsed
+        .wait_bindings
+        .iter()
+        .map(WaitAliasSpec::from)
+        .collect();
 
     // Phase 2: resolve data source inputs against the consolidated state
     // and refresh them via `read_data_source` (#1683, #1685).

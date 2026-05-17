@@ -383,7 +383,9 @@ pub enum BindingValueSource {
     /// observable — the dependency edge is handled separately by
     /// `Effect::Wait` lowering and is not affected by this value-layer
     /// alias.
-    WaitAlias { target: BindingName },
+    WaitAlias {
+        target: BindingName,
+    },
 }
 
 /// One entry in [`ResolvedBindings`]: the merged attribute map and the
@@ -732,7 +734,8 @@ mod resolved_bindings_tests {
         let states: HashMap<ResourceId, State> = HashMap::new();
         let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
-        let resolved = ResolvedBindings::from_resources_with_state(&resources, &states, &remote, &[]);
+        let resolved =
+            ResolvedBindings::from_resources_with_state(&resources, &states, &remote, &[]);
 
         let attrs = resolved.get("vpc").expect("vpc binding present");
         assert_eq!(
@@ -780,7 +783,8 @@ mod resolved_bindings_tests {
         );
         let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
-        let resolved = ResolvedBindings::from_resources_with_state(&resources, &states, &remote, &[]);
+        let resolved =
+            ResolvedBindings::from_resources_with_state(&resources, &states, &remote, &[]);
 
         let attrs = resolved.get("vpc").expect("vpc binding present");
         assert_eq!(
@@ -813,7 +817,8 @@ mod resolved_bindings_tests {
         );
         remote.insert("network".to_string(), network_attrs);
 
-        let resolved = ResolvedBindings::from_resources_with_state(&resources, &states, &remote, &[]);
+        let resolved =
+            ResolvedBindings::from_resources_with_state(&resources, &states, &remote, &[]);
 
         let attrs = resolved.get("network").expect("upstream binding present");
         assert_eq!(
@@ -841,7 +846,8 @@ mod resolved_bindings_tests {
         let states: HashMap<ResourceId, State> = HashMap::new();
         let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
-        let resolved = ResolvedBindings::from_resources_with_state(&resources, &states, &remote, &[]);
+        let resolved =
+            ResolvedBindings::from_resources_with_state(&resources, &states, &remote, &[]);
         assert!(resolved.get("anonymous").is_none());
     }
 
@@ -871,7 +877,8 @@ mod resolved_bindings_tests {
             .collect(),
         );
 
-        let resolved = ResolvedBindings::from_resources_with_state(&resources, &states, &remote, &[]);
+        let resolved =
+            ResolvedBindings::from_resources_with_state(&resources, &states, &remote, &[]);
         let attrs = resolved.get("shared").expect("shared binding present");
         assert_eq!(
             attrs.get("kind"),
@@ -918,7 +925,8 @@ mod resolved_bindings_tests {
         );
         let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
-        let resolved = ResolvedBindings::from_resources_with_state(&resources, &states, &remote, &[]);
+        let resolved =
+            ResolvedBindings::from_resources_with_state(&resources, &states, &remote, &[]);
         let attrs = resolved.get("vpc").expect("vpc binding present");
         assert!(
             attrs.get("id").is_none(),
@@ -1210,7 +1218,9 @@ mod resolved_bindings_tests {
             resolved
                 .get("cert_issued")
                 .and_then(|a| a.get("certificate_arn")),
-            Some(&Value::Concrete(ConcreteValue::String("arn:old".to_string()))),
+            Some(&Value::Concrete(ConcreteValue::String(
+                "arn:old".to_string()
+            ))),
             "wait alias is a snapshot: a later set('cert', …) must not mutate it"
         );
     }
@@ -1250,7 +1260,9 @@ mod resolved_bindings_tests {
         assert_eq!(a, b);
         assert_eq!(
             a,
-            Some(Value::Concrete(ConcreteValue::String("arn:shared".to_string())))
+            Some(Value::Concrete(ConcreteValue::String(
+                "arn:shared".to_string()
+            )))
         );
     }
 }

@@ -9,6 +9,7 @@ use std::time::Duration;
 use colored::Colorize;
 use futures::stream::{self, StreamExt};
 
+use carina_core::binding_index::WaitAliasSpec;
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
 use carina_core::effect::Effect;
@@ -20,7 +21,6 @@ use carina_core::provider::{
     self as provider_mod, Provider, ProviderError, ProviderFactory, ProviderNormalizer,
     ProviderRouter,
 };
-use carina_core::binding_index::WaitAliasSpec;
 use carina_core::resolver::{resolve_refs_for_plan, resolve_refs_with_state_and_remote};
 use carina_core::resource::{
     ConcreteValue, DeferredValue, Resource, ResourceId, State, Value, contains_resource_ref,
@@ -1312,8 +1312,11 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
 
         // Phase 2: resolve data source refs against the consolidated
         // `current_states`, then refresh each via `read_data_source`.
-        let ds_wait_aliases: Vec<WaitAliasSpec> =
-            parsed.wait_bindings.iter().map(WaitAliasSpec::from).collect();
+        let ds_wait_aliases: Vec<WaitAliasSpec> = parsed
+            .wait_bindings
+            .iter()
+            .map(WaitAliasSpec::from)
+            .collect();
         let resolved_data_sources = resolve_data_source_refs_for_refresh(
             &sorted_resources,
             &current_states,
@@ -1417,8 +1420,11 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
         &parsed.resources,
         ctx.schemas(),
     );
-    let wait_aliases: Vec<WaitAliasSpec> =
-        parsed.wait_bindings.iter().map(WaitAliasSpec::from).collect();
+    let wait_aliases: Vec<WaitAliasSpec> = parsed
+        .wait_bindings
+        .iter()
+        .map(WaitAliasSpec::from)
+        .collect();
     resolve_refs_for_plan(
         &mut resources,
         &current_states,

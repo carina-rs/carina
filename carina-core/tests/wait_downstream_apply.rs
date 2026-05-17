@@ -436,7 +436,10 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
         Value::Concrete(ConcreteValue::String(arn.to_string())),
     );
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
-    current_states.insert(cert.id.clone(), State::existing(cert.id.clone(), cert_attrs));
+    current_states.insert(
+        cert.id.clone(),
+        State::existing(cert.id.clone(), cert_attrs),
+    );
     let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
     let wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed

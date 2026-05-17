@@ -1564,9 +1564,13 @@ mod tests {
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
-        let err =
-            resolve_refs_with_state_and_remote(&mut resources, &HashMap::new(), &remote_bindings, &[])
-                .expect_err("missing key in concrete upstream map must error");
+        let err = resolve_refs_with_state_and_remote(
+            &mut resources,
+            &HashMap::new(),
+            &remote_bindings,
+            &[],
+        )
+        .expect_err("missing key in concrete upstream map must error");
         assert!(
             err.contains("orgs.accounts") && err.contains("registry_qa"),
             "error must name the upstream path and the missing key, got: {err}"
@@ -1608,9 +1612,13 @@ mod tests {
                 }),
             )],
         )];
-        let err =
-            resolve_refs_with_state_and_remote(&mut resources, &HashMap::new(), &remote_bindings, &[])
-                .expect_err("empty map subscript must error");
+        let err = resolve_refs_with_state_and_remote(
+            &mut resources,
+            &HashMap::new(),
+            &remote_bindings,
+            &[],
+        )
+        .expect_err("empty map subscript must error");
         assert!(
             err.contains("<no keys>"),
             "empty-map error must say '<no keys>', got: {err}"
@@ -1741,9 +1749,13 @@ mod tests {
                 }),
             )],
         )];
-        let err =
-            resolve_refs_with_state_and_remote(&mut resources, &HashMap::new(), &remote_bindings, &[])
-                .expect_err("chained subscript with missing key must error");
+        let err = resolve_refs_with_state_and_remote(
+            &mut resources,
+            &HashMap::new(),
+            &remote_bindings,
+            &[],
+        )
+        .expect_err("chained subscript with missing key must error");
         assert!(
             err.contains("eu") && err.contains("us"),
             "error must mention the missing key and known keys, got: {err}"
