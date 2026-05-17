@@ -17,3 +17,20 @@ resolver = "2"
 version = "0.4.0"
 repository = "https://github.com/carina-rs/carina"
 homepage = "https://github.com/carina-rs/carina"
+
+# The CI Test job's nextest test-run phase is link-heavy across the
+# workspace's many test binaries. Default `debug = 2` emits full DWARF;
+# `line-tables-only` keeps file + line numbers in panics and backtraces
+# (test failures stay locatable) while dropping variable/type debuginfo,
+# producing lighter binaries that link and start faster. Measured on CI:
+# nextest test-run phase ~125s -> ~82-98s. The compile phase re-warms to
+# steady state once this is on the default branch (rust-cache only saves
+# there). No dependency or runtime/program-behavior change; interactive
+# debuggers (lldb/rust-gdb) lose variable/type inspection on debug builds
+# while panics and backtraces keep file+line. Reversible (a 1-commit
+# revert, which itself triggers one more re-warm). Refs #3104/#3089.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
