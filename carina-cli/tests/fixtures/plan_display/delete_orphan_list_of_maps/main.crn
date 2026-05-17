@@ -1,0 +1,11 @@
+# Delete orphan with a list-of-maps attribute in state.
+#
+# No resources are declared in config; the ACM certificate is present
+# in carina.state.json only, so it is an orphan to be deleted. Its
+# `domain_validation_options` is a list-of-maps and must render
+# vertically (multi-line) in the delete plan rather than on one long,
+# unreadable line.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}

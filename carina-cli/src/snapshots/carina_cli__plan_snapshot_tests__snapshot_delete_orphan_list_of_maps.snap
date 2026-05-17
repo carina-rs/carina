@@ -1,0 +1,19 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  - aws.acm.Certificate orphan_cert
+      certificate_arn: "arn:aws:acm:us-east-1:151116838382:certificate/3fc2dbff-d965-4533-aeac-9e9d85ac527a"
+      domain_name: "registry-dev.carina-rs.dev"
+      domain_validation_options: 
+        * domain_name: "registry-dev.carina-rs.dev"
+          resource_record: 
+            name: "_b799e8cef71fc960510b85f44c464976.registry-dev.carina-rs.dev."
+            type: "CNAME"
+            value: "_914ec1412ad1bbde685f236a55c98d23.jkddzztszm.acm-validations.aws."
+          validation_method: "DNS"
+          validation_status: "SUCCESS"
+
+Plan: 0 to add, 0 to change, 1 to destroy.
