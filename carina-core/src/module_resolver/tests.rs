@@ -3989,6 +3989,22 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
 
     let module = {
         let mut m = create_module_with_intra_refs();
+        // The loop iterates `cert.domain_validation_options`, so `cert`
+        // must be a real module-internal binding for the
+        // intra-module-conditional prefix to apply (same condition as
+        // `rewrite_intra_module_refs`). Add it so this unit faithfully
+        // models the real `let cert = aws.acm.Certificate { … }` case.
+        m.resources.push(Resource {
+            id: ResourceId::new("acm.Certificate", "cert"),
+            attributes: HashMap::new().into_iter().collect(),
+            kind: ResourceKind::Managed,
+            directives: Directives::default(),
+            prefixes: HashMap::new(),
+            binding: Some("cert".to_string()),
+            dependency_bindings: BTreeSet::new(),
+            module_source: None,
+            quoted_string_attrs: std::collections::HashSet::new(),
+        });
         m.deferred_for_expressions.push(DeferredForExpression {
             file: None,
             line: 7,
@@ -4001,7 +4017,22 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
             binding: ForBinding::Map("_".to_string(), "opt".to_string()),
             template_resource: Resource {
                 id: ResourceId::new("route53.RecordSet", "placeholder"),
-                attributes: HashMap::new().into_iter().collect(),
+                attributes: {
+                    // The loop body references the module-internal
+                    // `cert` binding — the part of the template
+                    // treatment that actually SURVIVES materialization
+                    // (`substitute_attrs` does not re-run ref-rewrite).
+                    // PR-B must prefix this to `r.cert` so the
+                    // generated RecordSet wires to the prefixed module
+                    // certificate; without it the loop body silently
+                    // dangles. Round-3 review test gap.
+                    let mut a = IndexMap::new();
+                    a.insert(
+                        "validated_cert".to_string(),
+                        Value::resource_ref("cert".to_string(), "arn".to_string(), vec![]),
+                    );
+                    a
+                },
                 kind: ResourceKind::Managed,
                 directives: Directives::default(),
                 prefixes: HashMap::new(),
@@ -4046,17 +4077,129 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
     let d = &expanded.deferred_for_expressions[0];
     assert_eq!(d.resource_type, "aws.route53.RecordSet");
     assert_eq!(d.iterable_attr, "domain_validation_options");
-    // PR-A contract: binding-name fields pass through *unchanged*
-    // (call instance is "r"). PR-B will instance-prefix these — this
-    // is exactly the assertion PR-B must flip, so it locks PR-A's
-    // pass-through behavior and pre-stages the PR-B boundary.
+    // carina#3126 PR-B: binding-name fields are instance-prefixed so
+    // the loop-generated resources are isolated per module instance
+    // and the iterable resolves against the (now prefixed) module
+    // resource. Call instance is "r".
+    //
+    // `binding_name` is the generated-resource address prefix →
+    // prefixed unconditionally (mirrors `Resource.binding`).
     assert_eq!(
-        d.binding_name, "_domain_validation_options",
-        "PR-A must NOT prefix binding_name (PR-B owes that)"
+        d.binding_name, "r._domain_validation_options",
+        "PR-B must instance-prefix binding_name"
     );
+    // `cert` is a module-internal `let cert` binding → prefixed
+    // (same caller-collision guard `rewrite_intra_module_refs`
+    // applies to a `ResourceRef` head; a caller-shared name would
+    // NOT be prefixed — see prefix_deferred_for_expression).
     assert_eq!(
-        d.iterable_binding, "cert",
-        "PR-A must NOT prefix iterable_binding (PR-B owes that)"
+        d.iterable_binding, "r.cert",
+        "PR-B must instance-prefix the intra-module iterable root"
+    );
+
+    // The part of the template treatment that SURVIVES materialization
+    // (`substitute_attrs` does not re-run ref-rewrite): the loop body's
+    // intra-module ref must be prefixed, and module_source stamped, so
+    // the generated RecordSet wires to the prefixed module certificate.
+    // Round-3 review found this load-bearing path had zero coverage.
+    let validated_cert = d
+        .template_resource
+        .attributes
+        .get("validated_cert")
+        .expect("template attr preserved");
+    match validated_cert {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+            assert_eq!(
+                path.binding(),
+                "r.cert",
+                "loop body's intra-module ref must be instance-prefixed"
+            );
+            assert_eq!(path.attribute(), "arn");
+        }
+        other => panic!("expected prefixed ResourceRef, got {other:?}"),
+    }
+    assert!(
+        matches!(
+            d.template_resource.module_source,
+            Some(crate::resource::ModuleSource::Module { ref instance, .. }) if instance == "r"
+        ),
+        "template_resource must carry the module instance source; got: {:?}",
+        d.template_resource.module_source
+    );
+}
+
+/// carina#3126 PR-B negative case: an `iterable_binding` that is NOT a
+/// module-internal binding (a caller-passed / argument binding that
+/// merely shares a name) must **not** be instance-prefixed — the same
+/// caller-collision guard `rewrite_intra_module_refs` applies to a
+/// `ResourceRef` head. This locks the `else` arm of the conditional
+/// and is the safety property the deliberate divergence from the
+/// design's unconditional-prefix table protects. Without this test a
+/// future "simplification" back to unconditional prefixing would pass
+/// CI while silently breaking caller-passed iterables.
+#[test]
+fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
+    use crate::parser::{DeferredForExpression, ForBinding};
+
+    let module = {
+        let mut m = create_module_with_intra_refs();
+        // No module resource/wait is bound `accounts` — it is meant to
+        // come from the caller (e.g. an argument), so it is NOT in
+        // `intra_module_bindings` and must survive unprefixed.
+        m.deferred_for_expressions.push(DeferredForExpression {
+            file: None,
+            line: 3,
+            header: "for _, a in accounts.list".to_string(),
+            resource_type: "awscc.sso.Assignment".to_string(),
+            attributes: vec![],
+            binding_name: "_list".to_string(),
+            iterable_binding: "accounts".to_string(),
+            iterable_attr: "list".to_string(),
+            binding: ForBinding::Map("_".to_string(), "a".to_string()),
+            template_resource: Resource {
+                id: ResourceId::new("sso.Assignment", "placeholder"),
+                attributes: HashMap::new().into_iter().collect(),
+                kind: ResourceKind::Managed,
+                directives: Directives::default(),
+                prefixes: HashMap::new(),
+                binding: None,
+                dependency_bindings: BTreeSet::new(),
+                module_source: None,
+                quoted_string_attrs: std::collections::HashSet::new(),
+            },
+        });
+        m
+    };
+
+    let resolver = {
+        let mut r = ModuleResolver::new(".");
+        r.imported_modules.insert("net".to_string(), module);
+        r
+    };
+
+    let call = ModuleCall {
+        module_name: "net".to_string(),
+        binding_name: Some("prod".to_string()),
+        arguments: {
+            let mut args = HashMap::new();
+            args.insert(
+                "cidr".to_string(),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            );
+            args
+        },
+    };
+
+    let expanded = resolver.expand_module_call(&call, "prod", None).unwrap();
+    let d = &expanded.deferred_for_expressions[0];
+    // `binding_name` is a synthesized address prefix → always prefixed.
+    assert_eq!(d.binding_name, "prod._list");
+    // `accounts` is NOT module-internal → must stay UNPREFIXED
+    // (caller-collision guard). A regression to unconditional
+    // prefixing would make this `prod.accounts` and fail here.
+    assert_eq!(
+        d.iterable_binding, "accounts",
+        "a non-module-internal iterable binding must NOT be prefixed"
     );
 }
 
@@ -4141,6 +4284,12 @@ let r = registry {
     let d = &parsed.deferred_for_expressions[0];
     assert_eq!(d.resource_type, "aws.route53.RecordSet");
     assert_eq!(d.iterable_attr, "domain_validation_options");
+    // carina#3126 PR-B: through the full resolve_modules pipeline the
+    // deferred-for's binding-name fields are instance-prefixed (call
+    // binding is `r`), so the loop resolves against the prefixed
+    // module `cert` and its generated resources are instance-scoped.
+    assert_eq!(d.binding_name, "r._domain_validation_options");
+    assert_eq!(d.iterable_binding, "r.cert");
 
     // carina#3061: the module-internal wait binding still survives the
     // same pipeline and is instance-prefixed (the existing invariant,
