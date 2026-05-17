@@ -508,7 +508,7 @@ mod tests {
         res.id.provider = "aws".to_string();
         // Force the anonymous/not-yet-promoted state explicitly.
         res.id.name = ResourceName::Pending;
-        parsed.resources.push(res);
+        parsed.resources.push(res); // allow: direct — fixture test inspection
 
         let entries = validated_entries(&parsed);
         assert_eq!(entries.len(), 1);
