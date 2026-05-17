@@ -186,20 +186,31 @@ impl<'cfg> ModuleResolver<'cfg> {
 
         // Expand the module's own module_calls. Pass the parent module's
         // argument signature so the inner type-check can resolve any
-        // pass-through arg refs (#2549). The `module_calls` clone is
-        // needed because the loop body extends `parsed.resources` while
-        // iterating; the borrow checker treats the two as one borrow even
-        // though the fields are disjoint.
+        // pass-through arg refs (#2549). `module_calls` and
+        // `enclosing_args` are cloned because the loop body now folds
+        // the contribution in via `merge_parsed_file(parsed, …)` — a
+        // whole-`&mut parsed` borrow that conflicts with any live
+        // immutable borrow of a `parsed` field (the old per-field
+        // `.extend()` only needed a disjoint field borrow; the single
+        // merge surface needs the whole struct).
+        //
+        // The pre-loop `enclosing_args` snapshot is behaviour-equivalent
+        // to the old live `&parsed.arguments` borrow *because* a module
+        // contribution never adds `arguments` (`expand_module_call`'s
+        // exhaustive literal pins `arguments: Vec::new()`), so the merge
+        // can't grow `parsed.arguments` mid-loop. That invariant is
+        // enforced by the same exhaustive literal this PR introduces.
         let module_calls = parsed.module_calls.clone();
-        let enclosing_args: &[ArgumentParameter] = &parsed.arguments;
+        let enclosing_args: Vec<ArgumentParameter> = parsed.arguments.clone();
         for call in &module_calls {
             let instance_prefix = instance_prefix_for_call(call);
 
-            match self.expand_module_call(call, &instance_prefix, Some(enclosing_args)) {
+            match self.expand_module_call(call, &instance_prefix, Some(&enclosing_args)) {
                 Ok(expanded) => {
-                    parsed.resources.extend(expanded.resources); // allow: direct — module expansion, handled separately
-                    // Propagate instance-prefixed wait bindings (carina#3061).
-                    parsed.wait_bindings.extend(expanded.wait_bindings);
+                    // The module contribution is a `ParsedFile`; fold it
+                    // in via the one shared merge surface so no field can
+                    // be silently dropped here (carina#3126 / carina#3061).
+                    crate::config_loader::merge_parsed_file(parsed, expanded);
                 }
                 Err(e) => {
                     self.base_dir = original_base_dir;
@@ -242,13 +253,22 @@ pub fn resolve_modules_with_config<E>(
     // Process imports
     resolver.process_imports(&parsed.uses)?;
 
-    // Expand module calls
-    for call in &parsed.module_calls {
+    // Expand module calls. `module_calls` is cloned because the loop
+    // body folds each contribution in via `merge_parsed_file(parsed,
+    // …)`, a whole-`&mut parsed` borrow that conflicts with iterating
+    // `&parsed.module_calls` in place.
+    let module_calls = parsed.module_calls.clone();
+    for call in &module_calls {
         let instance_prefix = instance_prefix_for_call(call);
         let expanded = resolver.expand_module_call(call, &instance_prefix, None)?;
-        parsed.resources.extend(expanded.resources); // allow: direct — module expansion, handled separately
-        // Propagate instance-prefixed wait bindings (carina#3061).
-        parsed.wait_bindings.extend(expanded.wait_bindings);
+        // `expand_module_call` returns a parser-phase `ParsedFile`;
+        // this caller's `parsed` is a generic `File<E>` (the CLI
+        // validate path passes an `InferredFile`). Relabel the
+        // export-param-free contribution to the target phase, then
+        // fold it in via the one shared merge surface so no field can
+        // be silently dropped here (carina#3126 / carina#3061).
+        let expanded = crate::config_loader::relabel_export_phase(expanded);
+        crate::config_loader::merge_parsed_file(parsed, expanded);
     }
 
     Ok(())

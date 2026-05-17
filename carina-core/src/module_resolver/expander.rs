@@ -5,7 +5,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use indexmap::IndexMap;
 
-use crate::parser::{ArgumentParameter, BindingName, ModuleCall, WaitBinding};
+use crate::parser::{
+    ArgumentParameter, BindingName, DeferredForExpression, ModuleCall, ParsedFile, WaitBinding,
+};
 use crate::resource::{
     ConcreteValue, DeferredValue, Directives, Resource, ResourceId, ResourceKind, ResourceName,
     Value,
@@ -15,23 +17,6 @@ use super::error::ModuleError;
 use super::resolver::ModuleResolver;
 use super::typecheck::check_module_arg_type;
 use super::validation::{evaluate_require_expr, evaluate_validate_expr, format_value_for_error};
-
-/// Result of expanding a single module call.
-///
-/// A module call contributes both resources and `wait` declarations to
-/// the caller; both must reach the caller for a module-internal `wait`
-/// to keep synchronizing its downstream consumers (carina#3061).
-#[derive(Debug)]
-pub struct ExpandedModule {
-    /// Expanded, instance-prefixed resources (plus the virtual
-    /// attribute proxy when the module declares `attributes`).
-    pub resources: Vec<Resource>,
-    /// The module's `wait` declarations, with every binding-name field
-    /// (`binding`, `target`, the predicate LHS root, `depends_on`)
-    /// rewritten with the call's `instance_prefix` so they match the
-    /// prefixed resource bindings and the prefixed downstream refs.
-    pub wait_bindings: Vec<WaitBinding>,
-}
 
 impl ModuleResolver<'_> {
     /// Expand a module call into resources.
@@ -46,12 +31,34 @@ impl ModuleResolver<'_> {
     /// enclosing module's declared types so a pass-through arg ref like
     /// `inner_arg = outer_arg` can be checked structurally before the
     /// parent's argument substitution erases the type tag (#2549).
+    /// Returns the contribution as a concrete `ParsedFile` — module
+    /// expansion is a parser-phase operation (it reads parser-phase
+    /// module data from `imported_modules`), so the honest return type
+    /// is `ParsedFile`, not a phantom `File<E>`.
+    ///
+    /// carina#3126 root fix: the caller folds this in via the *one*
+    /// shared [`merge_parsed_file`](crate::config_loader) — there is no
+    /// second hand-maintained field list that can silently diverge
+    /// from `File<E>` (the carina#3061 / carina#3126 bug class: a
+    /// module-internal `wait` / `for` dropped because the expansion
+    /// path forgot a field). The contribution is built below with an
+    /// **exhaustive struct literal**, so a new `File<E>` field cannot
+    /// compile until it is classified as "populated from the module
+    /// (instance-prefixed)" or "consumed during expansion, not
+    /// propagated". The generic-`File<E>` caller
+    /// (`resolve_modules_with_config<E>`) routes the contribution
+    /// through [`relabel_export_phase`](crate::config_loader) before
+    /// the merge so it stays phase-agnostic (today every caller is
+    /// `E = ParsedExportParam`, making that a same-phase no-op;
+    /// `export_params` is always empty so the relabel is total
+    /// regardless). The recursive parser-phase caller
+    /// (`resolve_nested_modules`) merges directly.
     pub fn expand_module_call(
         &self,
         call: &ModuleCall,
         instance_prefix: &str,
         enclosing_args: Option<&[ArgumentParameter]>,
-    ) -> Result<ExpandedModule, ModuleError> {
+    ) -> Result<ParsedFile, ModuleError> {
         let module = self
             .imported_modules
             .get(&call.module_name)
@@ -309,9 +316,59 @@ impl ModuleResolver<'_> {
             .map(|wb| prefix_wait_binding(wb, instance_prefix))
             .collect();
 
-        Ok(ExpandedModule {
+        // carina#3126: propagate the module's deferred for-expressions
+        // (previously dropped at this boundary). PR-A passes them
+        // through; PR-B fills in the instance-prefixing classified in
+        // `prefix_deferred_for_expression`.
+        let expanded_deferred_for_expressions: Vec<DeferredForExpression> = module
+            .deferred_for_expressions
+            .iter()
+            .map(|d| prefix_deferred_for_expression(d, instance_prefix))
+            .collect();
+
+        // The contribution is a full `ParsedFile` built with an
+        // **exhaustive struct literal** (no `..Default::default()`):
+        // adding a `File<E>` field breaks this until someone decides
+        // whether a module instance contributes it. Fields a module
+        // does *not* propagate are explicitly empty *here*, with the
+        // reason — never silently absent (the carina#3126 fix).
+        Ok(ParsedFile {
+            // Populated from the module, instance-prefixed:
             resources: expanded_resources,
             wait_bindings: expanded_wait_bindings,
+            deferred_for_expressions: expanded_deferred_for_expressions,
+
+            // Consumed *inside* expansion, not propagated to the caller
+            // (a module instance does not re-export these as raw
+            // collections — they are inlined / surfaced via the
+            // virtual attribute resource above):
+            //   - `providers`: modules inherit the caller's providers.
+            //   - `variables` / `user_functions`: module-local, already
+            //     substituted into the expanded resources.
+            //   - `uses` / `module_calls`: nested modules are resolved
+            //     within `expand_module_call`, not re-emitted.
+            //   - `arguments` / `attribute_params` / `export_params`:
+            //     the call's args are bound here; outputs reach the
+            //     caller through the `_virtual` attribute resource.
+            //   - `requires`: evaluated against this call's args here.
+            //   - `state_blocks` / `backend`: a module does not own
+            //     caller state/backend config.
+            //   - `structural_bindings` / `warnings`: scoped to the
+            //     module's own parse, not merged upward.
+            providers: Vec::new(),
+            variables: IndexMap::new(),
+            uses: Vec::new(),
+            module_calls: Vec::new(),
+            arguments: Vec::new(),
+            attribute_params: Vec::new(),
+            export_params: Vec::new(),
+            backend: None,
+            state_blocks: Vec::new(),
+            user_functions: HashMap::new(),
+            upstream_states: Vec::new(),
+            requires: Vec::new(),
+            structural_bindings: HashSet::new(),
+            warnings: Vec::new(),
         })
     }
 }
@@ -384,6 +441,71 @@ fn prefix_wait_binding(wb: &WaitBinding, instance_prefix: &str) -> WaitBinding {
         timeout_secs: *timeout_secs,
         depends_on: depends_on.iter().map(prefixed_name).collect(),
         line: *line,
+    }
+}
+
+/// Instance-prefix a [`DeferredForExpression`] crossing a module
+/// boundary, mirroring [`prefix_wait_binding`].
+///
+/// The struct is **destructured exhaustively** — the same carina#3061
+/// compile-time forcing function: if a field is added to
+/// `DeferredForExpression`, this stops compiling until someone
+/// classifies it as binding-name (prefix), value/provenance (pass
+/// through), or loop-local (pass through). That guard is the whole
+/// point of carina#3126's single merge surface — a new field cannot
+/// be silently dropped at the module boundary.
+///
+/// **PR-A scope:** every field is passed through *unchanged*. This
+/// already fixes the carina#3126 silent-drop (the entry now reaches
+/// the caller). The binding-name fields that still need
+/// instance-prefixing for a *correct* expansion under a module
+/// instance are called out per-field below and are PR-B's payload;
+/// each is marked `// PR-B:` so the follow-up is mechanical and the
+/// classification is recorded at the type level now.
+fn prefix_deferred_for_expression(
+    d: &DeferredForExpression,
+    _instance_prefix: &str,
+) -> DeferredForExpression {
+    let DeferredForExpression {
+        file,
+        line,
+        header,
+        resource_type,
+        attributes,
+        binding_name,
+        iterable_binding,
+        iterable_attr,
+        binding,
+        template_resource,
+    } = d;
+
+    DeferredForExpression {
+        // provenance — pass through (like WaitBinding.line)
+        file: file.clone(),
+        line: *line,
+        // verbatim user-surface display text — pass through
+        // (like WaitBinding.until_raw)
+        header: header.clone(),
+        // provider-qualified type — not a binding
+        resource_type: resource_type.clone(),
+        // PR-B: `Value`s may carry ResourceRef/BindingRef into
+        // module-internal bindings — must run rewrite_intra_module_refs
+        // + substitute_arguments like module.resources attributes.
+        attributes: attributes.clone(),
+        // PR-B: generated-resource binding prefix — must
+        // apply_instance_prefix (mirrors Resource.binding prefixing).
+        binding_name: binding_name.clone(),
+        // PR-B: iterable root binding — must apply_instance_prefix
+        // (mirrors prefix_wait_binding's lhs_segments[0] head).
+        iterable_binding: iterable_binding.clone(),
+        // attribute path tail — not a binding
+        iterable_attr: iterable_attr.clone(),
+        // loop-var pattern kind — loop-local, not a module binding
+        binding: binding.clone(),
+        // PR-B: full Resource — must get the same treatment as a
+        // module.resources entry (id/binding prefix + ref-rewrite +
+        // arg-substitute + canonicalize).
+        template_resource: template_resource.clone(),
     }
 }
 

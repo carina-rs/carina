@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::parser::{self, InferredFile, ParsedFile, ProviderContext};
+use crate::parser::{self, File, InferredFile, ParsedFile, ProviderContext};
 use crate::schema::SchemaRegistry;
 use crate::validation::inference::InferenceError;
 
@@ -271,29 +271,100 @@ pub fn parse_directory_with_overrides(
     Ok(merged)
 }
 
-/// Merge fields from `source` into `target`.
-pub(crate) fn merge_parsed_file(target: &mut ParsedFile, source: ParsedFile) {
-    target.providers.extend(source.providers);
-    target.resources.extend(source.resources);
-    target.variables.extend(source.variables);
-    target.uses.extend(source.uses);
-    target.module_calls.extend(source.module_calls);
-    target.arguments.extend(source.arguments);
-    target.attribute_params.extend(source.attribute_params);
-    target.export_params.extend(source.export_params);
-    target.state_blocks.extend(source.state_blocks);
-    target.user_functions.extend(source.user_functions);
-    target.upstream_states.extend(source.upstream_states);
-    target.wait_bindings.extend(source.wait_bindings);
-    target.requires.extend(source.requires);
-    target
-        .structural_bindings
-        .extend(source.structural_bindings);
-    target.warnings.extend(source.warnings);
+/// Re-label a parsed file's export-param phase (`File<A>` → `File<B>`)
+/// when it carries **no** export params.
+///
+/// Module expansion produces a concrete `ParsedFile` contribution (it
+/// is a parser-phase operation), but the caller's target is a generic
+/// `File<E>` (`resolve_modules_with_config<E>`). Today every
+/// production caller instantiates `E = ParsedExportParam`, so this is
+/// a same-phase no-op; the `<A, B>` generality keeps
+/// `resolve_modules_with_config` phase-agnostic for a future
+/// inferred-phase caller without re-introducing a hand-listed field
+/// list. A module contribution never re-exports raw export params —
+/// `export_params` is always empty — so the relabel is total and
+/// lossless.
+///
+/// Delegates to [`File::map_export_params`](crate::parser::File), the
+/// single exhaustive-destructure phase-axis surface (the carina#3126 /
+/// carina#3061 compile-time forcing function: a new `File<E>` field
+/// stops `map_export_params` from compiling until classified, so the
+/// module-expansion bridge can never silently drop a field).
+/// `debug_assert!`s `export_params` is empty — a contract tripwire for
+/// a future caller that violates the precondition; not reachable from
+/// the sole current caller (`expand_module_call` pins
+/// `export_params: Vec::new()`).
+pub(crate) fn relabel_export_phase<A, B>(f: File<A>) -> File<B> {
+    f.map_export_params(|export_params| {
+        // Tripwire for a future caller that violates the precondition.
+        // `debug_assert!` (not `assert!`): carina-core is a library;
+        // the real enforcement is the exhaustive destructure in
+        // `map_export_params`, and the sole current caller pins
+        // `export_params: Vec::new()`, so this is unreachable today —
+        // a release-build crash here would be a strictly worse failure
+        // mode than the test/CI catch a debug assert already gives.
+        debug_assert!(
+            export_params.is_empty(),
+            "relabel_export_phase: only an export-param-free file may cross \
+             phases; a module contribution must never carry export_params"
+        );
+        Vec::new()
+    })
+}
+
+/// Fold one parsed file's content into another (the sibling-`.crn`
+/// directory merge, and the module-load merge).
+///
+/// `source` is **destructured exhaustively** rather than field-accessed:
+/// this is the single source of truth for "every mergeable `File<E>`
+/// field", and the destructure is a compile-time forcing function — if
+/// a field is added to `File<E>`, this stops compiling until someone
+/// decides how it merges. Without that guard a new field is silently
+/// dropped on this path, which is exactly the carina#3126 / carina#3061
+/// class of bug (a `File<E>` field that one merge path forgot). Generic
+/// over the export-param phase `E` so the parser phase and inferred
+/// phase share one merge.
+pub(crate) fn merge_parsed_file<E>(target: &mut File<E>, source: File<E>) {
+    let File {
+        providers,
+        resources,
+        variables,
+        uses,
+        module_calls,
+        arguments,
+        attribute_params,
+        export_params,
+        backend,
+        state_blocks,
+        user_functions,
+        upstream_states,
+        wait_bindings,
+        requires,
+        structural_bindings,
+        warnings,
+        deferred_for_expressions,
+    } = source;
+
+    target.providers.extend(providers);
+    target.resources.extend(resources);
+    target.variables.extend(variables);
+    target.uses.extend(uses);
+    target.module_calls.extend(module_calls);
+    target.arguments.extend(arguments);
+    target.attribute_params.extend(attribute_params);
+    target.export_params.extend(export_params);
+    target.state_blocks.extend(state_blocks);
+    target.user_functions.extend(user_functions);
+    target.upstream_states.extend(upstream_states);
+    target.wait_bindings.extend(wait_bindings);
+    target.requires.extend(requires);
+    target.structural_bindings.extend(structural_bindings);
+    target.warnings.extend(warnings);
     target
         .deferred_for_expressions
-        .extend(source.deferred_for_expressions);
-    if let Some(backend) = source.backend {
+        .extend(deferred_for_expressions);
+    // `backend` is config, not accumulated content: last file wins.
+    if let Some(backend) = backend {
         target.backend = Some(backend);
     }
 }
