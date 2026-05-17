@@ -2306,7 +2306,7 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
     plan.add(Effect::Wait {
         binding: "cert_issued".to_string(),
         target_id: cert_id.clone(),
-        target_identifier: None,
+        target: crate::effect::WaitTarget::ResolvedAtApply,
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
             value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
@@ -2453,7 +2453,7 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
     plan.add(Effect::Wait {
         binding: "cert_issued".to_string(),
         target_id: cert_id.clone(),
-        target_identifier: None,
+        target: crate::effect::WaitTarget::ResolvedAtApply,
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
             value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
@@ -2551,7 +2551,7 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
     plan.add(Effect::Wait {
         binding: "cert_issued".to_string(),
         target_id: cert_id.clone(),
-        target_identifier: None,
+        target: crate::effect::WaitTarget::ResolvedAtApply,
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
             value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
@@ -2925,5 +2925,180 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
         )])),
         "`resource_records` list element must resolve from chained \
          access into the post-create state; got: {resource_records:?}",
+    );
+}
+
+// -----------------------------------------------------------------------
+// carina#3119: wait target identifier must be resolved at apply time from
+// the just-created resource's state, not the plan-time value.
+// -----------------------------------------------------------------------
+
+/// Provider whose `read` only succeeds when handed the *correct* created
+/// identifier; with `None` (or a wrong identifier) it returns not-found,
+/// exactly like the real AWS ACM provider. It records every identifier
+/// passed to `read` so the test can assert what the apply path threaded
+/// through.
+struct IdentifierAwareProvider {
+    expected_identifier: String,
+    /// State returned by `create` (carries the real identifier + the
+    /// attribute the wait predicate checks).
+    created_state: Mutex<Option<State>>,
+    read_identifiers: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+impl IdentifierAwareProvider {
+    fn new(expected_identifier: &str, created_state: State) -> Self {
+        Self {
+            expected_identifier: expected_identifier.to_string(),
+            created_state: Mutex::new(Some(created_state)),
+            read_identifiers: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn read_identifiers(&self) -> Vec<Option<String>> {
+        self.read_identifiers.lock().unwrap().clone()
+    }
+}
+
+impl Provider for IdentifierAwareProvider {
+    fn name(&self) -> &str {
+        "identifier-aware"
+    }
+
+    fn read(
+        &self,
+        id: &ResourceId,
+        identifier: Option<&str>,
+        _request: ReadRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let owned = identifier.map(|s| s.to_string());
+        self.read_identifiers.lock().unwrap().push(owned.clone());
+        let id = id.clone();
+        let expected = self.expected_identifier.clone();
+        let state = self.created_state.lock().unwrap().clone();
+        Box::pin(async move {
+            match owned {
+                Some(ref got) if got == &expected => {
+                    state.ok_or_else(|| ProviderError::api_error("no canned state for read"))
+                }
+                _ => Err(ProviderError::not_found(format!(
+                    "wait target {id} not found (deleted out-of-band?)"
+                ))
+                .for_resource(id)),
+            }
+        })
+    }
+
+    fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+        self.read(&resource.id, None, ReadRequest)
+    }
+
+    fn create(
+        &self,
+        _id: &ResourceId,
+        _request: CreateRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let state = self.created_state.lock().unwrap().clone();
+        Box::pin(
+            async move { state.ok_or_else(|| ProviderError::api_error("no canned create state")) },
+        )
+    }
+
+    fn update(
+        &self,
+        _id: &ResourceId,
+        _identifier: &str,
+        _request: UpdateRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        Box::pin(async move { Err(ProviderError::api_error("update not expected")) })
+    }
+
+    fn delete(
+        &self,
+        _id: &ResourceId,
+        _identifier: &str,
+        _request: DeleteRequest,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
+        Box::pin(async move { Err(ProviderError::api_error("delete not expected")) })
+    }
+}
+
+/// Regression for carina#3119: a resource created *in the same apply run*
+/// has no plan-time identifier, so the differ emits
+/// `WaitTarget::ResolvedAtApply` on `Effect::Wait`. The executor must
+/// resolve the real identifier from the just-completed Create's state
+/// (held in `applied_states`), not poll `provider.read` with no
+/// identifier.
+///
+/// This exercises the real apply path (`execute_plan`). The pre-existing
+/// wait unit tests in `wait.rs` use a provider that ignores the
+/// identifier, so they never caught this.
+#[tokio::test]
+async fn wait_resolves_target_identifier_from_just_created_state() {
+    use crate::wait::predicate::{AttrPath, WaitPredicate};
+
+    let mut cert = Resource::new("test", "cert");
+    cert.binding = Some("cert".to_string());
+    let cert_id = cert.id.clone();
+
+    // Post-create state: the provider hands back the real identifier
+    // (unknown at plan time) plus the attribute the wait predicate reads.
+    let mut created_attrs = HashMap::new();
+    created_attrs.insert(
+        "status".to_string(),
+        Value::Concrete(ConcreteValue::String("issued".to_string())),
+    );
+    let created_state =
+        State::existing(cert_id.clone(), created_attrs).with_identifier("cert-arn-real");
+
+    let provider = IdentifierAwareProvider::new("cert-arn-real", created_state);
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(cert));
+    plan.add(Effect::Wait {
+        binding: "cert_issued".to_string(),
+        target_id: cert_id.clone(),
+        // The differ emits `ResolvedAtApply` because the cert does not
+        // exist at plan time (created in this same run).
+        target: crate::effect::WaitTarget::ResolvedAtApply,
+        until: WaitPredicate::Equals {
+            attr: AttrPath::single("status"),
+            value: Value::Concrete(ConcreteValue::String("issued".to_string())),
+        },
+        until_surface: "cert.status == \"issued\"".to_string(),
+        timeout: std::time::Duration::from_secs(5),
+        interval: std::time::Duration::from_millis(10),
+        explicit_dependencies: std::collections::HashSet::new(),
+    });
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+    };
+
+    let observer = MockObserver::new();
+    let result = execute_plan(&provider, input, &observer).await;
+
+    assert_eq!(
+        result.failure_count,
+        0,
+        "wait must not fail; the just-created identifier should reach \
+         provider.read. read identifiers seen: {:?}",
+        provider.read_identifiers()
+    );
+    assert_eq!(result.success_count, 2, "both Create and Wait must succeed");
+    assert!(
+        provider
+            .read_identifiers()
+            .iter()
+            .any(|i| i.as_deref() == Some("cert-arn-real")),
+        "the wait read must be called with the created identifier \
+         resolved from applied_states, not the plan-time None; got: {:?}",
+        provider.read_identifiers()
     );
 }

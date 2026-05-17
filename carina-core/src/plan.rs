@@ -427,7 +427,7 @@ mod tests {
         let e = Effect::Wait {
             binding: "cert_issued".to_string(),
             target_id: ResourceId::new("acm.Certificate", "cert"),
-            target_identifier: None,
+            target: crate::effect::WaitTarget::ResolvedAtApply,
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
                 value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
@@ -454,7 +454,7 @@ mod tests {
         plan.add(Effect::Wait {
             binding: "cert_issued".to_string(),
             target_id: ResourceId::new("acm.Certificate", "cert"),
-            target_identifier: None,
+            target: crate::effect::WaitTarget::ResolvedAtApply,
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
                 value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),

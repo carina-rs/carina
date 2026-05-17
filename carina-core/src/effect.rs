@@ -40,6 +40,44 @@ pub struct CascadingUpdate {
     pub to: Resource,
 }
 
+/// How an [`Effect::Wait`] obtains the cloud provider identifier its
+/// polling `read()` needs.
+///
+/// The differ cannot always know the target's identifier at plan time:
+/// when the target is *created in the same apply run* it has no prior
+/// state, so its real identifier (e.g. an ACM certificate ARN) only
+/// exists after the `Create` effect completes. Splitting "known now"
+/// from "resolve at apply" into the type — instead of overloading
+/// `Option<String>`'s `None` — forces the executor to handle the
+/// apply-time case explicitly via an exhaustive `match`, so future code
+/// cannot silently pass a stale plan-time `None` to `provider.read`
+/// (carina#3119).
+///
+/// Guard: the old `Option<String>`-shaped pattern — treating the
+/// plan-time value as something you can `.as_deref()` straight into the
+/// poll loop — no longer type-checks. `WaitTarget` has no `Option`-like
+/// API, so there is no `None` to forward:
+///
+/// ```compile_fail
+/// use carina_core::effect::WaitTarget;
+/// let t = WaitTarget::ResolvedAtApply;
+/// // Was: `target_identifier.as_deref()` — `WaitTarget` has no
+/// // `as_deref`, forcing callers through an exhaustive match that
+/// // handles the apply-time resolution explicitly.
+/// let _ = t.as_deref();
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WaitTarget {
+    /// The target already exists; its identifier was resolved from
+    /// `current_states` at plan time.
+    Known(String),
+    /// The target is created or updated in this same run. The executor
+    /// resolves the real identifier from the just-applied state
+    /// (`applied_states`) before polling; falls back to no identifier
+    /// only when the target was never produced in this plan.
+    ResolvedAtApply,
+}
+
 /// Effect representing an operation on a resource
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Effect {
@@ -141,8 +179,9 @@ pub enum Effect {
         /// Resolved id of the target resource (`wait cert { ... }` →
         /// `cert`'s `ResourceId`).
         target_id: ResourceId,
-        /// Cloud provider identifier of the target, when already known.
-        target_identifier: Option<String>,
+        /// How the executor obtains the target's cloud provider
+        /// identifier for its polling `read()`. See [`WaitTarget`].
+        target: WaitTarget,
         /// Typed predicate evaluated against each `read()` snapshot.
         until: WaitPredicate,
         /// Surface form of the `until` expression as the user wrote it
@@ -485,7 +524,7 @@ mod tests {
         let _ = Effect::Wait {
             binding: "cert_issued".to_string(),
             target_id: ResourceId::new("acm.Certificate", "cert"),
-            target_identifier: None,
+            target: WaitTarget::ResolvedAtApply,
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
                 value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
@@ -506,7 +545,7 @@ mod tests {
         let e = Effect::Wait {
             binding: "cert_issued".to_string(),
             target_id: ResourceId::new("acm.Certificate", "cert"),
-            target_identifier: None,
+            target: WaitTarget::ResolvedAtApply,
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
                 value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
@@ -528,7 +567,7 @@ mod tests {
         let e = Effect::Wait {
             binding: "cert_issued".to_string(),
             target_id: ResourceId::new("acm.Certificate", "cert"),
-            target_identifier: None,
+            target: WaitTarget::ResolvedAtApply,
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
                 value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
@@ -551,7 +590,7 @@ mod tests {
         let original = Effect::Wait {
             binding: "cert_issued".to_string(),
             target_id: ResourceId::new("acm.Certificate", "cert"),
-            target_identifier: None,
+            target: WaitTarget::ResolvedAtApply,
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
                 value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
