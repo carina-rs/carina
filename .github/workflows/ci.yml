@@ -99,6 +99,16 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    # Spike (#3089): sccache with the GitHub Actions cache backend caches
+    # rustc invocations across runs — including workspace crates and
+    # feature-added deps that Swatinem/rust-cache does NOT cache. This is
+    # the missing piece that made the Winch spike (#3098) net-negative:
+    # winch-codegen/wasmtime-internal-winch recompiled every run. With
+    # sccache, Winch's -78s test-run win should flip net-positive.
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      CARINA_WASM_WINCH: "1"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -106,6 +116,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-wasip2
+      - uses: mozilla-actions/sccache-action@v0.0.6
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       # Build the WASM fixture so carina-plugin-host's integration tests run
@@ -115,6 +126,7 @@ jobs:
       - run: cargo nextest run --workspace --all-features
       # nextest does not run doctests; cover them with cargo test --doc.
       - run: cargo test --workspace --doc --all-features
+      - run: sccache --show-stats
 
   binary-build:
     name: Binary Build (linux-x86_64)
