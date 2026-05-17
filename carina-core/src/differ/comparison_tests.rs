@@ -1116,3 +1116,382 @@ fn carina3080_principal_scalar_vs_singleton_is_no_change_via_pipeline() {
          canonicalize pipeline — got {result:?}"
     );
 }
+
+/// carina#3122 SHAPE A: a steady-state no-op plan on awscc CloudFront
+/// `Distribution` must NOT report a change for `allowed_methods` /
+/// `cached_methods`. Those are nested two Struct levels deep
+/// (`distribution_config` → `default_cache_behavior` →
+/// `allowed_methods`) and schema-typed `unordered_list(StringEnum)`.
+///
+/// Representative subset modeling the same axes as the live plan
+/// against `carina-rs/infra registry/dev/registry` (the verbatim live
+/// capture is `tests/carina3122_live_phantom.rs`). Both sides reach
+/// the differ as `ConcreteValue::String` in fully-qualified namespaced
+/// DSL form; the values are identical and only the element ORDER
+/// differs:
+/// - State (`from`):   `[String("awscc.cloudfront.Distribution.AllowedMethods.head"),
+///                        String("…AllowedMethods.get")]` — order head, get
+/// - Desired (`to`):   `[String("…AllowedMethods.get"),
+///                        String("…AllowedMethods.head")]` — order get, head
+///
+/// `allowed_methods` is schema-typed `unordered_list(StringEnum)`, so
+/// element order is NOT significant: a multiset-equal pair must be
+/// `NoChange`. A pure order-only difference, not a type or alias
+/// mismatch.
+///
+/// Root cause of the live phantom was external to carina-core: the
+/// infra stack pinned an old awscc revision whose generated schema
+/// still used `AttributeType::list` (`ordered: true`) for these
+/// fields; awscc HEAD already emits `unordered_list` (`ordered:
+/// false`). carina-core itself is correct *given* `ordered: false`.
+/// This test pins that contract: with the schema declaring the list
+/// unordered, a value-equal/order-reversed pair is `NoChange`. It is
+/// the regression guard so a future stale-pin recurrence is not
+/// misattributed to carina-core.
+///
+/// Verdict reached through the real `canonicalize_*_with_schemas` →
+/// `diff` pipeline (see `feedback_unit_test_path_is_not_apply_path`).
+#[test]
+fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
+    use crate::schema::{AttributeSchema, ResourceSchema, StructField};
+    use crate::value::{canonicalize_resources_with_schemas, canonicalize_states_with_schemas};
+
+    let method_enum = |name: &str, values: &[&str]| AttributeType::StringEnum {
+        name: name.to_string(),
+        values: values.iter().map(|s| s.to_string()).collect(),
+        namespace: Some("awscc.cloudfront.Distribution".to_string()),
+        dsl_aliases: values
+            .iter()
+            .map(|s| (s.to_string(), s.to_lowercase()))
+            .collect(),
+    };
+    let default_cache_behavior = AttributeType::Struct {
+        name: "DefaultCacheBehavior".to_string(),
+        fields: vec![
+            StructField::new(
+                "allowed_methods",
+                AttributeType::unordered_list(method_enum(
+                    "AllowedMethods",
+                    &["GET", "HEAD", "OPTIONS", "PUT", "PATCH", "POST", "DELETE"],
+                )),
+            )
+            .with_provider_name("AllowedMethods"),
+            StructField::new(
+                "cached_methods",
+                AttributeType::unordered_list(method_enum(
+                    "CachedMethods",
+                    &["GET", "HEAD", "OPTIONS"],
+                )),
+            )
+            .with_provider_name("CachedMethods"),
+            // User-authored scalar fields, so the test also covers the
+            // "authored field survives projection and compares equal"
+            // path alongside the read-back-default stripping.
+            StructField::new("compress", AttributeType::Bool).with_provider_name("Compress"),
+            StructField::new("target_origin_id", AttributeType::String)
+                .with_provider_name("TargetOriginId"),
+            StructField::new(
+                "viewer_protocol_policy",
+                method_enum(
+                    "ViewerProtocolPolicy",
+                    &["allow-all", "https-only", "redirect-to-https"],
+                ),
+            )
+            .with_provider_name("ViewerProtocolPolicy"),
+        ],
+    };
+    let distribution_config = AttributeType::Struct {
+        name: "DistributionConfig".to_string(),
+        fields: vec![
+            StructField::new("default_cache_behavior", default_cache_behavior)
+                .with_provider_name("DefaultCacheBehavior"),
+        ],
+    };
+    let mut schema = ResourceSchema::new("cloudfront.Distribution");
+    schema.attributes.insert(
+        "distribution_config".to_string(),
+        AttributeSchema::new("distribution_config", distribution_config),
+    );
+    let mut registry = crate::schema::SchemaRegistry::new();
+    registry.insert("awscc", schema.clone());
+
+    // Both sides are the SAME namespaced DSL String shape (per the
+    // live plan JSON); only element order differs.
+    let ns_method = |type_name: &str, alias: &str| {
+        Value::Concrete(ConcreteValue::String(format!(
+            "awscc.cloudfront.Distribution.{type_name}.{alias}"
+        )))
+    };
+    let methods = |type_name: &str, a: &str, b: &str| {
+        Value::Concrete(ConcreteValue::List(vec![
+            ns_method(type_name, a),
+            ns_method(type_name, b),
+        ]))
+    };
+
+    // Desired (`to`): order get, head. Includes the user-authored
+    // scalar fields so they survive `prev_explicit` projection and are
+    // compared (equal) on both sides — distinct from the read-back
+    // defaults below which are projected away.
+    let s = |v: &str| Value::Concrete(ConcreteValue::String(v.to_string()));
+    let mut desired_dcb = IndexMap::new();
+    desired_dcb.insert(
+        "allowed_methods".to_string(),
+        methods("AllowedMethods", "get", "head"),
+    );
+    desired_dcb.insert(
+        "cached_methods".to_string(),
+        methods("CachedMethods", "get", "head"),
+    );
+    desired_dcb.insert(
+        "compress".to_string(),
+        Value::Concrete(ConcreteValue::Bool(true)),
+    );
+    desired_dcb.insert("target_origin_id".to_string(), s("s3-origin"));
+    desired_dcb.insert(
+        "viewer_protocol_policy".to_string(),
+        s("awscc.cloudfront.Distribution.ViewerProtocolPolicy.redirect_to_https"),
+    );
+    let mut desired_dc = IndexMap::new();
+    desired_dc.insert(
+        "default_cache_behavior".to_string(),
+        Value::Concrete(ConcreteValue::Map(desired_dcb)),
+    );
+    let mut resources = vec![
+        Resource::new("cloudfront.Distribution", "d1").with_attribute(
+            "distribution_config",
+            Value::Concrete(ConcreteValue::Map(desired_dc)),
+        ),
+    ];
+    resources[0].id.provider = "awscc".to_string();
+    canonicalize_resources_with_schemas(&mut resources, &registry);
+
+    // State (`from`): same namespaced String values, opposite order
+    // (head, get) — the awscc `normalize_state` pass rewrites the
+    // Cloud Control read-back to this fully-qualified DSL form. PLUS
+    // the server-side read-back defaults the user never authored.
+    // These exact keys/values are from the live plan `--json` diff of
+    // `from` vs `to` (registry/dev/registry, state_serial 33). They
+    // are present ONLY in `from` (state); `to` (desired) has just the
+    // user-authored fields. Critically, several are NOT type-zero
+    // (`http_version` is a non-empty StringEnum, `ipv6_enabled`/
+    // `staging` are `true`), so `is_type_default` does NOT tolerate
+    // them — they must instead be stripped by the `prev_explicit`
+    // projection. This test exercises the real `diff` signature with
+    // `prev_explicit` built from the desired resource (as the
+    // carina-cli plan path does).
+    let empty_list = || Value::Concrete(ConcreteValue::List(vec![]));
+    let mut state_dcb = IndexMap::new();
+    state_dcb.insert(
+        "allowed_methods".to_string(),
+        methods("AllowedMethods", "head", "get"),
+    );
+    state_dcb.insert(
+        "cached_methods".to_string(),
+        methods("CachedMethods", "head", "get"),
+    );
+    // User-authored default_cache_behavior fields — identical on both
+    // sides, so they survive projection and compare equal.
+    state_dcb.insert(
+        "compress".to_string(),
+        Value::Concrete(ConcreteValue::Bool(true)),
+    );
+    state_dcb.insert("target_origin_id".to_string(), s("s3-origin"));
+    state_dcb.insert(
+        "viewer_protocol_policy".to_string(),
+        s("awscc.cloudfront.Distribution.ViewerProtocolPolicy.redirect_to_https"),
+    );
+    // Read-back-only defaults inside default_cache_behavior (NOT in `to`).
+    state_dcb.insert("field_level_encryption_id".to_string(), s(""));
+    state_dcb.insert("function_associations".to_string(), empty_list());
+    state_dcb.insert("lambda_function_associations".to_string(), empty_list());
+    state_dcb.insert(
+        "smooth_streaming".to_string(),
+        Value::Concrete(ConcreteValue::Bool(false)),
+    );
+    state_dcb.insert("trusted_key_groups".to_string(), empty_list());
+    state_dcb.insert("trusted_signers".to_string(), empty_list());
+    let mut grpc = IndexMap::new();
+    grpc.insert(
+        "enabled".to_string(),
+        Value::Concrete(ConcreteValue::Bool(false)),
+    );
+    state_dcb.insert(
+        "grpc_config".to_string(),
+        Value::Concrete(ConcreteValue::Map(grpc)),
+    );
+
+    let mut state_dc = IndexMap::new();
+    state_dc.insert(
+        "default_cache_behavior".to_string(),
+        Value::Concrete(ConcreteValue::Map(state_dcb)),
+    );
+    // Read-back-only defaults at distribution_config top level (NOT in
+    // `to`). `http_version`/`ipv6_enabled`/`staging` are non-zero, so
+    // only the prev_explicit projection can suppress them.
+    state_dc.insert("cache_behaviors".to_string(), empty_list());
+    state_dc.insert("continuous_deployment_policy_id".to_string(), s(""));
+    state_dc.insert("custom_error_responses".to_string(), empty_list());
+    state_dc.insert("default_root_object".to_string(), s(""));
+    state_dc.insert(
+        "http_version".to_string(),
+        s("awscc.cloudfront.Distribution.HttpVersion.http1_1"),
+    );
+    state_dc.insert(
+        "ipv6_enabled".to_string(),
+        Value::Concrete(ConcreteValue::Bool(true)),
+    );
+    state_dc.insert(
+        "staging".to_string(),
+        Value::Concrete(ConcreteValue::Bool(false)),
+    );
+    state_dc.insert("web_acl_id".to_string(), s(""));
+    let mut state_attrs = HashMap::new();
+    state_attrs.insert(
+        "distribution_config".to_string(),
+        Value::Concrete(ConcreteValue::Map(state_dc)),
+    );
+    let mut id = ResourceId::new("cloudfront.Distribution", "d1");
+    id.provider = "awscc".to_string();
+    let mut states = std::collections::HashMap::new();
+    let st = State::existing(id, state_attrs);
+    states.insert(st.id.clone(), st);
+    canonicalize_states_with_schemas(&mut states, &registry);
+
+    // The carina-cli plan path passes `prev_explicit` built from the
+    // desired resource so server-side defaults are projected out of
+    // the state side before comparison. Model that here.
+    let prev_explicit = crate::explicit::build_from_resource(&resources[0]);
+
+    let current = states.into_values().next().unwrap();
+    let result = diff(
+        &resources[0],
+        &current,
+        None,
+        Some(&prev_explicit),
+        Some(&schema),
+    );
+    assert!(
+        matches!(result, Diff::NoChange(_)),
+        "carina#3122 SHAPE A: a steady-state no-op plan must be \
+         NoChange. State carries server read-back defaults the user \
+         never authored (http_version, ipv6_enabled, …) plus \
+         order-reversed unordered List<StringEnum> allowed_methods/\
+         cached_methods; prev_explicit projection + unordered-list \
+         multiset must collapse all of it — got {result:?}"
+    );
+}
+
+/// Contrast to `carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline`:
+/// the SAME order-reversed value-equal lists, but with the schema
+/// declaring the list **ordered** (`AttributeType::list`, i.e.
+/// `ordered: true`). This is exactly the stale-pin condition
+/// (carina#3122 root cause): the pinned old awscc revision generated
+/// `allowed_methods` as an ordered list, so carina-core compared the
+/// elements positionally and reported a phantom change.
+///
+/// Asserting `Diff::Update` here pins that the schema's `ordered`
+/// flag is the deciding factor — without this, the no-change test
+/// above could keep passing even if the schema-typed ordered-list arm
+/// regressed, because the no-schema fallback path always treats lists
+/// as multisets. Together the two tests prove: ordered ⇒ Change,
+/// unordered ⇒ NoChange, for identical value-equal/order-reversed
+/// input.
+#[test]
+fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline() {
+    use crate::schema::{AttributeSchema, ResourceSchema, StructField};
+    use crate::value::{canonicalize_resources_with_schemas, canonicalize_states_with_schemas};
+
+    let method_enum = |name: &str, values: &[&str]| AttributeType::StringEnum {
+        name: name.to_string(),
+        values: values.iter().map(|s| s.to_string()).collect(),
+        namespace: Some("awscc.cloudfront.Distribution".to_string()),
+        dsl_aliases: values
+            .iter()
+            .map(|s| (s.to_string(), s.to_lowercase()))
+            .collect(),
+    };
+    // The only load-bearing difference for the `allowed_methods`
+    // verdict vs the no-change test: `list` (ordered: true) instead of
+    // `unordered_list`. (This test uses a trimmed shape — no
+    // `cached_methods`, no read-back-default state block — since only
+    // the `allowed_methods` ordering is under test here.)
+    let default_cache_behavior = AttributeType::Struct {
+        name: "DefaultCacheBehavior".to_string(),
+        fields: vec![
+            StructField::new(
+                "allowed_methods",
+                AttributeType::list(method_enum(
+                    "AllowedMethods",
+                    &["GET", "HEAD", "OPTIONS", "PUT", "PATCH", "POST", "DELETE"],
+                )),
+            )
+            .with_provider_name("AllowedMethods"),
+        ],
+    };
+    let distribution_config = AttributeType::Struct {
+        name: "DistributionConfig".to_string(),
+        fields: vec![
+            StructField::new("default_cache_behavior", default_cache_behavior)
+                .with_provider_name("DefaultCacheBehavior"),
+        ],
+    };
+    let mut schema = ResourceSchema::new("cloudfront.Distribution");
+    schema.attributes.insert(
+        "distribution_config".to_string(),
+        AttributeSchema::new("distribution_config", distribution_config),
+    );
+    let mut registry = crate::schema::SchemaRegistry::new();
+    registry.insert("awscc", schema.clone());
+
+    let ns = |alias: &str| {
+        Value::Concrete(ConcreteValue::String(format!(
+            "awscc.cloudfront.Distribution.AllowedMethods.{alias}"
+        )))
+    };
+    let list = |a: &str, b: &str| Value::Concrete(ConcreteValue::List(vec![ns(a), ns(b)]));
+    let dcb = |a: &str, b: &str| {
+        let mut m = IndexMap::new();
+        m.insert("allowed_methods".to_string(), list(a, b));
+        let mut dc = IndexMap::new();
+        dc.insert(
+            "default_cache_behavior".to_string(),
+            Value::Concrete(ConcreteValue::Map(m)),
+        );
+        Value::Concrete(ConcreteValue::Map(dc))
+    };
+
+    let mut resources = vec![
+        Resource::new("cloudfront.Distribution", "d1")
+            .with_attribute("distribution_config", dcb("get", "head")),
+    ];
+    resources[0].id.provider = "awscc".to_string();
+    canonicalize_resources_with_schemas(&mut resources, &registry);
+
+    let mut state_attrs = HashMap::new();
+    state_attrs.insert("distribution_config".to_string(), dcb("head", "get"));
+    let mut id = ResourceId::new("cloudfront.Distribution", "d1");
+    id.provider = "awscc".to_string();
+    let mut states = std::collections::HashMap::new();
+    let st = State::existing(id, state_attrs);
+    states.insert(st.id.clone(), st);
+    canonicalize_states_with_schemas(&mut states, &registry);
+
+    let prev_explicit = crate::explicit::build_from_resource(&resources[0]);
+    let current = states.into_values().next().unwrap();
+    let result = diff(
+        &resources[0],
+        &current,
+        None,
+        Some(&prev_explicit),
+        Some(&schema),
+    );
+    assert!(
+        matches!(result, Diff::Update { .. }),
+        "carina#3122: with an ORDERED list schema, the same \
+         order-reversed value-equal lists MUST be a Change — this is \
+         the stale-pin failure mode the no-change test guards \
+         against. If this is NoChange the `ordered` flag is being \
+         ignored and the contract is no longer pinned — got {result:?}"
+    );
+}
