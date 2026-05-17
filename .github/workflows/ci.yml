@@ -98,7 +98,12 @@ jobs:
 
   test:
     name: Test
-    runs-on: ubuntu-latest
+    # Spike (#3089): the Test bottleneck is CPU-bound WASM
+    # precompile_component, ~4x slower on the 2-vCPU ubuntu-latest than
+    # local. public repos get GitHub larger runners at no cost, so move
+    # only this job to a 4-core runner to attack the root cause directly
+    # (no added compilable code, unlike the 3 rejected code-side spikes).
+    runs-on: ubuntu-latest-4-core
     steps:
       - uses: actions/checkout@v4
         with:
