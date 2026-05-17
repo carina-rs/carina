@@ -1,79 +1,96 @@
-//! Integration tests for the `plan-fixture` example binary.
+//! Integration tests for fixture-based plan rendering.
 //!
-//! The example renders plan output from fixtures without needing real
-//! provider plugins, mirroring the logic used by the plan snapshot tests.
+//! These exercise the same library path the `plan-fixture` example binary
+//! uses (`carina_cli::fixture_plan` + `carina_cli::display`), without
+//! spawning a nested `cargo run --example plan-fixture` subprocess. The
+//! subprocess form serialized eight concurrent cargo invocations on the
+//! target lock and pushed several cases past nextest's 60s SLOW threshold,
+//! dominating the CI Test job (refs #3084). Calling the library directly
+//! keeps the same behavior assertion (rendered output is non-empty) while
+//! running sub-second.
 
-use std::process::Command;
+use carina_cli::DetailLevel;
+use carina_cli::display::{format_destroy_plan, format_plan};
+use carina_cli::fixture_plan::{
+    build_plan_from_fixture_name, delete_attributes_from_plan, delete_attributes_from_states,
+};
 
-fn run_plan_fixture(args: &[&str]) -> std::process::Output {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let mut cmd = Command::new(env!("CARGO"));
-    cmd.args(["run", "--quiet", "--example", "plan-fixture", "--"])
-        .args(args)
-        .current_dir(manifest_dir);
-    cmd.output()
-        .expect("failed to execute plan-fixture example")
+/// Render a fixture the way the `plan-fixture` example does for a normal
+/// (non-destroy) plan and return the formatted output string.
+fn render_plan(fixture: &str, detail: DetailLevel) -> String {
+    let fp = build_plan_from_fixture_name(fixture);
+    let delete_attributes = delete_attributes_from_plan(&fp.plan, &fp.current_states);
+    format_plan(
+        &fp.plan,
+        detail,
+        &delete_attributes,
+        Some(&fp.schemas),
+        &fp.moved_origins,
+        &[],
+        &fp.deferred_for_expressions,
+        Some(&fp.prev_explicit),
+    )
 }
 
-fn assert_success(output: &std::process::Output, fixture: &str) {
+/// Render a fixture as a destroy plan, mirroring `plan-fixture --destroy`.
+fn render_destroy_plan(fixture: &str, detail: DetailLevel) -> String {
+    let fp = build_plan_from_fixture_name(fixture);
+    let delete_attributes = delete_attributes_from_states(&fp.current_states);
+    format_destroy_plan(&fp.plan, detail, &delete_attributes)
+}
+
+fn assert_non_empty(output: &str, fixture: &str) {
     assert!(
-        output.status.success(),
-        "plan-fixture for '{}' failed.\nstdout: {}\nstderr: {}",
-        fixture,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    assert!(
-        !output.stdout.is_empty(),
-        "plan-fixture for '{}' produced empty stdout",
+        !output.is_empty(),
+        "plan-fixture for '{}' produced empty output",
         fixture,
     );
 }
 
 #[test]
 fn plan_fixture_all_create() {
-    let output = run_plan_fixture(&["all_create"]);
-    assert_success(&output, "all_create");
+    let output = render_plan("all_create", DetailLevel::Full);
+    assert_non_empty(&output, "all_create");
 }
 
 #[test]
 fn plan_fixture_mixed_operations() {
-    let output = run_plan_fixture(&["mixed_operations"]);
-    assert_success(&output, "mixed_operations");
+    let output = render_plan("mixed_operations", DetailLevel::Full);
+    assert_non_empty(&output, "mixed_operations");
 }
 
 #[test]
 fn plan_fixture_delete_orphan() {
-    let output = run_plan_fixture(&["delete_orphan"]);
-    assert_success(&output, "delete_orphan");
+    let output = render_plan("delete_orphan", DetailLevel::Full);
+    assert_non_empty(&output, "delete_orphan");
 }
 
 #[test]
 fn plan_fixture_compact_detail_none() {
-    let output = run_plan_fixture(&["compact", "--detail", "none"]);
-    assert_success(&output, "compact");
+    let output = render_plan("compact", DetailLevel::None);
+    assert_non_empty(&output, "compact");
 }
 
 #[test]
 fn plan_fixture_destroy_full() {
-    let output = run_plan_fixture(&["destroy_full", "--destroy"]);
-    assert_success(&output, "destroy_full");
+    let output = render_destroy_plan("destroy_full", DetailLevel::Full);
+    assert_non_empty(&output, "destroy_full");
 }
 
 #[test]
 fn plan_fixture_upstream_state() {
-    let output = run_plan_fixture(&["upstream_state"]);
-    assert_success(&output, "upstream_state");
+    let output = render_plan("upstream_state", DetailLevel::Full);
+    assert_non_empty(&output, "upstream_state");
 }
 
 #[test]
 fn plan_fixture_upstream_state_map_subscript() {
-    let output = run_plan_fixture(&["upstream_state_map_subscript"]);
-    assert_success(&output, "upstream_state_map_subscript");
+    let output = render_plan("upstream_state_map_subscript", DetailLevel::Full);
+    assert_non_empty(&output, "upstream_state_map_subscript");
 }
 
 #[test]
 fn plan_fixture_upstream_state_map_dot_notation() {
-    let output = run_plan_fixture(&["upstream_state_map_dot_notation"]);
-    assert_success(&output, "upstream_state_map_dot_notation");
+    let output = render_plan("upstream_state_map_dot_notation", DetailLevel::Full);
+    assert_non_empty(&output, "upstream_state_map_dot_notation");
 }
