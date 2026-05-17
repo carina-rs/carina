@@ -1239,6 +1239,26 @@ pub fn canonicalize_with_type(value: Value, attr_type: &AttributeType) -> Value 
         (Value::Deferred(DeferredValue::Secret(inner)), _) => Value::Deferred(
             DeferredValue::Secret(Box::new(canonicalize_with_type(*inner, attr_type))),
         ),
+        // Union: the missing nesting kind (List/Map/Struct/Secret
+        // already recurse; Union was the lone gap — carina#3080).
+        // `principal` is `Union[Struct{ service: Union[String,
+        // List<String>] }, String]`, so without descending into the
+        // matching member the nested `string_or_list_of_strings`
+        // `service` never folds to `StringList`, and a bare scalar
+        // (desired) vs singleton list (aws-read) reaches the differ as
+        // a never-converging phantom. Pick the member with the SAME
+        // scorer `validate_union` uses (`select_union_member` wraps
+        // `union_member_score`) — one ranking function, not a second
+        // parallel shape predicate that could drift from the
+        // validator's — then re-dispatch so the existing arms
+        // canonicalize it. `None` (no member shares the value's shape)
+        // is identity — never guess-coerce.
+        (val, AttributeType::Union(members)) => {
+            match crate::schema::select_union_member(members, &val) {
+                Some(member) => canonicalize_with_type(val, member),
+                None => val,
+            }
+        }
         (v, _) => v,
     }
 }
@@ -3021,6 +3041,95 @@ mod tests {
         }
     }
 
+    /// carina#3080: `principal` is `Union[Struct{ service:
+    /// Union[String, List<String>] }, String]`. The canonicalizer must
+    /// recurse through the outer `Union` into the `Struct` member so
+    /// the nested `string_or_list_of_strings` `service` field is folded
+    /// to `StringList` — on both the bare-scalar (desired) and the
+    /// singleton-list (aws-read) spelling.
+    fn principal_union() -> AttributeType {
+        AttributeType::Union(vec![
+            AttributeType::Struct {
+                name: "PrincipalStruct".to_string(),
+                fields: vec![crate::schema::StructField::new(
+                    "service",
+                    string_or_list_of_strings(),
+                )],
+            },
+            AttributeType::String,
+        ])
+    }
+
+    #[test]
+    fn canonicalize_recurses_through_union_into_struct_scalar() {
+        let t = principal_union();
+        let mut map = IndexMap::new();
+        map.insert(
+            "service".to_string(),
+            Value::Concrete(ConcreteValue::String(
+                "cloudfront.amazonaws.com".to_string(),
+            )),
+        );
+        let v = Value::Concrete(ConcreteValue::Map(map));
+        let canon = canonicalize_with_type(v, &t);
+        match canon {
+            Value::Concrete(ConcreteValue::Map(m)) => {
+                assert_eq!(
+                    m.get("service"),
+                    Some(&Value::Concrete(ConcreteValue::StringList(vec![
+                        "cloudfront.amazonaws.com".to_string()
+                    ])))
+                );
+            }
+            _ => panic!("expected Map"),
+        }
+    }
+
+    #[test]
+    fn canonicalize_recurses_through_union_into_struct_singleton_list() {
+        let t = principal_union();
+        let mut map = IndexMap::new();
+        map.insert(
+            "service".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("cloudfront.amazonaws.com".to_string()),
+            )])),
+        );
+        let v = Value::Concrete(ConcreteValue::Map(map));
+        let canon = canonicalize_with_type(v, &t);
+        match canon {
+            Value::Concrete(ConcreteValue::Map(m)) => {
+                assert_eq!(
+                    m.get("service"),
+                    Some(&Value::Concrete(ConcreteValue::StringList(vec![
+                        "cloudfront.amazonaws.com".to_string()
+                    ])))
+                );
+            }
+            _ => panic!("expected Map"),
+        }
+    }
+
+    /// The `String` member of the same Union, given a bare string,
+    /// passes through unchanged (it is not `string_or_list_of_strings`).
+    #[test]
+    fn canonicalize_union_string_member_passthrough() {
+        let t = principal_union();
+        let v = Value::Concrete(ConcreteValue::String("*".to_string()));
+        let canon = canonicalize_with_type(v.clone(), &t);
+        assert_eq!(canon, v);
+    }
+
+    /// A Union with no member whose shape matches the value → identity
+    /// (safe fallthrough; never guess-coerce).
+    #[test]
+    fn canonicalize_union_no_matching_member_is_identity() {
+        let t = AttributeType::Union(vec![AttributeType::Int, AttributeType::Bool]);
+        let v = Value::Concrete(ConcreteValue::String("not-an-int".to_string()));
+        let canon = canonicalize_with_type(v.clone(), &t);
+        assert_eq!(canon, v);
+    }
+
     #[test]
     fn canonicalize_recurses_into_map_value_type() {
         let t = AttributeType::Map {
@@ -3456,6 +3565,85 @@ mod tests {
         assert_eq!(
             resources[0].attributes.get("subject"),
             state.attributes.get("subject"),
+        );
+    }
+
+    /// carina#3080 end-to-end via the REAL pipeline entry
+    /// (`canonicalize_*_with_schemas`), NOT the `Union` arm directly
+    /// (`feedback_unit_test_path_is_not_apply_path`). `principal` is
+    /// `Union[Struct{ service: Union[String, List<String>] }, String]`.
+    /// Desired holds the bare scalar; state holds the aws-read
+    /// singleton list. After both pass through the pipeline they must
+    /// be byte-identical `StringList` — the
+    /// `differ/comparison.rs:28-47` invariant ("non-canonical reaching
+    /// the differ is a bug") is then satisfied, not worked around.
+    #[test]
+    fn canonicalize_pipeline_folds_union_nested_string_or_list_both_sides() {
+        use crate::schema::{
+            AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
+        };
+        let principal = AttributeType::Union(vec![
+            AttributeType::Struct {
+                name: "PrincipalStruct".to_string(),
+                fields: vec![StructField::new("service", string_or_list_of_strings())],
+            },
+            AttributeType::String,
+        ]);
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "aws",
+            ResourceSchema::new("iam.policy")
+                .attribute(AttributeSchema::new("principal", principal)),
+        );
+
+        // Desired: bare scalar inside the Struct member.
+        let mut desired_inner = IndexMap::new();
+        desired_inner.insert(
+            "service".to_string(),
+            Value::Concrete(ConcreteValue::String(
+                "cloudfront.amazonaws.com".to_string(),
+            )),
+        );
+        let mut resources = vec![make_resource(vec![(
+            "principal",
+            Value::Concrete(ConcreteValue::Map(desired_inner)),
+        )])];
+        canonicalize_resources_with_schemas(&mut resources, &registry);
+
+        // State: aws-read singleton list inside the Struct member.
+        let mut state_inner = IndexMap::new();
+        state_inner.insert(
+            "service".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("cloudfront.amazonaws.com".to_string()),
+            )])),
+        );
+        let mut states = std::collections::HashMap::new();
+        let s = make_state(vec![(
+            "principal",
+            Value::Concrete(ConcreteValue::Map(state_inner)),
+        )]);
+        states.insert(s.id.clone(), s);
+        canonicalize_states_with_schemas(&mut states, &registry);
+
+        let state = states.values().next().unwrap();
+        let expected = {
+            let mut m = IndexMap::new();
+            m.insert(
+                "service".to_string(),
+                Value::Concrete(ConcreteValue::StringList(vec![
+                    "cloudfront.amazonaws.com".to_string(),
+                ])),
+            );
+            Value::Concrete(ConcreteValue::Map(m))
+        };
+        assert_eq!(resources[0].attributes.get("principal"), Some(&expected));
+        assert_eq!(state.attributes.get("principal"), Some(&expected));
+        assert_eq!(
+            resources[0].attributes.get("principal"),
+            state.attributes.get("principal"),
+            "carina#3080: both sides must collapse to the same StringList \
+             via the real pipeline so the differ sees no phantom"
         );
     }
 

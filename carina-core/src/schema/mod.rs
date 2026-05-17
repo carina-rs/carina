@@ -1462,7 +1462,7 @@ impl AttributeType {
 ///
 /// On a tie, the first member at the maximum wins — `validate_union`
 /// uses strict `>` so declaration order is preserved.
-fn union_member_score(member: &AttributeType, value: ConcreteValueRef<'_>) -> u32 {
+pub(crate) fn union_member_score(member: &AttributeType, value: ConcreteValueRef<'_>) -> u32 {
     use AttributeType as AT;
     match (member, value) {
         // Map↔Struct: the original heuristic. Highest score so a
@@ -1514,6 +1514,54 @@ fn union_member_score(member: &AttributeType, value: ConcreteValueRef<'_>) -> u3
             .unwrap_or(0),
         _ => 0,
     }
+}
+
+/// Pick the Union member a concrete value structurally "is", using the
+/// **same scoring function** [`validate_union`] uses for error
+/// attribution ([`union_member_score`], #2219). Reusing the one scorer
+/// — rather than authoring a second parallel shape predicate — is
+/// deliberate (carina#3080 design): the canonicalizer
+/// ([`crate::value::canonicalize_with_type`]'s `Union` arm) and the
+/// validator must not drift apart in how they judge a value's member.
+/// There is one ranking function here, not two kept in sync by review.
+///
+/// Selection rules:
+/// - Project the value to its concrete shape (deferred values have no
+///   shape → `None`, identity fallthrough at the call site).
+/// - Score **every** member; the **strict-max** member wins, so on a
+///   tie the earliest-declared member is kept (strict `>`, the same
+///   declaration-order preference `validate_union` applies, e.g.
+///   `string_or_principal_struct`'s deliberate Struct-before-String).
+/// - All members score `0` (no shared structure) → `None`. The caller
+///   treats `None` as identity (never guess-coerce); a `Map` value can
+///   never select a `String` member because `(String, Map)` scores `0`.
+///
+/// Note the deliberate scope difference from `validate_union`: that
+/// function scores only members whose `validate_concrete` *failed*
+/// (the first member that validates `Ok` short-circuits — its job is
+/// to attribute an *error* message). This function scores *all*
+/// members because its job is the opposite: pick the structurally
+/// best-matching member to canonicalize *into*, whether or not it
+/// would also validate. For the IAM-union shapes this fix targets
+/// (`Union[Struct, String]`, `Union[String, List<String>]`) the
+/// members are shape-disjoint — exactly one scores `> 0` for a given
+/// value — so the two functions select the same member regardless;
+/// the broader scoring only matters for hypothetical overlapping
+/// unions, where "best structural match" is the correct rule for a
+/// canonicalizer (and a no-op for `None`-on-tie safety).
+pub(crate) fn select_union_member<'a>(
+    members: &'a [AttributeType],
+    value: &Value,
+) -> Option<&'a AttributeType> {
+    let projected = value.as_concrete()?;
+    let mut best: Option<(u32, &AttributeType)> = None;
+    for member in members {
+        let score = union_member_score(member, projected);
+        if score > 0 && best.as_ref().is_none_or(|(prev, _)| score > *prev) {
+            best = Some((score, member));
+        }
+    }
+    best.map(|(_, m)| m)
 }
 
 /// Map every accepted field name to its canonical [`StructField`].

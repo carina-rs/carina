@@ -1037,3 +1037,82 @@ fn union_string_or_list_through_custom_wrapper() {
     let b = Value::Concrete(ConcreteValue::StringList(vec!["x".to_string()]));
     assert!(type_aware_equal(&a, &b, Some(&custom), None));
 }
+
+/// carina#3080 differ parity (design Test plan item 2+3): the
+/// `principal` `Union[Struct{ service: Union[String, List<String>] },
+/// String]` phantom must vanish at the **differ verdict**, and it must
+/// vanish *because the pipeline canonicalizes both sides to the same
+/// `StringList`* — NOT because of any comparator special-case (which
+/// `comparison.rs:28-47` prohibits). This runs the real order:
+/// `canonicalize_*_with_schemas` (the apply/plan path) → `diff`.
+#[test]
+fn carina3080_principal_scalar_vs_singleton_is_no_change_via_pipeline() {
+    use crate::schema::{AttributeSchema, ResourceSchema, StructField};
+    use crate::value::{canonicalize_resources_with_schemas, canonicalize_states_with_schemas};
+
+    let principal = AttributeType::Union(vec![
+        AttributeType::Struct {
+            name: "PrincipalStruct".to_string(),
+            fields: vec![StructField::new(
+                "service",
+                AttributeType::Union(vec![
+                    AttributeType::String,
+                    AttributeType::list(AttributeType::String),
+                ]),
+            )],
+        },
+        AttributeType::String,
+    ]);
+    let mut schema = ResourceSchema::new("iam.policy");
+    schema.attributes.insert(
+        "principal".to_string(),
+        AttributeSchema::new("principal", principal),
+    );
+    let mut registry = crate::schema::SchemaRegistry::new();
+    registry.insert("aws", schema.clone());
+
+    // Desired: user's bare scalar inside the Struct member.
+    let mut desired_inner = IndexMap::new();
+    desired_inner.insert(
+        "service".to_string(),
+        Value::Concrete(ConcreteValue::String(
+            "cloudfront.amazonaws.com".to_string(),
+        )),
+    );
+    let mut resources = vec![Resource::new("iam.policy", "p1").with_attribute(
+        "principal",
+        Value::Concrete(ConcreteValue::Map(desired_inner)),
+    )];
+    // Force the provider segment so the registry lookup ("aws") hits.
+    resources[0].id.provider = "aws".to_string();
+    canonicalize_resources_with_schemas(&mut resources, &registry);
+
+    // State: aws-read singleton list inside the Struct member.
+    let mut state_inner = IndexMap::new();
+    state_inner.insert(
+        "service".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("cloudfront.amazonaws.com".to_string()),
+        )])),
+    );
+    let mut state_attrs = HashMap::new();
+    state_attrs.insert(
+        "principal".to_string(),
+        Value::Concrete(ConcreteValue::Map(state_inner)),
+    );
+    let mut id = ResourceId::new("iam.policy", "p1");
+    id.provider = "aws".to_string();
+    let mut states = std::collections::HashMap::new();
+    let st = State::existing(id, state_attrs);
+    states.insert(st.id.clone(), st);
+    canonicalize_states_with_schemas(&mut states, &registry);
+
+    let current = states.into_values().next().unwrap();
+    let result = diff(&resources[0], &current, None, None, Some(&schema));
+    assert!(
+        matches!(result, Diff::NoChange(_)),
+        "carina#3080: scalar (desired) vs singleton-list (state) under \
+         Union[Struct,String] must be NoChange after the real \
+         canonicalize pipeline — got {result:?}"
+    );
+}
