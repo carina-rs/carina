@@ -122,7 +122,7 @@ pub(super) async fn refresh_pending_states(
 /// `wait` as the synchronization mechanism for upstream attributes
 /// that populate asynchronously (ACM `domain_validation_options`,
 /// CloudFront `domain_name`, etc.).
-pub(super) fn resolve_resource(
+pub(super) async fn resolve_resource(
     resource: &Resource,
     bindings: &ResolvedBindings,
     pipeline: &RenormalizePipeline<'_>,
@@ -133,7 +133,7 @@ pub(super) fn resolve_resource(
         assert_fully_resolved(&resolved_value, key)?;
         resolved.attributes.insert(key.clone(), resolved_value);
     }
-    renormalize(resolved, pipeline)
+    renormalize(resolved, pipeline).await
 }
 
 /// Resolve a resource, preferring unresolved source for re-resolution.
@@ -141,7 +141,7 @@ pub(super) fn resolve_resource(
 ///
 /// See [`resolve_resource`] for the fail-fast contract on
 /// still-deferred values.
-pub(super) fn resolve_resource_with_source(
+pub(super) async fn resolve_resource_with_source(
     target: &Resource,
     source: &Resource,
     bindings: &ResolvedBindings,
@@ -153,7 +153,7 @@ pub(super) fn resolve_resource_with_source(
         assert_fully_resolved(&resolved_value, key)?;
         resolved.attributes.insert(key.clone(), resolved_value);
     }
-    renormalize(resolved, pipeline)
+    renormalize(resolved, pipeline).await
 }
 
 /// The full plan-time normalization pipeline, threaded into the apply
@@ -202,10 +202,13 @@ pub(super) struct RenormalizePipeline<'a> {
 /// mirrors the caller's signature — `resolve_resource{,_with_source}`
 /// fail-fast earlier on still-`Deferred` values — so this stays the tail
 /// expression without forcing `Ok(...)` at every call site.
-fn renormalize(resolved: Resource, pipeline: &RenormalizePipeline<'_>) -> Result<Resource, String> {
+async fn renormalize(
+    resolved: Resource,
+    pipeline: &RenormalizePipeline<'_>,
+) -> Result<Resource, String> {
     let mut one = [resolved];
     crate::value::canonicalize_resources_with_schemas(&mut one, pipeline.schemas);
-    pipeline.normalizer.normalize_desired(&mut one);
+    pipeline.normalizer.normalize_desired(&mut one).await;
     crate::value::resolve_enum_aliases_for_resources(&mut one, pipeline.factories);
     let [resolved] = one;
     Ok(resolved)
@@ -367,7 +370,7 @@ pub(super) async fn execute_basic_effect<'a>(
 
     match effect {
         Effect::Create(resource) => {
-            let resolved = match resolve_resource(resource, bindings, pipeline) {
+            let resolved = match resolve_resource(resource, bindings, pipeline).await {
                 Ok(r) => r,
                 Err(e) => {
                     observer.on_event(&ExecutionEvent::EffectFailed {
@@ -428,7 +431,7 @@ pub(super) async fn execute_basic_effect<'a>(
         } => {
             let resolve_source = unresolved.get(id).unwrap_or(to);
             let resolved_to =
-                match resolve_resource_with_source(to, resolve_source, bindings, pipeline) {
+                match resolve_resource_with_source(to, resolve_source, bindings, pipeline).await {
                     Ok(r) => r,
                     Err(e) => {
                         observer.on_event(&ExecutionEvent::EffectFailed {

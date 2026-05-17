@@ -567,7 +567,7 @@ impl<'a> PlanPreprocessor<'a> {
     /// Run the full normalization pipeline on desired resources and current states.
     ///
     /// Call after `resolve_refs_with_state_and_remote()` and before `create_plan()`.
-    pub fn prepare(
+    pub async fn prepare(
         &self,
         resources: &mut [Resource],
         current_states: &mut HashMap<ResourceId, State>,
@@ -592,13 +592,14 @@ impl<'a> PlanPreprocessor<'a> {
             !current_states_contain_unknown(current_states),
             "Value::Deferred(DeferredValue::Unknown) found in current_states — RFC #2371 constraint b violated"
         );
-        self.normalizer.normalize_desired(resources);
-        self.normalizer.normalize_state(current_states);
+        self.normalizer.normalize_desired(resources).await;
+        self.normalizer.normalize_state(current_states).await;
         let schemas = self.ctx.schemas();
         for config in provider_configs {
             if !config.default_tags.is_empty() {
                 self.normalizer
-                    .merge_default_tags(resources, &config.default_tags, schemas);
+                    .merge_default_tags(resources, &config.default_tags, schemas)
+                    .await;
             }
         }
         resolve_enum_aliases_with_ctx(self.ctx, resources);
@@ -733,7 +734,11 @@ pub fn normalize_desired_with_ctx(ctx: &WiringContext, resources: &mut [Resource
         let attrs = indexmap::IndexMap::new();
         router.add_normalizer(rt.block_on(factory.create_normalizer(None, &attrs)));
     }
-    router.normalize_desired(resources);
+    // `rt` is the outermost runtime here (sync helper for fixture/test
+    // plan paths), so this `block_on` is not a nested one — the
+    // self-deadlock class fixed by carina#3112 only existed when the
+    // sync normalizer's *own* body opened a nested runtime.
+    rt.block_on(router.normalize_desired(resources));
 }
 
 /// Normalize enum values in current states to match DSL format.
@@ -754,7 +759,8 @@ pub fn normalize_state_with_ctx(
         let attrs = indexmap::IndexMap::new();
         router.add_normalizer(rt.block_on(factory.create_normalizer(None, &attrs)));
     }
-    router.normalize_state(current_states);
+    // Outermost runtime (see `normalize_desired_with_ctx`): not nested.
+    rt.block_on(router.normalize_state(current_states));
 }
 
 /// Resolve enum alias values in resources to their canonical AWS form.
@@ -1284,7 +1290,9 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
         // Hydrate now — before phase 2 resolves data source refs — so
         // any attributes the provider's read() didn't return are
         // available when building the binding map (#1685).
-        provider.hydrate_read_state(&mut current_states, &saved_attrs);
+        provider
+            .hydrate_read_state(&mut current_states, &saved_attrs)
+            .await;
 
         // Transfer state for explicit `moved` blocks and anonymous →
         // let-bound renames (#1685). Must run before phase 2 so the ref
@@ -1366,7 +1374,9 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
             // renames so the later `resolve_refs_with_state_and_remote`
             // call (and data-source-input resolution) sees entries
             // under their current binding names (#1685).
-            provider.hydrate_read_state(&mut current_states, &saved_attrs);
+            provider
+                .hydrate_read_state(&mut current_states, &saved_attrs)
+                .await;
             moved_pairs.extend(materialize_moved_states(
                 &mut current_states,
                 &mut prev_explicit,
@@ -1448,7 +1458,9 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
     // Run the normalization pipeline: normalize_desired → normalize_state →
     // merge_default_tags → resolve_enum_aliases (order matters).
     let preprocessor = PlanPreprocessor::new(&provider, &ctx);
-    preprocessor.prepare(&mut resources, &mut current_states, &parsed.providers);
+    preprocessor
+        .prepare(&mut resources, &mut current_states, &parsed.providers)
+        .await;
 
     // Build directives map from state file for orphaned resource deletion
     let directives_map = state_file

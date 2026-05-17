@@ -522,7 +522,9 @@ pub(super) async fn execute_effects_phased(
                             resolve_source,
                             &binding_snapshot,
                             &pipeline,
-                        ) {
+                        )
+                        .await
+                        {
                             Ok(r) => r,
                             Err(e) => {
                                 observer.on_event(&ExecutionEvent::EffectFailed {
@@ -567,7 +569,9 @@ pub(super) async fn execute_effects_phased(
                                         &cascade.to,
                                         &local_bindings,
                                         &pipeline,
-                                    ) {
+                                    )
+                                    .await
+                                    {
                                         Ok(r) => r,
                                         Err(e) => {
                                             observer.on_event(
@@ -1122,7 +1126,9 @@ pub(super) async fn execute_effects_phased(
                                     resolve_source,
                                     &binding_snapshot,
                                     &pipeline,
-                                ) {
+                                )
+                                .await
+                                {
                                     Ok(r) => r,
                                     Err(e) => {
                                         observer.on_event(&ExecutionEvent::EffectFailed {

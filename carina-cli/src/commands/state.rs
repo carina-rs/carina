@@ -751,7 +751,9 @@ pub(crate) async fn run_state_refresh_locked(
         &parsed.resources,
         ctx.schemas(),
     );
-    provider.hydrate_read_state(&mut current_states, &saved_attrs);
+    provider
+        .hydrate_read_state(&mut current_states, &saved_attrs)
+        .await;
     // awscc#251: also lift the provider-read `current_states` (not just
     // `saved_attrs`) — the values read at the refresh loop above arrive
     // as plain `String` for IAM enum fields and must be lifted before

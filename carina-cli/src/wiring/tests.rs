@@ -327,7 +327,7 @@ fn test_merge_default_tags_prevents_false_diff() {
         router.add_normalizer(rt.block_on(factory.create_normalizer(None, &attrs)));
     }
     let mut resources_with = vec![resource];
-    router.merge_default_tags(&mut resources_with, &default_tags, &schemas);
+    rt.block_on(router.merge_default_tags(&mut resources_with, &default_tags, &schemas));
 
     // After merging, desired now has tags matching state → no diff
     let plan_with = create_plan(

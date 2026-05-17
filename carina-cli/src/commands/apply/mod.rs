@@ -920,7 +920,9 @@ async fn run_apply_locked(
 
     // Hydrate, transfer state for moved blocks and anonymous → let-bound
     // renames (#1685), then run phase 2 against the consolidated state.
-    provider.hydrate_read_state(&mut current_states, &saved_attrs);
+    provider
+        .hydrate_read_state(&mut current_states, &saved_attrs)
+        .await;
     let moved_pairs = {
         let mut pairs = crate::wiring::materialize_moved_states(
             &mut current_states,
@@ -1021,11 +1023,13 @@ async fn run_apply_locked(
 
     // Run the normalization pipeline (same as plan path in wiring.rs).
     let preprocessor = crate::wiring::PlanPreprocessor::new(&provider, ctx);
-    preprocessor.prepare(
-        &mut resources_for_plan,
-        &mut current_states,
-        &parsed.providers,
-    );
+    preprocessor
+        .prepare(
+            &mut resources_for_plan,
+            &mut current_states,
+            &parsed.providers,
+        )
+        .await;
 
     let directives_map = state_file
         .as_ref()

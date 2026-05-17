@@ -170,11 +170,12 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         }
         for provider_config in &parsed.providers {
             if !provider_config.default_tags.is_empty() {
-                router.merge_default_tags(
+                // Outermost runtime (see `normalize_desired_with_ctx`): not nested.
+                rt.block_on(router.merge_default_tags(
                     &mut resources,
                     &provider_config.default_tags,
                     wiring.schemas(),
-                );
+                ));
             }
         }
     }
