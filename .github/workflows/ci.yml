@@ -112,6 +112,12 @@ jobs:
       # instead of silently skipping. Without this step a stale or missing
       # fixture leaves the wasm_integration_test suite as a no-op in CI.
       - run: cargo build -p carina-provider-mock --target wasm32-wasip2
+      # Precompile the mock fixture .wasm -> .cwasm ONCE for the whole job.
+      # nextest runs each test in its own process, so an in-process cache
+      # cannot share Wasmtime's ~25s precompile_component across the WASM
+      # tests on this slow runner. The carina-plugin-host tests load this
+      # shared .cwasm via from_precompiled instead (refs #3089).
+      - run: cargo run -p carina-plugin-host --example precompile-mock-fixture
       - run: cargo nextest run --workspace --all-features
       # nextest does not run doctests; cover them with cargo test --doc.
       - run: cargo test --workspace --doc --all-features

@@ -37,25 +37,50 @@ macro_rules! skip_if_no_wasm {
     };
 }
 
-/// Build a `WasmProviderFactory` using a per-test temporary cache directory.
+/// Path of the `.cwasm` the CI `precompile-mock-fixture` example writes
+/// next to the `.wasm` fixture, if present. Kept in sync with that
+/// example's `fixture_paths()`.
+fn prebuilt_cwasm() -> Option<std::path::PathBuf> {
+    let cwasm = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("target/wasm32-wasip2/debug/carina_provider_mock.precompiled.cwasm");
+    cwasm.exists().then_some(cwasm)
+}
+
+/// Build a `WasmProviderFactory` for a CRUD/WIT test.
 ///
-/// Tests in this binary run in parallel; if they all shared
-/// `WasmProviderFactory::new()`'s default `~/.carina/cache`, concurrent
-/// precompile runs race on the same `.cwasm` path and one test can observe
-/// a partially-written file (`"failed to load code for …"`). Each test gets
-/// its own cache dir via this helper to eliminate that race.
-async fn load_factory(wasm: &std::path::Path) -> (WasmProviderFactory, tempfile::TempDir) {
-    let cache = tempfile::tempdir().expect("Failed to create cache tempdir");
-    let factory = WasmProviderFactory::from_file_cached(wasm, cache.path())
+/// `cargo nextest` runs every test in its own process, so an in-process
+/// `OnceCell` cannot share the ~25s `precompile_component` across the 8
+/// tests here on CI's slow runner (refs #3089). Instead the CI Test job
+/// runs the `precompile-mock-fixture` example once to write a shared
+/// `.cwasm`; every test process then loads it via `from_precompiled`
+/// (a fast memory-mapped `Component::deserialize_file`), skipping
+/// `precompile` entirely.
+///
+/// When that prebuilt `.cwasm` is absent (local `cargo test`/`cargo
+/// nextest` without the CI step) the helper falls back to the original
+/// per-test `from_file_cached` path so local runs still pass. The
+/// fallback's cache dir is leaked so it outlives the factory's mmap for
+/// the whole test process — a single bounded leak per test, cheaper than
+/// the prior 8× redundant precompiles.
+async fn load_factory(wasm: &std::path::Path) -> WasmProviderFactory {
+    if let Some(cwasm) = prebuilt_cwasm() {
+        return WasmProviderFactory::from_precompiled(&cwasm)
+            .await
+            .expect("Failed to load WASM provider from prebuilt .cwasm");
+    }
+    let cache = Box::leak(Box::new(
+        tempfile::tempdir().expect("Failed to create cache tempdir"),
+    ));
+    WasmProviderFactory::from_file_cached(wasm, cache.path())
         .await
-        .expect("Failed to load WASM provider");
-    (factory, cache)
+        .expect("Failed to load WASM provider")
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_mock_provider_factory() {
     let path = skip_if_no_wasm!();
-    let (factory, _cache) = load_factory(&path).await;
+    let factory = load_factory(&path).await;
 
     assert_eq!(factory.name(), "mock");
     assert_eq!(factory.display_name(), "Mock Provider (Process)");
@@ -68,7 +93,7 @@ async fn test_wasm_mock_provider_factory() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_mock_provider_create_and_read() {
     let path = skip_if_no_wasm!();
-    let (factory, _cache) = load_factory(&path).await;
+    let factory = load_factory(&path).await;
     let provider = factory
         .create_provider(None, &indexmap::IndexMap::new())
         .await
@@ -149,7 +174,7 @@ async fn test_wasm_mock_provider_create_and_read() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_mock_provider_update_and_delete() {
     let path = skip_if_no_wasm!();
-    let (factory, _cache) = load_factory(&path).await;
+    let factory = load_factory(&path).await;
     let provider = factory
         .create_provider(None, &indexmap::IndexMap::new())
         .await
@@ -266,7 +291,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_mock_provider_normalizer() {
     let path = skip_if_no_wasm!();
-    let (factory, _cache) = load_factory(&path).await;
+    let factory = load_factory(&path).await;
     let normalizer = factory
         .create_normalizer(None, &indexmap::IndexMap::new())
         .await;
@@ -310,7 +335,7 @@ async fn test_wasm_mock_provider_merge_default_tags_dispatches_through_wit() {
     // echoes the host-supplied `default_tags` into a sentinel attribute;
     // its presence proves the WIT bridge round-tripped.
     let path = skip_if_no_wasm!();
-    let (factory, _cache) = load_factory(&path).await;
+    let factory = load_factory(&path).await;
     let normalizer = factory
         .create_normalizer(None, &indexmap::IndexMap::new())
         .await;
@@ -349,7 +374,7 @@ async fn test_wasm_mock_provider_merge_default_tags_empty_short_circuits() {
     // Empty `default_tags` must skip the WIT round-trip entirely; if it
     // didn't, the mock guest would still write its sentinel attribute.
     let path = skip_if_no_wasm!();
-    let (factory, _cache) = load_factory(&path).await;
+    let factory = load_factory(&path).await;
     let normalizer = factory
         .create_normalizer(None, &indexmap::IndexMap::new())
         .await;
@@ -378,7 +403,7 @@ async fn test_wasm_mock_provider_merge_default_tags_preserves_order() {
     // Multi-resource ordering: the host zips the guest's response by
     // index, so the guest must return resources in input order.
     let path = skip_if_no_wasm!();
-    let (factory, _cache) = load_factory(&path).await;
+    let factory = load_factory(&path).await;
     let normalizer = factory
         .create_normalizer(None, &indexmap::IndexMap::new())
         .await;
@@ -417,7 +442,7 @@ async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
     // into state plus a sentinel `__mock_read_data_source__` flag. If
     // that flag shows up, the WASM bridge forwarded the call correctly.
     let path = skip_if_no_wasm!();
-    let (factory, _cache) = load_factory(&path).await;
+    let factory = load_factory(&path).await;
     let provider = factory
         .create_provider(None, &indexmap::IndexMap::new())
         .await
