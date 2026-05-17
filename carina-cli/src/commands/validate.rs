@@ -8,7 +8,7 @@ use carina_core::config_loader::{
     find_crn_files_in_dir, get_base_dir, load_configuration_with_config,
 };
 use carina_core::lint::find_duplicate_attrs;
-use carina_core::parser::{ProviderContext, UpstreamState};
+use carina_core::parser::{File, ProviderContext, ResourceContext, UpstreamState};
 
 use super::validate_and_resolve_errors;
 use crate::error::AppError;
@@ -92,6 +92,44 @@ pub fn validate_with_factories(
     error_reports
 }
 
+/// Test-support twin of [`validate_with_factories`] that returns the
+/// resource identifier list `run_validate` would display, instead of
+/// the error strings. Runs the identical load + resolve pipeline, then
+/// derives the list via `validated_resource_ids` — the exact
+/// production display path — so e2e tests assert on what the user
+/// actually sees (including deferred-for loop bodies, carina#3121).
+///
+/// Not used outside test code.
+pub fn validated_resource_ids_with_factories(
+    path: &Path,
+    factories: Vec<Box<dyn carina_core::provider::ProviderFactory>>,
+) -> Vec<String> {
+    let provider_context = ProviderContext::default();
+    let loaded = match load_configuration_with_config(
+        path,
+        &provider_context,
+        &carina_core::schema::SchemaRegistry::new(),
+    ) {
+        Ok(l) => l,
+        Err(e) => panic!("fixture failed to load: {e}"),
+    };
+    let mut parsed = loaded.parsed;
+    let base_dir = get_base_dir(path);
+
+    // Run the same resolve/validate pass as the CLI so the parsed tree
+    // (and its `deferred_for_expressions`) is in the post-validation
+    // state the display path observes.
+    let _ = super::validate_and_resolve_errors_with_factories(
+        &mut parsed,
+        base_dir,
+        false,
+        factories,
+        std::collections::HashMap::new(),
+    );
+
+    validated_resource_ids(&parsed)
+}
+
 /// Format `LoadedConfig.inference_errors` into "export '<name>': type
 /// annotation required: <reason>" strings via the shared
 /// `inference::format_inference_error` helper so the CLI and LSP keep
@@ -102,6 +140,43 @@ fn format_inference_errors(
     errors
         .iter()
         .map(|(name, err)| carina_core::validation::inference::format_inference_error(name, err))
+        .collect()
+}
+
+/// The list of resource identifiers `validate` reports, derived from
+/// [`File::iter_all_resources`] so it stays in sync with every
+/// other resource-walking checker (the unified-walk invariant from
+/// `notes/specs/2026-04-19-unify-resource-walk-design.md`).
+///
+/// A `for` loop whose iterable is unresolved at parse time (e.g. a
+/// same-config provider-read attribute, carina#3121) contributes a
+/// `DeferredForExpression` whose `template_resource` has a `Pending`
+/// name — `resource.id` alone would render as a meaningless
+/// trailing-dot string. For those entries we render the loop's
+/// placeholder address form (`{resource_type}.{binding_name}[?]`) plus
+/// the source `for` header and its location so the user can see the
+/// loop body the planner intends to manage instead of it silently
+/// vanishing from the count and list. The location suffix also keeps
+/// two distinct anonymous loops over the *same* iterable
+/// distinguishable (`binding_name` + `header` alone are identical for
+/// `for _, opt in cert.dvo { … }` repeated twice). Direct resources
+/// render via their `id` unchanged.
+fn validated_resource_ids<E>(parsed: &File<E>) -> Vec<String> {
+    parsed
+        .iter_all_resources()
+        .map(|(ctx, resource)| match ctx {
+            ResourceContext::Direct => resource.id.to_string(),
+            ResourceContext::Deferred(d) => {
+                let location = match &d.file {
+                    Some(file) => format!("{file}:{}", d.line),
+                    None => d.line.to_string(),
+                };
+                format!(
+                    "{}.{}[?] (deferred: {} @ {})",
+                    d.resource_type, d.binding_name, d.header, location
+                )
+            }
+        })
         .collect()
 }
 
@@ -196,10 +271,11 @@ pub fn run_validate(
                 file: Some(file_path.display().to_string()),
             });
         }
+        let resources = validated_resource_ids(&parsed);
         let output = ValidateOutput {
             status: "ok",
-            resource_count: parsed.resources.len(), // allow: direct — display/reporting
-            resources: parsed.resources.iter().map(|r| r.id.to_string()).collect(), // allow: direct — display/reporting
+            resource_count: resources.len(),
+            resources,
             warnings,
         };
         println!(
@@ -210,18 +286,16 @@ pub fn run_validate(
         return Ok(());
     }
 
+    let resource_ids = validated_resource_ids(&parsed);
     println!(
         "{}",
-        format!(
-            "✓ {} resources validated successfully.",
-            parsed.resources.len() // allow: direct — display/reporting
-        )
-        .green()
-        .bold()
+        format!("✓ {} resources validated successfully.", resource_ids.len())
+            .green()
+            .bold()
     );
 
-    for resource in &parsed.resources {
-        println!("  • {}", resource.id);
+    for id in &resource_ids {
+        println!("  • {}", id);
     }
 
     for binding in &unused_warnings {
@@ -293,6 +367,68 @@ mod tests {
         assert_eq!(parsed["resources"].as_array().unwrap().len(), 2);
         // warnings should be omitted when empty
         assert!(parsed.get("warnings").is_none());
+    }
+
+    /// carina#3121 fix A: the `--json` output must enumerate a `for`
+    /// loop body over an unresolved (deferred) iterable, not just the
+    /// human-readable list. Builds `ValidateOutput` exactly as the
+    /// `if json` branch of `run_validate` does — `resource_count` and
+    /// `resources` both derived from `validated_resource_ids` — and
+    /// asserts the serialized JSON contains the deferred placeholder
+    /// entry and a count that includes it. This pins the `--json` path
+    /// the e2e test reaches only through the shared helper.
+    #[test]
+    fn json_output_enumerates_deferred_for_body() {
+        let src = r#"
+            let cert = aws.acm.Certificate {
+                domain_name       = "registry.example.com"
+                validation_method = "DNS"
+            }
+
+            for _, opt in cert.domain_validation_options {
+                aws.route53.RecordSet {
+                    hosted_zone_id   = "Z123"
+                    name             = opt.resource_record.name
+                    type             = "CNAME"
+                    ttl              = 300
+                    resource_records = [opt.resource_record.value]
+                }
+            }
+        "#;
+        let parsed =
+            carina_core::parser::parse(src, &ProviderContext::default()).expect("fixture parses");
+        // The loop is deferred (iterable is a same-config provider-read
+        // attribute), so it is not in `parsed.resources` but is in
+        // `deferred_for_expressions` — exactly the carina#3121 shape.
+        assert_eq!(parsed.deferred_for_expressions.len(), 1);
+
+        let resources = validated_resource_ids(&parsed);
+        let output = ValidateOutput {
+            status: "ok",
+            resource_count: resources.len(),
+            resources,
+            warnings: vec![],
+        };
+        let json = serde_json::to_string(&output).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        // cert (direct) + the deferred RecordSet body.
+        assert_eq!(value["resource_count"], 2);
+        let listed = value["resources"].as_array().unwrap();
+        assert!(
+            listed
+                .iter()
+                .any(|r| r.as_str().unwrap().contains("acm.Certificate")),
+            "json must list the let-bound certificate; got: {listed:?}"
+        );
+        assert!(
+            listed.iter().any(|r| {
+                let s = r.as_str().unwrap();
+                s.contains("route53.RecordSet") && s.contains("[?]") && s.contains("(deferred:")
+            }),
+            "json must list the deferred for-loop body as a placeholder \
+             entry; got: {listed:?}"
+        );
     }
 
     fn upstream(binding: &str, source: &str) -> UpstreamState {
