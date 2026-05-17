@@ -1530,3 +1530,113 @@ fn format_deferred_value_duration_renders_canonical() {
     // but a resolved Duration must render verbatim.
     assert_eq!(result, "1min");
 }
+
+/// Regression for #3115: a deleted-effect attribute whose value is a
+/// multi-line `format_value_pretty` map (e.g. CloudFront
+/// `default_cache_behavior`) must not bleed the red strikethrough
+/// across the *leading indentation whitespace* of continuation lines.
+///
+/// `colored` places the ANSI style once at the start and the reset
+/// once at the end of the whole string. Styling the entire multi-line
+/// pretty payload in one shot makes the strike span the newline-leading
+/// indent spaces of every continuation line, so the strike appears to
+/// start at the left edge instead of at the content column.
+///
+/// Invariant asserted: on every rendered line, the first non-whitespace
+/// character must appear before any ANSI escape (`\x1b`). Equivalently,
+/// the leading-whitespace prefix of each line carries no escape byte.
+#[test]
+fn delete_pretty_attribute_does_not_strike_indentation() {
+    use indexmap::IndexMap;
+
+    // A nested map forces `format_value_pretty` into a multi-line
+    // vertical layout with indented continuation lines, mirroring the
+    // real CloudFront `default_cache_behavior` shape from the bug
+    // report.
+    let mut forwarded_values = IndexMap::new();
+    forwarded_values.insert(
+        "query_string".to_string(),
+        Value::Concrete(ConcreteValue::Bool(false)),
+    );
+    let mut cache_behavior = IndexMap::new();
+    cache_behavior.insert(
+        "viewer_protocol_policy".to_string(),
+        Value::Concrete(ConcreteValue::String("redirect-to-https".to_string())),
+    );
+    cache_behavior.insert(
+        "forwarded_values".to_string(),
+        Value::Concrete(ConcreteValue::Map(forwarded_values)),
+    );
+
+    let row = DetailRow::PrettyAttribute {
+        key: "default_cache_behavior".to_string(),
+        value: Value::Concrete(ConcreteValue::Map(cache_behavior)),
+    };
+    let effect = Effect::Delete {
+        id: carina_core::resource::ResourceId::new("cloudfront.Distribution", "dist"),
+        identifier: "E123".to_string(),
+        directives: Default::default(),
+        binding: None,
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+    };
+
+    // Force ANSI styling on: the test harness' stdout is not a TTY, so
+    // `colored` auto-disables escapes and the bug (which is *in* the
+    // escape placement) would be invisible without this override.
+    colored::control::set_override(true);
+
+    let mut out = String::new();
+    // Non-empty `attr_prefix` so continuation lines have a real indent.
+    render_detail_row(&mut out, &row, &effect, "    ");
+
+    colored::control::unset_override();
+
+    // A style that opens on one line and resets on a later line keeps
+    // strikethrough/red active across the intervening newline(s), so
+    // the terminal paints the strike over the leading indentation of
+    // every continuation line. The correct shape (matching the
+    // non-delete `color_lines` path) opens and closes the style
+    // *within* each line, after that line's indentation.
+    //
+    // Invariant: at every `\n`, the ANSI style depth must be zero —
+    // no styling span may cross a line boundary.
+    let mut depth: i32 = 0;
+    let mut saw_open = false;
+    let bytes: Vec<char> = out.chars().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == '\u{1b}' && i + 1 < bytes.len() && bytes[i + 1] == '[' {
+            // Parse a CSI `\x1b[...m` sequence.
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j] != 'm' {
+                j += 1;
+            }
+            let params: String = bytes[i + 2..j].iter().collect();
+            if params == "0" {
+                depth = (depth - 1).max(0);
+            } else {
+                depth += 1;
+                saw_open = true;
+            }
+            i = j + 1;
+            continue;
+        }
+        if c == '\n' {
+            assert_eq!(
+                depth, 0,
+                "an ANSI style span crossed a newline: strikethrough/red \
+                 bleeds across the leading indentation of the next line. \
+                 rendered: {:?}",
+                out,
+            );
+        }
+        i += 1;
+    }
+    assert!(
+        saw_open,
+        "no ANSI styling was emitted; the test must run with colored \
+         override on and exercise the Delete styling path",
+    );
+}
