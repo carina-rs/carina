@@ -17,3 +17,16 @@ resolver = "2"
 version = "0.4.0"
 repository = "https://github.com/carina-rs/carina"
 homepage = "https://github.com/carina-rs/carina"
+
+# Spike (#3089): the CI Test job spends ~74s in the nextest compile+link
+# phase. Default `debug = 2` emits full DWARF, which dominates link time
+# for the workspace's many test binaries. `line-tables-only` keeps file
+# + line numbers in panics/backtraces (so test failures stay diagnosable)
+# while dropping the heavy variable/type debuginfo, cutting link time.
+# Zero new dependencies, so this cannot hit the uncached-compile wall
+# that cancelled the .cwasm/job-split/Winch spikes.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
