@@ -7,7 +7,7 @@ use std::time::Instant;
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::deps::find_failed_dependency;
-use crate::effect::Effect;
+use crate::effect::{Effect, WaitTarget};
 use crate::provider::Provider;
 use crate::resource::{Resource, ResourceId, State, Value};
 
@@ -292,6 +292,27 @@ pub(super) async fn execute_effects_sequential(
 
             // Snapshot bindings for this effect's resolution
             let binding_snapshot = input.bindings.clone();
+            // Resolve the wait target's identifier *now*, before the
+            // dispatch closure: a target created in this same run has no
+            // plan-time identifier (`WaitTarget::ResolvedAtApply`), so
+            // we read it from the just-completed effect's state held in
+            // `applied_states`. The scheduler guarantees the producing
+            // Create/Update/Replace ran before this Wait is dispatched
+            // (see the Wait-dependency edges above), so the entry is
+            // present. Falls back to no identifier only when the target
+            // was never produced in this plan (refresh-only apply).
+            // carina#3119.
+            let wait_identifier: Option<String> = match effect {
+                Effect::Wait {
+                    target_id, target, ..
+                } => match target {
+                    WaitTarget::Known(id) => Some(id.clone()),
+                    WaitTarget::ResolvedAtApply => applied_states
+                        .get(target_id)
+                        .and_then(|s| s.identifier.clone()),
+                },
+                _ => None,
+            };
             let unresolved = &input.unresolved_resources;
             let pipeline = RenormalizePipeline {
                 normalizer: input.normalizer,
@@ -364,7 +385,6 @@ pub(super) async fn execute_effects_sequential(
                     Effect::Wait {
                         binding,
                         target_id,
-                        target_identifier,
                         until,
                         timeout,
                         interval,
@@ -380,7 +400,7 @@ pub(super) async fn execute_effects_sequential(
                         match super::wait::execute_wait_effect(
                             provider,
                             target_id,
-                            target_identifier.as_deref(),
+                            wait_identifier.as_deref(),
                             until,
                             *timeout,
                             *interval,

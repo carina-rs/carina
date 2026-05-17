@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::deps::get_resource_dependencies;
-use crate::effect::{CascadingUpdate, Effect, TemporaryName};
+use crate::effect::{CascadingUpdate, Effect, TemporaryName, WaitTarget};
 use crate::identifier::generate_random_suffix;
 use crate::parser::WaitBinding;
 use crate::plan::{Plan, PlanError};
@@ -433,9 +433,18 @@ pub fn create_plan(
             value: wb.until_predicate.rhs.clone(),
         };
         let target_id = target_resource.id.clone();
-        let target_identifier = current_states
+        // The target's identifier is only known at plan time if it
+        // already exists in state. When the target is created/updated
+        // in this same run it has no prior state, so the executor must
+        // resolve the real identifier from the just-applied state — see
+        // [`WaitTarget`] and carina#3119.
+        let target = match current_states
             .get(&target_id)
-            .and_then(|s| s.identifier.clone());
+            .and_then(|s| s.identifier.clone())
+        {
+            Some(id) => WaitTarget::Known(id),
+            None => WaitTarget::ResolvedAtApply,
+        };
         let schema = registry.get(
             &target_id.provider,
             &target_id.resource_type,
@@ -455,7 +464,7 @@ pub fn create_plan(
             // type tracked for its own newtype migration (carina#3066).
             binding: wb.binding.as_str().to_string(),
             target_id,
-            target_identifier,
+            target,
             until,
             until_surface: wb.until_raw.clone(),
             timeout,
