@@ -1013,6 +1013,35 @@ fn color_lines(rendered: &str, ref_binding: bool) -> String {
     out
 }
 
+/// Apply red + strikethrough to a (possibly multi-line)
+/// `format_value_pretty` payload **per line**, leaving each line's
+/// leading indentation whitespace unstyled.
+///
+/// Styling the whole multi-line string in one shot
+/// (`pretty.red().strikethrough()`) opens the ANSI style once and
+/// resets it once, so the style spans the newline-leading indentation
+/// of every continuation line — the terminal then paints the strike
+/// across the indent, making the line look far longer than its
+/// content (#3115). This mirrors `color_lines`' indent handling so
+/// the strike starts at the content column, not the left edge.
+fn strike_lines(rendered: &str) -> String {
+    let mut out = String::with_capacity(rendered.len());
+    for (i, line) in rendered.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let indent_end = line
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(line.len());
+        let (indent, body) = line.split_at(indent_end);
+        out.push_str(indent);
+        if !body.is_empty() {
+            out.push_str(&body.red().strikethrough().to_string());
+        }
+    }
+    out
+}
+
 /// Apply type-based coloring to a value, with dimmed modifier for default values.
 fn colored_value_dimmed(rendered: &str) -> String {
     // List: color each element individually
@@ -1096,7 +1125,7 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
             };
             let pretty = format_value_pretty(value, layout);
             let cv = match effect {
-                Effect::Delete { .. } => pretty.red().strikethrough().to_string(),
+                Effect::Delete { .. } => strike_lines(&pretty),
                 _ => colored_value(&pretty, false),
             };
             writeln!(out, "{}{}: {}", attr_prefix, key, cv).unwrap();
@@ -1121,7 +1150,7 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
                 };
                 let pretty = carina_core::value::format_value_pretty(&entry.value, layout);
                 let cv = match effect {
-                    Effect::Delete { .. } => pretty.red().strikethrough().to_string(),
+                    Effect::Delete { .. } => strike_lines(&pretty),
                     _ => colored_value(&pretty, false),
                 };
                 if let Some(ann) = &entry.annotation {
@@ -1573,7 +1602,7 @@ fn render_added_removed_block(
         let pretty = format_value_pretty(value, layout);
         let cv = match kind {
             ListOfMapsDiffItemKind::Added => colored_value(&pretty, false),
-            ListOfMapsDiffItemKind::Removed => pretty.red().strikethrough().to_string(),
+            ListOfMapsDiffItemKind::Removed => strike_lines(&pretty),
         };
         writeln!(out, "{}{}: {}", field_indent, key, cv).unwrap();
     }
