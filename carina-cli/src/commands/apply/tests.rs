@@ -770,3 +770,156 @@ async fn confirm_apply_propagates_interrupt() {
     let err = confirm_apply(reader, interrupt, false).await.unwrap_err();
     assert!(matches!(err, AppError::Interrupted));
 }
+
+// carina#3132 PR-2: the apply path expands deferred-for loops
+// *post-refresh* via the *same* `crate::wiring::expand_same_config_deferred_for`
+// the plan path uses (PR-1). The function itself is exhaustively
+// unit-tested in `wiring::tests::expand_same_config_deferred_for_tests`;
+// these tests pin the **apply-side contract**: `run_apply_locked`
+// depends on that exact shared function (plan/apply parity —
+// MEMORY "unit-test path ≠ apply path"), and the carina#3132 real
+// registry shape (chained `opt.resource_record.name`, resolvable since
+// carina#3136) materializes + resolves identically on the apply side.
+mod apply_deferred_for_parity {
+    use carina_core::binding_index::WaitAliasSpec;
+    use carina_core::parser::{ProviderContext, parse};
+    use carina_core::resource::{ConcreteValue, ResourceId, State, Value};
+    use std::collections::HashMap;
+
+    fn dvo_state(parsed: &carina_core::parser::ParsedFile) -> HashMap<ResourceId, State> {
+        let cert = parsed
+            .resources
+            .iter()
+            .find(|r| r.binding.as_deref() == Some("cert"))
+            .expect("parsed cert resource");
+        let mut rr = indexmap::IndexMap::new();
+        rr.insert(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("_a1.r.example.com".into())),
+        );
+        rr.insert(
+            "value".to_string(),
+            Value::Concrete(ConcreteValue::String("_a1.acm-validations.aws.".into())),
+        );
+        let mut entry = indexmap::IndexMap::new();
+        entry.insert(
+            "resource_record".to_string(),
+            Value::Concrete(ConcreteValue::Map(rr)),
+        );
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "domain_validation_options".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(entry),
+            )])),
+        );
+        let mut states = HashMap::new();
+        states.insert(cert.id.clone(), State::existing(cert.id.clone(), attrs));
+        states
+    }
+
+    /// The apply path's exact call: same-config `let cert` read
+    /// iterable with a chained loop-var body, fed a post-refresh
+    /// `current_states`. Asserts the apply side materializes AND
+    /// resolves the chained ref — parity with the plan path's
+    /// `chained_loop_var_field_access_resolves_post_expansion`.
+    #[test]
+    fn apply_post_refresh_expansion_resolves_registry_shape() {
+        let src = r#"
+            let cert = aws.acm.Certificate {
+                domain_name       = "r.example.com"
+                validation_method = "DNS"
+            }
+
+            for (_, opt) in cert.domain_validation_options {
+                aws.route53.RecordSet {
+                    name             = opt.resource_record.name
+                    type             = "CNAME"
+                    resource_records = [opt.resource_record.value]
+                }
+            }
+        "#;
+        let parsed = parse(src, &ProviderContext::default()).expect("parse");
+        let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
+        let states = dvo_state(&parsed);
+
+        // This is the exact function `run_apply_locked` calls
+        // post-refresh (carina#3132 PR-2). Reaching it through the
+        // apply module's `crate::wiring::` path pins the dependency.
+        let out = crate::wiring::expand_same_config_deferred_for(
+            &parsed,
+            &sorted,
+            &states,
+            &HashMap::new(),
+            &[] as &[WaitAliasSpec],
+        )
+        .expect("expand");
+
+        let record_sets: Vec<_> = out
+            .sorted_resources
+            .iter()
+            .filter(|r| r.id.resource_type.contains("RecordSet"))
+            .collect();
+        assert_eq!(
+            record_sets.len(),
+            1,
+            "apply materializes one RecordSet per domain_validation_options entry"
+        );
+        assert_eq!(
+            record_sets[0].get_attr("name"),
+            Some(&Value::Concrete(ConcreteValue::String(
+                "_a1.r.example.com".into()
+            ))),
+            "apply resolves the chained loop-var ref identically to plan \
+             (carina#3132 PR-3 registry shape)"
+        );
+        assert!(
+            out.residual_deferred_for.is_empty(),
+            "resolved loop leaves no residual on the apply path"
+        );
+        assert_eq!(
+            out.new_child_ids.len(),
+            1,
+            "the materialized RecordSet is reported for the apply-side \
+             targeted child-refresh"
+        );
+    }
+
+    /// No refreshed cert state ⇒ the loop stays deferred on the apply
+    /// path too (no mis-expansion), matching the plan path's
+    /// unresolvable-iterable behavior.
+    #[test]
+    fn apply_unresolvable_iterable_stays_deferred() {
+        let src = r#"
+            let cert = aws.acm.Certificate {
+                domain_name       = "r.example.com"
+                validation_method = "DNS"
+            }
+
+            for (_, opt) in cert.domain_validation_options {
+                aws.route53.RecordSet { name = opt.resource_record.name }
+            }
+        "#;
+        let parsed = parse(src, &ProviderContext::default()).expect("parse");
+        let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
+        let empty: HashMap<ResourceId, State> = HashMap::new();
+
+        let out = crate::wiring::expand_same_config_deferred_for(
+            &parsed,
+            &sorted,
+            &empty,
+            &HashMap::new(),
+            &[] as &[WaitAliasSpec],
+        )
+        .expect("expand");
+
+        assert!(
+            out.sorted_resources
+                .iter()
+                .all(|r| !r.id.resource_type.contains("RecordSet")),
+            "no RecordSet materializes without a resolvable iterable on apply"
+        );
+        assert_eq!(out.residual_deferred_for.len(), 1);
+        assert!(out.new_child_ids.is_empty());
+    }
+}

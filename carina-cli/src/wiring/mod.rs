@@ -1932,12 +1932,14 @@ pub async fn read_with_retry(
 /// results into `current_states`.
 ///
 /// Shared by the phase-1 refresh and the carina#3132 post-expansion
-/// child refresh: same `stream::iter → begin_multi → read_with_retry →
-/// buffer_unordered(5)` pipeline. `saved_dep_bindings` restores
-/// carina-only `dependency_bindings` the provider's `read()` does not
-/// return (#1565); pass an empty map when there is nothing to restore
-/// (the new loop children have no prior state-file dep bindings).
-async fn refresh_resource_set<'a>(
+/// child refresh on **both** the plan path (this module) and the apply
+/// path (`commands::apply`): same `stream::iter → begin_multi →
+/// read_with_retry → buffer_unordered(5)` pipeline. `saved_dep_bindings`
+/// restores carina-only `dependency_bindings` the provider's `read()`
+/// does not return (#1565); pass an empty map when there is nothing to
+/// restore (the new loop children have no prior state-file dep
+/// bindings).
+pub(crate) async fn refresh_resource_set<'a>(
     provider: &dyn Provider,
     multi: &indicatif::MultiProgress,
     resources: impl Iterator<Item = &'a Resource>,

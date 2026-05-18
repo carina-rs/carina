@@ -6,7 +6,7 @@ use colored::Colorize;
 
 use futures::stream::{self, StreamExt};
 
-use carina_core::binding_index::{IterableBindings, ResolvedBindings, WaitAliasSpec};
+use carina_core::binding_index::{ResolvedBindings, WaitAliasSpec};
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
@@ -789,23 +789,16 @@ async fn run_apply_locked(
     )
     .await?;
 
-    // Expand deferred for-expressions now that remote values are available.
-    // Must happen BEFORE sort_resources_by_dependencies so expanded resources
-    // are included in the sorted set used for planning (#1844).
-    //
-    // The apply path still expands pre-refresh against upstream-only
-    // bindings (carina#3132 PR-1 is plan-path only; PR-2 moves this to a
-    // post-refresh stage so plan/apply do not diverge on same-config
-    // read iterables).
-    parsed.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(
-        remote_bindings.clone(),
-    ));
-
-    // Print warnings after expansion (resolved ones are removed)
-    parsed.print_warnings();
-
-    // Sort resources by dependencies (after expansion so expanded resources are included)
-    let sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
+    // carina#3132: `sorted_resources` is `mut` because deferred-for
+    // expansion now runs post-refresh (after phase-2, below) via the
+    // shared `expand_same_config_deferred_for` and re-sorts the
+    // augmented set in place — same timing/view as the plan path so
+    // plan and apply cannot diverge on same-config read iterables.
+    // Until then it is the pre-expansion set; the loop's iterable
+    // source (e.g. `let cert`) is a normal top-level resource already
+    // here and refreshed by phase 1, only the loop's generated children
+    // are added later.
+    let mut sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
 
     // Build state-file-derived maps up front so anonymous → let-bound
     // rename transfer (#1685) can run between refresh phases 1 and 2.
@@ -993,6 +986,54 @@ async fn run_apply_locked(
         current_states.insert(id, state);
     }
 
+    // carina#3132: expand same-config deferred-for loops post-refresh
+    // via the *same* `expand_same_config_deferred_for` the plan path
+    // calls (one resolution timing; plan/apply parity). Then
+    // targeted-refresh the materialized children through the same
+    // `refresh_resource_set` helper phase 1 used, so a re-apply after
+    // they were created sees their live state instead of a phantom
+    // Create. The #1844 sort constraint (expanded resources must be in
+    // the sorted/refreshed/diffed set) is honored by the re-sort
+    // inside `expand_same_config_deferred_for`.
+    let crate::wiring::DeferredForExpansion {
+        sorted_resources: resorted,
+        residual_deferred_for,
+        new_child_ids,
+    } = crate::wiring::expand_same_config_deferred_for(
+        parsed,
+        &sorted_resources,
+        &current_states,
+        &remote_bindings,
+        &wait_aliases,
+    )?;
+    sorted_resources = resorted;
+    // Expansion borrows `parsed` immutably (expands a clone), so
+    // `parsed.deferred_for_expressions` is NOT drained of resolved
+    // loops the way the old `&mut self` call drained it. `print_plan`
+    // must therefore receive this *residual* (still-unresolvable) list,
+    // not `parsed.deferred_for_expressions` — otherwise a resolved loop
+    // renders as both its materialized children AND a phantom
+    // "deferred" entry. Mirrors the plan path's `ctx.residual_deferred_for`
+    // (`commands/plan.rs`).
+
+    if !new_child_ids.is_empty() {
+        let children = sorted_resources
+            .iter()
+            .filter(|r| new_child_ids.contains(&r.id));
+        crate::wiring::refresh_resource_set(
+            provider_ref,
+            &multi,
+            children,
+            &state_file,
+            &HashMap::new(),
+            &mut current_states,
+        )
+        .await?;
+        provider
+            .hydrate_read_state(&mut current_states, &saved_attrs)
+            .await;
+    }
+
     // Build initial bindings for reference resolution (wait_aliases
     // defined above before Phase 2).
     let mut bindings = ResolvedBindings::from_resources_with_state(
@@ -1107,7 +1148,7 @@ async fn run_apply_locked(
             Some(ctx.schemas()),
             &HashMap::new(),
             &export_changes,
-            &parsed.deferred_for_expressions,
+            &residual_deferred_for,
             None,
         );
 
@@ -1178,7 +1219,7 @@ async fn run_apply_locked(
         Some(ctx.schemas()),
         &moved_origins,
         &export_changes,
-        &parsed.deferred_for_expressions,
+        &residual_deferred_for,
         Some(&prev_explicit),
     );
 
