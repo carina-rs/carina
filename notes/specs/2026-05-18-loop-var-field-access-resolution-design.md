@@ -152,24 +152,43 @@ fix is to navigate that in-scope value along the parsed field path
    step 2 instead of erroring. The error message and behavior for the
    real misuse (`let s = "x"; s.foo`) are unchanged.
 
-4. **Loop-variable references are a distinct, typed shape.** The defect
-   exists because a loop-var field access is *represented as* a
-   resource `ResourceRef`, which a later resolver can only resolve
-   against resource bindings. Rather than overload `ResourceRef`,
-   introduce a dedicated deferred variant — e.g.
-   `DeferredValue::LoopVarRef { var: String, path: AccessPath }` (name
-   provisional) — emitted only by step 2's "still-placeholder" case.
+4. **The still-placeholder case is a new `UnknownReason`, not a new
+   top-level `DeferredValue`.** The defect exists because a loop-var
+   field access is *represented as* a resource `ResourceRef`, which a
+   later resolver can only resolve against resource bindings. The fix
+   needs a representation that says "loop-variable field path, resolved
+   at for-expansion, never serialized" — which is **exactly** the
+   contract of `UnknownReason`, the parse-internal placeholder family
+   that already holds `ForValue` / `ForKey` / `ForIndex` and the
+   `AccessPath`-carrying `UpstreamRef { path }`. Add
+   `UnknownReason::ForValuePath { path: AccessPath }` (name
+   provisional) — the `ForValue` sibling that additionally carries the
+   navigation path — emitted only by step 2's still-placeholder case.
+
+   This is deliberately **not** a new `DeferredValue::LoopVarRef`
+   variant. `DeferredValue` is mid-migration under RFC #2972 (the
+   `ConcreteValueRef`/`DeferredValueRef` borrowing split, eventually a
+   physical `Value { Concrete, Deferred }` split); a new top-level
+   variant there forces the `DeferredValueRef<'a>` mirror, ~35
+   `match DeferredValue` sites across carina-core (plus carina-cli /
+   lsp / the triplicated aws-types — see
+   [[project_aws_types_triplicated_copies]]), and a serde decision.
+   `UnknownReason` lives under the already `#[serde(skip)]`
+   `DeferredValue::Unknown(..)` arm: no state-format change, no RFC
+   #2972 surface touched, and the blast radius is the handful of sites
+   that already exhaustively match `UnknownReason`.
+
    `substitute_placeholder` (`carina-core/src/parser/ast.rs:993`)
-   gains one arm: when the loop value variable matches `var`, replace
-   the node by `navigate_value_path(substituted_element, …path)` (the
-   *same* navigator from step 1 — single source of truth).
-   `resolve_ref_value` is **not** taught about loop vars; it never sees
-   `LoopVarRef` because expansion resolves it first. The exhaustive
-   `match` in `substitute_placeholder` already forces a compile error
-   on a new `DeferredValue`/`UnknownReason` variant
-   (ast.rs:1013-1015 precedent), so the new variant cannot be silently
-   dropped — a typed-completeness lever consistent with the
-   carina#3132 `IterableBindings` typed-view rationale.
+   gains one arm next to its existing `ForValue` arm: replace the node
+   by `navigate_value_path(substituted_element, …path)` (the *same*
+   navigator from step 1 — single source of truth). Its
+   "explicit-arm, no wildcard" `UnknownReason` match
+   (ast.rs:1013-1015) **already forces a compile error** when a new
+   `UnknownReason` variant is added, so the substitution cannot be
+   silently skipped — the typed-completeness lever is inherited, not
+   re-invented. `resolve_ref_value` is **not** taught about loop vars;
+   it never sees the new variant because for-expansion resolves it
+   first.
 
 ### Why this shape (long-term, type-safe)
 
@@ -179,14 +198,27 @@ fix is to navigate that in-scope value along the parsed field path
   implementation of "follow `attribute.fields[subscripts]` into a
   `Value`" (the carina#3132 root-cause-over-per-site rule applied here:
   the bug is *one* missing navigation, fixed once).
-- **Loop-var vs resource-ref is made unrepresentable-to-confuse.** A
-  dedicated `LoopVarRef` variant means a loop-variable reference can
-  never again be mistaken for a resource binding by
-  `resolve_ref_value`; the bug class (`ResourceRef{binding:loop_var}`
-  reaching a resolver that only knows resource bindings) becomes a
+- **Loop-var vs resource-ref is made unrepresentable-to-confuse, at
+  minimum blast radius.** The new `UnknownReason::ForValuePath` variant
+  means a loop-variable reference can never again be mistaken for a
+  resource binding by `resolve_ref_value` (which only matches
+  `ResourceRef`); the bug class — `ResourceRef{binding:loop_var}`
+  reaching a resolver that only knows resource bindings — becomes a
   compile-time-distinct shape, mirroring how carina#3132's
   `IterableBindings` made "iterable resolved against the wrong map"
-  unrepresentable.
+  unrepresentable. Choosing `UnknownReason` over a new top-level
+  `DeferredValue` variant keeps that guarantee while *not* perturbing
+  the RFC #2972 split or the state serialization format.
+- **The differ's never-equal invariant is inherited, not re-asserted.**
+  `Value`'s hand-rolled `PartialEq` (`resource/mod.rs:751`) makes
+  `Value::Deferred(DeferredValue::Unknown(_))` **never equal to
+  anything** — so an unresolved loop-var-path placeholder is correctly
+  never "the same value" as another, and the differ cannot silently
+  suppress a real diff. A new top-level `DeferredValue::LoopVarRef`
+  would have to *manually* opt into this invariant (and a future
+  maintainer could get it wrong); an `UnknownReason` variant gets it
+  for free because the `Unknown(_)` arm already covers it. This is the
+  decisive type-safety reason for the placement.
 - **Resource refs strictly untouched.** Step 2's "not a bound variable
   ⇒ unchanged `ResourceRef`" branch is the guard that keeps
   `cert.domain_validation_options` (a real resource binding) flowing
@@ -202,7 +234,7 @@ fix is to navigate that in-scope value along the parsed field path
 - **Placeholder-bearing navigation in the deferred-template parse.** At
   template-parse time the element is the `ForValue` placeholder, so
   `navigate_value_path` cannot produce a concrete value yet — step 2
-  must emit the path-carrying `LoopVarRef` and rely on
+  must emit the path-carrying `UnknownReason::ForValuePath` and rely on
   `substitute_placeholder` re-navigating post-expansion. The
   implementation PR must prove (fixture) that a deferred
   `for (_, opt) in cert.<read> { name = opt.resource_record.name }`
@@ -218,9 +250,11 @@ fix is to navigate that in-scope value along the parsed field path
   the navigator only needs the already-allowed
   `attribute → fields → trailing subscripts` order.
 - **LSP / scope check.** `check_identifier_scope` must not flag the new
-  `LoopVarRef` as an unknown binding (a loop var is intentionally not a
-  top-level binding). The implementation PR audits the
-  scope-check/diagnostics path the same way carina#3132 audited
+  `UnknownReason::ForValuePath` as an unknown binding (a loop var is
+  intentionally not a top-level binding). Since it lives under
+  `DeferredValue::Unknown(..)`, scope-check paths that already skip
+  `Unknown(_)` cover it for free; the implementation PR verifies this
+  the same way carina#3132 audited
   `resolve_refs_*`.
 - **Not a phantom/renderer change.** Parser-level value shaping only;
   no differ/detail-row code is touched. Stated to scope reviewers away
@@ -233,8 +267,9 @@ a multi-stage pipeline like carina#3132):
 
 1. Add `navigate_value_path` (pure, unit-tested in isolation:
    map/list/missing-hop/scalar-reject).
-2. Site A + Site B parser changes + the `LoopVarRef` variant +
-   `substitute_placeholder` arm.
+2. Site A + Site B parser changes + the
+   `UnknownReason::ForValuePath` variant + the `substitute_placeholder`
+   arm.
 3. Acceptance: parser tests for the full behavior matrix above flipping
    from ERR/unresolved to resolved; a carina-cli wiring test that the
    deferred `for (_, opt) in cert.<read>` path yields concrete body
