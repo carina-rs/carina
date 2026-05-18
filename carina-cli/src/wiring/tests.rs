@@ -1405,6 +1405,53 @@ mod expand_same_config_deferred_for_tests {
         ]))
     }
 
+    /// Direct unit test of `RefreshableChildIds::select` — the sole
+    /// constructor of the post-expansion refresh iterator. The
+    /// `expand_*` tests cover it end-to-end, but `select` carries the
+    /// carina#3141 invariant ("yield exactly the ids in the set, skip
+    /// everything else") and a refactor could break it without tripping
+    /// the higher-level tests, so pin it directly. Builds a
+    /// `RefreshableChildIds` from a known id subset and asserts `select`
+    /// over a resource slice yields precisely those resources, in slice
+    /// order, and nothing outside the set.
+    #[test]
+    fn refreshable_child_ids_select_yields_exactly_the_set() {
+        // `Resource::new` gives each resource a distinct, concrete
+        // `ResourceId` directly — no parse/ID-reconcile step, so the
+        // test pins `select`'s set-membership logic in isolation
+        // (anonymous ids are still pending right after `parse`, which is
+        // a different concern covered by the expand_* tests).
+        let r_a = Resource::new("aws.ec2.Vpc", "a");
+        let r_b = Resource::new("aws.ec2.Vpc", "b");
+        let r_c = Resource::new("aws.ec2.Vpc", "c");
+        let resources = vec![r_a.clone(), r_b.clone(), r_c.clone()];
+
+        // Refreshable set = {a, c}; b must be skipped.
+        let mut ids = std::collections::HashSet::new();
+        ids.insert(r_a.id.clone());
+        ids.insert(r_c.id.clone());
+        let refreshable = RefreshableChildIds(ids);
+
+        assert_eq!(refreshable.len(), 2);
+        assert!(!refreshable.is_empty());
+        assert!(refreshable.contains(&r_a.id));
+        assert!(!refreshable.contains(&r_b.id));
+
+        let selected: Vec<&ResourceId> = refreshable.select(&resources).map(|r| &r.id).collect();
+        assert_eq!(
+            selected,
+            vec![&r_a.id, &r_c.id],
+            "select must yield exactly the set members, in slice order, \
+             and skip the resource not in the set"
+        );
+
+        // An empty set selects nothing — the "all expanded children are
+        // moved targets" case from the plan/apply guard.
+        let empty = RefreshableChildIds::default();
+        assert!(empty.is_empty());
+        assert_eq!(empty.select(&resources).count(), 0);
+    }
+
     #[test]
     fn same_config_read_iterable_materializes_in_plan_resources() {
         let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
