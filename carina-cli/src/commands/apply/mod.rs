@@ -995,16 +995,19 @@ async fn run_apply_locked(
     // Create. The #1844 sort constraint (expanded resources must be in
     // the sorted/refreshed/diffed set) is honored by the re-sort
     // inside `expand_same_config_deferred_for`.
+    let moved_targets: HashSet<ResourceId> = moved_pairs.iter().map(|(_, to)| to.clone()).collect();
     let crate::wiring::DeferredForExpansion {
         sorted_resources: resorted,
         residual_deferred_for,
         new_child_ids,
+        refreshable_child_ids,
     } = crate::wiring::expand_same_config_deferred_for(
         parsed,
         &sorted_resources,
         &current_states,
         &remote_bindings,
         &wait_aliases,
+        &moved_targets,
     )?;
     sorted_resources = resorted;
     // Expansion borrows `parsed` immutably (expands a clone), so
@@ -1017,9 +1020,14 @@ async fn run_apply_locked(
     // (`commands/plan.rs`).
 
     if !new_child_ids.is_empty() {
-        let children = sorted_resources
-            .iter()
-            .filter(|r| new_child_ids.contains(&r.id));
+        // Refresh only `refreshable_child_ids` (carina#3141): a child
+        // that is also a `moved` target keeps the migrated state from
+        // `materialize_moved_states`; re-reading it would clobber that
+        // state with `not_found`. `select` is the same (and only)
+        // constructor the plan path uses — there is no way to filter by
+        // the wider `new_child_ids` here, so a divergence is a compile
+        // error, not a silent parity bug.
+        let children = refreshable_child_ids.select(&sorted_resources);
         crate::wiring::refresh_resource_set(
             provider_ref,
             &multi,

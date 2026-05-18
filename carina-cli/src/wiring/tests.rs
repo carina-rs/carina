@@ -1422,6 +1422,7 @@ mod expand_same_config_deferred_for_tests {
             &states,
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
+            &std::collections::HashSet::new(),
         )
         .expect("expand");
 
@@ -1482,6 +1483,7 @@ mod expand_same_config_deferred_for_tests {
             &states,
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
+            &std::collections::HashSet::new(),
         )
         .expect("expand");
 
@@ -1524,6 +1526,7 @@ mod expand_same_config_deferred_for_tests {
             &empty_states,
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
+            &std::collections::HashSet::new(),
         )
         .expect("expand");
 
@@ -1586,6 +1589,7 @@ mod expand_same_config_deferred_for_tests {
             &HashMap::new(),
             &remote,
             &[] as &[WaitAliasSpec],
+            &std::collections::HashSet::new(),
         )
         .expect("expand");
 
@@ -1652,6 +1656,7 @@ mod expand_same_config_deferred_for_tests {
             &states,
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
+            &std::collections::HashSet::new(),
         )
         .expect("expand");
 
@@ -1684,6 +1689,223 @@ mod expand_same_config_deferred_for_tests {
                 Value::Concrete(ConcreteValue::String("_a1.acm-validations.aws.".into()))
             ]))),
             "resource_records[0] must resolve to ...resource_record.value"
+        );
+    }
+
+    /// The carina#3141 repro DSL: `let cert` + same-config
+    /// `for (_, opt) in cert.domain_validation_options` loop. Builds the
+    /// expansion once with NO moved targets, then again declaring the
+    /// materialized child as a `moved` `to`. Asserts:
+    ///   - `new_child_ids` is identical in both runs (the moved-exclusion
+    ///     must not change what materialized).
+    ///   - run 1: the child IS in `refreshable_child_ids` (non-moved
+    ///     expanded children are still refreshed — regression guard
+    ///     against an over-broad filter).
+    ///   - run 2: the child is NOT in `refreshable_child_ids` (its
+    ///     migrated state from `materialize_moved_states` must survive,
+    ///     so the differ emits `Move`, never a same-address `Create`).
+    ///
+    /// Both the plan path (`create_plan_from_parsed_with_upstream`) and
+    /// the apply path (`run_apply_locked`) refresh exactly
+    /// `refreshable_child_ids` — this single typed field is what makes
+    /// the moved-exclusion impossible to diverge between them
+    /// (cf. MEMORY "unit-test path ≠ apply path"; the divergence is a
+    /// compile error against `DeferredForExpansion`, not a runtime gap).
+    #[test]
+    fn moved_target_child_is_excluded_from_refreshable_set() {
+        let src = r#"
+            let cert = aws.acm.Certificate {
+                domain_name       = "r.example.com"
+                validation_method = "DNS"
+            }
+
+            for (_, opt) in cert.domain_validation_options {
+                aws.route53.RecordSet {
+                    name             = opt.resource_record.name
+                    type             = "CNAME"
+                    resource_records = [opt.resource_record.value]
+                }
+            }
+        "#;
+        let parsed = parse(src, &ProviderContext::default()).expect("parse");
+        let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
+
+        let mut rr = indexmap::IndexMap::new();
+        rr.insert(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("_a1.r.example.com".into())),
+        );
+        rr.insert(
+            "value".to_string(),
+            Value::Concrete(ConcreteValue::String("_a1.acm-validations.aws.".into())),
+        );
+        let mut entry = indexmap::IndexMap::new();
+        entry.insert(
+            "resource_record".to_string(),
+            Value::Concrete(ConcreteValue::Map(rr)),
+        );
+        let dvo = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(entry),
+        )]));
+        let states = states_with_cert(&parsed, "domain_validation_options", dvo);
+
+        // Run 1: no moved targets — the expanded child must be both a
+        // new child AND refreshable (regression guard: the #3141 filter
+        // must not skip refresh for ordinary expanded children).
+        let out_no_moved = expand_same_config_deferred_for(
+            &parsed,
+            &sorted,
+            &states,
+            &HashMap::new(),
+            &[] as &[WaitAliasSpec],
+            &std::collections::HashSet::new(),
+        )
+        .expect("expand without moved targets");
+
+        assert_eq!(
+            out_no_moved.new_child_ids.len(),
+            1,
+            "one RecordSet materialized per domain_validation_options entry"
+        );
+        let child_id = out_no_moved
+            .new_child_ids
+            .iter()
+            .next()
+            .expect("the materialized child id")
+            .clone();
+        assert!(
+            out_no_moved.refreshable_child_ids.contains(&child_id),
+            "a non-moved expanded child must still be refreshed"
+        );
+
+        // Run 2: declare that same child id as a `moved` `to`.
+        let mut moved_targets = std::collections::HashSet::new();
+        moved_targets.insert(child_id.clone());
+        let out_moved = expand_same_config_deferred_for(
+            &parsed,
+            &sorted,
+            &states,
+            &HashMap::new(),
+            &[] as &[WaitAliasSpec],
+            &moved_targets,
+        )
+        .expect("expand with the child as a moved target");
+
+        assert_eq!(
+            out_moved.new_child_ids, out_no_moved.new_child_ids,
+            "the moved-exclusion must not change what materialized"
+        );
+        assert!(
+            !out_moved.refreshable_child_ids.contains(&child_id),
+            "a child that is a `moved` target must be excluded from \
+             refreshable_child_ids so its migrated state is not \
+             overwritten by a not_found provider read (carina#3141)"
+        );
+        assert!(
+            out_moved.refreshable_child_ids.is_empty(),
+            "the only expanded child is the moved target, so nothing \
+             is refreshable; got {:?}",
+            out_moved.refreshable_child_ids
+        );
+    }
+
+    /// Multi-entry variant: ≥2 `domain_validation_options` (real ACM
+    /// certs have apex + SAN). Moving only the first index must exclude
+    /// exactly that child from refresh and leave the second one
+    /// refreshable — the per-index `moved` (`[0]`, `[1]`, …) and the
+    /// exclusion set are both exercised, not just the single-entry case.
+    #[test]
+    fn moved_exclusion_is_per_child_with_multiple_entries() {
+        let src = r#"
+            let cert = aws.acm.Certificate {
+                domain_name       = "r.example.com"
+                validation_method = "DNS"
+            }
+
+            for (_, opt) in cert.domain_validation_options {
+                aws.route53.RecordSet {
+                    name             = opt.resource_record.name
+                    type             = "CNAME"
+                    resource_records = [opt.resource_record.value]
+                }
+            }
+        "#;
+        let parsed = parse(src, &ProviderContext::default()).expect("parse");
+        let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
+
+        let make_entry = |name: &str, value: &str| {
+            let mut rr = indexmap::IndexMap::new();
+            rr.insert(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String(name.into())),
+            );
+            rr.insert(
+                "value".to_string(),
+                Value::Concrete(ConcreteValue::String(value.into())),
+            );
+            let mut entry = indexmap::IndexMap::new();
+            entry.insert(
+                "resource_record".to_string(),
+                Value::Concrete(ConcreteValue::Map(rr)),
+            );
+            Value::Concrete(ConcreteValue::Map(entry))
+        };
+        let dvo = Value::Concrete(ConcreteValue::List(vec![
+            make_entry("_apex.r.example.com", "_apex.acm-validations.aws."),
+            make_entry("_san.r.example.com", "_san.acm-validations.aws."),
+        ]));
+        let states = states_with_cert(&parsed, "domain_validation_options", dvo);
+
+        let baseline = expand_same_config_deferred_for(
+            &parsed,
+            &sorted,
+            &states,
+            &HashMap::new(),
+            &[] as &[WaitAliasSpec],
+            &std::collections::HashSet::new(),
+        )
+        .expect("expand");
+        assert_eq!(
+            baseline.new_child_ids.len(),
+            2,
+            "two RecordSets materialized (apex + SAN)"
+        );
+
+        // Move only one of the two children.
+        let mut ids: Vec<ResourceId> = baseline.new_child_ids.iter().cloned().collect();
+        ids.sort_by_key(|id| id.to_string());
+        let moved_child = ids[0].clone();
+        let kept_child = ids[1].clone();
+
+        let mut moved_targets = std::collections::HashSet::new();
+        moved_targets.insert(moved_child.clone());
+        let out = expand_same_config_deferred_for(
+            &parsed,
+            &sorted,
+            &states,
+            &HashMap::new(),
+            &[] as &[WaitAliasSpec],
+            &moved_targets,
+        )
+        .expect("expand");
+
+        assert_eq!(
+            out.new_child_ids, baseline.new_child_ids,
+            "moved-exclusion must not change what materialized"
+        );
+        assert!(
+            !out.refreshable_child_ids.contains(&moved_child),
+            "the moved child must be excluded from refresh"
+        );
+        assert!(
+            out.refreshable_child_ids.contains(&kept_child),
+            "the non-moved child must still be refreshed"
+        );
+        assert_eq!(
+            out.refreshable_child_ids.len(),
+            1,
+            "exactly one of two children is refreshable; got {:?}",
+            out.refreshable_child_ids
         );
     }
 }
