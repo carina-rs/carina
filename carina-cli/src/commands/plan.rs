@@ -334,12 +334,10 @@ pub async fn run_plan(
     )
     .await?;
 
-    // Expand deferred for-expressions now that remote values are available
-    parsed.expand_deferred_for_expressions(&remote_bindings);
-
-    // Print warnings after expansion (resolved deferred for-expressions have their warnings removed)
-    parsed.print_warnings();
-
+    // carina#3132: deferred-for expansion runs inside
+    // `create_plan_from_parsed_with_upstream` (post-refresh), which also
+    // prints post-expansion warnings and returns the still-unresolved
+    // loops via `ctx.residual_deferred_for`.
     let ctx = create_plan_from_parsed_with_upstream(
         &parsed,
         &state_file,
@@ -414,7 +412,7 @@ pub async fn run_plan(
             Some(wiring.schemas()),
             &ctx.moved_origins,
             &export_changes,
-            &parsed.deferred_for_expressions,
+            &ctx.residual_deferred_for,
             Some(&ctx.prev_explicit),
         );
     }

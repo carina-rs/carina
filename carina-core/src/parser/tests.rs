@@ -1,4 +1,5 @@
 use super::*;
+use crate::binding_index::IterableBindings;
 use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Resource, Value};
 use indexmap::IndexMap;
 use std::collections::HashMap;
@@ -7171,7 +7172,7 @@ fn expand_deferred_for_with_remote_bindings() {
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
     // Expand deferred for-expressions
-    parsed.expand_deferred_for_expressions(&remote_bindings);
+    parsed.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings));
 
     // Deferred should be resolved
     assert_eq!(
@@ -7233,7 +7234,7 @@ fn expand_deferred_for_no_remote_data_stays_deferred() {
 
     // Empty remote_bindings — upstream hasn't been applied yet
     let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
-    parsed.expand_deferred_for_expressions(&remote_bindings);
+    parsed.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings));
 
     // Should remain deferred
     assert_eq!(
@@ -7281,7 +7282,7 @@ fn expand_deferred_for_map_binding_substitutes_key_and_value() {
     );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
-    parsed.expand_deferred_for_expressions(&remote_bindings);
+    parsed.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings));
 
     assert_eq!(parsed.deferred_for_expressions.len(), 0);
     assert_eq!(parsed.resources.len(), 2); // allow: direct — fixture test inspection
@@ -7341,7 +7342,7 @@ fn expand_deferred_for_indexed_binding_substitutes_index_and_value() {
     );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
-    parsed.expand_deferred_for_expressions(&remote_bindings);
+    parsed.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings));
 
     assert_eq!(parsed.resources.len(), 2); // allow: direct — fixture test inspection
     assert_eq!(
@@ -7398,7 +7399,7 @@ fn expand_deferred_for_substitutes_placeholder_inside_interpolation() {
     );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
-    parsed.expand_deferred_for_expressions(&remote_bindings);
+    parsed.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings));
     assert_eq!(parsed.resources.len(), 1); // allow: direct — fixture test inspection
 
     // label must have the placeholder substituted in the interpolation.
@@ -7488,7 +7489,7 @@ fn expand_deferred_for_simple_binding_with_map_iterable_warns() {
     );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
-    parsed.expand_deferred_for_expressions(&remote_bindings);
+    parsed.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings));
 
     assert_eq!(
         parsed.resources.len(), // allow: direct — fixture test inspection
@@ -7535,7 +7536,7 @@ fn expand_deferred_for_map_binding_with_list_iterable_warns() {
     );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
-    parsed.expand_deferred_for_expressions(&remote_bindings);
+    parsed.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings));
 
     // Mismatch: should NOT expand silently with numeric indices
     assert_eq!(

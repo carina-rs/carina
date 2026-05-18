@@ -9,7 +9,7 @@ use std::time::Duration;
 use colored::Colorize;
 use futures::stream::{self, StreamExt};
 
-use carina_core::binding_index::WaitAliasSpec;
+use carina_core::binding_index::{ResolvedBindings, WaitAliasSpec};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
 use carina_core::effect::Effect;
@@ -51,6 +51,14 @@ pub struct PlanContext {
     /// Forwarded to the display layer so server-side default fields the
     /// user never wrote do not surface in plan output (refs awscc#206).
     pub prev_explicit: HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
+    /// Deferred-for loops still unresolved after the post-refresh
+    /// expansion (carina#3132). The iterable is genuinely unknowable at
+    /// plan time (e.g. depends on a not-yet-created resource); the loop
+    /// legitimately stays deferred and is rendered as the carina#3128
+    /// validate/plan placeholder. Replaces the pre-refresh
+    /// `parsed.deferred_for_expressions` the caller used to pass to
+    /// `print_plan` — expansion no longer mutates `parsed`.
+    pub residual_deferred_for: Vec<carina_core::parser::DeferredForExpression>,
 }
 
 /// Cached provider factories and schemas, constructed once per CLI invocation.
@@ -1117,12 +1125,107 @@ pub async fn create_providers_from_configs(
     Ok((router, ctx))
 }
 
+/// Outcome of the carina#3132 post-refresh deferred-for expansion.
+pub struct DeferredForExpansion {
+    /// The augmented, re-sorted resource set: every original resource
+    /// plus the materialized loop children, topologically ordered.
+    /// Equal in length to the input when no loop resolved.
+    pub sorted_resources: Vec<Resource>,
+    /// Loops still unresolved (iterable genuinely unknowable at plan
+    /// time) — rendered as the carina#3128 validate/plan placeholder.
+    pub residual_deferred_for: Vec<carina_core::parser::DeferredForExpression>,
+    /// Ids of the resources materialized by this expansion (empty when
+    /// no loop resolved). The caller targeted-refreshes exactly these.
+    pub new_child_ids: HashSet<ResourceId>,
+}
+
+/// Pure core of the carina#3132 fix: project the post-refresh
+/// `ResolvedBindings` into the typed iterable view, expand every
+/// deferred-for whose iterable is now resolvable, and re-sort the
+/// augmented set.
+///
+/// `from_resources_with_state` merges local DSL ⊕ refreshed
+/// `current_states` ⊕ `upstream_state`/`wait` bindings, so a same-config
+/// `cert.domain_validation_options` loop and an `upstream_state` loop
+/// resolve through the *identical* view — one resolution point, no
+/// upstream-only carve-out.
+///
+/// Pure (no provider I/O) so it is unit-testable with a hand-built
+/// post-refresh `current_states`; `create_plan_from_parsed_with_upstream`
+/// calls exactly this function, then targeted-refreshes
+/// `new_child_ids`.
+pub fn expand_same_config_deferred_for<E: Clone>(
+    parsed: &carina_core::parser::File<E>,
+    sorted_resources: &[Resource],
+    current_states: &HashMap<ResourceId, State>,
+    remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    wait_aliases: &[WaitAliasSpec],
+) -> Result<DeferredForExpansion, AppError> {
+    // Common case: no deferred-for at all. Skip the binding projection
+    // and the whole-`File` clone entirely (this runs on every plan /
+    // validate). Parse warnings still print — with no deferred-for,
+    // expansion would remove none of them, so `parsed`'s set is exactly
+    // what the post-expansion path would have printed.
+    if parsed.deferred_for_expressions.is_empty() {
+        parsed.print_warnings();
+        return Ok(DeferredForExpansion {
+            sorted_resources: sorted_resources.to_vec(),
+            residual_deferred_for: Vec::new(),
+            new_child_ids: HashSet::new(),
+        });
+    }
+
+    let iterable_bindings = ResolvedBindings::from_resources_with_state(
+        sorted_resources,
+        current_states,
+        remote_bindings,
+        wait_aliases,
+    )
+    .project_iterable_bindings();
+
+    // `expand_deferred_for_expressions` is a `&mut self` method that
+    // appends generated resources and drops resolved entries. `parsed`
+    // is borrowed immutably here, so expand on a local clone and read
+    // the augmented resource set / residual deferred list back out.
+    let mut expanded: carina_core::parser::File<E> = (*parsed).clone();
+    expanded.expand_deferred_for_expressions(&iterable_bindings);
+    expanded.print_warnings();
+    let residual_deferred_for = expanded.deferred_for_expressions.clone();
+
+    let pre_ids: HashSet<ResourceId> = sorted_resources.iter().map(|r| r.id.clone()).collect();
+
+    // A length delta means a loop materialized. Compare against the
+    // input slice length (not the deduped `pre_ids` set) so the test is
+    // a pure "did expansion add resources" check. Re-sort the augmented
+    // set: `topological_sort` preserves declaration order for
+    // independent resources (#1071), so already-planned resources keep
+    // their relative order (carina#3132 re-sort stability requirement)
+    // and the children are slotted in per their refs.
+    let materialized = expanded.resources.len() != sorted_resources.len();
+    let resorted = if materialized {
+        sort_resources_by_dependencies(&expanded.resources).map_err(AppError::Validation)?
+    } else {
+        sorted_resources.to_vec()
+    };
+    let new_child_ids: HashSet<ResourceId> = resorted
+        .iter()
+        .map(|r| r.id.clone())
+        .filter(|id| !pre_ids.contains(id))
+        .collect();
+
+    Ok(DeferredForExpansion {
+        sorted_resources: resorted,
+        residual_deferred_for,
+        new_child_ids,
+    })
+}
+
 /// Create a plan from parsed configuration (without upstream state bindings).
 ///
 /// This is a convenience wrapper around `create_plan_from_parsed_with_upstream`
 /// for callers that don't use upstream_state blocks.
 #[allow(dead_code)]
-pub async fn create_plan_from_parsed<E>(
+pub async fn create_plan_from_parsed<E: Clone>(
     parsed: &carina_core::parser::File<E>,
     state_file: &Option<StateFile>,
     refresh: bool,
@@ -1132,7 +1235,7 @@ pub async fn create_plan_from_parsed<E>(
         .await
 }
 
-pub async fn create_plan_from_parsed_with_upstream<E>(
+pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     parsed: &carina_core::parser::File<E>,
     state_file: &Option<StateFile>,
     refresh: bool,
@@ -1141,7 +1244,13 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
 ) -> Result<PlanContext, AppError> {
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
     let ctx = WiringContext::new(factories);
-    let sorted_resources =
+    // Mutable: a same-config deferred-for loop is expanded into concrete
+    // resources *after* refresh (carina#3132) and the augmented set is
+    // re-sorted in place below. Every use up to that point sees the
+    // pre-expansion set (the loop's iterable source — e.g. `let cert` —
+    // is a normal top-level resource already here and refreshed by the
+    // normal phase-1 pass; only the loop's generated children are added).
+    let mut sorted_resources =
         sort_resources_by_dependencies(&parsed.resources).map_err(AppError::Validation)?;
 
     // Select appropriate Provider based on configuration
@@ -1212,36 +1321,15 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
         // from their dependencies (#1683). Phase 1: managed resources in
         // parallel. Phase 2: data sources whose input attributes have
         // been resolved against phase 1's `current_states`.
-        let phase1_results: Vec<Result<(ResourceId, State), AppError>> = stream::iter(
-            sorted_resources
-                .iter()
-                .filter(|r| !r.is_virtual() && !r.is_data_source()),
+        refresh_resource_set(
+            provider_ref,
+            &multi,
+            sorted_resources.iter(),
+            state_file,
+            &saved_dep_bindings,
+            &mut current_states,
         )
-        .map(|resource| {
-            let progress = RefreshProgress::begin_multi(&multi, &resource.id);
-            let identifier = state_file
-                .as_ref()
-                .and_then(|sf| sf.get_identifier_for_resource(resource));
-            let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
-            async move {
-                let mut state = read_with_retry(provider_ref, &resource.id, identifier.as_deref())
-                    .await
-                    .map_err(AppError::Provider)?;
-                // Restore dependency_bindings from state file (#1565).
-                if let Some(deps) = dep_bindings {
-                    state.dependency_bindings = deps;
-                }
-                progress.finish();
-                Ok((resource.id.clone(), state))
-            }
-        })
-        .buffer_unordered(5)
-        .collect()
-        .await;
-        for result in phase1_results {
-            let (id, state) = result?;
-            current_states.insert(id, state);
-        }
+        .await?;
 
         // Refresh orphaned resources (#844). These are tracked in state
         // but removed from the .crn config — they're looked up by their
@@ -1401,6 +1489,70 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
         }
     }
 
+    let wait_aliases: Vec<WaitAliasSpec> = parsed
+        .wait_bindings
+        .iter()
+        .map(WaitAliasSpec::from)
+        .collect();
+
+    // carina#3132: expand same-config deferred-for loops after refresh,
+    // against the same post-refresh `ResolvedBindings` view every
+    // non-loop `ResourceRef` resolves against. Pure expand+re-sort is
+    // factored into `expand_same_config_deferred_for` (see its doc);
+    // here we perform the I/O half — targeted-refresh of the children
+    // so a re-plan after they were applied sees their live state
+    // instead of a phantom Create.
+    let DeferredForExpansion {
+        sorted_resources: resorted,
+        residual_deferred_for,
+        new_child_ids,
+    } = expand_same_config_deferred_for(
+        parsed,
+        &sorted_resources,
+        &current_states,
+        remote_bindings,
+        &wait_aliases,
+    )?;
+    sorted_resources = resorted;
+
+    if !new_child_ids.is_empty() {
+        let children = || {
+            sorted_resources
+                .iter()
+                .filter(|r| new_child_ids.contains(&r.id))
+        };
+        if refresh {
+            refresh_resource_set(
+                &provider,
+                &refresh_multi_progress(),
+                children(),
+                state_file,
+                &HashMap::new(),
+                &mut current_states,
+            )
+            .await?;
+            provider
+                .hydrate_read_state(&mut current_states, &saved_attrs)
+                .await;
+        } else if let Some(sf) = state_file.as_ref() {
+            // --refresh=false: restore children's state from the cached
+            // state file, same as the original resources. A child not in
+            // cached state stays `not_found` → Create (mirrors the
+            // non-loop ref's behavior under --refresh=false).
+            for resource in children() {
+                let state = sf.build_state_for_resource(resource);
+                current_states.insert(resource.id.clone(), state);
+            }
+            provider
+                .hydrate_read_state(&mut current_states, &saved_attrs)
+                .await;
+        } else {
+            for resource in children() {
+                current_states.insert(resource.id.clone(), State::not_found(resource.id.clone()));
+            }
+        }
+    }
+
     // Build orphan dependency bindings from state file for tree structure
     let orphan_dependencies = if let Some(sf) = state_file.as_ref() {
         let desired_ids: HashSet<ResourceId> =
@@ -1430,11 +1582,6 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
         &parsed.resources,
         ctx.schemas(),
     );
-    let wait_aliases: Vec<WaitAliasSpec> = parsed
-        .wait_bindings
-        .iter()
-        .map(WaitAliasSpec::from)
-        .collect();
     resolve_refs_for_plan(
         &mut resources,
         &current_states,
@@ -1504,6 +1651,7 @@ pub async fn create_plan_from_parsed_with_upstream<E>(
         moved_origins,
         upstream_snapshot: remote_bindings.clone(),
         prev_explicit,
+        residual_deferred_for,
     })
 }
 
@@ -1778,6 +1926,52 @@ pub async fn read_with_retry(
         }
     }
     unreachable!()
+}
+
+/// Refresh a set of managed resources concurrently and merge the
+/// results into `current_states`.
+///
+/// Shared by the phase-1 refresh and the carina#3132 post-expansion
+/// child refresh: same `stream::iter → begin_multi → read_with_retry →
+/// buffer_unordered(5)` pipeline. `saved_dep_bindings` restores
+/// carina-only `dependency_bindings` the provider's `read()` does not
+/// return (#1565); pass an empty map when there is nothing to restore
+/// (the new loop children have no prior state-file dep bindings).
+async fn refresh_resource_set<'a>(
+    provider: &dyn Provider,
+    multi: &indicatif::MultiProgress,
+    resources: impl Iterator<Item = &'a Resource>,
+    state_file: &Option<StateFile>,
+    saved_dep_bindings: &HashMap<ResourceId, BTreeSet<String>>,
+    current_states: &mut HashMap<ResourceId, State>,
+) -> Result<(), AppError> {
+    let results: Vec<Result<(ResourceId, State), AppError>> =
+        stream::iter(resources.filter(|r| !r.is_virtual() && !r.is_data_source()))
+            .map(|resource| {
+                let progress = RefreshProgress::begin_multi(multi, &resource.id);
+                let identifier = state_file
+                    .as_ref()
+                    .and_then(|sf| sf.get_identifier_for_resource(resource));
+                let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
+                async move {
+                    let mut state = read_with_retry(provider, &resource.id, identifier.as_deref())
+                        .await
+                        .map_err(AppError::Provider)?;
+                    if let Some(deps) = dep_bindings {
+                        state.dependency_bindings = deps;
+                    }
+                    progress.finish();
+                    Ok((resource.id.clone(), state))
+                }
+            })
+            .buffer_unordered(5)
+            .collect()
+            .await;
+    for result in results {
+        let (id, state) = result?;
+        current_states.insert(id, state);
+    }
+    Ok(())
 }
 
 /// Read a data source resource via the provider with retry on throttling errors.
