@@ -6,7 +6,7 @@ use colored::Colorize;
 
 use futures::stream::{self, StreamExt};
 
-use carina_core::binding_index::{ResolvedBindings, WaitAliasSpec};
+use carina_core::binding_index::{IterableBindings, ResolvedBindings, WaitAliasSpec};
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
@@ -792,7 +792,14 @@ async fn run_apply_locked(
     // Expand deferred for-expressions now that remote values are available.
     // Must happen BEFORE sort_resources_by_dependencies so expanded resources
     // are included in the sorted set used for planning (#1844).
-    parsed.expand_deferred_for_expressions(&remote_bindings);
+    //
+    // The apply path still expands pre-refresh against upstream-only
+    // bindings (carina#3132 PR-1 is plan-path only; PR-2 moves this to a
+    // post-refresh stage so plan/apply do not diverge on same-config
+    // read iterables).
+    parsed.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(
+        remote_bindings.clone(),
+    ));
 
     // Print warnings after expansion (resolved ones are removed)
     parsed.print_warnings();

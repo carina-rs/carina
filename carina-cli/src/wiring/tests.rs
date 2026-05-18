@@ -1324,3 +1324,366 @@ mod read_with_retry_identifier_tests {
         assert_eq!(calls[0].1.as_deref(), Some("AROABC123"));
     }
 }
+
+// ---------------------------------------------------------------------
+// carina#3132 PR-1: `expand_same_config_deferred_for` — the pure
+// post-refresh expansion the plan path calls. Tested with a hand-built
+// post-refresh `current_states` (the documented refresh-phase output);
+// `create_plan_from_parsed_with_upstream` invokes this exact function,
+// so this is the real plan-path expansion, not a transform in
+// isolation (cf. MEMORY "unit-test path ≠ apply path").
+//
+// `--refresh=false` needs no dedicated case here: the pure function is
+// refresh-agnostic (it expands against whatever `current_states` it is
+// given — cached-state and live-refresh are the same input shape, both
+// covered below). The only refresh-specific code is the child-state
+// restore in `create_plan_from_parsed_with_upstream`, which routes the
+// new children through the *same* `sf.build_state_for_resource` /
+// `State::not_found` path the original resources already use under
+// `--refresh=false` (via the shared `children()` filter).
+// ---------------------------------------------------------------------
+mod expand_same_config_deferred_for_tests {
+    use super::*;
+    use carina_core::binding_index::WaitAliasSpec;
+    use carina_core::parser::{ProviderContext, parse};
+    use carina_core::resource::{ConcreteValue, State, Value};
+    use std::collections::HashMap;
+
+    /// `let cert` (same-config) + a `for` over its provider-read
+    /// `account_ids`, plus a plain independent resource so re-sort
+    /// stability has something to preserve order against.
+    ///
+    /// The loop body uses the **bare** loop variable (`target = id`),
+    /// the shape the deferred-for substitution machinery supports
+    /// today. Chained loop-var field access (`opt.resource_record.name`)
+    /// is a *separate, pre-existing* unsupported case — see
+    /// `chained_loop_var_field_access_is_a_known_limitation` below — and
+    /// is out of PR-1 scope (the design's "Changing the deferred-for
+    /// parse" non-goal).
+    const SRC: &str = r#"
+        let cert = aws.acm.Certificate {
+            domain_name       = "registry.example.com"
+            validation_method = "DNS"
+        }
+
+        aws.ec2.Vpc {
+            name       = "anchor"
+            cidr_block = "10.0.0.0/16"
+        }
+
+        for (_, id) in cert.account_ids {
+            aws.sso.Assignment {
+                instance_arn = "arn:aws:sso:::instance/ssoins-1"
+                target_id    = id
+                target_type  = "AWS_ACCOUNT"
+            }
+        }
+    "#;
+
+    /// Build `current_states` as the refresh phase would: the parsed
+    /// `cert` resource's own id → an existing State carrying the
+    /// provider-read list attribute the loop iterates.
+    fn states_with_cert(
+        parsed: &ParsedFile,
+        attr: &str,
+        value: Value,
+    ) -> HashMap<ResourceId, State> {
+        let cert = parsed
+            .resources
+            .iter()
+            .find(|r| r.binding.as_deref() == Some("cert"))
+            .expect("parsed cert resource");
+        let mut attrs = HashMap::new();
+        attrs.insert(attr.to_string(), value);
+        let mut states = HashMap::new();
+        states.insert(cert.id.clone(), State::existing(cert.id.clone(), attrs));
+        states
+    }
+
+    fn account_ids() -> Value {
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("111111111111".into())),
+            Value::Concrete(ConcreteValue::String("222222222222".into())),
+        ]))
+    }
+
+    #[test]
+    fn same_config_read_iterable_materializes_in_plan_resources() {
+        let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
+        assert_eq!(
+            parsed.deferred_for_expressions.len(),
+            1,
+            "loop must be deferred at parse time (iterable is a same-config provider-read)"
+        );
+        let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
+        let states = states_with_cert(&parsed, "account_ids", account_ids());
+
+        let out = expand_same_config_deferred_for(
+            &parsed,
+            &sorted,
+            &states,
+            &HashMap::new(),
+            &[] as &[WaitAliasSpec],
+        )
+        .expect("expand");
+
+        let assignments: Vec<_> = out
+            .sorted_resources
+            .iter()
+            .filter(|r| r.id.resource_type.contains("Assignment"))
+            .collect();
+        assert_eq!(
+            assignments.len(),
+            2,
+            "one concrete Assignment per cert.account_ids entry; got {:?}",
+            out.sorted_resources
+                .iter()
+                .map(|r| r.id.to_string())
+                .collect::<Vec<_>>()
+        );
+
+        // The bare loop variable must be substituted from the
+        // *refreshed* cert value — proving the post-refresh
+        // ResolvedBindings view (not the empty pre-refresh map) fed the
+        // expansion. This is the carina#3132 fix.
+        let mut targets: Vec<String> = assignments
+            .iter()
+            .filter_map(|r| match r.get_attr("target_id") {
+                Some(Value::Concrete(ConcreteValue::String(s))) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        targets.sort();
+        assert_eq!(
+            targets,
+            vec!["111111111111".to_string(), "222222222222".to_string()],
+            "target_id must be substituted from the refreshed \
+             cert.account_ids entries"
+        );
+
+        assert!(
+            out.residual_deferred_for.is_empty(),
+            "resolved loop must leave no residual; got {:?}",
+            out.residual_deferred_for
+        );
+    }
+
+    #[test]
+    fn resort_preserves_pre_expansion_relative_order() {
+        // carina#3132 highest-risk requirement: appending loop children
+        // and re-sorting must not reorder already-planned resources
+        // (SimHash / moved-matching stability).
+        let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
+        let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
+        let pre_order: Vec<String> = sorted.iter().map(|r| r.id.to_string()).collect();
+        let states = states_with_cert(&parsed, "account_ids", account_ids());
+
+        let out = expand_same_config_deferred_for(
+            &parsed,
+            &sorted,
+            &states,
+            &HashMap::new(),
+            &[] as &[WaitAliasSpec],
+        )
+        .expect("expand");
+
+        let post_filtered: Vec<String> = out
+            .sorted_resources
+            .iter()
+            .map(|r| r.id.to_string())
+            .filter(|id| pre_order.contains(id))
+            .collect();
+        assert_eq!(
+            post_filtered, pre_order,
+            "re-sort must preserve the relative order of already-planned resources"
+        );
+        // The two materialized Assignment children — and only those —
+        // are reported as new (none of the pre-expansion ids leak in).
+        assert_eq!(
+            out.new_child_ids.len(),
+            2,
+            "new_child_ids must be exactly the materialized loop children"
+        );
+        assert!(
+            out.new_child_ids
+                .iter()
+                .all(|id| !pre_order.contains(&id.to_string())),
+            "new_child_ids must not include any pre-expansion resource"
+        );
+    }
+
+    #[test]
+    fn unresolvable_iterable_stays_deferred_no_misexpansion() {
+        // No cert state → iterable genuinely unknowable. The loop must
+        // stay in residual (carina#3128 placeholder), NOT mis-expand.
+        let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
+        let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
+        let empty_states: HashMap<ResourceId, State> = HashMap::new();
+
+        let out = expand_same_config_deferred_for(
+            &parsed,
+            &sorted,
+            &empty_states,
+            &HashMap::new(),
+            &[] as &[WaitAliasSpec],
+        )
+        .expect("expand");
+
+        assert!(
+            out.sorted_resources
+                .iter()
+                .all(|r| !r.id.resource_type.contains("Assignment")),
+            "no Assignment may materialize without a resolvable iterable"
+        );
+        assert_eq!(
+            out.residual_deferred_for.len(),
+            1,
+            "the unresolvable loop must remain deferred so the validate/\
+             plan placeholder still renders"
+        );
+        assert_eq!(
+            out.sorted_resources.len(),
+            sorted.len(),
+            "resource set unchanged when nothing materialized"
+        );
+    }
+
+    #[test]
+    fn upstream_state_iterable_still_expands_via_unified_view() {
+        // Regression guard: the pre-existing `upstream_state` iterable
+        // path must keep working now that it flows through the same
+        // projected ResolvedBindings (design non-goal: must not regress
+        // the upstream path).
+        let src = r#"
+            let orgs = upstream_state {
+                source = "../organizations"
+            }
+
+            for account_id in orgs.accounts {
+                awscc.sso.Assignment {
+                    instance_arn = 'arn:aws:sso:::instance/ssoins-1'
+                    target_id    = account_id
+                    target_type  = 'AWS_ACCOUNT'
+                }
+            }
+        "#;
+        let parsed = parse(src, &ProviderContext::default()).expect("parse");
+        assert_eq!(parsed.deferred_for_expressions.len(), 1);
+        let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
+
+        let mut orgs_attrs = HashMap::new();
+        orgs_attrs.insert(
+            "accounts".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("111111111111".to_string())),
+                Value::Concrete(ConcreteValue::String("222222222222".to_string())),
+            ])),
+        );
+        let mut remote = HashMap::new();
+        remote.insert("orgs".to_string(), orgs_attrs);
+
+        let out = expand_same_config_deferred_for(
+            &parsed,
+            &sorted,
+            &HashMap::new(),
+            &remote,
+            &[] as &[WaitAliasSpec],
+        )
+        .expect("expand");
+
+        let assignments = out
+            .sorted_resources
+            .iter()
+            .filter(|r| r.id.resource_type.contains("Assignment"))
+            .count();
+        assert_eq!(
+            assignments, 2,
+            "upstream_state iterable must still expand via the unified view"
+        );
+        assert!(out.residual_deferred_for.is_empty());
+    }
+
+    #[test]
+    fn chained_loop_var_field_access_is_a_known_limitation() {
+        // Chained field access on the loop variable
+        // (`opt.resource_record.name`) is stored as a
+        // `ResourceRef { binding: "opt", .. }`, which
+        // `substitute_placeholder` never replaces (only the bare
+        // `ForValue` is). The loop materializes but its attributes stay
+        // unresolved. Pre-existing limitation, tracked in carina#3136;
+        // PR-1 is necessary but not sufficient for #3132's real-infra
+        // acceptance. This pins current behavior so #3136's fix has a
+        // regression target and PR-3 does not silently fail.
+        let src = r#"
+            let cert = aws.acm.Certificate {
+                domain_name       = "r.example.com"
+                validation_method = "DNS"
+            }
+
+            for (_, opt) in cert.domain_validation_options {
+                aws.route53.RecordSet {
+                    name             = opt.resource_record.name
+                    type             = "CNAME"
+                    resource_records = [opt.resource_record.value]
+                }
+            }
+        "#;
+        let parsed = parse(src, &ProviderContext::default()).expect("parse");
+        let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
+
+        let mut rr = indexmap::IndexMap::new();
+        rr.insert(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("_a1.r.example.com".into())),
+        );
+        rr.insert(
+            "value".to_string(),
+            Value::Concrete(ConcreteValue::String("_a1.acm-validations.aws.".into())),
+        );
+        let mut entry = indexmap::IndexMap::new();
+        entry.insert(
+            "resource_record".to_string(),
+            Value::Concrete(ConcreteValue::Map(rr)),
+        );
+        let dvo = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(entry),
+        )]));
+        let states = states_with_cert(&parsed, "domain_validation_options", dvo);
+
+        let out = expand_same_config_deferred_for(
+            &parsed,
+            &sorted,
+            &states,
+            &HashMap::new(),
+            &[] as &[WaitAliasSpec],
+        )
+        .expect("expand");
+
+        let record_sets: Vec<_> = out
+            .sorted_resources
+            .iter()
+            .filter(|r| r.id.resource_type.contains("RecordSet"))
+            .collect();
+        // The loop DOES materialize (PR-1's expansion+re-sort works) ...
+        assert_eq!(
+            record_sets.len(),
+            1,
+            "loop still materializes one RecordSet (expansion itself works)"
+        );
+        // ... but the chained loop-var ref is NOT substituted yet: this
+        // is the tracked limitation. When the follow-up lands, flip this
+        // assertion to expect the concrete String.
+        let name = record_sets[0].get_attr("name");
+        assert!(
+            matches!(
+                name,
+                Some(Value::Deferred(
+                    carina_core::resource::DeferredValue::ResourceRef { .. }
+                ))
+            ),
+            "KNOWN LIMITATION: chained loop-var field access stays an \
+             unresolved ResourceRef (tracked follow-up); got {:?}",
+            name
+        );
+    }
+}

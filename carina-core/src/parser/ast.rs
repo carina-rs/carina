@@ -6,6 +6,7 @@ use super::error::ParseWarning;
 use super::expressions::for_expr::ForBinding;
 use super::expressions::validate_expr::CompareOp;
 use super::util::snake_to_pascal;
+use crate::binding_index::IterableBindings;
 use crate::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, UnknownReason, Value};
 use crate::version_constraint::VersionConstraint;
 use indexmap::IndexMap;
@@ -829,17 +830,23 @@ impl<E> File<E> {
         }
     }
 
-    /// Expand deferred for-expressions using loaded upstream_state bindings.
+    /// Expand deferred for-expressions against the resolved binding view.
     ///
     /// For each deferred for-expression whose iterable can now be resolved
-    /// from `remote_bindings`, expand the template into concrete resources
-    /// and add them to `self.resources`. Resolved entries are removed from
+    /// from `bindings`, expand the template into concrete resources and
+    /// add them to `self.resources`. Resolved entries are removed from
     /// `deferred_for_expressions`; unresolved ones remain (with their
     /// warning preserved).
-    pub fn expand_deferred_for_expressions(
-        &mut self,
-        remote_bindings: &HashMap<String, HashMap<String, Value>>,
-    ) {
+    ///
+    /// `bindings` is an [`IterableBindings`]: every binding an iterable
+    /// may reference — same-config `let` resources (post-refresh),
+    /// `upstream_state` data, and `wait` aliases — merged into one view.
+    /// Taking the typed view rather than the raw upstream-only map is the
+    /// carina#3132 fix: a same-config `let cert` read iterable
+    /// (`for _, opt in cert.domain_validation_options`) is in scope here
+    /// only because the caller projects the post-refresh
+    /// [`crate::binding_index::ResolvedBindings`] in.
+    pub fn expand_deferred_for_expressions(&mut self, bindings: &IterableBindings) {
         let mut expanded_resources = Vec::new();
         let mut resolved_indices = Vec::new();
         // Indices where the iterable resolved but had the wrong shape. These
@@ -850,8 +857,8 @@ impl<E> File<E> {
         let mut new_warnings: Vec<ParseWarning> = Vec::new();
 
         for (idx, deferred) in self.deferred_for_expressions.iter().enumerate() {
-            // Look up the iterable value in remote_bindings
-            let iterable = remote_bindings
+            // Look up the iterable value in the merged binding view
+            let iterable = bindings
                 .get(&deferred.iterable_binding)
                 .and_then(|attrs| attrs.get(&deferred.iterable_attr));
 

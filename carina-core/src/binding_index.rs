@@ -560,6 +560,69 @@ impl ResolvedBindings {
             },
         );
     }
+
+    /// Project this resolved view into the [`IterableBindings`] a
+    /// deferred-for expansion consumes.
+    ///
+    /// Every entry's merged attribute map (local DSL ⊕ refreshed state,
+    /// with upstream and wait-alias entries already folded in by
+    /// [`Self::from_resources_with_state`]) is exposed under its binding
+    /// name. This is the *only* same-config-aware constructor of
+    /// `IterableBindings`: a deferred-for iterable resolves against the
+    /// exact post-refresh view every non-loop `ResourceRef` resolves
+    /// against (carina#3132 — one resolution timing, no upstream-only
+    /// carve-out). The projection is a verbatim clone of the merged
+    /// maps; no new join logic.
+    pub fn project_iterable_bindings(&self) -> IterableBindings {
+        IterableBindings {
+            by_binding: self
+                .by_name
+                .iter()
+                .map(|(name, rb)| (name.clone(), rb.attributes.clone()))
+                .collect(),
+        }
+    }
+}
+
+/// The set of every binding a deferred-for iterable may legally
+/// reference: same-config `let` resources (post-refresh), `upstream_state`
+/// data, and `wait` aliases — all merged.
+///
+/// Exists as a distinct newtype, rather than a bare
+/// `HashMap<String, HashMap<String, Value>>`, so the input to
+/// [`File::expand_deferred_for_expressions`] *names* its contract. Before
+/// carina#3132 the expander took the raw map and the only caller passed
+/// the upstream-only `remote_bindings`; a same-config `let cert`'s
+/// refreshed `domain_validation_options` was therefore never in scope and
+/// the loop stayed deferred forever. Routing construction through
+/// [`ResolvedBindings::project_iterable_bindings`] (the merged view) —
+/// or the explicitly-named [`Self::from_upstream_only`] for the
+/// upstream-only unit tests — makes "iterable resolved against the wrong
+/// map" unrepresentable.
+#[derive(Debug, Default, Clone)]
+pub struct IterableBindings {
+    by_binding: HashMap<String, HashMap<String, Value>>,
+}
+
+impl IterableBindings {
+    /// Construct from an upstream-only binding map.
+    ///
+    /// Named to make the upstream-only nature explicit at the call site:
+    /// the runtime plan/apply paths must use
+    /// [`ResolvedBindings::project_iterable_bindings`] so same-config
+    /// `let` reads are in scope. This constructor exists for the
+    /// carina-core parser tests that exercise the `upstream_state`
+    /// iterable path with hand-built bindings.
+    pub fn from_upstream_only(remote_bindings: HashMap<String, HashMap<String, Value>>) -> Self {
+        Self {
+            by_binding: remote_bindings,
+        }
+    }
+
+    /// Resolve a binding's attribute map (the iterable's source).
+    pub fn get(&self, binding: &str) -> Option<&HashMap<String, Value>> {
+        self.by_binding.get(binding)
+    }
 }
 
 #[cfg(test)]
