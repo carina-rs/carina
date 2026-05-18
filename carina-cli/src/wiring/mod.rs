@@ -1125,6 +1125,52 @@ pub async fn create_providers_from_configs(
     Ok((router, ctx))
 }
 
+/// The expanded children that are safe to re-read from the provider —
+/// `new_child_ids` minus any child that is a `moved` block `to` target
+/// (carina#3141).
+///
+/// This is a newtype, not a bare `HashSet<ResourceId>`, on purpose. The
+/// plan path and the apply path must refresh *exactly this set* and not
+/// the wider `new_child_ids`; if both were `HashSet<ResourceId>` a
+/// caller could `new_child_ids.contains(...)` by mistake and the
+/// moved-exclusion would silently not apply (the recurring
+/// "unit-test path ≠ apply path" parity hazard). The only way to obtain
+/// the refresh iterator is [`RefreshableChildIds::select`], which
+/// `new_child_ids` does not have — so a path that filters by the wrong
+/// set is a *compile error*, not a runtime divergence. See the
+/// "Residual structural risk" section of
+/// notes/specs/2026-05-18-moved-into-loop-expansion-refresh-design.md.
+#[derive(Debug, Clone, Default)]
+pub struct RefreshableChildIds(HashSet<ResourceId>);
+
+impl RefreshableChildIds {
+    /// From a resource slice, yield exactly the resources that should be
+    /// re-read from the provider after a deferred-for expansion: the
+    /// expanded children that are not `moved` targets. Both the plan and
+    /// apply child-refresh sites must build their refresh iterator
+    /// through this method — there is no other constructor for the
+    /// refresh set, which is what makes the plan/apply parity a
+    /// type-level invariant rather than a reviewer's responsibility.
+    pub fn select<'a>(&'a self, resources: &'a [Resource]) -> impl Iterator<Item = &'a Resource> {
+        resources.iter().filter(move |r| self.0.contains(&r.id))
+    }
+
+    /// Test/inspection accessor: is this id in the refreshable set?
+    pub fn contains(&self, id: &ResourceId) -> bool {
+        self.0.contains(id)
+    }
+
+    /// Test/inspection accessor: number of refreshable children.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Test/inspection accessor: are there no refreshable children?
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// Outcome of the carina#3132 post-refresh deferred-for expansion.
 pub struct DeferredForExpansion {
     /// The augmented, re-sorted resource set: every original resource
@@ -1135,8 +1181,14 @@ pub struct DeferredForExpansion {
     /// time) — rendered as the carina#3128 validate/plan placeholder.
     pub residual_deferred_for: Vec<carina_core::parser::DeferredForExpression>,
     /// Ids of the resources materialized by this expansion (empty when
-    /// no loop resolved). The caller targeted-refreshes exactly these.
+    /// no loop resolved).
     pub new_child_ids: HashSet<ResourceId>,
+    /// Expanded children safe to re-read from the provider: the
+    /// `moved`-excluded subset of `new_child_ids` (carina#3141). The
+    /// plan and apply child-refresh sites build their refresh iterator
+    /// via [`RefreshableChildIds::select`]; see that type's doc for why
+    /// it is a newtype (compile-time plan/apply parity).
+    pub refreshable_child_ids: RefreshableChildIds,
 }
 
 /// Pure core of the carina#3132 fix: project the post-refresh
@@ -1153,13 +1205,20 @@ pub struct DeferredForExpansion {
 /// Pure (no provider I/O) so it is unit-testable with a hand-built
 /// post-refresh `current_states`; `create_plan_from_parsed_with_upstream`
 /// calls exactly this function, then targeted-refreshes
-/// `new_child_ids`.
+/// `refreshable_child_ids`.
+///
+/// `moved_targets` is the set of `moved` block `to` ResourceIds (already
+/// materialized by `materialize_moved_states` on both the plan and apply
+/// paths before this call). Children whose id is in this set are kept
+/// out of `refreshable_child_ids` so their migrated state survives
+/// (carina#3141).
 pub fn expand_same_config_deferred_for<E: Clone>(
     parsed: &carina_core::parser::File<E>,
     sorted_resources: &[Resource],
     current_states: &HashMap<ResourceId, State>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     wait_aliases: &[WaitAliasSpec],
+    moved_targets: &HashSet<ResourceId>,
 ) -> Result<DeferredForExpansion, AppError> {
     // Common case: no deferred-for at all. Skip the binding projection
     // and the whole-`File` clone entirely (this runs on every plan /
@@ -1172,6 +1231,7 @@ pub fn expand_same_config_deferred_for<E: Clone>(
             sorted_resources: sorted_resources.to_vec(),
             residual_deferred_for: Vec::new(),
             new_child_ids: HashSet::new(),
+            refreshable_child_ids: RefreshableChildIds::default(),
         });
     }
 
@@ -1213,10 +1273,24 @@ pub fn expand_same_config_deferred_for<E: Clone>(
         .filter(|id| !pre_ids.contains(id))
         .collect();
 
+    // carina#3141: a child that is also a `moved` block `to` already
+    // holds the migrated state from `materialize_moved_states`. Exclude
+    // it from the refreshable set so the caller's targeted refresh does
+    // not overwrite that state with a `not_found` provider read (the
+    // state file still keys the old name, so no identifier resolves).
+    let refreshable_child_ids = RefreshableChildIds(
+        new_child_ids
+            .iter()
+            .filter(|id| !moved_targets.contains(*id))
+            .cloned()
+            .collect(),
+    );
+
     Ok(DeferredForExpansion {
         sorted_resources: resorted,
         residual_deferred_for,
         new_child_ids,
+        refreshable_child_ids,
     })
 }
 
@@ -1502,25 +1576,31 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     // here we perform the I/O half — targeted-refresh of the children
     // so a re-plan after they were applied sees their live state
     // instead of a phantom Create.
+    let moved_targets: HashSet<ResourceId> = moved_pairs.iter().map(|(_, to)| to.clone()).collect();
     let DeferredForExpansion {
         sorted_resources: resorted,
         residual_deferred_for,
         new_child_ids,
+        refreshable_child_ids,
     } = expand_same_config_deferred_for(
         parsed,
         &sorted_resources,
         &current_states,
         remote_bindings,
         &wait_aliases,
+        &moved_targets,
     )?;
     sorted_resources = resorted;
 
     if !new_child_ids.is_empty() {
-        let children = || {
-            sorted_resources
-                .iter()
-                .filter(|r| new_child_ids.contains(&r.id))
-        };
+        // Refresh only `refreshable_child_ids` (carina#3141): a child
+        // that is also a `moved` target keeps the migrated state from
+        // `materialize_moved_states`; re-reading it here (any of the
+        // three branches below) would clobber that state with
+        // `not_found`. `select` is the only constructor for the refresh
+        // set — the apply path uses the same one, so the moved-exclusion
+        // cannot diverge between the two paths (compile-time parity).
+        let children = || refreshable_child_ids.select(&sorted_resources);
         if refresh {
             refresh_resource_set(
                 &provider,

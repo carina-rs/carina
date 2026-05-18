@@ -852,6 +852,7 @@ mod apply_deferred_for_parity {
             &states,
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
+            &std::collections::HashSet::new(),
         )
         .expect("expand");
 
@@ -910,6 +911,7 @@ mod apply_deferred_for_parity {
             &empty,
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
+            &std::collections::HashSet::new(),
         )
         .expect("expand");
 
@@ -921,5 +923,81 @@ mod apply_deferred_for_parity {
         );
         assert_eq!(out.residual_deferred_for.len(), 1);
         assert!(out.new_child_ids.is_empty());
+    }
+
+    /// carina#3141 apply-side contract: `run_apply_locked` refreshes
+    /// exactly `refreshable_child_ids`, the same typed field the plan
+    /// path consumes. Reaching `expand_same_config_deferred_for` through
+    /// the apply module's `crate::wiring::` path pins that the apply
+    /// path's moved-exclusion is the *identical* computation as the plan
+    /// path's — a divergence would be a compile error against
+    /// `DeferredForExpansion`, not a silent parity bug
+    /// (MEMORY "unit-test path ≠ apply path"). Parity twin of
+    /// `wiring::tests::...::moved_target_child_is_excluded_from_refreshable_set`.
+    #[test]
+    fn apply_moved_target_child_excluded_from_refreshable_set() {
+        let src = r#"
+            let cert = aws.acm.Certificate {
+                domain_name       = "r.example.com"
+                validation_method = "DNS"
+            }
+
+            for (_, opt) in cert.domain_validation_options {
+                aws.route53.RecordSet {
+                    name             = opt.resource_record.name
+                    type             = "CNAME"
+                    resource_records = [opt.resource_record.value]
+                }
+            }
+        "#;
+        let parsed = parse(src, &ProviderContext::default()).expect("parse");
+        let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
+        let states = dvo_state(&parsed);
+
+        // No moved targets: the expanded child is refreshable.
+        let baseline = crate::wiring::expand_same_config_deferred_for(
+            &parsed,
+            &sorted,
+            &states,
+            &HashMap::new(),
+            &[] as &[WaitAliasSpec],
+            &std::collections::HashSet::new(),
+        )
+        .expect("expand");
+        assert_eq!(baseline.new_child_ids.len(), 1);
+        let child_id = baseline
+            .new_child_ids
+            .iter()
+            .next()
+            .expect("materialized child")
+            .clone();
+        assert!(
+            baseline.refreshable_child_ids.contains(&child_id),
+            "apply: a non-moved expanded child must still be refreshed"
+        );
+
+        // Declare it a `moved` `to`: it must drop out of the refreshable
+        // set so `run_apply_locked` does not clobber the migrated state.
+        let mut moved_targets = std::collections::HashSet::new();
+        moved_targets.insert(child_id.clone());
+        let out = crate::wiring::expand_same_config_deferred_for(
+            &parsed,
+            &sorted,
+            &states,
+            &HashMap::new(),
+            &[] as &[WaitAliasSpec],
+            &moved_targets,
+        )
+        .expect("expand");
+
+        assert_eq!(
+            out.new_child_ids, baseline.new_child_ids,
+            "apply: moved-exclusion must not change what materialized"
+        );
+        assert!(
+            !out.refreshable_child_ids.contains(&child_id),
+            "apply: a `moved` target child must be excluded from \
+             refreshable_child_ids (carina#3141 parity with plan path)"
+        );
     }
 }
