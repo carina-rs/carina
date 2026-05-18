@@ -113,6 +113,9 @@ impl std::fmt::Display for UnknownReason {
             UnknownReason::ForKey => write!(f, "deferred for-binding key"),
             UnknownReason::ForIndex => write!(f, "deferred for-binding index"),
             UnknownReason::ForValue => write!(f, "deferred for-binding value"),
+            UnknownReason::ForValuePath { path } => {
+                write!(f, "deferred for-binding value {}", path.to_dot_string())
+            }
             UnknownReason::EmptyInterpolation => write!(f, "empty interpolation"),
         }
     }
@@ -130,6 +133,9 @@ pub fn render_unknown(reason: &UnknownReason) -> String {
         UnknownReason::ForKey => "(known after upstream apply: key)".to_string(),
         UnknownReason::ForIndex => "(known after upstream apply: index)".to_string(),
         UnknownReason::ForValue => "(known after upstream apply)".to_string(),
+        UnknownReason::ForValuePath { path } => {
+            format!("(known after upstream apply: {})", path.to_dot_string())
+        }
         UnknownReason::EmptyInterpolation => "(empty interpolation)".to_string(),
     }
 }
@@ -1541,6 +1547,22 @@ mod tests {
         assert_eq!(
             render_unknown(&UnknownReason::ForValue),
             "(known after upstream apply)"
+        );
+    }
+
+    #[test]
+    fn render_unknown_for_value_path() {
+        // carina#3136: the path-carrying loop-var placeholder renders
+        // the path like every other payload-carrying arm (not the bare
+        // `ForValue` string), so an unresolved chained loop-var access
+        // stays distinguishable in plan output.
+        use crate::resource::AccessPath;
+        let r = UnknownReason::ForValuePath {
+            path: AccessPath::with_fields("opt", "resource_record", vec!["name".to_string()]),
+        };
+        assert_eq!(
+            render_unknown(&r),
+            "(known after upstream apply: opt.resource_record.name)"
         );
     }
 

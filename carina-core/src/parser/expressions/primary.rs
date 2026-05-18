@@ -12,8 +12,61 @@ use crate::parser::{
     ParseContext, ParseError, Rule, evaluate_user_function, extract_key_string, first_inner,
     is_static_value, next_pair, parse_block_contents, parse_expression, parse_expression_eval,
 };
-use crate::resource::{AccessPath, ConcreteValue, DeferredValue, PathSegment, Subscript, Value};
+use crate::resource::{
+    AccessPath, ConcreteValue, DeferredValue, PathSegment, Subscript, UnknownReason, Value,
+};
 use indexmap::IndexMap;
+
+/// Resolve a field-access path rooted at a **bound variable** (a
+/// `for`-loop value var, a `let`-of-struct), shared by the two parser
+/// entry points that can reach one (carina#3136). Returns:
+///
+/// - `Some(resolved)` — the variable is a concrete tree and the path
+///   navigates: the real nested value (resolved-for-loop / struct let).
+/// - `Some(ForValuePath)` — the variable is the deferred-for `ForValue`
+///   placeholder (element not yet known): the path-carrying loop-var
+///   placeholder, re-navigated post-expansion by
+///   `substitute_placeholder`.
+/// - `None` — bound, concrete, but the path does not navigate (a
+///   scalar, or a genuine key/shape miss). The caller applies its own
+///   miss policy (scalar diagnostic vs. legacy `ResourceRef`); the two
+///   call sites genuinely differ there, everything above is identical
+///   and must not drift (the plan-path symmetry this fix exists for).
+///
+/// The deferred-for template binds the value var to exactly the bare
+/// `ForValue` placeholder (`for_expr.rs`), so the placeholder test is a
+/// direct match, not a tree walk.
+fn resolve_bound_var_field_access(bound: &Value, path: &AccessPath) -> Option<EvalValue> {
+    if let Some(v) = crate::resource::navigate_value_path(bound, path) {
+        return Some(EvalValue::from_value(v));
+    }
+    if matches!(
+        bound,
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue))
+    ) {
+        return Some(EvalValue::from_value(Value::Deferred(
+            DeferredValue::Unknown(UnknownReason::ForValuePath { path: path.clone() }),
+        )));
+    }
+    None
+}
+
+/// True when `bound` is a scalar value, where field access
+/// (`s.foo` on `let s = "x"`) is genuinely meaningless — the domain of
+/// the Site B "not a resource" diagnostic.
+fn is_scalar_value(bound: &Value) -> bool {
+    matches!(
+        bound,
+        Value::Concrete(
+            ConcreteValue::String(_)
+                | ConcreteValue::Int(_)
+                | ConcreteValue::Float(_)
+                | ConcreteValue::Bool(_)
+                | ConcreteValue::Duration(_)
+                | ConcreteValue::EnumIdentifier(_)
+        )
+    )
+}
 
 /// Decode a duration literal (`75min`, `1h`, `30s`) into integer
 /// seconds.
@@ -145,17 +198,40 @@ fn parse_namespaced_id_value(
         return Ok(as_resource_ref(trailing_segments));
     }
 
-    if parts.len() == 2
-        && ctx.get_variable(parts[0]).is_some()
+    // carina#3136: `parts[0]` is a bound variable that is not a
+    // resource binding. Field access on a *scalar* variable
+    // (`let s = "x"; s.foo`) is genuinely meaningless → keep the
+    // error. But a struct/map-valued `for`-loop value variable
+    // (`for (_, o) in [{k=…}] { … o.k }`) is legitimate navigation:
+    // route it through the same navigator Site A uses.
+    if let Some(crate::eval_value::EvalValue::User(bound)) = ctx.get_variable(parts[0])
         && !ctx.is_resource_binding(parts[0])
     {
-        return Err(ParseError::InvalidExpression {
-            line: 0,
-            message: format!(
-                "'{}' is not a resource, cannot access attribute '{}'",
-                parts[0], parts[1]
-            ),
-        });
+        let mut segments: Vec<PathSegment> = parts[2..]
+            .iter()
+            .map(|s| PathSegment::Field {
+                name: (*s).to_string(),
+            })
+            .collect();
+        segments.extend(trailing_segments.clone());
+        let path = AccessPath::with_segments(parts[0].to_string(), parts[1].to_string(), segments);
+        if let Some(ev) = resolve_bound_var_field_access(bound, &path) {
+            return Ok(ev);
+        }
+        // Miss. A scalar can't have fields — the original user error.
+        if is_scalar_value(bound) {
+            return Err(ParseError::InvalidExpression {
+                line: 0,
+                message: format!(
+                    "'{}' is not a resource, cannot access attribute '{}'",
+                    parts[0], parts[1]
+                ),
+            });
+        }
+        // Non-scalar bound value whose path did not navigate (genuine
+        // key/shape miss): keep the legacy `ResourceRef` so existing
+        // scope/typo diagnostics still surface it.
+        return Ok(as_resource_ref(trailing_segments));
     }
 
     // Dotted IDs that aren't an enum shorthand are binding refs; emit
@@ -489,14 +565,34 @@ pub(crate) fn parse_primary_eval(
                 } else {
                     let attribute_name = field_names.remove(0);
                     let path = AccessPath::with_fields_and_subscripts(
-                        binding_name,
+                        binding_name.clone(),
                         attribute_name,
                         field_names,
                         subscripts,
                     );
-                    Ok(EvalValue::from_value(Value::Deferred(
-                        DeferredValue::ResourceRef { path },
-                    )))
+                    // carina#3136: field access on a bound **variable**
+                    // (a `for`-loop value var, a `let`-of-struct) is
+                    // not a resource reference. The no-field arm above
+                    // already consults `get_variable`; this arm must
+                    // too, or `o.rr.name` escapes as a
+                    // `ResourceRef{binding:o}` no resolver can resolve
+                    // (a loop var is never a `ResolvedBindings` entry).
+                    // A non-variable head is a genuine resource binding
+                    // (`cert.domain_validation_options`) and a miss on a
+                    // bound var falls back to `ResourceRef` so existing
+                    // scope/typo diagnostics still surface — Site A has
+                    // no scalar-error arm (its no-field sibling already
+                    // guards scalars upstream).
+                    if let Some(crate::eval_value::EvalValue::User(bound)) =
+                        ctx.get_variable(&binding_name)
+                        && let Some(ev) = resolve_bound_var_field_access(bound, &path)
+                    {
+                        Ok(ev)
+                    } else {
+                        Ok(EvalValue::from_value(Value::Deferred(
+                            DeferredValue::ResourceRef { path },
+                        )))
+                    }
                 }
             }
         }

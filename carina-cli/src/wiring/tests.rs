@@ -1353,13 +1353,11 @@ mod expand_same_config_deferred_for_tests {
     /// `account_ids`, plus a plain independent resource so re-sort
     /// stability has something to preserve order against.
     ///
-    /// The loop body uses the **bare** loop variable (`target = id`),
-    /// the shape the deferred-for substitution machinery supports
-    /// today. Chained loop-var field access (`opt.resource_record.name`)
-    /// is a *separate, pre-existing* unsupported case — see
-    /// `chained_loop_var_field_access_is_a_known_limitation` below — and
-    /// is out of PR-1 scope (the design's "Changing the deferred-for
-    /// parse" non-goal).
+    /// The loop body uses the **bare** loop variable (`target = id`).
+    /// Chained loop-var field access (`opt.resource_record.name`) is
+    /// covered separately by
+    /// `chained_loop_var_field_access_resolves_post_expansion` below
+    /// (carina#3136).
     const SRC: &str = r#"
         let cert = aws.acm.Certificate {
             domain_name       = "registry.example.com"
@@ -1604,16 +1602,14 @@ mod expand_same_config_deferred_for_tests {
     }
 
     #[test]
-    fn chained_loop_var_field_access_is_a_known_limitation() {
-        // Chained field access on the loop variable
-        // (`opt.resource_record.name`) is stored as a
-        // `ResourceRef { binding: "opt", .. }`, which
-        // `substitute_placeholder` never replaces (only the bare
-        // `ForValue` is). The loop materializes but its attributes stay
-        // unresolved. Pre-existing limitation, tracked in carina#3136;
-        // PR-1 is necessary but not sufficient for #3132's real-infra
-        // acceptance. This pins current behavior so #3136's fix has a
-        // regression target and PR-3 does not silently fail.
+    fn chained_loop_var_field_access_resolves_post_expansion() {
+        // carina#3136 (the flipped carina#3132 PR-1 limitation pin):
+        // chained field access on the loop variable
+        // (`opt.resource_record.name`) is parsed to
+        // `Unknown(ForValuePath { path })` and re-navigated against the
+        // real element by `substitute_placeholder` at for-expansion.
+        // The loop materializes AND its attributes resolve to concrete
+        // values — this is the carina#3132 PR-3 real-registry shape.
         let src = r#"
             let cert = aws.acm.Certificate {
                 domain_name       = "r.example.com"
@@ -1664,26 +1660,30 @@ mod expand_same_config_deferred_for_tests {
             .iter()
             .filter(|r| r.id.resource_type.contains("RecordSet"))
             .collect();
-        // The loop DOES materialize (PR-1's expansion+re-sort works) ...
         assert_eq!(
             record_sets.len(),
             1,
-            "loop still materializes one RecordSet (expansion itself works)"
+            "loop materializes one RecordSet per domain_validation_options entry"
         );
-        // ... but the chained loop-var ref is NOT substituted yet: this
-        // is the tracked limitation. When the follow-up lands, flip this
-        // assertion to expect the concrete String.
-        let name = record_sets[0].get_attr("name");
-        assert!(
-            matches!(
-                name,
-                Some(Value::Deferred(
-                    carina_core::resource::DeferredValue::ResourceRef { .. }
-                ))
-            ),
-            "KNOWN LIMITATION: chained loop-var field access stays an \
-             unresolved ResourceRef (tracked follow-up); got {:?}",
-            name
+        // carina#3136: the chained loop-var ref is now substituted from
+        // the real refreshed element — `name` is the concrete String,
+        // not an unresolved ResourceRef.
+        assert_eq!(
+            record_sets[0].get_attr("name"),
+            Some(&Value::Concrete(ConcreteValue::String(
+                "_a1.r.example.com".into()
+            ))),
+            "name must resolve to the refreshed \
+             cert.domain_validation_options[0].resource_record.name"
+        );
+        // And the nested access inside a list literal
+        // (`resource_records = [opt.resource_record.value]`) resolves too.
+        assert_eq!(
+            record_sets[0].get_attr("resource_records"),
+            Some(&Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("_a1.acm-validations.aws.".into()))
+            ]))),
+            "resource_records[0] must resolve to ...resource_record.value"
         );
     }
 }

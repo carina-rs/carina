@@ -1000,6 +1000,19 @@ pub(super) fn substitute_placeholder(
         Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)) => {
             *v = value.clone();
         }
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValuePath { path })) => {
+            // carina#3136: a field access on the loop variable
+            // (`opt.resource_record.name`). The element is now known
+            // (`value`); re-navigate it along the remembered path via
+            // the *same* navigator the parse-time resolved case uses
+            // (single source of truth). If it does not navigate (the
+            // element genuinely lacks that path), leave the placeholder
+            // so the existing "unresolved" surfacing applies rather
+            // than silently substituting a wrong value.
+            if let Some(resolved) = crate::resource::navigate_value_path(value, path) {
+                *v = resolved;
+            }
+        }
         Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey)) => {
             if let Some(k) = key {
                 *v = Value::Concrete(ConcreteValue::String(k.to_string()));
