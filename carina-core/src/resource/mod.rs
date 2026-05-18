@@ -482,6 +482,86 @@ impl std::fmt::Display for AccessPath {
     }
 }
 
+/// Peel `Value::Secret` wrappers, returning the inner value and the
+/// number of layers peeled. Pair with [`rewrap_secrets`] so dot-form /
+/// subscript access can descend into a secret container and re-tag the
+/// leaf (#2439; plan-display redaction depends on the tag). Single
+/// source of truth for the secret-tunnel discipline, shared by
+/// `resolver::resolve_ref_value` and [`navigate_value_path`].
+pub(crate) fn peel_secrets(mut value: Value) -> (Value, usize) {
+    let mut depth = 0;
+    while let Value::Deferred(DeferredValue::Secret(inner)) = value {
+        value = *inner;
+        depth += 1;
+    }
+    (value, depth)
+}
+
+/// Re-wrap `value` in `depth` layers of `Value::Secret`. Inverse of
+/// [`peel_secrets`].
+pub(crate) fn rewrap_secrets(value: Value, depth: usize) -> Value {
+    (0..depth).fold(value, |acc, _| {
+        Value::Deferred(DeferredValue::Secret(Box::new(acc)))
+    })
+}
+
+/// Navigate a value tree along an [`AccessPath`]'s `attribute` then
+/// ordered `segments`, returning the value at the leaf.
+///
+/// This is the single source of truth for "follow
+/// `attribute.field[subscript]…` into a concrete `Value`" used by
+/// loop-variable field-access resolution (carina#3136). The element a
+/// `for` loop binds its value variable to is a plain concrete tree
+/// (`Map`/`List`/scalar); `root` is that element, and the path's
+/// `binding` (the loop variable name) has already been matched by the
+/// caller, so navigation starts at `attribute`.
+///
+/// Semantics mirror the segment walk in
+/// [`crate::resolver::resolve_ref_value`] exactly — `Map`+`Field`,
+/// `List`+`Subscript::Int`, `Map`+`Subscript::Str` — including
+/// `Secret` peel/rewrap so a secret leaf keeps its tag. Any missing
+/// hop, shape mismatch (a field expected where the value is a scalar),
+/// or out-of-range index yields `None`: a loop-variable path that does
+/// not navigate is "not resolvable here", never a panic or a wrong
+/// value.
+pub fn navigate_value_path(root: &Value, path: &AccessPath) -> Option<Value> {
+    // The `attribute` head is the first hop: `root` is the loop
+    // element, `root[attribute]` is the first navigated value.
+    let (peeled_root, root_secret) = peel_secrets(root.clone());
+    let Value::Concrete(ConcreteValue::Map(root_map)) = &peeled_root else {
+        return None;
+    };
+    let mut current = rewrap_secrets(root_map.get(path.attribute())?.clone(), root_secret);
+
+    for segment in path.segments() {
+        let (peeled, secret_depth) = peel_secrets(current);
+        let next = match (&peeled, segment) {
+            (Value::Concrete(ConcreteValue::Map(map)), PathSegment::Field { name }) => {
+                map.get(name)?.clone()
+            }
+            (
+                Value::Concrete(ConcreteValue::List(items)),
+                PathSegment::Subscript {
+                    index: Subscript::Int { index },
+                },
+            ) => {
+                let i = usize::try_from(*index).ok().filter(|i| *i < items.len())?;
+                items[i].clone()
+            }
+            (
+                Value::Concrete(ConcreteValue::Map(map)),
+                PathSegment::Subscript {
+                    index: Subscript::Str { key },
+                },
+            ) => map.get(key)?.clone(),
+            _ => return None,
+        };
+        current = rewrap_secrets(next, secret_depth);
+    }
+
+    Some(current)
+}
+
 /// Serde adapter that maps `std::time::Duration` ↔ integer seconds.
 ///
 /// Without this, the default `Duration` serde impl emits
@@ -725,6 +805,20 @@ pub enum UnknownReason {
     /// Loop-variable value in a deferred for-expression
     /// (`for v in iterable`). Substituted with the actual element.
     ForValue,
+    /// Field access on a deferred for-expression's loop variable
+    /// (`for (_, opt) in iterable { … opt.resource_record.name … }`).
+    /// Carries the navigation path past the loop variable. The
+    /// `ForValue` sibling that additionally remembers *which* nested
+    /// value of the element is wanted: at template-parse time the
+    /// element is not yet known, so the parser emits this; once the
+    /// iterable resolves, `substitute_placeholder` re-navigates the
+    /// real element along `path` (carina#3136). Distinct from a
+    /// resource `ResourceRef` so `resolve_ref_value` — which only
+    /// resolves against resource bindings — never sees a loop variable
+    /// it cannot resolve. Lives under the `#[serde(skip)]`
+    /// `Unknown(..)` arm, so it inherits the never-equal `PartialEq`
+    /// invariant and is never serialized.
+    ForValuePath { path: AccessPath },
     /// Mid-edit empty `${}` interpolation. Carries no payload — the
     /// presence of the marker is enough for the LSP to surface a
     /// diagnostic at the `${}` span and for downstream resolvers to
@@ -1186,6 +1280,10 @@ impl Value {
                     // allocation.
                     UnknownReason::UpstreamRef { path } => path.hash(hasher),
                     UnknownReason::UpstreamBareRef { binding } => binding.hash(hasher),
+                    // Carries an `AccessPath` payload — hash it like
+                    // `UpstreamRef` so two distinct loop-var paths get
+                    // distinct hashes.
+                    UnknownReason::ForValuePath { path } => path.hash(hasher),
                     // `For{Key,Index,Value}` and `EmptyInterpolation`
                     // carry no payload; the discriminant alone already
                     // distinguishes them.

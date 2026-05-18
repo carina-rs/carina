@@ -10330,3 +10330,131 @@ fn access_path_serde_round_trips_mixed_segments() {
     let reloaded: AccessPath = serde_json::from_str(&json).unwrap();
     assert_eq!(original, reloaded);
 }
+
+// carina#3136: field access on a struct/map-valued for-loop variable.
+// The full behavior matrix that was ERR / unresolved before the fix
+// must now resolve; the scalar guard and the bare-var path must not
+// regress.
+mod loop_var_field_access_matrix {
+    use super::*;
+
+    fn first_name(src: &str) -> Value {
+        let p = parse(src, &ProviderContext::default()).expect("parse");
+        assert_eq!(
+            p.deferred_for_expressions.len(),
+            0,
+            "inline-list loop must fully expand at parse time"
+        );
+        p.resources
+            .first()
+            .expect("one resource")
+            .get_attr("name")
+            .expect("name attr")
+            .clone()
+    }
+
+    #[test]
+    fn one_level_field_on_indexed_binding_resolves() {
+        // Was: parse error "'o' is not a resource…" (Site B).
+        assert_eq!(
+            first_name(r#"for (_, o) in [{ k = "v1" }] { aws.ec2.Subnet { name = o.k } }"#),
+            Value::Concrete(ConcreteValue::String("v1".into()))
+        );
+    }
+
+    #[test]
+    fn two_level_field_resolves_the_registry_shape() {
+        // Was: unresolved ResourceRef{binding:o,…} (Site A). This is
+        // the carina#3132 real registry `opt.resource_record.name`.
+        assert_eq!(
+            first_name(
+                r#"for (_, o) in [{ rr = { name = "n1" } }] { aws.ec2.Subnet { name = o.rr.name } }"#
+            ),
+            Value::Concrete(ConcreteValue::String("n1".into()))
+        );
+    }
+
+    #[test]
+    fn one_level_field_on_simple_binding_resolves() {
+        assert_eq!(
+            first_name(r#"for o in [{ k = "v9" }] { aws.ec2.Subnet { name = o.k } }"#),
+            Value::Concrete(ConcreteValue::String("v9".into()))
+        );
+    }
+
+    #[test]
+    fn scalar_loop_var_field_access_still_errors() {
+        // The Site B guard's correct domain: field access on a scalar
+        // is meaningless and must keep erroring.
+        let err = parse(
+            r#"for s in ["x"] { aws.ec2.Subnet { name = s.foo } }"#,
+            &ProviderContext::default(),
+        );
+        assert!(
+            err.is_err(),
+            "field access on a scalar loop var must still error; got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn bare_loop_var_still_resolves_no_regression() {
+        assert_eq!(
+            first_name(r#"for (_, az) in ["a", "b"] { aws.ec2.Subnet { name = az } }"#),
+            Value::Concrete(ConcreteValue::String("a".into()))
+        );
+    }
+
+    #[test]
+    fn deferred_template_emits_for_value_path_then_substitutes() {
+        // The deferred path: iterable is an unresolved upstream ref, so
+        // the loop is deferred and the body's `o.k` is parsed to
+        // `Unknown(ForValuePath)`. Then expand with a concrete iterable
+        // and assert substitute_placeholder re-navigates it.
+        let src = r#"
+            let up = upstream_state { source = "../x" }
+            for (_, o) in up.items {
+                aws.ec2.Subnet { name = o.k }
+            }
+        "#;
+        let mut p = parse(src, &ProviderContext::default()).expect("parse");
+        assert_eq!(p.deferred_for_expressions.len(), 1, "loop deferred");
+        // The template body must carry the path-aware placeholder, not
+        // a resource ResourceRef (which would never resolve for a loop
+        // var) and not a bare ForValue (which would lose the `.k`).
+        let tmpl = &p.deferred_for_expressions[0].template_resource;
+        assert!(
+            matches!(
+                tmpl.get_attr("name"),
+                Some(Value::Deferred(DeferredValue::Unknown(
+                    crate::resource::UnknownReason::ForValuePath { .. }
+                )))
+            ),
+            "deferred template must carry ForValuePath; got {:?}",
+            tmpl.get_attr("name")
+        );
+
+        let mut items = IndexMap::new();
+        items.insert(
+            "k".to_string(),
+            Value::Concrete(ConcreteValue::String("resolved".into())),
+        );
+        let mut up_attrs = HashMap::new();
+        up_attrs.insert(
+            "items".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(items),
+            )])),
+        );
+        let mut remote = HashMap::new();
+        remote.insert("up".to_string(), up_attrs);
+        p.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote));
+
+        assert_eq!(p.deferred_for_expressions.len(), 0, "loop expanded");
+        assert_eq!(
+            p.resources.first().expect("one resource").get_attr("name"),
+            Some(&Value::Concrete(ConcreteValue::String("resolved".into()))),
+            "ForValuePath must re-navigate the resolved element"
+        );
+    }
+}

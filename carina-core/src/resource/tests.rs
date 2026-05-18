@@ -1582,3 +1582,125 @@ fn directives_provider_instance_deserialises_from_legacy_json_without_field() {
     let d: Directives = serde_json::from_str(legacy).unwrap();
     assert!(d.provider_instance.is_none());
 }
+
+// carina#3136: navigate_value_path — the single path-walking primitive
+// loop-variable field access resolves through.
+mod navigate_value_path_tests {
+    use super::*;
+
+    fn s(v: &str) -> Value {
+        Value::Concrete(ConcreteValue::String(v.to_string()))
+    }
+    fn map(pairs: &[(&str, Value)]) -> Value {
+        let mut m = indexmap::IndexMap::new();
+        for (k, v) in pairs {
+            m.insert(k.to_string(), v.clone());
+        }
+        Value::Concrete(ConcreteValue::Map(m))
+    }
+
+    #[test]
+    fn one_level_field() {
+        // root = { k = "v" }, path = _.k  → "v"
+        let root = map(&[("k", s("v"))]);
+        let path = AccessPath::new("o", "k");
+        assert_eq!(navigate_value_path(&root, &path), Some(s("v")));
+    }
+
+    #[test]
+    fn two_level_field_the_real_registry_shape() {
+        // root = { resource_record = { name = "n1" } }
+        // path = _.resource_record.name  → "n1"
+        let root = map(&[("resource_record", map(&[("name", s("n1"))]))]);
+        let path = AccessPath::with_fields("opt", "resource_record", vec!["name".into()]);
+        assert_eq!(navigate_value_path(&root, &path), Some(s("n1")));
+    }
+
+    #[test]
+    fn list_int_subscript_after_field() {
+        // root = { vals = ["a", "b"] }, path = _.vals[1]  → "b"
+        let root = map(&[(
+            "vals",
+            Value::Concrete(ConcreteValue::List(vec![s("a"), s("b")])),
+        )]);
+        let path = AccessPath::with_fields_and_subscripts(
+            "o",
+            "vals",
+            vec![],
+            vec![Subscript::Int { index: 1 }],
+        );
+        assert_eq!(navigate_value_path(&root, &path), Some(s("b")));
+    }
+
+    #[test]
+    fn map_str_subscript() {
+        // root = { tags = { Name = "x" } }, path = _.tags["Name"]  → "x"
+        let root = map(&[("tags", map(&[("Name", s("x"))]))]);
+        let path = AccessPath::with_fields_and_subscripts(
+            "o",
+            "tags",
+            vec![],
+            vec![Subscript::Str { key: "Name".into() }],
+        );
+        assert_eq!(navigate_value_path(&root, &path), Some(s("x")));
+    }
+
+    #[test]
+    fn missing_field_is_none() {
+        let root = map(&[("k", s("v"))]);
+        let path = AccessPath::new("o", "absent");
+        assert_eq!(navigate_value_path(&root, &path), None);
+    }
+
+    #[test]
+    fn scalar_root_rejects_field_access() {
+        // root is a scalar string — `.k` is meaningless → None (the
+        // Site B "not a resource" guard's correct domain).
+        let root = s("scalar");
+        let path = AccessPath::new("o", "k");
+        assert_eq!(navigate_value_path(&root, &path), None);
+    }
+
+    #[test]
+    fn out_of_range_index_is_none() {
+        let root = map(&[("vals", Value::Concrete(ConcreteValue::List(vec![s("a")])))]);
+        let path = AccessPath::with_fields_and_subscripts(
+            "o",
+            "vals",
+            vec![],
+            vec![Subscript::Int { index: 5 }],
+        );
+        assert_eq!(navigate_value_path(&root, &path), None);
+    }
+
+    #[test]
+    fn secret_leaf_keeps_its_tag() {
+        // root = { tok = secret("s") }; navigating to it must re-wrap
+        // the Secret so the tag survives end-to-end (#2439 parity).
+        let root = map(&[(
+            "tok",
+            Value::Deferred(DeferredValue::Secret(Box::new(s("s")))),
+        )]);
+        let path = AccessPath::new("o", "tok");
+        assert_eq!(
+            navigate_value_path(&root, &path),
+            Some(Value::Deferred(DeferredValue::Secret(Box::new(s("s")))))
+        );
+    }
+
+    #[test]
+    fn field_through_secret_wrapped_map() {
+        // root = secret({ name = "n" }); _.name peels the secret to
+        // descend, then re-wraps the leaf.
+        let inner = map(&[("name", s("n"))]);
+        let root = map(&[(
+            "rr",
+            Value::Deferred(DeferredValue::Secret(Box::new(inner))),
+        )]);
+        let path = AccessPath::with_fields("o", "rr", vec!["name".into()]);
+        assert_eq!(
+            navigate_value_path(&root, &path),
+            Some(Value::Deferred(DeferredValue::Secret(Box::new(s("n")))))
+        );
+    }
+}

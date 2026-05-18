@@ -10,7 +10,7 @@ use indexmap::IndexMap;
 use crate::binding_index::ResolvedBindings;
 use crate::resource::{
     ConcreteValue, DeferredValue, InterpolationPart, Resource, ResourceId, State, Value,
-    contains_resource_ref,
+    contains_resource_ref, peel_secrets, rewrap_secrets,
 };
 
 /// Resolve all ResourceRef values in resources using current state.
@@ -356,27 +356,10 @@ pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<V
     }
 }
 
-/// Strip leading `Value::Secret` wrappers, returning the inner value
-/// and the number of layers peeled. Pair with [`rewrap_secrets`] to
-/// preserve the secret tag end-to-end through `field_path` /
-/// `subscripts` projection (#2439). Plan-display redaction depends on
-/// the tag.
-fn peel_secrets(mut value: Value) -> (Value, usize) {
-    let mut depth = 0;
-    while let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        value = *inner;
-        depth += 1;
-    }
-    (value, depth)
-}
-
-/// Re-wrap `value` in `depth` layers of `Value::Secret`. Inverse of
-/// [`peel_secrets`].
-fn rewrap_secrets(value: Value, depth: usize) -> Value {
-    (0..depth).fold(value, |acc, _| {
-        Value::Deferred(DeferredValue::Secret(Box::new(acc)))
-    })
-}
+// `peel_secrets` / `rewrap_secrets` live in `crate::resource` (next to
+// the `Secret` definition and `navigate_value_path`) so the
+// secret-tunnel discipline (#2439) has one home shared with
+// carina#3136's loop-var navigator.
 
 /// Format the "key not found; available keys: ..." error for a missing
 /// map entry. Shared by the `field_path` (dot-notation, #2447) and
