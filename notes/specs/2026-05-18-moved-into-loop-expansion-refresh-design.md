@@ -105,85 +105,174 @@ the ordering interaction, not post-process the wrong effects.
 
 ## Options considered
 
-### Option A — exclude moved targets from the post-expansion refresh
+The selection axis is **long-term maintainability × type safety**
+([[feedback_long_term_and_type_safety]] /
+[[feedback_type_safety_over_runtime_checks]]), not short-term diff size.
+"Type safety" here means *the plan/apply parity invariant is enforced by
+the type system* — a divergence must be a compile error, not something a
+reviewer or a test has to catch. The #3132 series repeatedly paid for
+hand-maintained plan/apply parity
+([[feedback_unit_test_path_is_not_apply_path]]); a fix that re-creates
+that hazard is rejected on those grounds even if it is the fewest lines.
 
-In the `if !new_child_ids.is_empty()` block (plan `:1518-1536`, apply
-`:1019-1035`), filter the `children` iterator so any child whose id is a
-`moved_pairs` `to` is **not** passed to `refresh_resource_set`.
+### Option A — exclude moved targets from the post-expansion refresh, via a typed view
 
-- Pro: minimal; one-line filter at the two call sites; the migrated
-  state placed by step 1 survives untouched, so the differ compares
-  desired vs the *moved* state and emits `Move` + (`Change` iff drift)
-  — exactly #3141's "Expected".
-- Con: the expanded child genuinely *should* be refreshed for its live
-  attributes in the non-moved case; this skips refresh for moved
-  targets, so if the moved resource drifted in the provider, the differ
-  sees the *state-file* values, not live values. This is acceptable:
-  carina's moved semantics already diff desired against the moved state
-  entry (that is the documented contract of
-  `materialize_moved_states` — "the differ compares desired(to) against
-  actual(from)"); the moved entry is the same baseline a non-loop
-  `moved` already uses. Drift detection for a `moved` target is no worse
-  than it is for any other `moved` block today.
-- Type-safety note: `moved_pairs` is already `Vec<(ResourceId,
-  ResourceId)>` in scope at both call sites; the filter is a
-  `HashSet<&ResourceId>` membership test. No new escape hatch.
+The migrated state placed by `materialize_moved_states` (step 1) must
+survive the post-expansion refresh (step 3) for any child whose id is a
+`moved_pairs` `to`. The decision *which expanded children are
+refreshable* is computed **once**, where the expansion and the
+`moved_pairs` are both already known, and carried in the typed result
+that both the plan and apply paths already consume —
+`DeferredForExpansion`:
 
-### Option B — refresh, then re-apply the migrated state on top
+```rust
+pub struct DeferredForExpansion {
+    pub sorted_resources: Vec<Resource>,
+    pub residual_deferred_for: ...,
+    pub new_child_ids: HashSet<ResourceId>,
+    /// Expanded children that are safe to re-read from the provider.
+    /// Excludes any child that is a `moved` target (its migrated state
+    /// must not be overwritten by a `not_found` provider read). Computed
+    /// once from `new_child_ids` minus the `moved_pairs` `to`s.
+    pub refreshable_child_ids: HashSet<ResourceId>,
+}
+```
 
-Let `refresh_resource_set` run, then after it, for each
-`moved_pairs` `to` that is in `new_child_ids`, re-insert the migrated
-state (snapshot it before refresh).
+Both call sites then refresh `refreshable_child_ids` — they never see
+`moved_pairs` in the refresh decision and cannot diverge:
 
-- Pro: keeps refresh uniform.
-- Con: throws away the value `read_with_retry` returned and re-installs
-  the pre-refresh snapshot — i.e. it is Option A with extra steps and a
-  redundant provider round-trip. The provider read here is *guaranteed
-  useless* (no identifier → `not_found`), so paying for it then
-  discarding it is pure waste. Strictly dominated by A.
+```rust
+refresh_resource_set(
+    provider, &multi,
+    sorted_resources.iter().filter(|r| exp.refreshable_child_ids.contains(&r.id)),
+    ...,
+);
+```
 
-### Option C — make the refresh use the moved `from` identifier
+- **Pro (type safety, primary):** the moved-exclusion lives in exactly
+  one place (`expand_same_config_deferred_for`, the function both paths
+  already call). The plan and apply paths consume the same typed field;
+  if one path is changed to refresh a different set, that is a type
+  mismatch against `DeferredForExpansion`, not a silently-passing
+  divergence. The parity invariant is enforced by the compiler. This is
+  the only option that structurally closes the
+  [[feedback_unit_test_path_is_not_apply_path]] hazard rather than
+  re-paying it.
+- **Pro (long-term):** root fix — it removes the step-3 overwrite of the
+  step-1 migration at the point the two mechanisms collide, and it does
+  so by *narrowing the type* of "what may be refreshed" rather than
+  adding a runtime guard at each consumer. A future change to refresh
+  timing inherits the moved-exclusion for free instead of having to
+  re-derive it.
+- **Con:** a moved target is not live-refreshed, so post-move provider
+  drift is diffed against the migrated state, not live values. This is
+  **identical to every other `moved` block** in carina today
+  (`materialize_moved_states`' documented contract: "the differ compares
+  desired(to) against actual(from)"). It is not a regression; it is
+  consistency with existing `moved` semantics.
+- **Counter-consideration (short-term cost only):** adds one field to
+  `DeferredForExpansion` and threads its computation into
+  `expand_same_config_deferred_for`. Slightly more than a per-site
+  filter, but the cost buys the compiler-enforced parity above.
 
-Thread `moved_pairs` into `refresh_resource_set` so that when a child id
-equals a `moved` `to`, the identifier is looked up under the `from`
-name (`get_identifier_for_resource` on a synthetic `from`-named
-resource), so the provider read targets the *real* live resource.
+### Option A′ — hand-written filter at each call site (rejected)
 
-- Pro: most "correct" — the expanded-and-moved child gets genuine live
-  attributes, so post-move drift *is* detected as a `Change`.
-- Con: widest blast radius. Changes `refresh_resource_set`'s signature
-  and semantics (a `pub(crate)` helper called from 3+ sites including
-  phase-1 refresh and the `--refresh=false` path). It also re-introduces
-  a question the #3132 series deliberately deferred: whether a moved
-  resource's identity should be re-keyed in the state file before
-  refresh at all. Higher risk against the "re-sort / SimHash reconcile /
-  moved matching must stay stable" invariant the predecessor design
-  flagged as the highest-risk area.
+The minimal-diff variant: at the plan call site *and* the apply call
+site, build `moved_pairs.to` into a `HashSet` and add
+`.filter(|r| !moved_to.contains(&r.id))` to the child iterator.
+
+- Fewer lines than A.
+- **Rejected:** the filter is duplicated across the plan and apply call
+  sites. If a later change touches one site's filter and not the other,
+  **the code still compiles** and the plan/apply effect sets silently
+  diverge — the exact [[feedback_unit_test_path_is_not_apply_path]] /
+  [[feedback_type_safety_over_runtime_checks]] failure the #3132 series
+  kept hitting. Short-term diff size does not outweigh re-introducing a
+  type-unsafe parity hazard ([[feedback_long_term_and_type_safety]]).
+  A′ is A's payload without A's type safety; documented only to record
+  why "just add a filter" was not chosen.
+
+### Option B — refresh, then re-apply the migrated state on top (rejected)
+
+Let `refresh_resource_set` run, then for each `moved_pairs` `to` in
+`new_child_ids`, re-insert a pre-refresh snapshot of the migrated state.
+
+- **Rejected:** same outcome as A but issues a provider read that is
+  *guaranteed useless* (no identifier → `not_found`) and then discards
+  its result. Strictly dominated by A — wasted round-trip, more steps,
+  same type-safety story as A′ (still per-site). No reason to choose it.
+
+### Option C — make the refresh use the moved `from` identifier (rejected)
+
+Thread `moved_pairs` into `refresh_resource_set` so a child whose id is
+a `moved` `to` is read using the `from` name's identifier, targeting the
+real live resource. This is the *most* correct (post-move drift becomes
+a real `Change`).
+
+- **Rejected:** widest blast radius. Changes the signature and
+  semantics of `refresh_resource_set` — a `pub(crate)` helper called
+  from 3+ sites including phase-1 refresh and the `--refresh=false`
+  path — and re-opens the question the #3132 series deliberately
+  deferred (whether a moved resource's identity is re-keyed in the
+  state file before refresh). It pushes hardest against the
+  "re-sort / SimHash reconcile / moved matching must stay stable"
+  invariant the predecessor design named the highest-risk area. The
+  extra correctness (live post-move drift) is **not required by #3141**
+  ("Expected" is `Move` + optionally `Change` *from the moved state*,
+  which A delivers). Paying the largest risk against the highest-risk
+  invariant for correctness #3141 does not ask for is the wrong
+  long-term trade ([[feedback_long_term_and_type_safety]]). If live
+  post-move drift detection is ever wanted it is a separate, later
+  concern on its own issue ([[feedback_scope_discipline]]).
 
 ## Decision
 
-**Adopt Option A.**
+**Adopt Option A (typed view).**
 
 Rationale, weighing long-term maintainability and type safety
-([[feedback_long_term_and_type_safety]]):
+([[feedback_long_term_and_type_safety]] /
+[[feedback_type_safety_over_runtime_checks]]):
 
-- A is the *root* fix, not a bandaid: it removes the step-3 overwrite of
-  the step-1 migration at the exact point the two mechanisms collide,
-  rather than post-processing effects (the rejected #3141 "direction 1")
-  or rejecting the plan (#3141 "direction 3", a fallback only).
-- A's drift behavior is **identical to every other `moved` block** in
-  carina today: the differ already diffs desired against the migrated
-  state entry, not a fresh provider read, for non-loop `moved`. A simply
-  extends that existing, documented contract to loop-expansion targets.
-  C would make loop-`moved` *behave differently* (live-refresh) from
-  plain `moved` — an inconsistency, not an improvement.
-- B is strictly dominated by A (same outcome, wasted provider call).
-- C's extra correctness (post-move drift as `Change`) is not required by
-  #3141 ("Expected" is `Move` + optionally `Change` *from the moved
-  state*, which A delivers) and costs the most blast radius against the
-  highest-risk invariant. If post-move live-drift detection is ever
-  wanted, it is a separate, later concern filed on its own — not folded
-  in here ([[feedback_scope_discipline]]).
+- **Type safety is the deciding axis.** A enforces the plan/apply parity
+  invariant in the type system (one `DeferredForExpansion.refreshable_child_ids`
+  field both paths consume); A′/B leave parity to per-site discipline
+  that compiles even when wrong — the recurring
+  [[feedback_unit_test_path_is_not_apply_path]] failure. A is the only
+  option that *structurally* closes that hazard.
+- **A is the root fix, not a bandaid.** It removes the step-3 overwrite
+  at the collision point, not via post-processing effects (rejected
+  #3141 "direction 1") or rejecting the plan (#3141 "direction 3",
+  fallback only).
+- **A's drift behavior is consistent with all existing `moved` blocks**;
+  C would make loop-`moved` behave differently (live-refresh) from plain
+  `moved` — an inconsistency, not an improvement, and at the highest
+  blast radius.
+- **Short-term cost is a counter-consideration only.** A′ is fewer lines
+  but type-unsafe; B is dominated; C is over-scoped. The one extra
+  `DeferredForExpansion` field A adds is the price of compiler-enforced
+  parity and is worth it long-term.
+
+### Residual structural risk (explicitly not folded in)
+
+Option A stops the *symptom's* collision point but **does not remove the
+underlying fragility**: `current_states: HashMap<ResourceId, State>` is
+written by multiple pipeline stages (`materialize_moved_states`,
+`apply_anonymous_to_named_renames`, `refresh_resource_set`, phase-2
+data-source read) with **order-dependent unconditional `insert`** —
+last-writer-wins on a shared key. moved×loop is the instance #3141
+surfaced; the same class can recur for other stage pairs that contend
+the same key (e.g. anonymous→named rename × loop, import × loop). A only
+narrows the type of "what refresh may touch"; it does not make the
+stage-ordering safe by construction.
+
+This is **deliberately not fixed here** ([[feedback_scope_discipline]]):
+#3141 is one instance and A is its root fix. Per
+[[feedback_root_cause_over_per_site_patch]], the stage-ordering
+last-writer-wins structure is recorded as a **future tracker candidate**
+— if a second instance of this class appears, file the tracker rather
+than adding another per-pair carve-out. The implementation PR should
+leave a code comment at the `DeferredForExpansion` computation pointing
+here so the structural debt is discoverable, not silently absorbed.
 
 ## Implementation plan (separate PR, after this design PR merges)
 
@@ -191,15 +280,25 @@ Rationale, weighing long-term maintainability and type safety
 [[feedback_no_premature_close]]: this design PR uses `refs #3141`;
 `Closes #3141` goes on the implementation PR only.
 
-1. **Plan path** (`carina-cli/src/wiring/mod.rs`, the
-   `if !new_child_ids.is_empty()` block ~`:1518`): build a
-   `HashSet<&ResourceId>` of `moved_pairs` `to`s; the `children()`
-   closure additionally filters `!moved_to.contains(&r.id)`. Resources
-   that are both an expanded child *and* a moved target keep the
-   migrated state from `materialize_moved_states`.
-2. **Apply path** (`carina-cli/src/commands/apply/mod.rs`, the
-   `if !new_child_ids.is_empty()` block ~`:1019`): the identical filter.
-   Plan/apply must not diverge ([[feedback_unit_test_path_is_not_apply_path]]).
+1. **Typed view** (`carina-cli/src/wiring/mod.rs`,
+   `expand_same_config_deferred_for` + `DeferredForExpansion`): add the
+   `refreshable_child_ids: HashSet<ResourceId>` field, computed once as
+   `new_child_ids` minus the `moved_pairs` `to`s. `moved_pairs` is
+   already materialized before this call on both paths
+   (`materialize_moved_states` runs first), so thread it (or just the
+   set of `to`s) into `expand_same_config_deferred_for` as an input.
+   Leave the code comment pointing at the "Residual structural risk"
+   section so the stage-ordering debt is discoverable.
+2. **Both call sites consume the typed field, not a hand filter.** Plan
+   path (`wiring/mod.rs` ~`:1518`) and apply path
+   (`apply/mod.rs` ~`:1019`) both refresh
+   `sorted_resources.iter().filter(|r| exp.refreshable_child_ids.contains(&r.id))`.
+   Neither site computes the moved-exclusion itself; a divergence is a
+   type mismatch against `DeferredForExpansion`, not a silently-passing
+   parity bug ([[feedback_unit_test_path_is_not_apply_path]] /
+   [[feedback_type_safety_over_runtime_checks]]). Explicitly **do not**
+   re-introduce a per-site `moved_to.contains` filter (rejected Option
+   A′).
 3. **`add_state_block_effects` audit**: confirm that with step 1/2 in
    place the differ no longer produces the `Create` (because
    `current_states[to]` is now the migrated state, not `not_found`), so
