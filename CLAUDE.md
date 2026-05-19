@@ -455,6 +455,54 @@ merged uniformly — no file name (including `main.crn`) is privileged.
 - CLI: `load_module()` / `ModuleResolver::load_module` require a directory path.
 - LSP: Module loading in `diagnostics/checks.rs` handles directory modules for proper validation.
 
+### Plan Concurrency Contract
+
+<!-- constrained-by #key-abstractions -->
+
+`carina plan` **takes no state lock.** `apply`/`destroy` acquire an
+exclusive lock (`backend.acquire_lock(...)`); `plan` deliberately does
+not. A lock on a read-only operation is overkill, and because the
+backend lock API is exclusive-only it would serialize concurrent
+`plan`s and let a long `plan` block deploys — too strong for a command
+whose output is only a prediction. (This was a deliberate decision for
+issue #3111; options considered were: (1) document as intentional,
+(2) acquire a shared/read lock, (3) detect drift and warn. Option 3
+was chosen — option 1 is weaker than Terraform and leaves the user
+unaware of staleness; option 2 needs a shared-lock mode the backends
+do not have and is only justified once a saved-plan/`plan -out`→`apply`
+workflow exists.)
+
+Because `plan` reads state once at `T0` and computes the diff against
+that snapshot with no lock held, a concurrent `apply`/`destroy` can
+make the displayed plan stale (a TOCTOU window — *not* a torn read;
+both backends write state atomically). To bound this, `plan`:
+
+1. Fingerprints state at `T0` (`StateFile::serial` + `lineage`) right
+   after the initial read — `StateSnapshot::capture` in
+   `carina-cli/src/commands/plan.rs`.
+2. Re-reads state just before display and compares
+   (`detect_state_drift`). A `lineage` change (state recreated) is
+   reported in preference to a `serial` bump (concurrent write).
+3. On drift, prints a **warning** to stderr and still shows the plan.
+   Drift is never fatal: the plan is a prediction, and `apply`
+   re-acquires the lock and recomputes the diff before mutating
+   anything, so final correctness is enforced on the `apply` side.
+
+`plan --out <file>` still writes the saved plan even when drift is
+detected (the warning goes to stderr; the plan file is the command's
+product). This is safe because the saved-plan apply path
+(`run_apply_from_plan_locked`) records the plan's `state_lineage` /
+`state_serial` and, under the apply lock, hard-errors on a lineage
+mismatch and warns on a serial bump before mutating — so a stale saved
+plan cannot be silently applied.
+
+The contract is "best-effort snapshot with drift warning", not "locked
+read". A failed re-read is also a warning, not an error. Regression
+coverage: pure classification in
+`commands::plan::state_drift_tests`; the real `carina plan` path
+(concurrent writer slipped into the `T0..T1` window via a deterministic
+file-handshake seam) in `carina-cli/tests/plan_state_drift_e2e.rs`.
+
 ### Directory-scoped, never single-file
 
 **Carina configurations are directory units.** Every feature that reads DSL
