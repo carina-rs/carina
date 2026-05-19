@@ -45,6 +45,11 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "io-
 async-trait = "0.1"
 carina-lsp = { path = "../carina-lsp" }
 insta = "1"
+# Real PTY for the refresh-separator regression test (#3150). The bug only
+# manifests under a TTY (indicatif leaves the last spinner line unterminated);
+# a piped-stdout test cannot observe it — which is exactly how #3149 shipped
+# the broken fix.
+portable-pty = "0.8"
 regex-lite = "0.1"
 tempfile = "3"
 tower-lsp = "0.20"
