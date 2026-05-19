@@ -882,6 +882,14 @@ async fn run_apply_locked(
     // rename transfer below so old-name entries are present for
     // `apply_anonymous_to_named_renames` to transfer.
     let mut orphan_dependencies: HashMap<ResourceId, BTreeSet<String>> = HashMap::new();
+    // Ids the orphan pass already live-read this run. A for-loop child
+    // applied previously is in state but not yet a desired resource at
+    // orphan time (expansion is post-refresh); the orphan pass live-reads
+    // it under the same state name the child resolves to.
+    // `expand_same_config_deferred_for` excludes these from the
+    // post-expansion child refresh so the same address is not read twice
+    // (carina#3145). Mirrors the plan path in `wiring/mod.rs`.
+    let mut orphan_refreshed_ids: HashSet<ResourceId> = HashSet::new();
     if let Some(sf) = state_file.as_ref() {
         let desired_ids: HashSet<ResourceId> =
             sorted_resources.iter().map(|r| r.id.clone()).collect();
@@ -912,6 +920,7 @@ async fn run_apply_locked(
         for result in orphan_results {
             let (id, refreshed) = result?;
             if refreshed.exists {
+                orphan_refreshed_ids.insert(id.clone());
                 current_states.entry(id).or_insert(refreshed);
             }
         }
@@ -1008,6 +1017,7 @@ async fn run_apply_locked(
         &remote_bindings,
         &wait_aliases,
         &moved_targets,
+        &orphan_refreshed_ids,
     )?;
     sorted_resources = resorted;
     // Expansion borrows `parsed` immutably (expands a clone), so

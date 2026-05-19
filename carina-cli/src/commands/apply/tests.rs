@@ -853,6 +853,7 @@ mod apply_deferred_for_parity {
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
         )
         .expect("expand");
 
@@ -912,6 +913,7 @@ mod apply_deferred_for_parity {
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
         )
         .expect("expand");
 
@@ -962,6 +964,7 @@ mod apply_deferred_for_parity {
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
         )
         .expect("expand");
         assert_eq!(baseline.new_child_ids.len(), 1);
@@ -987,6 +990,7 @@ mod apply_deferred_for_parity {
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &moved_targets,
+            &std::collections::HashSet::new(),
         )
         .expect("expand");
 
