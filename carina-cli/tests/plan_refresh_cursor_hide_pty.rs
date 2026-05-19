@@ -17,7 +17,7 @@
 //! **raw** PTY bytes, not a CSI-stripped copy, because the sequences under
 //! test are themselves CSI.
 
-use std::io::{Read, Write};
+use std::io::Read;
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tempfile::TempDir;
@@ -119,60 +119,20 @@ fn assert_cursor_not_left_hidden(raw: &str) {
     }
 }
 
-/// Ctrl+C during `carina plan` must still leave the cursor restored. The
-/// RAII guard's `Drop` cannot help here — `plan` holds no state lock so it
-/// is not wrapped in `run_with_ctrl_c` (#3111), and the default SIGINT
-/// disposition terminates the process without unwinding. The
-/// SIGINT-handler restore net (`cursor::install_restore_handlers`) is what
-/// makes this pass.
-///
-/// This is timing-tolerant by construction: it asserts only the
-/// end-state invariant "cursor not left hidden", which holds whether the
-/// Ctrl+C landed mid-spinner (signal handler restores) or after the guard
-/// already restored. It does not assert *which* path restored it, so there
-/// is no race to lose.
-#[test]
-fn plan_ctrl_c_does_not_leave_cursor_hidden_on_pty() {
-    let tmp = init_project(
-        "backend local { path = \"carina.state.json\" }\n\
-         mock.test.resource { name = \"r1\" }\n",
-    );
-
-    let pty = native_pty_system()
-        .openpty(PtySize {
-            rows: 40,
-            cols: 120,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .expect("openpty");
-
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_carina"));
-    cmd.arg("plan");
-    cmd.arg(tmp.path().to_str().unwrap());
-    cmd.cwd(tmp.path());
-    cmd.env_remove("CLICOLOR_FORCE");
-    cmd.env_remove("NO_COLOR");
-    cmd.env_remove("RUST_LOG");
-
-    let mut child = pty.slave.spawn_command(cmd).expect("spawn under pty");
-    drop(pty.slave);
-
-    // Send the terminal INTR character (Ctrl+C = 0x03). The PTY line
-    // discipline translates it into SIGINT for the foreground process
-    // group, exactly as a real interactive Ctrl+C would — no extra
-    // dependency, no direct kill(2).
-    let mut writer = pty.master.take_writer().expect("pty writer");
-    let _ = writer.write_all(&[0x03]);
-    let _ = writer.flush();
-
-    let mut reader = pty.master.try_clone_reader().expect("pty reader");
-    let mut buf = Vec::new();
-    reader.read_to_end(&mut buf).expect("read pty output");
-    let _ = child.wait();
-
-    let raw = String::from_utf8_lossy(&buf);
-    // Whether or not Ctrl+C landed before the spinner started, the decisive
-    // property is the same: the run must not end with a hidden cursor.
-    assert_cursor_not_left_hidden(&raw);
-}
+// NOTE on the SIGINT/SIGTERM restore path:
+//
+// There is intentionally no PTY test that sends Ctrl+C mid-spinner. The
+// mock provider has no delay hook, so the refresh completes in
+// milliseconds: a `0x03` written right after spawn almost always lands
+// *before* the cursor is ever hidden, so the run never enters the guarded
+// state and the test would pass vacuously — identically with or without
+// `install_restore_handlers`. Forcing a deterministic "spinner has started,
+// now signal" handshake would require a test-only delay seam in the
+// provider read path, which does not exist and is out of scope for #3153.
+//
+// The signal-handler write path is instead covered deterministically by a
+// unit test that drives `restore_cursor_once(true)` directly (the
+// `async_signal_safe == true` `libc::write` branch the SIGINT/SIGTERM
+// handler runs) in `carina-cli/src/cursor.rs`, alongside the claim-once
+// coordination test. A real end-to-end SIGINT regression test with a
+// readiness handshake is tracked as a follow-up issue (#3157).

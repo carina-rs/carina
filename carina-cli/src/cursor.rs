@@ -261,4 +261,30 @@ mod tests {
             "guard must not re-emit a restore the signal path already did, got {buf:?}"
         );
     }
+
+    #[test]
+    fn signal_safe_restore_path_claims_once_and_is_idempotent() {
+        let _l = TEST_LOCK.lock().unwrap();
+        // Exercise the `async_signal_safe == true` branch — the exact code
+        // the SIGINT/SIGTERM handler runs (`libc::write` to fd 1). The 6
+        // bytes go to the test process's captured stdout; as in the real
+        // signal handler the write is fire-and-forget, so the contract
+        // under test is the claim-once return value and flag transition,
+        // not the bytes. This is the only deterministic coverage of the
+        // signal-handler write path (the PTY Ctrl+C route is vacuous — see
+        // the note in tests/plan_refresh_cursor_hide_pty.rs).
+        CURSOR_HIDDEN.store(true, Ordering::SeqCst);
+        assert!(
+            restore_cursor_once(true),
+            "armed: the signal-safe path claims and performs the restore"
+        );
+        assert!(
+            !CURSOR_HIDDEN.load(Ordering::SeqCst),
+            "flag cleared after the signal-safe restore"
+        );
+        assert!(
+            !restore_cursor_once(true),
+            "not armed: a second signal-safe call must be a no-op (no double restore)"
+        );
+    }
 }
