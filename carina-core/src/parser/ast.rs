@@ -820,7 +820,13 @@ impl<E> File<E> {
     }
 
     /// Print all collected warnings to stderr.
-    pub fn print_warnings(&self) {
+    ///
+    /// Returns `true` iff at least one warning line was printed. Callers that
+    /// interleave this with indicatif progress output use the return value to
+    /// know the terminal's last line is now a newline-terminated `⚠` line
+    /// (not an open spinner bar) — see
+    /// `carina-cli`'s `finish_refresh_bar_region`.
+    pub fn print_warnings(&self) -> bool {
         for w in &self.warnings {
             let location = match &w.file {
                 Some(f) => format!("{}:{}", f, w.line),
@@ -828,6 +834,7 @@ impl<E> File<E> {
             };
             eprintln!("  ⚠ {}: {}", location, w.message);
         }
+        !self.warnings.is_empty()
     }
 
     /// Expand deferred for-expressions against the resolved binding view.

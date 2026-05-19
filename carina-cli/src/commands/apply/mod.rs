@@ -1010,6 +1010,10 @@ async fn run_apply_locked(
         residual_deferred_for,
         new_child_ids,
         refreshable_child_ids,
+        // `printed_warnings` drives the plan path's spinner-bar-region
+        // close (#3150); the apply path's post-refresh bar handling is
+        // tracked separately in #3151 and does not consume it here.
+        printed_warnings: _,
     } = crate::wiring::expand_same_config_deferred_for(
         parsed,
         &sorted_resources,

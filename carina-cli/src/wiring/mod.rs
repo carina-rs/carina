@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::IsTerminal;
 use std::path::Path;
 
 #[cfg(test)]
@@ -1189,6 +1190,13 @@ pub struct DeferredForExpansion {
     /// via [`RefreshableChildIds::select`]; see that type's doc for why
     /// it is a newtype (compile-time plan/apply parity).
     pub refreshable_child_ids: RefreshableChildIds,
+    /// Whether `print_warnings()` emitted any `⚠` line during expansion.
+    /// A printed warning is newline-terminated and lands on top of
+    /// indicatif's open spinner bar line, so it *closes* the bar region
+    /// the refresh phases left open. [`finish_refresh_bar_region`] uses
+    /// this to avoid adding a second, spurious blank line on the
+    /// deferred-for-with-warnings TTY path (#3150 Round-4 finding).
+    pub printed_warnings: bool,
 }
 
 /// Pure core of the carina#3132 fix: project the post-refresh
@@ -1240,12 +1248,13 @@ pub fn expand_same_config_deferred_for<E: Clone>(
     // expansion would remove none of them, so `parsed`'s set is exactly
     // what the post-expansion path would have printed.
     if parsed.deferred_for_expressions.is_empty() {
-        parsed.print_warnings();
+        let printed_warnings = parsed.print_warnings();
         return Ok(DeferredForExpansion {
             sorted_resources: sorted_resources.to_vec(),
             residual_deferred_for: Vec::new(),
             new_child_ids: HashSet::new(),
             refreshable_child_ids: RefreshableChildIds::default(),
+            printed_warnings,
         });
     }
 
@@ -1263,7 +1272,7 @@ pub fn expand_same_config_deferred_for<E: Clone>(
     // the augmented resource set / residual deferred list back out.
     let mut expanded: carina_core::parser::File<E> = (*parsed).clone();
     expanded.expand_deferred_for_expressions(&iterable_bindings);
-    expanded.print_warnings();
+    let printed_warnings = expanded.print_warnings();
     let residual_deferred_for = expanded.deferred_for_expressions.clone();
 
     let pre_ids: HashSet<ResourceId> = sorted_resources.iter().map(|r| r.id.clone()).collect();
@@ -1314,6 +1323,7 @@ pub fn expand_same_config_deferred_for<E: Clone>(
         residual_deferred_for,
         new_child_ids,
         refreshable_child_ids,
+        printed_warnings,
     })
 }
 
@@ -1395,6 +1405,17 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     // in `commands/apply/mod.rs`.
     let mut orphan_refreshed_ids: HashSet<ResourceId> = HashSet::new();
 
+    // Running state: is indicatif's spinner bar region currently *open*
+    // (cursor parked on an unterminated `✓` line)? Set true by any refresh
+    // phase that draws bars (managed, orphan, data-source, deferred-for
+    // children); set back to false when `print_warnings` emits a
+    // newline-terminated `⚠` line over the open bar (which closes the
+    // region). `finish_refresh_bar_region` reads the final value to close
+    // the region exactly once, before the plan is printed (#3150). It is a
+    // running flag, not a cumulative OR: a printed warning between phases
+    // resets it (Round-4 finding — see the reset after expansion below).
+    let mut refresh_printed_bars = false;
+
     if refresh {
         RefreshProgress::start_header();
         let multi = refresh_multi_progress();
@@ -1427,7 +1448,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         // from their dependencies (#1683). Phase 1: managed resources in
         // parallel. Phase 2: data sources whose input attributes have
         // been resolved against phase 1's `current_states`.
-        refresh_resource_set(
+        refresh_printed_bars |= refresh_resource_set(
             provider_ref,
             &multi,
             sorted_resources.iter(),
@@ -1447,6 +1468,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
                 sorted_resources.iter().map(|r| r.id.clone()).collect();
             let orphan_states: Vec<(ResourceId, State)> =
                 sf.build_orphan_states(&desired_ids).into_iter().collect();
+            refresh_printed_bars |= !orphan_states.is_empty();
             let orphan_results: Vec<Result<(ResourceId, State), AppError>> =
                 stream::iter(orphan_states)
                     .map(|(id, state)| {
@@ -1527,6 +1549,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
             ctx.schemas(),
             &ds_wait_aliases,
         )?;
+        refresh_printed_bars |= !resolved_data_sources.is_empty();
         let phase2_results: Vec<Result<(ResourceId, State), AppError>> =
             stream::iter(resolved_data_sources.iter())
                 .map(|resource| {
@@ -1615,6 +1638,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         residual_deferred_for,
         new_child_ids,
         refreshable_child_ids,
+        printed_warnings,
     } = expand_same_config_deferred_for(
         parsed,
         &sorted_resources,
@@ -1626,6 +1650,17 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     )?;
     sorted_resources = resorted;
 
+    // A printed `⚠` warning is newline-terminated and is written on top of
+    // indicatif's open spinner bar line, so it closes the bar region the
+    // refresh phases above left open — the cursor is no longer parked on an
+    // unterminated `✓` line. Clear the flag so `finish_refresh_bar_region`
+    // does not add a second, spurious blank line on the
+    // deferred-for-with-warnings TTY path (#3150 Round-4 finding). The
+    // child-refresh phase below may re-open the region if it draws bars.
+    if printed_warnings {
+        refresh_printed_bars = false;
+    }
+
     if !new_child_ids.is_empty() {
         // Refresh only `refreshable_child_ids` (carina#3141): a child
         // that is also a `moved` target keeps the migrated state from
@@ -1636,7 +1671,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         // cannot diverge between the two paths (compile-time parity).
         let children = || refreshable_child_ids.select(&sorted_resources);
         if refresh {
-            refresh_resource_set(
+            refresh_printed_bars |= refresh_resource_set(
                 &provider,
                 &refresh_multi_progress(),
                 children(),
@@ -1666,6 +1701,10 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
             }
         }
     }
+
+    // All refresh phases are done. Close indicatif's open bar line so the
+    // separator + plan render below it instead of being swallowed (#3150).
+    finish_refresh_bar_region(refresh_printed_bars);
 
     // Build orphan dependency bindings from state file for tree structure
     let orphan_dependencies = if let Some(sf) = state_file.as_ref() {
@@ -2053,6 +2092,10 @@ pub async fn read_with_retry(
 /// does not return (#1565); pass an empty map when there is nothing to
 /// restore (the new loop children have no prior state-file dep
 /// bindings).
+/// Returns `true` iff at least one refresh spinner bar was started (i.e. the
+/// filtered iterator was non-empty). The caller uses this to decide whether
+/// the indicatif bar region needs an explicit terminating newline before the
+/// plan is printed — see [`finish_refresh_bar_region`].
 pub(crate) async fn refresh_resource_set<'a>(
     provider: &dyn Provider,
     multi: &indicatif::MultiProgress,
@@ -2060,10 +2103,12 @@ pub(crate) async fn refresh_resource_set<'a>(
     state_file: &Option<StateFile>,
     saved_dep_bindings: &HashMap<ResourceId, BTreeSet<String>>,
     current_states: &mut HashMap<ResourceId, State>,
-) -> Result<(), AppError> {
+) -> Result<bool, AppError> {
+    let mut started_bar = false;
     let results: Vec<Result<(ResourceId, State), AppError>> =
         stream::iter(resources.filter(|r| !r.is_virtual() && !r.is_data_source()))
             .map(|resource| {
+                started_bar = true;
                 let progress = RefreshProgress::begin_multi(multi, &resource.id);
                 let identifier = state_file
                     .as_ref()
@@ -2087,7 +2132,39 @@ pub(crate) async fn refresh_resource_set<'a>(
         let (id, state) = result?;
         current_states.insert(id, state);
     }
-    Ok(())
+    Ok(started_bar)
+}
+
+/// Terminate indicatif's spinner-bar region so a following `print!` starts on
+/// a fresh line.
+///
+/// Root cause of #3150: indicatif draws the refresh spinners to **stderr**
+/// (`MultiProgress::new()`'s default draw target in indicatif 0.17) and
+/// leaves the **last** finished bar line *without* a terminating newline
+/// (the cursor is parked at the end of `✓ <name> [<elapsed>s]`). Under a
+/// TTY stdout and stderr are the *same terminal device*, so the next thing
+/// written to stdout — the `\n` separator from
+/// [`crate::display::refresh_plan_separator`] — lands right after that open
+/// bar line and is consumed just closing it, so no blank line appears
+/// before `Execution Plan:` / `No changes.`. This emits the one newline
+/// that closes the bar region; the separator then renders as the single
+/// intended blank line.
+///
+/// Only needed when the bar region is actually open on the terminal the
+/// plan prints to. `started_bar` is the running "region open" state
+/// (false for the empty-config header-only case, and reset when a
+/// `print_warnings` `⚠` line already closed the region). The
+/// `stdout().is_terminal()` gate excludes the piped path: there
+/// `refresh_multi_progress` redirects bars to stderr-only (keyed on
+/// exactly `!stdout().is_terminal()`) while the plan goes to a piped
+/// stdout whose `Refreshing state...` header is already newline-terminated
+/// by its `println!`, so no close is needed. On a TTY both fds are the
+/// same device, so `stdout().is_terminal()` correctly proxies "the open
+/// bar line is on the device we are about to print the plan to".
+pub(crate) fn finish_refresh_bar_region(started_bar: bool) {
+    if started_bar && std::io::stdout().is_terminal() {
+        println!();
+    }
 }
 
 /// Read a data source resource via the provider with retry on throttling errors.
