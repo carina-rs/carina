@@ -32,6 +32,7 @@ use carina_provider_mock::MockProvider;
 use carina_state::StateFile;
 
 use crate::commands::shared::progress::{RefreshProgress, refresh_multi_progress};
+use crate::cursor::CursorGuard;
 use crate::error::AppError;
 
 /// Result of creating a plan, with context needed for saving
@@ -1416,6 +1417,10 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     // resets it (Round-4 finding — see the reset after expansion below).
     let mut refresh_printed_bars = false;
 
+    // Hide the cursor for the refresh spinners; see `CursorGuard`. Armed
+    // only when `refresh` actually draws spinners (#3153).
+    let cursor_guard = refresh.then(CursorGuard::stdout);
+
     if refresh {
         RefreshProgress::start_header();
         let multi = refresh_multi_progress();
@@ -1705,6 +1710,10 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     // All refresh phases are done. Close indicatif's open bar line so the
     // separator + plan render below it instead of being swallowed (#3150).
     finish_refresh_bar_region(refresh_printed_bars);
+
+    // Explicit drop (not scope exit): the cursor must be restored before
+    // the plan prints below, not at end of function (#3153).
+    drop(cursor_guard);
 
     // Build orphan dependency bindings from state file for tree structure
     let orphan_dependencies = if let Some(sf) = state_file.as_ref() {

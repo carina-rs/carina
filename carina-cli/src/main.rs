@@ -299,6 +299,11 @@ async fn main() {
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
+    // Restore the terminal cursor if a refresh spinner is interrupted by
+    // SIGINT/SIGTERM or a panic — exit paths the RAII `CursorGuard`'s
+    // `Drop` cannot reach (#3153).
+    carina_cli::cursor::install_restore_handlers();
+
     // Create parser configuration with AWS KMS decryptor.
     // This must happen before any .crn parsing so that decrypt() calls can be evaluated.
     let provider_context = create_provider_context();

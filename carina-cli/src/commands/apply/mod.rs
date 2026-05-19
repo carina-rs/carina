@@ -38,6 +38,7 @@ use crate::commands::shared::state_writeback::{
     resolve_exports,
 };
 use crate::commands::state::map_lock_error;
+use crate::cursor::CursorGuard;
 use crate::display::print_plan;
 use crate::error::AppError;
 use crate::wiring::{
@@ -823,6 +824,9 @@ async fn run_apply_locked(
     // Read states for all resources using identifier from state
     // In identifier-based approach, if there's no identifier in state, the resource doesn't exist
     // Skip virtual resources (module attribute containers) — they have no infrastructure.
+    // Hide the cursor for the refresh spinners; see `CursorGuard`. Apply
+    // always refreshes, so it is unconditional (#3153).
+    let cursor_guard = CursorGuard::stdout();
     RefreshProgress::start_header();
     let multi = refresh_multi_progress();
     let provider_ref = &provider;
@@ -1055,6 +1059,11 @@ async fn run_apply_locked(
             .hydrate_read_state(&mut current_states, &saved_attrs)
             .await;
     }
+
+    // Explicit drop (not scope exit): the cursor must be restored before
+    // the plan / confirmation prompt prints below, not at end of function.
+    // All refresh spinner phases are done by here (#3153).
+    drop(cursor_guard);
 
     // Build initial bindings for reference resolution (wait_aliases
     // defined above before Phase 2).
