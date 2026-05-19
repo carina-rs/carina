@@ -251,6 +251,11 @@ pub trait StateBackend: Send + Sync {
     }
 }
 
+/// Backend type identifier for the implicit/local filesystem backend.
+/// The single spelling shared by every "is this local?" decision so the
+/// literal `"local"` is not open-coded across modules.
+pub const LOCAL_BACKEND_TYPE: &str = "local";
+
 /// Configuration for a state backend
 #[derive(Debug, Clone)]
 pub struct BackendConfig {
@@ -284,6 +289,11 @@ impl BackendConfig {
     /// Get a boolean attribute with a default value
     pub fn get_bool_or(&self, key: &str, default: bool) -> bool {
         self.get_bool(key).unwrap_or(default)
+    }
+
+    /// Whether this configuration names the local filesystem backend.
+    pub fn is_local(&self) -> bool {
+        self.backend_type == LOCAL_BACKEND_TYPE
     }
 }
 

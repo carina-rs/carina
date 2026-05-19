@@ -5,6 +5,7 @@ pub mod export;
 pub mod fmt;
 pub mod init;
 pub mod lint;
+pub mod migrate_state;
 pub mod module;
 pub mod plan;
 pub(crate) mod shared;
@@ -20,7 +21,6 @@ use carina_core::module_resolver;
 use carina_core::parser::{BackendConfig, ProviderContext};
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 use carina_state::BackendLock;
-use carina_state::backend::BackendConfig as StateBackendConfig;
 
 use crate::error::AppError;
 use crate::wiring::{
@@ -46,13 +46,7 @@ pub fn check_backend_lock(
     backend_config: Option<&BackendConfig>,
     reconfigure: bool,
 ) -> Result<(), AppError> {
-    let current = match backend_config {
-        Some(config) => {
-            let state_config = StateBackendConfig::from(config);
-            BackendLock::from_config(&state_config)?
-        }
-        None => BackendLock::local_default(),
-    };
+    let current = BackendLock::for_config(backend_config)?;
     let existing = BackendLock::load(base_dir).map_err(AppError::Backend)?;
 
     match existing {
@@ -65,8 +59,8 @@ pub fn check_backend_lock(
                     "Backend configuration has changed since the last run:\n\n{}\n\n\
                      Changing backend settings can silently redirect Carina at a \
                      different state file, which may cause state loss or drift.\n\n\
-                     To preserve existing state, run `carina state migrate` — it \
-                     will copy state from the old backend to the new one and \
+                     To preserve existing state, run `carina init --migrate-state` \
+                     — it will copy state from the old backend to the new one and \
                      update the backend lock.\n\n\
                      To discard the old state and start fresh with the new backend, \
                      re-run with --reconfigure.",
@@ -103,14 +97,9 @@ pub fn ensure_backend_lock(
     if lock_path.exists() {
         return Ok(());
     }
-    let lock = match backend_config {
-        Some(config) => {
-            let state_config = StateBackendConfig::from(config);
-            BackendLock::from_config(&state_config)?
-        }
-        None => BackendLock::local_default(),
-    };
-    lock.save(base_dir).map_err(AppError::Backend)
+    BackendLock::for_config(backend_config)?
+        .save(base_dir)
+        .map_err(AppError::Backend)
 }
 
 /// Run the common validation and module resolution pipeline.
@@ -533,7 +522,7 @@ mod tests {
         assert!(msg.contains("bucket"));
         assert!(msg.contains("old-bucket"));
         assert!(msg.contains("new-bucket"));
-        assert!(msg.contains("carina state migrate"));
+        assert!(msg.contains("carina init --migrate-state"));
         assert!(msg.contains("--reconfigure"));
     }
 

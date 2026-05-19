@@ -175,7 +175,7 @@ enum Commands {
         #[command(subcommand)]
         command: StateCommands,
     },
-    /// Download and install provider binaries
+    /// Download and install provider binaries; migrate state on backend change
     Init {
         /// Path to directory containing .crn files
         #[arg(default_value = ".")]
@@ -187,6 +187,16 @@ enum Commands {
         /// provider is missing from the lock. Intended for CI (like cargo --locked).
         #[arg(long, conflicts_with = "upgrade")]
         locked: bool,
+        /// Migrate the state file from the backend recorded in
+        /// carina-backend.lock to the currently configured backend when
+        /// they differ. Without this flag, a backend change is a hard error.
+        #[arg(long)]
+        migrate_state: bool,
+        /// When migrating, overwrite a target backend that already
+        /// contains a different state. Has no effect without
+        /// --migrate-state.
+        #[arg(long, requires = "migrate_state")]
+        force: bool,
     },
     /// Lint .crn files for style issues
     Lint {
@@ -415,8 +425,12 @@ async fn main() {
             path,
             upgrade,
             locked,
+            migrate_state,
+            force,
         } => {
-            if let Err(e) = commands::init::run_init(&path, upgrade, locked) {
+            if let Err(e) =
+                commands::init::run_init(&path, upgrade, locked, migrate_state, force).await
+            {
                 // process::exit skips Drop — restore the cursor first
                 // (#3158); claim-once with the guard/net.
                 carina_cli::cursor::restore_cursor();

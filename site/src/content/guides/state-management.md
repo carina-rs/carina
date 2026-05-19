@@ -68,6 +68,32 @@ carina state bucket-delete <bucket-name> --force
 
 This is a destructive operation that removes the bucket and all state history.
 
+## Moving state to a different backend
+
+<!-- derived-from ../reference/cli/init.md -->
+
+When you change the `backend` block — switching from local state to S3,
+or changing the `key` while reorganizing component directories — the
+state file must move with it. There is a single answer:
+
+```bash
+carina init --migrate-state
+```
+
+`init` compares the configured backend against the one recorded in
+`carina-backend.lock`. If they differ it copies the state from the old
+backend to the new one, verifies the copy, and rewrites the lock. A bare
+`carina init` (and any `plan`/`apply`/`destroy`) **refuses** when the
+backend changed, so you never silently abandon the old state — you have
+to opt in with `--migrate-state` (or revert the backend configuration).
+
+A local source is deleted after the verified copy; a remote source is
+kept as a recoverable backup. Add `--force` only when a *different*
+state already exists at the new backend and you intend to replace it.
+
+See the [`init` reference](/reference/cli/init/) for the full semantics
+and crash-recovery behavior.
+
 ## Importing existing resources
 
 To bring an existing cloud resource under Carina management, use the `import` block:

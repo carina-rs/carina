@@ -14,8 +14,8 @@ use carina_core::value::{
     redact_secrets_in_plan, redact_secrets_in_resource, redact_secrets_in_state,
 };
 use carina_state::{
-    BackendConfig as StateBackendConfig, LocalBackend, StateBackend, StateFile, create_backend,
-    create_local_backend, resolve_backend,
+    BackendConfig as StateBackendConfig, StateBackend, StateFile, create_backend,
+    create_local_backend, resolve_backend_anchored,
 };
 
 use super::validate_and_resolve_with_config;
@@ -905,29 +905,14 @@ async fn build_upstream_backend(
     ))
     .await?;
 
-    let backend: Box<dyn StateBackend> = match loaded.parsed.backend.as_ref() {
-        // Anchor local-backend state paths at the upstream's source directory
-        // so `path = "foo.json"` resolves relative to the upstream, not the
-        // downstream process's CWD.
-        Some(config) if config.backend_type == "local" => {
-            let state_path = StateBackendConfig::from(config)
-                .get_string("path")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(LocalBackend::DEFAULT_STATE_FILE));
-            let anchored = if state_path.is_absolute() {
-                state_path
-            } else {
-                source_abs.join(state_path)
-            };
-            Box::new(LocalBackend::with_path(anchored))
-        }
-        Some(config) => resolve_backend(Some(config))
+    // Anchor local-backend state paths at the upstream's source directory
+    // so `path = "foo.json"` resolves relative to the upstream, not the
+    // downstream process's CWD.
+    let upstream_backend_config = loaded.parsed.backend.as_ref().map(StateBackendConfig::from);
+    let backend: Box<dyn StateBackend> =
+        resolve_backend_anchored(upstream_backend_config.as_ref(), source_abs)
             .await
-            .map_err(AppError::Backend)?,
-        None => Box::new(LocalBackend::with_path(
-            source_abs.join(LocalBackend::DEFAULT_STATE_FILE),
-        )),
-    };
+            .map_err(AppError::Backend)?;
 
     Ok(backend)
 }
