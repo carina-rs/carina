@@ -21,7 +21,7 @@ use carina_state::{
 use super::validate_and_resolve_with_config;
 use crate::DetailLevel;
 use crate::commands::shared::state_writeback::apply_name_overrides;
-use crate::display::print_plan;
+use crate::display::{print_plan, refresh_plan_separator};
 use crate::error::AppError;
 use crate::wiring::{
     WiringContext, build_factories_from_providers, create_plan_from_parsed_with_upstream,
@@ -405,6 +405,10 @@ pub async fn run_plan(
             .map(|s| s.exports.clone())
             .unwrap_or_default();
         let export_changes = compute_export_diffs(&resolved_exports, &current_exports);
+        // Separate the refresh-progress block (printed above when `refresh`)
+        // from the plan's terminal section so they don't read as a run-on
+        // (#3148).
+        print!("{}", refresh_plan_separator(refresh));
         print_plan(
             &ctx.plan,
             detail,
