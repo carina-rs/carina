@@ -180,6 +180,131 @@ fn format_plan_save_error(e: &carina_core::value::SerializationError, flag: &str
     }
 }
 
+/// A point-in-time fingerprint of the state file captured immediately
+/// after `plan` first reads state (T0). `plan` takes no state lock
+/// (issue #3111: a lock on a read-only operation is overkill and would
+/// serialize concurrent `plan`s), so a concurrent `apply`/`destroy`
+/// can mutate state between this snapshot and when the plan is
+/// displayed. Comparing this snapshot against a re-read at T1 lets
+/// `plan` warn that its output may be stale (TOCTOU drift detection).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StateSnapshot {
+    /// `StateFile::serial` — monotonically increasing per state write.
+    serial: u64,
+    /// `StateFile::lineage` — changes only if the state was recreated
+    /// from scratch (e.g. a destroy + fresh apply, or `state` surgery).
+    lineage: String,
+}
+
+impl StateSnapshot {
+    /// Capture the snapshot from the state read at T0. `None` when no
+    /// state exists yet (first-ever plan): there is nothing a
+    /// concurrent writer could make stale, so drift detection is moot.
+    pub(crate) fn capture(state: Option<&StateFile>) -> Option<Self> {
+        state.map(|s| Self {
+            serial: s.serial,
+            lineage: s.lineage.clone(),
+        })
+    }
+}
+
+/// How the state changed between the T0 snapshot and the T1 re-read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StateDrift {
+    /// Same lineage, higher serial: a concurrent `apply`/`destroy`
+    /// wrote state while this `plan` was computing its diff.
+    SerialAdvanced { from: u64, to: u64 },
+    /// Lineage changed: the state was recreated entirely (destroy +
+    /// fresh apply, or `carina state` surgery) under this `plan`.
+    LineageChanged { from: String, to: String },
+    /// State existed at T0 but is gone at T1 (deleted concurrently).
+    StateRemoved,
+}
+
+impl StateDrift {
+    /// User-facing warning line explaining the plan may be stale.
+    pub(crate) fn warning(&self) -> String {
+        let detail = match self {
+            StateDrift::SerialAdvanced { from, to } => {
+                format!("state serial advanced {from} -> {to}")
+            }
+            StateDrift::LineageChanged { from, to } => {
+                format!("state lineage changed {from} -> {to}")
+            }
+            StateDrift::StateRemoved => "state was removed".to_string(),
+        };
+        format!(
+            "Warning: state changed during plan ({detail}); a concurrent \
+             apply/destroy ran while this plan was being computed. The \
+             plan output may be stale — re-run `carina plan`."
+        )
+    }
+}
+
+/// Compare the T0 snapshot against the state re-read at T1 (just
+/// before plan display) and classify any drift.
+///
+/// `before` is `None` only when no state existed at T0, in which case
+/// nothing could have gone stale — return `None`. A lineage change is
+/// reported in preference to a serial change because it is the
+/// stronger signal (the entire state was replaced).
+pub(crate) fn detect_state_drift(
+    before: Option<&StateSnapshot>,
+    after: Option<&StateFile>,
+) -> Option<StateDrift> {
+    let before = before?;
+    match after {
+        None => Some(StateDrift::StateRemoved),
+        Some(after) => {
+            if after.lineage != before.lineage {
+                Some(StateDrift::LineageChanged {
+                    from: before.lineage.clone(),
+                    to: after.lineage.clone(),
+                })
+            } else if after.serial != before.serial {
+                Some(StateDrift::SerialAdvanced {
+                    from: before.serial,
+                    to: after.serial,
+                })
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Test-only rendezvous between `plan`'s T0 state read and its T1
+/// re-read. Production builds never set the env var, so this is a
+/// no-op (one failed `getenv`); when set by the drift e2e test it is a
+/// file handshake — not a sleep — so the test can place a concurrent
+/// writer *deterministically* in the T0..T1 window (a fixed sleep
+/// would race the binary's own startup cost and flake). The binary
+/// signals "T0 captured" by creating `<dir>/t0_done`, then blocks
+/// until the test creates `<dir>/proceed`. The wait is bounded so a
+/// broken test cannot hang the binary forever. It has no effect on
+/// the concurrency contract.
+async fn drift_detection_test_barrier() {
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+    // Matches the test side's t0_done tolerance. Generous because the
+    // repo runs process-per-test under heavily parallel nextest, where
+    // the test thread can be starved between observing t0_done and
+    // creating proceed; a tight bound here would flake. Unbounded is
+    // unnecessary (a runaway test is already capped by nextest's slow
+    // timeout) and this is test-only anyway, so it cannot hang prod.
+    const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    let Ok(dir) = std::env::var("CARINA_TEST_PLAN_DRIFT_HANDSHAKE_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let _ = std::fs::write(dir.join("t0_done"), b"");
+    let proceed = dir.join("proceed");
+    let deadline = tokio::time::Instant::now() + MAX_WAIT;
+    while !proceed.exists() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_plan(
     path: &Path,
@@ -272,6 +397,9 @@ pub async fn run_plan(
         backend
     };
 
+    // T0 fingerprint; see `StateSnapshot` for the TOCTOU rationale.
+    let state_snapshot_t0 = StateSnapshot::capture(state_file.as_ref());
+
     // Show bootstrap plan if needed
     if will_create_state_bucket {
         let backend_provider = plan_backend
@@ -347,6 +475,40 @@ pub async fn run_plan(
     )
     .await?;
     let has_changes = ctx.plan.mutation_count() > 0;
+
+    // TOCTOU drift detection (#3111). `plan` took no state lock, so a
+    // concurrent apply/destroy may have written state while the diff
+    // above was being computed. Re-read state now and compare against
+    // the T0 fingerprint; warn (do not fail) if it moved — the plan is
+    // a prediction, and apply re-locks + recomputes before mutating.
+    //
+    // Skipped entirely when no state existed at T0 (first-ever plan, or
+    // a bootstrap run that will create the backend): there is no
+    // baseline, so nothing could have gone stale and even a re-read
+    // *failure* is not worth a "may be stale" warning.
+    if let Some(snapshot_t0) = state_snapshot_t0.as_ref() {
+        drift_detection_test_barrier().await;
+        match plan_backend.read_state().await {
+            Ok(state_t1) => {
+                if let Some(drift) = detect_state_drift(Some(snapshot_t0), state_t1.as_ref()) {
+                    eprintln!("{}", drift.warning().yellow());
+                }
+            }
+            // A failed re-read is not fatal: the plan already computed
+            // against the T0 snapshot. Surface it so the user knows
+            // drift could not be checked, but let the plan print.
+            Err(e) => {
+                eprintln!(
+                    "{}",
+                    format!(
+                        "Warning: could not re-read state to check for \
+                         concurrent changes ({e}); plan output may be stale."
+                    )
+                    .yellow()
+                );
+            }
+        }
+    }
 
     // Check for prevent_destroy violations
     if ctx.plan.has_errors() {
@@ -1435,5 +1597,95 @@ mod plan_serialization_error_tests {
                 other => panic!("expected UnknownNotAllowed for {label}, got: {other:?}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod state_drift_tests {
+    use super::*;
+
+    fn state(serial: u64, lineage: &str) -> StateFile {
+        let mut s = StateFile::new();
+        s.serial = serial;
+        s.lineage = lineage.to_string();
+        s
+    }
+
+    #[test]
+    fn no_state_at_t0_means_no_drift() {
+        let before = StateSnapshot::capture(None);
+        let after = state(5, "abc");
+        assert_eq!(detect_state_drift(before.as_ref(), Some(&after)), None);
+    }
+
+    #[test]
+    fn unchanged_serial_and_lineage_is_no_drift() {
+        let s = state(7, "abc");
+        let before = StateSnapshot::capture(Some(&s));
+        assert_eq!(detect_state_drift(before.as_ref(), Some(&s)), None);
+    }
+
+    #[test]
+    fn advanced_serial_same_lineage_is_serial_drift() {
+        let t0 = state(7, "abc");
+        let before = StateSnapshot::capture(Some(&t0));
+        let t1 = state(8, "abc");
+        assert_eq!(
+            detect_state_drift(before.as_ref(), Some(&t1)),
+            Some(StateDrift::SerialAdvanced { from: 7, to: 8 })
+        );
+    }
+
+    #[test]
+    fn changed_lineage_is_lineage_drift_even_if_serial_lower() {
+        let t0 = state(9, "old-lineage");
+        let before = StateSnapshot::capture(Some(&t0));
+        // Fresh state after destroy+apply: new lineage, serial reset.
+        let t1 = state(0, "new-lineage");
+        assert_eq!(
+            detect_state_drift(before.as_ref(), Some(&t1)),
+            Some(StateDrift::LineageChanged {
+                from: "old-lineage".to_string(),
+                to: "new-lineage".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn state_removed_between_t0_and_t1_is_removed_drift() {
+        let t0 = state(3, "abc");
+        let before = StateSnapshot::capture(Some(&t0));
+        assert_eq!(
+            detect_state_drift(before.as_ref(), None),
+            Some(StateDrift::StateRemoved)
+        );
+    }
+
+    #[test]
+    fn warning_message_names_the_drift_kind() {
+        assert!(
+            StateDrift::SerialAdvanced { from: 1, to: 2 }
+                .warning()
+                .contains("serial advanced 1 -> 2")
+        );
+        assert!(
+            StateDrift::LineageChanged {
+                from: "a".into(),
+                to: "b".into()
+            }
+            .warning()
+            .contains("lineage changed a -> b")
+        );
+        assert!(
+            StateDrift::StateRemoved
+                .warning()
+                .contains("state was removed")
+        );
+        // Every variant must steer the user to re-run plan.
+        assert!(
+            StateDrift::StateRemoved
+                .warning()
+                .contains("re-run `carina plan`")
+        );
     }
 }
