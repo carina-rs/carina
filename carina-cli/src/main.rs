@@ -299,9 +299,9 @@ async fn main() {
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
-    // Restore the terminal cursor if a refresh spinner is interrupted by
-    // SIGINT/SIGTERM or a panic — exit paths the RAII `CursorGuard`'s
-    // `Drop` cannot reach (#3153).
+    // Restore the terminal cursor on the exit paths the command-wide
+    // `CursorGuard`'s `Drop` cannot reach — SIGINT/SIGTERM and panic
+    // (#3153, #3158).
     carina_cli::cursor::install_restore_handlers();
 
     // Create parser configuration with AWS KMS decryptor.
@@ -309,6 +309,12 @@ async fn main() {
     let provider_context = create_provider_context();
 
     let cli = Cli::parse();
+
+    // Command-wide cursor hide (#3158 — rationale in `cursor.rs`). Placed
+    // after `Cli::parse()` because that exits the process itself on
+    // --help/--version/parse error, so those paths must not hide; and
+    // before dispatch so all user-visible output runs cursor-hidden.
+    let _cursor_guard = carina_cli::cursor::CursorGuard::stdout();
 
     // Handle Plan separately since it returns Result<bool, String>
     if let Commands::Plan {
@@ -336,6 +342,9 @@ async fn main() {
         {
             Ok(has_changes) => {
                 if detailed_exitcode && has_changes {
+                    // process::exit skips Drop — restore the cursor first
+                    // (#3158); claim-once with the guard/net.
+                    carina_cli::cursor::restore_cursor();
                     std::process::exit(2);
                 }
             }
@@ -408,6 +417,9 @@ async fn main() {
             locked,
         } => {
             if let Err(e) = commands::init::run_init(&path, upgrade, locked) {
+                // process::exit skips Drop — restore the cursor first
+                // (#3158); claim-once with the guard/net.
+                carina_cli::cursor::restore_cursor();
                 eprintln!("{}", format!("Error: {e}").red());
                 std::process::exit(1);
             }
@@ -498,6 +510,10 @@ fn render_app_error(e: &error::AppError) -> AppErrorRendering {
 /// matches; everything else falls through to the generic `Error: ...`
 /// formatter (#2407).
 fn handle_app_error(e: error::AppError) -> ! {
+    // `process::exit` runs no destructors, so the command-wide CursorGuard
+    // would never restore the cursor on the error path — restore it here
+    // first (#3158). Claim-once, so this is harmless if a guard also ran.
+    carina_cli::cursor::restore_cursor();
     let rendering = render_app_error(&e);
     if !rendering.stderr.is_empty() {
         eprint!("{}", rendering.stderr);

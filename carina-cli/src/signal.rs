@@ -44,6 +44,10 @@ where
                         .red()
                         .bold()
                 );
+                // The SIGINT handler also restores on this second Ctrl+C,
+                // but `process::exit` skips Drop and handler ordering is
+                // not guaranteed — restore explicitly (claim-once, #3158).
+                crate::cursor::restore_cursor();
                 std::process::exit(130);
             });
 

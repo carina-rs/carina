@@ -31,7 +31,7 @@ use crate::commands::shared::state_writeback::{
     apply_destroy_to_state, apply_name_overrides, build_orphan_resource,
 };
 use crate::commands::state::map_lock_error;
-use crate::cursor::CursorGuard;
+use crate::cursor::CursorReveal;
 use crate::display::{format_destroy_plan, format_effect};
 use crate::error::AppError;
 use crate::wiring::{
@@ -182,11 +182,6 @@ async fn run_destroy_locked(
     // Build current states -- either from provider (refresh=true) or from state file
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
 
-    // Hide the cursor for the refresh spinners; see `CursorGuard`. Only the
-    // `refresh` branch below draws spinners, so arm the guard only then
-    // (#3153).
-    let cursor_guard = refresh.then(CursorGuard::stdout);
-
     if refresh {
         RefreshProgress::start_header();
         let multi = refresh_multi_progress();
@@ -270,11 +265,6 @@ async fn run_destroy_locked(
             all_resources.push(orphan_resource);
         }
     }
-
-    // Explicit drop (not scope exit): the cursor must be restored before
-    // the destroy plan / "Type 'yes' to confirm" prompt prints below, not
-    // at end of function (#3153).
-    drop(cursor_guard);
 
     // Sort all resources (managed + orphans) for destroy ordering.
     // Uses depth-based pre-sorting to ensure stable ordering for independent
@@ -434,13 +424,19 @@ async fn run_destroy_locked(
             "  {}",
             "This action cannot be undone. Type 'yes' to confirm.".yellow()
         );
-        print!("\n  Enter a value: ");
-        std::io::Write::flush(&mut std::io::stdout()).map_err(|e| e.to_string())?;
-
+        // The cursor is hidden command-wide (#3158); reveal it for this
+        // irreversible-destroy confirmation so the user does not type
+        // blind, and re-hide on scope exit.
         let mut input = String::new();
-        std::io::stdin()
-            .read_line(&mut input)
-            .map_err(|e| e.to_string())?;
+        {
+            let _reveal = CursorReveal::new();
+            print!("\n  Enter a value: ");
+            std::io::Write::flush(&mut std::io::stdout()).map_err(|e| e.to_string())?;
+
+            std::io::stdin()
+                .read_line(&mut input)
+                .map_err(|e| e.to_string())?;
+        }
 
         if input.trim() != "yes" {
             println!();
