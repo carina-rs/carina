@@ -51,6 +51,49 @@ pub async fn resolve_backend(
     }
 }
 
+/// Resolve a backend, anchoring a local backend's relative state `path`
+/// (or the unset default) at `base_dir` instead of the process CWD.
+///
+/// `resolve_backend` / `create_backend` treat a local `path` as
+/// CWD-relative, which is correct only when the command is run from the
+/// project directory. Commands that accept an explicit directory
+/// argument (`carina init <dir>`, upstream `remote_state` resolution)
+/// must reach the state next to *that* directory's `.crn` files
+/// regardless of where the binary was invoked from — they use this.
+/// Remote backends carry their own absolute address and are delegated
+/// unchanged to `create_backend`.
+pub async fn resolve_backend_anchored(
+    backend_config: Option<&BackendConfig>,
+    base_dir: &std::path::Path,
+) -> BackendResult<Box<dyn StateBackend>> {
+    match backend_config {
+        Some(config) if config.is_local() => Ok(Box::new(LocalBackend::with_path(
+            anchored_local_path(config, base_dir),
+        ))),
+        Some(config) => create_backend(config).await,
+        None => Ok(Box::new(LocalBackend::with_path(
+            base_dir.join(LocalBackend::DEFAULT_STATE_FILE),
+        ))),
+    }
+}
+
+/// Resolve a local backend's state file path, anchoring a relative
+/// `path` (or the unset default) at `base_dir`.
+pub fn anchored_local_path(
+    config: &BackendConfig,
+    base_dir: &std::path::Path,
+) -> std::path::PathBuf {
+    let path = config
+        .get_string("path")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(LocalBackend::DEFAULT_STATE_FILE));
+    if path.is_absolute() {
+        path
+    } else {
+        base_dir.join(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

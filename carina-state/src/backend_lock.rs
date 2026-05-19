@@ -65,9 +65,30 @@ impl BackendLock {
     /// `check_backend_lock` to detect local → remote transitions.
     pub fn local_default() -> Self {
         Self {
-            backend_type: "local".to_string(),
+            backend_type: crate::backend::LOCAL_BACKEND_TYPE.to_string(),
             attributes: BTreeMap::new(),
         }
+    }
+
+    /// Lock snapshot for an optional parser backend block: the configured
+    /// backend when present, the implicit local default when absent.
+    ///
+    /// This is the single source of truth for "what backend does this
+    /// configuration name"; `check_backend_lock`, `ensure_backend_lock`,
+    /// `init`'s drift check, and the migration path all go through it so
+    /// they cannot disagree.
+    pub fn for_config(
+        backend_config: Option<&carina_core::parser::BackendConfig>,
+    ) -> Result<Self, carina_core::value::SerializationError> {
+        match backend_config {
+            Some(cfg) => Self::from_config(&BackendConfig::from(cfg)),
+            None => Ok(Self::local_default()),
+        }
+    }
+
+    /// Whether this lock describes the local backend.
+    pub fn is_local(&self) -> bool {
+        self.backend_type == crate::backend::LOCAL_BACKEND_TYPE
     }
 
     /// Path to the lock file under `base_dir` (project root).
@@ -116,6 +137,61 @@ impl BackendLock {
         std::fs::write(&path, contents)
             .map_err(|e| BackendError::Io(format!("Failed to write {}: {}", path.display(), e)))?;
         Ok(())
+    }
+
+    /// Reconstruct a runtime [`BackendConfig`] from this locked snapshot.
+    ///
+    /// This is the inverse of [`from_config`]'s `value_to_json` step: it
+    /// is used by the `init --migrate-state` path to open the *old*
+    /// backend (the address recorded in `carina-backend.lock`) so its
+    /// state can be read and copied to the newly configured backend.
+    ///
+    /// Fidelity contract: every backend attribute that any backend
+    /// actually *reads* is a string or a bool (`bucket` / `key` /
+    /// `region` / `path` via `get_string`; `encrypt` / `auto_create` /
+    /// `use_lockfile` via `get_bool`). Those round-trip exactly, so the
+    /// reconstructed *source address* is always faithful. `from_config`
+    /// also accepts integers/durations (collapsed to a JSON number) and
+    /// writes `null` for anything else; numbers are reconstructed as
+    /// `Int` best-effort (an out-of-`i64` value falls back to its `f64`
+    /// truncation rather than being dropped — totality matters more than
+    /// precision for an attribute no backend consumes), and `null`
+    /// reconstructs as `Bool(false)` (an arbitrary non-dropping
+    /// placeholder; no backend reads a null-valued attribute). Crucially,
+    /// **no key is ever dropped**: a silently-missing attribute could
+    /// re-address the migration source, so the map is preserved
+    /// key-for-key.
+    ///
+    /// [`from_config`]: BackendLock::from_config
+    pub fn to_state_config(&self) -> BackendConfig {
+        use carina_core::resource::{ConcreteValue, Value};
+        let attributes = self
+            .attributes
+            .iter()
+            .map(|(k, v)| {
+                let value = match v {
+                    serde_json::Value::String(s) => {
+                        Value::Concrete(ConcreteValue::String(s.clone()))
+                    }
+                    serde_json::Value::Bool(b) => Value::Concrete(ConcreteValue::Bool(*b)),
+                    serde_json::Value::Number(n) => Value::Concrete(ConcreteValue::Int(
+                        n.as_i64()
+                            .unwrap_or_else(|| n.as_f64().unwrap_or(0.0) as i64),
+                    )),
+                    // `value_to_json` writes `null` only as its lossy
+                    // fallback for non-scalar attributes (which no
+                    // backend reads); keep the key so the address shape
+                    // is preserved rather than silently shrinking it.
+                    serde_json::Value::Null => Value::Concrete(ConcreteValue::Bool(false)),
+                    other => Value::Concrete(ConcreteValue::String(other.to_string())),
+                };
+                (k.clone(), value)
+            })
+            .collect();
+        BackendConfig {
+            backend_type: self.backend_type.clone(),
+            attributes,
+        }
     }
 
     /// Produce a human-readable diff description for error messages.
@@ -298,6 +374,104 @@ mod tests {
         let a = BackendLock::from_config(&make_config("b", "us-east-1")).unwrap();
         let b = BackendLock::from_config(&make_config("b", "us-east-1")).unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn to_state_config_roundtrips_remote_attributes() {
+        // A locked remote backend must be reconstructible into a
+        // `StateBackendConfig` so the migration path can read the OLD
+        // state from the address recorded in the lock.
+        let lock = BackendLock::from_config(&make_config("old-bucket", "us-east-1")).unwrap();
+        let cfg = lock.to_state_config();
+        assert_eq!(cfg.backend_type, "s3");
+        assert_eq!(cfg.get_string("bucket"), Some("old-bucket"));
+        assert_eq!(cfg.get_string("region"), Some("us-east-1"));
+    }
+
+    #[test]
+    fn to_state_config_preserves_bool_and_int() {
+        let mut attributes = HashMap::new();
+        attributes.insert(
+            "bucket".to_string(),
+            Value::Concrete(ConcreteValue::String("b".to_string())),
+        );
+        attributes.insert(
+            "use_lockfile".to_string(),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        );
+        attributes.insert(
+            "max_retries".to_string(),
+            Value::Concrete(ConcreteValue::Int(7)),
+        );
+        let config = BackendConfig {
+            backend_type: "s3".to_string(),
+            attributes,
+        };
+        let lock = BackendLock::from_config(&config).unwrap();
+        let cfg = lock.to_state_config();
+        assert_eq!(cfg.get_string("bucket"), Some("b"));
+        assert_eq!(cfg.get_bool("use_lockfile"), Some(true));
+        assert!(matches!(
+            cfg.attributes.get("max_retries"),
+            Some(Value::Concrete(ConcreteValue::Int(7)))
+        ));
+    }
+
+    #[test]
+    fn to_state_config_of_local_default_is_local() {
+        let cfg = BackendLock::local_default().to_state_config();
+        assert_eq!(cfg.backend_type, "local");
+        assert!(cfg.attributes.is_empty());
+    }
+
+    /// `from_config` collapses a `Duration` attribute to a JSON number;
+    /// the inverse cannot tell it apart from an `Int` (no backend reads
+    /// either, so this is acceptable) — but it must still preserve the
+    /// real string address attributes around it and never drop the key.
+    #[test]
+    fn to_state_config_duration_does_not_corrupt_sibling_address() {
+        use std::time::Duration;
+        let mut attributes = HashMap::new();
+        attributes.insert(
+            "bucket".to_string(),
+            Value::Concrete(ConcreteValue::String("real-bucket".to_string())),
+        );
+        attributes.insert(
+            "ttl".to_string(),
+            Value::Concrete(ConcreteValue::Duration(Duration::from_secs(42))),
+        );
+        let config = BackendConfig {
+            backend_type: "s3".to_string(),
+            attributes,
+        };
+        let cfg = BackendLock::from_config(&config).unwrap().to_state_config();
+        // The address attribute the backend actually reads is intact.
+        assert_eq!(cfg.get_string("bucket"), Some("real-bucket"));
+        // The duration key survives (as an Int) — not silently dropped.
+        assert!(
+            cfg.attributes.contains_key("ttl"),
+            "no attribute key may be dropped on reconstruction"
+        );
+    }
+
+    /// A JSON number outside `i64` range must not drop the key (which
+    /// would re-address the migration source); totality over precision.
+    #[test]
+    fn to_state_config_large_number_keeps_key() {
+        let mut lock = BackendLock::from_config(&make_config("b", "us-east-1")).unwrap();
+        lock.attributes.insert(
+            "huge".to_string(),
+            serde_json::Value::Number(serde_json::Number::from_f64(1e30).unwrap()),
+        );
+        lock.attributes
+            .insert("weird".to_string(), serde_json::Value::Null);
+        let cfg = lock.to_state_config();
+        assert_eq!(cfg.attributes.len(), lock.attributes.len());
+        assert!(cfg.attributes.contains_key("huge"));
+        assert!(cfg.attributes.contains_key("weird"));
+        // The genuine address attributes still round-trip exactly.
+        assert_eq!(cfg.get_string("bucket"), Some("b"));
+        assert_eq!(cfg.get_string("region"), Some("us-east-1"));
     }
 
     #[test]
