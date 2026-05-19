@@ -1470,6 +1470,7 @@ mod expand_same_config_deferred_for_tests {
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
         )
         .expect("expand");
 
@@ -1531,6 +1532,7 @@ mod expand_same_config_deferred_for_tests {
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
         )
         .expect("expand");
 
@@ -1573,6 +1575,7 @@ mod expand_same_config_deferred_for_tests {
             &empty_states,
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
+            &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
         )
         .expect("expand");
@@ -1636,6 +1639,7 @@ mod expand_same_config_deferred_for_tests {
             &HashMap::new(),
             &remote,
             &[] as &[WaitAliasSpec],
+            &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
         )
         .expect("expand");
@@ -1703,6 +1707,7 @@ mod expand_same_config_deferred_for_tests {
             &states,
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
+            &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
         )
         .expect("expand");
@@ -1806,6 +1811,7 @@ mod expand_same_config_deferred_for_tests {
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
         )
         .expect("expand without moved targets");
 
@@ -1835,6 +1841,7 @@ mod expand_same_config_deferred_for_tests {
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &moved_targets,
+            &std::collections::HashSet::new(),
         )
         .expect("expand with the child as a moved target");
 
@@ -1910,6 +1917,7 @@ mod expand_same_config_deferred_for_tests {
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
         )
         .expect("expand");
         assert_eq!(
@@ -1933,6 +1941,7 @@ mod expand_same_config_deferred_for_tests {
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &moved_targets,
+            &std::collections::HashSet::new(),
         )
         .expect("expand");
 
@@ -1947,6 +1956,130 @@ mod expand_same_config_deferred_for_tests {
         assert!(
             out.refreshable_child_ids.contains(&kept_child),
             "the non-moved child must still be refreshed"
+        );
+        assert_eq!(
+            out.refreshable_child_ids.len(),
+            1,
+            "exactly one of two children is refreshable; got {:?}",
+            out.refreshable_child_ids
+        );
+    }
+
+    /// carina#3145: a for-loop child that was applied on a previous run
+    /// is in the state file. On the next `plan`/`apply`, the phase-1
+    /// orphan pass classifies it as an orphan (it is not yet a desired
+    /// resource — expansion happens *after* refresh) and performs a live
+    /// provider read of it, storing the result in `current_states`. The
+    /// post-expansion child refresh then reads the *same* address a
+    /// second time. Two live provider reads for one resource.
+    ///
+    /// The fix decides "already live-read this run" *once*, in the same
+    /// place the moved-target exclusion is decided, and carries it in the
+    /// typed `RefreshableChildIds` so the plan and apply paths cannot
+    /// diverge. This test pins that contract: an id in `already_refreshed`
+    /// must materialize as a child but be excluded from
+    /// `refreshable_child_ids` (no redundant second read), while a child
+    /// not in that set stays refreshable.
+    #[test]
+    fn already_refreshed_child_is_excluded_from_refreshable_set() {
+        let src = r#"
+            let cert = aws.acm.Certificate {
+                domain_name       = "r.example.com"
+                validation_method = "DNS"
+            }
+
+            for (_, opt) in cert.domain_validation_options {
+                aws.route53.RecordSet {
+                    name             = opt.resource_record.name
+                    type             = "CNAME"
+                    resource_records = [opt.resource_record.value]
+                }
+            }
+        "#;
+        let parsed = parse(src, &ProviderContext::default()).expect("parse");
+        let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
+
+        let make_entry = |name: &str, value: &str| {
+            let mut rr = indexmap::IndexMap::new();
+            rr.insert(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String(name.into())),
+            );
+            rr.insert(
+                "value".to_string(),
+                Value::Concrete(ConcreteValue::String(value.into())),
+            );
+            let mut entry = indexmap::IndexMap::new();
+            entry.insert(
+                "resource_record".to_string(),
+                Value::Concrete(ConcreteValue::Map(rr)),
+            );
+            Value::Concrete(ConcreteValue::Map(entry))
+        };
+        let dvo = Value::Concrete(ConcreteValue::List(vec![
+            make_entry("_apex.r.example.com", "_apex.acm-validations.aws."),
+            make_entry("_san.r.example.com", "_san.acm-validations.aws."),
+        ]));
+        let states = states_with_cert(&parsed, "domain_validation_options", dvo);
+
+        // Baseline: nothing pre-refreshed — both children materialize and
+        // are refreshable (the single live read happens post-expansion).
+        let baseline = expand_same_config_deferred_for(
+            &parsed,
+            &sorted,
+            &states,
+            &HashMap::new(),
+            &[] as &[WaitAliasSpec],
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+        )
+        .expect("expand");
+        assert_eq!(
+            baseline.new_child_ids.len(),
+            2,
+            "two RecordSets materialized (apex + SAN)"
+        );
+        assert_eq!(
+            baseline.refreshable_child_ids.len(),
+            2,
+            "with nothing pre-refreshed both children are refreshable"
+        );
+
+        // The phase-1 orphan pass already live-read the first child this
+        // run (it is in the state file from a prior apply, not yet a
+        // desired resource at orphan time).
+        let mut ids: Vec<ResourceId> = baseline.new_child_ids.iter().cloned().collect();
+        ids.sort_by_key(|id| id.to_string());
+        let already_read = ids[0].clone();
+        let still_unread = ids[1].clone();
+
+        let mut already_refreshed = std::collections::HashSet::new();
+        already_refreshed.insert(already_read.clone());
+
+        let out = expand_same_config_deferred_for(
+            &parsed,
+            &sorted,
+            &states,
+            &HashMap::new(),
+            &[] as &[WaitAliasSpec],
+            &std::collections::HashSet::new(),
+            &already_refreshed,
+        )
+        .expect("expand");
+
+        assert_eq!(
+            out.new_child_ids, baseline.new_child_ids,
+            "the already-refreshed exclusion must not change what materialized"
+        );
+        assert!(
+            !out.refreshable_child_ids.contains(&already_read),
+            "a child already live-read by the phase-1 orphan pass must be \
+             excluded from refreshable_child_ids so it is not read a \
+             second time (carina#3145)"
+        );
+        assert!(
+            out.refreshable_child_ids.contains(&still_unread),
+            "a child not yet read this run must still be refreshed"
         );
         assert_eq!(
             out.refreshable_child_ids.len(),

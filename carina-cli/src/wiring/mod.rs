@@ -1212,6 +1212,19 @@ pub struct DeferredForExpansion {
 /// paths before this call). Children whose id is in this set are kept
 /// out of `refreshable_child_ids` so their migrated state survives
 /// (carina#3141).
+///
+/// `already_refreshed` is the set of ResourceIds the phase-1 orphan pass
+/// already performed a live provider read for *this run*. A for-loop
+/// child applied on a previous run sits in the state file; because
+/// expansion happens *after* refresh, that child is not yet a desired
+/// resource when the orphan pass runs, so the orphan pass classifies it
+/// as an orphan and live-reads it (keyed by the same state name the
+/// post-expansion child resolves to → identical provider identity). Such
+/// a child is kept out of `refreshable_child_ids` so the post-expansion
+/// child refresh does not read the same address a second time
+/// (carina#3145). The decision is made here, once, alongside the
+/// moved-target exclusion, and carried in the typed `RefreshableChildIds`
+/// so the plan and apply paths cannot diverge.
 pub fn expand_same_config_deferred_for<E: Clone>(
     parsed: &carina_core::parser::File<E>,
     sorted_resources: &[Resource],
@@ -1219,6 +1232,7 @@ pub fn expand_same_config_deferred_for<E: Clone>(
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     wait_aliases: &[WaitAliasSpec],
     moved_targets: &HashSet<ResourceId>,
+    already_refreshed: &HashSet<ResourceId>,
 ) -> Result<DeferredForExpansion, AppError> {
     // Common case: no deferred-for at all. Skip the binding projection
     // and the whole-`File` clone entirely (this runs on every plan /
@@ -1273,15 +1287,24 @@ pub fn expand_same_config_deferred_for<E: Clone>(
         .filter(|id| !pre_ids.contains(id))
         .collect();
 
-    // carina#3141: a child that is also a `moved` block `to` already
-    // holds the migrated state from `materialize_moved_states`. Exclude
-    // it from the refreshable set so the caller's targeted refresh does
-    // not overwrite that state with a `not_found` provider read (the
-    // state file still keys the old name, so no identifier resolves).
+    // Exclude a child from the post-expansion refresh when re-reading it
+    // would be wrong or redundant:
+    //
+    // - carina#3141: a child that is also a `moved` block `to` already
+    //   holds the migrated state from `materialize_moved_states`.
+    //   Re-reading it would overwrite that state with a `not_found`
+    //   provider read (the state file still keys the old name, so no
+    //   identifier resolves).
+    // - carina#3145: a child applied on a previous run is in the state
+    //   file but is not yet a desired resource when the phase-1 orphan
+    //   pass runs (expansion is post-refresh), so that pass already
+    //   live-read it under the same state name the child resolves to.
+    //   Reading it again here is a redundant second provider call for
+    //   the same address.
     let refreshable_child_ids = RefreshableChildIds(
         new_child_ids
             .iter()
-            .filter(|id| !moved_targets.contains(*id))
+            .filter(|id| !moved_targets.contains(*id) && !already_refreshed.contains(*id))
             .cloned()
             .collect(),
     );
@@ -1362,6 +1385,15 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     // detected anonymous → let-bound renames. Populated inside the
     // refresh block so the later plan-building code sees them.
     let mut moved_pairs: Vec<(ResourceId, ResourceId)> = Vec::new();
+    // Ids the phase-1 orphan pass already performed a live provider read
+    // for this run. A for-loop child applied on a previous run is in the
+    // state file but not yet a desired resource at orphan time (expansion
+    // is post-refresh), so the orphan pass live-reads it under the same
+    // state name the child later resolves to. `expand_same_config_deferred_for`
+    // excludes these from the post-expansion child refresh so the same
+    // address is not read twice (carina#3145). Mirrored by the apply path
+    // in `commands/apply/mod.rs`.
+    let mut orphan_refreshed_ids: HashSet<ResourceId> = HashSet::new();
 
     if refresh {
         RefreshProgress::start_header();
@@ -1444,6 +1476,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
             for result in orphan_results {
                 let (id, refreshed) = result?;
                 if refreshed.exists {
+                    orphan_refreshed_ids.insert(id.clone());
                     current_states.entry(id).or_insert(refreshed);
                 }
             }
@@ -1589,6 +1622,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         remote_bindings,
         &wait_aliases,
         &moved_targets,
+        &orphan_refreshed_ids,
     )?;
     sorted_resources = resorted;
 
