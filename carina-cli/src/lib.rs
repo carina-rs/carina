@@ -1,4 +1,5 @@
 pub mod commands;
+pub mod cursor;
 pub mod display;
 pub mod error;
 pub mod fixture_plan;
