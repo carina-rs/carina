@@ -1,21 +1,23 @@
-//! PTY regression test for issue #3153.
+//! PTY regression test for issues #3153 / #3158.
 //!
-//! `carina plan` (and `apply` / `destroy`) draws the refresh spinner with
-//! indicatif, which manages line clearing and cursor *movement* but never
-//! emits DECTCEM cursor hide/show (`\x1b[?25l` / `\x1b[?25h`). So while the
-//! spinner runs the terminal's text caret stays visible, parked on the
-//! active spinner row; screenshots of `carina plan` show a stray cursor
-//! and it reads as "the command is waiting for input".
+//! `carina` draws the refresh spinner with indicatif, which manages line
+//! clearing and cursor *movement* but never emits DECTCEM cursor hide/show
+//! (`\x1b[?25l` / `\x1b[?25h`). Without intervention the caret stays
+//! visible the whole run; screenshots show a stray cursor and a parked
+//! caret reads as "the command is waiting for input".
 //!
-//! The fix wraps the refresh phase in a `CursorGuard` (emits `\x1b[?25l`
-//! on entry, `\x1b[?25h` on the normal / `?`-error drop) backed by a
-//! SIGINT/SIGTERM + panic restore net for the non-unwinding exits (see
-//! `carina-cli/src/cursor.rs`; the signal/panic coordination is unit-tested
-//! there). This test asserts the happy path against a real PTY (the
-//! user-facing reality — under a pipe the spinner is suppressed entirely):
-//! both sequences present, in stream order. It deliberately inspects the
-//! **raw** PTY bytes, not a CSI-stripped copy, because the sequences under
-//! test are themselves CSI.
+//! #3153 added a `CursorGuard`; #3158 widened it to the **whole command
+//! run** (a single guard built in `main.rs`, held to process exit) because
+//! the refresh-only scope made the cursor flicker (visible during provider
+//! load → hidden during refresh → visible again before the result). The
+//! plan path has no interactive prompt, so the correct user-facing
+//! behavior is: hide once near the start, **no `\x1b[?25h` until the very
+//! end** (no mid-run reveal), restore exactly once at exit.
+//!
+//! This test asserts that against a real PTY (the user-facing reality —
+//! under a pipe the spinner is suppressed entirely). It deliberately
+//! inspects the **raw** PTY bytes, not a CSI-stripped copy, because the
+//! sequences under test are themselves CSI.
 
 use std::io::Read;
 
@@ -66,10 +68,12 @@ fn init_project(body: &str) -> TempDir {
     tmp
 }
 
-/// On a TTY, `carina plan` with resources to refresh must hide the cursor
-/// before the spinner runs and restore it after, in that order (#3153).
+/// On a TTY, `carina plan` must hide the cursor once near the start and
+/// not reveal it again until the very end — no mid-run flicker (#3158).
+/// The plan path has no confirmation prompt, so there must be exactly one
+/// hide and exactly one show, the show coming after the final plan output.
 #[test]
-fn plan_hides_and_restores_cursor_around_refresh_on_pty() {
+fn plan_keeps_cursor_hidden_for_whole_command_no_flicker_on_pty() {
     let tmp = init_project(
         "backend local { path = \"carina.state.json\" }\n\
          mock.test.resource { name = \"r1\" }\n",
@@ -84,18 +88,54 @@ fn plan_hides_and_restores_cursor_around_refresh_on_pty() {
         "expected at least one ✓ refresh line on the TTY path.\n{raw}"
     );
 
-    let hide = raw.find("\x1b[?25l").unwrap_or_else(|| {
-        panic!("expected DECTCEM cursor-hide (ESC[?25l) during refresh.\n{raw:?}")
-    });
-    let show = raw.rfind("\x1b[?25h").unwrap_or_else(|| {
-        panic!("expected DECTCEM cursor-show (ESC[?25h) after refresh.\n{raw:?}")
-    });
+    let hides: Vec<usize> = raw.match_indices("\x1b[?25l").map(|(i, _)| i).collect();
+    let shows: Vec<usize> = raw.match_indices("\x1b[?25h").map(|(i, _)| i).collect();
 
-    assert!(
-        hide < show,
-        "cursor must be hidden (ESC[?25l) before it is restored (ESC[?25h); \
-         got hide@{hide} show@{show}.\n{raw:?}"
+    // Exactly one hide/show pair: command-wide guard hides once at startup,
+    // restores once at exit. More than one show before the end would be the
+    // #3158 flicker (a reveal in the middle of the run).
+    assert_eq!(
+        hides.len(),
+        1,
+        "expected exactly one cursor-hide (command-wide), got {}: {raw:?}",
+        hides.len()
     );
+    assert_eq!(
+        shows.len(),
+        1,
+        "expected exactly one cursor-show (restore at exit); more than one \
+         means the cursor flickered mid-run (#3158), got {}: {raw:?}",
+        shows.len()
+    );
+
+    let hide = hides[0];
+    let show = shows[0];
+
+    // Hide must come before any refresh output (the guard is installed in
+    // main.rs before command dispatch, so it precedes `Refreshing state...`).
+    let refreshing = raw
+        .find("Refreshing state")
+        .unwrap_or_else(|| panic!("expected 'Refreshing state' in output.\n{raw:?}"));
+    assert!(
+        hide < refreshing,
+        "cursor-hide (@{hide}) must precede 'Refreshing state' (@{refreshing}) \
+         — the whole command runs with the cursor hidden (#3158).\n{raw:?}"
+    );
+
+    // The single show must come after the last visible output (the plan /
+    // No-changes terminal section), i.e. it is the exit restore, not a
+    // mid-run reveal.
+    let last_content = raw
+        .rfind("No changes")
+        .or_else(|| raw.rfind("Execution Plan"))
+        .or_else(|| raw.rfind('✓'))
+        .unwrap_or_else(|| panic!("expected a plan terminal section.\n{raw:?}"));
+    assert!(
+        show > last_content,
+        "the only cursor-show (@{show}) must come AFTER the final plan \
+         output (@{last_content}); a show before it is the #3158 flicker.\n{raw:?}"
+    );
+
     assert_cursor_not_left_hidden(&raw);
 }
 
@@ -117,6 +157,68 @@ fn assert_cursor_not_left_hidden(raw: &str) {
              cursor-show at all.\n{raw:?}"
         ),
     }
+}
+
+/// Like [`run_on_pty`] but does NOT assert success — for the error-path
+/// test, where `carina` is expected to exit non-zero via
+/// `main::handle_app_error` → `std::process::exit`.
+fn run_on_pty_allow_failure(args: &[&str], cwd: &std::path::Path) -> String {
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_carina"));
+    for a in args {
+        cmd.arg(a);
+    }
+    cmd.cwd(cwd);
+    cmd.env_remove("CLICOLOR_FORCE");
+    cmd.env_remove("NO_COLOR");
+    cmd.env_remove("RUST_LOG");
+
+    let mut child = pty.slave.spawn_command(cmd).expect("spawn under pty");
+    drop(pty.slave);
+
+    let mut reader = pty.master.try_clone_reader().expect("pty reader");
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).expect("read pty output");
+    let _ = child.wait();
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// On the error path, `carina` exits via `process::exit` (which runs no
+/// destructors) — neither the command-wide `CursorGuard`'s `Drop` nor the
+/// signal/panic net fires. `main::handle_app_error` must restore the cursor
+/// explicitly, or the terminal is left with a hidden cursor on every
+/// command error (#3158: command-wide hiding makes this reachable from the
+/// very start of the run).
+#[test]
+fn plan_error_path_does_not_leave_cursor_hidden_on_pty() {
+    let tmp = TempDir::new().unwrap();
+    // A parse error: forces validation/load failure → `handle_app_error`
+    // → `std::process::exit`, bypassing Drop.
+    std::fs::write(tmp.path().join("main.crn"), "this is not valid carina {{\n").unwrap();
+
+    let raw = run_on_pty_allow_failure(&["plan", tmp.path().to_str().unwrap()], tmp.path());
+
+    // Non-vacuous by construction: the command-wide guard arms right after
+    // Cli::parse() (before dispatch), and this parse error is detected
+    // *during* dispatch, so on a PTY the cursor is always hidden before the
+    // error — proving the error path genuinely entered the guarded state.
+    assert!(
+        raw.contains("\x1b[?25l"),
+        "expected the cursor to have been hidden before the error \
+         (command-wide guard arms before dispatch).\n{raw:?}"
+    );
+    // The decisive invariant: the error path (process::exit, skips Drop)
+    // must still restore the cursor — `handle_app_error` calls
+    // `restore_cursor()`.
+    assert_cursor_not_left_hidden(&raw);
 }
 
 // NOTE on the SIGINT/SIGTERM restore path:
