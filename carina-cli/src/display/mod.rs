@@ -26,6 +26,21 @@ use carina_core::value::{format_value, format_value_with_key, is_list_of_maps, m
 
 use crate::DetailLevel;
 
+/// Separator emitted between the state-refresh progress block and the plan's
+/// terminal section.
+///
+/// `carina plan` prints the `Refreshing state...` header and a series of
+/// indented `✓ <name> [<elapsed>s]` lines, then the plan output. Without a
+/// separator the last refresh line and the plan's terminal section
+/// (`Execution Plan:` or `No changes. Infrastructure is up-to-date.`) sit on
+/// adjacent rows and read as a visual run-on (issue #3148). When a refresh
+/// occurred, return a single blank line to insert before the plan output;
+/// otherwise (e.g. `--refresh=false`, fixture/snapshot path) there is no
+/// progress block above the plan, so emit nothing.
+pub fn refresh_plan_separator(refreshed: bool) -> &'static str {
+    if refreshed { "\n" } else { "" }
+}
+
 /// Check if a resource has a `let` binding (i.e., is not anonymous).
 fn has_binding(resource: &carina_core::resource::Resource) -> bool {
     resource.binding.is_some()

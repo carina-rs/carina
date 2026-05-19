@@ -1640,3 +1640,18 @@ fn delete_pretty_attribute_does_not_strike_indentation() {
          override on and exercise the Delete styling path",
     );
 }
+
+/// When a state refresh has been printed above the plan output, a single
+/// blank line must separate the refresh-progress block from the plan's
+/// terminal section (`Execution Plan:` or `No changes.`). See issue #3148.
+#[test]
+fn test_refresh_plan_separator_emits_blank_line_after_refresh() {
+    assert_eq!(refresh_plan_separator(true), "\n");
+}
+
+/// Without a refresh (e.g. `--refresh=false`, fixture/snapshot path) there
+/// is no progress block above the plan, so no extra blank line is emitted.
+#[test]
+fn test_refresh_plan_separator_no_blank_line_without_refresh() {
+    assert_eq!(refresh_plan_separator(false), "");
+}
