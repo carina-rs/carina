@@ -272,6 +272,162 @@ pub(crate) struct ApplyStateSave<'a> {
     pub schemas: &'a SchemaRegistry,
 }
 
+/// Typed plan of state-file writes computed from an apply result.
+///
+/// Enforces the invariant that **at most one write lands on any given
+/// `ResourceId`**: `add_upsert` and `add_cleanup` reject overlapping
+/// writes with `WritebackConflict`. The apply step then runs a single
+/// non-overlapping pass over `upserts` and `cleanups`.
+///
+/// `Effect::Move` is a cleanup operation only — the `to` row's
+/// contents always come from Phase 1's `add_upsert`. For
+/// Move+Replace / Move+Update / Move+Create the `to` row is fed by
+/// `applied_states[to]` (the provider's post-apply State); for a pure
+/// rename, by `current_states[to]` (which `materialize_moved_states`
+/// has already populated from the `from` row before writeback runs).
+/// Either way, Move's only writeback responsibility is dropping the
+/// stale `from` address. See carina#3170 for the bug class this
+/// prevents.
+pub(crate) struct WritebackPlan<'a> {
+    upserts: indexmap::IndexMap<ResourceId, PlannedUpsert<'a>>,
+    cleanups: HashSet<ResourceId>,
+}
+
+/// One planned upsert. Carrying the desired `&Resource` here (rather
+/// than re-deriving it from `sorted_resources` in the apply loop)
+/// makes the "every upsert has a desired resource" invariant
+/// representable in the type — there is no separate lookup that can
+/// miss.
+struct PlannedUpsert<'a> {
+    resource: &'a Resource,
+    source: UpsertSource<'a>,
+}
+
+/// Source of the post-apply `State` that feeds the `to` row of a
+/// planned upsert. `Applied` (provider returned a result) is gated to
+/// receive `permanent_name_overrides`; `CurrentState` is not.
+enum UpsertSource<'a> {
+    Applied(&'a State),
+    CurrentState(&'a State),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum WritebackConflict {
+    #[error(
+        "writeback planned two upserts for the same resource id: {id} (apply pipeline produced overlapping post-apply states)"
+    )]
+    DuplicateUpsert { id: ResourceId },
+    #[error(
+        "writeback planned both an upsert and a cleanup for the same resource id: {id} (likely a moved-block `from` colliding with a desired-side resource)"
+    )]
+    UpsertCleanupOverlap { id: ResourceId },
+}
+
+impl From<WritebackConflict> for AppError {
+    fn from(e: WritebackConflict) -> Self {
+        AppError::Validation(e.to_string())
+    }
+}
+
+impl<'a> WritebackPlan<'a> {
+    fn new() -> Self {
+        Self {
+            upserts: indexmap::IndexMap::new(),
+            cleanups: HashSet::new(),
+        }
+    }
+
+    /// Register an upsert for `resource` with `source`. The first call
+    /// wins for this id; subsequent calls return `DuplicateUpsert`.
+    /// Calling after `add_cleanup` for the same id returns
+    /// `UpsertCleanupOverlap`.
+    fn add_upsert(
+        &mut self,
+        resource: &'a Resource,
+        source: UpsertSource<'a>,
+    ) -> Result<(), WritebackConflict> {
+        let id = &resource.id;
+        if self.cleanups.contains(id) {
+            return Err(WritebackConflict::UpsertCleanupOverlap { id: id.clone() });
+        }
+        if self.upserts.contains_key(id) {
+            return Err(WritebackConflict::DuplicateUpsert { id: id.clone() });
+        }
+        self.upserts
+            .insert(id.clone(), PlannedUpsert { resource, source });
+        Ok(())
+    }
+
+    /// Register a cleanup against `id`. Calling after `add_upsert(id)`
+    /// returns `UpsertCleanupOverlap`. Cleanup is idempotent.
+    fn add_cleanup(&mut self, id: ResourceId) -> Result<(), WritebackConflict> {
+        if self.upserts.contains_key(&id) {
+            return Err(WritebackConflict::UpsertCleanupOverlap { id });
+        }
+        self.cleanups.insert(id);
+        Ok(())
+    }
+}
+
+/// Build the typed writeback plan from the raw apply inputs.
+///
+/// Phase 1 (`sorted_resources` walk) registers upserts from
+/// `applied_states` first, falling back to `current_states` when the
+/// resource exists but had no provider call, and emitting cleanups
+/// when the resource was absent post-refresh. Phase 2 (`plan.effects()`
+/// walk) registers cleanups for `Delete` / `Remove` / `Move`'s `from`.
+/// `Effect::Move` deliberately does **not** touch the `to` slot — that
+/// is Phase 1's job.
+fn decompose<'a>(
+    sorted_resources: &'a [Resource],
+    current_states: &'a HashMap<ResourceId, State>,
+    applied_states: &'a HashMap<ResourceId, State>,
+    plan: &Plan,
+    successfully_deleted: &HashSet<ResourceId>,
+    failed_refreshes: &HashSet<ResourceId>,
+) -> Result<WritebackPlan<'a>, WritebackConflict> {
+    let mut wb = WritebackPlan::new();
+
+    for resource in sorted_resources {
+        if let Some(applied) = applied_states.get(&resource.id) {
+            wb.add_upsert(resource, UpsertSource::Applied(applied))?;
+        } else if failed_refreshes.contains(&resource.id) {
+            // Refresh failed; we don't know whether the live resource
+            // still exists, so leave any pre-existing row untouched.
+            continue;
+        } else if let Some(current) = current_states.get(&resource.id) {
+            if current.exists {
+                wb.add_upsert(resource, UpsertSource::CurrentState(current))?;
+            } else {
+                wb.add_cleanup(resource.id.clone())?;
+            }
+        }
+    }
+
+    for effect in plan.effects() {
+        match effect {
+            Effect::Delete { id, .. } if successfully_deleted.contains(id) => {
+                wb.add_cleanup(id.clone())?;
+            }
+            Effect::Remove { id } => {
+                wb.add_cleanup(id.clone())?;
+            }
+            Effect::Move { from, .. } => {
+                // Move's only writeback responsibility is to drop the
+                // stale `from` row. The `to` row is owned by Phase 1
+                // (`applied_states[to]` for Move + Replace/Update/Create,
+                // or `current_states[to]` for pure rename, which
+                // `materialize_moved_states` transferred from `from`
+                // before writeback runs).
+                wb.add_cleanup(from.clone())?;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(wb)
+}
+
 pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateFile, AppError> {
     let ApplyStateSave {
         state_file,
@@ -286,13 +442,18 @@ pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateF
     } = save;
     let mut state = state_file.unwrap_or_default();
 
-    for resource in sorted_resources {
-        let existing = state.find_resource(
-            &resource.id.provider,
-            &resource.id.resource_type,
-            resource.id.name_str(),
-        );
-        // Collect write-only attribute names from the schema for this resource type.
+    let writeback = decompose(
+        sorted_resources,
+        current_states,
+        applied_states,
+        plan,
+        successfully_deleted,
+        failed_refreshes,
+    )?;
+
+    for (id, planned) in &writeback.upserts {
+        let resource = planned.resource;
+        let existing = state.find_resource(&id.provider, &id.resource_type, id.name_str());
         let write_only_keys: Vec<String> = schemas
             .get_for(resource)
             .map(|schema| {
@@ -305,65 +466,23 @@ pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateF
             })
             .unwrap_or_default();
 
-        if let Some(applied_state) = applied_states.get(&resource.id) {
-            let mut resource_state =
-                ResourceState::from_provider_state(resource, applied_state, existing)?;
-            if let Some(overrides) = permanent_name_overrides.get(&resource.id) {
-                resource_state.name_overrides = overrides.clone();
-            }
-            if !write_only_keys.is_empty() {
-                resource_state.merge_write_only_attributes(resource, &write_only_keys);
-            }
-            state.upsert_resource(resource_state);
-        } else if failed_refreshes.contains(&resource.id) {
-            continue;
-        } else if let Some(current_state) = current_states.get(&resource.id) {
-            if current_state.exists {
-                let mut resource_state =
-                    ResourceState::from_provider_state(resource, current_state, existing)?;
-                if !write_only_keys.is_empty() {
-                    resource_state.merge_write_only_attributes(resource, &write_only_keys);
-                }
-                state.upsert_resource(resource_state);
-            } else {
-                state.remove_resource(
-                    &resource.id.provider,
-                    &resource.id.resource_type,
-                    resource.id.name_str(),
-                );
-            }
+        let (applied_state, is_applied) = match planned.source {
+            UpsertSource::Applied(s) => (s, true),
+            UpsertSource::CurrentState(s) => (s, false),
+        };
+        let mut resource_state =
+            ResourceState::from_provider_state(resource, applied_state, existing)?;
+        if is_applied && let Some(overrides) = permanent_name_overrides.get(id) {
+            resource_state.name_overrides = overrides.clone();
         }
+        if !write_only_keys.is_empty() {
+            resource_state.merge_write_only_attributes(resource, &write_only_keys);
+        }
+        state.upsert_resource(resource_state);
     }
 
-    for effect in plan.effects() {
-        match effect {
-            Effect::Delete { id, .. } if successfully_deleted.contains(id) => {
-                state.remove_resource(&id.provider, &id.resource_type, id.name_str());
-            }
-            Effect::Import { .. } => {
-                // Already handled in the sorted_resources loop above via applied_states.
-                // Re-upserting here would overwrite metadata (directives, prefixes,
-                // desired_keys, binding, dependency_bindings) with bare defaults.
-            }
-            Effect::Remove { id } => {
-                state.remove_resource(&id.provider, &id.resource_type, id.name_str());
-            }
-            Effect::Move { from, to } => {
-                // Move: update the resource's identity in state
-                if let Some(existing) = state
-                    .find_resource(&from.provider, &from.resource_type, from.name_str())
-                    .cloned()
-                {
-                    state.remove_resource(&from.provider, &from.resource_type, from.name_str());
-                    let mut moved_resource = existing;
-                    moved_resource.provider = to.provider.clone();
-                    moved_resource.resource_type = to.resource_type.clone();
-                    moved_resource.name = to.name_str().to_string();
-                    state.upsert_resource(moved_resource);
-                }
-            }
-            _ => {}
-        }
+    for id in &writeback.cleanups {
+        state.remove_resource(&id.provider, &id.resource_type, id.name_str());
     }
 
     Ok(state)
