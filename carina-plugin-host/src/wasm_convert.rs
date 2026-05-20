@@ -671,6 +671,7 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
         proto::AttributeType::Int => CoreAttributeType::Int,
         proto::AttributeType::Float => CoreAttributeType::Float,
         proto::AttributeType::Bool => CoreAttributeType::Bool,
+        proto::AttributeType::Duration => CoreAttributeType::Duration,
         proto::AttributeType::StringEnum {
             values,
             name,
@@ -1446,6 +1447,22 @@ mod tests {
             }
             other => panic!("expected List, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn json_to_attribute_types_decodes_duration() {
+        // Acceptance for carina#3166: providers that declare a
+        // Duration-typed schema attribute via `provider_config_attribute_types`
+        // (e.g. assume_role.duration in aws#342 / awscc#260) must
+        // round-trip through `{"type":"Duration"}` to
+        // `CoreAttributeType::Duration` so the host's type checker
+        // accepts `duration = 30min` against that declaration.
+        let json = r#"{"timeout":{"type":"Duration"}}"#;
+        let types = json_to_attribute_types(json);
+        assert!(matches!(
+            types.get("timeout"),
+            Some(CoreAttributeType::Duration)
+        ));
     }
 
     #[test]
