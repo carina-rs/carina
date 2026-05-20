@@ -322,120 +322,133 @@ pub(super) async fn execute_effects_sequential(
             let completed_ref = &completed;
 
             in_flight.push(async move {
-                let result = match effect {
-                    Effect::Create(_) | Effect::Update { .. } | Effect::Delete { .. } => {
-                        SingleEffectResult::Basic(
-                            execute_basic_effect(
-                                effect,
-                                &BasicEffectCtx {
-                                    provider,
-                                    bindings: &binding_snapshot,
-                                    unresolved,
-                                    pipeline: &pipeline,
-                                    completed: completed_ref,
-                                    total,
-                                },
-                                observer,
-                            )
-                            .await,
-                        )
-                    }
-                    Effect::Replace {
-                        id,
-                        from,
-                        to,
-                        directives,
-                        cascading_updates,
-                        temporary_name,
-                        ..
-                    } => {
-                        let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                        let started = Instant::now();
-                        let progress = ProgressInfo {
-                            completed: c,
-                            total,
-                        };
-                        observer.on_event(&ExecutionEvent::EffectStarted { effect });
-
-                        execute_replace_parallel(
-                            provider,
-                            &ReplaceContext {
-                                effect,
-                                id,
-                                from,
-                                to,
-                                directives,
-                                cascading_updates,
-                                temporary_name: temporary_name.as_ref(),
+                let result = match effect.as_basic() {
+                    // `BasicEffect` is the type-level contract for
+                    // `execute_basic_effect`: any Create/Update/Delete
+                    // narrows here, and any non-basic variant falls
+                    // through to the `None` arm so it can't accidentally
+                    // be dispatched (carina#3164). The compiler enforces
+                    // exhaustiveness on the outer `match effect { ... }`
+                    // below.
+                    Some(basic) => SingleEffectResult::Basic(
+                        execute_basic_effect(
+                            basic,
+                            &BasicEffectCtx {
+                                provider,
                                 bindings: &binding_snapshot,
                                 unresolved,
                                 pipeline: &pipeline,
-                                started,
-                                progress,
+                                completed: completed_ref,
+                                total,
                             },
                             observer,
                         )
-                        .await
-                    }
-                    Effect::Read { .. } => SingleEffectResult::ReadNoOp,
-                    // State operations are handled separately during apply
-                    Effect::Import { .. } | Effect::Remove { .. } | Effect::Move { .. } => {
-                        SingleEffectResult::ReadNoOp
-                    }
-                    Effect::Wait {
-                        binding,
-                        target_id,
-                        until,
-                        timeout,
-                        interval,
-                        ..
-                    } => {
-                        let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                        let started = Instant::now();
-                        observer.on_event(&ExecutionEvent::EffectStarted { effect });
-                        let progress = ProgressInfo {
-                            completed: c,
-                            total,
-                        };
-                        match super::wait::execute_wait_effect(
-                            provider,
+                        .await,
+                    ),
+                    None => match effect {
+                        Effect::Create(_) | Effect::Update { .. } | Effect::Delete { .. } => {
+                            // `as_basic()` returns `Some` for exactly these
+                            // three variants; they're handled by the `Some`
+                            // arm above.
+                            unreachable!("Create/Update/Delete are narrowed by as_basic()")
+                        }
+                        Effect::Replace {
+                            id,
+                            from,
+                            to,
+                            directives,
+                            cascading_updates,
+                            temporary_name,
+                            ..
+                        } => {
+                            let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                            let started = Instant::now();
+                            let progress = ProgressInfo {
+                                completed: c,
+                                total,
+                            };
+                            observer.on_event(&ExecutionEvent::EffectStarted { effect });
+
+                            execute_replace_parallel(
+                                provider,
+                                &ReplaceContext {
+                                    effect,
+                                    id,
+                                    from,
+                                    to,
+                                    directives,
+                                    cascading_updates,
+                                    temporary_name: temporary_name.as_ref(),
+                                    bindings: &binding_snapshot,
+                                    unresolved,
+                                    pipeline: &pipeline,
+                                    started,
+                                    progress,
+                                },
+                                observer,
+                            )
+                            .await
+                        }
+                        Effect::Read { .. } => SingleEffectResult::ReadNoOp,
+                        // State operations are handled separately during apply
+                        Effect::Import { .. } | Effect::Remove { .. } | Effect::Move { .. } => {
+                            SingleEffectResult::ReadNoOp
+                        }
+                        Effect::Wait {
+                            binding,
                             target_id,
-                            wait_identifier.as_deref(),
                             until,
-                            *timeout,
-                            *interval,
-                        )
-                        .await
-                        {
-                            Ok(state) => {
-                                observer.on_event(&ExecutionEvent::EffectSucceeded {
-                                    effect,
-                                    state: Some(&state),
-                                    duration: started.elapsed(),
-                                    progress,
-                                });
-                                SingleEffectResult::Wait {
-                                    success: true,
-                                    binding: binding.clone(),
-                                    target_state: Some(state),
+                            timeout,
+                            interval,
+                            ..
+                        } => {
+                            let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                            let started = Instant::now();
+                            observer.on_event(&ExecutionEvent::EffectStarted { effect });
+                            let progress = ProgressInfo {
+                                completed: c,
+                                total,
+                            };
+                            match super::wait::execute_wait_effect(
+                                provider,
+                                target_id,
+                                wait_identifier.as_deref(),
+                                until,
+                                *timeout,
+                                *interval,
+                            )
+                            .await
+                            {
+                                Ok(state) => {
+                                    observer.on_event(&ExecutionEvent::EffectSucceeded {
+                                        effect,
+                                        state: Some(&state),
+                                        duration: started.elapsed(),
+                                        progress,
+                                    });
+                                    SingleEffectResult::Wait {
+                                        success: true,
+                                        binding: binding.clone(),
+                                        target_state: Some(state),
+                                    }
                                 }
-                            }
-                            Err(e) => {
-                                let err_msg = e.to_string();
-                                observer.on_event(&ExecutionEvent::EffectFailed {
-                                    effect,
-                                    error: &err_msg,
-                                    duration: started.elapsed(),
-                                    progress,
-                                });
-                                SingleEffectResult::Wait {
-                                    success: false,
-                                    binding: binding.clone(),
-                                    target_state: None,
+                                Err(e) => {
+                                    let err_msg = e.to_string();
+                                    observer.on_event(&ExecutionEvent::EffectFailed {
+                                        effect,
+                                        error: &err_msg,
+                                        duration: started.elapsed(),
+                                        progress,
+                                    });
+                                    SingleEffectResult::Wait {
+                                        success: false,
+                                        binding: binding.clone(),
+                                        target_state: None,
+                                    }
                                 }
                             }
                         }
-                    }
+                    },
                 };
                 (idx, result)
             });

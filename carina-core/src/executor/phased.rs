@@ -371,6 +371,24 @@ pub(super) async fn execute_effects_phased(
                     continue;
                 }
 
+                // Phase 1 only dispatches `Create`/`Update`/`Delete` to
+                // `execute_basic_effect`. State-only effects (`Move`/
+                // `Import`/`Remove`) and `Wait` are routed elsewhere
+                // (the CLI's `execute_state_only_effects` step, or the
+                // sequential path's Wait branch). The previous
+                // `&Effect` signature let them slip through and trip an
+                // `unreachable!()` (carina#3164); narrowing via
+                // `as_basic()` makes the contract type-level. The
+                // outer `phase1_indices` filter still excludes
+                // `Replace` and `Read` so they reach their dedicated
+                // phases; everything else that isn't basic ends up
+                // here and is silently skipped from the basic
+                // executor's point of view.
+                let Some(basic_effect) = effect.as_basic() else {
+                    completed_indices.insert(idx);
+                    continue;
+                };
+
                 let binding_snapshot = input.bindings.clone();
                 let unresolved = &input.unresolved_resources;
                 let pipeline = RenormalizePipeline {
@@ -382,7 +400,7 @@ pub(super) async fn execute_effects_phased(
 
                 in_flight.push(async move {
                     let basic = execute_basic_effect(
-                        effect,
+                        basic_effect,
                         &BasicEffectCtx {
                             provider,
                             bindings: &binding_snapshot,

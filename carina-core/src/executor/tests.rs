@@ -3102,3 +3102,82 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
         provider.read_identifiers()
     );
 }
+
+/// Regression for carina#3164: a plan that mixes `Effect::Move` with
+/// interdependent `Effect::Replace` effects must not panic. The
+/// phased executor's Phase 1 was filtering only `Replace` and `Read`,
+/// so state-only `Move` effects were dispatched into
+/// `execute_basic_effect` and tripped its `unreachable!()` arm.
+/// Move effects are state-only and must be skipped by the runtime
+/// executor — the CLI's `execute_state_only_effects` step applies them
+/// to state.
+#[tokio::test]
+async fn test_phased_move_with_interdependent_replace_does_not_panic() {
+    let provider = MockProvider::new();
+
+    let role_id = ResourceId::new("test", "role");
+    let policy_old_id = ResourceId::new("test", "policy_old");
+    let policy_new_id = ResourceId::new("test", "policy_new");
+
+    let role_from = State::existing(role_id.clone(), HashMap::new()).with_identifier("role-old");
+    let mut role_to = Resource::new("test", "role");
+    role_to.binding = Some("role".to_string());
+
+    let policy_from =
+        State::existing(policy_new_id.clone(), HashMap::new()).with_identifier("policy-old");
+    let mut policy_to = Resource::new("test", "policy_new");
+    policy_to.dependency_bindings = std::collections::BTreeSet::from(["role".to_string()]);
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Replace {
+        id: role_id.clone(),
+        from: Box::new(role_from),
+        to: role_to,
+        directives: Directives::default(),
+        changed_create_only: vec!["role_name".to_string()],
+        cascading_updates: vec![],
+        temporary_name: None,
+        cascade_ref_hints: vec![],
+    });
+    plan.add(Effect::Move {
+        from: policy_old_id,
+        to: policy_new_id.clone(),
+    });
+    plan.add(Effect::Replace {
+        id: policy_new_id,
+        from: Box::new(policy_from),
+        to: policy_to,
+        directives: Directives::default(),
+        changed_create_only: vec!["policy_name".to_string()],
+        cascading_updates: vec![],
+        temporary_name: None,
+        cascade_ref_hints: vec![],
+    });
+
+    provider.push_delete(Ok(()));
+    provider.push_create(Ok(ok_state(&role_id)));
+    provider.push_delete(Ok(()));
+    provider.push_create(Ok(ok_state(&ResourceId::new("test", "policy_new"))));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+    };
+
+    let observer = MockObserver::new();
+    let result = execute_plan(&provider, input, &observer).await;
+
+    assert_eq!(
+        result.failure_count, 0,
+        "Replace effects must succeed; Move must be skipped, not dispatched to execute_basic_effect"
+    );
+    assert_eq!(
+        result.success_count, 2,
+        "two Replace effects should be counted as successes; Move is state-only and handled by the CLI"
+    );
+}

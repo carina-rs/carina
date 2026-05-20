@@ -207,7 +207,128 @@ pub enum Effect {
     },
 }
 
+/// A type-level narrowing of [`Effect`] to the variants the basic
+/// executor (`execute_basic_effect`) actually handles: `Create`,
+/// `Update`, and `Delete`.
+///
+/// The basic executor was previously typed on `&Effect` and used a
+/// `_ => unreachable!("execute_basic_effect called with non-basic
+/// effect")` arm to reject `Replace`/`Read`/`Import`/`Remove`/`Move`/
+/// `Wait`. Callers' filters were the *only* thing keeping non-basic
+/// effects out; a single missed filter (#3164) panicked apply at
+/// runtime and left the state lock acquired.
+///
+/// `BasicEffect` makes that contract live in the type system instead.
+/// The only way to obtain one is [`Effect::as_basic`], which returns
+/// `None` for every non-basic variant. `execute_basic_effect` takes
+/// `BasicEffect<'a>` directly and exhaustively matches its three arms —
+/// no `unreachable!()` is needed, and adding a new `Effect` variant
+/// won't compile until the call sites decide whether the variant is
+/// "basic" or routed elsewhere.
+///
+/// Variants borrow from the source `&'a Effect` so the basic executor
+/// can still forward the original effect into `ExecutionEvent::*`
+/// observer calls.
+#[derive(Debug)]
+pub enum BasicEffect<'a> {
+    Create {
+        effect: &'a Effect,
+        resource: &'a Resource,
+    },
+    Update {
+        effect: &'a Effect,
+        id: &'a ResourceId,
+        from: &'a State,
+        to: &'a Resource,
+        changed_attributes: &'a [String],
+    },
+    Delete {
+        effect: &'a Effect,
+        id: &'a ResourceId,
+        identifier: &'a str,
+        directives: &'a Directives,
+    },
+}
+
+impl<'a> BasicEffect<'a> {
+    /// Returns the source `&Effect` this `BasicEffect` was narrowed
+    /// from. Used by `execute_basic_effect` to forward the original
+    /// effect to `ExecutionEvent::*` observer calls without storing it
+    /// twice.
+    pub fn as_effect(&self) -> &'a Effect {
+        match *self {
+            BasicEffect::Create { effect, .. }
+            | BasicEffect::Update { effect, .. }
+            | BasicEffect::Delete { effect, .. } => effect,
+        }
+    }
+}
+
 impl Effect {
+    /// Narrow this effect to a [`BasicEffect`] if it is one of the
+    /// variants the basic executor handles (`Create`, `Update`,
+    /// `Delete`). Returns `None` for `Replace`, `Read`, `Import`,
+    /// `Remove`, `Move`, and `Wait` — those route through other
+    /// executor paths or are state-only (applied by the CLI's
+    /// `execute_state_only_effects` step).
+    ///
+    /// This is the *only* way to construct a `BasicEffect`, so the
+    /// basic executor's "this is a Create/Update/Delete" contract
+    /// lives in the type system rather than in caller-side filters.
+    /// See [`BasicEffect`] for the rationale (#3164).
+    ///
+    /// Guard: `BasicEffect` has no `From<&Effect>` or other public
+    /// constructor — callers must route through `as_basic()` and
+    /// handle the `None` case. A bare `&Effect` does not coerce to
+    /// `BasicEffect`:
+    ///
+    /// ```compile_fail
+    /// use carina_core::effect::{BasicEffect, Effect};
+    /// use carina_core::resource::Resource;
+    /// let effect = Effect::Create(Resource::new("test", "x"));
+    /// // Was: a missed filter could pass a non-basic `&Effect` straight
+    /// // into `execute_basic_effect` and trip `unreachable!()` at apply
+    /// // time (carina#3164). The conversion no longer exists.
+    /// let _: BasicEffect = (&effect).into();
+    /// ```
+    pub fn as_basic(&self) -> Option<BasicEffect<'_>> {
+        match self {
+            Effect::Create(resource) => Some(BasicEffect::Create {
+                effect: self,
+                resource,
+            }),
+            Effect::Update {
+                id,
+                from,
+                to,
+                changed_attributes,
+            } => Some(BasicEffect::Update {
+                effect: self,
+                id,
+                from,
+                to,
+                changed_attributes,
+            }),
+            Effect::Delete {
+                id,
+                identifier,
+                directives,
+                ..
+            } => Some(BasicEffect::Delete {
+                effect: self,
+                id,
+                identifier,
+                directives,
+            }),
+            Effect::Replace { .. }
+            | Effect::Read { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::Wait { .. } => None,
+        }
+    }
+
     /// Returns the kind of Effect as a string (for display)
     pub fn kind(&self) -> &'static str {
         match self {
@@ -610,5 +731,105 @@ mod tests {
         );
         let decoded: Effect = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, original);
+    }
+
+    /// `as_basic()` must return `Some` for the three variants the
+    /// basic executor handles, and `None` for every other variant.
+    /// This is the carina#3164 type-level contract: filters used to
+    /// be caller-side, and a missed filter (Move slipping into Phase
+    /// 1 of the phased executor) panicked apply.
+    #[test]
+    fn as_basic_narrows_to_create_update_and_delete_only() {
+        use crate::resource::State as ResState;
+
+        let rid = ResourceId::new("test", "x");
+
+        // Basic variants must narrow.
+        let create = Effect::Create(Resource::new("test", "x"));
+        assert!(matches!(
+            create.as_basic(),
+            Some(BasicEffect::Create { .. })
+        ));
+
+        let update = Effect::Update {
+            id: rid.clone(),
+            from: Box::new(ResState::not_found(rid.clone())),
+            to: Resource::new("test", "x"),
+            changed_attributes: vec![],
+        };
+        assert!(matches!(
+            update.as_basic(),
+            Some(BasicEffect::Update { .. })
+        ));
+
+        let delete = Effect::Delete {
+            id: rid.clone(),
+            identifier: "x-1".to_string(),
+            directives: Directives::default(),
+            binding: None,
+            dependencies: HashSet::new(),
+            explicit_dependencies: HashSet::new(),
+        };
+        assert!(matches!(
+            delete.as_basic(),
+            Some(BasicEffect::Delete { .. })
+        ));
+
+        // Non-basic variants must not. If a new variant is added and
+        // someone forgets to extend `as_basic`, the exhaustive match
+        // inside `as_basic` is what catches it at compile time; this
+        // test catches misclassification of an existing variant.
+        let read = Effect::Read {
+            resource: Resource::new("test", "x"),
+        };
+        let replace = Effect::Replace {
+            id: rid.clone(),
+            from: Box::new(ResState::not_found(rid.clone())),
+            to: Resource::new("test", "x"),
+            directives: Directives::default(),
+            changed_create_only: vec![],
+            cascading_updates: vec![],
+            temporary_name: None,
+            cascade_ref_hints: vec![],
+        };
+        let import = Effect::Import {
+            id: rid.clone(),
+            identifier: "x-1".to_string(),
+        };
+        let remove = Effect::Remove { id: rid.clone() };
+        let mov = Effect::Move {
+            from: rid.clone(),
+            to: ResourceId::new("test", "y"),
+        };
+        let wait = Effect::Wait {
+            binding: "w".to_string(),
+            target_id: rid.clone(),
+            target: WaitTarget::ResolvedAtApply,
+            until: WaitPredicate::Equals {
+                attr: crate::wait::predicate::AttrPath {
+                    segments: vec!["status".to_string()],
+                },
+                value: crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+                    "ready".to_string(),
+                )),
+            },
+            until_surface: "status == 'ready'".to_string(),
+            timeout: std::time::Duration::from_secs(60),
+            interval: std::time::Duration::from_secs(1),
+            explicit_dependencies: HashSet::new(),
+        };
+        for (label, e) in [
+            ("Read", read),
+            ("Replace", replace),
+            ("Import", import),
+            ("Remove", remove),
+            ("Move", mov),
+            ("Wait", wait),
+        ] {
+            assert!(
+                e.as_basic().is_none(),
+                "{label} must not narrow to BasicEffect"
+            );
+        }
     }
 }

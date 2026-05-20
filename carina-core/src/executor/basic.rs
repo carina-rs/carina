@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::binding_index::ResolvedBindings;
-use crate::effect::Effect;
+use crate::effect::{BasicEffect, Effect};
 use crate::provider::{
     CreateRequest, DeleteRequest, Provider, ProviderNormalizer, ReadRequest, UpdateRequest,
     build_update_patch,
@@ -343,14 +343,19 @@ pub(super) struct BasicEffectCtx<'a> {
 
 /// Execute a single Create, Update, or Delete effect.
 ///
-/// This helper encapsulates the shared dispatch logic: increment progress counter,
-/// record start time, emit EffectStarted, resolve resource, call provider, and
-/// emit EffectSucceeded/EffectFailed. Returns a `BasicEffectResult` that callers
-/// map to their path-specific result types.
+/// Takes a [`BasicEffect`] — a type-level narrowing of `Effect` to the
+/// three variants this function actually handles. Non-basic variants
+/// (`Replace`/`Read`/`Import`/`Remove`/`Move`/`Wait`) cannot reach this
+/// function because [`Effect::as_basic`] is the only constructor and
+/// returns `None` for them. This contract used to live in caller-side
+/// filters with an `unreachable!()` backstop; a missed filter
+/// (carina#3164) panicked apply with `execute_basic_effect called
+/// with non-basic effect`. The type now enforces it.
 ///
-/// Panics if called with a Replace, Read, Import, Remove, or Move effect.
+/// Returns a `BasicEffectResult` that callers map to their path-specific
+/// result types.
 pub(super) async fn execute_basic_effect<'a>(
-    effect: &'a Effect,
+    basic: BasicEffect<'a>,
     ctx: &BasicEffectCtx<'a>,
     observer: &'a dyn ExecutionObserver,
 ) -> BasicEffectResult {
@@ -366,10 +371,11 @@ pub(super) async fn execute_basic_effect<'a>(
         completed: c,
         total,
     };
+    let effect = basic.as_effect();
     observer.on_event(&ExecutionEvent::EffectStarted { effect });
 
-    match effect {
-        Effect::Create(resource) => {
+    match basic {
+        BasicEffect::Create { resource, .. } => {
             let resolved = match resolve_resource(resource, bindings, pipeline).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -423,11 +429,12 @@ pub(super) async fn execute_basic_effect<'a>(
                 }
             }
         }
-        Effect::Update {
+        BasicEffect::Update {
             id,
             from,
             to,
             changed_attributes,
+            ..
         } => {
             let resolve_source = unresolved.get(id).unwrap_or(to);
             let resolved_to =
@@ -457,7 +464,7 @@ pub(super) async fn execute_basic_effect<'a>(
             // Without this, the patch would omit the changed
             // reference value and the provider would never be told
             // to update it.
-            let mut effective_changed: Vec<String> = changed_attributes.clone();
+            let mut effective_changed: Vec<String> = changed_attributes.to_vec();
             for (key, new_value) in &resolved_to.attributes {
                 if effective_changed.iter().any(|k| k == key) {
                     continue;
@@ -468,7 +475,7 @@ pub(super) async fn execute_basic_effect<'a>(
             }
             let patch = build_update_patch(&effective_changed, &resolved_to, from);
             let request = UpdateRequest {
-                from: (**from).clone(),
+                from: from.clone(),
                 patch,
             };
             match provider.update(id, identifier, request).await {
@@ -501,7 +508,7 @@ pub(super) async fn execute_basic_effect<'a>(
                 }
             }
         }
-        Effect::Delete {
+        BasicEffect::Delete {
             id,
             identifier,
             directives,
@@ -537,11 +544,10 @@ pub(super) async fn execute_basic_effect<'a>(
                 });
                 BasicEffectResult::Failure {
                     binding: None,
-                    refresh: Some((id.clone(), identifier.clone())),
+                    refresh: Some((id.clone(), identifier.to_string())),
                 }
             }
         },
-        _ => unreachable!("execute_basic_effect called with non-basic effect"),
     }
 }
 
