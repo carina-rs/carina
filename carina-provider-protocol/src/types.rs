@@ -340,6 +340,12 @@ pub enum AttributeType {
     Int,
     Float,
     Bool,
+    /// Time duration. Authored in the DSL as a literal like `30min`,
+    /// `1h`, or `15s` (`duration_literal` in the grammar); reaches the
+    /// provider across the WIT boundary as integer seconds. Lets
+    /// providers declare Duration-typed schema attributes so the
+    /// host-side type checker accepts the literal form (carina#3166).
+    Duration,
     #[serde(rename = "string_enum")]
     StringEnum {
         values: Vec<String>,
@@ -467,6 +473,20 @@ mod tests {
         let json = serde_json::to_string(&attr).unwrap();
         let back: AttributeType = serde_json::from_str(&json).unwrap();
         assert_eq!(json, serde_json::to_string(&back).unwrap());
+    }
+
+    #[test]
+    fn duration_attribute_type_serializes_as_duration_tag() {
+        // Providers serialize this via serde_json across the WIT
+        // boundary; the host must reconstruct it from the
+        // `{"type": "Duration"}` form. Pinning the wire shape is the
+        // only thing that keeps the cross-boundary contract stable
+        // (carina#3166).
+        let attr = AttributeType::Duration;
+        let json = serde_json::to_string(&attr).unwrap();
+        assert_eq!(json, r#"{"type":"Duration"}"#);
+        let back: AttributeType = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, AttributeType::Duration));
     }
 
     #[test]
