@@ -64,50 +64,6 @@ impl TryFrom<&Resource> for ManagedResource {
     }
 }
 
-impl ManagedResource {
-    /// Project a legacy [`Resource`] onto a `ManagedResource` view
-    /// **regardless of `kind`**, discarding the discriminant.
-    ///
-    /// Unlike the strict [`TryFrom<&Resource>`] impl above, this
-    /// helper does not check `kind`. It exists for one specific
-    /// caller (`carina-cli`'s `resolve_exports`) where the
-    /// bindings-index construction needs to treat
-    /// `ResourceKind::DataSource` as having the same attribute /
-    /// state shape as a managed resource: the binding index only
-    /// indexes by `binding` name + attribute map, and DataSources
-    /// participate in that lookup just like Managed resources do.
-    /// Routing both through the same `ManagedResource` view keeps
-    /// the binding-index API single-typed without forcing the
-    /// caller to spread `match kind` across the bridge.
-    ///
-    /// `Virtual` resources must **not** be passed here — the
-    /// caller has already split them out (the typestate invariant
-    /// that virtuals are post-apply-only forbids them participating
-    /// in the pre-apply / managed binding view). Passing a virtual
-    /// drops it to a Managed view, which would re-introduce the
-    /// class of bug #3169 fixed. Callers that observe a virtual
-    /// must route it through [`VirtualResource::try_from`] instead.
-    ///
-    /// Removed when #3181 inline-merges `Resource` into
-    /// `ManagedResource`.
-    pub fn as_managed_view(r: &Resource) -> Self {
-        debug_assert!(
-            !matches!(r.kind, ResourceKind::Virtual),
-            "as_managed_view called on Virtual; route via VirtualResource::try_from",
-        );
-        Self {
-            id: r.id.clone(),
-            attributes: r.attributes.clone(),
-            directives: r.directives.clone(),
-            prefixes: r.prefixes.clone(),
-            binding: r.binding.clone(),
-            dependency_bindings: r.dependency_bindings.clone(),
-            module_source: r.module_source.clone(),
-            quoted_string_attrs: r.quoted_string_attrs.clone(),
-        }
-    }
-}
-
 /// Transitional bridge — rebuild a legacy [`Resource`] from a
 /// `ManagedResource`. Co-located with the reverse `TryFrom<&Resource>`
 /// impl above so #3181 can remove both directions in one place when

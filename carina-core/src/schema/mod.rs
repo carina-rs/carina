@@ -3336,10 +3336,9 @@ impl SchemaRegistry {
     /// `Managed` entry for normal resources and the `DataSource` entry for
     /// `read`-keyword resources (`ResourceKind::DataSource`).
     pub fn get_for(&self, resource: &crate::resource::Resource) -> Option<&ResourceSchema> {
-        let kind = if resource.is_data_source() {
-            SchemaKind::DataSource
-        } else {
-            SchemaKind::Managed
+        let kind = match resource.kind {
+            crate::resource::ResourceKind::DataSource => SchemaKind::DataSource,
+            _ => SchemaKind::Managed,
         };
         self.get(&resource.id.provider, &resource.id.resource_type, kind)
     }

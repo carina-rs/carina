@@ -139,7 +139,7 @@ pub(crate) struct FinalizeApplyInput<'a> {
 /// 1. Build `post_apply_states` from `state.resources` (managed
 ///    resources' applied attributes).
 /// 2. Split `sorted_resources` into a managed view (Managed +
-///    DataSource collapsed via [`ManagedResource::as_managed_view`])
+///    DataSource collapsed onto `ManagedResource` by field projection)
 ///    and a virtual view ([`VirtualResource::try_from`]).
 /// 3. Build the bindings view from the managed slice via
 ///    [`ResolvedBindings::from_managed_with_state`] (#3176).
@@ -196,8 +196,8 @@ pub(crate) fn resolve_exports(
     // onto a `ManagedResource` view because the binding index only
     // cares about (binding name, attribute map, state merge) —
     // DataSources share that shape with managed resources. See
-    // `ManagedResource::as_managed_view` for the rationale and the
-    // `Virtual must not pass through here` invariant.
+    // The `Virtual must not pass through here` invariant holds because
+    // the `match` routes `Virtual` to its own branch above.
     let mut managed: Vec<ManagedResource> = Vec::with_capacity(sorted_resources.len());
     for r in sorted_resources {
         match r.kind {
@@ -206,7 +206,20 @@ pub(crate) fn resolve_exports(
                 continue;
             }
             ResourceKind::Managed | ResourceKind::DataSource => {
-                managed.push(ManagedResource::as_managed_view(r));
+                // DataSources are collapsed onto a `ManagedResource`
+                // view: the binding index only cares about
+                // (binding name, attribute map, state merge), a shape
+                // DataSources share with managed resources.
+                managed.push(ManagedResource {
+                    id: r.id.clone(),
+                    attributes: r.attributes.clone(),
+                    directives: r.directives.clone(),
+                    prefixes: r.prefixes.clone(),
+                    binding: r.binding.clone(),
+                    dependency_bindings: r.dependency_bindings.clone(),
+                    module_source: r.module_source.clone(),
+                    quoted_string_attrs: r.quoted_string_attrs.clone(),
+                });
             }
         }
     }
