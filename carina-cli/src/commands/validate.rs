@@ -8,7 +8,7 @@ use carina_core::config_loader::{
     find_crn_files_in_dir, get_base_dir, load_configuration_with_config,
 };
 use carina_core::lint::find_duplicate_attrs;
-use carina_core::parser::{File, ProviderContext, ResourceContext, UpstreamState};
+use carina_core::parser::{File, ProviderContext, ResourceRef, UpstreamState};
 use carina_core::resource::{ResourceId, ResourceName};
 
 use super::validate_and_resolve_errors;
@@ -223,18 +223,23 @@ impl std::fmt::Display for ValidatedEntry<'_> {
 fn validated_entries<E>(parsed: &File<E>) -> Vec<ValidatedEntry<'_>> {
     parsed
         .iter_all_resources()
-        .map(|(ctx, resource)| match ctx {
-            ResourceContext::Direct => match resource.id.name {
-                ResourceName::Bound(_) => ValidatedEntry::Resolved(&resource.id),
-                ResourceName::Pending => ValidatedEntry::PendingDirect(&resource.id),
-            },
-            ResourceContext::Deferred(d) => ValidatedEntry::DeferredLoop {
+        .map(|rref| match rref {
+            ResourceRef::Deferred { deferred: d, .. } => ValidatedEntry::DeferredLoop {
                 resource_type: &d.resource_type,
                 binding_name: &d.binding_name,
                 header: &d.header,
                 file: d.file.as_deref(),
                 line: d.line,
             },
+            // Managed / Virtual / DataSource — all direct, classified
+            // by whether the id has a resolved name.
+            other => {
+                let id = other.id();
+                match id.name {
+                    ResourceName::Bound(_) => ValidatedEntry::Resolved(id),
+                    ResourceName::Pending => ValidatedEntry::PendingDirect(id),
+                }
+            }
         })
         .collect()
 }

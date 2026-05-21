@@ -12,7 +12,7 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::document::Document;
 use crate::position;
-use carina_core::parser::{ParseError, ParsedFile};
+use carina_core::parser::{ParseError, ParsedFile, ResourceRef};
 use carina_core::provider::ProviderFactory;
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
@@ -248,7 +248,13 @@ impl DiagnosticEngine {
 
             // Check resource types — include for-body template resources so
             // attribute/type/enum validation fires inside `for` loops too.
-            for (ctx, resource) in parsed.iter_all_resources() {
+            for rref in parsed.iter_all_resources() {
+                let ctx = rref.context();
+                // Bridge to the legacy `Resource` shape — `get_for`,
+                // `resolved_attributes`, and the id/attribute reads below
+                // are not yet typestate-aware (carina#3181 PR B).
+                let resource = rref.as_legacy_resource();
+                let resource = resource.as_ref();
                 let provider = &resource.id.provider;
                 let full_resource_type = format!("{}.{}", provider, resource.id.resource_type);
                 // Source-range hint for attribute position lookups. Without
@@ -331,7 +337,7 @@ impl DiagnosticEngine {
                 if let Some(schema) = &schema {
                     // Check data source without `read` keyword
                     if schema.is_data_source()
-                        && carina_core::resource::DataSource::try_from(resource).is_err()
+                        && !matches!(rref, ResourceRef::DataSource(_))
                         && let Some((line, col)) = self.find_resource_type_position(
                             doc,
                             provider,
@@ -825,7 +831,7 @@ impl DiagnosticEngine {
                 Some(merged) => {
                     let current_file_bindings: HashSet<String> = parsed
                         .iter_all_resources()
-                        .filter_map(|(_, r)| r.binding.clone())
+                        .filter_map(|rref| rref.binding().map(str::to_string))
                         .collect();
                     carina_core::validation::check_unused_bindings(merged)
                         .into_iter()

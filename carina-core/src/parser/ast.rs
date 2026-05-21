@@ -8,8 +8,8 @@ use super::expressions::validate_expr::CompareOp;
 use super::util::snake_to_pascal;
 use crate::binding_index::IterableBindings;
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, Resource, ResourceId, UnknownReason, Value,
-    VirtualResource,
+    ConcreteValue, DataSource, DeferredValue, Directives, Resource, ResourceId, ResourceKind,
+    ResourceLike, UnknownReason, Value, VirtualResource,
 };
 use crate::version_constraint::VersionConstraint;
 use indexmap::IndexMap;
@@ -58,6 +58,136 @@ pub struct DeferredForExpression {
 pub enum ResourceContext<'a> {
     Direct,
     Deferred(&'a DeferredForExpression),
+}
+
+/// A resource yielded by [`File::iter_all_resources`], discriminated by
+/// its typestate arm.
+///
+/// Part of the carina#3181 resource typestate split. The three typed
+/// arms borrow from `File`'s typed slices ([`File::resources`] managed
+/// rows, [`File::virtual_resources`], [`File::data_sources`]); the
+/// `Deferred` arm is a `for`-expression template body that still lives
+/// as a legacy [`Resource`] in [`File::deferred_for_expressions`].
+///
+/// Read-only consumers reach the shared accessors via
+/// [`ResourceRef::as_resource_like`] (or the `id` / `attributes` /
+/// `binding` passthroughs); callers that still branch on the kind use
+/// [`ResourceRef::kind`].
+#[derive(Debug, Clone, Copy)]
+pub enum ResourceRef<'a> {
+    /// A top-level managed resource.
+    Managed(&'a Resource),
+    /// A top-level virtual resource (module-expansion synthetic node).
+    Virtual(&'a VirtualResource),
+    /// A top-level data source (`read`-keyword resource).
+    DataSource(&'a DataSource),
+    /// The template body of a deferred `for` expression. Still a legacy
+    /// [`Resource`]; classify with [`ResourceRef::kind`] if needed.
+    Deferred {
+        resource: &'a Resource,
+        deferred: &'a DeferredForExpression,
+    },
+}
+
+impl<'a> ResourceRef<'a> {
+    /// View as the shared read-only trait — covers `id` / `attributes` /
+    /// `binding` / `dependency_bindings` for every arm.
+    pub fn as_resource_like(&self) -> &dyn ResourceLike {
+        match self {
+            ResourceRef::Managed(r) => *r,
+            ResourceRef::Virtual(v) => *v,
+            ResourceRef::DataSource(d) => *d,
+            ResourceRef::Deferred { resource, .. } => *resource,
+        }
+    }
+
+    /// Stable identifier of this resource.
+    pub fn id(&self) -> &'a ResourceId {
+        match self {
+            ResourceRef::Managed(r) => &r.id,
+            ResourceRef::Virtual(v) => &v.id,
+            ResourceRef::DataSource(d) => &d.id,
+            ResourceRef::Deferred { resource, .. } => &resource.id,
+        }
+    }
+
+    /// Source-order preserving attribute map.
+    pub fn attributes(&self) -> &'a IndexMap<String, Value> {
+        match self {
+            ResourceRef::Managed(r) => &r.attributes,
+            ResourceRef::Virtual(v) => &v.attributes,
+            ResourceRef::DataSource(d) => &d.attributes,
+            ResourceRef::Deferred { resource, .. } => &resource.attributes,
+        }
+    }
+
+    /// `let` binding name if any.
+    pub fn binding(&self) -> Option<&'a str> {
+        match self {
+            ResourceRef::Managed(r) => r.binding.as_deref(),
+            ResourceRef::Virtual(v) => v.binding.as_deref(),
+            ResourceRef::DataSource(d) => d.binding.as_deref(),
+            ResourceRef::Deferred { resource, .. } => resource.binding.as_deref(),
+        }
+    }
+
+    /// Classification of this resource. The `Deferred` arm reports the
+    /// template body's own `kind`.
+    pub fn kind(&self) -> ResourceKind {
+        match self {
+            ResourceRef::Managed(_) => ResourceKind::Managed,
+            ResourceRef::Virtual(_) => ResourceKind::Virtual,
+            ResourceRef::DataSource(_) => ResourceKind::DataSource,
+            ResourceRef::Deferred { resource, .. } => resource.kind.clone(),
+        }
+    }
+
+    /// `directives` meta-argument block. [`VirtualResource`] drops the
+    /// field (no `prevent_destroy` on a synthetic node) — returns `None`
+    /// for the `Virtual` arm.
+    pub fn directives(&self) -> Option<&'a Directives> {
+        match self {
+            ResourceRef::Managed(r) => Some(&r.directives),
+            ResourceRef::Virtual(_) => None,
+            ResourceRef::DataSource(d) => Some(&d.directives),
+            ResourceRef::Deferred { resource, .. } => Some(&resource.directives),
+        }
+    }
+
+    /// Parser-level set of attributes written as quoted string literals.
+    pub fn quoted_string_attrs(&self) -> &'a HashSet<String> {
+        match self {
+            ResourceRef::Managed(r) => &r.quoted_string_attrs,
+            ResourceRef::Virtual(v) => &v.quoted_string_attrs,
+            ResourceRef::DataSource(d) => &d.quoted_string_attrs,
+            ResourceRef::Deferred { resource, .. } => &resource.quoted_string_attrs,
+        }
+    }
+
+    /// The [`ResourceContext`] an old `iter_all_resources` caller would
+    /// have seen — `Deferred` for a for-expression template, `Direct`
+    /// otherwise.
+    pub fn context(&self) -> ResourceContext<'a> {
+        match self {
+            ResourceRef::Deferred { deferred, .. } => ResourceContext::Deferred(deferred),
+            _ => ResourceContext::Direct,
+        }
+    }
+
+    /// Bridge to the legacy [`Resource`] shape for APIs not yet
+    /// typestate-aware (`SchemaRegistry::get_for`,
+    /// `Resource::resolved_attributes`). Borrows for the `Managed` /
+    /// `Deferred` arms; rebuilds via the `From<&VirtualResource>` /
+    /// `From<&DataSource>` bridges for the other two. Removed in #3181
+    /// PR E alongside those bridges.
+    pub fn as_legacy_resource(&self) -> std::borrow::Cow<'a, Resource> {
+        match self {
+            ResourceRef::Managed(r) => std::borrow::Cow::Borrowed(r),
+            ResourceRef::Deferred { resource, .. } => std::borrow::Cow::Borrowed(resource),
+            ResourceRef::Virtual(v) => std::borrow::Cow::Owned(Resource::from(*v)),
+            ResourceRef::DataSource(d) => std::borrow::Cow::Owned(Resource::from(*d)),
+        }
+    }
 }
 
 /// Resource type path for typed references (e.g., aws.vpc, aws.security_group)
@@ -815,23 +945,38 @@ impl<E> File<E> {
         }
     }
 
-    /// Iterate every resource reachable from the parsed file — both
-    /// top-level `resources` and the `template_resource` of each deferred
-    /// for-expression — tagged with its origin context.
+    /// Iterate every resource reachable from the parsed file — the
+    /// top-level managed resources, virtual resources, data sources, and
+    /// the `template_resource` of each deferred for-expression — each
+    /// wrapped in a typed [`ResourceRef`].
     ///
     /// Per-attribute checkers (type, enum, required, ref validity, etc.)
     /// should prefer this over `self.resources.iter()` so they stay in sync
     /// with for-body code. See
     /// `notes/specs/2026-04-19-unify-resource-walk-design.md` for the
     /// rationale.
-    pub fn iter_all_resources(&self) -> impl Iterator<Item = (ResourceContext<'_>, &Resource)> {
+    ///
+    /// **carina#3181 PR B:** the managed arm filters `self.resources` to
+    /// `ResourceKind::Managed` rows. While the typestate migration is in
+    /// flight `resources` still holds virtual + data-source rows too (the
+    /// PR A duplicate storage); the filter keeps each resource yielded
+    /// exactly once — virtuals and data sources come from their typed
+    /// slices instead. PR C makes `resources` managed-only and drops the
+    /// filter.
+    pub fn iter_all_resources(&self) -> impl Iterator<Item = ResourceRef<'_>> {
         self.resources
             .iter()
-            .map(|r| (ResourceContext::Direct, r))
+            .filter(|r| matches!(r.kind, ResourceKind::Managed))
+            .map(ResourceRef::Managed)
+            .chain(self.virtual_resources.iter().map(ResourceRef::Virtual))
+            .chain(self.data_sources.iter().map(ResourceRef::DataSource))
             .chain(
                 self.deferred_for_expressions
                     .iter()
-                    .map(|d| (ResourceContext::Deferred(d), &d.template_resource)),
+                    .map(|d| ResourceRef::Deferred {
+                        resource: &d.template_resource,
+                        deferred: d,
+                    }),
             )
     }
 
@@ -992,6 +1137,19 @@ impl<E> File<E> {
             self.deferred_for_expressions.remove(idx);
         }
 
+        // carina#3181 PR A/B duplicate-storage invariant: every resource
+        // lives both in the legacy `resources` Vec and in its typed slice.
+        // Expansion happens after the parser's initial projection, so
+        // project the freshly expanded for-body resources into the typed
+        // slices here too — otherwise an expanded `read` for-body would be
+        // dropped by `iter_all_resources`'s managed-only filter.
+        for resource in &expanded_resources {
+            if let Ok(ds) = DataSource::try_from(resource) {
+                self.data_sources.push(ds);
+            } else if let Ok(vr) = VirtualResource::try_from(resource) {
+                self.virtual_resources.push(vr);
+            }
+        }
         self.resources.extend(expanded_resources);
         self.warnings.extend(new_warnings);
     }

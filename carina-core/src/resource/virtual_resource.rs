@@ -107,3 +107,30 @@ impl TryFrom<&Resource> for VirtualResource {
         }
     }
 }
+
+/// Transitional bridge — rebuild a legacy [`Resource`] from a
+/// `VirtualResource`. Symmetric with [`From<&ManagedResource> for Resource`]
+/// in `managed.rs` and [`From<&DataSource> for Resource`] in
+/// `data_source.rs`; removed alongside them when #3181 inline-merges
+/// `Resource` into the typestate structs.
+///
+/// `directives` / `prefixes` are reconstructed empty — `VirtualResource`
+/// drops both fields as compile-time invariants (no `prevent_destroy` and
+/// no auto-generated names apply to a synthetic node). The flattened
+/// `module_name` + `instance` pair is restored into `virtual_module`.
+impl From<&VirtualResource> for Resource {
+    fn from(v: &VirtualResource) -> Self {
+        Self {
+            id: v.id.clone(),
+            attributes: v.attributes.clone(),
+            kind: ResourceKind::Virtual,
+            directives: super::Directives::default(),
+            prefixes: std::collections::HashMap::new(),
+            binding: v.binding.clone(),
+            dependency_bindings: v.dependency_bindings.clone(),
+            module_source: None,
+            quoted_string_attrs: v.quoted_string_attrs.clone(),
+            virtual_module: Some((v.module_name.clone(), v.instance.clone())),
+        }
+    }
+}
