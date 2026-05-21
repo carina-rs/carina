@@ -3,6 +3,8 @@
 //! Core library for an infrastructure management tool that treats side effects as values
 
 pub mod binding_index;
+#[cfg(test)]
+mod binding_index_split_tests;
 pub mod builtins;
 pub mod config_loader;
 pub mod deps;
