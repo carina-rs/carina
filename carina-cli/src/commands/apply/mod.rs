@@ -299,8 +299,13 @@ pub(crate) async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), 
     // no source-side view of which exports the user intends — see the
     // `FinalizeApplyInput::export_params` doc-comment.
     if let Some(params) = input.export_params {
-        state.exports =
-            resolve_exports(params, input.sorted_resources, &state, input.wait_aliases)?;
+        state.exports = resolve_exports(
+            params,
+            input.sorted_resources,
+            input.pre_resolve_virtuals,
+            &state,
+            input.wait_aliases,
+        )?;
     }
 
     if let Some(lock) = input.lock {
@@ -353,11 +358,18 @@ pub(crate) async fn persist_exports_only(
     lock: Option<&LockInfo>,
     state_file: Option<StateFile>,
     sorted_resources: &[Resource],
+    pre_resolve_virtuals: &[carina_core::resource::VirtualResource],
     export_params: &[carina_core::parser::InferredExportParam],
     wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
 ) -> Result<(), AppError> {
     let mut state = state_file.unwrap_or_default();
-    let exports = resolve_exports(export_params, sorted_resources, &state, wait_aliases)?;
+    let exports = resolve_exports(
+        export_params,
+        sorted_resources,
+        pre_resolve_virtuals,
+        &state,
+        wait_aliases,
+    )?;
     state.exports = exports;
     if let Some(lk) = lock {
         save_state_locked(backend, lk, &mut state).await?;
@@ -1077,6 +1089,20 @@ async fn run_apply_locked(
         ctx.schemas(),
     );
 
+    // Snapshot each virtual resource's *pre-resolve* attributes
+    // (still carrying `ResourceRef`s) before the head-of-pipeline
+    // `resolve_refs_with_state_and_remote` call below replaces them
+    // with pre-apply concrete values. `finalize_apply`'s export
+    // resolution needs this snapshot to re-resolve virtuals against
+    // the post-apply state — see #3169 / #3177. Without it, every
+    // virtual ref is frozen at the pre-apply value and `state.exports`
+    // captures stale data after any Replace on a referenced managed
+    // resource.
+    let pre_resolve_virtuals: Vec<carina_core::resource::VirtualResource> = sorted_resources
+        .iter()
+        .filter_map(|r| carina_core::resource::VirtualResource::try_from(r).ok())
+        .collect();
+
     // Resolve references and enum identifiers, then create initial plan for display
     let mut resources_for_plan = sorted_resources.clone();
     resolve_refs_with_state_and_remote(
@@ -1191,11 +1217,22 @@ async fn run_apply_locked(
             )
             .cyan()
         );
+        // No-op apply path: virtuals were never resolved (no head-of-
+        // pipeline pass ran), so `sorted_resources` still carries
+        // the authored `ResourceRef` snapshots. Pull pre-resolve
+        // virtuals straight from it — same shape `resolve_exports`
+        // expects from the post-apply path.
+        let pre_resolve_virtuals_noop: Vec<carina_core::resource::VirtualResource> =
+            sorted_resources
+                .iter()
+                .filter_map(|r| carina_core::resource::VirtualResource::try_from(r).ok())
+                .collect();
         persist_exports_only(
             backend,
             lock,
             state_file,
             &sorted_resources,
+            &pre_resolve_virtuals_noop,
             &parsed.export_params,
             &wait_aliases,
         )
@@ -1301,6 +1338,7 @@ async fn run_apply_locked(
         schemas,
         export_params: Some(&parsed.export_params),
         wait_aliases: &wait_aliases,
+        pre_resolve_virtuals: &pre_resolve_virtuals,
     })
     .await?;
 
@@ -1641,6 +1679,10 @@ async fn run_apply_from_plan_locked(
         // the field is required; pass the reconstructed aliases so the
         // value is correct if a future plan file persists export_params.
         wait_aliases: &wait_aliases,
+        // Same rationale as `export_params: None`: no export
+        // resolution runs from the `apply --plan` path, so no
+        // pre-resolve virtual snapshot is needed.
+        pre_resolve_virtuals: &[],
     })
     .await?;
 

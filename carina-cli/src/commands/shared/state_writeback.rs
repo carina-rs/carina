@@ -89,6 +89,26 @@ pub(crate) struct FinalizeApplyInput<'a> {
     /// (paired with `export_params: None`, so no export resolution
     /// runs there anyway).
     pub wait_aliases: &'a [carina_core::binding_index::WaitAliasSpec],
+    /// Pre-resolve snapshot of every `VirtualResource` in the
+    /// configuration: each one carries its **authored**
+    /// `ResourceRef` attribute values (e.g. `role_arn = role.arn`),
+    /// not the pre-apply-resolved concrete values.
+    ///
+    /// `apply` mutates a working copy of `sorted_resources`
+    /// in-place via `resolve_refs_with_state_and_remote` at the head
+    /// of the pipeline, which collapses every `ResourceRef` —
+    /// including the ones inside virtual `attributes` — into
+    /// pre-apply concrete values. By the time `finalize_apply`
+    /// runs, the resolved copy holds the *pre-apply* values, and a
+    /// post-apply re-resolve has nothing to chase.
+    ///
+    /// This field carries the unresolved snapshot taken **before**
+    /// that head-of-pipeline pass, so the export-resolution path
+    /// (#3169 / #3177) can re-resolve virtuals against the
+    /// post-apply state. Empty for the `apply --plan` path, where
+    /// `export_params` is also `None` and no export resolution
+    /// runs.
+    pub pre_resolve_virtuals: &'a [carina_core::resource::VirtualResource],
 }
 
 /// Resolve export expressions using bindings built from applied state.
@@ -101,22 +121,49 @@ pub(crate) struct FinalizeApplyInput<'a> {
 /// bindings — a downstream `exports { x = my_module_call.attr }` then
 /// fails with `unresolved reference my_module_call.attr` even though
 /// `carina plan` rendered the value cleanly. Issue #2479.
+///
+/// # Post-apply virtual re-resolution (#3169)
+///
+/// Before #3177 this function fed `sorted_resources` directly into
+/// `from_resources_with_state`. That captured each virtual's
+/// **pre-apply** attribute snapshot — for a virtual whose
+/// `attributes.role_arn = role.arn` and a managed `role` that was
+/// `Replace`d during apply, the pre-apply `role.arn` was the
+/// *old* ARN. The writeback path then wrote that stale ARN into
+/// `state.exports`, even though `state.resources[role].attributes.arn`
+/// already held the new ARN. Issue #3169.
+///
+/// The fix splits `sorted_resources` by kind and re-resolves virtual
+/// attributes against the post-apply view before exports use them:
+///
+/// 1. Build `post_apply_states` from `state.resources` (managed
+///    resources' applied attributes).
+/// 2. Split `sorted_resources` into a managed view (Managed +
+///    DataSource collapsed via [`ManagedResource::as_managed_view`])
+///    and a virtual view ([`VirtualResource::try_from`]).
+/// 3. Build the bindings view from the managed slice via
+///    [`ResolvedBindings::from_managed_with_state`] (#3176).
+/// 4. Re-resolve each virtual's `ResourceRef`s against that view via
+///    [`resolve_virtual_refs_post_apply`] (#3175), so a virtual that
+///    references a Replaced managed gets the *post*-replace value.
+/// 5. Layer the re-resolved virtuals onto the bindings view via
+///    `add_virtual_resources` (#3176).
+/// 6. Resolve export expressions against the combined view.
 pub(crate) fn resolve_exports(
     export_params: &[carina_core::parser::InferredExportParam],
     sorted_resources: &[Resource],
+    pre_resolve_virtuals: &[carina_core::resource::VirtualResource],
     state: &StateFile,
     wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
-) -> Result<HashMap<String, serde_json::Value>, carina_core::value::SerializationError> {
+) -> Result<HashMap<String, serde_json::Value>, AppError> {
     use carina_core::binding_index::ResolvedBindings;
-    use carina_core::resource::Value;
+    use carina_core::resolver::resolve_virtual_refs_post_apply;
+    use carina_core::resource::{ManagedResource, ResourceKind, Value};
 
-    // `from_resources_with_state` merges DSL-side attributes
-    // (`sorted_resources`, including `ResourceKind::Virtual` synthesised
-    // by module-call expansion) with provider-returned post-apply
-    // attributes (`current_states`, derived from `state.resources`).
-    // Same merge order the planner uses, so plan and writeback resolve
-    // identically.
-    let current_states = state
+    // Step 1: rebuild post-apply `current_states` from
+    // `state.resources` (the writeback already wrote the post-apply
+    // attribute values into the StateFile).
+    let post_apply_states = state
         .resources
         .iter()
         .map(|rs| {
@@ -139,13 +186,61 @@ pub(crate) fn resolve_exports(
             )
         })
         .collect::<HashMap<_, _>>();
-    let bindings = ResolvedBindings::from_resources_with_state(
-        sorted_resources,
-        &current_states,
+
+    // Step 2: extract the managed view from `sorted_resources`.
+    // `sorted_resources` carries the *resolved* working copy that
+    // the apply pipeline mutated — its virtual entries have already
+    // had `ResourceRef`s collapsed to pre-apply concrete values, so
+    // we ignore them here and pull virtuals from
+    // `pre_resolve_virtuals` instead. DataSources are collapsed
+    // onto a `ManagedResource` view because the binding index only
+    // cares about (binding name, attribute map, state merge) —
+    // DataSources share that shape with managed resources. See
+    // `ManagedResource::as_managed_view` for the rationale and the
+    // `Virtual must not pass through here` invariant.
+    let mut managed: Vec<ManagedResource> = Vec::with_capacity(sorted_resources.len());
+    for r in sorted_resources {
+        match r.kind {
+            ResourceKind::Virtual { .. } => {
+                // Virtuals come from `pre_resolve_virtuals` below.
+                continue;
+            }
+            ResourceKind::Managed | ResourceKind::DataSource => {
+                managed.push(ManagedResource::as_managed_view(r));
+            }
+        }
+    }
+
+    // Virtuals: fresh clone of the **pre-resolve** snapshot. Their
+    // attributes still carry `ResourceRef`s, so the post-apply
+    // resolver below can pick up the post-apply state values for
+    // any managed sibling that was Replaced during apply
+    // (#3169 / #3177).
+    let mut virtuals: Vec<carina_core::resource::VirtualResource> = pre_resolve_virtuals.to_vec();
+
+    // Step 3: build the bindings view from the managed slice plus
+    // post-apply states. Wait aliases land at the end of construction
+    // and snapshot whatever binding the alias targets (carina#3085).
+    let mut bindings = ResolvedBindings::from_managed_with_state(
+        &managed,
+        &post_apply_states,
         &HashMap::new(),
         wait_aliases,
     );
 
+    // Step 4: re-resolve each virtual's attributes against the
+    // post-apply bindings view. After this, a virtual's
+    // `role_arn = role.arn` no longer holds the pre-apply
+    // `ResourceRef`; it holds the post-apply concrete value.
+    resolve_virtual_refs_post_apply(&mut virtuals, &bindings)?;
+
+    // Step 5: layer the re-resolved virtuals onto the bindings view.
+    // Now `exports { foo = some_module.role_arn }` resolves against
+    // a binding whose `role_arn` is the post-apply value.
+    bindings.add_virtual_resources(&virtuals)?;
+
+    // Step 6: resolve the export expressions against the combined
+    // view.
     let mut exports = HashMap::new();
     for param in export_params {
         if let Some(ref value) = param.value {
