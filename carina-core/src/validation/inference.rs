@@ -186,19 +186,25 @@ pub fn bindings_from_parts(
     for us in upstream_states {
         out.insert(us.binding.clone(), InferenceBinding::UpstreamState);
     }
+    // Per-iteration kind classification via `TryFrom` instead of a
+    // `resource.is_virtual()` runtime guard (carina#3180). Source-order
+    // insertion is preserved so duplicate-binding last-write-wins
+    // semantics — documented above as the mid-edit LSP fallback — keep
+    // matching the source order.
+    //
+    // `Virtual` resources synthesised by module-call expansion
+    // (`expand_module_call`) carry no provider identity — their
+    // attributes are projections from the module's
+    // `attributes { ... }` block. Tag them so `infer_resource_ref`
+    // recurses into the bound expression instead of trying a schema
+    // lookup that would always fail. #2493.
     for resource in resources {
         let Some(name) = &resource.binding else {
             continue;
         };
-        // `Virtual` resources synthesised by module-call expansion
-        // (`expand_module_call`) carry no provider identity — their
-        // attributes are projections from the module's
-        // `attributes { ... }` block. Tag them so `infer_resource_ref`
-        // recurses into the bound expression instead of trying a schema
-        // lookup that would always fail. #2493.
-        let entry = if resource.is_virtual() {
+        let entry = if let Ok(v) = crate::resource::VirtualResource::try_from(resource) {
             InferenceBinding::Virtual {
-                attributes: resource.attributes.clone(),
+                attributes: v.attributes,
             }
         } else {
             InferenceBinding::Resource {

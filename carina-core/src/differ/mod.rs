@@ -111,19 +111,35 @@ pub fn split_resources_by_kind(
     Vec<crate::resource::ManagedResource>,
     Vec<crate::resource::DataSource>,
 ) {
+    let (managed, data_sources, _virtuals) = split_resources_by_kind_with_virtuals(resources);
+    (managed, data_sources)
+}
+
+/// Like [`split_resources_by_kind`], but also returns the virtual slice
+/// instead of dropping it. Used by callers that need to handle all
+/// three kinds (inference binding map, validation diagnostics, etc.)
+/// so the `match resource.kind` per-iteration check is replaced by a
+/// single typed split at the top of the function (carina#3180).
+pub fn split_resources_by_kind_with_virtuals(
+    resources: &[Resource],
+) -> (
+    Vec<crate::resource::ManagedResource>,
+    Vec<crate::resource::DataSource>,
+    Vec<crate::resource::VirtualResource>,
+) {
     let mut managed = Vec::new();
     let mut data_sources = Vec::new();
+    let mut virtuals = Vec::new();
     for r in resources {
         if let Ok(ds) = crate::resource::DataSource::try_from(r) {
             data_sources.push(ds);
+        } else if let Ok(v) = crate::resource::VirtualResource::try_from(r) {
+            virtuals.push(v);
         } else if let Ok(m) = crate::resource::ManagedResource::try_from(r) {
             managed.push(m);
         }
-        // Virtuals are silently dropped by both `TryFrom` impls
-        // returning `Err(ResourceKindMismatch)`; the post-apply-only
-        // typestate invariant means they have no role here.
     }
-    (managed, data_sources)
+    (managed, data_sources, virtuals)
 }
 
 #[cfg(test)]

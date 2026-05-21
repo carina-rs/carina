@@ -2119,7 +2119,10 @@ pub(crate) async fn refresh_resource_set<'a>(
 ) -> Result<bool, AppError> {
     let mut started_bar = false;
     let results: Vec<Result<(ResourceId, State), AppError>> =
-        stream::iter(resources.filter(|r| !r.is_virtual() && !r.is_data_source()))
+        // Typed kind gate (carina#3180): refresh only addresses
+        // managed resources. Data sources go through the data-source
+        // refresh path, virtuals carry no provider state.
+        stream::iter(resources.filter(|r| carina_core::resource::ManagedResource::try_from(*r).is_ok()))
             .map(|resource| {
                 started_bar = true;
                 let progress = RefreshProgress::begin_multi(multi, &resource.id);
@@ -2234,7 +2237,9 @@ pub(crate) fn resolve_data_source_refs_for_refresh(
     carina_core::value::canonicalize_resources_with_schemas(&mut resolved, schemas);
     Ok(resolved
         .into_iter()
-        .filter(|r| !r.is_virtual() && r.is_data_source())
+        // Typed kind gate (carina#3180): only data sources are
+        // forwarded to the data-source refresh stage.
+        .filter(|r| carina_core::resource::DataSource::try_from(r).is_ok())
         .collect())
 }
 
