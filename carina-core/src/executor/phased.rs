@@ -170,11 +170,24 @@ pub(super) fn build_phase_dependency_map(
 }
 
 /// Resolve binding-name dependencies to the effect indices they reach,
-/// expanding any [`ResourceKind::Virtual`] proxy bindings transparently
+/// expanding any [`VirtualResource`] proxy bindings transparently
 /// through their own attribute references (#2543).
+///
+/// `virtuals_by_binding` now holds only virtuals (typestate-split
+/// #3178): the previous mixed `HashMap<&str, &Resource>` plus a
+/// runtime `matches!(res.kind, Virtual { .. })` check is replaced
+/// by a slice of one type. A binding being present in
+/// `virtuals_by_binding` *is* the "this is a virtual" condition; no
+/// runtime kind probe is needed.
 pub(super) struct DepResolver<'a> {
     binding_to_idx: &'a HashMap<String, usize>,
-    binding_to_resource: HashMap<&'a str, &'a Resource>,
+    /// Virtual resources owned by the resolver, keyed by their
+    /// `binding` name. Owned rather than `&'a VirtualResource`
+    /// because `VirtualResource::try_from(&Resource)` returns an
+    /// owned wrapper — keeping a borrow would force a
+    /// self-referential struct. The clone cost is bounded by the
+    /// number of virtuals in the config (typically small).
+    virtuals_by_binding: HashMap<String, crate::resource::VirtualResource>,
     /// `Some` filters output indices to those in the phase; `None` retains
     /// every reachable index.
     phase_set: Option<&'a HashSet<usize>>,
@@ -186,13 +199,33 @@ impl<'a> DepResolver<'a> {
         unresolved_resources: &'a HashMap<ResourceId, Resource>,
         phase_set: Option<&'a HashSet<usize>>,
     ) -> Self {
-        let binding_to_resource = unresolved_resources
-            .values()
-            .filter_map(|r| r.binding.as_deref().map(|b| (b, r)))
-            .collect();
+        // Project the mixed `unresolved_resources` map to a
+        // virtual-only `virtuals_by_binding` view via
+        // `VirtualResource::try_from`. Managed / DataSource arms
+        // fail the conversion and are silently filtered — that is
+        // the typestate-split equivalent of the legacy
+        // `matches!(res.kind, Virtual { .. })` check inside
+        // `expand`.
+        //
+        // The legacy code recorded all kinds in
+        // `binding_to_resource` and gated virtual-expansion on a
+        // runtime kind check at lookup time. Restricting the map
+        // to virtuals at construction time keeps the observable
+        // behaviour identical (only virtuals were ever traversed
+        // by the legacy gate) and removes the runtime probe.
+        let virtuals_by_binding: HashMap<String, crate::resource::VirtualResource> =
+            unresolved_resources
+                .values()
+                .filter_map(|r| {
+                    let binding = r.binding.clone()?;
+                    crate::resource::VirtualResource::try_from(r)
+                        .ok()
+                        .map(|v| (binding, v))
+                })
+                .collect();
         Self {
             binding_to_idx,
-            binding_to_resource,
+            virtuals_by_binding,
             phase_set,
         }
     }
@@ -207,7 +240,15 @@ impl<'a> DepResolver<'a> {
         }
     }
 
-    fn expand(&self, binding: &'a str, out: &mut HashSet<usize>, visited: &mut HashSet<&'a str>) {
+    /// Recursive dependency walk. The `'b` lifetime is bound to the
+    /// `&self` borrow at the call site so the borrowed keys live
+    /// inside the resolver (`virtuals_by_binding` / `binding_to_idx`).
+    fn expand<'b>(
+        &'b self,
+        binding: &'b str,
+        out: &mut HashSet<usize>,
+        visited: &mut HashSet<&'b str>,
+    ) {
         if !visited.insert(binding) {
             return;
         }
@@ -217,24 +258,23 @@ impl<'a> DepResolver<'a> {
             }
             return;
         }
-        // No Effect for this binding. If it's a Virtual resource (a module's
-        // attributes-block proxy), follow the references in its own attributes
-        // to the underlying resources the module exposes.
-        let Some(res) = self.binding_to_resource.get(binding) else {
+        // No effect for this binding. If it names a `VirtualResource`
+        // (a module's attributes-block proxy), follow the
+        // references in its own attributes to the underlying
+        // resources the module exposes. The typed map answers
+        // "is this a virtual?" by presence — no `matches!` probe.
+        let Some(virt) = self.virtuals_by_binding.get(binding) else {
             return;
         };
-        if !matches!(res.kind, crate::resource::ResourceKind::Virtual { .. }) {
-            return;
-        }
-        // `get_resource_dependencies` returns owned `String`s, but the
-        // visit set borrows from this resolver's keys to avoid per-binding
-        // allocation. Re-borrow each inner binding from the
-        // `binding_to_resource` / `binding_to_idx` keys so the borrow lifetime
-        // matches `'a`.
-        for inner in get_resource_dependencies(res) {
-            let key: &'a str =
-                if let Some((k, _)) = self.binding_to_resource.get_key_value(inner.as_str()) {
-                    k
+        // `get_virtual_resource_dependencies` returns owned `String`s,
+        // but the visit set borrows from this resolver's keys to
+        // avoid per-binding allocation. Re-borrow each inner
+        // binding from the resolver's own keys so the borrow
+        // lifetime matches `'b` (the `&self` borrow lifetime).
+        for inner in crate::deps::get_virtual_resource_dependencies(virt) {
+            let key: &'b str =
+                if let Some((k, _)) = self.virtuals_by_binding.get_key_value(inner.as_str()) {
+                    k.as_str()
                 } else if let Some((k, _)) = self.binding_to_idx.get_key_value(inner.as_str()) {
                     k.as_str()
                 } else {

@@ -35,6 +35,25 @@ pub fn get_resource_dependencies(resource: &Resource) -> HashSet<String> {
     deps
 }
 
+/// Dependency-binding collection for a [`VirtualResource`](crate::resource::VirtualResource).
+///
+/// `VirtualResource` has no `directives` field — synthetic IR nodes
+/// never carry `depends_on`. The collection therefore reduces to
+/// "attributes' ResourceRefs ∪ `dependency_bindings`", which is the
+/// same first-two-thirds of [`get_resource_dependencies`].
+pub fn get_virtual_resource_dependencies(
+    virt: &crate::resource::VirtualResource,
+) -> HashSet<String> {
+    let mut deps = HashSet::new();
+    for value in virt.attributes.values() {
+        collect_dependencies(value, &mut deps);
+    }
+    for name in &virt.dependency_bindings {
+        deps.insert(name.clone());
+    }
+    deps
+}
+
 /// Recursively collect resource reference dependencies from a value.
 ///
 /// Both attribute references (`vpc.vpc_id`) and bare-binding refs
@@ -341,6 +360,44 @@ mod tests {
         let deps = get_resource_dependencies(&resource);
         assert!(deps.contains("b"));
         assert!(deps.contains("c"));
+        assert_eq!(deps.len(), 2);
+    }
+
+    #[test]
+    fn test_get_virtual_resource_dependencies_collects_attrs_and_deps() {
+        use crate::resource::VirtualResource;
+        use indexmap::IndexMap;
+        use std::collections::BTreeSet;
+
+        // Build a virtual whose attributes carry a ResourceRef and
+        // whose `dependency_bindings` carries a separate entry.
+        // Both must end up in the merged set.
+        let mut attributes = IndexMap::new();
+        attributes.insert(
+            "role_arn".to_string(),
+            Value::resource_ref("role".to_string(), "arn", vec![]),
+        );
+        let mut dep_bindings = BTreeSet::new();
+        dep_bindings.insert("explicit_dep".to_string());
+        let virt = VirtualResource {
+            id: ResourceId::new("_virtual.module", "v"),
+            attributes,
+            binding: Some("v".to_string()),
+            dependency_bindings: dep_bindings,
+            module_name: "m".to_string(),
+            instance: "v".to_string(),
+            quoted_string_attrs: Default::default(),
+        };
+
+        let deps = get_virtual_resource_dependencies(&virt);
+        assert!(
+            deps.contains("role"),
+            "expected attribute ResourceRef binding `role`, got {deps:?}",
+        );
+        assert!(
+            deps.contains("explicit_dep"),
+            "expected pre-recorded dependency `explicit_dep`, got {deps:?}",
+        );
         assert_eq!(deps.len(), 2);
     }
 
