@@ -394,8 +394,10 @@ pub async fn detect_drift(
     let mut drift_messages: Vec<String> = Vec::new();
 
     for resource in sorted_resources {
-        // Skip virtual resources (module attribute containers)
-        if resource.is_virtual() {
+        // Skip virtual resources (module attribute containers).
+        // Typed kind gate (carina#3180): the drift check operates over
+        // provider-backed kinds only.
+        if carina_core::resource::VirtualResource::try_from(resource).is_ok() {
             continue;
         }
 
@@ -861,10 +863,11 @@ async fn run_apply_locked(
         .unwrap_or_default();
 
     // Phase 1: refresh managed (non-data-source) resources in parallel.
+    // Typed kind gate (carina#3180).
     let phase1_results: Vec<Result<(ResourceId, State), AppError>> = stream::iter(
         sorted_resources
             .iter()
-            .filter(|r| !r.is_virtual() && !r.is_data_source()),
+            .filter(|r| carina_core::resource::ManagedResource::try_from(*r).is_ok()),
     )
     .map(|resource| {
         let progress = RefreshProgress::begin_multi(&multi, &resource.id);

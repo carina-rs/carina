@@ -39,11 +39,30 @@ pub fn validate_resources<E>(
     let mut all_errors = Vec::new();
     let lookup = crate::parser::provider_context_lookup(provider_context);
 
+    // Classify per kind via typed wrappers instead of runtime
+    // `is_virtual()` / `is_data_source()` calls (carina#3180). Virtuals
+    // are post-apply attribute containers and have no schema to
+    // validate against, so they are silently filtered. Managed and
+    // data sources route to the same schema-lookup body but render
+    // different kind-mismatch diagnostics when the registry entry of
+    // the *opposite* kind exists.
+    use crate::resource::{DataSource, ManagedResource, VirtualResource};
+    enum ValidatableKind {
+        Managed,
+        DataSource,
+    }
     for (_ctx, resource) in parsed.iter_all_resources() {
-        // Skip virtual resources (module attribute containers)
-        if resource.is_virtual() {
+        if VirtualResource::try_from(resource).is_ok() {
             continue;
         }
+        let kind = if DataSource::try_from(resource).is_ok() {
+            ValidatableKind::DataSource
+        } else if ManagedResource::try_from(resource).is_ok() {
+            ValidatableKind::Managed
+        } else {
+            // Unknown kind — shouldn't happen, but keep the loop total.
+            continue;
+        };
 
         match registry.get_for(resource) {
             Some(schema) => {
@@ -75,20 +94,24 @@ pub fn validate_resources<E>(
                     format!("{}.{}", provider, resource_type)
                 };
 
-                if resource.is_data_source() && has_managed {
-                    // `read` used against a managed-only type
-                    all_errors.push(format!(
-                        "{} is a managed resource, not a data source. Remove the `read` keyword:\n  let <name> = {} {{ }}",
-                        kind_label, kind_label
-                    ));
-                } else if !resource.is_data_source() && has_data_source {
-                    // No `read` against a data-source-only type
-                    all_errors.push(format!(
-                        "{} is a data source and must be used with the `read` keyword:\n  let <name> = read {} {{ }}",
-                        kind_label, kind_label
-                    ));
-                } else {
-                    all_errors.push(format!("Unknown resource type: {}", kind_label));
+                match kind {
+                    ValidatableKind::DataSource if has_managed => {
+                        // `read` used against a managed-only type
+                        all_errors.push(format!(
+                            "{} is a managed resource, not a data source. Remove the `read` keyword:\n  let <name> = {} {{ }}",
+                            kind_label, kind_label
+                        ));
+                    }
+                    ValidatableKind::Managed if has_data_source => {
+                        // No `read` against a data-source-only type
+                        all_errors.push(format!(
+                            "{} is a data source and must be used with the `read` keyword:\n  let <name> = read {} {{ }}",
+                            kind_label, kind_label
+                        ));
+                    }
+                    _ => {
+                        all_errors.push(format!("Unknown resource type: {}", kind_label));
+                    }
                 }
             }
         }

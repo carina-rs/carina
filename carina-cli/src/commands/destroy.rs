@@ -188,9 +188,13 @@ async fn run_destroy_locked(
 
         // Read states for managed resources concurrently using identifier from state.
         // Skip data sources (read-only) and virtual resources -- they won't be destroyed.
+        // The `ManagedResource::try_from(r).is_ok()` filter expresses
+        // the kind constraint through the typed wrapper instead of
+        // chained `is_data_source()` / `is_virtual()` runtime checks
+        // (carina#3180).
         let managed_resources: Vec<&Resource> = all_resources
             .iter()
-            .filter(|r| !r.is_data_source() && !r.is_virtual())
+            .filter(|r| carina_core::resource::ManagedResource::try_from(*r).is_ok())
             .collect();
         let provider_ref = &provider;
         let results: Vec<Result<(ResourceId, State), AppError>> = stream::iter(&managed_resources)
@@ -248,9 +252,11 @@ async fn run_destroy_locked(
             }
         }
     } else if let Some(sf) = state_file.as_ref() {
-        // --refresh=false: build states from state file without AWS calls
+        // --refresh=false: build states from state file without AWS calls.
+        // Typed filter (carina#3180): non-managed kinds have no
+        // identifier shape to lift from the state file.
         for resource in &all_resources {
-            if resource.is_data_source() || resource.is_virtual() {
+            if carina_core::resource::ManagedResource::try_from(resource).is_err() {
                 continue;
             }
             let state = sf.build_state_for_resource(resource);
@@ -279,8 +285,9 @@ async fn run_destroy_locked(
     let resources_to_destroy: Vec<&Resource> = destroy_order
         .iter()
         .filter(|r| {
-            // Skip data sources (read-only) and virtual resources -- nothing to destroy
-            if r.is_data_source() || r.is_virtual() {
+            // Skip data sources (read-only) and virtual resources -- nothing to destroy.
+            // Typed kind gate (carina#3180).
+            if carina_core::resource::ManagedResource::try_from(*r).is_err() {
                 return false;
             }
 
