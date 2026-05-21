@@ -15,12 +15,17 @@ fn sample_value(s: &str) -> Value {
 
 fn make_resource(kind: ResourceKind) -> Resource {
     let deps: BTreeSet<String> = ["dep_binding".into()].into_iter().collect();
-    Resource::new("aws.s3.Bucket", "b")
+    let is_virtual = matches!(kind, ResourceKind::Virtual);
+    let mut res = Resource::new("aws.s3.Bucket", "b")
         .with_kind(kind)
         .with_attribute("k", sample_value("v"))
         .with_binding("b")
         .with_dependency_bindings(deps)
-        .with_module_source(ModuleSource::module("m", "inst"))
+        .with_module_source(ModuleSource::module("m", "inst"));
+    if is_virtual {
+        res.virtual_module = Some(("m".into(), "inst".into()));
+    }
+    res
 }
 
 fn assert_resource_like<R: ResourceLike>(
@@ -62,10 +67,7 @@ fn managed_resource_implements_resource_like() {
 
 #[test]
 fn virtual_resource_implements_resource_like() {
-    let res = make_resource(ResourceKind::Virtual {
-        module_name: "m".into(),
-        instance: "inst".into(),
-    });
+    let res = make_resource(ResourceKind::Virtual);
     let v = VirtualResource::try_from(&res).expect("Virtual → VirtualResource");
     let deps: BTreeSet<String> = ["dep_binding".into()].into_iter().collect();
     let expected_id = v.id.clone();
@@ -90,10 +92,9 @@ fn binding_none_covers_all_arms() {
     let managed = ManagedResource::try_from(&res_managed).expect("Managed → ManagedResource");
     assert_eq!(<ManagedResource as ResourceLike>::binding(&managed), None);
 
-    let res_virt = Resource::new("aws.s3.Bucket", "b").with_kind(ResourceKind::Virtual {
-        module_name: "m".into(),
-        instance: "i".into(),
-    });
+    let mut res_virt = Resource::new("aws.s3.Bucket", "b").with_kind(ResourceKind::Virtual);
+
+    res_virt.virtual_module = Some(("m".into(), "i".into()));
     let v = VirtualResource::try_from(&res_virt).expect("Virtual → VirtualResource");
     assert_eq!(<VirtualResource as ResourceLike>::binding(&v), None);
 
@@ -114,10 +115,7 @@ fn resource_like_supports_generic_dispatch() {
     let managed = ManagedResource::try_from(&res).expect("Managed → ManagedResource");
     assert_eq!(first_attribute_key(&managed), Some(&"k".to_string()));
 
-    let virt_src = make_resource(ResourceKind::Virtual {
-        module_name: "m".into(),
-        instance: "inst".into(),
-    });
+    let virt_src = make_resource(ResourceKind::Virtual);
     let v = VirtualResource::try_from(&virt_src).expect("Virtual → VirtualResource");
     assert_eq!(first_attribute_key(&v), Some(&"k".to_string()));
 

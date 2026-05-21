@@ -47,6 +47,7 @@ fn create_test_module() -> ParsedFile {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             quoted_string_attrs: std::collections::HashSet::new(),
+            virtual_module: None,
         }],
         variables: IndexMap::new(),
         uses: vec![],
@@ -153,6 +154,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             quoted_string_attrs: std::collections::HashSet::new(),
+            virtual_module: None,
         }],
         variables: IndexMap::new(),
         uses: vec![],
@@ -297,6 +299,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             quoted_string_attrs: std::collections::HashSet::new(),
+            virtual_module: None,
         }],
         variables: IndexMap::new(),
         uses: vec![],
@@ -397,6 +400,7 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
             instance: current_prefix.clone(),
         }),
         quoted_string_attrs: std::collections::HashSet::new(),
+        virtual_module: None,
     }];
 
     let state_lookup = |_: &str, _: &str| vec![state_name.clone()];
@@ -440,6 +444,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
                 quoted_string_attrs: std::collections::HashSet::new(),
+                virtual_module: None,
             },
             Resource {
                 id: ResourceId::new("ec2.Subnet", "sub"),
@@ -458,6 +463,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
                 quoted_string_attrs: std::collections::HashSet::new(),
+                virtual_module: None,
             },
         ],
         variables: IndexMap::new(),
@@ -601,6 +607,7 @@ fn create_module_with_attributes() -> ParsedFile {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             quoted_string_attrs: std::collections::HashSet::new(),
+            virtual_module: None,
         }],
         variables: IndexMap::new(),
         uses: vec![],
@@ -657,13 +664,11 @@ fn test_expand_module_call_creates_virtual_resource() {
         .expect("Virtual resource should exist");
 
     assert_eq!(virtual_res.binding, Some("web".to_string()));
-    // Module info should be in the kind, not in attributes
+    // Module info should be in the virtual_module field, not in attributes
+    assert_eq!(virtual_res.kind, ResourceKind::Virtual);
     assert_eq!(
-        virtual_res.kind,
-        ResourceKind::Virtual {
-            module_name: "web_tier".to_string(),
-            instance: "web".to_string(),
-        }
+        virtual_res.virtual_module,
+        Some(("web_tier".to_string(), "web".to_string()))
     );
     assert!(!virtual_res.attributes.contains_key("_module"));
     assert!(!virtual_res.attributes.contains_key("_module_instance"));
@@ -1297,6 +1302,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             quoted_string_attrs: std::collections::HashSet::new(),
+            virtual_module: None,
         });
         m.wait_bindings.push(WaitBinding {
             binding: "cert_issued".into(),
@@ -1547,6 +1553,7 @@ fn create_module_with_interpolation() -> ParsedFile {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             quoted_string_attrs: std::collections::HashSet::new(),
+            virtual_module: None,
         }],
         variables: IndexMap::new(),
         uses: vec![],
@@ -4004,6 +4011,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             quoted_string_attrs: std::collections::HashSet::new(),
+            virtual_module: None,
         });
         m.deferred_for_expressions.push(DeferredForExpression {
             file: None,
@@ -4040,6 +4048,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
                 quoted_string_attrs: std::collections::HashSet::new(),
+                virtual_module: None,
             },
         });
         m
@@ -4166,6 +4175,7 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
                 quoted_string_attrs: std::collections::HashSet::new(),
+                virtual_module: None,
             },
         });
         m

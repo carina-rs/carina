@@ -1190,10 +1190,11 @@ fn resolve_exports_resolves_module_call_attribute_via_virtual_resource() {
     // an expanded sub-resource.
     let mut virtual_resource = Resource::new("_virtual", "github_actions_carina");
     virtual_resource.binding = Some("github_actions_carina".to_string());
-    virtual_resource.kind = ResourceKind::Virtual {
-        module_name: "github_module".to_string(),
-        instance: "github_actions_carina".to_string(),
-    };
+    virtual_resource.kind = ResourceKind::Virtual;
+    virtual_resource.virtual_module = Some((
+        "github_module".to_string(),
+        "github_actions_carina".to_string(),
+    ));
     virtual_resource.attributes.insert(
         "role_arn".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {
@@ -1274,10 +1275,8 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_virtuals() {
 
     let mut inner_virtual = Resource::new("_virtual", "outer.inner");
     inner_virtual.binding = Some("outer.inner".to_string());
-    inner_virtual.kind = ResourceKind::Virtual {
-        module_name: "inner_module".to_string(),
-        instance: "outer.inner".to_string(),
-    };
+    inner_virtual.kind = ResourceKind::Virtual;
+    inner_virtual.virtual_module = Some(("inner_module".to_string(), "outer.inner".to_string()));
     inner_virtual.attributes.insert(
         "role_arn".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {
@@ -1287,10 +1286,8 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_virtuals() {
 
     let mut outer_virtual = Resource::new("_virtual", "outer");
     outer_virtual.binding = Some("outer".to_string());
-    outer_virtual.kind = ResourceKind::Virtual {
-        module_name: "outer_module".to_string(),
-        instance: "outer".to_string(),
-    };
+    outer_virtual.kind = ResourceKind::Virtual;
+    outer_virtual.virtual_module = Some(("outer_module".to_string(), "outer".to_string()));
     outer_virtual.attributes.insert(
         "public_role_arn".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {
@@ -1432,10 +1429,9 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
 
     let mut virtual_resource = Resource::new("_virtual", "carina_module");
     virtual_resource.binding = Some("carina_module".to_string());
-    virtual_resource.kind = ResourceKind::Virtual {
-        module_name: "carina_module".to_string(),
-        instance: "carina_module".to_string(),
-    };
+    virtual_resource.kind = ResourceKind::Virtual;
+    virtual_resource.virtual_module =
+        Some(("carina_module".to_string(), "carina_module".to_string()));
     virtual_resource.attributes.insert(
         "role_arn".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {

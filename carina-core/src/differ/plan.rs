@@ -392,6 +392,7 @@ pub fn create_plan(
                     dependency_bindings: BTreeSet::new(),
                     module_source: None,
                     quoted_string_attrs: std::collections::HashSet::new(),
+                    virtual_module: None,
                 };
                 get_resource_dependencies(&temp_resource)
             };

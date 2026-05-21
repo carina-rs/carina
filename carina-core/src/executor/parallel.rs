@@ -598,10 +598,9 @@ mod tests {
 
         let mut virt = Resource::with_provider("_virtual", "_virtual", "bootstrap", None);
         virt.binding = Some("bootstrap".to_string());
-        virt.kind = ResourceKind::Virtual {
-            module_name: "github-oidc".to_string(),
-            instance: "bootstrap".to_string(),
-        };
+        virt.kind = ResourceKind::Virtual;
+
+        virt.virtual_module = Some(("github-oidc".to_string(), "bootstrap".to_string()));
         virt.set_attr(
             "role_name",
             Value::resource_ref("bootstrap.role", "role_name", vec![]),

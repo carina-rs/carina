@@ -306,7 +306,7 @@ fn apply_path_propagates_module_wait_binding() {
         .collect();
     let virtual_r = parsed.resources.iter().any(|r| {
         r.binding.as_deref() == Some("r")
-            && matches!(r.kind, carina_core::resource::ResourceKind::Virtual { .. })
+            && matches!(r.kind, carina_core::resource::ResourceKind::Virtual)
     });
     // This assertion encodes the hypothesis. If it FAILS showing
     // binding="r", we've found the apply-path root cause: the nested

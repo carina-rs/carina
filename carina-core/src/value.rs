@@ -3384,6 +3384,7 @@ mod tests {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             quoted_string_attrs: HashSet::new(),
+            virtual_module: None,
         }
     }
 

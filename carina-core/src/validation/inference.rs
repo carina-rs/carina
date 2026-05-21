@@ -1329,10 +1329,12 @@ mod tests {
         // points at the inner role's schema attribute.
         let mut virt = crate::resource::Resource::new("_virtual", "github_actions_carina");
         virt.binding = Some("github_actions_carina".to_string());
-        virt.kind = ResourceKind::Virtual {
-            module_name: "github_module".to_string(),
-            instance: "github_actions_carina".to_string(),
-        };
+        virt.kind = ResourceKind::Virtual;
+
+        virt.virtual_module = Some((
+            "github_module".to_string(),
+            "github_actions_carina".to_string(),
+        ));
         virt.attributes.insert(
             "role_id".to_string(),
             Value::resource_ref(

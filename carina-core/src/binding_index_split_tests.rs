@@ -184,15 +184,13 @@ fn virtual_as_resource(v: &VirtualResource) -> Resource {
     Resource {
         id: v.id.clone(),
         attributes: v.attributes.clone(),
-        kind: ResourceKind::Virtual {
-            module_name: v.module_name.clone(),
-            instance: v.instance.clone(),
-        },
+        kind: ResourceKind::Virtual,
         directives: Default::default(),
         prefixes: HashMap::new(),
         binding: v.binding.clone(),
         dependency_bindings: v.dependency_bindings.clone(),
         module_source: None,
         quoted_string_attrs: v.quoted_string_attrs.clone(),
+        virtual_module: Some((v.module_name.clone(), v.instance.clone())),
     }
 }

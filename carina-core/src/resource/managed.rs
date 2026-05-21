@@ -92,7 +92,7 @@ impl ManagedResource {
     /// `ManagedResource`.
     pub fn as_managed_view(r: &Resource) -> Self {
         debug_assert!(
-            !matches!(r.kind, ResourceKind::Virtual { .. }),
+            !matches!(r.kind, ResourceKind::Virtual),
             "as_managed_view called on Virtual; route via VirtualResource::try_from",
         );
         Self {
@@ -124,6 +124,7 @@ impl From<&ManagedResource> for Resource {
             dependency_bindings: m.dependency_bindings.clone(),
             module_source: m.module_source.clone(),
             quoted_string_attrs: m.quoted_string_attrs.clone(),
+            virtual_module: None,
         }
     }
 }

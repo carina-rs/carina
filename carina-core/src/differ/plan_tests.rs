@@ -1188,10 +1188,9 @@ fn prevent_destroy_collects_multiple_errors() {
 #[test]
 fn virtual_resources_are_skipped_in_plan() {
     // Virtual resources (module attribute containers) should not generate any effects
-    let mut virtual_resource = Resource::new("_virtual", "web").with_kind(ResourceKind::Virtual {
-        module_name: "web_tier".to_string(),
-        instance: "web".to_string(),
-    });
+    let mut virtual_resource = Resource::new("_virtual", "web").with_kind(ResourceKind::Virtual);
+
+    virtual_resource.virtual_module = Some(("web_tier".to_string(), "web".to_string()));
     virtual_resource.binding = Some("web".to_string());
     virtual_resource.set_attr(
         "security_group".to_string(),

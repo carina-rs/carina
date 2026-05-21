@@ -69,6 +69,7 @@ pub(in crate::parser) fn parse_anonymous_resource(
         dependency_bindings: BTreeSet::new(),
         module_source: None,
         quoted_string_attrs,
+        virtual_module: None,
     })
 }
 
@@ -241,6 +242,7 @@ pub(crate) fn parse_resource_expr(
         dependency_bindings: BTreeSet::new(),
         module_source: None,
         quoted_string_attrs,
+        virtual_module: None,
     })
 }
 
@@ -298,6 +300,7 @@ pub(crate) fn parse_read_resource_expr(
         dependency_bindings: BTreeSet::new(),
         module_source: None,
         quoted_string_attrs,
+        virtual_module: None,
     })
 }
 

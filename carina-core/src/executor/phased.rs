@@ -1352,10 +1352,9 @@ mod tests {
 
         let mut virt = Resource::with_provider("_virtual", "_virtual", "bootstrap", None);
         virt.binding = Some("bootstrap".to_string());
-        virt.kind = ResourceKind::Virtual {
-            module_name: "github-oidc".to_string(),
-            instance: "bootstrap".to_string(),
-        };
+        virt.kind = ResourceKind::Virtual;
+
+        virt.virtual_module = Some(("github-oidc".to_string(), "bootstrap".to_string()));
         // The virtual exposes `role_name = role.role_name`, which after intra-module
         // rewriting becomes `bootstrap.role.role_name`.
         virt.set_attr(
@@ -1399,10 +1398,9 @@ mod tests {
 
         let mut inner_virt = Resource::with_provider("_virtual", "_virtual", "outer.inner", None);
         inner_virt.binding = Some("outer.inner".to_string());
-        inner_virt.kind = ResourceKind::Virtual {
-            module_name: "inner-mod".to_string(),
-            instance: "outer.inner".to_string(),
-        };
+        inner_virt.kind = ResourceKind::Virtual;
+
+        inner_virt.virtual_module = Some(("inner-mod".to_string(), "outer.inner".to_string()));
         inner_virt.set_attr(
             "role_name",
             Value::resource_ref("outer.inner.role", "role_name", vec![]),
@@ -1410,10 +1408,9 @@ mod tests {
 
         let mut outer_virt = Resource::with_provider("_virtual", "_virtual", "outer", None);
         outer_virt.binding = Some("outer".to_string());
-        outer_virt.kind = ResourceKind::Virtual {
-            module_name: "outer-mod".to_string(),
-            instance: "outer".to_string(),
-        };
+        outer_virt.kind = ResourceKind::Virtual;
+
+        outer_virt.virtual_module = Some(("outer-mod".to_string(), "outer".to_string()));
         outer_virt.set_attr(
             "role_name",
             Value::resource_ref("outer.inner", "role_name", vec![]),

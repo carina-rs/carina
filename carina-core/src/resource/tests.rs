@@ -767,10 +767,9 @@ fn state_dependency_bindings_dedup_on_duplicate_insert() {
 
 #[test]
 fn resource_typed_virtual_field() {
-    let resource = Resource::new("_virtual", "web").with_kind(ResourceKind::Virtual {
-        module_name: "web_tier".to_string(),
-        instance: "web".to_string(),
-    });
+    let mut resource = Resource::new("_virtual", "web").with_kind(ResourceKind::Virtual);
+
+    resource.virtual_module = Some(("web_tier".to_string(), "web".to_string()));
     assert!(resource.is_virtual());
     // _virtual should NOT be in attributes
     assert!(!resource.attributes.contains_key("_virtual"));
@@ -794,25 +793,21 @@ fn resource_kind_enum_managed_by_default() {
 
 #[test]
 fn resource_kind_enum_virtual_carries_module_info() {
-    let resource = Resource::new("_virtual", "web").with_kind(ResourceKind::Virtual {
-        module_name: "web_tier".to_string(),
-        instance: "web".to_string(),
-    });
+    let mut resource = Resource::new("_virtual", "web").with_kind(ResourceKind::Virtual);
+
+    resource.virtual_module = Some(("web_tier".to_string(), "web".to_string()));
     assert!(resource.is_virtual());
     assert!(!resource.is_data_source());
-    // Module info is in the kind, not in attributes
+    // Module info is in the virtual_module field, not in attributes
     assert!(!resource.attributes.contains_key("_module"));
     assert!(!resource.attributes.contains_key("_module_instance"));
-    // Can extract module info from the kind
-    match &resource.kind {
-        ResourceKind::Virtual {
-            module_name,
-            instance,
-        } => {
+    // Can extract module info from the virtual_module field
+    match &resource.virtual_module {
+        Some((module_name, instance)) => {
             assert_eq!(module_name, "web_tier");
             assert_eq!(instance, "web");
         }
-        _ => panic!("Expected Virtual kind"),
+        None => panic!("Expected virtual_module to be set"),
     }
 }
 

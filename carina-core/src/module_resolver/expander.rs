@@ -251,16 +251,14 @@ impl ModuleResolver<'_> {
             let virtual_resource = Resource {
                 id: ResourceId::new("_virtual", binding_name),
                 attributes: virtual_attrs,
-                kind: ResourceKind::Virtual {
-                    module_name: call.module_name.clone(),
-                    instance: instance_prefix.to_string(),
-                },
+                kind: ResourceKind::Virtual,
                 directives: Directives::default(),
                 prefixes: HashMap::new(),
                 binding: Some(binding_name.clone()),
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
                 quoted_string_attrs: std::collections::HashSet::new(),
+                virtual_module: Some((call.module_name.clone(), instance_prefix.to_string())),
             };
             expanded_resources.push(virtual_resource);
         }

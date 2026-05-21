@@ -22,6 +22,7 @@ fn sample_value(s: &str) -> Value {
 /// are written in-place after construction.
 fn make_resource(kind: ResourceKind) -> Resource {
     let deps: BTreeSet<String> = ["dep_binding".into()].into_iter().collect();
+    let is_virtual = matches!(kind, ResourceKind::Virtual);
 
     let mut res = Resource::new("aws.s3.Bucket", "b")
         .with_kind(kind)
@@ -29,6 +30,9 @@ fn make_resource(kind: ResourceKind) -> Resource {
         .with_binding("b")
         .with_dependency_bindings(deps)
         .with_module_source(ModuleSource::module("m", "inst"));
+    if is_virtual {
+        res.virtual_module = Some(("my_module".into(), "my_instance".into()));
+    }
 
     res.directives = Directives {
         force_delete: true,
@@ -57,10 +61,7 @@ fn managed_resource_carries_full_managed_field_set() {
 
 #[test]
 fn virtual_resource_flattens_module_name_and_instance_drops_directives_and_prefixes() {
-    let res = make_resource(ResourceKind::Virtual {
-        module_name: "my_module".into(),
-        instance: "my_instance".into(),
-    });
+    let res = make_resource(ResourceKind::Virtual);
     let v = VirtualResource::try_from(&res).expect("Virtual → VirtualResource");
 
     assert_eq!(v.id, res.id);
@@ -88,10 +89,7 @@ fn data_source_carries_directives_and_module_source_drops_prefixes() {
 
 #[test]
 fn try_from_rejects_kind_mismatch_for_managed() {
-    let virt = make_resource(ResourceKind::Virtual {
-        module_name: "m".into(),
-        instance: "i".into(),
-    });
+    let virt = make_resource(ResourceKind::Virtual);
     let err = ManagedResource::try_from(&virt).expect_err("Virtual must not convert to Managed");
     assert_eq!(err.expected, ResourceKindLabel::Managed);
     assert_eq!(err.actual, ResourceKindLabel::Virtual);
@@ -124,10 +122,7 @@ fn try_from_rejects_kind_mismatch_for_data_source() {
     assert_eq!(err.expected, ResourceKindLabel::DataSource);
     assert_eq!(err.actual, ResourceKindLabel::Managed);
 
-    let virt = make_resource(ResourceKind::Virtual {
-        module_name: "m".into(),
-        instance: "i".into(),
-    });
+    let virt = make_resource(ResourceKind::Virtual);
     let err = DataSource::try_from(&virt).expect_err("Virtual must not convert to DataSource");
     assert_eq!(err.expected, ResourceKindLabel::DataSource);
     assert_eq!(err.actual, ResourceKindLabel::Virtual);
@@ -156,14 +151,7 @@ fn resource_kind_label_display_round_trip() {
 #[test]
 fn resource_kind_projects_to_label_dropping_payload() {
     assert_eq!(ResourceKind::Managed.label(), ResourceKindLabel::Managed);
-    assert_eq!(
-        ResourceKind::Virtual {
-            module_name: "m".into(),
-            instance: "i".into(),
-        }
-        .label(),
-        ResourceKindLabel::Virtual,
-    );
+    assert_eq!(ResourceKind::Virtual.label(), ResourceKindLabel::Virtual,);
     assert_eq!(
         ResourceKind::DataSource.label(),
         ResourceKindLabel::DataSource,
