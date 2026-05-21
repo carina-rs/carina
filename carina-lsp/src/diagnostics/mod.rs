@@ -331,7 +331,7 @@ impl DiagnosticEngine {
                 if let Some(schema) = &schema {
                     // Check data source without `read` keyword
                     if schema.is_data_source()
-                        && !resource.is_data_source()
+                        && carina_core::resource::DataSource::try_from(resource).is_err()
                         && let Some((line, col)) = self.find_resource_type_position(
                             doc,
                             provider,
