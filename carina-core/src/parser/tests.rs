@@ -86,11 +86,9 @@ fn iter_all_resources_yields_direct_then_deferred() {
     assert!(matches!(items[1].context(), ResourceContext::Deferred(_)));
 }
 
-/// carina#3181 PR B: `iter_all_resources` yields each resource exactly
-/// once with the correct typed arm. While `resources` still holds
-/// data-source rows too (PR A duplicate storage), the managed-only
-/// filter must keep a `read` resource from being double-counted as both
-/// `Managed` and `DataSource`.
+/// carina#3181: `iter_all_resources` yields each resource exactly once
+/// with the correct typed arm — a managed resource as `Managed`, a
+/// `read` resource as `DataSource` — chaining the typed slices.
 #[test]
 fn iter_all_resources_classifies_managed_and_data_source_arms() {
     let src = r#"
@@ -126,6 +124,42 @@ fn iter_all_resources_classifies_managed_and_data_source_arms() {
         data_sources[0].kind(),
         crate::resource::ResourceKind::DataSource
     );
+}
+
+/// carina#3181 PR C: `legacy_top_level_resources` rebuilds the mixed
+/// `Vec<Resource>` from the typed slices — every kind present, each with
+/// the correct `ResourceKind` discriminant — for legacy `&[Resource]`
+/// APIs (`sort_resources_by_dependencies`, `split_resources_by_kind`).
+#[test]
+fn legacy_top_level_resources_rebuilds_mixed_vec() {
+    let src = r#"
+        provider aws {
+            region = aws.Region.ap_northeast_1
+        }
+        let bucket = aws.s3.Bucket {
+            bucket = "my-bucket"
+        }
+        let _ = read aws.sts.caller_identity {}
+    "#;
+    let parsed = parse(src, &ProviderContext::default()).unwrap();
+
+    // `resources` is managed-only, `data_sources` holds the read.
+    assert_eq!(parsed.resources.len(), 1); // allow: direct — fixture test inspection
+    assert_eq!(parsed.data_sources.len(), 1);
+
+    // The rebuilt legacy view holds both, each with the right kind.
+    let legacy = parsed.legacy_top_level_resources();
+    assert_eq!(legacy.len(), 2);
+    let managed = legacy
+        .iter()
+        .find(|r| r.kind == crate::resource::ResourceKind::Managed)
+        .expect("managed resource in legacy view");
+    let data_source = legacy
+        .iter()
+        .find(|r| r.kind == crate::resource::ResourceKind::DataSource)
+        .expect("data source in legacy view");
+    assert_eq!(managed.id.resource_type, "s3.Bucket");
+    assert_eq!(data_source.id.resource_type, "sts.caller_identity");
 }
 
 #[test]
@@ -1292,19 +1326,20 @@ fn parse_read_resource_expr() {
     "#;
 
     let result = parse(input, &ProviderContext::default()).unwrap();
-    assert_eq!(result.resources.len(), 1);
+    // carina#3181 PR C: the `read` resource lands in `data_sources`.
+    assert!(result.resources.is_empty());
+    assert_eq!(result.data_sources.len(), 1);
 
-    let resource = &result.resources[0];
-    assert_eq!(resource.id.resource_type, "s3_bucket");
-    assert_eq!(resource.id.name_str(), "existing"); // binding name becomes the resource ID
-    assert!(resource.is_data_source());
+    let data_source = &result.data_sources[0];
+    assert_eq!(data_source.id.resource_type, "s3_bucket");
+    assert_eq!(data_source.id.name_str(), "existing"); // binding name becomes the resource ID
 }
 
 #[test]
 fn parse_read_resource_does_not_inject_data_source_attribute() {
-    // Regression test for #2224: `kind == DataSource` is the only
-    // record that a `read` block produces a data source — there must
-    // be no `_data_source` key shadowing it in the attribute map.
+    // Regression test for #2224: a `read` block produces a data source
+    // — there must be no `_data_source` key shadowing it in the
+    // attribute map. carina#3181 PR C: it lands in `data_sources`.
     let input = r#"
         let existing = read aws.s3_bucket {
             name = "my-bucket"
@@ -1312,11 +1347,11 @@ fn parse_read_resource_does_not_inject_data_source_attribute() {
         }
     "#;
     let result = parse(input, &ProviderContext::default()).unwrap();
-    let resource = &result.resources[0];
-    assert!(resource.is_data_source());
-    assert!(resource.attributes.contains_key("name"));
-    assert!(resource.attributes.contains_key("region"));
-    assert!(!resource.attributes.contains_key("_data_source"));
+    assert!(result.resources.is_empty());
+    let data_source = &result.data_sources[0];
+    assert!(data_source.attributes.contains_key("name"));
+    assert!(data_source.attributes.contains_key("region"));
+    assert!(!data_source.attributes.contains_key("_data_source"));
 }
 
 #[test]
@@ -1330,7 +1365,8 @@ fn parse_read_resource_without_name_uses_binding() {
     let result = parse(input, &ProviderContext::default());
     assert!(result.is_ok());
     let parsed = result.unwrap();
-    assert_eq!(parsed.resources[0].id.name_str(), "existing"); // binding name
+    // carina#3181 PR C: `read` resources live in the `data_sources` slice.
+    assert_eq!(parsed.data_sources[0].id.name_str(), "existing"); // binding name
 }
 
 #[test]
@@ -1348,15 +1384,14 @@ fn parse_read_with_regular_resources() {
     "#;
 
     let result = parse(input, &ProviderContext::default()).unwrap();
-    assert_eq!(result.resources.len(), 2);
 
-    // First resource is read-only (data source)
-    assert!(result.resources[0].is_data_source());
-    assert_eq!(result.resources[0].id.name_str(), "existing_bucket"); // binding name
+    // carina#3181 PR C: the data source and the managed resource land
+    // in separate typed slices.
+    assert_eq!(result.data_sources.len(), 1);
+    assert_eq!(result.data_sources[0].id.name_str(), "existing_bucket"); // binding name
 
-    // Second resource is a regular resource
-    assert!(!result.resources[1].is_data_source());
-    assert_eq!(result.resources[1].id.name_str(), "new_bucket"); // binding name
+    assert_eq!(result.resources.len(), 1);
+    assert_eq!(result.resources[0].id.name_str(), "new_bucket"); // binding name
 }
 
 #[test]
@@ -6461,19 +6496,21 @@ fn parse_let_discard_read_resource() {
     "#;
 
     let result = parse(input, &ProviderContext::default()).unwrap();
-    assert_eq!(result.resources.len(), 1);
-    assert_eq!(result.resources[0].id.resource_type, "sts.caller_identity");
+    // carina#3181 PR C: `resources` is managed-only — the `read`
+    // resource lives in the typed `data_sources` slice.
+    assert!(result.resources.is_empty());
+    assert_eq!(result.data_sources.len(), 1);
     assert_eq!(
-        result.resources[0].kind,
-        crate::resource::ResourceKind::DataSource
+        result.data_sources[0].id.resource_type,
+        "sts.caller_identity"
     );
 }
 
-/// carina#3181 PR A: the parser projects `read`-keyword resources into
-/// the typed `data_sources` slice in parallel with the legacy
-/// `resources` Vec (duplicate storage during the typestate migration).
+/// carina#3181 PR C: the parser partitions resources into the
+/// managed-only `resources` Vec and the typed `data_sources` slice —
+/// each resource lands in exactly one slice.
 #[test]
-fn parse_populates_data_sources_slice_in_parallel() {
+fn parse_partitions_managed_and_data_source_slices() {
     let input = r#"
         provider aws {
             region = aws.Region.ap_northeast_1
@@ -6488,25 +6525,15 @@ fn parse_populates_data_sources_slice_in_parallel() {
 
     let result = parse(input, &ProviderContext::default()).unwrap();
 
-    // Legacy mixed Vec still holds both resources.
-    assert_eq!(result.resources.len(), 2);
+    // `resources` is managed-only — just the bucket.
+    assert_eq!(result.resources.len(), 1);
+    assert_eq!(result.resources[0].id.resource_type, "s3.Bucket");
 
-    // The typed slice holds only the read-keyword resource, and its
-    // contents match the corresponding legacy entry.
+    // The data source lives only in the typed `data_sources` slice.
     assert_eq!(result.data_sources.len(), 1);
     assert_eq!(
         result.data_sources[0].id.resource_type,
         "sts.caller_identity"
-    );
-    let legacy_data_source = result
-        .resources
-        .iter()
-        .find(|r| r.kind == crate::resource::ResourceKind::DataSource)
-        .expect("legacy resources still contains the data source");
-    assert_eq!(result.data_sources[0].id, legacy_data_source.id);
-    assert_eq!(
-        result.data_sources[0].attributes,
-        legacy_data_source.attributes
     );
 
     // The parser never synthesizes virtual resources — that is the

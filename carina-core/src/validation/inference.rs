@@ -139,7 +139,11 @@ pub type InferenceBindings = HashMap<String, InferenceBinding>;
 /// over [`bindings_from_parts`] for the common case of having a parsed
 /// file in hand.
 pub fn bindings_from_parsed(parsed: &crate::parser::ParsedFile) -> InferenceBindings {
-    let mut out = bindings_from_parts(&parsed.resources, &parsed.upstream_states);
+    // carina#3181: `parsed.resources` is managed-only; rebuild the mixed
+    // legacy view so `bindings_from_parts` still sees data-source and
+    // (post-expansion) virtual rows and classifies each correctly.
+    let all_resources = parsed.legacy_top_level_resources();
+    let mut out = bindings_from_parts(&all_resources, &parsed.upstream_states);
     // Pre-expansion (load_configuration), `parsed.resources` does not
     // yet hold the `Virtual` resources that `expand_module_call`
     // synthesises for each module-call binding. Register the binding

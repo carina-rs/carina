@@ -209,7 +209,12 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
     // (early-return at top), so a cycle here is at least *touched* by
     // depends_on — but the cycle itself may go through value refs only.
     // Don't claim attribution; just report the cycle.
-    if let Err(msg) = sort_resources_by_dependencies(&parsed.resources) {
+    //
+    // carina#3181: `parsed.resources` is managed-only now, so rebuild the
+    // mixed legacy view (managed + virtual + data source) — the cycle
+    // graph must see every top-level resource.
+    let all_resources = parsed.legacy_top_level_resources();
+    if let Err(msg) = sort_resources_by_dependencies(&all_resources) {
         diags.push(DependsOnDiagnostic::error(msg));
     }
 

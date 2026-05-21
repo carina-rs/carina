@@ -35,7 +35,7 @@
 //! ```ignore
 //! let index = BindingIndex::from_parsed(&parsed, &registry);
 //! if let Some(entry) = index.get("vpc") {
-//!     // entry.resource and entry.schema are both available
+//!     // entry.schema is the resolved schema for the binding
 //! }
 //! ```
 
@@ -44,12 +44,11 @@ use crate::resource::{ManagedResource, Resource, ResourceId, State, Value, Virtu
 use crate::schema::{ResourceSchema, SchemaRegistry};
 use std::collections::HashMap;
 
-/// One entry in the binding index. Both fields are non-`Option` because the
+/// One entry in the binding index. `schema` is non-`Option` because the
 /// builder skips bindings whose schema cannot be resolved — callers never
 /// have to defend against half-populated entries.
 #[derive(Debug)]
 pub struct BindingEntry<'a> {
-    pub resource: &'a Resource,
     pub schema: &'a ResourceSchema,
 }
 
@@ -83,24 +82,30 @@ impl<'a> BindingIndex<'a> {
     ) -> Self {
         let mut entries = HashMap::new();
         let mut known_names = std::collections::HashSet::new();
-        // Walk top-level resources only. The parser auto-generates a
-        // synthetic `binding` for anonymous for-body templates (used for
-        // resource address derivation), but those names are an internal
-        // detail — they were never visible to validation's binding map
-        // pre-#2231 and surfacing them here would be an unintended
-        // behaviour change for ResourceRef lookups. The LSP and
-        // validation both still walk `iter_all_resources` *separately*
-        // for their own checks; only the binding-name table is scoped to
-        // top-level here.
-        for resource in &parsed.resources {
-            let Some(binding_name) = resource.binding.as_ref() else {
+        // Walk top-level resources only — managed resources, data
+        // sources, and virtuals (carina#3181: `iter_top_level_resources`
+        // chains the typed slices and excludes deferred for-body
+        // templates). The parser auto-generates a synthetic `binding` for
+        // anonymous for-body templates (used for resource address
+        // derivation), but those names are an internal detail — they were
+        // never visible to validation's binding map pre-#2231 and
+        // surfacing them here would be an unintended behaviour change for
+        // ResourceRef lookups. The LSP and validation both still walk
+        // `iter_all_resources` *separately* for their own checks; only
+        // the binding-name table is scoped to top-level here.
+        for rref in parsed.iter_top_level_resources() {
+            let Some(binding_name) = rref.binding() else {
                 continue;
             };
-            known_names.insert(binding_name.clone());
-            let Some(schema) = registry.get_for(resource) else {
+            known_names.insert(binding_name.to_string());
+            // `get_for` is not yet typestate-aware — bridge through the
+            // legacy `Resource` shape. A virtual resource has no schema,
+            // so it stays in `known_names` but gets no `entries` row,
+            // matching the prior "known binding, schema absent" surface.
+            let Some(schema) = registry.get_for(&rref.as_legacy_resource()) else {
                 continue;
             };
-            entries.insert(binding_name.clone(), BindingEntry { resource, schema });
+            entries.insert(binding_name.to_string(), BindingEntry { schema });
         }
         Self {
             entries,
@@ -231,8 +236,14 @@ impl BindingNameSet {
     pub fn from_parsed<E>(parsed: &crate::parser::File<E>) -> Self {
         let mut by_name: HashMap<String, BindingNameKind> = HashMap::new();
 
-        for resource in &parsed.resources {
-            if let Some(name) = resource.binding.as_deref() {
+        // carina#3181: walk the typed top-level slices — managed
+        // resources, data sources, and virtuals all register a
+        // `Resource`-kind binding name (a data source declared as
+        // `let x = read ...` is addressable by `ResourceRef`, and a
+        // virtual binding was a `Resource`-kind name before the
+        // typestate split too).
+        for rref in parsed.iter_top_level_resources() {
+            if let Some(name) = rref.binding() {
                 by_name
                     .entry(name.to_string())
                     .or_insert(BindingNameKind::Resource);
@@ -727,8 +738,30 @@ let vpc = aws.ec2.Vpc {
         let index = BindingIndex::from_parsed(&parsed, &registry);
         let entry = index.get("vpc").expect("vpc binding present");
         assert_eq!(entry.schema.resource_type, "ec2.Vpc");
-        assert_eq!(entry.resource.binding.as_deref(), Some("vpc"));
+        assert!(index.is_declared("vpc"));
         assert_eq!(index.len(), 1);
+    }
+
+    /// carina#3181 PR C: `read` (data-source) bindings must appear in the
+    /// `BindingIndex` — `from_parsed` walks the typed `data_sources`
+    /// slice, not just managed `resources`.
+    #[test]
+    fn build_indexes_data_source_binding() {
+        let src = r#"
+let existing = read aws.ec2.Vpc {
+    name = "v"
+}
+"#;
+        let parsed = parse(src, &Default::default()).expect("parse");
+        let mut registry = SchemaRegistry::new();
+        registry.insert("aws", vpc_schema().as_data_source());
+
+        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let entry = index
+            .get("existing")
+            .expect("data-source binding present in index");
+        assert_eq!(entry.schema.resource_type, "ec2.Vpc");
+        assert!(index.is_declared("existing"));
     }
 
     #[test]

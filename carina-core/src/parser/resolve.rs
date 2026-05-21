@@ -7,9 +7,58 @@ use super::ast::{AttributeParameter, ExportParameter, ModuleCall, ParsedFile};
 use super::error::{ParseError, undefined_identifier_error};
 use super::static_eval::is_static_value;
 use crate::eval_value::EvalValue;
-use crate::resource::{ConcreteValue, DeferredValue, Resource, Value};
+use crate::resource::{ConcreteValue, DataSource, DeferredValue, Resource, ResourceLike, Value};
 use indexmap::IndexMap;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+
+/// Mutable pre-apply traversal — the resolver mutates `attributes` and
+/// `dependency_bindings` of every resource whose references are resolved
+/// **before** apply: managed [`Resource`]s and [`DataSource`]s.
+///
+/// `VirtualResource` is excluded on purpose — a virtual resource's
+/// attributes may carry refs whose resolution is deferred to the
+/// post-apply path, so the pre-apply resolver must never rewrite them
+/// (carina#3181; see the `virtual_resource.rs` module doc).
+trait PreApplyResourceMut: ResourceLike {
+    fn attributes_mut(&mut self) -> &mut IndexMap<String, Value>;
+    fn dependency_bindings_mut(&mut self) -> &mut BTreeSet<String>;
+}
+
+impl PreApplyResourceMut for Resource {
+    fn attributes_mut(&mut self) -> &mut IndexMap<String, Value> {
+        &mut self.attributes
+    }
+    fn dependency_bindings_mut(&mut self) -> &mut BTreeSet<String> {
+        &mut self.dependency_bindings
+    }
+}
+
+impl PreApplyResourceMut for DataSource {
+    fn attributes_mut(&mut self) -> &mut IndexMap<String, Value> {
+        &mut self.attributes
+    }
+    fn dependency_bindings_mut(&mut self) -> &mut BTreeSet<String> {
+        &mut self.dependency_bindings
+    }
+}
+
+/// Mutable iterator over the pre-apply resolvable resources — managed
+/// resources then data sources (carina#3181). Used by the resolver to
+/// rewrite refs in place across both typed slices in one walk.
+fn iter_pre_apply_resources_mut(
+    parsed: &mut ParsedFile,
+) -> impl Iterator<Item = &mut dyn PreApplyResourceMut> + '_ {
+    parsed
+        .resources
+        .iter_mut()
+        .map(|r| r as &mut dyn PreApplyResourceMut)
+        .chain(
+            parsed
+                .data_sources
+                .iter_mut()
+                .map(|d| d as &mut dyn PreApplyResourceMut),
+        )
+}
 
 /// Resolve forward references after the full binding set is known.
 ///
@@ -141,21 +190,29 @@ pub fn resolve_resource_refs_with_config(
     // Save dependency bindings before resolution may change ResourceRef binding names.
     // This preserves direct dependencies that would be lost by recursive resolution
     // (e.g., tgw_attach.transit_gateway_id resolves to tgw.id, losing the tgw_attach dep).
-    for resource in &mut parsed.resources {
-        let deps = crate::deps::get_resource_value_ref_dependencies(resource);
+    //
+    // carina#3181: walk managed resources *and* data sources — a data
+    // source's attributes can carry refs too, and `parsed.resources` is
+    // now managed-only.
+    for resource in iter_pre_apply_resources_mut(parsed) {
+        let deps = crate::deps::get_resource_value_ref_dependencies(&*resource);
         if !deps.is_empty() {
-            resource.dependency_bindings = deps.into_iter().collect();
+            *resource.dependency_bindings_mut() = deps.into_iter().collect();
         }
     }
 
-    // Build a map of binding_name -> attributes for quick lookup
+    // Build a map of binding_name -> attributes for quick lookup. Walk
+    // every top-level resource (managed, data source, virtual) so a
+    // `ResourceRef` to any binding resolves. `binding_map` only needs
+    // key-based lookup, not source order, so the inner map stays a plain
+    // `HashMap`.
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
-    for resource in &parsed.resources {
-        if let Some(ref binding_name) = resource.binding {
-            // `binding_map` only needs key-based lookup, not source order
-            // (callers consume it via `.get(name)` for ResourceRef
-            // resolution), so the inner map stays `HashMap`.
-            binding_map.insert(binding_name.clone(), resource.resolved_attributes());
+    for rref in parsed.iter_top_level_resources() {
+        if let Some(binding_name) = rref.binding() {
+            binding_map.insert(
+                binding_name.to_string(),
+                rref.as_legacy_resource().resolved_attributes(),
+            );
         }
     }
 
@@ -200,15 +257,19 @@ pub fn resolve_resource_refs_with_config(
 
     // Resolve references in each resource. Keep `IndexMap` to preserve
     // the user's source order through resolution (#2222).
-    for resource in &mut parsed.resources {
+    //
+    // carina#3181: managed resources and data sources both go through
+    // pre-apply ref resolution; `VirtualResource` is excluded — its refs
+    // are resolved on the post-apply path.
+    for resource in iter_pre_apply_resources_mut(parsed) {
         let mut resolved_attrs: IndexMap<String, Value> = IndexMap::new();
 
-        for (key, expr) in &resource.attributes {
+        for (key, expr) in resource.attributes().iter() {
             let resolved = resolve_value_with_config(expr, &binding_map, &fn_ctx)?;
             resolved_attrs.insert(key.clone(), resolved);
         }
 
-        resource.attributes = resolved_attrs;
+        *resource.attributes_mut() = resolved_attrs;
     }
 
     // Resolve top-level `let v = ...` bindings that contain
@@ -230,10 +291,14 @@ pub fn resolve_resource_refs_with_config(
     // During per-file parsing, "binding.attribute" strings from sibling files
     // remain as Value::Concrete(ConcreteValue::String). Convert them to ResourceRef now that the full
     // binding map is available.
+    // carina#3181: include data sources and virtuals — a sibling-file
+    // export can forward-reference any top-level binding.
     let resource_bindings: HashMap<String, Resource> = parsed
-        .resources
-        .iter()
-        .filter_map(|r| r.binding.as_ref().map(|b| (b.clone(), r.clone())))
+        .iter_top_level_resources()
+        .filter_map(|rref| {
+            rref.binding()
+                .map(|b| (b.to_string(), rref.as_legacy_resource().into_owned()))
+        })
         .collect();
     for export_param in &mut parsed.export_params {
         if let Some(value) = export_param.value.take() {
@@ -266,7 +331,13 @@ pub fn resolve_resource_refs_with_config(
 /// to rebuild a borrowed view per call).
 pub fn collect_known_bindings_merged(parsed: &ParsedFile) -> std::collections::HashSet<&str> {
     let mut known: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    known.extend(parsed.resources.iter().filter_map(|r| r.binding.as_deref())); // allow: direct — parser-internal, pre-expansion
+    // carina#3181: walk the typed top-level slices — managed resources,
+    // data sources, and virtuals all contribute a binding name in scope.
+    known.extend(
+        parsed
+            .iter_top_level_resources()
+            .filter_map(|r| r.binding()),
+    );
     known.extend(parsed.arguments.iter().map(|a| a.name.as_str()));
     known.extend(
         parsed
@@ -334,8 +405,14 @@ pub fn check_identifier_scope(parsed: &ParsedFile) -> Vec<ParseError> {
 /// validation to pay for both.
 pub fn check_provider_instance_routing(parsed: &ParsedFile) -> Vec<ParseError> {
     let mut errors = Vec::new();
-    for resource in &parsed.resources {
-        match &resource.directives.provider_instance {
+    // carina#3181: walk the typed top-level slices. `directives()` is
+    // `None` for the virtual arm (no `directives` on a synthetic node),
+    // which routes to the `None` match arm — and a virtual's `id` has an
+    // empty provider, so it is skipped there, matching prior behaviour.
+    for rref in parsed.iter_top_level_resources() {
+        let id = rref.id();
+        let provider_instance = rref.directives().and_then(|d| d.provider_instance.as_ref());
+        match provider_instance {
             Some(binding) => {
                 let Some(instance) = parsed
                     .providers
@@ -352,16 +429,13 @@ pub fn check_provider_instance_routing(parsed: &ParsedFile) -> Vec<ParseError> {
                     });
                     continue;
                 };
-                if instance.name != resource.id.provider {
+                if instance.name != id.provider {
                     errors.push(ParseError::InvalidExpression {
                         line: 0,
                         message: format!(
                             "directives.provider: instance `{binding}` has kind \
                              `{}`, but resource `{}.{}` requires kind `{}`",
-                            instance.name,
-                            resource.id.provider,
-                            resource.id.resource_type,
-                            resource.id.provider,
+                            instance.name, id.provider, id.resource_type, id.provider,
                         ),
                     });
                 }
@@ -369,7 +443,7 @@ pub fn check_provider_instance_routing(parsed: &ParsedFile) -> Vec<ParseError> {
             None => {
                 // Mock / synthetic resources (no provider prefix) have no
                 // kind to route by; skip them.
-                if resource.id.provider.is_empty() {
+                if id.provider.is_empty() {
                     continue;
                 }
                 let (kind_has_any, kind_has_default) =
@@ -377,7 +451,7 @@ pub fn check_provider_instance_routing(parsed: &ParsedFile) -> Vec<ParseError> {
                         .providers
                         .iter()
                         .fold((false, false), |(any, def), p| {
-                            let matches = p.name == resource.id.provider;
+                            let matches = p.name == id.provider;
                             (any || matches, def || (matches && p.is_default))
                         });
                 if !kind_has_any {
@@ -392,10 +466,7 @@ pub fn check_provider_instance_routing(parsed: &ParsedFile) -> Vec<ParseError> {
                              attributes to the top-level `provider {}` \
                              block, or set `directives {{ provider = \
                              <instance> }}` explicitly.",
-                            resource.id.provider,
-                            resource.id.resource_type,
-                            resource.id.provider,
-                            resource.id.provider,
+                            id.provider, id.resource_type, id.provider, id.provider,
                         ),
                     });
                 }
@@ -422,8 +493,12 @@ fn accumulate_undefined_reference_errors(
         });
     };
 
-    for resource in &parsed.resources {
-        for value in resource.attributes.values() {
+    // carina#3181: walk the typed top-level slices (managed, virtual,
+    // data source) — `parsed.resources` is managed-only now. Deferred
+    // for-expression templates are handled by
+    // `accumulate_deferred_iterable_errors`, so they are excluded here.
+    for rref in parsed.iter_top_level_resources() {
+        for value in rref.attributes().values() {
             check(value);
         }
     }
@@ -656,9 +731,16 @@ pub fn resolve_provider_unresolved_attributes<E>(
     config: &ProviderContext,
 ) -> Result<(), ParseError> {
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
-    for resource in &parsed.resources {
-        if let Some(ref binding_name) = resource.binding {
-            binding_map.insert(binding_name.clone(), resource.resolved_attributes());
+    // carina#3181: walk every top-level resource — managed, data source,
+    // and virtual. This runs after module expansion, so virtual resources
+    // exist and a provider attr like `default_tags = mod.tags` resolves
+    // through the module-call virtual.
+    for rref in parsed.iter_top_level_resources() {
+        if let Some(binding_name) = rref.binding() {
+            binding_map.insert(
+                binding_name.to_string(),
+                rref.as_legacy_resource().resolved_attributes(),
+            );
         }
     }
     for arg in &parsed.arguments {

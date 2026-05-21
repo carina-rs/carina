@@ -103,12 +103,17 @@ fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
 /// before reference resolution. Keeping the depends_on edges out of that
 /// snapshot is what lets the validation pass tell a redundant edge apart
 /// from a depends_on-only edge.
-pub fn get_resource_value_ref_dependencies(resource: &Resource) -> HashSet<String> {
+///
+/// Takes `&dyn ResourceLike` so the resolver can compute the snapshot for
+/// both managed [`Resource`]s and [`DataSource`]s (carina#3181).
+pub fn get_resource_value_ref_dependencies(
+    resource: &dyn crate::resource::ResourceLike,
+) -> HashSet<String> {
     let mut deps = HashSet::new();
-    for value in resource.attributes.values() {
+    for value in resource.attributes().values() {
         collect_dependencies(value, &mut deps);
     }
-    for name in &resource.dependency_bindings {
+    for name in resource.dependency_bindings() {
         deps.insert(name.clone());
     }
     deps

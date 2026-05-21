@@ -59,8 +59,11 @@ pub fn run_lint(path: &Path, provider_context: &ProviderContext) -> Result<(), A
     // and build a map of attr_name -> block_name for lint suggestions
     let mut all_list_struct_attrs: HashSet<String> = HashSet::new();
     let mut block_name_suggestions: HashMap<String, String> = HashMap::new();
-    for resource in &parsed.resources {
-        if let Some(schema) = schemas.get_for(resource) {
+    // carina#3181: walk every top-level resource — managed and data
+    // source schemas can both carry List<Struct> attributes. Virtuals
+    // have no schema, so `get_for` returns `None` for them.
+    for rref in parsed.iter_top_level_resources() {
+        if let Some(schema) = schemas.get_for(rref.as_legacy_resource().as_ref()) {
             all_list_struct_attrs.extend(list_struct_attr_names(schema));
             for (attr_name, attr_schema) in &schema.attributes {
                 if let Some(bn) = &attr_schema.block_name {
