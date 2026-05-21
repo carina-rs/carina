@@ -221,8 +221,11 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     .expect("resolve_refs should succeed");
 
     let registry = SchemaRegistry::new();
+    let (managed___, data_sources___) =
+        carina_core::differ::split_resources_by_kind(&resources_for_plan);
     let plan = create_plan(
-        &resources_for_plan,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &registry,
@@ -348,8 +351,11 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     .expect("resolve_refs should succeed");
 
     let registry = SchemaRegistry::new();
+    let (managed___, data_sources___) =
+        carina_core::differ::split_resources_by_kind(&resources_for_plan);
     let plan = create_plan(
-        &resources_for_plan,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &registry,
@@ -488,8 +494,11 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
 
     // ---- The dependency edge is intact: Effect::Wait still emitted.
     let registry = SchemaRegistry::new();
+    let (managed___, data_sources___) =
+        carina_core::differ::split_resources_by_kind(&resources_for_plan);
     let plan = create_plan(
-        &resources_for_plan,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &registry,

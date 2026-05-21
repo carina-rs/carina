@@ -98,6 +98,34 @@ pub fn diff(
     }
 }
 
+/// Split a legacy `[Resource]` mix into the typed slices that
+/// [`create_plan`] now requires (carina#3179).
+///
+/// Virtuals are dropped — they are post-apply attribute containers and
+/// never participate in differ logic. Used by tests and other callers
+/// that still hold an unsorted `Vec<Resource>` while wiring/parser
+/// migration to typed inputs proceeds.
+pub fn split_resources_by_kind(
+    resources: &[Resource],
+) -> (
+    Vec<crate::resource::ManagedResource>,
+    Vec<crate::resource::DataSource>,
+) {
+    let mut managed = Vec::new();
+    let mut data_sources = Vec::new();
+    for r in resources {
+        if let Ok(ds) = crate::resource::DataSource::try_from(r) {
+            data_sources.push(ds);
+        } else if let Ok(m) = crate::resource::ManagedResource::try_from(r) {
+            managed.push(m);
+        }
+        // Virtuals are silently dropped by both `TryFrom` impls
+        // returning `Err(ResourceKindMismatch)`; the post-apply-only
+        // typestate invariant means they have no role here.
+    }
+    (managed, data_sources)
+}
+
 #[cfg(test)]
 mod cascade_tests;
 #[cfg(test)]

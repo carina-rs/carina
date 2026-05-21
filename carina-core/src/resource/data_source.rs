@@ -70,3 +70,29 @@ impl TryFrom<&Resource> for DataSource {
         }
     }
 }
+
+/// Transitional bridge — rebuild a legacy [`Resource`] from a
+/// `DataSource`. Symmetric with [`From<&ManagedResource> for Resource`]
+/// in `managed.rs`; removed alongside it when #3181 inline-merges
+/// `Resource` into the typestate structs.
+///
+/// `prefixes` is reconstructed empty — `DataSource` drops the field as a
+/// compile-time invariant (auto-generated names do not apply to
+/// read-only lookups), and a `Resource` synthesized from a `DataSource`
+/// only flows into `Effect::Read { resource }` whose downstream
+/// consumers (executor read path) do not read `prefixes`.
+impl From<&DataSource> for Resource {
+    fn from(d: &DataSource) -> Self {
+        Self {
+            id: d.id.clone(),
+            attributes: d.attributes.clone(),
+            kind: ResourceKind::DataSource,
+            directives: d.directives.clone(),
+            prefixes: std::collections::HashMap::new(),
+            binding: d.binding.clone(),
+            dependency_bindings: d.dependency_bindings.clone(),
+            module_source: d.module_source.clone(),
+            quoted_string_attrs: d.quoted_string_attrs.clone(),
+        }
+    }
+}

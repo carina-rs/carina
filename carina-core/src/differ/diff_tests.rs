@@ -74,8 +74,10 @@ fn create_plan_from_resources() {
         State::existing(ResourceId::new("bucket", "existing-bucket"), attrs),
     );
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -103,8 +105,10 @@ fn create_plan_with_read_only_resource() {
     ];
 
     let current_states = HashMap::new();
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -207,8 +211,10 @@ fn create_plan_detects_orphaned_resources_for_deletion() {
         State::existing(ResourceId::new("bucket", "orphaned-bucket"), orphan_attrs),
     );
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&desired);
     let plan = create_plan(
-        &desired,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -257,8 +263,10 @@ fn read_only_resource_always_generates_read_effect() {
         State::existing(ResourceId::new("bucket", "existing-bucket"), attrs),
     );
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -328,8 +336,10 @@ fn replace_when_create_only_attr_changed() {
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
     );
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -383,8 +393,10 @@ fn normal_update_when_non_create_only_attr_changed() {
             )),
     );
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -451,8 +463,10 @@ fn replace_when_schema_force_replace() {
             .force_replace(),
     );
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -512,8 +526,10 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
             )),
     );
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -565,8 +581,10 @@ fn replace_carries_create_before_destroy_directives() {
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
     );
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -686,8 +704,10 @@ fn replace_with_provider_prefixed_schema_key() {
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
     );
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -955,8 +975,10 @@ fn orphan_delete_preserves_binding_and_dependencies() {
         State::existing(ResourceId::new("subnet", "my-subnet"), orphan_attrs),
     );
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&desired);
     let plan = create_plan(
-        &desired,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),

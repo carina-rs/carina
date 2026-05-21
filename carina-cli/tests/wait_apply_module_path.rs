@@ -398,8 +398,11 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         )
         .await;
 
+    let (managed___, data_sources___) =
+        carina_core::differ::split_resources_by_kind(&resources_for_plan);
     let plan = create_plan(
-        &resources_for_plan,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         ctx.schemas(),

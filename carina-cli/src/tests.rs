@@ -1345,8 +1345,10 @@ fn orphaned_state_resource_produces_delete_effect() {
     let saved_attrs = state_file.build_saved_attrs();
     let prev_explicit = state_file.build_explicit();
 
+    let (managed___, data_sources___) = carina_core::differ::split_resources_by_kind(&desired);
     let plan = create_plan(
-        &desired,
+        &managed___,
+        &data_sources___,
         &current_states,
         &directives_map,
         &SchemaRegistry::new(),
@@ -2304,8 +2306,10 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
     let saved_attrs = state_file.build_saved_attrs();
     let prev_explicit = state_file.build_explicit();
 
+    let (managed___, data_sources___) = carina_core::differ::split_resources_by_kind(&desired);
     let plan = create_plan(
-        &desired,
+        &managed___,
+        &data_sources___,
         &current_states,
         &directives_map,
         &SchemaRegistry::new(),
@@ -2389,8 +2393,10 @@ fn refresh_false_uses_cached_state_from_state_file() {
     let saved_attrs = state_file.build_saved_attrs();
     let prev_explicit = state_file.build_explicit();
 
+    let (managed___, data_sources___) = carina_core::differ::split_resources_by_kind(&desired);
     let plan = create_plan(
-        &desired,
+        &managed___,
+        &data_sources___,
         &current_states,
         &directives_map,
         &SchemaRegistry::new(),
@@ -2436,8 +2442,10 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
     let saved_attrs = state_file.build_saved_attrs();
     let prev_explicit = state_file.build_explicit();
 
+    let (managed___, data_sources___) = carina_core::differ::split_resources_by_kind(&desired);
     let plan = create_plan(
-        &desired,
+        &managed___,
+        &data_sources___,
         &current_states,
         &directives_map,
         &SchemaRegistry::new(),
@@ -2481,8 +2489,10 @@ fn refresh_false_without_state_file_treats_resources_as_new() {
         current_states.insert(res.id.clone(), State::not_found(res.id.clone()));
     }
 
+    let (managed___, data_sources___) = carina_core::differ::split_resources_by_kind(&desired);
     let plan = create_plan(
-        &desired,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),

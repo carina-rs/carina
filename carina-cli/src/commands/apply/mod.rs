@@ -1133,8 +1133,11 @@ async fn run_apply_locked(
         .map(|sf| sf.build_directives())
         .unwrap_or_default();
     let schemas = ctx.schemas();
+    let (managed_for_plan, data_sources_for_plan) =
+        carina_core::differ::split_resources_by_kind(&resources_for_plan);
     let mut plan = create_plan(
-        &resources_for_plan,
+        &managed_for_plan,
+        &data_sources_for_plan,
         &current_states,
         &directives_map,
         schemas,
@@ -1146,7 +1149,9 @@ async fn run_apply_locked(
 
     // Populate cascading updates for create_before_destroy Replace effects.
     // Uses unresolved resources (sorted_resources) so dependents retain ResourceRef values.
-    cascade_dependent_updates(&mut plan, &sorted_resources, &current_states, schemas);
+    let (unresolved_managed, _unresolved_ds) =
+        carina_core::differ::split_resources_by_kind(&sorted_resources);
+    cascade_dependent_updates(&mut plan, &unresolved_managed, &current_states, schemas);
 
     // Add state block effects (import/removed/moved) to the plan
     crate::wiring::add_state_block_effects(

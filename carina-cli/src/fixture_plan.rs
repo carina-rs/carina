@@ -214,8 +214,11 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &state_file,
     );
 
+    let (managed_for_plan, data_sources_for_plan) =
+        carina_core::differ::split_resources_by_kind(&resources);
     let mut plan = create_plan(
-        &resources,
+        &managed_for_plan,
+        &data_sources_for_plan,
         &current_states,
         &directives_map,
         wiring.schemas(),
@@ -225,9 +228,11 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &parsed.wait_bindings,
     );
 
+    let (unresolved_managed, _unresolved_ds) =
+        carina_core::differ::split_resources_by_kind(&sorted_resources);
     cascade_dependent_updates(
         &mut plan,
-        &sorted_resources,
+        &unresolved_managed,
         &current_states,
         wiring.schemas(),
     );

@@ -61,8 +61,10 @@ fn create_before_destroy_generates_temporary_name_for_name_attribute() {
             .with_name_attribute("bucket_name"),
     );
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -146,8 +148,10 @@ fn create_before_destroy_generates_temporary_name_with_can_rename() {
             .with_name_attribute("log_group_name"),
     );
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -213,8 +217,10 @@ fn no_temporary_name_without_create_before_destroy() {
             .with_name_attribute("bucket_name"),
     );
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -283,8 +289,10 @@ fn no_temporary_name_when_name_prefix_is_used() {
             .with_name_attribute("bucket_name"),
     );
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -337,8 +345,10 @@ fn no_temporary_name_without_name_attribute_in_schema() {
         // No name_attribute set
     );
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -405,8 +415,10 @@ fn no_temporary_name_when_name_attribute_changes() {
             .with_name_attribute("bucket_name"),
     );
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -672,8 +684,10 @@ fn create_plan_detects_attribute_removal() {
         explicit_top_level(&["region", "tags"]),
     );
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -738,8 +752,10 @@ fn create_plan_filters_non_removable_attribute_removal() {
             )),
     );
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -807,8 +823,10 @@ fn create_plan_skips_update_when_only_non_removable_removal() {
             .attribute(AttributeSchema::new("region", AttributeType::String).non_removable()),
     );
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -882,7 +900,8 @@ fn prevent_destroy_blocks_delete_for_orphaned_resource() {
     );
 
     let plan = create_plan(
-        &[], // no desired resources
+        &[],
+        &[],
         &current_states,
         &directives_map,
         &SchemaRegistry::new(),
@@ -945,8 +964,10 @@ fn prevent_destroy_blocks_replace() {
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
     );
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -999,8 +1020,10 @@ fn prevent_destroy_does_not_block_update() {
         State::existing(ResourceId::new("s3.Bucket", "my-bucket"), attrs),
     );
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -1037,8 +1060,10 @@ fn prevent_destroy_does_not_block_create() {
 
     let resources = vec![resource];
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &HashMap::new(), // no current states (resource doesn't exist)
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -1078,7 +1103,8 @@ fn without_prevent_destroy_delete_works_normally() {
     );
 
     let plan = create_plan(
-        &[], // no desired resources
+        &[],
+        &[],
         &current_states,
         &HashMap::new(), // no directives (default = prevent_destroy: false)
         &SchemaRegistry::new(),
@@ -1141,6 +1167,7 @@ fn prevent_destroy_collects_multiple_errors() {
 
     let plan = create_plan(
         &[],
+        &[],
         &current_states,
         &directives_map,
         &SchemaRegistry::new(),
@@ -1178,8 +1205,10 @@ fn virtual_resources_are_skipped_in_plan() {
 
     let resources = vec![virtual_resource, real_resource];
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &HashMap::new(),
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -1228,8 +1257,10 @@ fn wait_binding_lowers_to_wait_effect() {
         line: 1,
     };
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &HashMap::new(),
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -1313,8 +1344,10 @@ fn wait_uses_schema_default_timeout_when_omitted() {
         line: 1,
     };
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &HashMap::new(),
         &HashMap::new(),
         &schemas,
@@ -1356,8 +1389,10 @@ fn wait_with_unknown_target_emits_plan_error() {
         line: 1,
     };
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &HashMap::new(),
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -1420,8 +1455,10 @@ fn wait_omitted_when_all_consumers_unchanged() {
         line: 1,
     };
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -1470,8 +1507,10 @@ fn wait_emitted_when_a_consumer_has_a_pending_change() {
         line: 1,
     };
 
+    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &resources,
+        &managed___,
+        &data_sources___,
         &HashMap::new(),
         &HashMap::new(),
         &SchemaRegistry::new(),
