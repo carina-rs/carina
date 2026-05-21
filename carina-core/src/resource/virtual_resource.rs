@@ -17,6 +17,7 @@
 use std::collections::{BTreeSet, HashSet};
 
 use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 
 use super::{Resource, ResourceId, ResourceKind, ResourceKindLabel, ResourceKindMismatch, Value};
 
@@ -55,15 +56,17 @@ use super::{Resource, ResourceId, ResourceKind, ResourceKindLabel, ResourceKindM
 ///     &v.module_source
 /// }
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VirtualResource {
     pub id: ResourceId,
     /// Attributes that may contain unresolved `ResourceRef` /
     /// `BindingRef` values. Resolution is deferred until post-apply.
     pub attributes: IndexMap<String, Value>,
     /// Binding name from `let` bindings in DSL.
+    #[serde(default)]
     pub binding: Option<String>,
     /// Binding names this virtual depends on.
+    #[serde(default)]
     pub dependency_bindings: BTreeSet<String>,
     /// Module name from the originating `ResourceKind::Virtual` tag
     /// (e.g. "web_tier"). Always set for virtuals — see #2516.
@@ -71,7 +74,9 @@ pub struct VirtualResource {
     /// Module instance binding name (e.g. "web").
     pub instance: String,
     /// Parser-level: attributes whose value was written as a quoted
-    /// string literal.
+    /// string literal. Parse-time only; `#[serde(skip)]` keeps it out
+    /// of state — mirrors [`Resource::quoted_string_attrs`].
+    #[serde(default, skip)]
     pub quoted_string_attrs: HashSet<String>,
 }
 

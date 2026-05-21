@@ -9,8 +9,8 @@ use crate::parser::{
     ArgumentParameter, BindingName, DeferredForExpression, ModuleCall, ParsedFile, WaitBinding,
 };
 use crate::resource::{
-    ConcreteValue, DeferredValue, Directives, Resource, ResourceId, ResourceKind, ResourceName,
-    Value,
+    ConcreteValue, DataSource, DeferredValue, Directives, Resource, ResourceId, ResourceKind,
+    ResourceName, Value, VirtualResource,
 };
 
 use super::error::ModuleError;
@@ -292,6 +292,23 @@ impl ModuleResolver<'_> {
             })
             .collect();
 
+        // carina#3181 PR A: project the expanded resources into the
+        // typed `data_sources` / `virtual_resources` slices in parallel
+        // with the legacy `resources` Vec. A module instance contributes
+        // both managed resources and exactly one `_virtual` attribute
+        // resource (built above); a module may also declare data
+        // sources. `expanded_resources` keeps every resource so current
+        // consumers are untouched; PR B migrates them onto the typed
+        // slices.
+        let data_sources: Vec<DataSource> = expanded_resources
+            .iter()
+            .filter_map(|r| r.try_into().ok())
+            .collect();
+        let virtual_resources: Vec<VirtualResource> = expanded_resources
+            .iter()
+            .filter_map(|r| r.try_into().ok())
+            .collect();
+
         // The contribution is a full `ParsedFile` built with an
         // **exhaustive struct literal** (no `..Default::default()`):
         // adding a `File<E>` field breaks this until someone decides
@@ -301,6 +318,8 @@ impl ModuleResolver<'_> {
         Ok(ParsedFile {
             // Populated from the module, instance-prefixed:
             resources: expanded_resources,
+            data_sources,
+            virtual_resources,
             wait_bindings: expanded_wait_bindings,
             deferred_for_expressions: expanded_deferred_for_expressions,
 

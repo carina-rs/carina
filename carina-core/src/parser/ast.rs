@@ -7,7 +7,10 @@ use super::expressions::for_expr::ForBinding;
 use super::expressions::validate_expr::CompareOp;
 use super::util::snake_to_pascal;
 use crate::binding_index::IterableBindings;
-use crate::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, UnknownReason, Value};
+use crate::resource::{
+    ConcreteValue, DataSource, DeferredValue, Resource, ResourceId, UnknownReason, Value,
+    VirtualResource,
+};
 use crate::version_constraint::VersionConstraint;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
@@ -665,7 +668,27 @@ impl ExportParamLike for InferredExportParam {
 #[derive(Debug, Clone)]
 pub struct File<E> {
     pub providers: Vec<ProviderConfig>,
+    /// Heterogeneous resource collection (managed + virtual + data
+    /// source mixed), discriminated by `Resource::kind`.
+    ///
+    /// **Transitional (carina#3181 PR A):** the typestate split is
+    /// migrating consumers off this mixed `Vec` onto the typed
+    /// [`data_sources`](Self::data_sources) /
+    /// [`virtual_resources`](Self::virtual_resources) slices. While the
+    /// migration is in flight every resource is stored **twice**: once
+    /// here (legacy readers) and once in the matching typed slice. PR B
+    /// makes this field managed-only once all legacy readers are gone.
     pub resources: Vec<Resource>,
+    /// Read-only data-source resources (`read`-keyword resources).
+    ///
+    /// **Transitional (carina#3181 PR A):** populated in parallel with
+    /// `resources`; no consumer reads it yet (PR B migrates them).
+    pub data_sources: Vec<DataSource>,
+    /// Virtual resources synthesized by module-call expansion.
+    ///
+    /// **Transitional (carina#3181 PR A):** populated in parallel with
+    /// `resources`; no consumer reads it yet (PR B migrates them).
+    pub virtual_resources: Vec<VirtualResource>,
     pub variables: IndexMap<String, Value>,
     /// Module `use` statements
     pub uses: Vec<UseStatement>,
@@ -711,6 +734,8 @@ impl<E> Default for File<E> {
         Self {
             providers: Vec::new(),
             resources: Vec::new(),
+            data_sources: Vec::new(),
+            virtual_resources: Vec::new(),
             variables: IndexMap::new(),
             uses: Vec::new(),
             module_calls: Vec::new(),
@@ -748,6 +773,8 @@ impl<E> File<E> {
         let File {
             providers,
             resources,
+            data_sources,
+            virtual_resources,
             variables,
             uses,
             module_calls,
@@ -768,6 +795,8 @@ impl<E> File<E> {
         File {
             providers,
             resources,
+            data_sources,
+            virtual_resources,
             variables,
             uses,
             module_calls,
