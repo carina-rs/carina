@@ -79,11 +79,8 @@ impl TryFrom<&Resource> for VirtualResource {
     type Error = ResourceKindMismatch;
 
     fn try_from(res: &Resource) -> Result<Self, Self::Error> {
-        match &res.kind {
-            ResourceKind::Virtual {
-                module_name,
-                instance,
-            } => Ok(Self {
+        match (&res.kind, &res.virtual_module) {
+            (ResourceKind::Virtual, Some((module_name, instance))) => Ok(Self {
                 id: res.id.clone(),
                 attributes: res.attributes.clone(),
                 binding: res.binding.clone(),
@@ -92,7 +89,13 @@ impl TryFrom<&Resource> for VirtualResource {
                 instance: instance.clone(),
                 quoted_string_attrs: res.quoted_string_attrs.clone(),
             }),
-            other => Err(ResourceKindMismatch {
+            (ResourceKind::Virtual, None) => Err(ResourceKindMismatch {
+                // Inconsistent: kind says Virtual but virtual_module is None.
+                // Treat as the kind label mismatch since the data is missing.
+                expected: ResourceKindLabel::Virtual,
+                actual: ResourceKindLabel::Virtual,
+            }),
+            (other, _) => Err(ResourceKindMismatch {
                 expected: ResourceKindLabel::Virtual,
                 actual: other.label(),
             }),

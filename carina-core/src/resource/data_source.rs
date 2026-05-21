@@ -93,6 +93,7 @@ impl From<&DataSource> for Resource {
             dependency_bindings: d.dependency_bindings.clone(),
             module_source: d.module_source.clone(),
             quoted_string_attrs: d.quoted_string_attrs.clone(),
+            virtual_module: None,
         }
     }
 }

@@ -201,7 +201,7 @@ pub(crate) fn resolve_exports(
     let mut managed: Vec<ManagedResource> = Vec::with_capacity(sorted_resources.len());
     for r in sorted_resources {
         match r.kind {
-            ResourceKind::Virtual { .. } => {
+            ResourceKind::Virtual => {
                 // Virtuals come from `pre_resolve_virtuals` below.
                 continue;
             }
@@ -619,6 +619,7 @@ pub(crate) fn build_orphan_resource(sf: &carina_state::StateFile, id: &ResourceI
         dependency_bindings: rs.dependency_bindings.clone(),
         module_source: None,
         quoted_string_attrs: std::collections::HashSet::new(),
+        virtual_module: None,
     }
 }
 

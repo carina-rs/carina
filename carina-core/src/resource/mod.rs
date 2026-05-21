@@ -1599,7 +1599,14 @@ impl ModuleSource {
     }
 }
 
-/// Classification of a resource in the IR
+/// Classification of a resource in the IR.
+///
+/// Carina#3181 (step 2) flattened `Virtual { module_name, instance }`
+/// to a bare variant; the (`module_name`, `instance`) pair now lives on
+/// the [`Resource`] struct as `virtual_module: Option<(String, String)>`.
+/// The discriminator stays load-bearing while [`Effect`] payloads carry
+/// `Resource` (next step); both go away when the full inline-merge
+/// lands.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub enum ResourceKind {
     /// A managed infrastructure resource with full CRUD lifecycle.
@@ -1607,10 +1614,9 @@ pub enum ResourceKind {
     Managed,
     /// A virtual resource created by the module resolver to expose module attributes.
     /// Virtual resources are not sent to providers; they exist only in the IR.
-    Virtual {
-        module_name: String,
-        instance: String,
-    },
+    /// Pair with `Resource::virtual_module` for the originating module
+    /// data.
+    Virtual,
     /// A data source (read-only) that is queried but not managed
     DataSource,
 }
@@ -1668,6 +1674,13 @@ pub struct Resource {
     /// Parse-time only; `#[serde(skip)]` keeps it out of state.
     #[serde(default, skip)]
     pub quoted_string_attrs: HashSet<String>,
+    /// For virtual resources, the `(module_name, instance)` data
+    /// previously encoded in `ResourceKind::Virtual { module_name,
+    /// instance }`. Hoisted to a struct field so the discriminant
+    /// can be flattened to a plain enum (carina#3181 step 1). Only
+    /// `Some` when `kind == ResourceKind::Virtual`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_module: Option<(String, String)>,
 }
 
 impl Resource {
@@ -1682,6 +1695,7 @@ impl Resource {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             quoted_string_attrs: HashSet::new(),
+            virtual_module: None,
         }
     }
 
@@ -1701,6 +1715,7 @@ impl Resource {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             quoted_string_attrs: HashSet::new(),
+            virtual_module: None,
         }
     }
 
@@ -1779,7 +1794,7 @@ impl Resource {
     /// `attributes` values as a structured record. They should not be sent to
     /// providers for reading, creating, or updating.
     pub fn is_virtual(&self) -> bool {
-        matches!(self.kind, ResourceKind::Virtual { .. })
+        matches!(self.kind, ResourceKind::Virtual)
     }
 }
 
