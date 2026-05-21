@@ -63,3 +63,23 @@ impl TryFrom<&Resource> for ManagedResource {
         }
     }
 }
+
+/// Transitional bridge — rebuild a legacy [`Resource`] from a
+/// `ManagedResource`. Co-located with the reverse `TryFrom<&Resource>`
+/// impl above so #3181 can remove both directions in one place when
+/// `Resource` is inline-merged into `ManagedResource`.
+impl From<&ManagedResource> for Resource {
+    fn from(m: &ManagedResource) -> Self {
+        Self {
+            id: m.id.clone(),
+            attributes: m.attributes.clone(),
+            kind: ResourceKind::Managed,
+            directives: m.directives.clone(),
+            prefixes: m.prefixes.clone(),
+            binding: m.binding.clone(),
+            dependency_bindings: m.dependency_bindings.clone(),
+            module_source: m.module_source.clone(),
+            quoted_string_attrs: m.quoted_string_attrs.clone(),
+        }
+    }
+}

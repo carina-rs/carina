@@ -9,8 +9,8 @@ use indexmap::IndexMap;
 
 use crate::binding_index::ResolvedBindings;
 use crate::resource::{
-    ConcreteValue, DeferredValue, InterpolationPart, Resource, ResourceId, State, Value,
-    contains_resource_ref, peel_secrets, rewrap_secrets,
+    ConcreteValue, DeferredValue, InterpolationPart, ManagedResource, Resource, ResourceId, State,
+    Value, VirtualResource, contains_resource_ref, peel_secrets, rewrap_secrets,
 };
 
 /// Resolve all ResourceRef values in resources using current state.
@@ -118,6 +118,92 @@ fn resolve_refs_inner(
             resolved_attrs.insert(key.clone(), final_value);
         }
         resource.attributes = resolved_attrs;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Typed resolver entry points (#3175 / typestate split)
+// ---------------------------------------------------------------------------
+
+/// Pre-apply path: resolve `ResourceRef` values across a slice of
+/// `ManagedResource`s.
+///
+/// Encodes the design-doc invariant ("`VirtualResource`s are never
+/// resolved against pre-apply state") at the type level: the slice
+/// type rejects virtuals at compile time. For virtuals, use
+/// [`resolve_virtual_refs_post_apply`] from `finalize_apply` (#3177).
+///
+/// # Scope limitation
+///
+/// Bindings are built from the managed slice alone — virtual bindings
+/// are **not** in the binding map. A managed attribute that references
+/// a virtual binding pre-apply (`managed_x.attr = ref some_module.role_arn`)
+/// will leave its ResourceRef un-resolved. The typestate split treats
+/// this as a non-case: in the migration target, managed inputs that
+/// depend on virtual outputs are routed via `wait` bindings or
+/// upstream-state passthroughs. If a real call site needs the
+/// mixed-bindings shape, prefer the legacy shim
+/// [`resolve_refs_with_state_and_remote`] until #3176 ships a typed
+/// constructor that accepts both slices.
+///
+/// Internally this currently round-trips through the legacy
+/// `&mut [Resource]` pipeline so behaviour matches
+/// [`resolve_refs_with_state_and_remote`] bit-for-bit when the inputs
+/// contain no managed→virtual references. The round-trip itself is
+/// removed once a managed-slice `ResolvedBindings` constructor lands;
+/// the `From<&ManagedResource> for Resource` bridge survives until
+/// #3181 inline-merges the two types.
+pub fn resolve_managed_refs_with_state_and_remote(
+    managed: &mut [ManagedResource],
+    current_states: &HashMap<ResourceId, State>,
+    remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    wait_aliases: &[crate::binding_index::WaitAliasSpec],
+) -> Result<(), String> {
+    let mut bridge: Vec<Resource> = managed.iter().map(Resource::from).collect();
+    resolve_refs_inner(
+        &mut bridge,
+        current_states,
+        remote_bindings,
+        wait_aliases,
+        false,
+    )?;
+    // Invariant: `resolve_refs_inner` mutates ONLY `attributes` and
+    // `dependency_bindings` on each `Resource` (lines 86-91 and 109-121).
+    // If that contract is broadened, extend the write-back below — the
+    // bridge silently drops any other mutation otherwise. Removed
+    // entirely once #3181 lands and the bridge goes away.
+    for (m, r) in managed.iter_mut().zip(bridge) {
+        m.attributes = r.attributes;
+        m.dependency_bindings = r.dependency_bindings;
+    }
+    Ok(())
+}
+
+/// Post-apply path: resolve `ResourceRef` values across a slice of
+/// `VirtualResource`s using a `ResolvedBindings` view that the caller
+/// has already built against the post-apply state.
+///
+/// Calling this against pre-apply state would re-introduce the
+/// #3169 exports-drift bug, so the caller is responsible for the
+/// post-apply ordering. The signature is structurally distinct from
+/// [`resolve_managed_refs_with_state_and_remote`] (takes a built
+/// bindings view, not the raw state inputs) to make accidental
+/// pre-apply use harder to write.
+///
+/// `dependency_bindings` is left untouched: virtual→managed edges are
+/// already recorded during the pre-apply pass, and the post-apply
+/// resolution only needs to materialise the attribute values.
+pub fn resolve_virtual_refs_post_apply(
+    virtuals: &mut [VirtualResource],
+    bindings: &ResolvedBindings,
+) -> Result<(), String> {
+    for v in virtuals.iter_mut() {
+        let mut resolved_attrs: IndexMap<String, Value> = IndexMap::new();
+        for (key, value) in &v.attributes {
+            resolved_attrs.insert(key.clone(), resolve_ref_value(value, bindings)?);
+        }
+        v.attributes = resolved_attrs;
     }
     Ok(())
 }
