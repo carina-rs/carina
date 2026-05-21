@@ -73,11 +73,12 @@ pub fn validate_deferred_populate_refs<E>(
     // Walks both top-level resources and for-expression bodies so a
     // chained ref inside a `for` body still finds its target binding.
     let mut by_binding: HashMap<String, (String, String)> = HashMap::new();
-    for (_, r) in parsed.iter_all_resources() {
-        if let Some(b) = &r.binding {
+    for rref in parsed.iter_all_resources() {
+        if let Some(b) = rref.binding() {
+            let id = rref.id();
             by_binding.insert(
-                b.clone(),
-                (r.id.provider.clone(), r.id.resource_type.clone()),
+                b.to_string(),
+                (id.provider.clone(), id.resource_type.clone()),
             );
         }
     }
@@ -95,12 +96,12 @@ pub fn validate_deferred_populate_refs<E>(
         .collect();
 
     let mut out: Vec<DeferredPopulateDiagnostic> = Vec::new();
-    for (_, r) in parsed.iter_all_resources() {
-        for (key, value) in &r.attributes {
+    for rref in parsed.iter_all_resources() {
+        for (key, value) in rref.attributes() {
             collect_unsynchronized_refs(
                 value,
                 key,
-                r.binding.as_deref(),
+                rref.binding(),
                 &by_binding,
                 &synchronized,
                 schemas,

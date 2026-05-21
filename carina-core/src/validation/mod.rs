@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use indexmap::IndexMap;
 
 use crate::binding_index::BindingIndex;
-use crate::parser::{ModuleCall, ProviderContext, TypeExpr, validate_custom_type};
+use crate::parser::{ModuleCall, ProviderContext, ResourceRef, TypeExpr, validate_custom_type};
 use crate::provider::ProviderFactory;
 use crate::resource::{ConcreteValue, DeferredValue, Resource, Value};
 use crate::schema::{AttributeType, SchemaRegistry, suggest_similar_name};
@@ -39,30 +39,32 @@ pub fn validate_resources<E>(
     let mut all_errors = Vec::new();
     let lookup = crate::parser::provider_context_lookup(provider_context);
 
-    // Classify per kind via typed wrappers instead of runtime
-    // `is_virtual()` / `is_data_source()` calls (carina#3180). Virtuals
-    // are post-apply attribute containers and have no schema to
-    // validate against, so they are silently filtered. Managed and
-    // data sources route to the same schema-lookup body but render
-    // different kind-mismatch diagnostics when the registry entry of
-    // the *opposite* kind exists.
-    use crate::resource::{DataSource, ManagedResource, VirtualResource};
+    // Classify per kind via the typed `ResourceRef` arms instead of
+    // runtime `is_virtual()` / `is_data_source()` calls (carina#3180 /
+    // #3181). Virtuals are post-apply attribute containers and have no
+    // schema to validate against, so they are silently filtered. Managed
+    // and data sources route to the same schema-lookup body but render
+    // different kind-mismatch diagnostics when the registry entry of the
+    // *opposite* kind exists.
     enum ValidatableKind {
         Managed,
         DataSource,
     }
-    for (_ctx, resource) in parsed.iter_all_resources() {
-        if VirtualResource::try_from(resource).is_ok() {
-            continue;
-        }
-        let kind = if DataSource::try_from(resource).is_ok() {
-            ValidatableKind::DataSource
-        } else if ManagedResource::try_from(resource).is_ok() {
-            ValidatableKind::Managed
-        } else {
-            // Unknown kind — shouldn't happen, but keep the loop total.
-            continue;
+    for rref in parsed.iter_all_resources() {
+        let kind = match rref {
+            ResourceRef::Virtual(_) => continue,
+            ResourceRef::DataSource(_) => ValidatableKind::DataSource,
+            ResourceRef::Managed(_) => ValidatableKind::Managed,
+            // A deferred for-expression template body classifies by its
+            // own `kind` — same as the legacy `try_from` ladder did.
+            ResourceRef::Deferred { resource, .. } => match resource.kind {
+                crate::resource::ResourceKind::Virtual => continue,
+                crate::resource::ResourceKind::DataSource => ValidatableKind::DataSource,
+                crate::resource::ResourceKind::Managed => ValidatableKind::Managed,
+            },
         };
+        let resource = rref.as_legacy_resource();
+        let resource = resource.as_ref();
 
         match registry.get_for(resource) {
             Some(schema) => {
@@ -140,12 +142,13 @@ pub fn validate_resource_ref_types<E>(
     // (#2231).
     let bindings = BindingIndex::from_parsed(parsed, registry);
 
-    for (_ctx, resource) in parsed.iter_all_resources() {
-        let Some(schema) = registry.get_for(resource) else {
+    for rref in parsed.iter_all_resources() {
+        let resource = rref.as_legacy_resource();
+        let Some(schema) = registry.get_for(resource.as_ref()) else {
             continue;
         };
 
-        for (attr_name, attr_value) in &resource.attributes {
+        for (attr_name, attr_value) in rref.attributes() {
             if attr_name.starts_with('_') {
                 continue;
             }
@@ -791,12 +794,12 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
     // Walk top-level and for-body resources so bindings declared inside a
     // `for` template are also tracked.
     let mut defined_bindings: Vec<String> = Vec::new();
-    for (_ctx, resource) in parsed.iter_all_resources() {
-        if let Some(ref binding_name) = resource.binding {
+    for rref in parsed.iter_all_resources() {
+        if let Some(binding_name) = rref.binding() {
             if binding_name == "_" {
                 continue;
             }
-            defined_bindings.push(binding_name.clone());
+            defined_bindings.push(binding_name.to_string());
         }
     }
 
@@ -817,15 +820,17 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
     // string form survives, so a reference nested in
     // `principals = [binding.attr]` would otherwise be missed.
     let mut referenced: HashSet<String> = HashSet::new();
-    for (_ctx, resource) in parsed.iter_all_resources() {
-        for (attr_name, value) in &resource.attributes {
+    for rref in parsed.iter_all_resources() {
+        for (attr_name, value) in rref.attributes() {
             if attr_name.starts_with('_') {
                 continue;
             }
             collect_resource_refs(value, &mut referenced);
             collect_dot_notation_refs(value, &mut referenced);
         }
-        for dep in &resource.directives.depends_on {
+        // `VirtualResource` has no directives — `directives()` is `None`
+        // for that arm, so the depends_on walk is simply skipped.
+        for dep in rref.directives().into_iter().flat_map(|d| &d.depends_on) {
             referenced.insert(dep.clone());
         }
     }

@@ -14,8 +14,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::deps::sort_resources_by_dependencies;
-use crate::parser::File;
-use crate::resource::{Resource, ResourceKind};
+use crate::parser::{File, ResourceRef};
+use crate::resource::ResourceKind;
 use crate::validation::{collect_dot_notation_refs, collect_resource_refs};
 
 /// Severity of a depends_on diagnostic.
@@ -73,6 +73,15 @@ impl DependsOnDiagnostic {
     }
 }
 
+/// The `directives.depends_on` list of a resource, or an empty slice.
+///
+/// `VirtualResource` carries no directives — [`ResourceRef::directives`]
+/// is `None` for that arm, treated here as an empty `depends_on` list.
+fn depends_on_of<'a>(rref: ResourceRef<'a>) -> &'a [String] {
+    rref.directives()
+        .map_or(&[][..], |d| d.depends_on.as_slice())
+}
+
 /// Run all depends_on checks against a parsed file. Returns the full
 /// list of diagnostics (errors + warnings); callers decide how to surface
 /// them.
@@ -83,16 +92,16 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
     // (per the carina-core "directory-scoped, never single-file" rule).
     if parsed
         .iter_all_resources()
-        .all(|(_, r)| r.directives.depends_on.is_empty())
+        .all(|rref| depends_on_of(rref).is_empty())
     {
         return Vec::new();
     }
 
     let mut diags = Vec::new();
 
-    let bindings_by_name: HashMap<&str, &Resource> = parsed
+    let bindings_by_name: HashMap<&str, ResourceRef<'_>> = parsed
         .iter_all_resources()
-        .filter_map(|(_, r)| r.binding.as_deref().map(|n| (n, r)))
+        .filter_map(|rref| rref.binding().map(|n| (n, rref)))
         .collect();
     let upstream_names: HashSet<&str> = parsed
         .upstream_states
@@ -100,27 +109,28 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
         .map(|us| us.binding.as_str())
         .collect();
 
-    for (_, resource) in parsed.iter_all_resources() {
-        if resource.directives.depends_on.is_empty() {
+    for resource in parsed.iter_all_resources() {
+        let depends_on = depends_on_of(resource);
+        if depends_on.is_empty() {
             continue;
         }
         // `self_name` is only needed for self-reference detection; an
         // anonymous resource cannot self-reference (no name to point
         // back to), so an unbound resource just gets the other checks.
-        let self_name = resource.binding.as_deref().unwrap_or("(anonymous)");
+        let self_name = resource.binding().unwrap_or("(anonymous)");
 
         let mut value_ref_deps: HashSet<String> = HashSet::new();
-        for value in resource.attributes.values() {
+        for value in resource.attributes().values() {
             collect_resource_refs(value, &mut value_ref_deps);
             collect_dot_notation_refs(value, &mut value_ref_deps);
         }
-        for name in &resource.dependency_bindings {
+        for name in resource.as_resource_like().dependency_bindings() {
             value_ref_deps.insert(name.clone());
         }
 
         let mut seen: HashSet<&str> = HashSet::new();
         let mut duplicate_warned: HashSet<&str> = HashSet::new();
-        for dep_name in &resource.directives.depends_on {
+        for dep_name in depends_on {
             if !seen.insert(dep_name.as_str()) {
                 if duplicate_warned.insert(dep_name.as_str()) {
                     diags.push(
@@ -169,7 +179,7 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
                 continue;
             };
 
-            if matches!(target.kind, ResourceKind::DataSource) {
+            if matches!(target.kind(), ResourceKind::DataSource) {
                 diags.push(
                     DependsOnDiagnostic::error(format!(
                         "directives.depends_on on '{}': data sources cannot be \

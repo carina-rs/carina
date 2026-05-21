@@ -1021,9 +1021,9 @@ impl DiagnosticEngine {
         // Collect defined binding names from parsed resources, including
         // bindings declared inside for-body templates.
         let mut defined_bindings: HashSet<String> = HashSet::new();
-        for (_ctx, resource) in parsed.iter_all_resources() {
-            if let Some(ref binding_name) = resource.binding {
-                defined_bindings.insert(binding_name.clone());
+        for rref in parsed.iter_all_resources() {
+            if let Some(binding_name) = rref.binding() {
+                defined_bindings.insert(binding_name.to_string());
             }
         }
 
@@ -1637,8 +1637,8 @@ impl DiagnosticEngine {
             (None, None) => parsed.user_functions.keys().cloned().collect(),
         };
 
-        for (_ctx, resource) in parsed.iter_all_resources() {
-            for value in resource.attributes.values() {
+        for rref in parsed.iter_all_resources() {
+            for value in rref.attributes().values() {
                 self.collect_unknown_function_diagnostics(doc, value, &user_fns, &mut diagnostics);
             }
         }
@@ -1755,8 +1755,8 @@ impl DiagnosticEngine {
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
-        for (_ctx, resource) in parsed.iter_all_resources() {
-            for (attr_name, attr_value) in &resource.attributes {
+        for rref in parsed.iter_all_resources() {
+            for (attr_name, attr_value) in rref.attributes() {
                 if attr_name.starts_with('_') {
                     continue;
                 }

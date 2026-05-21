@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::config_loader::{find_crn_files_in_dir, parse_directory};
-use crate::parser::{ProviderContext, ResourceContext, TypeExpr, UpstreamState};
+use crate::parser::{ProviderContext, ResourceContext, ResourceRef, TypeExpr, UpstreamState};
 use crate::resource::{ConcreteValue, DeferredValue, Subscript, Value};
 use crate::schema::{AttributeType, SchemaRegistry, suggest_similar_name};
 
@@ -285,35 +285,35 @@ pub fn resolve_upstream_exports_with_schemas(
 /// `for-body` prefix when the resource is a deferred-for template.
 /// Three checks emit the same string; centralized here so a future
 /// tweak to the wording lands in one place.
-fn resource_attr_location(
-    ctx: ResourceContext<'_>,
-    resource: &crate::resource::Resource,
-    attr_name: &str,
-) -> String {
-    match ctx {
-        ResourceContext::Direct => format!("{} attribute `{}`", resource.id, attr_name),
-        ResourceContext::Deferred(d) => format!(
-            "for-body `{}` {} attribute `{}`",
-            d.header, resource.id, attr_name
-        ),
+fn resource_attr_location(rref: ResourceRef<'_>, attr_name: &str) -> String {
+    match rref.context() {
+        ResourceContext::Direct => format!("{} attribute `{}`", rref.id(), attr_name),
+        ResourceContext::Deferred(d) => {
+            format!(
+                "for-body `{}` {} attribute `{}`",
+                d.header,
+                rref.id(),
+                attr_name
+            )
+        }
     }
 }
 
-/// Walk every resource attribute in the project (Direct + deferred-for
-/// templates), yielding `(ResourceContext, &Resource, attr_name, &Value)`
-/// for each non-internal attribute (skips `_*` keys). Used by all three
-/// upstream-ref checks; centralized so the iter_all_resources walk and
-/// the `_*` skip are written once.
+/// Walk every resource attribute in the project (managed, virtual, data
+/// source, and deferred-for templates), yielding
+/// `(ResourceRef, attr_name, &Value)` for each non-internal attribute
+/// (skips `_*` keys). Used by all upstream-ref checks; centralized so the
+/// `iter_all_resources` walk and the `_*` skip are written once.
 fn for_each_resource_attr<E, F>(parsed: &crate::parser::File<E>, mut f: F)
 where
-    F: FnMut(ResourceContext<'_>, &crate::resource::Resource, &str, &Value),
+    F: FnMut(ResourceRef<'_>, &str, &Value),
 {
-    for (ctx, resource) in parsed.iter_all_resources() {
-        for (attr_name, value) in resource.attributes.iter() {
+    for rref in parsed.iter_all_resources() {
+        for (attr_name, value) in rref.attributes().iter() {
             if attr_name.starts_with('_') {
                 continue;
             }
-            f(ctx, resource, attr_name, value);
+            f(rref, attr_name, value);
         }
     }
 }
@@ -430,8 +430,8 @@ pub fn check_upstream_state_field_references<E: crate::parser::ExportParamLike>(
         // one walk via `iter_all_resources` (helper). Location strings
         // use the `ResourceContext::Deferred` branch to mention the for
         // header so users can tell body errors from top-level ones.
-        for_each_resource_attr(parsed, |ctx, resource, attr_name, value| {
-            check(value, &resource_attr_location(ctx, resource, attr_name));
+        for_each_resource_attr(parsed, |rref, attr_name, value| {
+            check(value, &resource_attr_location(rref, attr_name));
         });
         for_each_non_resource_value(parsed, NonResourceScope::All, |value, location| {
             check(value, location);
@@ -536,14 +536,15 @@ pub fn check_upstream_state_field_types<E>(
     registry: &SchemaRegistry,
 ) -> Vec<UpstreamTypeError> {
     let mut errors: Vec<UpstreamTypeError> = Vec::new();
-    for_each_resource_attr(parsed, |ctx, resource, attr_name, value| {
-        let Some(schema) = registry.get_for(resource) else {
+    for_each_resource_attr(parsed, |rref, attr_name, value| {
+        let resource = rref.as_legacy_resource();
+        let Some(schema) = registry.get_for(resource.as_ref()) else {
             return;
         };
         let Some(attr_schema) = schema.attributes.get(attr_name) else {
             return;
         };
-        let location = resource_attr_location(ctx, resource, attr_name);
+        let location = resource_attr_location(rref, attr_name);
         check_ref_against_type(
             value,
             &attr_schema.attr_type,
@@ -1020,11 +1021,11 @@ pub fn check_upstream_state_attribute_access_shapes<E: crate::parser::ExportPara
     exports: &UpstreamExports,
 ) -> Vec<UpstreamAttributeAccessShapeError> {
     let mut errors: Vec<UpstreamAttributeAccessShapeError> = Vec::new();
-    for_each_resource_attr(parsed, |ctx, resource, attr_name, value| {
+    for_each_resource_attr(parsed, |rref, attr_name, value| {
         visit_attribute_access(
             value,
             exports,
-            &resource_attr_location(ctx, resource, attr_name),
+            &resource_attr_location(rref, attr_name),
             &mut errors,
         );
     });
@@ -1184,11 +1185,11 @@ pub fn check_upstream_state_subscript_shapes<E: crate::parser::ExportParamLike>(
     exports: &UpstreamExports,
 ) -> Vec<UpstreamSubscriptShapeError> {
     let mut errors: Vec<UpstreamSubscriptShapeError> = Vec::new();
-    for_each_resource_attr(parsed, |ctx, resource, attr_name, value| {
+    for_each_resource_attr(parsed, |rref, attr_name, value| {
         visit_subscript_access(
             value,
             exports,
-            &resource_attr_location(ctx, resource, attr_name),
+            &resource_attr_location(rref, attr_name),
             &mut errors,
         );
     });

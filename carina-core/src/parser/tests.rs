@@ -71,15 +71,61 @@ fn iter_all_resources_yields_direct_then_deferred() {
     let items: Vec<_> = parsed.iter_all_resources().collect();
     assert_eq!(items.len(), 2, "expected one direct + one deferred");
 
-    assert!(matches!(items[0].0, ResourceContext::Direct));
+    // The direct managed resource comes first.
+    assert!(matches!(items[0], ResourceRef::Managed(_)));
+    assert!(matches!(items[0].context(), ResourceContext::Direct));
     assert_eq!(
-        items[0].1.get_attr("name"),
+        items[0].attributes().get("name"),
         Some(&Value::Concrete(ConcreteValue::String(
             "direct".to_string()
         )))
     );
 
-    assert!(matches!(items[1].0, ResourceContext::Deferred(_)));
+    // The for-expression template body comes last as a Deferred arm.
+    assert!(matches!(items[1], ResourceRef::Deferred { .. }));
+    assert!(matches!(items[1].context(), ResourceContext::Deferred(_)));
+}
+
+/// carina#3181 PR B: `iter_all_resources` yields each resource exactly
+/// once with the correct typed arm. While `resources` still holds
+/// data-source rows too (PR A duplicate storage), the managed-only
+/// filter must keep a `read` resource from being double-counted as both
+/// `Managed` and `DataSource`.
+#[test]
+fn iter_all_resources_classifies_managed_and_data_source_arms() {
+    let src = r#"
+        provider aws {
+            region = aws.Region.ap_northeast_1
+        }
+        let bucket = aws.s3.Bucket {
+            bucket = "my-bucket"
+        }
+        let _ = read aws.sts.caller_identity {}
+    "#;
+    let parsed = parse(src, &ProviderContext::default()).unwrap();
+
+    let items: Vec<_> = parsed.iter_all_resources().collect();
+    // Exactly one managed + one data source — the `read` resource must
+    // NOT also appear as a `Managed` arm.
+    assert_eq!(items.len(), 2, "expected one managed + one data source");
+
+    let managed: Vec<_> = items
+        .iter()
+        .filter(|r| matches!(r, ResourceRef::Managed(_)))
+        .collect();
+    let data_sources: Vec<_> = items
+        .iter()
+        .filter(|r| matches!(r, ResourceRef::DataSource(_)))
+        .collect();
+    assert_eq!(managed.len(), 1);
+    assert_eq!(data_sources.len(), 1);
+    assert_eq!(managed[0].id().resource_type, "s3.Bucket");
+    assert_eq!(data_sources[0].id().resource_type, "sts.caller_identity");
+    assert_eq!(managed[0].kind(), crate::resource::ResourceKind::Managed);
+    assert_eq!(
+        data_sources[0].kind(),
+        crate::resource::ResourceKind::DataSource
+    );
 }
 
 #[test]
