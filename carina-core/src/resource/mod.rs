@@ -1837,12 +1837,17 @@ mod tests;
 #[cfg(test)]
 mod typestate_tests;
 
+#[cfg(test)]
+mod resource_like_tests;
+
 pub mod data_source;
 pub mod managed;
+pub mod resource_like;
 pub mod virtual_resource;
 
 pub use data_source::DataSource;
 pub use managed::ManagedResource;
+pub use resource_like::ResourceLike;
 pub use virtual_resource::VirtualResource;
 
 /// Type-level label for the three resource arms.
