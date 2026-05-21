@@ -1770,8 +1770,11 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         .as_ref()
         .map(|sf| sf.build_directives())
         .unwrap_or_default();
+    let (managed_for_plan, data_sources_for_plan) =
+        carina_core::differ::split_resources_by_kind(&resources);
     let mut plan = create_plan(
-        &resources,
+        &managed_for_plan,
+        &data_sources_for_plan,
         &current_states,
         &directives_map,
         ctx.schemas(),
@@ -1784,7 +1787,14 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     // Populate cascading updates for Replace effects with create_before_destroy.
     // Uses unresolved resources (sorted_resources) so dependent Update effects
     // retain ResourceRef values for re-resolution at apply time.
-    cascade_dependent_updates(&mut plan, &sorted_resources, &current_states, ctx.schemas());
+    let (unresolved_managed, _unresolved_ds) =
+        carina_core::differ::split_resources_by_kind(&sorted_resources);
+    cascade_dependent_updates(
+        &mut plan,
+        &unresolved_managed,
+        &current_states,
+        ctx.schemas(),
+    );
 
     // Add state block effects (import/removed/moved) to the plan
     add_state_block_effects(

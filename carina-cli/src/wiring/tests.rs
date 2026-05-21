@@ -192,8 +192,11 @@ fn test_normalize_state_prevents_false_enum_diff() {
     let saved_attrs = HashMap::new();
     let prev_explicit = HashMap::new();
     let orphan_deps = HashMap::new();
+    let (managed___, data_sources___) =
+        carina_core::differ::split_resources_by_kind(&resources_without);
     let plan_without = create_plan(
-        &resources_without,
+        &managed___,
+        &data_sources___,
         &current_states,
         &directives_map,
         &schemas,
@@ -210,8 +213,11 @@ fn test_normalize_state_prevents_false_enum_diff() {
     // After normalize_state, state values match desired values → no diff
     normalize_state_with_ctx(&ctx, &mut current_states);
     let resources_with = vec![resource];
+    let (managed_w___, data_sources_w___) =
+        carina_core::differ::split_resources_by_kind(&resources_with);
     let plan_with = create_plan(
-        &resources_with,
+        &managed_w___,
+        &data_sources_w___,
         &current_states,
         &directives_map,
         &schemas,
@@ -301,8 +307,11 @@ fn test_merge_default_tags_prevents_false_diff() {
     let directives_map: HashMap<ResourceId, Directives> = HashMap::new();
     let saved_attrs = HashMap::new();
     let orphan_deps = HashMap::new();
+    let (managed___, data_sources___) =
+        carina_core::differ::split_resources_by_kind(&resources_without);
     let plan_without = create_plan(
-        &resources_without,
+        &managed___,
+        &data_sources___,
         &current_states,
         &directives_map,
         &schemas,
@@ -330,8 +339,11 @@ fn test_merge_default_tags_prevents_false_diff() {
     rt.block_on(router.merge_default_tags(&mut resources_with, &default_tags, &schemas));
 
     // After merging, desired now has tags matching state → no diff
+    let (managed_w___, data_sources_w___) =
+        carina_core::differ::split_resources_by_kind(&resources_with);
     let plan_with = create_plan(
-        &resources_with,
+        &managed_w___,
+        &data_sources_w___,
         &current_states,
         &directives_map,
         &schemas,

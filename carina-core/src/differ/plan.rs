@@ -8,7 +8,8 @@ use crate::identifier::generate_random_suffix;
 use crate::parser::WaitBinding;
 use crate::plan::{Plan, PlanError};
 use crate::resource::{
-    ConcreteValue, DeferredValue, Directives, Resource, ResourceId, ResourceKind, State, Value,
+    ConcreteValue, DataSource, DeferredValue, Directives, ManagedResource, Resource, ResourceId,
+    ResourceKind, State, Value,
 };
 use crate::schema::{
     ResourceSchema, SchemaKind, SchemaRegistry, WAIT_DEFAULT_INTERVAL, WAIT_DEFAULT_TIMEOUT,
@@ -143,9 +144,36 @@ fn generate_temporary_name(
 /// the user never wrote, refs awscc#206) and to detect attribute
 /// removals: if a top-level key was previously in the user's desired
 /// state but is now absent, it means the user intentionally removed it.
+///
+/// # Typestate invariants
+///
+/// Virtuals are intentionally not an input. The compile-fail doctest
+/// below pins that — passing a [`VirtualResource`](crate::resource::VirtualResource)
+/// slice must fail to type-check, so the post-apply-only virtual class
+/// (carina#3169) cannot accidentally reach pre-apply differ logic.
+///
+/// ```compile_fail
+/// use std::collections::{BTreeSet, HashMap};
+/// use carina_core::differ::create_plan;
+/// use carina_core::resource::VirtualResource;
+/// use carina_core::schema::SchemaRegistry;
+/// let virtuals: Vec<VirtualResource> = vec![];
+/// let _ = create_plan(
+///     &virtuals,
+///     &[],
+///     &HashMap::new(),
+///     &HashMap::new(),
+///     &SchemaRegistry::default(),
+///     &HashMap::new(),
+///     &HashMap::new(),
+///     &HashMap::new(),
+///     &[],
+/// );
+/// ```
 #[allow(clippy::too_many_arguments)]
 pub fn create_plan(
-    desired: &[Resource],
+    managed: &[ManagedResource],
+    data_sources: &[DataSource],
     current_states: &HashMap<ResourceId, State>,
     directives_map: &HashMap<ResourceId, Directives>,
     registry: &SchemaRegistry,
@@ -156,23 +184,29 @@ pub fn create_plan(
 ) -> Plan {
     let mut plan = Plan::new();
 
-    let desired_ids: std::collections::HashSet<&ResourceId> =
-        desired.iter().map(|r| &r.id).collect();
+    let desired_ids: std::collections::HashSet<&ResourceId> = managed
+        .iter()
+        .map(|r| &r.id)
+        .chain(data_sources.iter().map(|r| &r.id))
+        .collect();
 
-    for resource in desired {
-        // Skip virtual resources (module attribute containers)
-        if resource.is_virtual() {
-            continue;
-        }
+    // Data sources only generate Read effects; the typestate split
+    // routes them through their own slice so the legacy
+    // `if resource.is_data_source() { continue; }` runtime guard is no
+    // longer reachable from this loop (carina#3179).
+    for ds in data_sources {
+        plan.add(Effect::Read {
+            resource: Resource::from(ds),
+        });
+    }
 
-        // Data sources (read-only resources) only generate Read effects
-        if resource.is_data_source() {
-            plan.add(Effect::Read {
-                resource: resource.clone(),
-            });
-            continue;
-        }
-
+    for managed_res in managed {
+        // Bridge to the legacy `Resource` shape at the differ/effect
+        // seam. `Effect::Create | Update | Replace | Delete` still
+        // carries `Resource` over the saved-plan and provider WIT
+        // wire formats; flipping those payloads is deferred to a
+        // later cleanup (see #3181 design non-goals).
+        let resource: Resource = Resource::from(managed_res);
         let current = current_states
             .get(&resource.id)
             .cloned()
@@ -186,7 +220,7 @@ pub fn create_plan(
             SchemaKind::Managed,
         );
         let d = diff(
-            resource,
+            &resource,
             &current,
             saved,
             prev_explicit_for_resource,
@@ -305,7 +339,7 @@ pub fn create_plan(
                     .unwrap_or_default();
                 let directives = resource.directives.clone();
                 let binding = resource.binding.clone();
-                let dependencies = get_resource_dependencies(resource);
+                let dependencies = get_resource_dependencies(&resource);
                 let explicit_dependencies =
                     resource.directives.depends_on.iter().cloned().collect();
                 plan.add(Effect::Delete {
@@ -385,11 +419,33 @@ pub fn create_plan(
     // wait is skipped with a plan-level error so downstream resources
     // referencing the wait binding still fail loudly.
     for wb in wait_bindings {
-        let resolved = desired
+        // Wait targets resolve over managed + data-source bindings.
+        // Virtuals are post-apply attribute containers and don't carry
+        // `until`-pollable state, so excluding them (by construction
+        // via the typed-slice split) matches the runtime invariant.
+        let resolved = managed
             .iter()
             .find(|r| r.binding.as_deref() == Some(wb.target.as_str()))
-            .or_else(|| desired.iter().find(|r| r.id.name.as_str() == wb.target));
-        let Some(target_resource) = resolved else {
+            .map(|r| r.id.clone())
+            .or_else(|| {
+                data_sources
+                    .iter()
+                    .find(|r| r.binding.as_deref() == Some(wb.target.as_str()))
+                    .map(|r| r.id.clone())
+            })
+            .or_else(|| {
+                managed
+                    .iter()
+                    .find(|r| r.id.name.as_str() == wb.target)
+                    .map(|r| r.id.clone())
+            })
+            .or_else(|| {
+                data_sources
+                    .iter()
+                    .find(|r| r.id.name.as_str() == wb.target)
+                    .map(|r| r.id.clone())
+            });
+        let Some(target_id_resolved) = resolved else {
             plan.add_error(PlanError {
                 resource_id: ResourceId::new("__wait", wb.binding.as_str()),
                 message: format!(
@@ -412,13 +468,27 @@ pub fn create_plan(
         // (carina#3101). A genuinely pending consumer change still
         // produces the wait + its dependency edge (carina#3085 /
         // carina#3061 behavior preserved).
-        let gates_a_pending_change = desired.iter().any(|r| {
-            get_resource_dependencies(r).contains(wb.binding.as_str())
-                && plan
-                    .effects()
+        let gates_a_pending_change =
+            managed
+                .iter()
+                .map(|m| (&m.id, Resource::from(m)))
+                .any(|(id, r)| {
+                    get_resource_dependencies(&r).contains(wb.binding.as_str())
+                        && plan
+                            .effects()
+                            .iter()
+                            .any(|e| e.resource_id() == id && e.is_mutating())
+                })
+                || data_sources
                     .iter()
-                    .any(|e| e.resource_id() == &r.id && e.is_mutating())
-        });
+                    .map(|d| (&d.id, Resource::from(d)))
+                    .any(|(id, r)| {
+                        get_resource_dependencies(&r).contains(wb.binding.as_str())
+                            && plan
+                                .effects()
+                                .iter()
+                                .any(|e| e.resource_id() == id && e.is_mutating())
+                    });
         if !gates_a_pending_change {
             continue;
         }
@@ -432,7 +502,7 @@ pub fn create_plan(
             attr,
             value: wb.until_predicate.rhs.clone(),
         };
-        let target_id = target_resource.id.clone();
+        let target_id = target_id_resolved;
         // The target's identifier is only known at plan time if it
         // already exists in state. When the target is created/updated
         // in this same run it has no prior state, so the executor must
@@ -497,15 +567,22 @@ pub fn create_plan(
 /// `registry` provides attribute metadata to detect create-only attributes.
 pub fn cascade_dependent_updates(
     plan: &mut Plan,
-    unresolved_resources: &[Resource],
+    unresolved_managed: &[ManagedResource],
     current_states: &HashMap<ResourceId, State>,
     registry: &SchemaRegistry,
 ) {
+    // Bridge to legacy `Resource` once. `get_resource_dependencies` and
+    // the per-attribute `ResourceRef` walks downstream still consume
+    // `&Resource`; flipping them is out of scope for the differ-only
+    // pass that this function lives in (carina#3179).
+    let unresolved_resources: Vec<Resource> =
+        unresolved_managed.iter().map(Resource::from).collect();
+
     // Build binding/key -> unresolved resource mapping.
     // Uses the same key logic as the dependent lookup below so anonymous resources
     // (without _binding) are also found.
     let mut binding_to_unresolved: HashMap<String, &Resource> = HashMap::new();
-    for resource in unresolved_resources {
+    for resource in &unresolved_resources {
         let key = resource
             .binding
             .clone()
@@ -537,7 +614,7 @@ pub fn cascade_dependent_updates(
             .collect();
 
         if !all_replace_bindings.is_empty() {
-            for resource in unresolved_resources {
+            for resource in &unresolved_resources {
                 let deps = get_resource_dependencies(resource);
                 for dep in &deps {
                     if let Some(resource_id) = all_replace_bindings.get(dep) {
@@ -576,7 +653,7 @@ pub fn cascade_dependent_updates(
 
     // For each unresolved resource, check if it depends on a replaced binding.
     // Resources already in the plan are handled separately below.
-    for resource in unresolved_resources {
+    for resource in &unresolved_resources {
         if planned_ids.contains(&resource.id) {
             continue;
         }
@@ -599,7 +676,7 @@ pub fn cascade_dependent_updates(
     // attributes need to be merged into their existing effects.
     let mut merge_operations: Vec<CascadeMerge> = Vec::new();
 
-    for resource in unresolved_resources {
+    for resource in &unresolved_resources {
         if !planned_ids.contains(&resource.id) {
             continue;
         }
