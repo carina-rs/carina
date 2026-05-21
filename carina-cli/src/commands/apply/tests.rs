@@ -450,6 +450,620 @@ fn block_name_attribute_state_roundtrip() {
     }
 }
 
+/// Move + Replace targeting the same `to` ResourceId must end up with
+/// the post-Replace `identifier` and `attributes` in state, not the
+/// pre-Replace values inherited from the `from` row.
+///
+/// Regression coverage for carina#3170 (root cause of carina#3167).
+/// Before the WritebackPlan refactor, `build_state_after_apply`
+/// processed `Effect::Move` in a second loop that copied the
+/// pre-Replace `from` row's contents into the `to` row via
+/// `upsert_resource`, overwriting Phase 1's post-Replace Upsert. The
+/// result was a state row with the new SimHash address but the
+/// pre-Replace identifier and attributes, which on the next plan
+/// produces a spurious `+ Create` because `provider.read()` against
+/// the stale identifier returns `NoSuchEntity`.
+#[test]
+fn move_plus_replace_keeps_post_replace_identifier_and_attributes() {
+    use carina_core::effect::Effect;
+    use carina_core::resource::Directives;
+    use carina_state::{ResourceState, StateFile};
+
+    let mut schemas = SchemaRegistry::new();
+    let schema = ResourceSchema::new("iam.RolePolicy")
+        .attribute(AttributeSchema::new("role_name", AttributeType::String).create_only())
+        .attribute(AttributeSchema::new("policy_name", AttributeType::String).create_only())
+        .attribute(AttributeSchema::new(
+            "policy_document",
+            AttributeType::String,
+        ));
+    schemas.insert("awscc", schema);
+
+    // Desired resource lives at the post-rename SimHash address with
+    // the post-rename role_name + policy_name (the values the user
+    // wrote in .crn after the IAM Role rename).
+    let new_id = ResourceId::with_provider(
+        "awscc",
+        "iam.RolePolicy",
+        "rd.awscc_iam_role_policy_0cd2c914",
+        None,
+    );
+    let mut resource = Resource {
+        id: new_id.clone(),
+        ..Resource::with_provider(
+            new_id.provider.clone(),
+            new_id.resource_type.clone(),
+            new_id.name.as_str(),
+            None,
+        )
+    };
+    resource.set_attr(
+        "role_name".to_string(),
+        Value::Concrete(ConcreteValue::String(
+            "carina-registry-infra-deploy".to_string(),
+        )),
+    );
+    resource.set_attr(
+        "policy_name".to_string(),
+        Value::Concrete(ConcreteValue::String(
+            "carina-registry-infra-deploy-inline".to_string(),
+        )),
+    );
+    resource.set_attr(
+        "policy_document".to_string(),
+        Value::Concrete(ConcreteValue::String("{}".to_string())),
+    );
+    let sorted_resources = vec![resource];
+
+    // applied_states holds the provider's post-create State for the
+    // new address: new identifier + new attribute values.
+    let mut applied_attrs = HashMap::new();
+    applied_attrs.insert(
+        "role_name".to_string(),
+        Value::Concrete(ConcreteValue::String(
+            "carina-registry-infra-deploy".to_string(),
+        )),
+    );
+    applied_attrs.insert(
+        "policy_name".to_string(),
+        Value::Concrete(ConcreteValue::String(
+            "carina-registry-infra-deploy-inline".to_string(),
+        )),
+    );
+    applied_attrs.insert(
+        "policy_document".to_string(),
+        Value::Concrete(ConcreteValue::String("{}".to_string())),
+    );
+    let applied = State::existing(new_id.clone(), applied_attrs)
+        .with_identifier("carina-registry-infra-deploy-inline|carina-registry-infra-deploy");
+    let mut applied_states = HashMap::new();
+    applied_states.insert(new_id.clone(), applied);
+
+    // Pre-existing state file has the old SimHash address row, with
+    // the pre-rename role_name + policy_name and the pre-rename
+    // identifier. materialize_moved_states normally transfers this
+    // row's State to the new id in current_states; build_state_after_apply
+    // is invoked here after that transfer would have happened, so the
+    // saved `from` row in the file still has the old values.
+    let old_row = ResourceState::new(
+        "iam.RolePolicy",
+        "rd.awscc_iam_role_policy_02942703",
+        "awscc",
+    )
+    .with_identifier("carina-registry-deploy-inline|carina-registry-deploy")
+    .with_attribute(
+        "role_name",
+        serde_json::Value::String("carina-registry-deploy".to_string()),
+    )
+    .with_attribute(
+        "policy_name",
+        serde_json::Value::String("carina-registry-deploy-inline".to_string()),
+    )
+    .with_attribute(
+        "policy_document",
+        serde_json::Value::String("{}".to_string()),
+    );
+    let mut state_file = StateFile::default();
+    state_file.resources.push(old_row);
+
+    // Plan has Replace (handled via applied_states in Phase 1) plus
+    // Move from the old address to the new one (Phase 2).
+    let mut plan = Plan::new();
+    let from_id = ResourceId::with_provider(
+        "awscc",
+        "iam.RolePolicy",
+        "rd.awscc_iam_role_policy_02942703",
+        None,
+    );
+    plan.add(Effect::Replace {
+        id: new_id.clone(),
+        from: Box::new(State::existing(from_id.clone(), HashMap::new())),
+        to: sorted_resources[0].clone(),
+        directives: Directives::default(),
+        changed_create_only: vec!["role_name".to_string(), "policy_name".to_string()],
+        cascading_updates: vec![],
+        temporary_name: None,
+        cascade_ref_hints: vec![],
+    });
+    plan.add(Effect::Move {
+        from: from_id.clone(),
+        to: new_id.clone(),
+    });
+
+    let saved = build_state_after_apply(ApplyStateSave {
+        state_file: Some(state_file),
+        sorted_resources: &sorted_resources,
+        current_states: &HashMap::new(),
+        applied_states: &applied_states,
+        permanent_name_overrides: &HashMap::new(),
+        plan: &plan,
+        successfully_deleted: &HashSet::new(),
+        failed_refreshes: &HashSet::new(),
+        schemas: &schemas,
+    })
+    .expect("writeback should succeed");
+
+    // The old address must no longer exist in state.
+    assert!(
+        saved
+            .find_resource(
+                "awscc",
+                "iam.RolePolicy",
+                "rd.awscc_iam_role_policy_02942703"
+            )
+            .is_none(),
+        "old SimHash row must be removed after Move",
+    );
+
+    // The new address row must carry the post-Replace identifier and
+    // post-Replace attribute values, not the pre-Replace ones from the
+    // old row.
+    let new_row = saved
+        .find_resource(
+            "awscc",
+            "iam.RolePolicy",
+            "rd.awscc_iam_role_policy_0cd2c914",
+        )
+        .expect("new SimHash row must exist");
+    assert_eq!(
+        new_row.identifier.as_deref(),
+        Some("carina-registry-infra-deploy-inline|carina-registry-infra-deploy"),
+        "Move must not overwrite Replace's post-create identifier",
+    );
+    assert_eq!(
+        new_row.attributes.get("role_name"),
+        Some(&serde_json::Value::String(
+            "carina-registry-infra-deploy".to_string()
+        )),
+        "Move must not overwrite Replace's post-create role_name",
+    );
+    assert_eq!(
+        new_row.attributes.get("policy_name"),
+        Some(&serde_json::Value::String(
+            "carina-registry-infra-deploy-inline".to_string()
+        )),
+        "Move must not overwrite Replace's post-create policy_name",
+    );
+}
+
+/// Move + Update — same shape as the Replace case but the Update
+/// effect changes a non-create-only attribute. The post-Update
+/// attribute value must survive Phase 2's Move cleanup.
+#[test]
+fn move_plus_update_keeps_post_update_attributes() {
+    use carina_core::effect::Effect;
+    use carina_state::{ResourceState, StateFile};
+
+    let mut schemas = SchemaRegistry::new();
+    let schema = ResourceSchema::new("ec2.Tag")
+        .attribute(AttributeSchema::new("key", AttributeType::String).create_only())
+        .attribute(AttributeSchema::new("value", AttributeType::String));
+    schemas.insert("awscc", schema);
+
+    let new_id = ResourceId::with_provider("awscc", "ec2.Tag", "tag_new", None);
+    let mut resource = Resource::with_provider("awscc", "ec2.Tag", "tag_new", None);
+    resource.set_attr(
+        "key".to_string(),
+        Value::Concrete(ConcreteValue::String("env".to_string())),
+    );
+    resource.set_attr(
+        "value".to_string(),
+        Value::Concrete(ConcreteValue::String("prod".to_string())),
+    );
+    let sorted_resources = vec![resource];
+
+    let mut applied_attrs = HashMap::new();
+    applied_attrs.insert(
+        "key".to_string(),
+        Value::Concrete(ConcreteValue::String("env".to_string())),
+    );
+    applied_attrs.insert(
+        "value".to_string(),
+        Value::Concrete(ConcreteValue::String("prod".to_string())),
+    );
+    let applied = State::existing(new_id.clone(), applied_attrs).with_identifier("tag-abc");
+    let mut applied_states = HashMap::new();
+    applied_states.insert(new_id.clone(), applied);
+
+    // Old state row carries the pre-Update value.
+    let old_row = ResourceState::new("ec2.Tag", "tag_old", "awscc")
+        .with_identifier("tag-abc")
+        .with_attribute("key", serde_json::Value::String("env".to_string()))
+        .with_attribute("value", serde_json::Value::String("staging".to_string()));
+    let mut state_file = StateFile::default();
+    state_file.resources.push(old_row);
+
+    let mut plan = Plan::new();
+    let from_id = ResourceId::with_provider("awscc", "ec2.Tag", "tag_old", None);
+    plan.add(Effect::Update {
+        id: new_id.clone(),
+        from: Box::new(State::existing(from_id.clone(), HashMap::new())),
+        to: sorted_resources[0].clone(),
+        changed_attributes: vec!["value".to_string()],
+    });
+    plan.add(Effect::Move {
+        from: from_id,
+        to: new_id.clone(),
+    });
+
+    let saved = build_state_after_apply(ApplyStateSave {
+        state_file: Some(state_file),
+        sorted_resources: &sorted_resources,
+        current_states: &HashMap::new(),
+        applied_states: &applied_states,
+        permanent_name_overrides: &HashMap::new(),
+        plan: &plan,
+        successfully_deleted: &HashSet::new(),
+        failed_refreshes: &HashSet::new(),
+        schemas: &schemas,
+    })
+    .expect("writeback should succeed");
+
+    assert!(
+        saved.find_resource("awscc", "ec2.Tag", "tag_old").is_none(),
+        "old row must be removed by Move cleanup",
+    );
+    let new_row = saved
+        .find_resource("awscc", "ec2.Tag", "tag_new")
+        .expect("new row must exist");
+    assert_eq!(
+        new_row.attributes.get("value"),
+        Some(&serde_json::Value::String("prod".to_string())),
+        "Move must not overwrite Update's post-apply value",
+    );
+}
+
+/// Pure-rename `moved {}` block — no Create/Update/Replace on the
+/// `to` address. `materialize_moved_states` transferred the `from`
+/// State into `current_states[to]` before writeback runs, so Phase 1
+/// must pick up the row from `current_states` and the new address
+/// must end up with the carried-over attributes.
+#[test]
+fn move_alone_carries_attributes_via_current_states() {
+    use carina_core::effect::Effect;
+    use carina_state::{ResourceState, StateFile};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only()),
+    );
+
+    let new_id = ResourceId::with_provider("awscc", "s3.Bucket", "bucket_new", None);
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "bucket_new", None);
+    resource.set_attr(
+        "bucket_name".to_string(),
+        Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
+    );
+    let sorted_resources = vec![resource];
+
+    // current_states already carries the migrated row at the new id.
+    let mut current_attrs = HashMap::new();
+    current_attrs.insert(
+        "bucket_name".to_string(),
+        Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
+    );
+    let current = State::existing(new_id.clone(), current_attrs).with_identifier("my-bucket");
+    let mut current_states = HashMap::new();
+    current_states.insert(new_id.clone(), current);
+
+    // State file still has the pre-move address — that's what the
+    // Move's `from` cleanup targets.
+    let from_id = ResourceId::with_provider("awscc", "s3.Bucket", "bucket_old", None);
+    let old_row = ResourceState::new("s3.Bucket", "bucket_old", "awscc")
+        .with_identifier("my-bucket")
+        .with_attribute("bucket_name", serde_json::Value::String("my-bucket".into()));
+    let mut state_file = StateFile::default();
+    state_file.resources.push(old_row);
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Move {
+        from: from_id,
+        to: new_id.clone(),
+    });
+
+    let saved = build_state_after_apply(ApplyStateSave {
+        state_file: Some(state_file),
+        sorted_resources: &sorted_resources,
+        current_states: &current_states,
+        applied_states: &HashMap::new(),
+        permanent_name_overrides: &HashMap::new(),
+        plan: &plan,
+        successfully_deleted: &HashSet::new(),
+        failed_refreshes: &HashSet::new(),
+        schemas: &schemas,
+    })
+    .expect("writeback should succeed");
+
+    assert!(
+        saved
+            .find_resource("awscc", "s3.Bucket", "bucket_old")
+            .is_none(),
+        "old row must be removed",
+    );
+    let new_row = saved
+        .find_resource("awscc", "s3.Bucket", "bucket_new")
+        .expect("new row must exist");
+    assert_eq!(
+        new_row.identifier.as_deref(),
+        Some("my-bucket"),
+        "identifier carried over via current_states",
+    );
+    assert_eq!(
+        new_row.attributes.get("bucket_name"),
+        Some(&serde_json::Value::String("my-bucket".to_string())),
+    );
+}
+
+/// A `Move` whose `from` is not present in state and whose `to` has
+/// no Phase-1 source must be a no-op. This is the "moved block left
+/// behind after the move already happened" case that carina#3167's
+/// reporter saw — the block is harmless until the user deletes it.
+#[test]
+fn move_with_absent_from_is_no_op() {
+    use carina_core::effect::Effect;
+    use carina_state::StateFile;
+
+    let schemas = SchemaRegistry::new();
+    let from_id = ResourceId::with_provider("awscc", "s3.Bucket", "stale_from", None);
+    let to_id = ResourceId::with_provider("awscc", "s3.Bucket", "stale_to", None);
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Move {
+        from: from_id.clone(),
+        to: to_id.clone(),
+    });
+
+    let saved = build_state_after_apply(ApplyStateSave {
+        state_file: Some(StateFile::default()),
+        sorted_resources: &[],
+        current_states: &HashMap::new(),
+        applied_states: &HashMap::new(),
+        permanent_name_overrides: &HashMap::new(),
+        plan: &plan,
+        successfully_deleted: &HashSet::new(),
+        failed_refreshes: &HashSet::new(),
+        schemas: &schemas,
+    })
+    .expect("writeback should succeed");
+
+    assert!(saved.resources.is_empty(), "no-op move leaves state empty");
+}
+
+/// `failed_refreshes` must skip both Upsert and Cleanup: the
+/// pre-existing row stays untouched because we don't know whether
+/// the live resource still exists.
+#[test]
+fn failed_refresh_preserves_existing_row() {
+    use carina_state::{ResourceState, StateFile};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only()),
+    );
+
+    let id = ResourceId::with_provider("awscc", "s3.Bucket", "stuck", None);
+    let resource = Resource::with_provider("awscc", "s3.Bucket", "stuck", None);
+    let sorted_resources = vec![resource];
+
+    let mut failed_refreshes = HashSet::new();
+    failed_refreshes.insert(id.clone());
+
+    let existing = ResourceState::new("s3.Bucket", "stuck", "awscc")
+        .with_identifier("preserved-id")
+        .with_attribute(
+            "bucket_name",
+            serde_json::Value::String("preserved".to_string()),
+        );
+    let mut state_file = StateFile::default();
+    state_file.resources.push(existing);
+
+    let saved = build_state_after_apply(ApplyStateSave {
+        state_file: Some(state_file),
+        sorted_resources: &sorted_resources,
+        current_states: &HashMap::new(),
+        applied_states: &HashMap::new(),
+        permanent_name_overrides: &HashMap::new(),
+        plan: &Plan::new(),
+        successfully_deleted: &HashSet::new(),
+        failed_refreshes: &failed_refreshes,
+        schemas: &schemas,
+    })
+    .expect("writeback should succeed");
+
+    let row = saved
+        .find_resource("awscc", "s3.Bucket", "stuck")
+        .expect("row must be preserved");
+    assert_eq!(row.identifier.as_deref(), Some("preserved-id"));
+}
+
+/// A `Move` whose `from` collides with a desired resource at the
+/// same address is a `WritebackConflict::UpsertCleanupOverlap` — the
+/// apply pipeline upstream of writeback is supposed to prevent this
+/// (a `moved` block's `from` should never be in `sorted_resources`),
+/// so surface it as a validation error rather than silently dropping
+/// the desired row.
+#[test]
+fn move_from_overlapping_desired_resource_errors() {
+    use carina_core::effect::Effect;
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only()),
+    );
+
+    let id = ResourceId::with_provider("awscc", "s3.Bucket", "collision", None);
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "collision", None);
+    resource.set_attr(
+        "bucket_name".to_string(),
+        Value::Concrete(ConcreteValue::String("x".to_string())),
+    );
+    let sorted_resources = vec![resource.clone()];
+
+    let mut applied = HashMap::new();
+    applied.insert(
+        id.clone(),
+        State::existing(id.clone(), HashMap::new()).with_identifier("x"),
+    );
+
+    let to_id = ResourceId::with_provider("awscc", "s3.Bucket", "elsewhere", None);
+    let mut plan = Plan::new();
+    plan.add(Effect::Move {
+        from: id.clone(),
+        to: to_id,
+    });
+
+    let result = build_state_after_apply(ApplyStateSave {
+        state_file: None,
+        sorted_resources: &sorted_resources,
+        current_states: &HashMap::new(),
+        applied_states: &applied,
+        permanent_name_overrides: &HashMap::new(),
+        plan: &plan,
+        successfully_deleted: &HashSet::new(),
+        failed_refreshes: &HashSet::new(),
+        schemas: &schemas,
+    });
+
+    let err = result.expect_err("overlap must surface as a writeback error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("upsert") && msg.contains("cleanup"),
+        "error must name the overlap class, got: {msg}",
+    );
+}
+
+/// `Effect::Remove` whose `id` is still in `sorted_resources` (user
+/// wrote both `removed { from = X }` and X still in DSL) must
+/// surface the same `UpsertCleanupOverlap` as the Move overlap case.
+/// Locks in that the structural invariant covers every Phase-2
+/// cleanup-emitting effect, not just Move.
+#[test]
+fn remove_overlapping_desired_resource_errors() {
+    use carina_core::effect::Effect;
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only()),
+    );
+
+    let id = ResourceId::with_provider("awscc", "s3.Bucket", "collision", None);
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "collision", None);
+    resource.set_attr(
+        "bucket_name".to_string(),
+        Value::Concrete(ConcreteValue::String("x".to_string())),
+    );
+    let sorted_resources = vec![resource];
+
+    let mut applied = HashMap::new();
+    applied.insert(
+        id.clone(),
+        State::existing(id.clone(), HashMap::new()).with_identifier("x"),
+    );
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Remove { id: id.clone() });
+
+    let result = build_state_after_apply(ApplyStateSave {
+        state_file: None,
+        sorted_resources: &sorted_resources,
+        current_states: &HashMap::new(),
+        applied_states: &applied,
+        permanent_name_overrides: &HashMap::new(),
+        plan: &plan,
+        successfully_deleted: &HashSet::new(),
+        failed_refreshes: &HashSet::new(),
+        schemas: &schemas,
+    });
+
+    let err = result.expect_err("overlap must surface as a writeback error");
+    assert!(
+        err.to_string().contains("upsert") && err.to_string().contains("cleanup"),
+        "error must name the overlap class, got: {err}",
+    );
+}
+
+/// A self-move (`Effect::Move { from: X, to: X }`) where the
+/// resource is in `sorted_resources` must error. Phase 1 upserts the
+/// row, Phase 2 then tries to clean it up at the same id — surfacing
+/// the upstream planner bug rather than silently deleting the row.
+#[test]
+fn self_move_overlapping_desired_resource_errors() {
+    use carina_core::effect::Effect;
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only()),
+    );
+
+    let id = ResourceId::with_provider("awscc", "s3.Bucket", "self", None);
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "self", None);
+    resource.set_attr(
+        "bucket_name".to_string(),
+        Value::Concrete(ConcreteValue::String("x".to_string())),
+    );
+    let sorted_resources = vec![resource];
+
+    let mut applied = HashMap::new();
+    applied.insert(
+        id.clone(),
+        State::existing(id.clone(), HashMap::new()).with_identifier("x"),
+    );
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Move {
+        from: id.clone(),
+        to: id.clone(),
+    });
+
+    let result = build_state_after_apply(ApplyStateSave {
+        state_file: None,
+        sorted_resources: &sorted_resources,
+        current_states: &HashMap::new(),
+        applied_states: &applied,
+        permanent_name_overrides: &HashMap::new(),
+        plan: &plan,
+        successfully_deleted: &HashSet::new(),
+        failed_refreshes: &HashSet::new(),
+        schemas: &schemas,
+    });
+
+    let err = result.expect_err("self-move must surface as a writeback error");
+    assert!(
+        err.to_string().contains("upsert") && err.to_string().contains("cleanup"),
+        "error must name the overlap class, got: {err}",
+    );
+}
+
 #[test]
 fn format_duration_sub_second() {
     let d = Duration::from_millis(500);
