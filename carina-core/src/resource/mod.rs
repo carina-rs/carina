@@ -1833,3 +1833,59 @@ impl State {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod typestate_tests;
+
+pub mod data_source;
+pub mod managed;
+pub mod virtual_resource;
+
+pub use data_source::DataSource;
+pub use managed::ManagedResource;
+pub use virtual_resource::VirtualResource;
+
+/// Type-level label for the three resource arms.
+///
+/// Used by [`ResourceKindMismatch`] (the `TryFrom<&Resource>` error)
+/// and [`ResourceKind::label`]. Encoding the label as an enum — rather
+/// than a `&'static str` — means a typo in any `expected:` / `actual:`
+/// initializer is a compile error, not a runtime mismatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResourceKindLabel {
+    Managed,
+    Virtual,
+    DataSource,
+}
+
+impl std::fmt::Display for ResourceKindLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Managed => "Managed",
+            Self::Virtual => "Virtual",
+            Self::DataSource => "DataSource",
+        })
+    }
+}
+
+impl ResourceKind {
+    /// Project this kind onto its `ResourceKindLabel`, discarding any
+    /// payload (`module_name` / `instance` for `Virtual`).
+    pub fn label(&self) -> ResourceKindLabel {
+        match self {
+            Self::Managed => ResourceKindLabel::Managed,
+            Self::Virtual { .. } => ResourceKindLabel::Virtual,
+            Self::DataSource => ResourceKindLabel::DataSource,
+        }
+    }
+}
+
+/// Error returned by `TryFrom<&Resource>` impls on
+/// [`ManagedResource`], [`VirtualResource`], and [`DataSource`] when
+/// the source `Resource`'s `kind` does not match the requested target.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("expected {expected} resource, got {actual}")]
+pub struct ResourceKindMismatch {
+    pub expected: ResourceKindLabel,
+    pub actual: ResourceKindLabel,
+}
