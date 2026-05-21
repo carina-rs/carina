@@ -20,6 +20,8 @@ use crate::resource::{
 fn create_test_module() -> ParsedFile {
     ParsedFile {
         providers: vec![],
+        data_sources: vec![],
+        virtual_resources: vec![],
         resources: vec![Resource {
             id: ResourceId::new("security_group", "sg"),
             attributes: {
@@ -137,6 +139,8 @@ fn test_substitute_arguments_nested() {
 fn create_test_module_with_anonymous_resource() -> ParsedFile {
     ParsedFile {
         providers: vec![],
+        data_sources: vec![],
+        virtual_resources: vec![],
         resources: vec![Resource {
             id: ResourceId::with_provider("awscc", "iam.RolePolicy", "", None),
             attributes: {
@@ -279,6 +283,8 @@ fn test_expand_module_call() {
 fn create_module_with_named_provider_instance() -> ParsedFile {
     ParsedFile {
         providers: vec![],
+        data_sources: vec![],
+        virtual_resources: vec![],
         resources: vec![Resource {
             id: ResourceId::with_provider("aws", "acm.Certificate", "cert", Some("us".to_string())),
             attributes: {
@@ -424,6 +430,8 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
 fn create_module_with_intra_refs() -> ParsedFile {
     ParsedFile {
         providers: vec![],
+        data_sources: vec![],
+        virtual_resources: vec![],
         resources: vec![
             Resource {
                 id: ResourceId::new("ec2.Vpc", "main_vpc"),
@@ -586,6 +594,8 @@ fn create_module_with_attributes() -> ParsedFile {
 
     ParsedFile {
         providers: vec![],
+        data_sources: vec![],
+        virtual_resources: vec![],
         resources: vec![Resource {
             id: ResourceId::new("security_group", "sg"),
             attributes: {
@@ -682,6 +692,54 @@ fn test_expand_module_call_creates_virtual_resource() {
             vec![]
         ))
     );
+}
+
+/// carina#3181 PR A: module-call expansion projects the synthetic
+/// virtual resource into the typed `virtual_resources` slice in
+/// parallel with the legacy `resources` Vec (duplicate storage during
+/// the typestate migration).
+#[test]
+fn test_expand_module_call_populates_virtual_resources_slice() {
+    let resolver = {
+        let mut r = ModuleResolver::new(".");
+        r.imported_modules
+            .insert("web_tier".to_string(), create_module_with_attributes());
+        r
+    };
+
+    let call = ModuleCall {
+        module_name: "web_tier".to_string(),
+        binding_name: Some("web".to_string()),
+        arguments: HashMap::new(),
+    };
+
+    let expanded = resolver.expand_module_call(&call, "web", None).unwrap();
+
+    // Legacy mixed Vec still holds the managed + virtual resources.
+    assert_eq!(expanded.resources.len(), 2);
+
+    // The typed slice holds only the virtual resource, matching the
+    // corresponding legacy entry.
+    assert_eq!(expanded.virtual_resources.len(), 1);
+    assert_eq!(
+        expanded.virtual_resources[0].binding,
+        Some("web".to_string())
+    );
+    assert_eq!(expanded.virtual_resources[0].module_name, "web_tier");
+    assert_eq!(expanded.virtual_resources[0].instance, "web");
+    let legacy_virtual = expanded
+        .resources
+        .iter()
+        .find(|r| r.is_virtual())
+        .expect("legacy resources still contains the virtual resource");
+    assert_eq!(expanded.virtual_resources[0].id, legacy_virtual.id);
+    assert_eq!(
+        expanded.virtual_resources[0].attributes,
+        legacy_virtual.attributes
+    );
+
+    // This module declares no data sources.
+    assert!(expanded.data_sources.is_empty());
 }
 
 #[test]
@@ -1519,6 +1577,8 @@ fn create_module_with_interpolation() -> ParsedFile {
 
     ParsedFile {
         providers: vec![],
+        data_sources: vec![],
+        virtual_resources: vec![],
         resources: vec![Resource {
             id: ResourceId::new("ec2.Vpc", "vpc"),
             attributes: {
@@ -1885,6 +1945,8 @@ fn create_module_with_port_validation() -> ParsedFile {
     use crate::parser::{CompareOp, ValidateExpr, ValidationBlock};
     ParsedFile {
         providers: vec![],
+        data_sources: vec![],
+        virtual_resources: vec![],
         resources: vec![],
         variables: IndexMap::new(),
         uses: vec![],
@@ -2068,6 +2130,8 @@ fn test_argument_validation_no_message_uses_default() {
     use crate::parser::{CompareOp, ValidateExpr, ValidationBlock};
     let module = ParsedFile {
         providers: vec![],
+        data_sources: vec![],
+        virtual_resources: vec![],
         resources: vec![],
         variables: IndexMap::new(),
         uses: vec![],
@@ -2131,6 +2195,8 @@ fn test_argument_validation_len_with_list() {
     use crate::parser::{CompareOp, ValidateExpr, ValidationBlock};
     let module = ParsedFile {
         providers: vec![],
+        data_sources: vec![],
+        virtual_resources: vec![],
         resources: vec![],
         variables: IndexMap::new(),
         uses: vec![],
@@ -2216,6 +2282,8 @@ fn test_require_block_passes() {
     use crate::parser::{CompareOp, RequireBlock, ValidateExpr};
     let module = ParsedFile {
         providers: vec![],
+        data_sources: vec![],
+        virtual_resources: vec![],
         resources: vec![],
         variables: IndexMap::new(),
         uses: vec![],
@@ -2297,6 +2365,8 @@ fn test_require_block_fails_with_not_expr() {
     use crate::parser::{RequireBlock, ValidateExpr};
     let module = ParsedFile {
         providers: vec![],
+        data_sources: vec![],
+        virtual_resources: vec![],
         resources: vec![],
         variables: IndexMap::new(),
         uses: vec![],
@@ -2377,6 +2447,8 @@ fn test_require_block_len_function() {
     use crate::parser::{CompareOp, RequireBlock, ValidateExpr};
     let module = ParsedFile {
         providers: vec![],
+        data_sources: vec![],
+        virtual_resources: vec![],
         resources: vec![],
         variables: IndexMap::new(),
         uses: vec![],
@@ -2466,6 +2538,8 @@ fn test_require_block_multiple_constraints() {
     use crate::parser::{CompareOp, RequireBlock, ValidateExpr};
     let module = ParsedFile {
         providers: vec![],
+        data_sources: vec![],
+        virtual_resources: vec![],
         resources: vec![],
         variables: IndexMap::new(),
         uses: vec![],
@@ -3768,6 +3842,8 @@ let prod = outer {
 fn create_module_with_environment_union() -> ParsedFile {
     ParsedFile {
         providers: vec![],
+        data_sources: vec![],
+        virtual_resources: vec![],
         resources: vec![],
         variables: IndexMap::new(),
         uses: vec![],

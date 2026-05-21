@@ -11,6 +11,7 @@
 use std::collections::{BTreeSet, HashSet};
 
 use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 
 use super::{
     Directives, ModuleSource, Resource, ResourceId, ResourceKind, ResourceKindLabel,
@@ -30,22 +31,28 @@ use super::{
 ///     &d.prefixes
 /// }
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DataSource {
     pub id: ResourceId,
     /// Source-order preserving map of attribute name → expression.
     pub attributes: IndexMap<String, Value>,
     /// `directives` meta-argument block — `depends_on` and
     /// `provider_instance` are meaningful for data sources too.
+    #[serde(default)]
     pub directives: Directives,
     /// Binding name from `let` bindings in DSL.
+    #[serde(default)]
     pub binding: Option<String>,
     /// Binding names this data source depends on.
+    #[serde(default)]
     pub dependency_bindings: BTreeSet<String>,
     /// Module source info for data sources from modules.
+    #[serde(default)]
     pub module_source: Option<ModuleSource>,
     /// Parser-level: attributes whose value was written as a quoted
-    /// string literal.
+    /// string literal. Parse-time only; `#[serde(skip)]` keeps it out
+    /// of state — mirrors [`Resource::quoted_string_attrs`].
+    #[serde(default, skip)]
     pub quoted_string_attrs: HashSet<String>,
 }
 

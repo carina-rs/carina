@@ -6423,6 +6423,51 @@ fn parse_let_discard_read_resource() {
     );
 }
 
+/// carina#3181 PR A: the parser projects `read`-keyword resources into
+/// the typed `data_sources` slice in parallel with the legacy
+/// `resources` Vec (duplicate storage during the typestate migration).
+#[test]
+fn parse_populates_data_sources_slice_in_parallel() {
+    let input = r#"
+        provider aws {
+            region = aws.Region.ap_northeast_1
+        }
+
+        let _ = read aws.sts.caller_identity {}
+
+        let bucket = aws.s3.Bucket {
+            bucket = "my-bucket"
+        }
+    "#;
+
+    let result = parse(input, &ProviderContext::default()).unwrap();
+
+    // Legacy mixed Vec still holds both resources.
+    assert_eq!(result.resources.len(), 2);
+
+    // The typed slice holds only the read-keyword resource, and its
+    // contents match the corresponding legacy entry.
+    assert_eq!(result.data_sources.len(), 1);
+    assert_eq!(
+        result.data_sources[0].id.resource_type,
+        "sts.caller_identity"
+    );
+    let legacy_data_source = result
+        .resources
+        .iter()
+        .find(|r| r.kind == crate::resource::ResourceKind::DataSource)
+        .expect("legacy resources still contains the data source");
+    assert_eq!(result.data_sources[0].id, legacy_data_source.id);
+    assert_eq!(
+        result.data_sources[0].attributes,
+        legacy_data_source.attributes
+    );
+
+    // The parser never synthesizes virtual resources — that is the
+    // module expander's job.
+    assert!(result.virtual_resources.is_empty());
+}
+
 #[test]
 fn parse_upstream_state_registers_binding() {
     // After parsing upstream_state, the binding should be registered so that

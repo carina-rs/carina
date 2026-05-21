@@ -7,6 +7,8 @@ fn empty_parsed() -> ParsedFile {
     ParsedFile {
         providers: Vec::new(),
         resources: Vec::new(),
+        data_sources: Vec::new(),
+        virtual_resources: Vec::new(),
         variables: IndexMap::new(),
         uses: Vec::new(),
         module_calls: Vec::new(),

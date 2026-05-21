@@ -727,6 +727,8 @@ fn test_find_state_bucket_resource_matching_type() {
                 Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
             ),
         ],
+        data_sources: vec![],
+        virtual_resources: vec![],
         variables: IndexMap::new(),
         uses: vec![],
         module_calls: vec![],

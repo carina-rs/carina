@@ -27,7 +27,7 @@ use super::resolve::{
     resolve_resource_refs,
 };
 use crate::eval_value::EvalValue;
-use crate::resource::{DeferredValue, Resource, Value};
+use crate::resource::{DataSource, DeferredValue, Resource, Value};
 use indexmap::IndexMap;
 use pest::Parser;
 
@@ -363,9 +363,21 @@ pub fn parse_with_seeded_bindings(
         })
         .collect();
 
+    // carina#3181 PR A: project the read-keyword resources into the
+    // typed `data_sources` slice in parallel with the legacy `resources`
+    // Vec. `resources` keeps every resource (managed + data source) so
+    // current consumers are untouched; PR B migrates them onto the typed
+    // slices and makes `resources` managed-only.
+    let data_sources: Vec<DataSource> =
+        resources.iter().filter_map(|r| r.try_into().ok()).collect();
+
     Ok(ParsedFile {
         providers,
         resources,
+        data_sources,
+        // Virtual resources are synthesized by module-call expansion,
+        // not the parser — left empty here, populated in `expander.rs`.
+        virtual_resources: Vec::new(),
         variables,
         uses,
         module_calls,

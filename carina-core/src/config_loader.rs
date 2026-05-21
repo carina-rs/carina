@@ -328,6 +328,8 @@ pub(crate) fn merge_parsed_file<E>(target: &mut File<E>, source: File<E>) {
     let File {
         providers,
         resources,
+        data_sources,
+        virtual_resources,
         variables,
         uses,
         module_calls,
@@ -347,6 +349,8 @@ pub(crate) fn merge_parsed_file<E>(target: &mut File<E>, source: File<E>) {
 
     target.providers.extend(providers);
     target.resources.extend(resources);
+    target.data_sources.extend(data_sources);
+    target.virtual_resources.extend(virtual_resources);
     target.variables.extend(variables);
     target.uses.extend(uses);
     target.module_calls.extend(module_calls);
