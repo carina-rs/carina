@@ -40,7 +40,7 @@
 //! ```
 
 use crate::parser::BindingName;
-use crate::resource::{Resource, ResourceId, State, Value};
+use crate::resource::{ManagedResource, Resource, ResourceId, State, Value, VirtualResource};
 use crate::schema::{ResourceSchema, SchemaRegistry};
 use std::collections::HashMap;
 
@@ -496,6 +496,76 @@ impl ResolvedBindings {
         }
 
         Self { by_name }
+    }
+
+    /// Typed pre-apply constructor (#3176): build the bindings view
+    /// from a `ManagedResource` slice plus the same `current_states`,
+    /// `remote_bindings`, and `wait_aliases` inputs that
+    /// [`Self::from_resources_with_state`] consumes.
+    ///
+    /// Encodes the typestate-split invariant at the input side:
+    /// virtuals cannot be passed here. The pre-apply binding view a
+    /// caller builds via this constructor is the *only* view a
+    /// pre-apply resolver should consult; virtuals layer in
+    /// post-apply via [`Self::add_virtual_resources`].
+    ///
+    /// Implementation is intentionally a shallow wrapper that
+    /// rebridges each `ManagedResource` to a `Resource` (via the
+    /// existing `From<&ManagedResource>` impl, transitional until
+    /// #3181) so the binding-construction logic stays in one place.
+    /// The bridge disappears once the legacy `Resource` IR is
+    /// retired.
+    pub fn from_managed_with_state(
+        managed: &[ManagedResource],
+        current_states: &HashMap<ResourceId, State>,
+        remote_bindings: &HashMap<String, HashMap<String, Value>>,
+        wait_aliases: &[WaitAliasSpec],
+    ) -> Self {
+        let bridge: Vec<Resource> = managed.iter().map(Resource::from).collect();
+        Self::from_resources_with_state(&bridge, current_states, remote_bindings, wait_aliases)
+    }
+
+    /// Typed post-apply layering (#3176): add virtual-resource
+    /// bindings onto an existing view.
+    ///
+    /// **Ordering contract**: must be called *after* the managed-side
+    /// bindings have been constructed, so any virtual whose
+    /// attributes contain a `ResourceRef` to a managed sibling
+    /// resolves against the up-to-date managed view. The caller is
+    /// responsible for that ordering; the function itself just
+    /// appends.
+    ///
+    /// Unlike `from_managed_with_state`, this entry does **not** merge
+    /// `current_states`: virtuals have no provider-side state to
+    /// merge. The virtual's own attribute map (as authored, after
+    /// `resolve_virtual_refs_post_apply` materialised any refs) is
+    /// recorded verbatim.
+    ///
+    /// Same-name collisions favour the virtual entry (it is inserted
+    /// last) — consistent with the design-doc rule that the
+    /// post-apply view is layered *on top of* the pre-apply view.
+    ///
+    /// Returns `Result<(), String>` to match the design-doc signature;
+    /// today the only failure mode (an ordering-precondition check)
+    /// is left to the caller, so this currently always returns
+    /// `Ok(())`. The Result shape lets future validation (e.g. a
+    /// hard error on a same-name collision when the post-apply layer
+    /// expects to merge rather than overwrite) be added without
+    /// breaking the signature.
+    pub fn add_virtual_resources(&mut self, virtuals: &[VirtualResource]) -> Result<(), String> {
+        for v in virtuals.iter() {
+            let Some(binding_name) = v.binding.as_ref() else {
+                continue;
+            };
+            self.by_name.insert(
+                binding_name.clone(),
+                ResolvedBinding {
+                    attributes: crate::resource::attrs_to_hashmap(&v.attributes),
+                    source: BindingValueSource::Local,
+                },
+            );
+        }
+        Ok(())
     }
 
     pub fn get(&self, name: &str) -> Option<&HashMap<String, Value>> {
