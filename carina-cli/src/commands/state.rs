@@ -798,9 +798,19 @@ pub(crate) async fn run_state_refresh_locked(
             .iter()
             .map(carina_core::binding_index::WaitAliasSpec::from)
             .collect();
+        // State refresh path: `sorted_resources` has not been
+        // mutated by a head-of-pipeline resolver pass, so its
+        // virtuals still carry the authored `ResourceRef` snapshots
+        // and we can lift them straight out for `resolve_exports`'s
+        // post-apply re-resolution (#3169 / #3177).
+        let pre_resolve_virtuals: Vec<carina_core::resource::VirtualResource> = sorted_resources
+            .iter()
+            .filter_map(|r| carina_core::resource::VirtualResource::try_from(r).ok())
+            .collect();
         state.exports = crate::commands::shared::state_writeback::resolve_exports(
             &parsed.export_params,
             &sorted_resources,
+            &pre_resolve_virtuals,
             &state,
             &wait_aliases,
         )?;

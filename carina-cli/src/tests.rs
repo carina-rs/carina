@@ -1483,6 +1483,7 @@ async fn lock_released_on_write_state_failure() {
         schemas: &SchemaRegistry::new(),
         export_params: Some(&[]),
         wait_aliases: &[],
+        pre_resolve_virtuals: &[],
     })
     .await;
 
@@ -1617,6 +1618,7 @@ async fn finalize_apply_uses_write_state_locked() {
         schemas: &SchemaRegistry::new(),
         export_params: Some(&[]),
         wait_aliases: &[],
+        pre_resolve_virtuals: &[],
     })
     .await;
 
@@ -2207,6 +2209,7 @@ async fn finalize_apply_without_lock_uses_write_state() {
         schemas: &SchemaRegistry::new(),
         export_params: Some(&[]),
         wait_aliases: &[],
+        pre_resolve_virtuals: &[],
     })
     .await;
 
@@ -2891,6 +2894,7 @@ async fn persist_exports_only_clears_state_exports_when_params_empty() {
         &[],
         &[],
         &[],
+        &[],
     )
     .await;
 
@@ -2928,6 +2932,7 @@ async fn persist_exports_only_writes_state_with_new_exports() {
         &backend,
         Some(&lock),
         Some(StateFile::new()),
+        &[],
         &[],
         &export_params,
         &[],
@@ -2994,6 +2999,7 @@ async fn finalize_apply_clears_state_exports_when_params_empty() {
         schemas: &SchemaRegistry::new(),
         export_params: Some(&[]),
         wait_aliases: &[],
+        pre_resolve_virtuals: &[],
     })
     .await;
 
@@ -3050,6 +3056,7 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
         schemas: &SchemaRegistry::new(),
         export_params: None,
         wait_aliases: &[],
+        pre_resolve_virtuals: &[],
     })
     .await;
 

@@ -1137,7 +1137,7 @@ fn resolve_exports_resolves_cross_file_dot_notation_strings() {
     registry_prod.binding = Some("registry_prod".to_string());
     let sorted_resources = vec![registry_prod];
 
-    let exports = resolve_exports(&export_params, &sorted_resources, &state, &[]).unwrap();
+    let exports = resolve_exports(&export_params, &sorted_resources, &[], &state, &[]).unwrap();
 
     assert_eq!(
         exports.get("account_id"),
@@ -1201,6 +1201,10 @@ fn resolve_exports_resolves_module_call_attribute_via_virtual_resource() {
         }),
     );
     let sorted_resources = vec![role_resource, virtual_resource];
+    let pre_resolve_virtuals: Vec<carina_core::resource::VirtualResource> = sorted_resources
+        .iter()
+        .filter_map(|r| carina_core::resource::VirtualResource::try_from(r).ok())
+        .collect();
 
     let export_params = vec![ExportParameter {
         name: "role_arn".to_string(),
@@ -1210,7 +1214,14 @@ fn resolve_exports_resolves_module_call_attribute_via_virtual_resource() {
         })),
     }];
 
-    let exports = resolve_exports(&export_params, &sorted_resources, &state, &[]).unwrap();
+    let exports = resolve_exports(
+        &export_params,
+        &sorted_resources,
+        &pre_resolve_virtuals,
+        &state,
+        &[],
+    )
+    .unwrap();
 
     assert_eq!(
         exports.get("role_arn"),
@@ -1297,7 +1308,18 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_virtuals() {
         })),
     }];
 
-    let exports = resolve_exports(&export_params, &sorted_resources, &state, &[]).unwrap();
+    let pre_resolve_virtuals: Vec<carina_core::resource::VirtualResource> = sorted_resources
+        .iter()
+        .filter_map(|r| carina_core::resource::VirtualResource::try_from(r).ok())
+        .collect();
+    let exports = resolve_exports(
+        &export_params,
+        &sorted_resources,
+        &pre_resolve_virtuals,
+        &state,
+        &[],
+    )
+    .unwrap();
 
     assert_eq!(
         exports.get("role_arn"),
@@ -1306,6 +1328,174 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_virtuals() {
         )),
         "two-hop module-call chain must resolve through both virtuals, got: {:?}",
         exports
+    );
+}
+
+#[test]
+fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
+    // #3169 root-cause regression test (carina-rs/infra PR #64 drift).
+    //
+    // **The bug** (pre-#3177): the apply path's head-of-pipeline
+    // call to `resolve_refs_with_state_and_remote(&mut
+    // resources_for_plan, &pre_apply_current_states, …)` collapses
+    // every `ResourceRef` — including the ones inside a
+    // `VirtualResource`'s `attributes` — into the pre-apply
+    // concrete value (here: OLD_ARN). The virtual's `role_arn`
+    // attribute thus becomes a frozen string snapshot of the
+    // pre-apply state. Later in `finalize_apply`, the resource
+    // graph is sent into `resolve_exports`, which feeds the
+    // virtual's stale `role_arn` into `state.exports` — even
+    // though the writeback wrote the new ARN into
+    // `state.resources[role].arn`. So `state.exports.role_arn` and
+    // `state.resources[role].arn` disagree, with exports holding
+    // the old ARN.
+    //
+    // **The fix** (#3177): `apply/mod.rs` snapshots every virtual
+    // *before* the head-of-pipeline `ResourceRef` collapse — that
+    // snapshot still carries the authored `ref role.arn`. It
+    // threads that pre-resolve snapshot into `finalize_apply` →
+    // `resolve_exports`, which uses it (instead of the mutated
+    // `sorted_resources`) to build a fresh post-apply
+    // `ResolvedBindings` view via the typestate-split API
+    // (`from_managed_with_state` + `resolve_virtual_refs_post_apply`
+    // + `add_virtual_resources`). Exports then resolve against the
+    // post-apply view.
+    //
+    // **The test** mirrors that production pipeline: it (1)
+    // constructs the same managed + virtual graph, (2) takes a
+    // pre-resolve snapshot of the virtual, (3) runs the head-of-
+    // pipeline resolver against a *pre-apply* `current_states`
+    // (OLD_ARN), then (4) feeds the pre-resolve snapshot and the
+    // resolved working slice into `resolve_exports` along with a
+    // *post-apply* `StateFile` (NEW_ARN). The assertion checks the
+    // export ends up at NEW_ARN.
+    //
+    // Without the #3177 fix, `resolve_exports` would consult the
+    // mutated virtual's stale concrete attribute and return
+    // OLD_ARN. With the fix in place, the pre-resolve snapshot
+    // kicks in and re-resolves against the post-apply state.
+    use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
+    use carina_core::resolver::resolve_refs_with_state_and_remote;
+    use carina_core::resource::{
+        AccessPath, ConcreteValue, DeferredValue, ResourceId, ResourceKind, State as ResourceState,
+        Value, VirtualResource,
+    };
+    use carina_state::StateFile;
+    use std::collections::HashMap;
+
+    let pre_apply_arn = "arn:aws:iam::123456789012:role/role-OLD";
+    let post_apply_arn = "arn:aws:iam::123456789012:role/role-NEW";
+
+    // Step (a): post-apply `StateFile` — what `state.resources`
+    // looks like after the writeback wrote the new ARN. This is
+    // what `resolve_exports` sees as its `state` argument.
+    let post_apply_state_file = {
+        let json = serde_json::json!({
+            "version": 5,
+            "serial": 2,
+            "lineage": "test",
+            "carina_version": "0.4.0",
+            "resources": [
+                {
+                    "resource_type": "iam.Role",
+                    "name": "carina_role",
+                    "identifier": "carina-role-NEW",
+                    "provider": "awscc",
+                    "binding": "role",
+                    "attributes": { "arn": post_apply_arn }
+                }
+            ]
+        });
+        serde_json::from_value::<StateFile>(json).unwrap()
+    };
+
+    // Step (b): pre-apply `current_states` — what the head-of-
+    // pipeline resolver sees. Holds the OLD ARN, so the pre-apply
+    // pass freezes virtual `role_arn` to OLD_ARN.
+    let pre_apply_current_states: HashMap<ResourceId, ResourceState> = {
+        let id = ResourceId::with_provider("awscc", "iam.Role", "carina_role", None);
+        let mut attrs: HashMap<String, Value> = HashMap::new();
+        attrs.insert(
+            "arn".to_string(),
+            Value::Concrete(ConcreteValue::String(pre_apply_arn.to_string())),
+        );
+        let mut m = HashMap::new();
+        m.insert(id.clone(), ResourceState::existing(id, attrs));
+        m
+    };
+
+    // Build the authored resource graph: a managed `role` (DSL
+    // does not inline `arn` — provider returns it) and a virtual
+    // module-call binding that references `role.arn`.
+    let mut role_managed = Resource::with_provider("awscc", "iam.Role", "carina_role", None);
+    role_managed.binding = Some("role".to_string());
+
+    let mut virtual_resource = Resource::new("_virtual", "carina_module");
+    virtual_resource.binding = Some("carina_module".to_string());
+    virtual_resource.kind = ResourceKind::Virtual {
+        module_name: "carina_module".to_string(),
+        instance: "carina_module".to_string(),
+    };
+    virtual_resource.attributes.insert(
+        "role_arn".to_string(),
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new("role", "arn"),
+        }),
+    );
+
+    let mut sorted_resources = vec![role_managed, virtual_resource];
+
+    // Step (c): pre-resolve snapshot — same `apply/mod.rs` does
+    // before the head-of-pipeline resolver runs.
+    let pre_resolve_virtuals: Vec<VirtualResource> = sorted_resources
+        .iter()
+        .filter_map(|r| VirtualResource::try_from(r).ok())
+        .collect();
+
+    // Step (d): head-of-pipeline resolver. After this call,
+    // `sorted_resources[1].attributes["role_arn"]` is
+    // `Value::Concrete(String(OLD_ARN))` — the bug-class state.
+    resolve_refs_with_state_and_remote(
+        &mut sorted_resources,
+        &pre_apply_current_states,
+        &HashMap::new(),
+        &[],
+    )
+    .unwrap();
+
+    // Sanity-check the bug condition is in place before the fix
+    // runs: the virtual now carries the stale OLD_ARN inline.
+    assert_eq!(
+        sorted_resources[1].attributes.get("role_arn"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            pre_apply_arn.to_string()
+        ))),
+        "head-of-pipeline must have frozen virtual.role_arn to pre-apply OLD_ARN",
+    );
+
+    let export_params = vec![ExportParameter {
+        name: "role_arn".to_string(),
+        type_expr: TypeExpr::Unknown,
+        value: Some(Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new("carina_module", "role_arn"),
+        })),
+    }];
+
+    let exports = resolve_exports(
+        &export_params,
+        &sorted_resources,
+        &pre_resolve_virtuals,
+        &post_apply_state_file,
+        &[],
+    )
+    .unwrap();
+
+    assert_eq!(
+        exports.get("role_arn"),
+        Some(&serde_json::Value::String(post_apply_arn.to_string())),
+        "exports.role_arn must be the POST-apply ARN ({post_apply_arn}) — \
+         the value carried by state.resources, NOT a pre-apply snapshot. \
+         Got: {exports:?}",
     );
 }
 
