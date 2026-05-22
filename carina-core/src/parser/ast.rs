@@ -8,7 +8,7 @@ use super::expressions::validate_expr::CompareOp;
 use super::util::snake_to_pascal;
 use crate::binding_index::IterableBindings;
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, Directives, Resource, ResourceId, ResourceKind,
+    ConcreteValue, DataSource, DeferredValue, Directives, ManagedResource, ResourceId,
     ResourceLike, UnknownReason, Value, VirtualResource,
 };
 use crate::version_constraint::VersionConstraint;
@@ -44,7 +44,7 @@ pub struct DeferredForExpression {
     /// correct variable(s).
     pub binding: ForBinding,
     /// Template resource for expansion (the for body parsed with placeholders).
-    pub template_resource: Resource,
+    pub template_resource: ManagedResource,
 }
 
 /// Origin of a resource yielded by [`ParsedFile::iter_all_resources`].
@@ -67,24 +67,24 @@ pub enum ResourceContext<'a> {
 /// arms borrow from `File`'s typed slices ([`File::resources`] managed
 /// rows, [`File::virtual_resources`], [`File::data_sources`]); the
 /// `Deferred` arm is a `for`-expression template body that still lives
-/// as a legacy [`Resource`] in [`File::deferred_for_expressions`].
+/// as a legacy [`ManagedResource`] in [`File::deferred_for_expressions`].
 ///
 /// Read-only consumers reach the shared accessors via
 /// [`ResourceRef::as_resource_like`] (or the `id` / `attributes` /
-/// `binding` passthroughs); callers that still branch on the kind use
-/// [`ResourceRef::kind`].
+/// `binding` passthroughs); callers that branch on the kind match the
+/// enum arm directly.
 #[derive(Debug, Clone, Copy)]
 pub enum ResourceRef<'a> {
     /// A top-level managed resource.
-    Managed(&'a Resource),
+    Managed(&'a ManagedResource),
     /// A top-level virtual resource (module-expansion synthetic node).
     Virtual(&'a VirtualResource),
     /// A top-level data source (`read`-keyword resource).
     DataSource(&'a DataSource),
-    /// The template body of a deferred `for` expression. Still a legacy
-    /// [`Resource`]; classify with [`ResourceRef::kind`] if needed.
+    /// The template body of a deferred `for` expression — always a
+    /// managed resource (`for` bodies never carry `read` / virtual).
     Deferred {
-        resource: &'a Resource,
+        resource: &'a ManagedResource,
         deferred: &'a DeferredForExpression,
     },
 }
@@ -131,17 +131,6 @@ impl<'a> ResourceRef<'a> {
         }
     }
 
-    /// Classification of this resource. The `Deferred` arm reports the
-    /// template body's own `kind`.
-    pub fn kind(&self) -> ResourceKind {
-        match self {
-            ResourceRef::Managed(_) => ResourceKind::Managed,
-            ResourceRef::Virtual(_) => ResourceKind::Virtual,
-            ResourceRef::DataSource(_) => ResourceKind::DataSource,
-            ResourceRef::Deferred { resource, .. } => resource.kind.clone(),
-        }
-    }
-
     /// `directives` meta-argument block. [`VirtualResource`] drops the
     /// field (no `prevent_destroy` on a synthetic node) — returns `None`
     /// for the `Virtual` arm.
@@ -174,19 +163,10 @@ impl<'a> ResourceRef<'a> {
         }
     }
 
-    /// Bridge to the legacy [`Resource`] shape for APIs not yet
-    /// typestate-aware (`SchemaRegistry::get_for`,
-    /// `Resource::resolved_attributes`). Borrows for the `Managed` /
-    /// `Deferred` arms; rebuilds via the `From<&VirtualResource>` /
-    /// `From<&DataSource>` bridges for the other two. Removed in #3181
-    /// PR E alongside those bridges.
-    pub fn as_legacy_resource(&self) -> std::borrow::Cow<'a, Resource> {
-        match self {
-            ResourceRef::Managed(r) => std::borrow::Cow::Borrowed(r),
-            ResourceRef::Deferred { resource, .. } => std::borrow::Cow::Borrowed(resource),
-            ResourceRef::Virtual(v) => std::borrow::Cow::Owned(Resource::from(*v)),
-            ResourceRef::DataSource(d) => std::borrow::Cow::Owned(Resource::from(*d)),
-        }
+    /// Attributes projected to a `HashMap<String, Value>` — the
+    /// lookup-shaped view consumed by schema validation.
+    pub fn resolved_attributes(&self) -> HashMap<String, Value> {
+        crate::resource::attrs_to_hashmap(self.attributes())
     }
 }
 
@@ -798,26 +778,11 @@ impl ExportParamLike for InferredExportParam {
 #[derive(Debug, Clone)]
 pub struct File<E> {
     pub providers: Vec<ProviderConfig>,
-    /// Heterogeneous resource collection (managed + virtual + data
-    /// source mixed), discriminated by `Resource::kind`.
-    ///
-    /// **Transitional (carina#3181 PR A):** the typestate split is
-    /// migrating consumers off this mixed `Vec` onto the typed
-    /// [`data_sources`](Self::data_sources) /
-    /// [`virtual_resources`](Self::virtual_resources) slices. While the
-    /// migration is in flight every resource is stored **twice**: once
-    /// here (legacy readers) and once in the matching typed slice. PR B
-    /// makes this field managed-only once all legacy readers are gone.
-    pub resources: Vec<Resource>,
+    /// Top-level managed infrastructure resources.
+    pub resources: Vec<ManagedResource>,
     /// Read-only data-source resources (`read`-keyword resources).
-    ///
-    /// **Transitional (carina#3181 PR A):** populated in parallel with
-    /// `resources`; no consumer reads it yet (PR B migrates them).
     pub data_sources: Vec<DataSource>,
     /// Virtual resources synthesized by module-call expansion.
-    ///
-    /// **Transitional (carina#3181 PR A):** populated in parallel with
-    /// `resources`; no consumer reads it yet (PR B migrates them).
     pub virtual_resources: Vec<VirtualResource>,
     pub variables: IndexMap<String, Value>,
     /// Module `use` statements
@@ -993,35 +958,13 @@ impl<E> File<E> {
             .chain(self.data_sources.iter().map(ResourceRef::DataSource))
     }
 
-    /// Rebuild a single legacy `Vec<Resource>` of every top-level
-    /// resource — managed rows verbatim, data sources and virtuals
-    /// bridged back via `From<&DataSource>` / `From<&VirtualResource>`.
-    ///
-    /// **carina#3181 transitional (PR C):** `resources` is managed-only,
-    /// but several legacy APIs — `sort_resources_by_dependencies`,
-    /// `differ::split_resources_by_kind`, the resolver — still take a
-    /// mixed `&[Resource]`. This helper produces that mixed view without
-    /// reintroducing duplicate storage. Removed once those APIs are
-    /// typestate-aware. The order is managed → virtual → data source;
-    /// callers that care about ordering (dependency sort) re-sort
-    /// topologically anyway.
-    pub fn legacy_top_level_resources(&self) -> Vec<Resource> {
-        let mut out = Vec::with_capacity(
-            self.resources.len() + self.virtual_resources.len() + self.data_sources.len(),
-        );
-        out.extend(self.resources.iter().cloned());
-        out.extend(self.virtual_resources.iter().map(Resource::from));
-        out.extend(self.data_sources.iter().map(Resource::from));
-        out
-    }
-
     /// Find a resource by resource type and name attribute value
     pub fn find_resource_by_attr(
         &self,
         resource_type: &str,
         attr_name: &str,
         attr_value: &str,
-    ) -> Option<&Resource> {
+    ) -> Option<&ManagedResource> {
         self.resources.iter().find(|r| {
             r.id.resource_type == resource_type
                 && matches!(r.get_attr(attr_name), Some(Value::Concrete(ConcreteValue::String(n))) if n == attr_value)
@@ -1172,18 +1115,11 @@ impl<E> File<E> {
             self.deferred_for_expressions.remove(idx);
         }
 
-        // carina#3181 PR C: `resources` is managed-only. Partition the
-        // freshly expanded for-body resources — managed rows into
-        // `resources`, `read` rows into `data_sources` — so an expanded
-        // data-source for-body lands in the right typed slice. (A
-        // for-body cannot synthesize a virtual resource.)
-        for resource in expanded_resources {
-            if let Ok(ds) = DataSource::try_from(&resource) {
-                self.data_sources.push(ds);
-            } else {
-                self.resources.push(resource);
-            }
-        }
+        // carina#3181: a deferred for-expression's `template_resource` is
+        // a `ManagedResource`, so every expansion of it is managed — they
+        // go straight into the managed `resources` slice. (A `read` /
+        // virtual for-body never reaches the deferred path.)
+        self.resources.extend(expanded_resources);
         self.warnings.extend(new_warnings);
     }
 }
@@ -1194,7 +1130,7 @@ impl<E> File<E> {
 /// with concrete scalars, surrounding `Interpolation` shapes can collapse
 /// to a `String` (#2227).
 fn substitute_attrs(
-    resource: &mut crate::resource::Resource,
+    resource: &mut crate::resource::ManagedResource,
     index: Option<i64>,
     key: Option<&str>,
     value: &Value,

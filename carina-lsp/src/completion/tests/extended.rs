@@ -738,7 +738,7 @@ let igw_attachment = awscc.ec2.vpc_gateway_attachment {
     // so that "igw." gets replaced with "igw.internet_gateway_id".
     assert!(
         igw_completion.text_edit.is_some(),
-        "Resource reference completion should use text_edit to avoid prefix duplication. \
+        "ManagedResource reference completion should use text_edit to avoid prefix duplication. \
          Got insert_text: {:?}",
         igw_completion.insert_text
     );
@@ -2661,7 +2661,7 @@ exports {
     }
 }
 
-/// Resource-ref candidates: a binding whose resource schema exposes an
+/// ManagedResource-ref candidates: a binding whose resource schema exposes an
 /// attribute of the target type should appear as `<binding>.<attr>`
 /// at the value position. Guards the "offer matching refs" half of
 /// the issue spec.

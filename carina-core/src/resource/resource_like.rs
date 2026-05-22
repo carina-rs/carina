@@ -3,7 +3,7 @@
 //!
 //! Lets read-only consumers — plan tree builders, formatters,
 //! diagnostics — stay generic over the three sibling types
-//! ([`Resource`](super::Resource), [`ManagedResource`](super::ManagedResource),
+//! ([`ManagedResource`](super::ManagedResource),
 //! [`VirtualResource`](super::VirtualResource),
 //! [`DataSource`](super::DataSource)). Write-side callers (resolver,
 //! effect-executor, writeback) continue to take a concrete type and
@@ -13,9 +13,9 @@ use std::collections::BTreeSet;
 
 use indexmap::IndexMap;
 
-use super::{DataSource, ManagedResource, Resource, ResourceId, Value, VirtualResource};
+use super::{DataSource, ManagedResource, ResourceId, Value, VirtualResource};
 
-/// Read-only accessors shared by all four resource representations.
+/// Read-only accessors shared by all resource representations.
 ///
 /// Object-safe: `&dyn ResourceLike` is a legal type.
 pub trait ResourceLike {
@@ -48,21 +48,6 @@ impl<T: ResourceLike + ?Sized> ResourceLike for &T {
     }
     fn dependency_bindings(&self) -> &BTreeSet<String> {
         (**self).dependency_bindings()
-    }
-}
-
-impl ResourceLike for Resource {
-    fn id(&self) -> &ResourceId {
-        &self.id
-    }
-    fn attributes(&self) -> &IndexMap<String, Value> {
-        &self.attributes
-    }
-    fn binding(&self) -> Option<&str> {
-        self.binding.as_deref()
-    }
-    fn dependency_bindings(&self) -> &BTreeSet<String> {
-        &self.dependency_bindings
     }
 }
 

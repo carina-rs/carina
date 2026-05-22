@@ -109,13 +109,13 @@ impl std::fmt::Display for InferenceError {
 /// while still passing through `upstream_state`-derived references.
 ///
 /// `Virtual` carries the attribute map of a module-call's
-/// `ResourceKind::Virtual` resource so an `exports` reference of the form
+/// virtual resource so an `exports` reference of the form
 /// `<module_call>.<attr>` can transitively infer through the bound
 /// expression on the module's `attributes { ... }` block, instead of
 /// failing with `unknown binding` (#2493).
 #[derive(Debug, Clone)]
 pub enum InferenceBinding {
-    Resource {
+    ManagedResource {
         provider: String,
         resource_type: String,
     },
@@ -139,11 +139,15 @@ pub type InferenceBindings = HashMap<String, InferenceBinding>;
 /// over [`bindings_from_parts`] for the common case of having a parsed
 /// file in hand.
 pub fn bindings_from_parsed(parsed: &crate::parser::ParsedFile) -> InferenceBindings {
-    // carina#3181: `parsed.resources` is managed-only; rebuild the mixed
-    // legacy view so `bindings_from_parts` still sees data-source and
-    // (post-expansion) virtual rows and classifies each correctly.
-    let all_resources = parsed.legacy_top_level_resources();
-    let mut out = bindings_from_parts(&all_resources, &parsed.upstream_states);
+    // carina#3181: pass the typed top-level slices directly so
+    // `bindings_from_parts` classifies managed resources, data sources,
+    // and (post-expansion) virtual rows from their own kinds.
+    let mut out = bindings_from_parts(
+        &parsed.resources,
+        &parsed.data_sources,
+        &parsed.virtual_resources,
+        &parsed.upstream_states,
+    );
     // Pre-expansion (load_configuration), `parsed.resources` does not
     // yet hold the `Virtual` resources that `expand_module_call`
     // synthesises for each module-call binding. Register the binding
@@ -183,40 +187,58 @@ pub fn bindings_from_parsed(parsed: &crate::parser::ParsedFile) -> InferenceBind
 /// semantics; the duplicate-binding check elsewhere is the gate that
 /// reports it to the user.
 pub fn bindings_from_parts(
-    resources: &[crate::resource::Resource],
+    resources: &[crate::resource::ManagedResource],
+    data_sources: &[crate::resource::DataSource],
+    virtual_resources: &[crate::resource::VirtualResource],
     upstream_states: &[crate::parser::UpstreamState],
 ) -> InferenceBindings {
     let mut out = InferenceBindings::new();
     for us in upstream_states {
         out.insert(us.binding.clone(), InferenceBinding::UpstreamState);
     }
-    // Per-iteration kind classification via `TryFrom` instead of a
-    // `resource.is_virtual()` runtime guard (carina#3180). Source-order
-    // insertion is preserved so duplicate-binding last-write-wins
-    // semantics — documented above as the mid-edit LSP fallback — keep
-    // matching the source order.
-    //
-    // `Virtual` resources synthesised by module-call expansion
-    // (`expand_module_call`) carry no provider identity — their
-    // attributes are projections from the module's
-    // `attributes { ... }` block. Tag them so `infer_resource_ref`
-    // recurses into the bound expression instead of trying a schema
-    // lookup that would always fail. #2493.
+    // carina#3181: managed resources and data sources both carry a
+    // provider identity, so each maps to `InferenceBinding::ManagedResource`
+    // (a `read`-bound `${data_source.attr}` still resolves its type via
+    // a schema lookup). Virtual resources synthesised by module-call
+    // expansion (`expand_module_call`) carry no provider identity — their
+    // attributes are projections from the module's `attributes { ... }`
+    // block — so they are tagged `Virtual` and `infer_resource_ref`
+    // recurses into the bound expression instead of a schema lookup that
+    // would always fail. #2493.
     for resource in resources {
         let Some(name) = &resource.binding else {
             continue;
         };
-        let entry = if let Ok(v) = crate::resource::VirtualResource::try_from(resource) {
-            InferenceBinding::Virtual {
-                attributes: v.attributes,
-            }
-        } else {
-            InferenceBinding::Resource {
+        out.insert(
+            name.clone(),
+            InferenceBinding::ManagedResource {
                 provider: resource.id.provider.clone(),
                 resource_type: resource.id.resource_type.clone(),
-            }
+            },
+        );
+    }
+    for data_source in data_sources {
+        let Some(name) = &data_source.binding else {
+            continue;
         };
-        out.insert(name.clone(), entry);
+        out.insert(
+            name.clone(),
+            InferenceBinding::ManagedResource {
+                provider: data_source.id.provider.clone(),
+                resource_type: data_source.id.resource_type.clone(),
+            },
+        );
+    }
+    for virtual_resource in virtual_resources {
+        let Some(name) = &virtual_resource.binding else {
+            continue;
+        };
+        out.insert(
+            name.clone(),
+            InferenceBinding::Virtual {
+                attributes: virtual_resource.attributes.clone(),
+            },
+        );
     }
     out
 }
@@ -392,7 +414,7 @@ fn infer_resource_ref_with_visiting(
     visiting: &mut indexmap::IndexSet<String>,
 ) -> Result<TypeExpr, InferenceError> {
     let target = match bindings.get(binding) {
-        Some(InferenceBinding::Resource {
+        Some(InferenceBinding::ManagedResource {
             provider,
             resource_type,
         }) => (provider.as_str(), resource_type.as_str()),
@@ -736,7 +758,7 @@ mod tests {
         let mut b = InferenceBindings::new();
         b.insert(
             name.to_string(),
-            InferenceBinding::Resource {
+            InferenceBinding::ManagedResource {
                 provider: "awscc".to_string(),
                 resource_type: "ec2.Vpc".to_string(),
             },
@@ -1121,16 +1143,17 @@ mod tests {
         // resource wins, so `x.attr` infers precisely instead of
         // degrading to `NonInferableBinding`.
         use crate::parser::UpstreamState;
-        use crate::resource::Resource;
-        let resource = Resource::with_provider("awscc", "ec2.Vpc", "main", None).with_binding("x");
+        use crate::resource::ManagedResource;
+        let resource =
+            ManagedResource::with_provider("awscc", "ec2.Vpc", "main", None).with_binding("x");
         let upstream = UpstreamState {
             binding: "x".to_string(),
             source: std::path::PathBuf::from("../other"),
         };
-        let bindings = bindings_from_parts(&[resource], &[upstream]);
+        let bindings = bindings_from_parts(&[resource], &[], &[], &[upstream]);
         assert!(matches!(
             bindings.get("x"),
-            Some(InferenceBinding::Resource { .. })
+            Some(InferenceBinding::ManagedResource { .. })
         ));
     }
 
@@ -1141,7 +1164,7 @@ mod tests {
             binding: "network".to_string(),
             source: std::path::PathBuf::from("../network"),
         };
-        let bindings = bindings_from_parts(&[], &[upstream]);
+        let bindings = bindings_from_parts(&[], &[], &[], &[upstream]);
         assert!(matches!(
             bindings.get("network"),
             Some(InferenceBinding::UpstreamState)
@@ -1181,7 +1204,7 @@ mod tests {
         let mut bindings = InferenceBindings::new();
         bindings.insert(
             "policy".to_string(),
-            InferenceBinding::Resource {
+            InferenceBinding::ManagedResource {
                 provider: "awscc".to_string(),
                 resource_type: "iam.Policy".to_string(),
             },
@@ -1240,7 +1263,7 @@ mod tests {
     #[test]
     fn apply_inference_fills_inferable_export_with_inferred_type() {
         let mut parsed = crate::parser::ParsedFile::default();
-        let res = crate::resource::Resource::with_provider("awscc", "ec2.Vpc", "main", None)
+        let res = crate::resource::ManagedResource::with_provider("awscc", "ec2.Vpc", "main", None)
             .with_binding("main");
         parsed.resources.push(res); // allow: direct — fixture test inspection
         parsed.export_params.push(crate::parser::ParsedExportParam {
@@ -1317,10 +1340,9 @@ mod tests {
         // the `Virtual` binding (which post-expansion exposes the
         // module's attribute set), and surfaced a misleading
         // "unknown binding" diagnostic.
-        use crate::resource::ResourceKind;
         let mut parsed = crate::parser::ParsedFile::default();
         // Concrete role resource with prefixed binding (post-expansion shape).
-        let role = crate::resource::Resource::with_provider(
+        let role = crate::resource::ManagedResource::with_provider(
             "awscc",
             "ec2.Vpc",
             "github_actions_carina.role",
@@ -1330,16 +1352,10 @@ mod tests {
         parsed.resources.push(role); // allow: direct — fixture test inspection
         // Virtual resource that exposes the module's attributes.
         // `vpc_id` here stands in for the module-exposed attribute that
-        // points at the inner role's schema attribute.
-        let mut virt = crate::resource::Resource::new("_virtual", "github_actions_carina");
-        virt.binding = Some("github_actions_carina".to_string());
-        virt.kind = ResourceKind::Virtual;
-
-        virt.virtual_module = Some((
-            "github_module".to_string(),
-            "github_actions_carina".to_string(),
-        ));
-        virt.attributes.insert(
+        // points at the inner role's schema attribute. carina#3181:
+        // virtuals are a distinct typestate in `virtual_resources`.
+        let mut virt_attrs = indexmap::IndexMap::new();
+        virt_attrs.insert(
             "role_id".to_string(),
             Value::resource_ref(
                 "github_actions_carina.role".to_string(),
@@ -1347,7 +1363,16 @@ mod tests {
                 vec![],
             ),
         );
-        parsed.resources.push(virt); // allow: direct — fixture test inspection
+        let virt = crate::resource::VirtualResource {
+            id: crate::resource::ResourceId::new("_virtual", "github_actions_carina"),
+            attributes: virt_attrs,
+            binding: Some("github_actions_carina".to_string()),
+            dependency_bindings: std::collections::BTreeSet::new(),
+            module_name: "github_module".to_string(),
+            instance: "github_actions_carina".to_string(),
+            quoted_string_attrs: std::collections::HashSet::new(),
+        };
+        parsed.virtual_resources.push(virt); // allow: direct — fixture test inspection
         parsed.export_params.push(crate::parser::ParsedExportParam {
             name: "role_id".to_string(),
             type_expr: None,

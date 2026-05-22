@@ -10,7 +10,7 @@ use crate::app::FocusedPanel;
 pub enum SectionKind {
     Header,
     Argument,
-    Resource,
+    ManagedResource,
     Attribute,
     Import,
     ModuleCall,
@@ -274,7 +274,7 @@ impl InfoRow {
             type_info: resource_type.to_string(),
             detail: dep_detail,
             depth: 1,
-            kind: SectionKind::Resource,
+            kind: SectionKind::ManagedResource,
             required: false,
             default_value: None,
             description: None,

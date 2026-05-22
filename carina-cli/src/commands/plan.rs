@@ -9,7 +9,9 @@ use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::effect::Effect;
 use carina_core::parser::{BackendConfig, ProviderConfig, ProviderContext, UpstreamState};
 use carina_core::plan::Plan;
-use carina_core::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, State, Value};
+use carina_core::resource::{
+    ConcreteValue, DeferredValue, ManagedResource, ResourceId, State, Value,
+};
 use carina_core::value::{
     redact_secrets_in_plan, redact_secrets_in_resource, redact_secrets_in_state,
 };
@@ -50,7 +52,7 @@ pub struct PlanFile {
     /// The plan (effects)
     pub plan: Plan,
     /// Resources sorted by dependencies (for post-apply state saving)
-    pub sorted_resources: Vec<Resource>,
+    pub sorted_resources: Vec<ManagedResource>,
     /// Current states (for binding_map + state saving)
     pub current_states: Vec<CurrentStateEntry>,
     /// `upstream_state` bindings as resolved at plan time (#2303).
@@ -422,7 +424,7 @@ pub async fn run_plan(
             .green()
         );
         println!(
-            "  {} Resource definition will be added to .crn file",
+            "  {} ManagedResource definition will be added to .crn file",
             "→".cyan()
         );
         println!();
@@ -623,7 +625,7 @@ pub async fn run_plan(
 /// Resolve export value expressions for plan display.
 pub(crate) fn resolve_export_values_for_display(
     export_params: &[carina_core::parser::InferredExportParam],
-    resources: &[Resource],
+    resources: &[ManagedResource],
     current_states: &HashMap<ResourceId, State>,
     wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
 ) -> Vec<carina_core::parser::InferredExportParam> {
@@ -1516,7 +1518,7 @@ mod plan_serialization_error_tests {
     //! attributes, nested List/Map, Replace cascade) propagates the
     //! error.
     use carina_core::resource::{
-        AccessPath, ConcreteValue, DeferredValue, Resource, UnknownReason, Value,
+        AccessPath, ConcreteValue, DeferredValue, ManagedResource, UnknownReason, Value,
     };
     use carina_core::value::{SerializationError, redact_secrets_in_resource, value_to_json};
 
@@ -1560,7 +1562,7 @@ mod plan_serialization_error_tests {
 
     #[test]
     fn redact_secrets_in_resource_errors_on_unknown_attribute() {
-        let mut r = Resource::new("test.resource", "name");
+        let mut r = ManagedResource::new("test.resource", "name");
         r.attributes.insert("vpc_id".into(), upstream_unknown());
         let err = redact_secrets_in_resource(&r).unwrap_err();
         assert!(matches!(err, SerializationError::UnknownNotAllowed { .. }));

@@ -92,27 +92,37 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         reconcile_anonymous_identifiers_with_ctx(&wiring, &mut parsed.resources, sf);
     }
 
-    // carina#3181: `parsed.resources` is managed-only; rebuild the mixed
-    // legacy view so data sources still reach `split_resources_by_kind` /
-    // `create_plan`.
-    let all_top_level_resources = parsed.legacy_top_level_resources();
-    let sorted_resources = sort_resources_by_dependencies(&all_top_level_resources).unwrap();
+    // carina#3181: `parsed.resources` is managed-only; data sources live
+    // in `parsed.data_sources`. Only managed resources are dependency-
+    // sorted.
+    let sorted_resources = sort_resources_by_dependencies(&parsed.resources).unwrap();
+    let data_sources: Vec<carina_core::resource::DataSource> = parsed.data_sources.clone();
 
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
     if let Some(sf) = state_file.as_ref() {
         for resource in &sorted_resources {
-            let state = sf.build_state_for_resource(resource);
+            let state = sf.build_state_for_resource(&resource.id);
             current_states.insert(resource.id.clone(), state);
         }
+        for ds in &data_sources {
+            let state = sf.build_state_for_resource(&ds.id);
+            current_states.insert(ds.id.clone(), state);
+        }
 
-        let desired_ids: HashSet<ResourceId> =
-            sorted_resources.iter().map(|r| r.id.clone()).collect();
+        let desired_ids: HashSet<ResourceId> = sorted_resources
+            .iter()
+            .map(|r| r.id.clone())
+            .chain(data_sources.iter().map(|d| d.id.clone()))
+            .collect();
         for (id, state) in sf.build_orphan_states(&desired_ids) {
             current_states.entry(id).or_insert(state);
         }
     } else {
         for resource in &sorted_resources {
             current_states.insert(resource.id.clone(), State::not_found(resource.id.clone()));
+        }
+        for ds in &data_sources {
+            current_states.insert(ds.id.clone(), State::not_found(ds.id.clone()));
         }
     }
 
@@ -154,9 +164,24 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     )
     .expect("Failed to resolve refs with state");
 
+    // Resolve data-source input refs for the plan (carina#3181).
+    let mut data_sources_for_plan = data_sources.clone();
+    carina_core::resolver::resolve_data_source_refs_for_plan(
+        &mut data_sources_for_plan,
+        &resources,
+        &current_states,
+        &remote_bindings,
+        &wait_aliases,
+    )
+    .expect("Failed to resolve data source refs with state");
+
     // Type-level canonicalization for `Union[String, list(String)]`
     // fields. See #2481, #2511, #2513.
     carina_core::value::canonicalize_resources_with_schemas(&mut resources, wiring.schemas());
+    carina_core::value::canonicalize_data_sources_with_schemas(
+        &mut data_sources_for_plan,
+        wiring.schemas(),
+    );
     carina_core::value::canonicalize_states_with_schemas(&mut current_states, wiring.schemas());
 
     normalize_desired_with_ctx(&wiring, &mut resources);
@@ -218,10 +243,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &state_file,
     );
 
-    let (managed_for_plan, data_sources_for_plan) =
-        carina_core::differ::split_resources_by_kind(&resources);
     let mut plan = create_plan(
-        &managed_for_plan,
+        &resources,
         &data_sources_for_plan,
         &current_states,
         &directives_map,
@@ -232,11 +255,9 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &parsed.wait_bindings,
     );
 
-    let (unresolved_managed, _unresolved_ds) =
-        carina_core::differ::split_resources_by_kind(&sorted_resources);
     cascade_dependent_updates(
         &mut plan,
-        &unresolved_managed,
+        &sorted_resources,
         &current_states,
         wiring.schemas(),
     );

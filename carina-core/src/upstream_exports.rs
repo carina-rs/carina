@@ -537,8 +537,15 @@ pub fn check_upstream_state_field_types<E>(
 ) -> Vec<UpstreamTypeError> {
     let mut errors: Vec<UpstreamTypeError> = Vec::new();
     for_each_resource_attr(parsed, |rref, attr_name, value| {
-        let resource = rref.as_legacy_resource();
-        let Some(schema) = registry.get_for(resource.as_ref()) else {
+        // A deferred for-expression template body is always managed.
+        let schema = match rref {
+            ResourceRef::Virtual(_) => return,
+            ResourceRef::DataSource(d) => registry.get_for_data_source(d),
+            ResourceRef::Managed(m) | ResourceRef::Deferred { resource: m, .. } => {
+                registry.get_for(m)
+            }
+        };
+        let Some(schema) = schema else {
             return;
         };
         let Some(attr_schema) = schema.attributes.get(attr_name) else {

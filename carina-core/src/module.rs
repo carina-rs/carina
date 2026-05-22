@@ -21,7 +21,7 @@ pub struct Dependency {
 /// Dependency graph for resources within a module
 #[derive(Debug, Clone, Default)]
 pub struct DependencyGraph {
-    /// Resource binding name -> list of dependencies
+    /// ManagedResource binding name -> list of dependencies
     pub edges: HashMap<String, Vec<Dependency>>,
     /// Reverse edges: target -> list of resources that depend on it
     pub reverse_edges: HashMap<String, Vec<String>>,
@@ -211,7 +211,7 @@ pub struct TypedArgument {
     pub description: Option<String>,
 }
 
-/// Resource creation entry in module signature
+/// ManagedResource creation entry in module signature
 #[derive(Debug, Clone)]
 pub struct ResourceCreation {
     /// Binding name for this resource
@@ -249,7 +249,7 @@ pub struct TypedDependency {
 /// Typed dependency graph with resource type information
 #[derive(Debug, Clone, Default)]
 pub struct TypedDependencyGraph {
-    /// Resource binding name -> list of typed dependencies
+    /// ManagedResource binding name -> list of typed dependencies
     pub edges: HashMap<String, Vec<TypedDependency>>,
 }
 

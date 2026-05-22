@@ -6,7 +6,7 @@ use carina_core::provider::{
     BoxFuture, CreateRequest, DeleteRequest, PatchOpKind, Provider, ProviderError, ProviderResult,
     ReadRequest, UpdateRequest,
 };
-use carina_core::resource::{Resource, ResourceId, State, Value};
+use carina_core::resource::{DataSource, ResourceId, State, Value};
 use carina_core::value::{json_to_dsl_value, value_to_json};
 
 pub struct MockProvider {
@@ -78,7 +78,7 @@ impl Provider for MockProvider {
         })
     }
 
-    fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+    fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
         self.read(&resource.id, None, ReadRequest)
     }
 

@@ -135,7 +135,7 @@ pub enum Effect {
         /// Subset of `dependencies` that came from
         /// `directives { depends_on = [...] }` rather than value
         /// references. Captured at Delete construction time because the
-        /// originating Resource is gone by the time the executor runs
+        /// originating resource is gone by the time the executor runs
         /// (#2871). Empty for legacy state files.
         #[serde(default)]
         explicit_dependencies: HashSet<String>,
@@ -395,25 +395,6 @@ impl Effect {
         }
     }
 
-    /// Bridge this effect's resource to a legacy [`Resource`], if it has
-    /// one. carina#3181 PR D: the payloads are typestate structs, but a
-    /// few executor/display call sites still want a `Resource` — this
-    /// rebuilds one via the `From<&ManagedResource>` / `From<&DataSource>`
-    /// bridges. Removed once those call sites are typestate-aware.
-    pub fn resource_as_legacy(&self) -> Option<crate::resource::Resource> {
-        match self {
-            Effect::Create(resource) => Some(resource.into()),
-            Effect::Update { to, .. } => Some(to.into()),
-            Effect::Replace { to, .. } => Some(to.into()),
-            Effect::Read { resource } => Some(resource.into()),
-            Effect::Delete { .. }
-            | Effect::Import { .. }
-            | Effect::Remove { .. }
-            | Effect::Move { .. }
-            | Effect::Wait { .. } => None,
-        }
-    }
-
     /// Returns the `directives` block of this effect's resource, if it
     /// has one. `Read` (data source) and the managed variants both carry
     /// directives; state-only and `Wait` effects do not.
@@ -447,11 +428,11 @@ impl Effect {
     /// `directives { depends_on = [...] }` declarations**, as a snapshot
     /// (cloned).
     ///
-    /// For variants carrying a `Resource` (Create, Update, Replace,
+    /// For variants carrying a `ManagedResource` (Create, Update, Replace,
     /// Read), the answer is derived live from
     /// `resource.directives.depends_on`. For Delete the answer comes
     /// from a stored `explicit_dependencies` set captured by the differ
-    /// at construction time, because the originating Resource is gone
+    /// at construction time, because the originating resource is gone
     /// by the time the executor runs (#2871).
     ///
     /// State-only effects (Import, Remove, Move) return an empty set —

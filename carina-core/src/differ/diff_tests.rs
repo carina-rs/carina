@@ -5,7 +5,7 @@ use indexmap::IndexMap;
 
 #[test]
 fn diff_create_when_not_exists() {
-    let desired = Resource::new("bucket", "test");
+    let desired = ManagedResource::new("bucket", "test");
     let current = State::not_found(ResourceId::new("bucket", "test"));
 
     let result = diff(&desired, &current, None, None, None);
@@ -14,7 +14,7 @@ fn diff_create_when_not_exists() {
 
 #[test]
 fn diff_no_change_when_same() {
-    let desired = Resource::new("bucket", "test").with_attribute(
+    let desired = ManagedResource::new("bucket", "test").with_attribute(
         "region",
         Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
     );
@@ -32,7 +32,7 @@ fn diff_no_change_when_same() {
 
 #[test]
 fn diff_update_when_different() {
-    let desired = Resource::new("bucket", "test").with_attribute(
+    let desired = ManagedResource::new("bucket", "test").with_attribute(
         "region",
         Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
     );
@@ -58,8 +58,8 @@ fn diff_update_when_different() {
 #[test]
 fn create_plan_from_resources() {
     let resources = vec![
-        Resource::new("bucket", "new-bucket"),
-        Resource::new("bucket", "existing-bucket")
+        ManagedResource::new("bucket", "new-bucket"),
+        ManagedResource::new("bucket", "existing-bucket")
             .with_attribute("versioning", Value::Concrete(ConcreteValue::Bool(true))),
     ];
 
@@ -74,10 +74,9 @@ fn create_plan_from_resources() {
         State::existing(ResourceId::new("bucket", "existing-bucket"), attrs),
     );
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources,
+        &[],
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -94,21 +93,20 @@ fn create_plan_from_resources() {
 
 #[test]
 fn create_plan_with_read_only_resource() {
-    let resources = vec![
-        Resource::new("bucket", "existing-bucket")
-            .with_attribute(
-                "name",
-                Value::Concrete(ConcreteValue::String("existing-bucket".to_string())),
-            )
-            .with_read_only(true),
-        Resource::new("bucket", "new-bucket"),
+    // carina#3181: data sources are a distinct typestate fed to
+    // `create_plan` via its own `&[DataSource]` argument.
+    let data_sources = vec![
+        crate::resource::DataSource::new("bucket", "existing-bucket").with_attribute(
+            "name",
+            Value::Concrete(ConcreteValue::String("existing-bucket".to_string())),
+        ),
     ];
+    let resources = vec![ManagedResource::new("bucket", "new-bucket")];
 
     let current_states = HashMap::new();
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources,
+        &data_sources,
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -154,7 +152,7 @@ fn diff_update_when_list_of_maps_changed() {
         Value::Concrete(ConcreteValue::Int(443)),
     );
 
-    let desired = Resource::new("ec2_security_group", "test-sg").with_attribute(
+    let desired = ManagedResource::new("ec2_security_group", "test-sg").with_attribute(
         "security_group_ingress",
         Value::Concrete(ConcreteValue::List(vec![
             Value::Concrete(ConcreteValue::Map(ingress1.clone())),
@@ -192,7 +190,7 @@ fn diff_update_when_list_of_maps_changed() {
 fn create_plan_detects_orphaned_resources_for_deletion() {
     // A resource exists in current_states but NOT in desired list
     // create_plan() should generate a Delete effect for it
-    let desired = vec![Resource::new("bucket", "keep-this")];
+    let desired = vec![ManagedResource::new("bucket", "keep-this")];
 
     let mut current_states = HashMap::new();
     // "keep-this" exists and matches
@@ -211,10 +209,9 @@ fn create_plan_detects_orphaned_resources_for_deletion() {
         State::existing(ResourceId::new("bucket", "orphaned-bucket"), orphan_attrs),
     );
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&desired);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &desired,
+        &[],
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -242,14 +239,14 @@ fn create_plan_detects_orphaned_resources_for_deletion() {
 
 #[test]
 fn read_only_resource_always_generates_read_effect() {
-    // Even if the resource "exists", read-only resources should only generate Read effect
-    let resources = vec![
-        Resource::new("bucket", "existing-bucket")
-            .with_attribute(
-                "name",
-                Value::Concrete(ConcreteValue::String("existing-bucket".to_string())),
-            )
-            .with_read_only(true),
+    // Even if the resource "exists", read-only resources (data sources)
+    // should only generate a Read effect. carina#3181: data sources are
+    // a distinct typestate.
+    let data_sources = vec![
+        crate::resource::DataSource::new("bucket", "existing-bucket").with_attribute(
+            "name",
+            Value::Concrete(ConcreteValue::String("existing-bucket".to_string())),
+        ),
     ];
 
     let mut current_states = HashMap::new();
@@ -263,10 +260,9 @@ fn read_only_resource_always_generates_read_effect() {
         State::existing(ResourceId::new("bucket", "existing-bucket"), attrs),
     );
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &[],
+        &data_sources,
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -287,7 +283,7 @@ fn read_only_resource_always_generates_read_effect() {
 #[test]
 fn no_false_update_without_name_attribute() {
     // Simulate AWSCC resource: desired has cidr_block but no "name"
-    let desired = Resource::new("ec2.Vpc", "vpc").with_attribute(
+    let desired = ManagedResource::new("ec2.Vpc", "vpc").with_attribute(
         "cidr_block",
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
@@ -312,7 +308,7 @@ fn no_false_update_without_name_attribute() {
 fn replace_when_create_only_attr_changed() {
     use crate::schema::{AttributeSchema, AttributeType};
 
-    let resources = vec![Resource::new("ec2.Vpc", "my-vpc").with_attribute(
+    let resources = vec![ManagedResource::new("ec2.Vpc", "my-vpc").with_attribute(
         "cidr_block",
         Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
     )];
@@ -336,10 +332,9 @@ fn replace_when_create_only_attr_changed() {
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
     );
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources,
+        &[],
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -365,7 +360,7 @@ fn replace_when_create_only_attr_changed() {
 fn normal_update_when_non_create_only_attr_changed() {
     use crate::schema::{AttributeSchema, AttributeType};
 
-    let resources = vec![Resource::new("ec2.Vpc", "my-vpc").with_attribute(
+    let resources = vec![ManagedResource::new("ec2.Vpc", "my-vpc").with_attribute(
         "enable_dns_support",
         Value::Concrete(ConcreteValue::Bool(true)),
     )];
@@ -393,10 +388,9 @@ fn normal_update_when_non_create_only_attr_changed() {
             )),
     );
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources,
+        &[],
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -418,9 +412,9 @@ fn normal_update_when_non_create_only_attr_changed() {
 fn replace_when_schema_force_replace() {
     use crate::schema::AttributeType;
 
-    // Resource has changed attributes but NO create-only attributes
+    // ManagedResource has changed attributes but NO create-only attributes
     let resources = vec![
-        Resource::new("ec2.internet_gateway", "my-igw").with_attribute(
+        ManagedResource::new("ec2.internet_gateway", "my-igw").with_attribute(
             "tags",
             Value::Concrete(ConcreteValue::Map(
                 vec![(
@@ -463,10 +457,9 @@ fn replace_when_schema_force_replace() {
             .force_replace(),
     );
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources,
+        &[],
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -489,7 +482,7 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
     use crate::schema::{AttributeSchema, AttributeType};
 
     let resources = vec![
-        Resource::new("ec2.Vpc", "my-vpc")
+        ManagedResource::new("ec2.Vpc", "my-vpc")
             .with_attribute(
                 "cidr_block",
                 Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
@@ -526,10 +519,9 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
             )),
     );
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources,
+        &[],
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -555,7 +547,7 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
 fn replace_carries_create_before_destroy_directives() {
     use crate::schema::{AttributeSchema, AttributeType};
 
-    let mut resource = Resource::new("ec2.Vpc", "my-vpc").with_attribute(
+    let mut resource = ManagedResource::new("ec2.Vpc", "my-vpc").with_attribute(
         "cidr_block",
         Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
     );
@@ -581,10 +573,9 @@ fn replace_carries_create_before_destroy_directives() {
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
     );
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources,
+        &[],
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -639,7 +630,7 @@ fn diff_no_change_when_list_of_maps_reordered() {
     );
 
     // Desired: [rule1, rule2]
-    let desired = Resource::new("ec2_security_group", "test-sg").with_attribute(
+    let desired = ManagedResource::new("ec2_security_group", "test-sg").with_attribute(
         "security_group_egress",
         Value::Concrete(ConcreteValue::List(vec![
             Value::Concrete(ConcreteValue::Map(rule1.clone())),
@@ -676,7 +667,7 @@ fn replace_with_provider_prefixed_schema_key() {
     // In production, schemas are keyed by "awscc.ec2.Vpc" but resource_type is "ec2.Vpc"
     // The resource must have provider set so the generic lookup works
     let resources = vec![
-        Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None).with_attribute(
+        ManagedResource::with_provider("awscc", "ec2.Vpc", "my-vpc", None).with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         ),
@@ -704,10 +695,9 @@ fn replace_with_provider_prefixed_schema_key() {
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
     );
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources,
+        &[],
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -729,7 +719,7 @@ fn replace_with_provider_prefixed_schema_key() {
 /// current (AWS) returns 3, saved state has 3. Should be NoChange.
 #[test]
 fn diff_no_change_when_struct_has_extra_fields_with_saved() {
-    let desired = Resource::new("ec2.Subnet", "test-subnet").with_attribute(
+    let desired = ManagedResource::new("ec2.Subnet", "test-subnet").with_attribute(
         "private_dns_name_options_on_launch",
         Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
@@ -792,7 +782,7 @@ fn diff_no_change_when_struct_has_extra_fields_with_saved() {
 /// When an unmanaged field drifts externally, diff should still detect the change.
 #[test]
 fn diff_detects_drift_on_unmanaged_field() {
-    let desired = Resource::new("ec2.Subnet", "test-subnet").with_attribute(
+    let desired = ManagedResource::new("ec2.Subnet", "test-subnet").with_attribute(
         "private_dns_name_options_on_launch",
         Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
@@ -858,7 +848,7 @@ fn diff_detects_drift_on_unmanaged_field() {
 /// After merge + semantic comparison, this should be NoChange.
 #[test]
 fn diff_no_change_when_bare_struct_with_extra_fields() {
-    let desired = Resource::new("ec2.Subnet", "test-subnet").with_attribute(
+    let desired = ManagedResource::new("ec2.Subnet", "test-subnet").with_attribute(
         "private_dns_name_options_on_launch",
         Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
@@ -925,7 +915,7 @@ fn diff_works_without_saved_state() {
     // Desired has 2 fields, current has 3 (extra field). Without saved state,
     // this should still be NoChange because find_changed_attributes only checks
     // desired keys against current (not the other direction).
-    let desired = Resource::new("ec2.Subnet", "test-subnet").with_attribute(
+    let desired = ManagedResource::new("ec2.Subnet", "test-subnet").with_attribute(
         "opts",
         Value::Concrete(ConcreteValue::Map(IndexMap::from([
             ("a".to_string(), Value::Concrete(ConcreteValue::Int(1))),
@@ -975,10 +965,9 @@ fn orphan_delete_preserves_binding_and_dependencies() {
         State::existing(ResourceId::new("subnet", "my-subnet"), orphan_attrs),
     );
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&desired);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &desired,
+        &[],
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -1061,7 +1050,7 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
 
     // Desired state (post-normalization, post-alias-resolution)
     // "all" -> "-1" (alias resolved), "tcp" stays as namespaced identifier
-    let desired = Resource::with_provider("awscc", "ec2.SecurityGroup", "test-sg", None)
+    let desired = ManagedResource::with_provider("awscc", "ec2.SecurityGroup", "test-sg", None)
         .with_attribute(
             "security_group_egress",
             Value::Concrete(ConcreteValue::List(vec![
@@ -1311,7 +1300,7 @@ fn diff_false_positive_when_ordered_true_for_struct_list() {
         ),
     ])));
 
-    let desired = Resource::with_provider("awscc", "ec2.SecurityGroup", "test-sg", None)
+    let desired = ManagedResource::with_provider("awscc", "ec2.SecurityGroup", "test-sg", None)
         .with_attribute(
             "security_group_egress",
             Value::Concrete(ConcreteValue::List(vec![item_a.clone(), item_b.clone()])),
@@ -1389,7 +1378,7 @@ fn diff_no_change_for_compound_word_dsl_alias() {
 
     // Desired: API-canonical bare spelling (output of pass-2 in
     // AwsNormalizer::resolve_enum_identifiers).
-    let desired = Resource::with_provider("aws", "s3.BucketOwnershipControls", "test", None)
+    let desired = ManagedResource::with_provider("aws", "s3.BucketOwnershipControls", "test", None)
         .with_attribute(
             "object_ownership",
             Value::Concrete(ConcreteValue::String("BucketOwnerEnforced".to_string())),

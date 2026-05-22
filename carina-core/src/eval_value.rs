@@ -1,7 +1,7 @@
 //! Evaluator-internal values.
 //!
 //! `Value` is the public, user-facing type that flows through `ParsedFile`,
-//! `Resource.attributes`, plan display, state serialization, and the LSP.
+//! `ManagedResource.attributes`, plan display, state serialization, and the LSP.
 //! Every variant of `Value` is something a `.crn` author can directly
 //! observe in their configuration.
 //!

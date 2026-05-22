@@ -2,7 +2,7 @@
 
 use carina_core::deps::get_resource_dependencies;
 use carina_core::explicit::{self, ExplicitFields};
-use carina_core::resource::{ConcreteValue, Directives, Resource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, Directives, ManagedResource, ResourceId, State, Value};
 use carina_core::value::{
     SecretHashContext, contains_secret, json_to_dsl_value, merge_secrets_into_provider_json,
     value_to_json,
@@ -160,7 +160,7 @@ impl StateFile {
     }
 
     /// Get the identifier for a resource from state.
-    pub fn get_identifier_for_resource(&self, resource: &Resource) -> Option<String> {
+    pub fn get_identifier_for_resource(&self, resource: &ManagedResource) -> Option<String> {
         if let Some(resource_state) = self.find_resource(
             &resource.id.provider,
             &resource.id.resource_type,
@@ -226,14 +226,12 @@ impl StateFile {
         result
     }
 
-    /// Build a `State` for a resource from the state file data.
-    /// Returns a non-existing state if the resource is not found in the state file.
-    pub fn build_state_for_resource(&self, resource: &Resource) -> State {
-        let rs = self.find_resource(
-            &resource.id.provider,
-            &resource.id.resource_type,
-            resource.id.name_str(),
-        );
+    /// Build a `State` for a resource id from the state file data.
+    /// Returns a non-existing state if the resource is not found in the
+    /// state file. Takes a `&ResourceId` so it works for managed
+    /// resources and data sources alike (carina#3181).
+    pub fn build_state_for_resource(&self, id: &ResourceId) -> State {
+        let rs = self.find_resource(&id.provider, &id.resource_type, id.name_str());
         if let Some(identifier) = rs.and_then(|r| r.identifier.as_deref()) {
             let attrs: HashMap<String, Value> = rs
                 .unwrap()
@@ -242,14 +240,14 @@ impl StateFile {
                 .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
                 .collect();
             return State {
-                id: resource.id.clone(),
+                id: id.clone(),
                 identifier: Some(identifier.to_string()),
                 attributes: attrs,
                 exists: true,
                 dependency_bindings: rs.unwrap().dependency_bindings.clone(),
             };
         }
-        State::not_found(resource.id.clone())
+        State::not_found(id.clone())
     }
 
     /// Build state entries for resources tracked in the state file but absent from the
@@ -481,7 +479,7 @@ pub fn check_and_migrate_bytes(bytes: &[u8]) -> Result<StateFile, BackendError> 
 pub struct ResourceState {
     /// Resource type (e.g., "s3.Bucket", "ec2.Vpc")
     pub resource_type: String,
-    /// Resource name (from the `name` attribute in DSL)
+    /// ManagedResource name (from the `name` attribute in DSL)
     pub name: String,
     /// Provider name (e.g., "aws")
     pub provider: String,
@@ -524,7 +522,7 @@ pub struct ResourceState {
     /// Binding names of resources this resource depends on (via ResourceRef).
     /// Stored so orphan Delete effects can have tree structure.
     ///
-    /// Set semantics (BTreeSet) — see Resource::dependency_bindings (#2228).
+    /// Set semantics (BTreeSet) — see ManagedResource::dependency_bindings (#2228).
     /// Old state files persisted as JSON arrays continue to deserialize
     /// (serde transparently coerces array → BTreeSet, deduping any
     /// duplicates and re-serializing in sorted order on next write).
@@ -629,7 +627,11 @@ impl ResourceState {
     ///
     /// `write_only_keys` is the set of attribute names that are marked write-only
     /// in the resource schema.
-    pub fn merge_write_only_attributes(&mut self, resource: &Resource, write_only_keys: &[String]) {
+    pub fn merge_write_only_attributes(
+        &mut self,
+        resource: &ManagedResource,
+        write_only_keys: &[String],
+    ) {
         let mut merged = Vec::new();
         for key in write_only_keys {
             // Only merge if the user specified this attribute and it's not already
@@ -646,14 +648,14 @@ impl ResourceState {
         self.write_only_attributes = merged;
     }
 
-    /// Build a ResourceState from a Resource and its provider-returned State.
+    /// Build a ResourceState from a ManagedResource and its provider-returned State.
     ///
     /// If `existing` is provided, the `protected` flag is preserved from it.
     ///
     /// Returns an error if any attribute value cannot be converted to JSON
     /// (e.g., non-finite float values).
     pub fn from_provider_state(
-        resource: &Resource,
+        resource: &ManagedResource,
         state: &State,
         existing: Option<&ResourceState>,
     ) -> Result<Self, String> {

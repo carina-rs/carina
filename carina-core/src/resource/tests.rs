@@ -714,7 +714,7 @@ fn canonical_hash_consistency() {
 
 #[test]
 fn resource_typed_binding_field() {
-    let resource = Resource::new("s3.Bucket", "my-bucket").with_binding("my_bucket");
+    let resource = ManagedResource::new("s3.Bucket", "my-bucket").with_binding("my_bucket");
     assert_eq!(resource.binding, Some("my_bucket".to_string()));
     // binding should NOT be in attributes
     assert!(!resource.attributes.contains_key("_binding"));
@@ -722,7 +722,7 @@ fn resource_typed_binding_field() {
 
 #[test]
 fn resource_typed_dependency_bindings_field() {
-    let resource = Resource::new("ec2.Subnet", "my-subnet")
+    let resource = ManagedResource::new("ec2.Subnet", "my-subnet")
         .with_dependency_bindings(["vpc".to_string()].into_iter().collect());
     assert!(resource.dependency_bindings.contains("vpc"));
     assert_eq!(resource.dependency_bindings.len(), 1);
@@ -734,7 +734,7 @@ fn resource_typed_dependency_bindings_field() {
 /// entry (#2228).
 #[test]
 fn resource_dependency_bindings_dedup_on_duplicate_insert() {
-    let mut resource = Resource::new("ec2.Subnet", "my-subnet");
+    let mut resource = ManagedResource::new("ec2.Subnet", "my-subnet");
     resource.dependency_bindings.insert("vpc".to_string());
     resource.dependency_bindings.insert("vpc".to_string());
     assert_eq!(resource.dependency_bindings.len(), 1);
@@ -745,7 +745,7 @@ fn resource_dependency_bindings_dedup_on_duplicate_insert() {
 /// order (#2228).
 #[test]
 fn resource_dependency_bindings_iteration_is_sorted() {
-    let mut resource = Resource::new("ec2.Route", "my-route");
+    let mut resource = ManagedResource::new("ec2.Route", "my-route");
     resource.dependency_bindings.insert("rt".to_string());
     resource
         .dependency_bindings
@@ -766,61 +766,15 @@ fn state_dependency_bindings_dedup_on_duplicate_insert() {
 }
 
 #[test]
-fn resource_typed_virtual_field() {
-    let mut resource = Resource::new("_virtual", "web").with_kind(ResourceKind::Virtual);
-
-    resource.virtual_module = Some(("web_tier".to_string(), "web".to_string()));
-    assert!(resource.is_virtual());
-    // _virtual should NOT be in attributes
-    assert!(!resource.attributes.contains_key("_virtual"));
-}
-
-#[test]
 fn resource_default_metadata_fields() {
-    let resource = Resource::new("s3.Bucket", "my-bucket");
+    let resource = ManagedResource::new("s3.Bucket", "my-bucket");
     assert_eq!(resource.binding, None);
     assert!(resource.dependency_bindings.is_empty());
-    assert!(!resource.is_virtual());
-}
-
-#[test]
-fn resource_kind_enum_managed_by_default() {
-    let resource = Resource::new("s3.Bucket", "my-bucket");
-    assert_eq!(resource.kind, ResourceKind::Managed);
-    assert!(!resource.is_virtual());
-    assert!(!resource.is_data_source());
-}
-
-#[test]
-fn resource_kind_enum_virtual_carries_module_info() {
-    let mut resource = Resource::new("_virtual", "web").with_kind(ResourceKind::Virtual);
-
-    resource.virtual_module = Some(("web_tier".to_string(), "web".to_string()));
-    assert!(resource.is_virtual());
-    assert!(!resource.is_data_source());
-    // Module info is in the virtual_module field, not in attributes
-    assert!(!resource.attributes.contains_key("_module"));
-    assert!(!resource.attributes.contains_key("_module_instance"));
-    // Can extract module info from the virtual_module field
-    match &resource.virtual_module {
-        Some((module_name, instance)) => {
-            assert_eq!(module_name, "web_tier");
-            assert_eq!(instance, "web");
-        }
-        None => panic!("Expected virtual_module to be set"),
-    }
-}
-
-#[test]
-fn resource_kind_enum_data_source() {
-    let resource = Resource::new("s3.Bucket", "my-bucket").with_kind(ResourceKind::DataSource);
-    assert!(resource.is_data_source());
-    assert!(!resource.is_virtual());
 }
 
 #[test]
 fn resource_attributes_use_value_type() {
-    let resource = Resource::new("s3.Bucket", "test")
+    let resource = ManagedResource::new("s3.Bucket", "test")
         .with_attribute(
             "name",
             Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
@@ -862,11 +816,12 @@ fn attrs_to_hashmap_clones_values() {
 fn resource_module_source_typed_field() {
     // Real resources that belong to modules should use the typed module_source field
     // instead of storing _module/_module_instance as hidden attributes
-    let resource =
-        Resource::new("ec2.SecurityGroup", "web_sg").with_module_source(ModuleSource::Module {
+    let resource = ManagedResource::new("ec2.SecurityGroup", "web_sg").with_module_source(
+        ModuleSource::Module {
             name: "web_tier".to_string(),
             instance: "web".to_string(),
-        });
+        },
+    );
 
     // Module source info should be in the typed field
     assert_eq!(

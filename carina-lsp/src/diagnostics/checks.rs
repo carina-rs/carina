@@ -8,7 +8,7 @@ use crate::document::Document;
 use crate::position;
 use carina_core::builtins;
 use carina_core::parser::{ArgumentParameter, ParsedFile, TypeExpr};
-use carina_core::resource::{ConcreteValue, DeferredValue, Resource, Value};
+use carina_core::resource::{ConcreteValue, DeferredValue, ManagedResource, Value};
 use carina_core::schema::{ResourceSchema, suggest_similar_name};
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 
@@ -1111,7 +1111,7 @@ impl DiagnosticEngine {
         type_expr: &TypeExpr,
         path: &carina_core::resource::AccessPath,
         param_name: &str,
-        resources: &[carina_core::resource::Resource],
+        resources: &[carina_core::resource::ManagedResource],
     ) -> Option<String> {
         let expected_type = match type_expr {
             TypeExpr::Simple(name) => name.as_str(),
@@ -1377,7 +1377,7 @@ impl DiagnosticEngine {
         doc: &Document,
         parsed: &ParsedFile,
         merged: Option<&ParsedFile>,
-        all_resources: Option<&[Resource]>,
+        all_resources: Option<&[ManagedResource]>,
         sibling_bindings: &HashMap<String, String>,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();

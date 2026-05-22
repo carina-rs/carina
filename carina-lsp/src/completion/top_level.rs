@@ -236,7 +236,7 @@ impl CompletionProvider {
             let description = schema
                 .description
                 .as_deref()
-                .unwrap_or("Resource")
+                .unwrap_or("ManagedResource")
                 .to_string();
 
             // Build snippet with required attributes

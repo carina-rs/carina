@@ -27,7 +27,7 @@ use super::resolve::{
     resolve_resource_refs,
 };
 use crate::eval_value::EvalValue;
-use crate::resource::{DataSource, DeferredValue, Resource, Value};
+use crate::resource::{DataSource, DeferredValue, ManagedResource, Value};
 use indexmap::IndexMap;
 use pest::Parser;
 
@@ -53,7 +53,7 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
 /// Each name in `seeds` is registered in the per-file [`ParseContext`]
 /// the same way `register_argument_binding` does: a placeholder
 /// `Value::Deferred(DeferredValue::ResourceRef{ binding: <name>, attribute: "", … })` is
-/// installed in `ctx.variables`, and a placeholder `Resource` is
+/// installed in `ctx.variables`, and a placeholder `ManagedResource` is
 /// installed in `ctx.resource_bindings`. This means subsequent
 /// expressions resolve the name via the normal `ctx.get_variable` /
 /// `ctx.is_resource_binding` paths instead of degrading to the literal-
@@ -85,6 +85,7 @@ pub fn parse_with_seeded_bindings(
     seed_bindings(&mut ctx, seeds);
     let mut providers = Vec::new();
     let mut resources = Vec::new();
+    let mut data_sources: Vec<DataSource> = Vec::new();
     let mut uses = Vec::new();
     let mut module_calls = Vec::new();
     let mut arguments = Vec::new();
@@ -166,17 +167,27 @@ pub fn parse_with_seeded_bindings(
                                 let iterable_name =
                                     extract_for_iterable_name(&stmt, anon_for_counter);
                                 anon_for_counter += 1;
-                                let (expanded_resources, expanded_module_calls) =
-                                    parse_for_expr(stmt, &mut ctx, &iterable_name)?;
+                                let (
+                                    expanded_resources,
+                                    expanded_data_sources,
+                                    expanded_module_calls,
+                                ) = parse_for_expr(stmt, &mut ctx, &iterable_name)?;
                                 resources.extend(expanded_resources);
+                                data_sources.extend(expanded_data_sources);
                                 module_calls.extend(expanded_module_calls);
                             }
                             Rule::if_expr => {
                                 let binding_name = format!("_if{}", anon_if_counter);
                                 anon_if_counter += 1;
-                                let (_value, expanded_resources, expanded_module_calls, _import) =
-                                    parse_if_expr(stmt, &mut ctx, &binding_name)?;
+                                let (
+                                    _value,
+                                    expanded_resources,
+                                    expanded_data_sources,
+                                    expanded_module_calls,
+                                    _import,
+                                ) = parse_if_expr(stmt, &mut ctx, &binding_name)?;
                                 resources.extend(expanded_resources);
+                                data_sources.extend(expanded_data_sources);
                                 module_calls.extend(expanded_module_calls);
                             }
                             Rule::fn_def => {
@@ -211,6 +222,7 @@ pub fn parse_with_seeded_bindings(
                                     name,
                                     value,
                                     expanded_resources,
+                                    expanded_data_sources,
                                     expanded_module_calls,
                                     maybe_import,
                                     is_structural,
@@ -274,6 +286,20 @@ pub fn parse_with_seeded_bindings(
                                     }
                                     resources.extend(expanded_resources);
                                 }
+                                if !expanded_data_sources.is_empty() {
+                                    if !is_discard {
+                                        // Register the binding name so `name.attr`
+                                        // resolves as a `ResourceRef`. Data sources
+                                        // are a distinct type from `ManagedResource`,
+                                        // so a placeholder managed binding stands in
+                                        // for resolution purposes — same shape as the
+                                        // `_module_binding` / `_wait` placeholders.
+                                        let placeholder =
+                                            ManagedResource::new("_data_source", &name);
+                                        ctx.set_resource_binding(name.clone(), placeholder);
+                                    }
+                                    data_sources.extend(expanded_data_sources);
+                                }
                                 if !expanded_module_calls.is_empty() {
                                     for mut call in expanded_module_calls {
                                         if call.binding_name.is_none() {
@@ -284,12 +310,14 @@ pub fn parse_with_seeded_bindings(
                                     if !is_discard {
                                         // Register as a resource binding so that
                                         // `name.attr` resolves as ResourceRef
-                                        let placeholder = Resource::new("_module_binding", &name);
+                                        let placeholder =
+                                            ManagedResource::new("_module_binding", &name);
                                         ctx.set_resource_binding(name.clone(), placeholder);
                                     }
                                 }
                                 if is_upstream_state && !is_discard {
-                                    let placeholder = Resource::new("_upstream_state", &name);
+                                    let placeholder =
+                                        ManagedResource::new("_upstream_state", &name);
                                     ctx.set_resource_binding(name.clone(), placeholder);
                                     upstream_states.push(ctx.upstream_states[&name].clone());
                                 }
@@ -299,7 +327,7 @@ pub fn parse_with_seeded_bindings(
                                     // `<wait-binding>.<attr>` parses as `ResourceRef`.
                                     // Downstream resolution (Phase 4 of #2825) treats
                                     // it as passthrough of the target's snapshot.
-                                    let placeholder = Resource::new("_wait", &name);
+                                    let placeholder = ManagedResource::new("_wait", &name);
                                     ctx.set_resource_binding(name.clone(), placeholder);
                                     wait_bindings.push(ctx.wait_bindings[&name].clone());
                                 }
@@ -331,9 +359,12 @@ pub fn parse_with_seeded_bindings(
     // During parsing, unknown 2-part identifiers (e.g., vpc.vpc_id where vpc is
     // declared later) become String values like "vpc.vpc_id". Now that we have the
     // full binding set, convert matching ones to ResourceRef.
+    let resource_binding_names: std::collections::HashSet<String> =
+        ctx.resource_bindings.keys().cloned().collect();
     resolve_forward_references(
-        &ctx.resource_bindings,
+        &resource_binding_names,
         &mut resources,
+        &mut data_sources,
         &mut attribute_params,
         &mut module_calls,
         &mut export_params,
@@ -363,19 +394,11 @@ pub fn parse_with_seeded_bindings(
         })
         .collect();
 
-    // carina#3181 PR C: `resources` is now managed-only. Partition the
-    // parsed resources — `read`-keyword resources move into the typed
-    // `data_sources` slice, managed resources stay in `resources`. The
-    // parser never synthesizes virtual resources (that is the module
-    // expander's job), so `virtual_resources` is empty here.
-    let mut data_sources: Vec<DataSource> = Vec::new();
-    resources.retain(|r| match DataSource::try_from(r) {
-        Ok(ds) => {
-            data_sources.push(ds);
-            false
-        }
-        Err(_) => true,
-    });
+    // carina#3181: managed resources and data sources are collected into
+    // separate typed `Vec`s from the start — `resources` is managed-only,
+    // `data_sources` holds the `read`-keyword resources. The parser never
+    // synthesizes virtual resources (that is the module expander's job),
+    // so `virtual_resources` is empty here.
 
     Ok(ParsedFile {
         providers,
@@ -424,7 +447,7 @@ fn seed_bindings(ctx: &mut ParseContext<'_>, seeds: &[&str]) {
             binding: name.to_string(),
         });
         ctx.set_variable(name.to_string(), placeholder_ref);
-        let placeholder = Resource::new("_seeded", name);
+        let placeholder = ManagedResource::new("_seeded", name);
         ctx.set_resource_binding(name.to_string(), placeholder);
         ctx.seeded_bindings.insert(name.to_string());
     }

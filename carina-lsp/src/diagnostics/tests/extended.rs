@@ -3278,7 +3278,7 @@ fn exports_type_check_resolves_resource_binding_from_sibling_file() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().join("downstream");
     std::fs::create_dir_all(&base).unwrap();
-    // Resource binding lives in main.crn.
+    // ManagedResource binding lives in main.crn.
     std::fs::write(
         base.join("main.crn"),
         "let registry_prod = awscc.organizations.account {\n  name = 'prod'\n}\n",

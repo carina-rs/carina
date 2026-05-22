@@ -13,7 +13,9 @@ use crate::parser::{
     evaluate_static_value, first_inner, next_pair, parse_expression, parse_module_call,
     parse_read_resource_expr, parse_resource_expr,
 };
-use crate::resource::{ConcreteValue, DeferredValue, Resource, UnknownReason, Value};
+use crate::resource::{
+    ConcreteValue, DataSource, DeferredValue, ManagedResource, UnknownReason, Value,
+};
 
 /// Binding pattern for a for expression
 #[derive(Debug, Clone, PartialEq)]
@@ -76,9 +78,11 @@ fn is_bare_identifier(s: &str) -> bool {
     bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
-/// Result of parsing a for expression body: either a resource or a module call
+/// Result of parsing a for expression body: a managed resource, a data
+/// source, or a module call.
 pub(crate) enum ForBodyResult {
-    Resource(Box<Resource>),
+    ManagedResource(Box<ManagedResource>),
+    DataSource(Box<DataSource>),
     ModuleCall(ModuleCall),
 }
 
@@ -121,11 +125,12 @@ pub(crate) fn extract_for_iterable_name(
 ///
 /// When the body is a module call, each iteration produces a module call with
 /// a binding name like `binding[0]` or `binding["key"]`.
+#[allow(clippy::type_complexity)]
 pub(crate) fn parse_for_expr(
     pair: pest::iterators::Pair<Rule>,
     ctx: &mut ParseContext,
     binding_name: &str,
-) -> Result<(Vec<Resource>, Vec<ModuleCall>), ParseError> {
+) -> Result<(Vec<ManagedResource>, Vec<DataSource>, Vec<ModuleCall>), ParseError> {
     let for_line = pair.as_span().start_pos().line_col().0;
     let mut inner = pair.into_inner();
 
@@ -160,13 +165,16 @@ pub(crate) fn parse_for_expr(
     }
 
     let mut resources = Vec::new();
+    let mut data_sources = Vec::new();
     let mut module_calls = Vec::new();
 
     let collect = |result: ForBodyResult,
-                   resources: &mut Vec<Resource>,
+                   resources: &mut Vec<ManagedResource>,
+                   data_sources: &mut Vec<DataSource>,
                    module_calls: &mut Vec<ModuleCall>| {
         match result {
-            ForBodyResult::Resource(r) => resources.push(*r),
+            ForBodyResult::ManagedResource(r) => resources.push(*r),
+            ForBodyResult::DataSource(d) => data_sources.push(*d),
             ForBodyResult::ModuleCall(c) => module_calls.push(c),
         }
     };
@@ -186,7 +194,7 @@ pub(crate) fn parse_for_expr(
                 let mut iter_ctx = ctx.clone();
                 bind(&mut iter_ctx, var, item.clone());
                 let result = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
-                collect(result, &mut resources, &mut module_calls);
+                collect(result, &mut resources, &mut data_sources, &mut module_calls);
             }
         }
         (ForBinding::Indexed(idx_var, val_var), Value::Concrete(ConcreteValue::List(items))) => {
@@ -200,7 +208,7 @@ pub(crate) fn parse_for_expr(
                 );
                 bind(&mut iter_ctx, val_var, item.clone());
                 let result = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
-                collect(result, &mut resources, &mut module_calls);
+                collect(result, &mut resources, &mut data_sources, &mut module_calls);
             }
         }
         (ForBinding::Map(key_var, val_var), Value::Concrete(ConcreteValue::Map(map))) => {
@@ -218,7 +226,7 @@ pub(crate) fn parse_for_expr(
                 );
                 bind(&mut iter_ctx, val_var, val.clone());
                 let result = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
-                collect(result, &mut resources, &mut module_calls);
+                collect(result, &mut resources, &mut data_sources, &mut module_calls);
             }
         }
         // Unresolved reference — defer expansion to plan/apply when the
@@ -272,7 +280,7 @@ pub(crate) fn parse_for_expr(
             }
 
             let address = format!("{}[?]", binding_name);
-            if let Ok(ForBodyResult::Resource(resource)) =
+            if let Ok(ForBodyResult::ManagedResource(resource)) =
                 parse_for_body(body_pair, &template_ctx, &address)
             {
                 let attrs: Vec<(String, Value)> = resource
@@ -357,7 +365,7 @@ pub(crate) fn parse_for_expr(
                     }
                 }
                 let address = format!("{}[?]", binding_name);
-                if let Ok(ForBodyResult::Resource(resource)) =
+                if let Ok(ForBodyResult::ManagedResource(resource)) =
                     parse_for_body(body_pair, &template_ctx, &address)
                 {
                     let attrs: Vec<(String, Value)> = resource
@@ -383,7 +391,7 @@ pub(crate) fn parse_for_expr(
                         template_resource: *resource,
                     });
                 }
-                return Ok((resources, module_calls));
+                return Ok((resources, data_sources, module_calls));
             }
             let iterable_type = match &iterable {
                 Value::Concrete(ConcreteValue::String(s)) => {
@@ -424,7 +432,7 @@ pub(crate) fn parse_for_expr(
         }
     }
 
-    Ok((resources, module_calls))
+    Ok((resources, data_sources, module_calls))
 }
 
 /// Parse a for binding pattern.
@@ -520,11 +528,11 @@ pub(crate) fn parse_for_body(
             }
             Rule::resource_expr => {
                 let resource = parse_resource_expr(inner, &local_ctx, address)?;
-                return Ok(ForBodyResult::Resource(Box::new(resource)));
+                return Ok(ForBodyResult::ManagedResource(Box::new(resource)));
             }
             Rule::read_resource_expr => {
-                let resource = parse_read_resource_expr(inner, &local_ctx, address)?;
-                return Ok(ForBodyResult::Resource(Box::new(resource)));
+                let data_source = parse_read_resource_expr(inner, &local_ctx, address)?;
+                return Ok(ForBodyResult::DataSource(Box::new(data_source)));
             }
             Rule::module_call => {
                 let mut call = parse_module_call(inner, &local_ctx)?;

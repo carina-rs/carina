@@ -301,8 +301,8 @@ mod tests {
     use super::*;
     use crate::parser::{ParsedFile, WaitBinding};
     use crate::resource::{
-        AccessPath, ConcreteValue, DeferredValue, PathSegment, Resource, ResourceId, Subscript,
-        Value,
+        AccessPath, ConcreteValue, DeferredValue, ManagedResource, PathSegment, ResourceId,
+        Subscript, Value,
     };
     use crate::schema::{
         AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
@@ -350,12 +350,12 @@ mod tests {
     /// Build a `ParsedFile` with a cert binding + a route53 RecordSet
     /// that references the deferred field.
     fn parsed_with_unsynchronized_chained_ref() -> ParsedFile {
-        let mut cert = Resource::new("acm.Certificate", "cert");
+        let mut cert = ManagedResource::new("acm.Certificate", "cert");
         cert.id = ResourceId::new("acm.Certificate", "cert");
         cert.id.provider = "aws".to_string();
         cert.binding = Some("cert".to_string());
 
-        let mut record = Resource::new("route53.RecordSet", "record");
+        let mut record = ManagedResource::new("route53.RecordSet", "record");
         record.id = ResourceId::new("route53.RecordSet", "record");
         record.id.provider = "aws".to_string();
         record.binding = Some("record".to_string());
@@ -419,13 +419,13 @@ mod tests {
 
     #[test]
     fn chained_ref_to_non_deferred_inner_field_is_not_flagged() {
-        let mut record = Resource::new("route53.RecordSet", "record");
+        let mut record = ManagedResource::new("route53.RecordSet", "record");
         record.id = ResourceId::new("route53.RecordSet", "record");
         record.id.provider = "aws".to_string();
         record.binding = Some("record".to_string());
         record.set_attr("name", dvo_chained_ref("domain_name"));
 
-        let mut cert = Resource::new("acm.Certificate", "cert");
+        let mut cert = ManagedResource::new("acm.Certificate", "cert");
         cert.id = ResourceId::new("acm.Certificate", "cert");
         cert.id.provider = "aws".to_string();
         cert.binding = Some("cert".to_string());
@@ -442,7 +442,7 @@ mod tests {
     fn unknown_target_binding_does_not_emit_double_diagnostic() {
         // A typo in the binding name produces an undefined-identifier
         // error elsewhere; this pass must not pile on.
-        let mut record = Resource::new("route53.RecordSet", "record");
+        let mut record = ManagedResource::new("route53.RecordSet", "record");
         record.id = ResourceId::new("route53.RecordSet", "record");
         record.id.provider = "aws".to_string();
         record.binding = Some("record".to_string());
@@ -493,12 +493,12 @@ mod tests {
         r.insert("aws", schema);
         r.insert("aws", consumer);
 
-        let mut db = Resource::new("rds.DBInstance", "db");
+        let mut db = ManagedResource::new("rds.DBInstance", "db");
         db.id = ResourceId::new("rds.DBInstance", "db");
         db.id.provider = "aws".to_string();
         db.binding = Some("db".to_string());
 
-        let mut inst = Resource::new("ec2.Instance", "i");
+        let mut inst = ManagedResource::new("ec2.Instance", "i");
         inst.id = ResourceId::new("ec2.Instance", "i");
         inst.id.provider = "aws".to_string();
         inst.binding = Some("i".to_string());
@@ -527,7 +527,7 @@ mod tests {
     fn schema_lookup_miss_does_not_panic_or_emit() {
         // Resource type not in the registry — pass should bail
         // silently. Other passes report unknown resource types.
-        let mut record = Resource::new("unknown.thing", "x");
+        let mut record = ManagedResource::new("unknown.thing", "x");
         record.id = ResourceId::new("unknown.thing", "x");
         record.id.provider = "aws".to_string();
         record.binding = Some("x".to_string());

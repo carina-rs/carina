@@ -9,7 +9,7 @@ use crate::provider::{
     CreateRequest, DeleteRequest, PatchOp, PatchOpKind, Provider, UpdatePatch, UpdateRequest,
     build_update_patch,
 };
-use crate::resource::{ConcreteValue, Resource, ResourceId, State, Value};
+use crate::resource::{ConcreteValue, ManagedResource, ResourceId, State, Value};
 
 use super::basic::{
     BasicEffectResult, RenormalizePipeline, resolve_resource, resolve_resource_with_source,
@@ -21,7 +21,7 @@ use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
 /// path of replacements (cascade has no precomputed
 /// `changed_attributes` list, so the patch is derived from the
 /// from/to comparison directly).
-pub(super) fn compute_full_diff_patch(from: &State, to: &Resource) -> UpdatePatch {
+pub(super) fn compute_full_diff_patch(from: &State, to: &ManagedResource) -> UpdatePatch {
     use std::collections::HashSet;
 
     let mut keys: HashSet<&str> = HashSet::new();
@@ -84,12 +84,12 @@ pub(super) struct ReplaceContext<'a> {
     pub(super) effect: &'a Effect,
     pub(super) id: &'a ResourceId,
     pub(super) from: &'a State,
-    pub(super) to: &'a Resource,
+    pub(super) to: &'a ManagedResource,
     pub(super) directives: &'a crate::resource::Directives,
     pub(super) cascading_updates: &'a [crate::effect::CascadingUpdate],
     pub(super) temporary_name: Option<&'a crate::effect::TemporaryName>,
     pub(super) bindings: &'a ResolvedBindings,
-    pub(super) unresolved: &'a HashMap<ResourceId, Resource>,
+    pub(super) unresolved: &'a HashMap<ResourceId, ManagedResource>,
     pub(super) pipeline: &'a RenormalizePipeline<'a>,
     pub(super) started: Instant,
     pub(super) progress: ProgressInfo,
@@ -156,12 +156,8 @@ pub(super) async fn execute_cbd_replace_parallel(
             // Execute cascading updates
             let mut cascade_failed = false;
             for cascade in ctx.cascading_updates {
-                let resolved_to = match resolve_resource(
-                    &crate::resource::Resource::from(&cascade.to),
-                    &local_bindings,
-                    ctx.pipeline,
-                )
-                .await
+                let resolved_to = match resolve_resource(&cascade.to, &local_bindings, ctx.pipeline)
+                    .await
                 {
                     Ok(r) => r,
                     Err(e) => {

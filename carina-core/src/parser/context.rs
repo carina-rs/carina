@@ -8,7 +8,7 @@ use super::ast::{DeferredForExpression, ProviderConfig, UpstreamState, UserFunct
 use super::error::{ParseError, ParseWarning};
 use super::{ProviderContext, Rule};
 use crate::eval_value::EvalValue;
-use crate::resource::Resource;
+use crate::resource::ManagedResource;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
@@ -22,8 +22,8 @@ pub(crate) struct ParseContext<'cfg> {
     /// end of `parse(...)`; an unfinished closure surfaces as a
     /// parse-time error.
     pub(super) variables: IndexMap<String, EvalValue>,
-    /// Resource bindings (binding_name -> Resource)
-    pub(super) resource_bindings: HashMap<String, Resource>,
+    /// Resource bindings (binding_name -> ManagedResource)
+    pub(super) resource_bindings: HashMap<String, ManagedResource>,
     /// Imported modules (alias -> path)
     pub(super) imported_modules: HashMap<String, String>,
     /// User-defined functions
@@ -99,7 +99,7 @@ impl<'cfg> ParseContext<'cfg> {
         self.variables.get(name)
     }
 
-    pub(super) fn set_resource_binding(&mut self, name: String, resource: Resource) {
+    pub(super) fn set_resource_binding(&mut self, name: String, resource: ManagedResource) {
         self.resource_bindings.insert(name, resource);
     }
 

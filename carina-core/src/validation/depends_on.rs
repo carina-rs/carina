@@ -15,7 +15,6 @@ use std::collections::{HashMap, HashSet};
 
 use crate::deps::sort_resources_by_dependencies;
 use crate::parser::{File, ResourceRef};
-use crate::resource::ResourceKind;
 use crate::validation::{collect_dot_notation_refs, collect_resource_refs};
 
 /// Severity of a depends_on diagnostic.
@@ -179,7 +178,7 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
                 continue;
             };
 
-            if matches!(target.kind(), ResourceKind::DataSource) {
+            if matches!(target, ResourceRef::DataSource(_)) {
                 diags.push(
                     DependsOnDiagnostic::error(format!(
                         "directives.depends_on on '{}': data sources cannot be \
@@ -210,11 +209,13 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
     // depends_on — but the cycle itself may go through value refs only.
     // Don't claim attribution; just report the cycle.
     //
-    // carina#3181: `parsed.resources` is managed-only now, so rebuild the
-    // mixed legacy view (managed + virtual + data source) — the cycle
-    // graph must see every top-level resource.
-    let all_resources = parsed.legacy_top_level_resources();
-    if let Err(msg) = sort_resources_by_dependencies(&all_resources) {
+    // carina#3181: only managed resources can participate in a cycle —
+    // data sources are rejected as `depends_on` targets above (so they
+    // can be sources but never the depended-on end of an edge), and
+    // virtual resources are post-apply synthetic nodes with no
+    // directives. A cycle therefore lives entirely within the managed
+    // slice.
+    if let Err(msg) = sort_resources_by_dependencies(&parsed.resources) {
         diags.push(DependsOnDiagnostic::error(msg));
     }
 

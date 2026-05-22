@@ -65,7 +65,7 @@ pub async fn execute_wait_effect(
 mod tests {
     use super::*;
     use crate::provider::{BoxFuture, CreateRequest, DeleteRequest, ReadRequest, UpdateRequest};
-    use crate::resource::{ConcreteValue, Resource, Value};
+    use crate::resource::{ConcreteValue, DataSource, Value};
     use crate::wait::predicate::{AttrPath, WaitPredicate};
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -116,7 +116,7 @@ mod tests {
             })
         }
 
-        fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+        fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
             let id = resource.id.clone();
             Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
         }

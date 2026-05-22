@@ -266,10 +266,10 @@ pub(crate) fn parse_primary_eval(
 
     match inner.as_rule() {
         Rule::resource_expr => {
-            // Resource expressions cannot be used as attribute values (only valid in top-level let bindings)
+            // ManagedResource expressions cannot be used as attribute values (only valid in top-level let bindings)
             Err(ParseError::InvalidExpression {
                 line: 0,
-                message: "Resource expressions can only be used in let bindings".to_string(),
+                message: "ManagedResource expressions can only be used in let bindings".to_string(),
             })
         }
         Rule::list => {

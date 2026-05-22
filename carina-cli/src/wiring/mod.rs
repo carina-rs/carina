@@ -22,9 +22,9 @@ use carina_core::provider::{
     self as provider_mod, Provider, ProviderError, ProviderFactory, ProviderNormalizer,
     ProviderRouter,
 };
-use carina_core::resolver::{resolve_refs_for_plan, resolve_refs_with_state_and_remote};
+use carina_core::resolver::resolve_refs_for_plan;
 use carina_core::resource::{
-    ConcreteValue, DeferredValue, Resource, ResourceId, State, Value, contains_resource_ref,
+    ConcreteValue, DeferredValue, ManagedResource, ResourceId, State, Value, contains_resource_ref,
 };
 use carina_core::schema::{SchemaRegistry, resolve_block_names};
 use carina_core::validation;
@@ -37,7 +37,7 @@ use crate::error::AppError;
 /// Result of creating a plan, with context needed for saving
 pub struct PlanContext {
     pub plan: Plan,
-    pub sorted_resources: Vec<Resource>,
+    pub sorted_resources: Vec<ManagedResource>,
     pub current_states: HashMap<ResourceId, State>,
     /// Maps moved-to resource IDs to their original (moved-from) IDs.
     /// Used by display to show "(moved from: ...)" annotations on Update/Replace effects.
@@ -278,7 +278,7 @@ pub fn validate_resource_ref_types_with_ctx<E>(
 pub fn validate_attribute_param_ref_types_with_ctx(
     ctx: &WiringContext,
     attribute_params: &[carina_core::parser::AttributeParameter],
-    resources: &[Resource],
+    resources: &[ManagedResource],
 ) -> Vec<AppError> {
     lift_validation_result(validation::validate_attribute_param_ref_types(
         attribute_params,
@@ -365,7 +365,10 @@ fn value_contains_empty_interpolation(value: &Value) -> bool {
 }
 
 /// Resolve block name aliases and attribute prefixes in one step.
-pub fn resolve_names_with_ctx(ctx: &WiringContext, resources: &mut [Resource]) -> Vec<AppError> {
+pub fn resolve_names_with_ctx(
+    ctx: &WiringContext,
+    resources: &mut [ManagedResource],
+) -> Vec<AppError> {
     let mut errors = lift_validation_result(resolve_block_names(resources, ctx.schemas()));
     errors.extend(resolve_attr_prefixes_with_ctx(ctx, resources));
     errors
@@ -373,12 +376,12 @@ pub fn resolve_names_with_ctx(ctx: &WiringContext, resources: &mut [Resource]) -
 
 pub fn resolve_attr_prefixes_with_ctx(
     ctx: &WiringContext,
-    resources: &mut [Resource],
+    resources: &mut [ManagedResource],
 ) -> Vec<AppError> {
     lift_validation_result(identifier::resolve_attr_prefixes(resources, ctx.schemas()))
 }
 
-pub fn reconcile_prefixed_names(resources: &mut [Resource], state_file: &Option<StateFile>) {
+pub fn reconcile_prefixed_names(resources: &mut [ManagedResource], state_file: &Option<StateFile>) {
     let state_file = match state_file {
         Some(sf) => sf,
         None => return,
@@ -417,7 +420,7 @@ fn identity_attributes_for_provider(ctx: &WiringContext, name: &str) -> Vec<Stri
 /// new binding name so the differ sees the resource under its new identity.
 pub fn apply_anonymous_to_named_renames(
     ctx: &WiringContext,
-    resources: &[Resource],
+    resources: &[ManagedResource],
     providers: &[ProviderConfig],
     current_states: &mut HashMap<ResourceId, State>,
     prev_explicit: &mut HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
@@ -482,7 +485,7 @@ pub fn apply_anonymous_to_named_renames(
 
 pub fn reconcile_anonymous_identifiers_with_ctx(
     ctx: &WiringContext,
-    resources: &mut [Resource],
+    resources: &mut [ManagedResource],
     state_file: &mut StateFile,
 ) {
     let renames = identifier::reconcile_anonymous_identifiers(
@@ -549,7 +552,7 @@ pub fn apply_provider_prefix_renames(renames: &[(String, String)], state_file: &
 
 pub fn compute_anonymous_identifiers_with_ctx(
     ctx: &WiringContext,
-    resources: &mut [Resource],
+    resources: &mut [ManagedResource],
     providers: &[ProviderConfig],
 ) -> Vec<AppError> {
     match identifier::compute_anonymous_identifiers(resources, providers, ctx.schemas(), &|name| {
@@ -584,7 +587,7 @@ impl<'a> PlanPreprocessor<'a> {
     /// Call after `resolve_refs_with_state_and_remote()` and before `create_plan()`.
     pub async fn prepare(
         &self,
-        resources: &mut [Resource],
+        resources: &mut [ManagedResource],
         current_states: &mut HashMap<ResourceId, State>,
         provider_configs: &[ProviderConfig],
     ) {
@@ -648,7 +651,7 @@ struct StrippedAttribute {
 ///   `core_to_wit_value` `_` debug-format fallback would silently
 ///   stringify the ref (#2387).
 fn strip_attributes_matching(
-    resources: &mut [Resource],
+    resources: &mut [ManagedResource],
     predicate: &dyn Fn(&Value) -> bool,
 ) -> HashMap<ResourceId, Vec<StrippedAttribute>> {
     let mut out: HashMap<ResourceId, Vec<StrippedAttribute>> = HashMap::new();
@@ -695,7 +698,7 @@ fn strip_attributes_matching(
 /// provider-injected defaults) end up after the original entries,
 /// which matches behavior pre-#2377 for non-stripped attributes.
 fn restore_stripped_attributes(
-    resources: &mut [Resource],
+    resources: &mut [ManagedResource],
     mut stripped: HashMap<ResourceId, Vec<StrippedAttribute>>,
 ) {
     for resource in resources.iter_mut() {
@@ -740,7 +743,7 @@ fn current_states_contain_unknown(states: &HashMap<ResourceId, State>) -> bool {
 /// `normalize_desired()` to the resources. This resolves enum identifiers
 /// (e.g., bare enum identifiers -> namespaced enum strings) without requiring
 /// actual provider instances or network access.
-pub fn normalize_desired_with_ctx(ctx: &WiringContext, resources: &mut [Resource]) {
+pub fn normalize_desired_with_ctx(ctx: &WiringContext, resources: &mut [ManagedResource]) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("failed to build tokio runtime for normalize_desired");
@@ -787,7 +790,7 @@ pub fn normalize_state_with_ctx(
 ///
 /// This must be called on both desired resources and current states to ensure
 /// the differ sees consistent values and produces no false diffs.
-pub fn resolve_enum_aliases_with_ctx(ctx: &WiringContext, resources: &mut [Resource]) {
+pub fn resolve_enum_aliases_with_ctx(ctx: &WiringContext, resources: &mut [ManagedResource]) {
     // Single source of truth shared with the apply path
     // (`executor::renormalize`) so plan and apply cannot diverge on the
     // enum-alias stage again (carina#3063). The core helper mutates
@@ -874,12 +877,9 @@ pub fn validate_module_attribute_param_types<E>(
         if module_parsed.attribute_params.is_empty() {
             continue;
         }
-        // carina#3181: rebuild the mixed legacy view so an imported
-        // module's attribute params can ref-type-check against its
-        // `read` (data-source) bindings too.
         if let Err(joined) = validation::validate_attribute_param_ref_types(
             &module_parsed.attribute_params,
-            &module_parsed.legacy_top_level_resources(),
+            &module_parsed.resources,
             ctx.schemas(),
         ) {
             // Preserve the module-path prefix the legacy wrapper emitted
@@ -1161,7 +1161,10 @@ impl RefreshableChildIds {
     /// through this method — there is no other constructor for the
     /// refresh set, which is what makes the plan/apply parity a
     /// type-level invariant rather than a reviewer's responsibility.
-    pub fn select<'a>(&'a self, resources: &'a [Resource]) -> impl Iterator<Item = &'a Resource> {
+    pub fn select<'a>(
+        &'a self,
+        resources: &'a [ManagedResource],
+    ) -> impl Iterator<Item = &'a ManagedResource> {
         resources.iter().filter(move |r| self.0.contains(&r.id))
     }
 
@@ -1186,7 +1189,7 @@ pub struct DeferredForExpansion {
     /// The augmented, re-sorted resource set: every original resource
     /// plus the materialized loop children, topologically ordered.
     /// Equal in length to the input when no loop resolved.
-    pub sorted_resources: Vec<Resource>,
+    pub sorted_resources: Vec<ManagedResource>,
     /// Loops still unresolved (iterable genuinely unknowable at plan
     /// time) — rendered as the carina#3128 validate/plan placeholder.
     pub residual_deferred_for: Vec<carina_core::parser::DeferredForExpression>,
@@ -1244,7 +1247,7 @@ pub struct DeferredForExpansion {
 /// so the plan and apply paths cannot diverge.
 pub fn expand_same_config_deferred_for<E: Clone>(
     parsed: &carina_core::parser::File<E>,
-    sorted_resources: &[Resource],
+    sorted_resources: &[ManagedResource],
     current_states: &HashMap<ResourceId, State>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     wait_aliases: &[WaitAliasSpec],
@@ -1366,12 +1369,14 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     // pre-expansion set (the loop's iterable source — e.g. `let cert` —
     // is a normal top-level resource already here and refreshed by the
     // normal phase-1 pass; only the loop's generated children are added).
-    // carina#3181: `parsed.resources` is managed-only; rebuild the mixed
-    // legacy view (managed + virtual + data source) so data sources
-    // still reach `split_resources_by_kind` / `create_plan` below.
-    let all_top_level_resources = parsed.legacy_top_level_resources();
+    // carina#3181: `parsed.resources` is managed-only and
+    // `parsed.data_sources` holds the `read`-keyword resources. Only
+    // managed resources participate in the dependency sort; data sources
+    // are refreshed in a later phase against the already-populated
+    // `current_states`.
     let mut sorted_resources =
-        sort_resources_by_dependencies(&all_top_level_resources).map_err(AppError::Validation)?;
+        sort_resources_by_dependencies(&parsed.resources).map_err(AppError::Validation)?;
+    let data_sources: Vec<carina_core::resource::DataSource> = parsed.data_sources.clone();
 
     // Select appropriate Provider based on configuration
     let provider = get_provider_with_ctx(&ctx, parsed, base_dir).await?;
@@ -1397,7 +1402,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     // carina-state stays schema-free; the registry only exists here.
     carina_core::utils::lift_saved_state_string_enums(
         &mut saved_attrs,
-        &all_top_level_resources,
+        &sorted_resources,
         ctx.schemas(),
     );
     let mut prev_explicit = state_file
@@ -1557,6 +1562,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
             .collect();
         let resolved_data_sources = resolve_data_source_refs_for_refresh(
             &sorted_resources,
+            &data_sources,
             &current_states,
             remote_bindings,
             ctx.schemas(),
@@ -1590,7 +1596,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         // --refresh=false: use cached state from state file instead of calling provider.read()
         if let Some(sf) = state_file.as_ref() {
             for resource in &sorted_resources {
-                let state = sf.build_state_for_resource(resource);
+                let state = sf.build_state_for_resource(&resource.id);
                 current_states.insert(resource.id.clone(), state);
             }
 
@@ -1702,7 +1708,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
             // cached state stays `not_found` → Create (mirrors the
             // non-loop ref's behavior under --refresh=false).
             for resource in children() {
-                let state = sf.build_state_for_resource(resource);
+                let state = sf.build_state_for_resource(&resource.id);
                 current_states.insert(resource.id.clone(), state);
             }
             provider
@@ -1745,7 +1751,12 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     // resolver / differ consume it.
     carina_core::utils::lift_current_state_string_enums(
         &mut current_states,
-        &all_top_level_resources,
+        &sorted_resources,
+        ctx.schemas(),
+    );
+    carina_core::utils::lift_current_state_string_enums_for_data_sources(
+        &mut current_states,
+        &data_sources,
         ctx.schemas(),
     );
     resolve_refs_for_plan(
@@ -1754,6 +1765,21 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         remote_bindings,
         &wait_aliases,
     )?;
+    // Resolve data-source input refs for the plan and canonicalize, so
+    // each `read` resource flows into `create_plan` with concrete
+    // attribute values (carina#3181).
+    let mut data_sources_for_plan = data_sources.clone();
+    carina_core::resolver::resolve_data_source_refs_for_plan(
+        &mut data_sources_for_plan,
+        &resources,
+        &current_states,
+        remote_bindings,
+        &wait_aliases,
+    )?;
+    carina_core::value::canonicalize_data_sources_with_schemas(
+        &mut data_sources_for_plan,
+        ctx.schemas(),
+    );
 
     // Type-level canonicalization for `Union[String, list(String)]`
     // fields (IAM-style `string_or_list_of_strings`). Done after refs
@@ -1780,10 +1806,8 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         .as_ref()
         .map(|sf| sf.build_directives())
         .unwrap_or_default();
-    let (managed_for_plan, data_sources_for_plan) =
-        carina_core::differ::split_resources_by_kind(&resources);
     let mut plan = create_plan(
-        &managed_for_plan,
+        &resources,
         &data_sources_for_plan,
         &current_states,
         &directives_map,
@@ -1797,14 +1821,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     // Populate cascading updates for Replace effects with create_before_destroy.
     // Uses unresolved resources (sorted_resources) so dependent Update effects
     // retain ResourceRef values for re-resolution at apply time.
-    let (unresolved_managed, _unresolved_ds) =
-        carina_core::differ::split_resources_by_kind(&sorted_resources);
-    cascade_dependent_updates(
-        &mut plan,
-        &unresolved_managed,
-        &current_states,
-        ctx.schemas(),
-    );
+    cascade_dependent_updates(&mut plan, &sorted_resources, &current_states, ctx.schemas());
 
     // Add state block effects (import/removed/moved) to the plan
     add_state_block_effects(
@@ -2122,17 +2139,17 @@ pub async fn read_with_retry(
 pub(crate) async fn refresh_resource_set<'a>(
     provider: &dyn Provider,
     multi: &indicatif::MultiProgress,
-    resources: impl Iterator<Item = &'a Resource>,
+    resources: impl Iterator<Item = &'a ManagedResource>,
     state_file: &Option<StateFile>,
     saved_dep_bindings: &HashMap<ResourceId, BTreeSet<String>>,
     current_states: &mut HashMap<ResourceId, State>,
 ) -> Result<bool, AppError> {
     let mut started_bar = false;
     let results: Vec<Result<(ResourceId, State), AppError>> =
-        // Typed kind gate (carina#3180): refresh only addresses
-        // managed resources. Data sources go through the data-source
-        // refresh path, virtuals carry no provider state.
-        stream::iter(resources.filter(|r| carina_core::resource::ManagedResource::try_from(*r).is_ok()))
+        // carina#3181: `resources` is a managed-resource iterator —
+        // data sources go through the data-source refresh path and
+        // virtuals carry no provider state.
+        stream::iter(resources)
             .map(|resource| {
                 started_bar = true;
                 let progress = RefreshProgress::begin_multi(multi, &resource.id);
@@ -2196,11 +2213,11 @@ pub(crate) fn finish_refresh_bar_region(started_bar: bool) {
 /// Read a data source resource via the provider with retry on throttling errors.
 ///
 /// Same backoff policy as [`read_with_retry`] but uses [`Provider::read_data_source`]
-/// so the provider receives the full [`Resource`] (including user-supplied input
-/// attributes) rather than just the identifier.
+/// so the provider receives the full [`DataSource`](carina_core::resource::DataSource)
+/// (including user-supplied input attributes) rather than just the identifier.
 pub async fn read_data_source_with_retry(
     provider: &dyn Provider,
-    resource: &Resource,
+    resource: &carina_core::resource::DataSource,
 ) -> Result<State, ProviderError> {
     let max_retries = 3;
     for attempt in 0..=max_retries {
@@ -2225,38 +2242,34 @@ pub async fn read_data_source_with_retry(
 /// already-refreshed `current_states`, returning the data sources ready
 /// to pass to `read_data_source_with_retry` (#1683).
 ///
-/// The full `sorted_resources` slice must be passed (not a pre-filtered
-/// data-sources-only slice) because `resolve_refs_with_state_and_remote`
-/// builds its binding map from every resource with a `binding`, including
-/// managed ones that data sources reference.
+/// The `managed` slice is passed (not just the data sources) because the
+/// resolver builds its binding map from every managed resource with a
+/// `binding` — data sources reference those.
 pub(crate) fn resolve_data_source_refs_for_refresh(
-    sorted_resources: &[Resource],
+    managed: &[ManagedResource],
+    data_sources: &[carina_core::resource::DataSource],
     current_states: &HashMap<ResourceId, State>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     schemas: &carina_core::schema::SchemaRegistry,
     wait_aliases: &[WaitAliasSpec],
-) -> Result<Vec<Resource>, AppError> {
-    let mut resolved = sorted_resources.to_vec();
-    resolve_refs_with_state_and_remote(
+) -> Result<Vec<carina_core::resource::DataSource>, AppError> {
+    let mut resolved = data_sources.to_vec();
+    carina_core::resolver::resolve_data_source_refs(
         &mut resolved,
+        managed,
         current_states,
         remote_bindings,
         wait_aliases,
     )
     .map_err(AppError::Validation)?;
-    carina_core::value::canonicalize_resources_with_schemas(&mut resolved, schemas);
-    Ok(resolved
-        .into_iter()
-        // Typed kind gate (carina#3180): only data sources are
-        // forwarded to the data-source refresh stage.
-        .filter(|r| carina_core::resource::DataSource::try_from(r).is_ok())
-        .collect())
+    carina_core::value::canonicalize_data_sources_with_schemas(&mut resolved, schemas);
+    Ok(resolved)
 }
 
 /// Convenience wrappers for tests. Each creates a fresh `WiringContext` internally,
 /// which is acceptable in test code where the overhead is negligible.
 #[cfg(test)]
-pub fn validate_resources(resources: &[Resource]) -> Result<(), AppError> {
+pub fn validate_resources(resources: &[ManagedResource]) -> Result<(), AppError> {
     use carina_core::parser::ParsedFile;
     let ctx = WiringContext::new(vec![]);
     let parsed = ParsedFile {
@@ -2271,20 +2284,20 @@ pub fn validate_resources(resources: &[Resource]) -> Result<(), AppError> {
 }
 
 #[cfg(test)]
-pub fn resolve_names(resources: &mut [Resource]) -> Result<(), AppError> {
+pub fn resolve_names(resources: &mut [ManagedResource]) -> Result<(), AppError> {
     let ctx = WiringContext::new(vec![]);
     errors_to_legacy_result(resolve_names_with_ctx(&ctx, resources))
 }
 
 #[cfg(test)]
-pub fn resolve_attr_prefixes(resources: &mut [Resource]) -> Result<(), AppError> {
+pub fn resolve_attr_prefixes(resources: &mut [ManagedResource]) -> Result<(), AppError> {
     let ctx = WiringContext::new(vec![]);
     errors_to_legacy_result(resolve_attr_prefixes_with_ctx(&ctx, resources))
 }
 
 #[cfg(test)]
 pub fn compute_anonymous_identifiers(
-    resources: &mut [Resource],
+    resources: &mut [ManagedResource],
     providers: &[ProviderConfig],
 ) -> Result<(), AppError> {
     let ctx = WiringContext::new(vec![]);
@@ -2316,7 +2329,7 @@ fn errors_to_legacy_result(errors: Vec<AppError>) -> Result<(), AppError> {
 }
 
 #[cfg(test)]
-pub fn resolve_enum_aliases(resources: &mut [Resource]) {
+pub fn resolve_enum_aliases(resources: &mut [ManagedResource]) {
     let ctx = WiringContext::new(vec![]);
     resolve_enum_aliases_with_ctx(&ctx, resources)
 }

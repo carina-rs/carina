@@ -37,7 +37,7 @@ use carina_core::parser::ProviderContext;
 use carina_core::provider::{
     BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer, ProviderResult,
 };
-use carina_core::resource::{Resource, ResourceId, State, Value};
+use carina_core::resource::{DataSource, ResourceId, State, Value};
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 use indexmap::IndexMap;
 use std::sync::Mutex;
@@ -161,7 +161,7 @@ impl Provider for NoopProvider {
     }
     fn read_data_source(
         &self,
-        r: &Resource,
+        r: &DataSource,
     ) -> BoxFuture<'_, ProviderResult<carina_core::resource::State>> {
         let id = r.id.clone();
         Box::pin(async move { Ok(carina_core::resource::State::existing(id, HashMap::new())) })
@@ -304,10 +304,10 @@ fn apply_path_propagates_module_wait_binding() {
             )
         })
         .collect();
-    let virtual_r = parsed.resources.iter().any(|r| {
-        r.binding.as_deref() == Some("r")
-            && matches!(r.kind, carina_core::resource::ResourceKind::Virtual)
-    });
+    let virtual_r = parsed
+        .virtual_resources
+        .iter()
+        .any(|r| r.binding.as_deref() == Some("r"));
     // This assertion encodes the hypothesis. If it FAILS showing
     // binding="r", we've found the apply-path root cause: the nested
     // ref binds to the virtual module proxy, not the wait binding.
@@ -398,11 +398,9 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         )
         .await;
 
-    let (managed___, data_sources___) =
-        carina_core::differ::split_resources_by_kind(&resources_for_plan);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources_for_plan,
+        &parsed.data_sources,
         &current_states,
         &HashMap::new(),
         ctx.schemas(),
@@ -431,6 +429,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &unresolved_resources,
+        virtual_resources: &parsed.virtual_resources,
         bindings: ResolvedBindings::default(),
         current_states,
         normalizer: &NoopNormalizer,

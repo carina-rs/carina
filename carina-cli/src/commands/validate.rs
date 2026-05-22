@@ -506,10 +506,10 @@ mod tests {
     #[test]
     fn pending_named_direct_resource_does_not_render_trailing_dot() {
         use carina_core::parser::ParsedFile;
-        use carina_core::resource::Resource;
+        use carina_core::resource::ManagedResource;
 
         let mut parsed = ParsedFile::default();
-        let mut res = Resource::new("s3.Bucket", "placeholder");
+        let mut res = ManagedResource::new("s3.Bucket", "placeholder");
         res.id.provider = "aws".to_string();
         // Force the anonymous/not-yet-promoted state explicitly.
         res.id.name = ResourceName::Pending;

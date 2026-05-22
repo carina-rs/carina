@@ -11,8 +11,7 @@
 //! binding LHS) is enforced upstream by `parse_wait_expr`; the parse
 //! error surfaces via the regular parser diagnostic path.
 
-use crate::parser::File;
-use crate::resource::ResourceKind;
+use crate::parser::{File, ResourceRef};
 use crate::schema::{SchemaKind, SchemaRegistry};
 
 /// A wait-construct diagnostic.
@@ -38,24 +37,32 @@ pub fn validate_wait_bindings<E>(
     }
     let mut out: Vec<WaitDiagnostic> = Vec::new();
 
-    // Build binding → (provider, resource_type, kind) lookup once.
+    // Build binding → (provider, resource_type, schema_kind) lookup once.
     // carina#3181: walk the typed top-level slices so a data-source
-    // target (`let x = read ...`) is still found, and carry its kind so
-    // the schema lookup below uses the matching `SchemaKind`.
-    let mut by_binding: std::collections::HashMap<String, (String, String, ResourceKind)> =
+    // target (`let x = read ...`) is still found, and carry its
+    // `SchemaKind` so the schema lookup below uses the matching kind.
+    // A virtual target stores `None` — it is still "found" but has no
+    // schema to check attributes against.
+    let mut by_binding: std::collections::HashMap<String, (String, String, Option<SchemaKind>)> =
         std::collections::HashMap::new();
     for rref in parsed.iter_top_level_resources() {
         if let Some(b) = rref.binding() {
             let id = rref.id();
+            let schema_kind = match rref {
+                ResourceRef::Managed(_) | ResourceRef::Deferred { .. } => Some(SchemaKind::Managed),
+                ResourceRef::DataSource(_) => Some(SchemaKind::DataSource),
+                ResourceRef::Virtual(_) => None,
+            };
             by_binding.insert(
                 b.to_string(),
-                (id.provider.clone(), id.resource_type.clone(), rref.kind()),
+                (id.provider.clone(), id.resource_type.clone(), schema_kind),
             );
         }
     }
 
     for wb in &parsed.wait_bindings {
-        let Some((provider, resource_type, kind)) = by_binding.get(wb.target.as_str()) else {
+        let Some((provider, resource_type, schema_kind)) = by_binding.get(wb.target.as_str())
+        else {
             out.push(WaitDiagnostic {
                 message: format!(
                     "wait `{}`: target binding `{}` is not a known resource",
@@ -75,12 +82,10 @@ pub fn validate_wait_bindings<E>(
         };
         // Virtual resources have no schema — skip the attr check (the
         // target was still "found", matching pre-typestate behaviour).
-        let schema_kind = match kind {
-            ResourceKind::Managed => SchemaKind::Managed,
-            ResourceKind::DataSource => SchemaKind::DataSource,
-            ResourceKind::Virtual => continue,
+        let Some(schema_kind) = schema_kind else {
+            continue;
         };
-        let Some(schema) = schemas.get(provider, resource_type, schema_kind) else {
+        let Some(schema) = schemas.get(provider, resource_type, *schema_kind) else {
             // No schema for this resource type — skip the attr check.
             // The user already gets a separate "unknown resource type"
             // diagnostic from the upstream identifier-scope pass.
