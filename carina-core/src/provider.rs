@@ -12,7 +12,7 @@ use std::pin::Pin;
 use crate::resource::{
     ConcreteValue, DataSource, Directives, ManagedResource, ResourceId, State, Value,
 };
-use crate::schema::SchemaRegistry;
+use crate::schema::{SchemaRegistry, TypeIdentity};
 
 /// Contextual metadata attached to every [`ProviderError`] variant.
 ///
@@ -820,7 +820,11 @@ pub trait ProviderFactory: Send + Sync {
     /// Validate a value against a provider-defined custom type.
     /// Returns `Ok(())` if the value is valid or the type is unknown to this provider.
     /// Returns `Err(message)` if the value is invalid for the given type.
-    fn validate_custom_type(&self, _type_name: &str, _value: &str) -> Result<(), String> {
+    ///
+    /// `identity` is the structured [`TypeIdentity`] of the type, so a
+    /// provider resolves the exact provider-scoped type instead of
+    /// splitting a flat name string.
+    fn validate_custom_type(&self, _identity: &TypeIdentity, _value: &str) -> Result<(), String> {
         Ok(())
     }
 
@@ -930,8 +934,8 @@ pub fn collect_schemas(factories: &[Box<dyn ProviderFactory>]) -> SchemaRegistry
 /// for populating `ProviderContext.validators`.
 pub fn collect_custom_type_validators(
     registry: &SchemaRegistry,
-) -> HashMap<String, crate::parser::ValidatorFn> {
-    let mut validators: HashMap<String, crate::parser::ValidatorFn> = HashMap::new();
+) -> HashMap<TypeIdentity, crate::parser::ValidatorFn> {
+    let mut validators: HashMap<TypeIdentity, crate::parser::ValidatorFn> = HashMap::new();
 
     for (_provider, _resource_type, _kind, schema) in registry.iter() {
         for attr_schema in schema.attributes.values() {
@@ -942,11 +946,12 @@ pub fn collect_custom_type_validators(
     validators
 }
 
-/// Collect custom type names from a registry without allocating validators.
+/// Collect custom type identities from a registry without allocating
+/// validators.
 ///
-/// Cheaper than `collect_custom_type_validators` when only the type names
-/// are needed (e.g., for LSP completions).
-pub fn collect_custom_type_names(registry: &SchemaRegistry) -> Vec<String> {
+/// Cheaper than `collect_custom_type_validators` when only the
+/// identities are needed (e.g., for LSP completions).
+pub fn collect_custom_type_names(registry: &SchemaRegistry) -> Vec<TypeIdentity> {
     let mut names = std::collections::HashSet::new();
 
     for (_provider, _resource_type, _kind, schema) in registry.iter() {
@@ -961,18 +966,17 @@ pub fn collect_custom_type_names(registry: &SchemaRegistry) -> Vec<String> {
 /// Recursively extract Custom type validators from an AttributeType.
 fn collect_validators_from_type(
     attr_type: &crate::schema::AttributeType,
-    validators: &mut HashMap<String, crate::parser::ValidatorFn>,
+    validators: &mut HashMap<TypeIdentity, crate::parser::ValidatorFn>,
 ) {
     use crate::schema::AttributeType;
 
     match attr_type {
         AttributeType::Custom {
-            semantic_name: Some(name),
+            identity: Some(id),
             validate,
             ..
         } => {
-            let snake_name = crate::parser::pascal_to_snake(name);
-            validators.entry(snake_name).or_insert_with(|| {
+            validators.entry(id.clone()).or_insert_with(|| {
                 let validate_fn = validate.clone();
                 Box::new(move |s: &str| {
                     validate_fn(&crate::resource::Value::Concrete(
@@ -982,10 +986,7 @@ fn collect_validators_from_type(
                 })
             });
         }
-        AttributeType::Custom {
-            semantic_name: None,
-            ..
-        } => {}
+        AttributeType::Custom { identity: None, .. } => {}
         AttributeType::List { inner, .. } => {
             collect_validators_from_type(inner, validators);
         }
@@ -1007,24 +1008,21 @@ fn collect_validators_from_type(
     }
 }
 
-/// Recursively collect Custom type names from an AttributeType (names only, no closures).
+/// Recursively collect Custom type identities from an AttributeType
+/// (identities only, no closures).
 fn collect_type_names_from_type(
     attr_type: &crate::schema::AttributeType,
-    names: &mut std::collections::HashSet<String>,
+    names: &mut std::collections::HashSet<TypeIdentity>,
 ) {
     use crate::schema::AttributeType;
 
     match attr_type {
         AttributeType::Custom {
-            semantic_name: Some(name),
-            ..
+            identity: Some(id), ..
         } => {
-            names.insert(crate::parser::pascal_to_snake(name));
+            names.insert(id.clone());
         }
-        AttributeType::Custom {
-            semantic_name: None,
-            ..
-        } => {}
+        AttributeType::Custom { identity: None, .. } => {}
         AttributeType::List { inner, .. } => {
             collect_type_names_from_type(inner, names);
         }

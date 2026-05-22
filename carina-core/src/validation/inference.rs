@@ -574,10 +574,13 @@ fn descend_struct_field<'a>(
 /// recursive descent into `List`/`Map`/`Struct` schema receivers.
 ///
 /// Notable mappings:
-/// - `Custom { semantic_name: Some(name), .. }` → `TypeExpr::Simple(snake)`
-///   so the predicate's existing `Simple(name)` arm matches by
+/// - `Custom { identity: Some(id), .. }` with a provider axis →
+///   `TypeExpr::SchemaType` (the same structured form the parser
+///   produces for a dotted `awscc.ec2.VpcId` annotation). A bare,
+///   provider-agnostic identity → `TypeExpr::Simple(snake)` so the
+///   predicate's existing `Simple(name)` arm matches by
 ///   pascal_to_snake equality.
-/// - `Custom { semantic_name: None, .. }` → falls through to the base
+/// - `Custom { identity: None, .. }` → falls through to the base
 ///   type; an anonymous Custom is structurally a wrapper and carries
 ///   no identity to project.
 /// - `StringEnum` → `TypeExpr::String` (an enum value is still a
@@ -591,9 +594,15 @@ fn attribute_type_to_type_expr(attr_type: &AttributeType) -> TypeExpr {
         AttributeType::Bool => TypeExpr::Bool,
         AttributeType::Duration => TypeExpr::Duration,
         AttributeType::Custom {
-            semantic_name: Some(name),
-            ..
-        } => TypeExpr::Simple(crate::parser::pascal_to_snake(name)),
+            identity: Some(id), ..
+        } => match &id.provider {
+            Some(provider) => TypeExpr::SchemaType {
+                provider: provider.clone(),
+                path: id.segments.join("."),
+                type_name: id.kind.clone(),
+            },
+            None => TypeExpr::Simple(crate::parser::pascal_to_snake(&id.kind)),
+        },
         AttributeType::Custom { base, .. } => attribute_type_to_type_expr(base),
         AttributeType::StringEnum { .. } => TypeExpr::String,
         AttributeType::List { inner, .. } => {
@@ -723,7 +732,8 @@ mod tests {
     use super::*;
     use crate::resource::AccessPath;
     use crate::schema::{
-        AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, legacy_validator,
+        AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, TypeIdentity,
+        legacy_validator,
     };
 
     fn noop(_v: &Value) -> Result<(), String> {
@@ -732,7 +742,7 @@ mod tests {
 
     fn vpc_id_custom() -> AttributeType {
         AttributeType::Custom {
-            semantic_name: Some("VpcId".to_string()),
+            identity: Some(TypeIdentity::bare("VpcId")),
             pattern: None,
             length: None,
             base: Box::new(AttributeType::String),

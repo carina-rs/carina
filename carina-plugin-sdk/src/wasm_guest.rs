@@ -115,6 +115,16 @@ macro_rules! export_provider {
                 }
             }
 
+            fn wit_to_proto_type_identity(
+                ty: &wit_types::TypeIdentity,
+            ) -> proto::TypeIdentity {
+                proto::TypeIdentity {
+                    provider: ty.provider.clone(),
+                    segments: ty.segments.clone(),
+                    kind: ty.kind.clone(),
+                }
+            }
+
             fn proto_to_wit_resource_id(id: &proto::ResourceId) -> wit_types::ResourceId {
                 wit_types::ResourceId {
                     provider: id.provider.clone(),
@@ -453,13 +463,13 @@ macro_rules! export_provider {
                 }
 
                 fn validate_custom_type(
-                    type_name: String,
+                    ty: wit_types::TypeIdentity,
                     value: String,
                 ) -> Result<(), wit_types::ProviderError> {
                     let provider = get_provider().lock().unwrap();
                     $crate::CarinaProvider::validate_custom_type(
                         &*provider,
-                        &type_name,
+                        &wit_to_proto_type_identity(&ty),
                         &value,
                     )
                     .map_err(validate_string_to_provider_error)
@@ -583,6 +593,16 @@ macro_rules! export_provider {
                     provider: id.provider.clone(),
                     resource_type: id.resource_type.clone(),
                     name: id.name.clone(),
+                }
+            }
+
+            fn wit_to_proto_type_identity(
+                ty: &wit_types::TypeIdentity,
+            ) -> proto::TypeIdentity {
+                proto::TypeIdentity {
+                    provider: ty.provider.clone(),
+                    segments: ty.segments.clone(),
+                    kind: ty.kind.clone(),
                 }
             }
 
@@ -926,13 +946,13 @@ macro_rules! export_provider {
                 }
 
                 fn validate_custom_type(
-                    type_name: String,
+                    ty: wit_types::TypeIdentity,
                     value: String,
                 ) -> Result<(), wit_types::ProviderError> {
                     let provider = get_provider().lock().unwrap();
                     $crate::CarinaProvider::validate_custom_type(
                         &*provider,
-                        &type_name,
+                        &wit_to_proto_type_identity(&ty),
                         &value,
                     )
                     .map_err(validate_string_to_provider_error)

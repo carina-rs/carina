@@ -592,7 +592,7 @@ fn schema_validate_with_origins_reshapes_custom_namespaced_type() {
         AttributeSchema::new(
             "mode",
             AttributeType::Custom {
-                semantic_name: Some("Mode".to_string()),
+                identity: Some(TypeIdentity::bare("Mode")),
                 base: Box::new(AttributeType::String),
                 pattern: None,
                 length: None,
@@ -1765,7 +1765,7 @@ fn exclusive_required_multiple_groups() {
 fn validate_union_type() {
     // Create two Custom types that validate different prefixes
     let type_a = AttributeType::Custom {
-        semantic_name: Some("TypeA".to_string()),
+        identity: Some(TypeIdentity::bare("TypeA")),
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
@@ -1784,7 +1784,7 @@ fn validate_union_type() {
         to_dsl: None,
     };
     let type_b = AttributeType::Custom {
-        semantic_name: Some("TypeB".to_string()),
+        identity: Some(TypeIdentity::bare("TypeB")),
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
@@ -1881,7 +1881,7 @@ fn union_struct_unknown_field_shows_specific_error() {
 #[test]
 fn union_type_name() {
     let type_a = AttributeType::Custom {
-        semantic_name: Some("TypeA".to_string()),
+        identity: Some(TypeIdentity::bare("TypeA")),
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
@@ -1890,7 +1890,7 @@ fn union_type_name() {
         to_dsl: None,
     };
     let type_b = AttributeType::Custom {
-        semantic_name: Some("TypeB".to_string()),
+        identity: Some(TypeIdentity::bare("TypeB")),
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
@@ -1906,7 +1906,7 @@ fn union_type_name() {
 #[test]
 fn union_accepts_type_name() {
     let type_a = AttributeType::Custom {
-        semantic_name: Some("TypeA".to_string()),
+        identity: Some(TypeIdentity::bare("TypeA")),
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
@@ -1915,7 +1915,7 @@ fn union_accepts_type_name() {
         to_dsl: None,
     };
     let type_b = AttributeType::Custom {
-        semantic_name: Some("TypeB".to_string()),
+        identity: Some(TypeIdentity::bare("TypeB")),
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
@@ -2652,7 +2652,7 @@ fn validate_skips_internal_attributes() {
 
 fn make_custom(name: &str, base: AttributeType) -> AttributeType {
     AttributeType::Custom {
-        semantic_name: Some(name.to_string()),
+        identity: Some(TypeIdentity::bare(name)),
         base: Box::new(base),
         pattern: None,
         length: None,
@@ -2664,7 +2664,7 @@ fn make_custom(name: &str, base: AttributeType) -> AttributeType {
 
 fn make_custom_anon_pattern(pattern: &str) -> AttributeType {
     AttributeType::Custom {
-        semantic_name: None,
+        identity: None,
         base: Box::new(AttributeType::String),
         pattern: Some(pattern.to_string()),
         length: None,
@@ -2676,7 +2676,7 @@ fn make_custom_anon_pattern(pattern: &str) -> AttributeType {
 
 fn make_custom_anon_len(min: u64, max: u64) -> AttributeType {
     AttributeType::Custom {
-        semantic_name: None,
+        identity: None,
         base: Box::new(AttributeType::String),
         pattern: None,
         length: Some((Some(min), Some(max))),
@@ -2709,12 +2709,62 @@ fn assignable_allows_same_semantic_name() {
     assert!(a.is_assignable_to(&b));
 }
 
+/// carina#2807: two providers exposing a same-named custom type
+/// (`aws.Region` vs `gcp.Region`, different formats) must be distinct
+/// types. Before the structured `TypeIdentity`, a flat `semantic_name`
+/// string made them collide — `is_assignable_to` would treat them as
+/// the same type because the strings were equal.
+#[test]
+fn assignable_rejects_same_kind_across_providers() {
+    let provider_custom = |provider: &str| AttributeType::Custom {
+        identity: Some(TypeIdentity::new(
+            Some(provider),
+            Vec::<String>::new(),
+            "Region",
+        )),
+        base: Box::new(AttributeType::String),
+        pattern: None,
+        length: None,
+        validate: noop_validator(),
+        namespace: None,
+        to_dsl: None,
+    };
+    let aws_region = provider_custom("aws");
+    let gcp_region = provider_custom("gcp");
+    assert!(!aws_region.is_assignable_to(&gcp_region));
+    assert!(!gcp_region.is_assignable_to(&aws_region));
+}
+
+/// The generic provider-scoped `aws.Arn` (no service/resource segments)
+/// stays assignable against a more specific `aws.iam.Role.Arn`: an
+/// empty `segments` axis is the wider type, not a wildcard mismatch.
+#[test]
+fn assignable_allows_generic_arn_against_specific_arn() {
+    let mk = |segments: &[&str]| AttributeType::Custom {
+        identity: Some(TypeIdentity::new(Some("aws"), segments.to_vec(), "Arn")),
+        base: Box::new(AttributeType::String),
+        pattern: None,
+        length: None,
+        validate: noop_validator(),
+        namespace: None,
+        to_dsl: None,
+    };
+    let generic = mk(&[]);
+    let role_arn = mk(&["iam", "Role"]);
+    assert!(generic.is_assignable_to(&role_arn));
+    assert!(role_arn.is_assignable_to(&generic));
+
+    // …but two specific ARNs with different service/resource differ.
+    let cert_arn = mk(&["acm", "Certificate"]);
+    assert!(!role_arn.is_assignable_to(&cert_arn));
+}
+
 #[test]
 fn assignable_narrow_to_anonymous_unconstrained_sink() {
     // Semantic source with no pattern assigns to fully-anonymous unconstrained sink.
     let account = make_custom("AwsAccountId", AttributeType::String);
     let anon = AttributeType::Custom {
-        semantic_name: None,
+        identity: None,
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
@@ -2767,7 +2817,7 @@ fn assignable_union_source_requires_all_members_assignable() {
     // All members of source must be assignable to sink.
     let vpc = make_custom("VpcId", AttributeType::String);
     let anon_any = AttributeType::Custom {
-        semantic_name: None,
+        identity: None,
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
@@ -2793,7 +2843,7 @@ fn semantic_custom_assigns_to_anonymous_unconstrained_sink() {
     // which asserted VpcId <-> SubnetId were symmetric-compatible.
     let vpc = make_custom("VpcId", AttributeType::String);
     let anon = AttributeType::Custom {
-        semantic_name: None,
+        identity: None,
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
@@ -2833,7 +2883,7 @@ fn make_custom_anon_pattern_and_len(
     length: Option<(Option<u64>, Option<u64>)>,
 ) -> AttributeType {
     AttributeType::Custom {
-        semantic_name: None,
+        identity: None,
         base: Box::new(AttributeType::String),
         pattern: pattern.map(str::to_string),
         length,
@@ -2944,7 +2994,7 @@ fn assignable_anon_length_both_none_compatible() {
 #[test]
 fn custom_carries_semantic_name_pattern_length() {
     let t = AttributeType::Custom {
-        semantic_name: Some("VpcId".to_string()),
+        identity: Some(TypeIdentity::bare("VpcId")),
         base: Box::new(AttributeType::String),
         pattern: Some("^vpc-[a-f0-9]+$".to_string()),
         length: Some((Some(8), Some(21))),
@@ -2954,12 +3004,12 @@ fn custom_carries_semantic_name_pattern_length() {
     };
     match t {
         AttributeType::Custom {
-            semantic_name,
+            identity,
             pattern,
             length,
             ..
         } => {
-            assert_eq!(semantic_name.as_deref(), Some("VpcId"));
+            assert_eq!(identity.as_ref().map(|id| id.kind.as_str()), Some("VpcId"));
             assert_eq!(pattern.as_deref(), Some("^vpc-[a-f0-9]+$"));
             assert_eq!(length, Some((Some(8), Some(21))));
         }
@@ -2970,7 +3020,7 @@ fn custom_carries_semantic_name_pattern_length() {
 #[test]
 fn custom_type_name_anonymous_pattern_only() {
     let t = AttributeType::Custom {
-        semantic_name: None,
+        identity: None,
         base: Box::new(AttributeType::String),
         pattern: Some("^foo$".to_string()),
         length: None,
@@ -2984,7 +3034,7 @@ fn custom_type_name_anonymous_pattern_only() {
 #[test]
 fn custom_type_name_anonymous_length_only() {
     let t = AttributeType::Custom {
-        semantic_name: None,
+        identity: None,
         base: Box::new(AttributeType::String),
         pattern: None,
         length: Some((Some(1), Some(64))),
@@ -2998,7 +3048,7 @@ fn custom_type_name_anonymous_length_only() {
 #[test]
 fn custom_type_name_anonymous_pattern_and_length() {
     let t = AttributeType::Custom {
-        semantic_name: None,
+        identity: None,
         base: Box::new(AttributeType::String),
         pattern: Some("^.*$".to_string()),
         length: Some((Some(1), Some(64))),
@@ -3041,14 +3091,10 @@ fn validate_email_function_directly() {
 fn validate_email_type() {
     let t = types::email();
 
-    // Type identity: Custom with semantic_name "Email" and String base
+    // Type identity: Custom with kind "Email" and String base
     match &t {
-        AttributeType::Custom {
-            semantic_name,
-            base,
-            ..
-        } => {
-            assert_eq!(semantic_name.as_deref(), Some("Email"));
+        AttributeType::Custom { identity, base, .. } => {
+            assert_eq!(identity.as_ref().map(|id| id.kind.as_str()), Some("Email"));
             assert!(matches!(**base, AttributeType::String));
         }
         other => panic!("Expected AttributeType::Custom, got: {:?}", other),
@@ -3418,7 +3464,7 @@ fn custom_namespaced_string_literal_routes_validator_text_to_extra_message() {
         AttributeSchema::new(
             "mode",
             AttributeType::Custom {
-                semantic_name: Some("Mode".to_string()),
+                identity: Some(TypeIdentity::bare("Mode")),
                 base: Box::new(AttributeType::String),
                 pattern: None,
                 length: None,
@@ -3597,7 +3643,7 @@ fn union_string_vs_custom_picks_custom_error_for_string_input() {
     let union_type = AttributeType::Union(vec![
         AttributeType::Int,
         AttributeType::Custom {
-            semantic_name: Some("Arn".to_string()),
+            identity: Some(TypeIdentity::bare("Arn")),
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,
@@ -3665,7 +3711,7 @@ fn union_custom_with_int_base_picks_custom_error_for_int_input() {
     // is the `Custom` one.
     let union_type = AttributeType::Union(vec![
         AttributeType::Custom {
-            semantic_name: Some("PositiveInt".to_string()),
+            identity: Some(TypeIdentity::bare("PositiveInt")),
             base: Box::new(AttributeType::Int),
             pattern: None,
             length: None,
@@ -3732,7 +3778,7 @@ fn custom_validator_can_capture_external_state() {
     // #2217 (closure-capable Custom validator).
     let allowed_region = "ap-northeast-1".to_string();
     let attr = AttributeType::Custom {
-        semantic_name: Some("Region".to_string()),
+        identity: Some(TypeIdentity::bare("Region")),
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
@@ -3775,7 +3821,7 @@ fn custom_validator_returns_structured_type_error_directly() {
     // This is what unlocks LSP code-action quick-fixes for Custom-typed
     // attributes (see #2220 / #2309 for the structured-error path).
     let attr = AttributeType::Custom {
-        semantic_name: Some("Mode".to_string()),
+        identity: Some(TypeIdentity::bare("Mode")),
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
@@ -3925,7 +3971,7 @@ fn walk_custom_lookup_skips_value_unknown() {
     let custom_type = AttributeType::Custom {
         base: Box::new(AttributeType::String),
         validate: always_fail,
-        semantic_name: Some("vpc_id".to_string()),
+        identity: Some(TypeIdentity::bare("vpc_id")),
         namespace: None,
         pattern: None,
         length: None,
@@ -3969,7 +4015,7 @@ fn union_walk_custom_lookup_succeeds_when_any_member_accepts() {
     let custom = |name: &str| AttributeType::Custom {
         base: Box::new(AttributeType::String),
         validate: validator(|_v: &Value| Ok(())),
-        semantic_name: Some(name.to_string()),
+        identity: Some(TypeIdentity::bare(name)),
         namespace: None,
         pattern: None,
         length: None,
@@ -3977,12 +4023,12 @@ fn union_walk_custom_lookup_succeeds_when_any_member_accepts() {
     };
     let union = AttributeType::Union(vec![custom("ok_arm"), custom("fail_arm")]);
 
-    let lookup = |name: &str, _v: &Value| -> Result<(), TypeError> {
-        if name == "ok_arm" {
+    let lookup = |id: &TypeIdentity, _v: &Value| -> Result<(), TypeError> {
+        if id.kind == "ok_arm" {
             Ok(())
         } else {
             Err(TypeError::ValidationFailed {
-                message: format!("{name} rejects"),
+                message: format!("{} rejects", id.kind),
             })
         }
     };
@@ -4010,7 +4056,7 @@ fn union_walk_custom_lookup_emits_smallest_error_set_when_all_fail() {
     let custom = |name: &str| AttributeType::Custom {
         base: Box::new(AttributeType::String),
         validate: validator(|_v: &Value| Ok(())),
-        semantic_name: Some(name.to_string()),
+        identity: Some(TypeIdentity::bare(name)),
         namespace: None,
         pattern: None,
         length: None,
@@ -4018,9 +4064,9 @@ fn union_walk_custom_lookup_emits_smallest_error_set_when_all_fail() {
     };
     let union = AttributeType::Union(vec![custom("a"), custom("b")]);
 
-    let lookup = |name: &str, _v: &Value| -> Result<(), TypeError> {
+    let lookup = |id: &TypeIdentity, _v: &Value| -> Result<(), TypeError> {
         Err(TypeError::ValidationFailed {
-            message: format!("{name} rejects"),
+            message: format!("{} rejects", id.kind),
         })
     };
 
@@ -4050,11 +4096,11 @@ fn union_walk_custom_lookup_cidr_accepts_ipv4_when_lookup_routes_correctly() {
     // rejection through anyway. This is the awscc#217 reproduction.
     let cidr = AttributeType::Union(vec![types::ipv4_cidr(), types::ipv6_cidr()]);
 
-    let lookup = |name: &str, value: &Value| -> Result<(), TypeError> {
+    let lookup = |id: &TypeIdentity, value: &Value| -> Result<(), TypeError> {
         let Value::Concrete(ConcreteValue::String(s)) = value else {
             return Ok(());
         };
-        match name {
+        match id.kind.as_str() {
             "Ipv4Cidr" => {
                 validate_ipv4_cidr(s).map_err(|message| TypeError::ValidationFailed { message })
             }

@@ -16,6 +16,7 @@ use crate::parser::{ArgumentParameter, ModuleCall, ParsedFile, ProviderContext, 
 use crate::resource::{
     ConcreteValue, DeferredValue, Directives, ManagedResource, ResourceId, Value,
 };
+use crate::schema::TypeIdentity;
 
 fn create_test_module() -> ParsedFile {
     ParsedFile {
@@ -2662,9 +2663,9 @@ fn test_argument_type_custom_validator() {
     use crate::parser::ValidatorFn;
 
     // Create a ProviderContext with a custom "arn" validator
-    let mut validators: HashMap<String, ValidatorFn> = HashMap::new();
+    let mut validators: HashMap<TypeIdentity, ValidatorFn> = HashMap::new();
     validators.insert(
-        "arn".to_string(),
+        TypeIdentity::bare("Arn"),
         Box::new(|s: &str| {
             if s.starts_with("arn:") {
                 Ok(())
@@ -2737,9 +2738,9 @@ fn test_argument_type_custom_validator() {
 fn test_argument_type_list_of_custom_type() {
     use crate::parser::ValidatorFn;
 
-    let mut validators: HashMap<String, ValidatorFn> = HashMap::new();
+    let mut validators: HashMap<TypeIdentity, ValidatorFn> = HashMap::new();
     validators.insert(
-        "arn".to_string(),
+        TypeIdentity::bare("Arn"),
         Box::new(|s: &str| {
             if s.starts_with("arn:") {
                 Ok(())

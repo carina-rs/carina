@@ -1,6 +1,7 @@
 use super::*;
 use crate::binding_index::IterableBindings;
 use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, ManagedResource, Value};
+use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
 use std::collections::HashMap;
 
@@ -6296,9 +6297,9 @@ fn parse_custom_validator_accepts_valid() {
     // Test validate_custom_type directly with a type name that has no built-in
     // handler. Built-in types (cidr, ipv4_address, etc.) are matched first in
     // validate_custom_type, so custom validators only apply to other type names.
-    let mut validators: HashMap<String, ValidatorFn> = HashMap::new();
+    let mut validators: HashMap<TypeIdentity, ValidatorFn> = HashMap::new();
     validators.insert(
-        "custom_type".to_string(),
+        TypeIdentity::bare("CustomType"),
         Box::new(|s: &str| {
             if s.starts_with("valid-") {
                 Ok(())
@@ -6315,7 +6316,7 @@ fn parse_custom_validator_accepts_valid() {
     };
 
     let result = validate_custom_type(
-        "custom_type",
+        &TypeIdentity::bare("CustomType"),
         &Value::Concrete(ConcreteValue::String("valid-data".to_string())),
         &config,
     );
@@ -6323,7 +6324,7 @@ fn parse_custom_validator_accepts_valid() {
 
     // Unknown type with no custom validator should also pass (permissive)
     let result = validate_custom_type(
-        "unknown_type",
+        &TypeIdentity::bare("UnknownType"),
         &Value::Concrete(ConcreteValue::String("anything".to_string())),
         &config,
     );
@@ -6337,9 +6338,9 @@ fn parse_custom_validator_rejects_invalid() {
     // The "arn" type is accepted by the grammar as identifier. But it fails to parse.
     // Use "cidr" which is known to work in grammar. Register a custom stricter validator.
     // Actually, let's test validate_custom_type directly to avoid grammar issues.
-    let mut validators: HashMap<String, ValidatorFn> = HashMap::new();
+    let mut validators: HashMap<TypeIdentity, ValidatorFn> = HashMap::new();
     validators.insert(
-        "custom_type".to_string(),
+        TypeIdentity::bare("CustomType"),
         Box::new(|s: &str| {
             if s.starts_with("valid-") {
                 Ok(())
@@ -6358,14 +6359,14 @@ fn parse_custom_validator_rejects_invalid() {
     // Test validate_custom_type directly since the grammar may not accept
     // arbitrary type names. This verifies the custom validator is called.
     let valid_result = validate_custom_type(
-        "custom_type",
+        &TypeIdentity::bare("CustomType"),
         &Value::Concrete(ConcreteValue::String("valid-data".to_string())),
         &config,
     );
     assert!(valid_result.is_ok());
 
     let invalid_result = validate_custom_type(
-        "custom_type",
+        &TypeIdentity::bare("CustomType"),
         &Value::Concrete(ConcreteValue::String("invalid".to_string())),
         &config,
     );

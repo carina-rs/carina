@@ -621,14 +621,14 @@ fn is_plain_string_or_string_union(attr_type: &AttributeType) -> bool {
 
 /// Recursive check used by the `TypeExpr::String` arm of
 /// `is_type_expr_compatible_with_schema`: returns `true` when
-/// `attr_type` carries a `Custom { semantic_name: Some(_) }` either at
+/// `attr_type` carries a `Custom { identity: Some(_) }` either at
 /// the top level or anywhere inside a `Union`. A schema attribute that
 /// names a specific identity (`VpcId`, `Arn`, …) cannot accept a value
 /// known only as `String`. Issue #2358.
 ///
 /// Scope:
-/// - Looks at the outer `semantic_name` only — does **not** walk
-///   `Custom.base` chains. Real provider schemas keep `semantic_name`
+/// - Looks at the outer `identity` only — does **not** walk
+///   `Custom.base` chains. Real provider schemas keep `identity`
 ///   on the outer wrapper, so an anonymous `Custom` wrapping a
 ///   specific `Custom` does not occur in practice. If a future schema
 ///   introduces that shape, this helper would need to walk the base
@@ -637,13 +637,12 @@ fn is_plain_string_or_string_union(attr_type: &AttributeType) -> bool {
 ///   schemas currently express every named-identity Custom as a
 ///   `String`-base wrapper, so `TypeExpr::Int/Bool/Float` arms have
 ///   no analogous strictness. If a future schema adds e.g. a
-///   `Custom { semantic_name: "Port", base: Int }`, those arms will
+///   `Custom { identity: "Port", base: Int }`, those arms will
 ///   also need to consult this helper (or a sibling).
 fn attr_type_demands_specific_custom(attr_type: &AttributeType) -> bool {
     match attr_type {
         AttributeType::Custom {
-            semantic_name: Some(_),
-            ..
+            identity: Some(_), ..
         } => true,
         AttributeType::Union(types) => types.iter().any(attr_type_demands_specific_custom),
         _ => false,
@@ -958,7 +957,10 @@ pub fn validate_type_expr_value(
         return None;
     }
     match (type_expr, value) {
-        (TypeExpr::Simple(name), _) => validate_custom_type(name, value, config).err(),
+        (TypeExpr::Simple(name), _) => {
+            let identity = crate::schema::TypeIdentity::bare(crate::parser::snake_to_pascal(name));
+            validate_custom_type(&identity, value, config).err()
+        }
         (TypeExpr::List(inner), Value::Concrete(ConcreteValue::List(items))) => {
             for (i, item) in items.iter().enumerate() {
                 if let Some(e) = validate_type_expr_value(inner, item, config) {

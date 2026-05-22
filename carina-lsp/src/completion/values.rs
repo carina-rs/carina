@@ -519,13 +519,13 @@ impl CompletionProvider {
         }
     }
 
-    /// Extract the Custom type name from an AttributeType, if it is a Custom type.
+    /// Extract the Custom type's kind name from an AttributeType, if it
+    /// is a Custom type with a structured identity.
     fn extract_custom_type_name(attr_type: &AttributeType) -> Option<&str> {
         match attr_type {
             AttributeType::Custom {
-                semantic_name: Some(name),
-                ..
-            } => Some(name),
+                identity: Some(id), ..
+            } => Some(&id.kind),
             _ => None,
         }
     }
@@ -605,13 +605,11 @@ impl CompletionProvider {
                 },
             ],
             AttributeType::Custom {
-                semantic_name: Some(name),
-                ..
-            } if name == "Cidr" || name == "Ipv4Cidr" => self.cidr_completions(),
+                identity: Some(id), ..
+            } if id.kind == "Cidr" || id.kind == "Ipv4Cidr" => self.cidr_completions(),
             AttributeType::Custom {
-                semantic_name: Some(name),
-                ..
-            } if name == "Ipv6Cidr" => self.ipv6_cidr_completions(),
+                identity: Some(id), ..
+            } if id.kind == "Ipv6Cidr" => self.ipv6_cidr_completions(),
             // Generic ARN snippet only for the bare `Arn` type. Specific
             // ARN families (`IamRoleArn`, `IamPolicyArn`,
             // `IamOidcProviderArn`, `KmsKeyArn`, …) already have shape
@@ -622,15 +620,14 @@ impl CompletionProvider {
             // the per-type formats are useful enough to justify the
             // surface. See #2621.
             AttributeType::Custom {
-                semantic_name: Some(name),
-                ..
-            } if name == "Arn" => self.arn_completions(),
+                identity: Some(id), ..
+            } if id.kind == "Arn" => self.arn_completions(),
             AttributeType::Custom {
-                semantic_name: Some(name),
+                identity: Some(id),
                 namespace,
                 ..
-            } if name == "AvailabilityZone" => {
-                self.availability_zone_completions(namespace.as_deref().unwrap_or(""), name)
+            } if id.kind == "AvailabilityZone" => {
+                self.availability_zone_completions(namespace.as_deref().unwrap_or(""), &id.kind)
             }
             // List(non-Struct): delegate to inner type completions
             AttributeType::List { inner, .. } => self.completions_for_type(inner, resource_type),
@@ -1978,13 +1975,12 @@ fn parse_exports_type_text(text: &str) -> Option<AttributeType> {
         "Float" => Some(AttributeType::Float),
         "Bool" => Some(AttributeType::Bool),
         // Custom types also ship in PascalCase now (e.g. `AwsAccountId`,
-        // `Ipv4Cidr`). Carry the PascalCase form as `semantic_name` and
-        // canonicalise the internal key to snake_case.
+        // `Ipv4Cidr`). Carry the PascalCase form as a bare identity.
         name if name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
             && name.chars().all(|c| c.is_ascii_alphanumeric()) =>
         {
             Some(AttributeType::Custom {
-                semantic_name: Some(name.to_string()),
+                identity: Some(carina_core::schema::TypeIdentity::bare(name)),
                 base: Box::new(AttributeType::String),
                 pattern: None,
                 length: None,

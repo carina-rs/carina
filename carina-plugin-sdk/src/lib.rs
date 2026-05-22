@@ -155,7 +155,11 @@ pub trait CarinaProvider {
     /// Validate a value against a provider-defined custom type.
     /// Returns `Ok(())` if the value is valid or the type is unknown.
     /// Returns `Err(message)` if the value is invalid for the given type.
-    fn validate_custom_type(&self, _type_name: &str, _value: &str) -> Result<(), String> {
+    ///
+    /// `identity` is the structured [`TypeIdentity`] of the type, so a
+    /// provider matches on the discrete axes instead of splitting a
+    /// flat name string.
+    fn validate_custom_type(&self, _identity: &TypeIdentity, _value: &str) -> Result<(), String> {
         Ok(())
     }
 

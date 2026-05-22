@@ -17,6 +17,19 @@ pub struct ResourceId {
     pub name: String,
 }
 
+/// Structured identity of a provider-defined custom type.
+///
+/// Mirrors `carina_core::schema::TypeIdentity` and the WIT
+/// `type-identity` record. Keyed on discrete `provider + segments +
+/// kind` axes so two providers' same-named custom types stay distinct.
+/// An empty `provider` string denotes a provider-agnostic type.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TypeIdentity {
+    pub provider: String,
+    pub segments: Vec<String>,
+    pub kind: String,
+}
+
 /// Mirrors `carina_core::resource::Value`.
 ///
 /// Only includes variants that can cross the process boundary.

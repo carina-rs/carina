@@ -351,7 +351,7 @@ fn region_schemas() -> SchemaRegistry {
     }
 
     let region_custom = AttributeType::Custom {
-        semantic_name: Some("Region".to_string()),
+        identity: Some(carina_core::schema::TypeIdentity::bare("Region")),
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
@@ -807,10 +807,14 @@ impl ProviderFactory for WasmStyleProviderFactory {
     fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
         Ok(())
     }
-    fn validate_custom_type(&self, type_name: &str, value: &str) -> Result<(), String> {
-        // Mirror awscc's `prefixed` validator family: vpc_id must start
+    fn validate_custom_type(
+        &self,
+        identity: &carina_core::schema::TypeIdentity,
+        value: &str,
+    ) -> Result<(), String> {
+        // Mirror awscc's `prefixed` validator family: VpcId must start
         // with "vpc-".
-        if type_name == "vpc_id" && !value.starts_with("vpc-") {
+        if identity.kind == "VpcId" && !value.starts_with("vpc-") {
             return Err(format!(
                 "Invalid vpc_id '{}': must start with 'vpc-'",
                 value
@@ -842,7 +846,7 @@ impl ProviderFactory for WasmStyleProviderFactory {
 
 fn wasm_style_vpc_schema() -> ResourceSchema {
     let vpc_id_type = AttributeType::Custom {
-        semantic_name: Some("VpcId".to_string()),
+        identity: Some(carina_core::schema::TypeIdentity::bare("VpcId")),
         pattern: None,
         length: None,
         base: Box::new(AttributeType::String),
@@ -934,7 +938,7 @@ awsccmock.ec2.security_group {
 
 fn wasm_style_subnet_schema() -> ResourceSchema {
     let vpc_id_type = AttributeType::Custom {
-        semantic_name: Some("VpcId".to_string()),
+        identity: Some(carina_core::schema::TypeIdentity::bare("VpcId")),
         pattern: None,
         length: None,
         base: Box::new(AttributeType::String),
@@ -1022,12 +1026,12 @@ awsccmock.ec2.subnet {
 // Scenario: generic-String → specific Custom downcast (#2358)
 //
 // `vpc_id: String = main.vpc_id` declares a `String`-typed export of a
-// value whose actual type is `Custom { semantic_name: VpcId }`. The
+// value whose actual type is `Custom { identity: VpcId }`. The
 // declaration drops the specific identity, so any downstream consumer
 // receives `String` and can no longer be type-checked against a
 // `Custom { VpcId }` receiver. Validation, LSP diagnostics, and
 // completion must all reject the unsafe direction (`TypeExpr::String`
-// against a Custom-with-`semantic_name` receiver) while keeping the
+// against a Custom-with-`identity` receiver) while keeping the
 // safe direction (specific Custom export → same Custom receiver) and
 // literal-value assignment (`vpc_id = 'vpc-12345678'`) working.
 // ============================================================================
@@ -1049,7 +1053,7 @@ fn vpc_id_validate_2358(v: &Value) -> Result<(), String> {
 
 fn vpc_id_custom_type_2358() -> AttributeType {
     AttributeType::Custom {
-        semantic_name: Some("VpcId".to_string()),
+        identity: Some(carina_core::schema::TypeIdentity::bare("VpcId")),
         pattern: None,
         length: None,
         base: Box::new(AttributeType::String),

@@ -3237,9 +3237,10 @@ mod tests {
 
     #[test]
     fn canonicalize_through_custom_wrapper() {
+        use crate::schema::TypeIdentity;
         // Custom wrappers must be transparent for type matching.
         let t = AttributeType::Custom {
-            semantic_name: Some("PolicyConditionValue".to_string()),
+            identity: Some(TypeIdentity::bare("PolicyConditionValue")),
             base: Box::new(string_or_list_of_strings()),
             pattern: None,
             length: None,

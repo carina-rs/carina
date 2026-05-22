@@ -1304,7 +1304,7 @@ fn resource_ref_type_check_helper_regression() {
         .attribute(AttributeSchema::new(
             "my_id",
             AttributeType::Custom {
-                semantic_name: Some("MyId".to_string()),
+                identity: Some(carina_core::schema::TypeIdentity::bare("MyId")),
                 base: Box::new(AttributeType::String),
                 pattern: None,
                 length: None,
@@ -1332,7 +1332,7 @@ fn resource_ref_type_check_helper_regression() {
         .attribute(AttributeSchema::new(
             "custom_attr",
             AttributeType::Custom {
-                semantic_name: Some("MyId".to_string()),
+                identity: Some(carina_core::schema::TypeIdentity::bare("MyId")),
                 base: Box::new(AttributeType::String),
                 pattern: None,
                 length: None,
@@ -1773,7 +1773,7 @@ fn distinct_semantic_customs_are_rejected() {
         .attribute(AttributeSchema::new(
             "account_id",
             AttributeType::Custom {
-                semantic_name: Some("AwsAccountId".to_string()),
+                identity: Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
                 base: Box::new(AttributeType::String),
                 pattern: None,
                 length: None,
@@ -1787,7 +1787,7 @@ fn distinct_semantic_customs_are_rejected() {
     let target_schema = ResourceSchema::new("sso.Assignment").attribute(AttributeSchema::new(
         "target_id",
         AttributeType::Custom {
-            semantic_name: Some("TargetId".to_string()),
+            identity: Some(carina_core::schema::TypeIdentity::bare("TargetId")),
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,
@@ -1830,7 +1830,7 @@ fn exports_cross_file_ref_no_false_positive() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let aws_account_id_type = AttributeType::Custom {
-        semantic_name: Some("AwsAccountId".to_string()),
+        identity: Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,

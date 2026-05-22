@@ -25,7 +25,7 @@ use carina_core::provider::{
     ProviderNormalizer, ProviderResult, ReadRequest, SavedAttrs, UpdateRequest,
 };
 use carina_core::resource::{DataSource, ManagedResource, ResourceId, State, Value};
-use carina_core::schema::{CompletionValue, ResourceSchema};
+use carina_core::schema::{CompletionValue, ResourceSchema, TypeIdentity};
 use carina_core::value::SerializationError;
 
 use crate::wasm_bindings::CarinaProvider;
@@ -527,18 +527,18 @@ impl WasmBindings {
     async fn call_validate_custom_type(
         &self,
         store: &mut Store<HostState>,
-        type_name: &str,
+        identity: &wit_types::TypeIdentity,
         value: &str,
     ) -> wasmtime::Result<Result<(), wit_types::ProviderError>> {
         match self {
             WasmBindings::Basic(b) => {
                 b.carina_provider_provider()
-                    .call_validate_custom_type(store, type_name, value)
+                    .call_validate_custom_type(store, identity, value)
                     .await
             }
             WasmBindings::Http(b) => {
                 b.carina_provider_provider()
-                    .call_validate_custom_type(store, type_name, value)
+                    .call_validate_custom_type(store, identity, value)
                     .await
             }
         }
@@ -1422,14 +1422,15 @@ impl ProviderFactory for WasmProviderFactory {
         })
     }
 
-    fn validate_custom_type(&self, type_name: &str, value: &str) -> Result<(), String> {
+    fn validate_custom_type(&self, identity: &TypeIdentity, value: &str) -> Result<(), String> {
+        let wit_identity = wasm_convert::core_type_identity_to_wit(identity);
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let mut guard = self.init_instance.lock().await;
                 let (ref mut store, ref bindings) = *guard;
                 store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
                 bindings
-                    .call_validate_custom_type(store, type_name, value)
+                    .call_validate_custom_type(store, &wit_identity, value)
                     .await
                     .map_err(|e| format!("Failed to call validate_custom_type(): {e}"))?
                     .map_err(|e| {

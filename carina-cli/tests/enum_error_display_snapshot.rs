@@ -143,7 +143,7 @@ fn string_literal_expected_enum_custom_namespaced_display() {
         AttributeSchema::new(
             "mode",
             AttributeType::Custom {
-                semantic_name: Some("Mode".to_string()),
+                identity: Some(carina_core::schema::TypeIdentity::bare("Mode")),
                 base: Box::new(AttributeType::String),
                 pattern: None,
                 length: None,
