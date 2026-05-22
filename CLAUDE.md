@@ -242,6 +242,67 @@ machine-specific paths. Each new worktree needs the file copied or
 recreated. The `target/` directory inside the worktree should also be
 gitignored (it already is at the workspace level).
 
+#### Cross-Worktree Caching with sccache-wrapper (recommended)
+
+Plain sccache mixes the absolute source path into its cache key, so a
+second worktree at the *same commit* still misses many entries — even
+though the source is byte-identical. On a `carina-core` cold→warm
+benchmark (build in worktree A, then the same commit in worktree B) the
+second worktree took 7.6s with plain sccache because rustc still
+recompiled most crates (`user` time stayed at ~10s).
+
+[`sccache-wrapper`](https://github.com/moriyoshi/winterbaume/tree/main/tools/sccache-wrapper)
+is a `RUSTC_WRAPPER` that normalizes the workspace root to a
+`@@WORKSPACE@@` placeholder *before* computing the cache key, then
+delegates to sccache. With it, worktree B of the same benchmark hit the
+cache for all 52 crates and finished in 1.6s (`user` time ~1.3s) — a
+~4.8x wall-clock win on the second-and-later worktree.
+
+Setup:
+
+```bash
+# Build the wrapper from the winterbaume repo. Unset RUSTC_WRAPPER first
+# to avoid the wrapper recursively invoking itself during its own build.
+git clone --depth 1 https://github.com/moriyoshi/winterbaume.git /tmp/winterbaume
+( cd /tmp/winterbaume && RUSTC_WRAPPER= cargo build -p sccache-wrapper --release )
+
+# Install the binary somewhere on PATH (or note its absolute path).
+mkdir -p ~/.local/bin
+cp /tmp/winterbaume/target/release/sccache-wrapper ~/.local/bin/
+
+# Point .cargo/config.toml at the wrapper instead of sccache directly.
+cat > .cargo/config.toml << 'EOF'
+[build]
+rustc-wrapper = "/Users/<you>/.local/bin/sccache-wrapper"
+
+[env]
+# Shared rustc cache — keep it OUTSIDE any worktree so every worktree
+# reads and writes the same cache.
+WB_RUSTC_CACHE_DIR = "/Users/<you>/.cache/winterbaume-rustc-cache"
+EOF
+```
+
+Notes and trade-offs:
+
+- The wrapper *replaces* `rustc-wrapper = "sccache"` — it calls sccache
+  internally, so do not chain both.
+- Leave `WB_WORKSPACE_ROOT` unset. The wrapper then derives it per
+  invocation via `git rev-parse --show-toplevel`, so the same
+  `.cargo/config.toml` works in every worktree without per-worktree
+  edits. Set it explicitly only to skip that subprocess overhead.
+- The wrapper strips `-C incremental=…` (incremental compilation
+  conflicts with deterministic output). For a tight edit-rebuild loop
+  inside a *single* worktree, plain incremental builds can be faster;
+  the wrapper's win is concentrated on the second-and-later worktree.
+- A cold worktree sees little benefit (~8.4s vs ~9.6s in the
+  benchmark). The payoff is cross-worktree reuse.
+- `WB_RUSTC_CACHE_DEBUG=1` logs per-crate HIT/MISS to stderr;
+  `sccache-wrapper --dump-cache` lists all cache entries.
+
+Like the per-worktree `target/` change above, this is a pilot —
+collect real wall-clock numbers over the next few PR cycles before
+treating it as the established default (#2290).
+
 ### Multi-Worktree Parallel Verify
 
 When 2+ `git wt` worktrees are running `cargo nextest run` (or any
