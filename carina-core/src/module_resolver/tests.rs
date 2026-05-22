@@ -660,32 +660,23 @@ fn test_expand_module_call_creates_virtual_resource() {
         arguments: HashMap::new(),
     };
 
-    let expanded = resolver
-        .expand_module_call(&call, "web", None)
-        .unwrap()
-        .resources;
-    // 1 real resource + 1 virtual resource
-    assert_eq!(expanded.len(), 2);
-
-    // Find the virtual resource
-    let virtual_res = expanded
-        .iter()
-        .find(|r| r.is_virtual())
-        .expect("Virtual resource should exist");
+    let expanded = resolver.expand_module_call(&call, "web", None).unwrap();
+    // carina#3181 PR C: `resources` is managed-only — 1 real resource.
+    assert_eq!(expanded.resources.len(), 1);
+    // The virtual resource lives in the typed `virtual_resources` slice.
+    assert_eq!(expanded.virtual_resources.len(), 1);
+    let virtual_res = &expanded.virtual_resources[0];
 
     assert_eq!(virtual_res.binding, Some("web".to_string()));
-    // Module info should be in the virtual_module field, not in attributes
-    assert_eq!(virtual_res.kind, ResourceKind::Virtual);
-    assert_eq!(
-        virtual_res.virtual_module,
-        Some(("web_tier".to_string(), "web".to_string()))
-    );
+    // Module info lives in the flattened module_name / instance fields.
+    assert_eq!(virtual_res.module_name, "web_tier");
+    assert_eq!(virtual_res.instance, "web");
     assert!(!virtual_res.attributes.contains_key("_module"));
     assert!(!virtual_res.attributes.contains_key("_module_instance"));
     // The security_group attribute should be a rewritten ResourceRef
     // pointing to the dot-path binding (web.sg)
     assert_eq!(
-        virtual_res.get_attr("security_group"),
+        virtual_res.attributes.get("security_group"),
         Some(&Value::resource_ref(
             "web.sg".to_string(),
             "id".to_string(),
@@ -694,10 +685,10 @@ fn test_expand_module_call_creates_virtual_resource() {
     );
 }
 
-/// carina#3181 PR A: module-call expansion projects the synthetic
-/// virtual resource into the typed `virtual_resources` slice in
-/// parallel with the legacy `resources` Vec (duplicate storage during
-/// the typestate migration).
+/// carina#3181 PR C: module-call expansion partitions the expanded
+/// resources into the managed-only `resources` Vec and the typed
+/// `virtual_resources` / `data_sources` slices — each resource lands in
+/// exactly one slice.
 #[test]
 fn test_expand_module_call_populates_virtual_resources_slice() {
     let resolver = {
@@ -715,11 +706,11 @@ fn test_expand_module_call_populates_virtual_resources_slice() {
 
     let expanded = resolver.expand_module_call(&call, "web", None).unwrap();
 
-    // Legacy mixed Vec still holds the managed + virtual resources.
-    assert_eq!(expanded.resources.len(), 2);
+    // `resources` is managed-only — the synthetic virtual is NOT here.
+    assert_eq!(expanded.resources.len(), 1);
+    assert!(!expanded.resources.iter().any(|r| r.is_virtual()));
 
-    // The typed slice holds only the virtual resource, matching the
-    // corresponding legacy entry.
+    // The virtual resource lives only in the typed slice.
     assert_eq!(expanded.virtual_resources.len(), 1);
     assert_eq!(
         expanded.virtual_resources[0].binding,
@@ -727,16 +718,6 @@ fn test_expand_module_call_populates_virtual_resources_slice() {
     );
     assert_eq!(expanded.virtual_resources[0].module_name, "web_tier");
     assert_eq!(expanded.virtual_resources[0].instance, "web");
-    let legacy_virtual = expanded
-        .resources
-        .iter()
-        .find(|r| r.is_virtual())
-        .expect("legacy resources still contains the virtual resource");
-    assert_eq!(expanded.virtual_resources[0].id, legacy_virtual.id);
-    assert_eq!(
-        expanded.virtual_resources[0].attributes,
-        legacy_virtual.attributes
-    );
 
     // This module declares no data sources.
     assert!(expanded.data_sources.is_empty());
@@ -1450,19 +1431,17 @@ fn test_module_virtual_resource_dot_path_refs() {
         arguments: HashMap::new(),
     };
 
-    let expanded = resolver
-        .expand_module_call(&call, "web", None)
-        .unwrap()
-        .resources;
+    let expanded = resolver.expand_module_call(&call, "web", None).unwrap();
 
+    // carina#3181 PR C: the virtual resource lives in the typed slice.
     let virtual_res = expanded
-        .iter()
-        .find(|r| r.is_virtual())
+        .virtual_resources
+        .first()
         .expect("Virtual resource should exist");
 
     // The security_group attribute should reference dot-notation binding
     assert_eq!(
-        virtual_res.get_attr("security_group"),
+        virtual_res.attributes.get("security_group"),
         Some(&Value::resource_ref(
             "web.sg".to_string(),
             "id".to_string(),

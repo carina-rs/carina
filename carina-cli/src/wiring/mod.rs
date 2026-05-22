@@ -299,12 +299,15 @@ where
     E: carina_core::parser::ExportParamLike,
 {
     let mut errors = Vec::new();
-    for resource in &parsed.resources {
-        for (attr_name, value) in &resource.attributes {
+    // carina#3181: walk every top-level resource — managed, data source,
+    // virtual — so an empty interpolation in a `read` resource's
+    // attribute is still caught.
+    for rref in parsed.iter_top_level_resources() {
+        for (attr_name, value) in rref.attributes() {
             if value_contains_empty_interpolation(value) {
                 errors.push(AppError::Validation(format!(
                     "{}: attribute `{}`: empty interpolation `${{}}` — fill in the expression or remove it",
-                    resource.id, attr_name
+                    rref.id(), attr_name
                 )));
             }
         }
@@ -871,9 +874,12 @@ pub fn validate_module_attribute_param_types<E>(
         if module_parsed.attribute_params.is_empty() {
             continue;
         }
+        // carina#3181: rebuild the mixed legacy view so an imported
+        // module's attribute params can ref-type-check against its
+        // `read` (data-source) bindings too.
         if let Err(joined) = validation::validate_attribute_param_ref_types(
             &module_parsed.attribute_params,
-            &module_parsed.resources,
+            &module_parsed.legacy_top_level_resources(),
             ctx.schemas(),
         ) {
             // Preserve the module-path prefix the legacy wrapper emitted
@@ -1360,8 +1366,12 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     // pre-expansion set (the loop's iterable source — e.g. `let cert` —
     // is a normal top-level resource already here and refreshed by the
     // normal phase-1 pass; only the loop's generated children are added).
+    // carina#3181: `parsed.resources` is managed-only; rebuild the mixed
+    // legacy view (managed + virtual + data source) so data sources
+    // still reach `split_resources_by_kind` / `create_plan` below.
+    let all_top_level_resources = parsed.legacy_top_level_resources();
     let mut sorted_resources =
-        sort_resources_by_dependencies(&parsed.resources).map_err(AppError::Validation)?;
+        sort_resources_by_dependencies(&all_top_level_resources).map_err(AppError::Validation)?;
 
     // Select appropriate Provider based on configuration
     let provider = get_provider_with_ctx(&ctx, parsed, base_dir).await?;
@@ -1387,7 +1397,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     // carina-state stays schema-free; the registry only exists here.
     carina_core::utils::lift_saved_state_string_enums(
         &mut saved_attrs,
-        &parsed.resources,
+        &all_top_level_resources,
         ctx.schemas(),
     );
     let mut prev_explicit = state_file
@@ -1735,7 +1745,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     // resolver / differ consume it.
     carina_core::utils::lift_current_state_string_enums(
         &mut current_states,
-        &parsed.resources,
+        &all_top_level_resources,
         ctx.schemas(),
     );
     resolve_refs_for_plan(

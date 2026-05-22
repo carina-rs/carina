@@ -12,6 +12,7 @@
 //! error surfaces via the regular parser diagnostic path.
 
 use crate::parser::File;
+use crate::resource::ResourceKind;
 use crate::schema::{SchemaKind, SchemaRegistry};
 
 /// A wait-construct diagnostic.
@@ -37,20 +38,24 @@ pub fn validate_wait_bindings<E>(
     }
     let mut out: Vec<WaitDiagnostic> = Vec::new();
 
-    // Build binding → (provider, resource_type) lookup once.
-    let mut by_binding: std::collections::HashMap<String, (String, String)> =
+    // Build binding → (provider, resource_type, kind) lookup once.
+    // carina#3181: walk the typed top-level slices so a data-source
+    // target (`let x = read ...`) is still found, and carry its kind so
+    // the schema lookup below uses the matching `SchemaKind`.
+    let mut by_binding: std::collections::HashMap<String, (String, String, ResourceKind)> =
         std::collections::HashMap::new();
-    for r in &parsed.resources {
-        if let Some(b) = &r.binding {
+    for rref in parsed.iter_top_level_resources() {
+        if let Some(b) = rref.binding() {
+            let id = rref.id();
             by_binding.insert(
-                b.clone(),
-                (r.id.provider.clone(), r.id.resource_type.clone()),
+                b.to_string(),
+                (id.provider.clone(), id.resource_type.clone(), rref.kind()),
             );
         }
     }
 
     for wb in &parsed.wait_bindings {
-        let Some((provider, resource_type)) = by_binding.get(wb.target.as_str()) else {
+        let Some((provider, resource_type, kind)) = by_binding.get(wb.target.as_str()) else {
             out.push(WaitDiagnostic {
                 message: format!(
                     "wait `{}`: target binding `{}` is not a known resource",
@@ -68,7 +73,14 @@ pub fn validate_wait_bindings<E>(
         let Some(attr_name) = wb.until_predicate.lhs_segments.get(1) else {
             continue;
         };
-        let Some(schema) = schemas.get(provider, resource_type, SchemaKind::Managed) else {
+        // Virtual resources have no schema — skip the attr check (the
+        // target was still "found", matching pre-typestate behaviour).
+        let schema_kind = match kind {
+            ResourceKind::Managed => SchemaKind::Managed,
+            ResourceKind::DataSource => SchemaKind::DataSource,
+            ResourceKind::Virtual => continue,
+        };
+        let Some(schema) = schemas.get(provider, resource_type, schema_kind) else {
             // No schema for this resource type — skip the attr check.
             // The user already gets a separate "unknown resource type"
             // diagnostic from the upstream identifier-scope pass.

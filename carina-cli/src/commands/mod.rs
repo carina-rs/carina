@@ -326,10 +326,13 @@ pub fn validate_and_resolve_errors_with_factories(
             parsed,
             &argument_names,
         ));
+        // carina#3181: `parsed.resources` is managed-only; rebuild the
+        // mixed legacy view so attribute params can ref-type-check
+        // against `read` (data-source) bindings too.
         errors.extend(validate_attribute_param_ref_types_with_ctx(
             &ctx,
             &parsed.attribute_params,
-            &parsed.resources,
+            &parsed.legacy_top_level_resources(),
         ));
         if !errors.is_empty() {
             return errors;
@@ -344,9 +347,11 @@ pub fn validate_and_resolve_errors_with_factories(
         ) {
             errors.extend(split_validation_message(&msg));
         }
+        // carina#3181: rebuild the mixed legacy view so exports can
+        // ref-type-check against `read` (data-source) bindings too.
         if let Err(msg) = carina_core::validation::validate_export_param_ref_types(
             &parsed.export_params,
-            &parsed.resources,
+            &parsed.legacy_top_level_resources(),
             ctx.schemas(),
         ) {
             errors.extend(split_validation_message(&msg));

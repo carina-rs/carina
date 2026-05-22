@@ -813,7 +813,12 @@ async fn run_apply_locked(
     // source (e.g. `let cert`) is a normal top-level resource already
     // here and refreshed by phase 1, only the loop's generated children
     // are added later.
-    let mut sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
+    // carina#3181: `parsed.resources` is managed-only; rebuild the mixed
+    // legacy view (managed + virtual + data source) for the dependency
+    // sort and the StringEnum-lift passes below so data sources still
+    // reach `split_resources_by_kind` / `create_plan`.
+    let all_top_level_resources = parsed.legacy_top_level_resources();
+    let mut sorted_resources = sort_resources_by_dependencies(&all_top_level_resources)?;
 
     // Build state-file-derived maps up front so anonymous → let-bound
     // rename transfer (#1685) can run between refresh phases 1 and 2.
@@ -827,7 +832,7 @@ async fn run_apply_locked(
     // desired against un-lifted saved state. Same seam as the plan path.
     carina_core::utils::lift_saved_state_string_enums(
         &mut saved_attrs,
-        &parsed.resources,
+        &all_top_level_resources,
         ctx.schemas(),
     );
     let mut prev_explicit = state_file
@@ -1088,7 +1093,7 @@ async fn run_apply_locked(
     // populated `current_states` by here.
     carina_core::utils::lift_current_state_string_enums(
         &mut current_states,
-        &parsed.resources,
+        &all_top_level_resources,
         ctx.schemas(),
     );
 

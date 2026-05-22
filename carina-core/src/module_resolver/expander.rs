@@ -292,22 +292,24 @@ impl ModuleResolver<'_> {
             })
             .collect();
 
-        // carina#3181 PR A: project the expanded resources into the
-        // typed `data_sources` / `virtual_resources` slices in parallel
-        // with the legacy `resources` Vec. A module instance contributes
-        // both managed resources and exactly one `_virtual` attribute
-        // resource (built above); a module may also declare data
-        // sources. `expanded_resources` keeps every resource so current
-        // consumers are untouched; PR B migrates them onto the typed
-        // slices.
-        let data_sources: Vec<DataSource> = expanded_resources
-            .iter()
-            .filter_map(|r| r.try_into().ok())
-            .collect();
-        let virtual_resources: Vec<VirtualResource> = expanded_resources
-            .iter()
-            .filter_map(|r| r.try_into().ok())
-            .collect();
+        // carina#3181 PR C: partition the expanded resources into the
+        // managed-only `resources` Vec and the typed `data_sources` /
+        // `virtual_resources` slices. A module instance contributes
+        // managed resources, exactly one `_virtual` attribute resource
+        // (built above), and possibly data sources — each lands in
+        // exactly one slice.
+        let mut managed_resources: Vec<Resource> = Vec::new();
+        let mut data_sources: Vec<DataSource> = Vec::new();
+        let mut virtual_resources: Vec<VirtualResource> = Vec::new();
+        for resource in expanded_resources {
+            if let Ok(ds) = DataSource::try_from(&resource) {
+                data_sources.push(ds);
+            } else if let Ok(vr) = VirtualResource::try_from(&resource) {
+                virtual_resources.push(vr);
+            } else {
+                managed_resources.push(resource);
+            }
+        }
 
         // The contribution is a full `ParsedFile` built with an
         // **exhaustive struct literal** (no `..Default::default()`):
@@ -317,7 +319,7 @@ impl ModuleResolver<'_> {
         // reason — never silently absent (the carina#3126 fix).
         Ok(ParsedFile {
             // Populated from the module, instance-prefixed:
-            resources: expanded_resources,
+            resources: managed_resources,
             data_sources,
             virtual_resources,
             wait_bindings: expanded_wait_bindings,

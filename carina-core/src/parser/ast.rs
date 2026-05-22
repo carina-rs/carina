@@ -956,17 +956,14 @@ impl<E> File<E> {
     /// `notes/specs/2026-04-19-unify-resource-walk-design.md` for the
     /// rationale.
     ///
-    /// **carina#3181 PR B:** the managed arm filters `self.resources` to
-    /// `ResourceKind::Managed` rows. While the typestate migration is in
-    /// flight `resources` still holds virtual + data-source rows too (the
-    /// PR A duplicate storage); the filter keeps each resource yielded
-    /// exactly once — virtuals and data sources come from their typed
-    /// slices instead. PR C makes `resources` managed-only and drops the
-    /// filter.
+    /// **carina#3181 PR C:** `self.resources` is now managed-only — the
+    /// parser, module expander, and deferred-for expansion write each
+    /// resource into exactly one of `resources` / `data_sources` /
+    /// `virtual_resources`. The iterator chains the three typed slices
+    /// plus the deferred for-expression templates.
     pub fn iter_all_resources(&self) -> impl Iterator<Item = ResourceRef<'_>> {
         self.resources
             .iter()
-            .filter(|r| matches!(r.kind, ResourceKind::Managed))
             .map(ResourceRef::Managed)
             .chain(self.virtual_resources.iter().map(ResourceRef::Virtual))
             .chain(self.data_sources.iter().map(ResourceRef::DataSource))
@@ -978,6 +975,44 @@ impl<E> File<E> {
                         deferred: d,
                     }),
             )
+    }
+
+    /// Iterate the top-level resources — managed, virtual, and data
+    /// source — as typed [`ResourceRef`]s, **excluding** deferred
+    /// for-expression templates.
+    ///
+    /// Use this over [`iter_all_resources`](Self::iter_all_resources)
+    /// when a consumer needs only the concrete top-level declarations
+    /// (binding-name collection, dependency sorting) and a for-body
+    /// template would be a spurious entry.
+    pub fn iter_top_level_resources(&self) -> impl Iterator<Item = ResourceRef<'_>> {
+        self.resources
+            .iter()
+            .map(ResourceRef::Managed)
+            .chain(self.virtual_resources.iter().map(ResourceRef::Virtual))
+            .chain(self.data_sources.iter().map(ResourceRef::DataSource))
+    }
+
+    /// Rebuild a single legacy `Vec<Resource>` of every top-level
+    /// resource — managed rows verbatim, data sources and virtuals
+    /// bridged back via `From<&DataSource>` / `From<&VirtualResource>`.
+    ///
+    /// **carina#3181 transitional (PR C):** `resources` is managed-only,
+    /// but several legacy APIs — `sort_resources_by_dependencies`,
+    /// `differ::split_resources_by_kind`, the resolver — still take a
+    /// mixed `&[Resource]`. This helper produces that mixed view without
+    /// reintroducing duplicate storage. Removed once those APIs are
+    /// typestate-aware. The order is managed → virtual → data source;
+    /// callers that care about ordering (dependency sort) re-sort
+    /// topologically anyway.
+    pub fn legacy_top_level_resources(&self) -> Vec<Resource> {
+        let mut out = Vec::with_capacity(
+            self.resources.len() + self.virtual_resources.len() + self.data_sources.len(),
+        );
+        out.extend(self.resources.iter().cloned());
+        out.extend(self.virtual_resources.iter().map(Resource::from));
+        out.extend(self.data_sources.iter().map(Resource::from));
+        out
     }
 
     /// Find a resource by resource type and name attribute value
@@ -1137,20 +1172,18 @@ impl<E> File<E> {
             self.deferred_for_expressions.remove(idx);
         }
 
-        // carina#3181 PR A/B duplicate-storage invariant: every resource
-        // lives both in the legacy `resources` Vec and in its typed slice.
-        // Expansion happens after the parser's initial projection, so
-        // project the freshly expanded for-body resources into the typed
-        // slices here too — otherwise an expanded `read` for-body would be
-        // dropped by `iter_all_resources`'s managed-only filter.
-        for resource in &expanded_resources {
-            if let Ok(ds) = DataSource::try_from(resource) {
+        // carina#3181 PR C: `resources` is managed-only. Partition the
+        // freshly expanded for-body resources — managed rows into
+        // `resources`, `read` rows into `data_sources` — so an expanded
+        // data-source for-body lands in the right typed slice. (A
+        // for-body cannot synthesize a virtual resource.)
+        for resource in expanded_resources {
+            if let Ok(ds) = DataSource::try_from(&resource) {
                 self.data_sources.push(ds);
-            } else if let Ok(vr) = VirtualResource::try_from(resource) {
-                self.virtual_resources.push(vr);
+            } else {
+                self.resources.push(resource);
             }
         }
-        self.resources.extend(expanded_resources);
         self.warnings.extend(new_warnings);
     }
 }

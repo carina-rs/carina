@@ -92,7 +92,11 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         reconcile_anonymous_identifiers_with_ctx(&wiring, &mut parsed.resources, sf);
     }
 
-    let sorted_resources = sort_resources_by_dependencies(&parsed.resources).unwrap();
+    // carina#3181: `parsed.resources` is managed-only; rebuild the mixed
+    // legacy view so data sources still reach `split_resources_by_kind` /
+    // `create_plan`.
+    let all_top_level_resources = parsed.legacy_top_level_resources();
+    let sorted_resources = sort_resources_by_dependencies(&all_top_level_resources).unwrap();
 
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
     if let Some(sf) = state_file.as_ref() {
