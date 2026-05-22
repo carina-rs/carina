@@ -65,14 +65,42 @@ impl S3Backend {
         let region = resolve_region(config.get_string("region"), sdk_region.as_deref())?;
         let client = build_s3_client(&region).await;
 
-        Ok(Self {
+        Ok(Self::from_client(
             client,
             bucket,
             key,
             region,
             encrypt,
             auto_create,
-        })
+        ))
+    }
+
+    /// Construct an `S3Backend` over a caller-supplied `aws_sdk_s3::Client`.
+    ///
+    /// `from_config` is the production entry point — it resolves the
+    /// region and builds the SDK client itself. This constructor exists
+    /// so a test can inject a client wired to an in-process AWS mock
+    /// (`winterbaume`, library mode) and exercise the `StateBackend` I/O
+    /// path with no real AWS and no external process (#3203). It does
+    /// not touch the AWS SDK config chain; the `region` argument is used
+    /// verbatim (it still drives the `create_bucket` location
+    /// constraint).
+    pub fn from_client(
+        client: Client,
+        bucket: String,
+        key: String,
+        region: String,
+        encrypt: bool,
+        auto_create: bool,
+    ) -> Self {
+        Self {
+            client,
+            bucket,
+            key,
+            region,
+            encrypt,
+            auto_create,
+        }
     }
 
     /// Get the lock file key (state key + ".lock")
@@ -544,14 +572,23 @@ where
         .is_some_and(|service_err| is_conditional_write_conflict_code(service_err.code()))
 }
 
-fn is_head_bucket_not_found(err: &HeadBucketError) -> bool {
-    err.is_not_found()
-}
-
-fn is_missing_head_bucket_response<R>(
-    err: &aws_sdk_s3::error::SdkError<HeadBucketError, R>,
-) -> bool {
-    err.as_service_error().is_some_and(is_head_bucket_not_found)
+/// Returns `true` if a `HeadBucket` error means the bucket is absent.
+///
+/// `HeadBucket` is an HTTP `HEAD` request, so an absent bucket is a 404
+/// with no response body — the SDK cannot always resolve that into the
+/// typed `HeadBucketError::NotFound` variant and may leave it
+/// `Unhandled`. The HTTP status is therefore the reliable signal: a 404
+/// is a missing bucket regardless of how the SDK classified it. This is
+/// the same approach as `is_not_found_error` (used for `GetObject`),
+/// which also keys off `raw_response().status()`.
+///
+/// When no raw response is attached at all — a connection/dispatch
+/// failure rather than a service response — there is no evidence the
+/// bucket was reported absent, so this returns `false` and `bucket_exists`
+/// surfaces the underlying error.
+fn is_missing_head_bucket_response(err: &aws_sdk_s3::error::SdkError<HeadBucketError>) -> bool {
+    err.raw_response()
+        .is_some_and(|raw| raw.status().as_u16() == 404)
 }
 
 #[cfg(test)]
@@ -664,30 +701,56 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_is_head_bucket_not_found_for_not_found_error() {
-        let err = HeadBucketError::NotFound(aws_sdk_s3::types::error::NotFound::builder().build());
-        assert!(is_head_bucket_not_found(&err));
+    /// Build a `HeadBucket` raw HTTP response with the given status, so
+    /// the HTTP-status-based classifier can be exercised without a live
+    /// SDK call.
+    fn head_bucket_http_response(status: u16) -> aws_smithy_runtime_api::http::Response {
+        aws_smithy_runtime_api::http::Response::new(
+            status.try_into().unwrap(),
+            aws_smithy_types::body::SdkBody::empty(),
+        )
     }
 
     #[test]
-    fn test_is_head_bucket_not_found_rejects_other_service_errors() {
-        let err = HeadBucketError::generic(ErrorMetadata::builder().code("AccessDenied").build());
-        assert!(!is_head_bucket_not_found(&err));
-    }
-
-    #[test]
-    fn test_is_missing_head_bucket_response_for_not_found_service_error() {
+    fn test_is_missing_head_bucket_response_for_typed_not_found_with_404() {
+        // The SDK resolved the 404 into the typed NotFound variant.
         let err = SdkError::service_error(
             HeadBucketError::NotFound(aws_sdk_s3::types::error::NotFound::builder().build()),
-            (),
+            head_bucket_http_response(404),
         );
         assert!(is_missing_head_bucket_response(&err));
     }
 
     #[test]
-    fn test_is_missing_head_bucket_response_rejects_non_service_404s() {
-        let err = SdkError::response_error("not found response", ());
+    fn test_is_missing_head_bucket_response_for_unhandled_404() {
+        // The SDK left the 404 as an Unhandled error — e.g. when the
+        // response carries an error body the typed parser does not
+        // expect (this is exactly what an in-process S3 mock can emit).
+        // The HTTP status must still classify it as a missing bucket.
+        let err = SdkError::service_error(
+            HeadBucketError::generic(ErrorMetadata::builder().code("NoSuchBucket").build()),
+            head_bucket_http_response(404),
+        );
+        assert!(is_missing_head_bucket_response(&err));
+    }
+
+    #[test]
+    fn test_is_missing_head_bucket_response_rejects_non_404_status() {
+        // A 403 (e.g. AccessDenied) is not a missing bucket.
+        let err = SdkError::service_error(
+            HeadBucketError::generic(ErrorMetadata::builder().code("AccessDenied").build()),
+            head_bucket_http_response(403),
+        );
+        assert!(!is_missing_head_bucket_response(&err));
+    }
+
+    #[test]
+    fn test_is_missing_head_bucket_response_rejects_error_without_raw_response() {
+        // A construction/dispatch failure carries no HTTP response, so
+        // there is no evidence the bucket is absent — this must not be
+        // classified as a missing bucket.
+        let err: SdkError<HeadBucketError> =
+            SdkError::construction_failure("no raw response attached");
         assert!(!is_missing_head_bucket_response(&err));
     }
 

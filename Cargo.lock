@@ -980,6 +980,8 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
  "carina-core",
  "chrono",
  "hostname",
@@ -990,6 +992,8 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "uuid",
+ "winterbaume-core",
+ "winterbaume-s3",
 ]
 
 [[package]]
@@ -3234,6 +3238,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.37.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "331e97a1af0bf59823e6eadffe373d7b27f485be8748f71471c662c1f269b7fb"
+dependencies = [
+ "memchr",
+ "serde",
 ]
 
 [[package]]
@@ -5526,6 +5540,47 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "80d0f4e272c85def139476380b12f9ac60926689dd2e01d4923222f40580869d"
 dependencies = [
  "winapi",
+]
+
+[[package]]
+name = "winterbaume-core"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e9135da905ed2cbe0f7464134bf88feb0e1b1f3ce3315536805b4505db6abd4"
+dependencies = [
+ "aws-config",
+ "aws-credential-types",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "bytes",
+ "http 1.4.0",
+ "regex",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "winterbaume-s3"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48730964f4f607ae4739f90d75ab295dac32d06f2ed95892e5ad902748c0be59"
+dependencies = [
+ "bytes",
+ "chrono",
+ "http 1.4.0",
+ "md-5",
+ "quick-xml",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+ "winterbaume-core",
 ]
 
 [[package]]
