@@ -1390,14 +1390,16 @@ pub async fn run_apply_from_plan(
     let plan_file: PlanFile =
         serde_json::from_str(&content).map_err(|e| format!("Failed to parse plan file: {}", e))?;
 
-    // Validate version compatibility. Plan-file version 2 added the
-    // upstream-state snapshot (#2303); older plans cannot guarantee the
-    // upstream values used during cascade re-resolution match what the
-    // plan was computed against, so they are rejected outright per the
+    // Validate version compatibility. Plan-file version 3 (carina#3181)
+    // changed the saved `Effect` payload shapes — managed effects carry
+    // `ManagedResource`, `Read` carries `DataSource`, neither serializes
+    // the legacy `kind` / `virtual_module` fields. Older plans
+    // (version 2 and below) deserialize into a different `Effect` shape
+    // and cannot be applied, so they are rejected outright per the
     // repo's no-backward-compat policy.
-    if plan_file.version != 2 {
+    if plan_file.version != 3 {
         return Err(AppError::Config(format!(
-            "Unsupported plan file version: {} (expected 2). \
+            "Unsupported plan file version: {} (expected 3). \
              Re-run 'carina plan' to produce a plan in the current format.",
             plan_file.version
         )));

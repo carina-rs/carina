@@ -122,7 +122,10 @@ fn build_plan_file<E>(
     ctx: &crate::wiring::PlanContext,
 ) -> Result<PlanFile, carina_core::value::SerializationError> {
     Ok(PlanFile {
-        version: 2,
+        // carina#3181 PR D: bumped 2→3 — Effect payloads are now typestate
+        // structs, so the saved-plan JSON shape changed (managed/data-source
+        // payloads no longer carry `kind` / `virtual_module`).
+        version: 3,
         carina_version: env!("CARGO_PKG_VERSION").to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
         source_path: path.display().to_string(),

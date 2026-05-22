@@ -578,7 +578,7 @@ fn move_plus_replace_keeps_post_replace_identifier_and_attributes() {
     plan.add(Effect::Replace {
         id: new_id.clone(),
         from: Box::new(State::existing(from_id.clone(), HashMap::new())),
-        to: sorted_resources[0].clone(),
+        to: sorted_resources[0].clone().try_into().unwrap(),
         directives: Directives::default(),
         changed_create_only: vec!["role_name".to_string(), "policy_name".to_string()],
         cascading_updates: vec![],
@@ -698,7 +698,7 @@ fn move_plus_update_keeps_post_update_attributes() {
     plan.add(Effect::Update {
         id: new_id.clone(),
         from: Box::new(State::existing(from_id.clone(), HashMap::new())),
-        to: sorted_resources[0].clone(),
+        to: sorted_resources[0].clone().try_into().unwrap(),
         changed_attributes: vec!["value".to_string()],
     });
     plan.add(Effect::Move {

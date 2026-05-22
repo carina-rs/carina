@@ -407,7 +407,7 @@ fn import_fallback_matches_anonymous_resource_by_name_attribute() {
         Value::Concrete(ConcreteValue::String("carina-rs-state".to_string())),
     );
     let mut plan = Plan::new();
-    plan.add(Effect::Create(resource));
+    plan.add(Effect::Create(resource.try_into().unwrap()));
 
     // Import block with the logical name (not the hash)
     let state_blocks = vec![StateBlock::Import {

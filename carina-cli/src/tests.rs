@@ -11,7 +11,8 @@ use carina_core::parser::{ParsedFile, ProviderConfig};
 use carina_core::plan::Plan;
 use carina_core::provider::{BoxFuture, ProviderError, ProviderResult};
 use carina_core::resource::{
-    ConcreteValue, DeferredValue, Directives, Resource, ResourceId, State, Value,
+    ConcreteValue, DataSource, DeferredValue, Directives, ManagedResource, Resource, ResourceId,
+    State, Value,
 };
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
 use carina_state::{BackendError, LockInfo, ResourceState, StateBackend, StateFile};
@@ -270,7 +271,7 @@ fn plan_file_serde_round_trip() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Create(
-        Resource::with_provider("aws", "s3.Bucket", "my-bucket", None).with_attribute(
+        ManagedResource::with_provider("aws", "s3.Bucket", "my-bucket", None).with_attribute(
             "bucket",
             Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
         ),
@@ -302,7 +303,7 @@ fn plan_file_serde_round_trip() {
     }];
 
     let plan_file = PlanFile {
-        version: 2,
+        version: 3,
         carina_version: "0.1.0".to_string(),
         timestamp: "2025-01-01T00:00:00Z".to_string(),
         source_path: "example.crn".to_string(),
@@ -348,7 +349,7 @@ fn plan_file_serde_round_trip() {
     let json = serde_json::to_string_pretty(&plan_file).unwrap();
     let deserialized: PlanFile = serde_json::from_str(&json).unwrap();
 
-    assert_eq!(deserialized.version, 2);
+    assert_eq!(deserialized.version, 3);
     assert_eq!(deserialized.carina_version, "0.1.0");
     assert_eq!(deserialized.source_path, "example.crn");
     assert_eq!(deserialized.state_lineage, Some("test-lineage".to_string()));
@@ -579,7 +580,7 @@ fn test_detailed_exitcode_no_changes() {
 fn test_detailed_exitcode_with_changes() {
     // A plan with mutating effects means changes -- has_changes should be true
     let mut plan = Plan::new();
-    plan.add(Effect::Create(Resource::new("s3.Bucket", "test")));
+    plan.add(Effect::Create(ManagedResource::new("s3.Bucket", "test")));
     let has_changes = plan.mutation_count() > 0;
     assert!(has_changes);
 }
@@ -589,7 +590,7 @@ fn test_detailed_exitcode_read_only_no_changes() {
     // A plan with only Read effects should NOT count as changes
     let mut plan = Plan::new();
     plan.add(Effect::Read {
-        resource: Resource::new("sts.caller_identity", "identity").with_read_only(true),
+        resource: DataSource::new("sts.caller_identity", "identity"),
     });
     let has_changes = plan.mutation_count() > 0;
     assert!(!has_changes);
@@ -1818,7 +1819,7 @@ async fn rename_failure_in_create_before_destroy_counts_as_failure() {
     plan.add(Effect::Replace {
         id: id.clone(),
         from: Box::new(old_state.clone()),
-        to: new_resource.clone(),
+        to: (new_resource.clone()).try_into().unwrap(),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -1947,7 +1948,9 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: vpc_unresolved.clone().with_binding("vpc"),
+        to: (vpc_unresolved.clone().with_binding("vpc"))
+            .try_into()
+            .unwrap(),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -1960,7 +1963,7 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
     plan.add(Effect::Update {
         id: subnet_id.clone(),
         from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
-        to: subnet_resolved.clone(), // Has stale "vpc-OLD" in vpc_id
+        to: subnet_resolved.clone().try_into().unwrap(), // Has stale "vpc-OLD" in vpc_id
         changed_attributes: vec!["cidr_block".to_string()],
     });
 
@@ -2778,7 +2781,9 @@ fn plan_file_serialization_redacts_secrets() {
         .with_attribute("master_password", secret_password.clone());
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(resource_with_secret.clone()));
+    plan.add(Effect::Create(
+        (resource_with_secret.clone()).try_into().unwrap(),
+    ));
 
     let mut state_attrs = HashMap::new();
     state_attrs.insert(
@@ -2793,7 +2798,7 @@ fn plan_file_serialization_redacts_secrets() {
 
     // Redact before building PlanFile (same as production code does)
     let plan_file = PlanFile {
-        version: 2,
+        version: 3,
         carina_version: "0.1.0".to_string(),
         timestamp: "2025-01-01T00:00:00Z".to_string(),
         source_path: "example.crn".to_string(),

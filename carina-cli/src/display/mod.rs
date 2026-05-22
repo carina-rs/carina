@@ -42,8 +42,8 @@ pub fn refresh_plan_separator(refreshed: bool) -> &'static str {
 }
 
 /// Check if a resource has a `let` binding (i.e., is not anonymous).
-fn has_binding(resource: &carina_core::resource::Resource) -> bool {
-    resource.binding.is_some()
+fn has_binding(resource: &dyn carina_core::resource::ResourceLike) -> bool {
+    resource.binding().is_some()
 }
 
 /// Format a compact resource identifier, showing either the binding name in quotes
@@ -53,7 +53,7 @@ fn has_binding(resource: &carina_core::resource::Resource) -> bool {
 /// `parent_binding` is the binding name of the parent in the tree, used to skip
 /// redundant ResourceRef hints.
 fn format_compact_name(
-    resource: &carina_core::resource::Resource,
+    resource: &dyn carina_core::resource::ResourceLike,
     name: &str,
     parent_binding: Option<&str>,
 ) -> String {
@@ -720,18 +720,9 @@ impl<'a> TreeRenderContext<'a> {
             if let Effect::Delete { binding, .. } = effect {
                 binding.clone()
             } else {
-                let resource = match effect {
-                    Effect::Create(r) => Some(r),
-                    Effect::Update { to, .. } => Some(to),
-                    Effect::Replace { to, .. } => Some(to),
-                    Effect::Read { resource } => Some(resource),
-                    Effect::Delete { .. }
-                    | Effect::Import { .. }
-                    | Effect::Remove { .. }
-                    | Effect::Move { .. }
-                    | Effect::Wait { .. } => None,
-                };
-                resource.and_then(|r| r.binding.clone())
+                effect
+                    .resource_like()
+                    .and_then(|r| r.binding().map(str::to_string))
             }
         };
 

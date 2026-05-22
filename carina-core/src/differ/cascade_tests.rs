@@ -66,7 +66,7 @@ fn cascade_dependent_updates_adds_update_for_dependent() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: vpc.clone().with_binding("vpc"),
+        to: (vpc.clone().with_binding("vpc")).try_into().unwrap(),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -166,7 +166,7 @@ fn cascade_skips_resources_already_in_plan() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: vpc.clone(),
+        to: (vpc.clone()).try_into().unwrap(),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -179,7 +179,7 @@ fn cascade_skips_resources_already_in_plan() {
     plan.add(Effect::Update {
         id: subnet_id.clone(),
         from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
-        to: subnet.clone(),
+        to: (subnet.clone()).try_into().unwrap(),
         changed_attributes: vec!["cidr_block".to_string()],
     });
 
@@ -239,7 +239,7 @@ fn cascade_no_op_without_create_before_destroy() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: vpc.clone(),
+        to: (vpc.clone()).try_into().unwrap(),
         directives: Directives::default(), // create_before_destroy = false
         changed_create_only: vec!["cidr_block".to_string()],
         cascading_updates: vec![],
@@ -333,7 +333,7 @@ fn cascade_transitive_dependencies() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: vpc.clone(),
+        to: (vpc.clone()).try_into().unwrap(),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -414,7 +414,7 @@ fn cascade_anonymous_resource_dependent() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: vpc.clone(),
+        to: (vpc.clone()).try_into().unwrap(),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -526,7 +526,7 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: vpc.clone().with_binding("vpc"),
+        to: (vpc.clone().with_binding("vpc")).try_into().unwrap(),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -699,7 +699,7 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: vpc.clone().with_binding("vpc"),
+        to: (vpc.clone().with_binding("vpc")).try_into().unwrap(),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -712,7 +712,7 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
     plan.add(Effect::Replace {
         id: subnet_id.clone(),
         from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
-        to: subnet.clone().with_binding("subnet"),
+        to: (subnet.clone().with_binding("subnet")).try_into().unwrap(),
         directives: Directives::default(),
         changed_create_only: vec!["availability_zone".to_string()],
         cascading_updates: vec![],
@@ -846,7 +846,7 @@ fn auto_detect_create_before_destroy_when_resource_has_dependents() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: vpc.clone().with_binding("vpc"),
+        to: (vpc.clone().with_binding("vpc")).try_into().unwrap(),
         directives: Directives::default(), // create_before_destroy = false (user didn't set it)
         changed_create_only: vec!["cidr_block".to_string()],
         cascading_updates: vec![],
@@ -973,7 +973,7 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: vpc.clone().with_binding("vpc"),
+        to: (vpc.clone().with_binding("vpc")).try_into().unwrap(),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -986,7 +986,7 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
     plan.add(Effect::Update {
         id: subnet_id.clone(),
         from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
-        to: subnet.clone().with_binding("subnet"),
+        to: (subnet.clone().with_binding("subnet")).try_into().unwrap(),
         changed_attributes: vec!["tags".to_string()],
     });
 
@@ -1100,7 +1100,7 @@ fn cascade_prevent_destroy_blocks_promotion_to_replace() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: vpc.clone().with_binding("vpc"),
+        to: (vpc.clone().with_binding("vpc")).try_into().unwrap(),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -1230,7 +1230,7 @@ fn cascade_prevent_destroy_blocks_merge_upgrade_to_replace() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: vpc.clone().with_binding("vpc"),
+        to: (vpc.clone().with_binding("vpc")).try_into().unwrap(),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -1243,7 +1243,7 @@ fn cascade_prevent_destroy_blocks_merge_upgrade_to_replace() {
     plan.add(Effect::Update {
         id: subnet_id.clone(),
         from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
-        to: subnet.clone().with_binding("subnet"),
+        to: (subnet.clone().with_binding("subnet")).try_into().unwrap(),
         changed_attributes: vec!["tags".to_string()],
     });
 

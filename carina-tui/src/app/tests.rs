@@ -1,5 +1,5 @@
 use super::*;
-use carina_core::resource::{ConcreteValue, Directives, Resource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, Directives, ManagedResource, ResourceId, State, Value};
 use carina_core::value::format_value;
 
 #[test]
@@ -13,7 +13,10 @@ fn app_from_empty_plan() {
 #[test]
 fn app_from_plan_with_effects() {
     let mut plan = Plan::new();
-    plan.add(Effect::Create(Resource::new("s3.Bucket", "my-bucket")));
+    plan.add(Effect::Create(ManagedResource::new(
+        "s3.Bucket",
+        "my-bucket",
+    )));
     plan.add(Effect::Delete {
         id: ResourceId::new("s3.Bucket", "old-bucket"),
         identifier: "old-bucket-id".to_string(),
@@ -34,9 +37,9 @@ fn app_from_plan_with_effects() {
 #[test]
 fn navigation() {
     let mut plan = Plan::new();
-    plan.add(Effect::Create(Resource::new("s3.Bucket", "a")));
-    plan.add(Effect::Create(Resource::new("s3.Bucket", "b")));
-    plan.add(Effect::Create(Resource::new("s3.Bucket", "c")));
+    plan.add(Effect::Create(ManagedResource::new("s3.Bucket", "a")));
+    plan.add(Effect::Create(ManagedResource::new("s3.Bucket", "b")));
+    plan.add(Effect::Create(ManagedResource::new("s3.Bucket", "c")));
 
     let mut app = App::new(&plan, &SchemaRegistry::new());
     assert_eq!(app.selected, 0);
@@ -76,7 +79,7 @@ fn update_effect_has_detail_rows() {
             .into_iter()
             .collect(),
         )),
-        to: Resource::new("s3.Bucket", "my-bucket").with_attribute(
+        to: ManagedResource::new("s3.Bucket", "my-bucket").with_attribute(
             "versioning",
             Value::Concrete(ConcreteValue::String("Enabled".to_string())),
         ),
@@ -98,7 +101,7 @@ fn update_effect_has_detail_rows() {
 fn internal_attributes_filtered() {
     let mut plan = Plan::new();
     plan.add(Effect::Create(
-        Resource::new("s3.Bucket", "my-bucket")
+        ManagedResource::new("s3.Bucket", "my-bucket")
             .with_attribute(
                 "name",
                 Value::Concrete(ConcreteValue::String("test".to_string())),
@@ -155,7 +158,7 @@ fn replace_effect_symbols() {
     plan.add(Effect::Replace {
         id: ResourceId::new("ec2.Vpc", "my-vpc"),
         from: from.clone(),
-        to: Resource::new("ec2.Vpc", "my-vpc"),
+        to: ManagedResource::new("ec2.Vpc", "my-vpc"),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -170,7 +173,7 @@ fn replace_effect_symbols() {
     plan.add(Effect::Replace {
         id: ResourceId::new("ec2.Vpc", "my-vpc2"),
         from,
-        to: Resource::new("ec2.Vpc", "my-vpc2"),
+        to: ManagedResource::new("ec2.Vpc", "my-vpc2"),
         directives: Directives::default(),
         changed_create_only: vec!["cidr".to_string()],
         cascading_updates: vec![],
@@ -188,7 +191,7 @@ fn tree_structure_with_dependencies() {
     // Create a plan where subnet depends on vpc via ResourceRef
     let mut plan = Plan::new();
     plan.add(Effect::Create(
-        Resource::new("ec2.Vpc", "my-vpc")
+        ManagedResource::new("ec2.Vpc", "my-vpc")
             .with_binding("vpc")
             .with_attribute(
                 "cidr_block",
@@ -196,7 +199,7 @@ fn tree_structure_with_dependencies() {
             ),
     ));
     plan.add(Effect::Create(
-        Resource::new("ec2.Subnet", "my-subnet")
+        ManagedResource::new("ec2.Subnet", "my-subnet")
             .with_binding("subnet")
             .with_attribute(
                 "vpc_id",
@@ -221,7 +224,7 @@ fn tree_structure_with_dependencies() {
 fn selected_node_returns_correct_node() {
     let mut plan = Plan::new();
     plan.add(Effect::Create(
-        Resource::new("s3.Bucket", "my-bucket").with_attribute(
+        ManagedResource::new("s3.Bucket", "my-bucket").with_attribute(
             "name",
             Value::Concrete(ConcreteValue::String("test".to_string())),
         ),
@@ -237,7 +240,7 @@ fn selected_node_returns_correct_node() {
 #[test]
 fn toggle_focus_switches_panels() {
     let mut plan = Plan::new();
-    plan.add(Effect::Create(Resource::new("s3.Bucket", "a")));
+    plan.add(Effect::Create(ManagedResource::new("s3.Bucket", "a")));
     let mut app = App::new(&plan, &SchemaRegistry::new());
 
     assert_eq!(app.focused_panel, FocusedPanel::Tree);
@@ -250,7 +253,7 @@ fn toggle_focus_switches_panels() {
 #[test]
 fn detail_scroll_up_down() {
     let mut plan = Plan::new();
-    plan.add(Effect::Create(Resource::new("s3.Bucket", "a")));
+    plan.add(Effect::Create(ManagedResource::new("s3.Bucket", "a")));
     let mut app = App::new(&plan, &SchemaRegistry::new());
 
     assert_eq!(app.detail_scroll, 0);
@@ -270,8 +273,8 @@ fn detail_scroll_up_down() {
 #[test]
 fn detail_scroll_resets_on_navigation() {
     let mut plan = Plan::new();
-    plan.add(Effect::Create(Resource::new("s3.Bucket", "a")));
-    plan.add(Effect::Create(Resource::new("s3.Bucket", "b")));
+    plan.add(Effect::Create(ManagedResource::new("s3.Bucket", "a")));
+    plan.add(Effect::Create(ManagedResource::new("s3.Bucket", "b")));
     let mut app = App::new(&plan, &SchemaRegistry::new());
 
     app.detail_scroll = 5;
@@ -288,7 +291,7 @@ fn tree_scroll_cursor_moves_within_visible_area_before_scrolling() {
     // Create a plan with 10 items
     let mut plan = Plan::new();
     for i in 0..10 {
-        plan.add(Effect::Create(Resource::new(
+        plan.add(Effect::Create(ManagedResource::new(
             "s3.Bucket",
             format!("bucket-{}", i),
         )));
@@ -347,8 +350,8 @@ fn tree_scroll_cursor_moves_within_visible_area_before_scrolling() {
 fn tree_scroll_zero_height_does_not_scroll_on_move_down() {
     // When tree_area_height is 0 (before first render), move_down should not scroll
     let mut plan = Plan::new();
-    plan.add(Effect::Create(Resource::new("s3.Bucket", "a")));
-    plan.add(Effect::Create(Resource::new("s3.Bucket", "b")));
+    plan.add(Effect::Create(ManagedResource::new("s3.Bucket", "a")));
+    plan.add(Effect::Create(ManagedResource::new("s3.Bucket", "b")));
     let mut app = App::new(&plan, &SchemaRegistry::new());
     assert_eq!(app.tree_area_height, 0);
 
@@ -361,7 +364,7 @@ fn tree_scroll_zero_height_does_not_scroll_on_move_down() {
 fn make_tree_plan() -> Plan {
     let mut plan = Plan::new();
     plan.add(Effect::Create(
-        Resource::new("ec2.Vpc", "my-vpc")
+        ManagedResource::new("ec2.Vpc", "my-vpc")
             .with_binding("vpc")
             .with_attribute(
                 "cidr_block",
@@ -369,7 +372,7 @@ fn make_tree_plan() -> Plan {
             ),
     ));
     plan.add(Effect::Create(
-        Resource::new("ec2.Subnet", "my-subnet")
+        ManagedResource::new("ec2.Subnet", "my-subnet")
             .with_binding("subnet")
             .with_attribute(
                 "vpc_id",
@@ -377,7 +380,7 @@ fn make_tree_plan() -> Plan {
             ),
     ));
     plan.add(Effect::Create(
-        Resource::new("s3.Bucket", "my-bucket").with_binding("bucket"),
+        ManagedResource::new("s3.Bucket", "my-bucket").with_binding("bucket"),
     ));
     plan
 }
@@ -561,13 +564,14 @@ fn tab_complete_matches_middle_of_word() {
 
 #[test]
 fn tab_complete_with_provider_prefix() {
-    // Resource types with provider prefix (e.g., "awscc.ec2.Vpc")
+    // ManagedResource types with provider prefix (e.g., "awscc.ec2.Vpc")
     let mut plan = Plan::new();
     plan.add(Effect::Create(
-        Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None).with_binding("vpc"),
+        ManagedResource::with_provider("awscc", "ec2.Vpc", "my-vpc", None).with_binding("vpc"),
     ));
     plan.add(Effect::Create(
-        Resource::with_provider("awscc", "ec2.Subnet", "my-subnet", None).with_binding("subnet"),
+        ManagedResource::with_provider("awscc", "ec2.Subnet", "my-subnet", None)
+            .with_binding("subnet"),
     ));
     let mut app = App::new(&plan, &SchemaRegistry::new());
     app.search_active = true;
@@ -632,7 +636,7 @@ fn format_value_resolves_dsl_enum_identifiers() {
 fn create_effect_attributes_resolve_enum_values() {
     let mut plan = Plan::new();
     plan.add(Effect::Create(
-        Resource::new("ec2.vpc_endpoint", "my-endpoint")
+        ManagedResource::new("ec2.vpc_endpoint", "my-endpoint")
             .with_attribute(
                 "vpc_endpoint_type",
                 Value::Concrete(ConcreteValue::String(
@@ -685,7 +689,7 @@ fn move_suppressed_when_update_exists_for_same_target() {
             .into_iter()
             .collect(),
         )),
-        to: Resource::new("s3.Bucket", "new-name").with_attribute(
+        to: ManagedResource::new("s3.Bucket", "new-name").with_attribute(
             "versioning",
             Value::Concrete(ConcreteValue::String("Enabled".to_string())),
         ),
@@ -716,7 +720,7 @@ fn move_suppressed_when_replace_exists_for_same_target() {
             .into_iter()
             .collect(),
         )),
-        to: Resource::new("ec2.Vpc", "new-vpc"),
+        to: ManagedResource::new("ec2.Vpc", "new-vpc"),
         directives: Directives::default(),
         changed_create_only: vec!["cidr".to_string()],
         cascading_updates: vec![],

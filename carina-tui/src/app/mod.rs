@@ -628,27 +628,19 @@ fn build_tree_structure(plan: &Plan, nodes: &mut [TreeNode]) {
 /// Shorten effect labels: strip provider prefix and use binding name or compact hint.
 fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
     for (idx, effect) in plan.effects().iter().enumerate() {
-        let resource = match effect {
-            Effect::Create(r) => Some(r),
-            Effect::Update { to, .. } => Some(to),
-            Effect::Replace { to, .. } => Some(to),
-            Effect::Read { resource } => Some(resource),
-            Effect::Delete { .. }
-            | Effect::Import { .. }
-            | Effect::Remove { .. }
-            | Effect::Move { .. }
-            | Effect::Wait { .. } => None,
-        };
+        // carina#3181 PR D: `Effect` payloads are typestate structs;
+        // reach them through the shared `ResourceLike` view.
+        let resource = effect.resource_like();
 
         if let Some(r) = resource {
-            let display_type = r.id.display_type();
-            let has_binding = r.binding.is_some();
+            let display_type = r.id().display_type();
+            let has_binding = r.binding().is_some();
 
             let name_part = if has_binding {
                 // For bound resources, show the binding name
-                r.binding
-                    .clone()
-                    .unwrap_or_else(|| r.id.name_str().to_string())
+                r.binding()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| r.id().name_str().to_string())
             } else {
                 // For anonymous resources, try to extract a compact hint
                 let parent_binding = nodes[idx].parent.and_then(|p_idx| {
@@ -656,23 +648,14 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
                     if let Effect::Delete { binding, .. } = p_effect {
                         return binding.clone();
                     }
-                    let p_resource = match p_effect {
-                        Effect::Create(r) => Some(r),
-                        Effect::Update { to, .. } => Some(to),
-                        Effect::Replace { to, .. } => Some(to),
-                        Effect::Read { resource } => Some(resource),
-                        Effect::Delete { .. }
-                        | Effect::Import { .. }
-                        | Effect::Remove { .. }
-                        | Effect::Move { .. }
-                        | Effect::Wait { .. } => None,
-                    };
-                    p_resource.and_then(|pr| pr.binding.clone())
+                    p_effect
+                        .resource_like()
+                        .and_then(|pr| pr.binding().map(str::to_string))
                 });
                 if let Some(hint) = extract_compact_hint(r, parent_binding.as_deref()) {
                     format!("({})", hint)
                 } else {
-                    r.id.name_str().to_string()
+                    r.id().name_str().to_string()
                 }
             };
 

@@ -376,6 +376,10 @@ pub(super) async fn execute_basic_effect<'a>(
 
     match basic {
         BasicEffect::Create { resource, .. } => {
+            // carina#3181 PR D: `BasicEffect::Create.resource` is a
+            // `ManagedResource`; the executor's resolve/renormalize
+            // pipeline still works in legacy `Resource`, so bridge here.
+            let resource = &Resource::from(resource);
             let resolved = match resolve_resource(resource, bindings, pipeline).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -436,6 +440,10 @@ pub(super) async fn execute_basic_effect<'a>(
             changed_attributes,
             ..
         } => {
+            // carina#3181 PR D: `BasicEffect::Update.to` is a
+            // `ManagedResource`; bridge to legacy `Resource` for the
+            // executor's resolve pipeline and the `unresolved` map.
+            let to = &Resource::from(to);
             let resolve_source = unresolved.get(id).unwrap_or(to);
             let resolved_to =
                 match resolve_resource_with_source(to, resolve_source, bindings, pipeline).await {
