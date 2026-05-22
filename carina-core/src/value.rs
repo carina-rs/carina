@@ -721,6 +721,39 @@ pub fn redact_secrets_in_resource(
     })
 }
 
+/// Redact all secrets in a [`ManagedResource`](crate::resource::ManagedResource).
+///
+/// carina#3181 PR D: `Effect` payloads are typestate structs, so the
+/// redaction pass needs a typed entry point per arm.
+pub fn redact_secrets_in_managed(
+    resource: &crate::resource::ManagedResource,
+) -> Result<crate::resource::ManagedResource, SerializationError> {
+    let attributes: Result<_, _> = resource
+        .attributes
+        .iter()
+        .map(|(k, e)| redact_secrets_in_value(e).map(|rv| (k.clone(), rv)))
+        .collect();
+    Ok(crate::resource::ManagedResource {
+        attributes: attributes?,
+        ..resource.clone()
+    })
+}
+
+/// Redact all secrets in a [`DataSource`](crate::resource::DataSource).
+pub fn redact_secrets_in_data_source(
+    resource: &crate::resource::DataSource,
+) -> Result<crate::resource::DataSource, SerializationError> {
+    let attributes: Result<_, _> = resource
+        .attributes
+        .iter()
+        .map(|(k, e)| redact_secrets_in_value(e).map(|rv| (k.clone(), rv)))
+        .collect();
+    Ok(crate::resource::DataSource {
+        attributes: attributes?,
+        ..resource.clone()
+    })
+}
+
 /// Redact all secrets in a `State`, returning a new State with secrets replaced by hashes.
 pub fn redact_secrets_in_state(
     state: &crate::resource::State,
@@ -741,9 +774,9 @@ pub fn redact_secrets_in_effect(
     use crate::effect::Effect;
     Ok(match effect {
         Effect::Read { resource } => Effect::Read {
-            resource: redact_secrets_in_resource(resource)?,
+            resource: redact_secrets_in_data_source(resource)?,
         },
-        Effect::Create(resource) => Effect::Create(redact_secrets_in_resource(resource)?),
+        Effect::Create(resource) => Effect::Create(redact_secrets_in_managed(resource)?),
         Effect::Update {
             id,
             from,
@@ -752,7 +785,7 @@ pub fn redact_secrets_in_effect(
         } => Effect::Update {
             id: id.clone(),
             from: Box::new(redact_secrets_in_state(from)?),
-            to: redact_secrets_in_resource(to)?,
+            to: redact_secrets_in_managed(to)?,
             changed_attributes: changed_attributes.clone(),
         },
         Effect::Replace {
@@ -767,7 +800,7 @@ pub fn redact_secrets_in_effect(
         } => Effect::Replace {
             id: id.clone(),
             from: Box::new(redact_secrets_in_state(from)?),
-            to: redact_secrets_in_resource(to)?,
+            to: redact_secrets_in_managed(to)?,
             directives: directives.clone(),
             changed_create_only: changed_create_only.clone(),
             temporary_name: temporary_name.clone(),
@@ -778,7 +811,7 @@ pub fn redact_secrets_in_effect(
                     Ok::<_, SerializationError>(crate::effect::CascadingUpdate {
                         id: cu.id.clone(),
                         from: Box::new(redact_secrets_in_state(&cu.from)?),
-                        to: redact_secrets_in_resource(&cu.to)?,
+                        to: redact_secrets_in_managed(&cu.to)?,
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?,

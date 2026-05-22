@@ -48,8 +48,8 @@ pub(super) fn build_dependency_map(
     let mut deps_of: HashMap<usize, HashSet<usize>> = HashMap::new();
     for (idx, effect) in effects.iter().enumerate() {
         let mut dep_indices = HashSet::new();
-        if let Some(resource) = effect.resource() {
-            resolver.collect_from_resource(resource, &mut dep_indices);
+        if let Some(resource) = effect.resource_as_legacy() {
+            resolver.collect_from_resource(&resource, &mut dep_indices);
             if let Some(unresolved) = unresolved_resources.get(effect.resource_id()) {
                 resolver.collect_from_resource(unresolved, &mut dep_indices);
             }
@@ -369,13 +369,17 @@ pub(super) async fn execute_effects_sequential(
                             };
                             observer.on_event(&ExecutionEvent::EffectStarted { effect });
 
+                            // carina#3181 PR D: bridge the `ManagedResource`
+                            // payload to legacy `Resource` for `ReplaceContext`.
+                            let to = Resource::from(to);
+
                             execute_replace_parallel(
                                 provider,
                                 &ReplaceContext {
                                     effect,
                                     id,
                                     from,
-                                    to,
+                                    to: &to,
                                     directives,
                                     cascading_updates,
                                     temporary_name: temporary_name.as_ref(),
@@ -613,8 +617,8 @@ mod tests {
         );
 
         let effects = vec![
-            Effect::Create(role.clone()),
-            Effect::Create(role_policy.clone()),
+            Effect::Create(role.clone().try_into().unwrap()),
+            Effect::Create(role_policy.clone().try_into().unwrap()),
         ];
 
         let mut unresolved: HashMap<ResourceId, Resource> = HashMap::new();

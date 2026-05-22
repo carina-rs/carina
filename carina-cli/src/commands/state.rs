@@ -345,7 +345,8 @@ async fn run_state_lookup(
 fn build_plan_from_state(state: &StateFile) -> Plan {
     let mut plan = Plan::new();
     for rs in &state.resources {
-        let mut resource = Resource::with_provider(
+        // carina#3181 PR D: `Effect::Read` carries a `DataSource`.
+        let mut resource = carina_core::resource::DataSource::with_provider(
             &rs.provider,
             &rs.resource_type,
             &rs.name,
@@ -364,7 +365,6 @@ fn build_plan_from_state(state: &StateFile) -> Plan {
             }
         }
 
-        resource.kind = carina_core::resource::ResourceKind::DataSource;
         plan.add(Effect::Read { resource });
     }
     plan
@@ -1283,9 +1283,9 @@ mod tests {
         let state = load_fixture_state();
         let plan = build_plan_from_state(&state);
 
-        let vpc_resource = plan.effects()[0].resource().unwrap();
-        assert!(vpc_resource.attributes.contains_key("cidr_block"));
-        assert!(vpc_resource.attributes.contains_key("vpc_id"));
+        let vpc_resource = plan.effects()[0].resource_like().unwrap();
+        assert!(vpc_resource.attributes().contains_key("cidr_block"));
+        assert!(vpc_resource.attributes().contains_key("vpc_id"));
     }
 
     #[test]
@@ -1301,10 +1301,10 @@ mod tests {
         let plan = build_plan_from_state(&state);
 
         // subnet depends on vpc
-        let subnet_resource = plan.effects()[1].resource().unwrap();
+        let subnet_resource = plan.effects()[1].resource_like().unwrap();
         assert_eq!(
-            subnet_resource.dependency_bindings,
-            std::collections::BTreeSet::from(["vpc".to_string()])
+            subnet_resource.dependency_bindings(),
+            &std::collections::BTreeSet::from(["vpc".to_string()])
         );
     }
 }

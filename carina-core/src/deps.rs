@@ -315,8 +315,14 @@ pub fn find_failed_dependency(
     effect: &Effect,
     failed_bindings: &HashSet<String>,
 ) -> Option<String> {
-    let resource = effect.resource()?;
-    let deps = get_resource_dependencies(resource);
+    // carina#3181 PR D: `Effect` payloads are typestate structs, so the
+    // dependency set is assembled from the `ResourceLike` view (value
+    // refs + `dependency_bindings`) plus the effect's explicit
+    // `depends_on` edges — the same union `get_resource_dependencies`
+    // computes for a legacy `Resource`.
+    let resource = effect.resource_like()?;
+    let mut deps = get_resource_value_ref_dependencies(resource);
+    deps.extend(effect.explicit_dependencies());
     deps.into_iter().find(|dep| failed_bindings.contains(dep))
 }
 
@@ -345,7 +351,7 @@ pub fn find_failed_dependent<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::{Directives, Resource, ResourceId, Value};
+    use crate::resource::{Directives, ManagedResource, Resource, ResourceId, Value};
 
     fn make_resource(binding: &str, deps: &[&str]) -> Resource {
         let mut r = Resource::new("test", binding);
@@ -487,7 +493,7 @@ mod tests {
     #[test]
     fn test_find_failed_dependency_direct() {
         let resource = make_resource("b", &["a"]);
-        let effect = Effect::Create(resource);
+        let effect = Effect::Create(ManagedResource::try_from(&resource).unwrap());
 
         let mut failed = HashSet::new();
         failed.insert("a".to_string());
@@ -499,7 +505,7 @@ mod tests {
     #[test]
     fn test_find_failed_dependency_none() {
         let resource = make_resource("b", &["a"]);
-        let effect = Effect::Create(resource);
+        let effect = Effect::Create(ManagedResource::try_from(&resource).unwrap());
 
         let failed: HashSet<String> = HashSet::new();
 
@@ -510,7 +516,7 @@ mod tests {
     #[test]
     fn test_find_failed_dependency_no_deps() {
         let resource = make_resource("a", &[]);
-        let effect = Effect::Create(resource);
+        let effect = Effect::Create(ManagedResource::try_from(&resource).unwrap());
 
         let mut failed = HashSet::new();
         failed.insert("x".to_string());
@@ -522,7 +528,7 @@ mod tests {
     #[test]
     fn test_find_failed_dependency_transitive_propagation() {
         let resource_c = make_resource("c", &["b"]);
-        let effect_c = Effect::Create(resource_c);
+        let effect_c = Effect::Create(ManagedResource::try_from(&resource_c).unwrap());
 
         let mut failed = HashSet::new();
         failed.insert("a".to_string());

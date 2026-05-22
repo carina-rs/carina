@@ -4,7 +4,9 @@ use crate::provider::{
     BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer, ProviderError, ProviderResult,
     ReadRequest, UpdateRequest,
 };
-use crate::resource::{ConcreteValue, DeferredValue, Directives, Resource, Value};
+use crate::resource::{
+    ConcreteValue, DataSource, DeferredValue, Directives, ManagedResource, Resource, Value,
+};
 use parallel::{build_dependency_levels, build_dependency_map};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -376,8 +378,8 @@ impl ProviderFactory for AliasFactory {
 // Helper functions
 // -----------------------------------------------------------------------
 
-fn make_resource(binding: &str, deps: &[&str]) -> Resource {
-    let mut r = Resource::new("test", binding);
+fn make_resource(binding: &str, deps: &[&str]) -> ManagedResource {
+    let mut r = ManagedResource::new("test", binding);
     r.binding = Some(binding.to_string());
     for dep in deps {
         r.set_attr(
@@ -520,7 +522,7 @@ async fn test_apply_reapplies_enum_alias_stage() {
     let rid = resource.id.clone();
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(resource));
+    plan.add(Effect::Create(resource.try_into().unwrap()));
     provider.push_create(Ok(ok_state(&rid)));
 
     let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(AliasFactory)];
@@ -577,7 +579,7 @@ async fn test_apply_reapplies_enum_alias_stage_update_path() {
     plan.add(Effect::Update {
         id: rid.clone(),
         from: Box::new(from_state),
-        to: to_resource,
+        to: to_resource.try_into().unwrap(),
         changed_attributes: vec!["ip_protocol".to_string()],
     });
     provider.push_update(Ok(ok_state(&rid)));
@@ -631,7 +633,7 @@ async fn test_apply_reapplies_canonicalize_stage() {
     let rid = resource.id.clone();
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(resource));
+    plan.add(Effect::Create(resource.try_into().unwrap()));
     provider.push_create(Ok(ok_state(&rid)));
 
     let input = ExecutionInput {
@@ -1016,7 +1018,7 @@ async fn test_cbd_creates_before_deletes() {
     plan.add(Effect::Replace {
         id: rid.clone(),
         from: Box::new(from),
-        to,
+        to: to.try_into().unwrap(),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -1063,7 +1065,7 @@ async fn test_dbd_deletes_before_creates() {
     plan.add(Effect::Replace {
         id: rid.clone(),
         from: Box::new(from),
-        to,
+        to: to.try_into().unwrap(),
         directives: Directives::default(),
         changed_create_only: vec!["attr".to_string()],
         cascading_updates: vec![],
@@ -1126,7 +1128,7 @@ async fn test_phased_cbd_creates_in_forward_order_deletes_in_reverse() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(vpc_from),
-        to: vpc_to,
+        to: vpc_to.try_into().unwrap(),
         directives: cbd_directives.clone(),
         changed_create_only: vec!["attr".to_string()],
         cascading_updates: vec![],
@@ -1136,7 +1138,7 @@ async fn test_phased_cbd_creates_in_forward_order_deletes_in_reverse() {
     plan.add(Effect::Replace {
         id: subnet_id.clone(),
         from: Box::new(subnet_from),
-        to: subnet_to,
+        to: subnet_to.try_into().unwrap(),
         directives: cbd_directives,
         changed_create_only: vec!["attr".to_string()],
         cascading_updates: vec![],
@@ -1202,7 +1204,7 @@ async fn test_phased_noncbd_creates_after_deletes() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(vpc_from),
-        to: vpc_to,
+        to: vpc_to.try_into().unwrap(),
         directives: dbd_directives.clone(),
         changed_create_only: vec!["attr".to_string()],
         cascading_updates: vec![],
@@ -1212,7 +1214,7 @@ async fn test_phased_noncbd_creates_after_deletes() {
     plan.add(Effect::Replace {
         id: subnet_id.clone(),
         from: Box::new(subnet_from),
-        to: subnet_to,
+        to: subnet_to.try_into().unwrap(),
         directives: dbd_directives,
         changed_create_only: vec!["attr".to_string()],
         cascading_updates: vec![],
@@ -1285,7 +1287,7 @@ async fn test_observer_events_emitted_correctly() {
 #[tokio::test]
 async fn test_read_effect_is_no_op() {
     let provider = MockProvider::new();
-    let resource = Resource::new("test", "data").with_read_only(true);
+    let resource = DataSource::new("test", "data");
 
     let mut plan = Plan::new();
     plan.add(Effect::Read { resource });
@@ -1523,12 +1525,12 @@ fn test_build_dependency_levels_transitive_ref_preserves_direct_dep() {
     rt.dependency_bindings = std::collections::BTreeSet::from(["vpc".to_string()]);
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(vpc)); // idx 0
-    plan.add(Effect::Create(tgw)); // idx 1
-    plan.add(Effect::Create(subnet)); // idx 2
-    plan.add(Effect::Create(tgw_attach)); // idx 3
-    plan.add(Effect::Create(rt)); // idx 4
-    plan.add(Effect::Create(route)); // idx 5
+    plan.add(Effect::Create(vpc.try_into().unwrap())); // idx 0
+    plan.add(Effect::Create(tgw.try_into().unwrap())); // idx 1
+    plan.add(Effect::Create(subnet.try_into().unwrap())); // idx 2
+    plan.add(Effect::Create(tgw_attach.try_into().unwrap())); // idx 3
+    plan.add(Effect::Create(rt.try_into().unwrap())); // idx 4
+    plan.add(Effect::Create(route.try_into().unwrap())); // idx 5
 
     let levels = build_dependency_levels(plan.effects(), &HashMap::new());
 
@@ -1958,8 +1960,8 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
     let subnet_id = subnet.id.clone();
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(vpc));
-    plan.add(Effect::Create(subnet));
+    plan.add(Effect::Create(vpc.try_into().unwrap()));
+    plan.add(Effect::Create(subnet.try_into().unwrap()));
 
     // VPC create returns state with vpc_id
     let vpc_state = State::existing(
@@ -2137,7 +2139,7 @@ async fn test_delete_waits_for_replace_cbd_of_dependent() {
     // tgw_b: Create (new resource)
     let mut tgw_b = Resource::new("test", "tgw_b");
     tgw_b.binding = Some("tgw_b".to_string());
-    plan.add(Effect::Create(tgw_b));
+    plan.add(Effect::Create(tgw_b.try_into().unwrap()));
 
     // tgw_a: Delete
     plan.add(Effect::Delete {
@@ -2153,7 +2155,7 @@ async fn test_delete_waits_for_replace_cbd_of_dependent() {
     plan.add(Effect::Replace {
         id: attachment_id.clone(),
         from: Box::new(attachment_from),
-        to: attachment_to,
+        to: attachment_to.try_into().unwrap(),
         directives: cbd_directives,
         changed_create_only: vec!["transit_gateway_id".to_string()],
         cascading_updates: vec![],
@@ -2230,7 +2232,7 @@ async fn test_delete_waits_for_replace_cbd_even_when_delete_binding_is_none() {
     // tgw_b: Create
     let mut tgw_b = Resource::new("test", "tgw_b");
     tgw_b.binding = Some("tgw_b".to_string());
-    plan.add(Effect::Create(tgw_b));
+    plan.add(Effect::Create(tgw_b.try_into().unwrap()));
 
     // tgw_a: Delete — binding is None (the key difference from the previous test)
     plan.add(Effect::Delete {
@@ -2246,7 +2248,7 @@ async fn test_delete_waits_for_replace_cbd_even_when_delete_binding_is_none() {
     plan.add(Effect::Replace {
         id: attachment_id.clone(),
         from: Box::new(attachment_from),
-        to: attachment_to,
+        to: attachment_to.try_into().unwrap(),
         directives: cbd_directives,
         changed_create_only: vec!["transit_gateway_id".to_string()],
         cascading_updates: vec![],
@@ -2463,7 +2465,7 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
         interval: std::time::Duration::from_millis(1),
         explicit_dependencies: std::collections::HashSet::new(),
     });
-    plan.add(Effect::Create(dist));
+    plan.add(Effect::Create(dist.try_into().unwrap()));
 
     // create cert → PENDING; wait polls read → PENDING → ISSUED+arn.
     let mut create_attrs = HashMap::new();
@@ -2667,8 +2669,8 @@ async fn test_chained_index_then_field_unresolved_at_apply_fails_with_clear_erro
     let record_id = record.id.clone();
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(cert));
-    plan.add(Effect::Create(record));
+    plan.add(Effect::Create(cert.try_into().unwrap()));
+    plan.add(Effect::Create(record.try_into().unwrap()));
 
     // Mirror the AWS RequestCertificate read-back race: the DVO list
     // is populated asynchronously by ACM after RequestCertificate
@@ -2820,8 +2822,8 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
     let record_id = record.id.clone();
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(cert));
-    plan.add(Effect::Create(record));
+    plan.add(Effect::Create(cert.try_into().unwrap()));
+    plan.add(Effect::Create(record.try_into().unwrap()));
 
     // Cert create returns post-read state with DVO populated. Shape
     // mirrors what `read_acm_certificate` inserts after aws#295.
@@ -3054,7 +3056,7 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
     let provider = IdentifierAwareProvider::new("cert-arn-real", created_state);
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(cert));
+    plan.add(Effect::Create(cert.try_into().unwrap()));
     plan.add(Effect::Wait {
         binding: "cert_issued".to_string(),
         target_id: cert_id.clone(),
@@ -3132,7 +3134,7 @@ async fn test_phased_move_with_interdependent_replace_does_not_panic() {
     plan.add(Effect::Replace {
         id: role_id.clone(),
         from: Box::new(role_from),
-        to: role_to,
+        to: role_to.try_into().unwrap(),
         directives: Directives::default(),
         changed_create_only: vec!["role_name".to_string()],
         cascading_updates: vec![],
@@ -3146,7 +3148,7 @@ async fn test_phased_move_with_interdependent_replace_does_not_panic() {
     plan.add(Effect::Replace {
         id: policy_new_id,
         from: Box::new(policy_from),
-        to: policy_to,
+        to: policy_to.try_into().unwrap(),
         directives: Directives::default(),
         changed_create_only: vec!["policy_name".to_string()],
         cascading_updates: vec![],

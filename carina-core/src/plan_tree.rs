@@ -9,7 +9,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::deps::get_resource_dependencies;
+use crate::deps::get_resource_value_ref_dependencies;
 use crate::effect::Effect;
 use crate::plan::Plan;
 use crate::resource::{ConcreteValue, DeferredValue, Value};
@@ -32,66 +32,79 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
     let mut effect_types: HashMap<usize, String> = HashMap::new();
 
     for (idx, effect) in plan.effects().iter().enumerate() {
-        let (resource, deps) = match effect {
-            Effect::Create(r) => (Some(r), get_resource_dependencies(r)),
-            Effect::Update { to, .. } => (Some(to), get_resource_dependencies(to)),
-            Effect::Replace { to, .. } => (Some(to), get_resource_dependencies(to)),
-            Effect::Read { resource } => (Some(resource), get_resource_dependencies(resource)),
-            Effect::Delete {
-                id,
-                binding,
-                dependencies,
-                ..
-            } => {
-                let deps = dependencies.clone();
-                if let Some(b) = binding {
-                    binding_to_effect.insert(b.clone(), idx);
-                    effect_bindings.insert(idx, b.clone());
-                } else {
+        let (resource, deps): (Option<&dyn crate::resource::ResourceLike>, HashSet<String>) =
+            match effect {
+                // carina#3181 PR D: `Create`/`Update`/`Replace`/`Read`
+                // all carry a typestate struct — reach them through the
+                // shared `ResourceLike` view, and assemble the dependency
+                // set from value refs + the effect's explicit depends_on.
+                Effect::Create(_)
+                | Effect::Update { .. }
+                | Effect::Replace { .. }
+                | Effect::Read { .. } => {
+                    let rl = effect.resource_like().expect("variant carries a resource");
+                    let mut deps = get_resource_value_ref_dependencies(rl);
+                    deps.extend(effect.explicit_dependencies());
+                    (Some(rl), deps)
+                }
+                Effect::Delete {
+                    id,
+                    binding,
+                    dependencies,
+                    ..
+                } => {
+                    let deps = dependencies.clone();
+                    if let Some(b) = binding {
+                        binding_to_effect.insert(b.clone(), idx);
+                        effect_bindings.insert(idx, b.clone());
+                    } else {
+                        let fallback = id.to_string();
+                        binding_to_effect.insert(fallback.clone(), idx);
+                        effect_bindings.insert(idx, fallback);
+                    }
+                    effect_types.insert(idx, id.resource_type.clone());
+                    effect_deps.insert(idx, deps);
+                    continue;
+                }
+                Effect::Import { id, .. } | Effect::Remove { id, .. } => {
                     let fallback = id.to_string();
                     binding_to_effect.insert(fallback.clone(), idx);
                     effect_bindings.insert(idx, fallback);
+                    effect_types.insert(idx, id.resource_type.clone());
+                    effect_deps.insert(idx, HashSet::new());
+                    continue;
                 }
-                effect_types.insert(idx, id.resource_type.clone());
-                effect_deps.insert(idx, deps);
-                continue;
-            }
-            Effect::Import { id, .. } | Effect::Remove { id, .. } => {
-                let fallback = id.to_string();
-                binding_to_effect.insert(fallback.clone(), idx);
-                effect_bindings.insert(idx, fallback);
-                effect_types.insert(idx, id.resource_type.clone());
-                effect_deps.insert(idx, HashSet::new());
-                continue;
-            }
-            Effect::Move { to, .. } => {
-                let fallback = to.to_string();
-                binding_to_effect.insert(fallback.clone(), idx);
-                effect_bindings.insert(idx, fallback);
-                effect_types.insert(idx, to.resource_type.clone());
-                effect_deps.insert(idx, HashSet::new());
-                continue;
-            }
-            Effect::Wait {
-                binding, target_id, ..
-            } => {
-                // The wait depends on its target binding so the tree
-                // shows the wait as a child of the resource it gates.
-                let mut deps = HashSet::new();
-                deps.insert(target_id.name_str().to_string());
-                binding_to_effect.insert(binding.clone(), idx);
-                effect_bindings.insert(idx, binding.clone());
-                effect_types.insert(idx, "wait".to_string());
-                effect_deps.insert(idx, deps);
-                continue;
-            }
-        };
+                Effect::Move { to, .. } => {
+                    let fallback = to.to_string();
+                    binding_to_effect.insert(fallback.clone(), idx);
+                    effect_bindings.insert(idx, fallback);
+                    effect_types.insert(idx, to.resource_type.clone());
+                    effect_deps.insert(idx, HashSet::new());
+                    continue;
+                }
+                Effect::Wait {
+                    binding, target_id, ..
+                } => {
+                    // The wait depends on its target binding so the tree
+                    // shows the wait as a child of the resource it gates.
+                    let mut deps = HashSet::new();
+                    deps.insert(target_id.name_str().to_string());
+                    binding_to_effect.insert(binding.clone(), idx);
+                    effect_bindings.insert(idx, binding.clone());
+                    effect_types.insert(idx, "wait".to_string());
+                    effect_deps.insert(idx, deps);
+                    continue;
+                }
+            };
 
         if let Some(r) = resource {
-            let binding = r.binding.clone().unwrap_or_else(|| r.id.to_string());
+            let binding = r
+                .binding()
+                .map(str::to_string)
+                .unwrap_or_else(|| r.id().to_string());
             binding_to_effect.insert(binding.clone(), idx);
             effect_bindings.insert(idx, binding);
-            effect_types.insert(idx, r.id.resource_type.clone());
+            effect_types.insert(idx, r.id().resource_type.clone());
         }
         effect_deps.insert(idx, deps);
     }
@@ -272,11 +285,11 @@ pub fn build_single_parent_tree(
 /// `parent_binding` is the binding name of the parent resource in the tree, used to
 /// skip ResourceRef attributes that redundantly reference the parent.
 pub fn extract_compact_hint(
-    resource: &crate::resource::Resource,
+    resource: &dyn crate::resource::ResourceLike,
     parent_binding: Option<&str>,
 ) -> Option<String> {
     let mut keys: Vec<_> = resource
-        .attributes
+        .attributes()
         .keys()
         .filter(|k| !k.starts_with('_'))
         .collect();
@@ -284,7 +297,7 @@ pub fn extract_compact_hint(
 
     // Priority 1: First distinguishing string attribute (most identifying)
     for key in &keys {
-        if let Some(Value::Concrete(ConcreteValue::String(s))) = resource.get_attr(key)
+        if let Some(Value::Concrete(ConcreteValue::String(s))) = resource.attributes().get(*key)
             && !s.is_empty()
         {
             let short_key = shorten_attr_name(key);
@@ -301,7 +314,7 @@ pub fn extract_compact_hint(
 
     // Priority 2: First non-parent ResourceRef attribute (direct or inside a List)
     for key in &keys {
-        match resource.get_attr(key) {
+        match resource.attributes().get(*key) {
             Some(Value::Deferred(DeferredValue::ResourceRef { path })) => {
                 if parent_binding == Some(path.binding()) {
                     continue;
@@ -369,8 +382,8 @@ mod tests {
         bucket.directives.depends_on = vec!["role".to_string()];
 
         let mut plan = Plan::new();
-        plan.add(Effect::Create(role));
-        plan.add(Effect::Create(bucket));
+        plan.add(Effect::Create(role.try_into().unwrap()));
+        plan.add(Effect::Create(bucket.try_into().unwrap()));
         let graph = build_dependency_graph(&plan);
 
         let bucket_idx = *graph

@@ -156,13 +156,16 @@ mod tests {
     use super::*;
     use carina_core::effect::Effect;
     use carina_core::plan::Plan;
-    use carina_core::resource::{ConcreteValue, Resource, Value};
+    use carina_core::resource::{ConcreteValue, ManagedResource, Value};
     use carina_core::schema::SchemaRegistry;
 
     #[test]
     fn tree_connector_root_has_no_prefix() {
         let mut plan = Plan::new();
-        plan.add(Effect::Create(Resource::new("s3.Bucket", "my-bucket")));
+        plan.add(Effect::Create(ManagedResource::new(
+            "s3.Bucket",
+            "my-bucket",
+        )));
         let app = App::new(&plan, &SchemaRegistry::new());
         assert_eq!(build_tree_connector(0, &app), "");
     }
@@ -171,7 +174,7 @@ mod tests {
     fn tree_connector_single_child() {
         let mut plan = Plan::new();
         plan.add(Effect::Create(
-            Resource::new("ec2.Vpc", "my-vpc")
+            ManagedResource::new("ec2.Vpc", "my-vpc")
                 .with_binding("vpc")
                 .with_attribute(
                     "cidr_block",
@@ -179,7 +182,7 @@ mod tests {
                 ),
         ));
         plan.add(Effect::Create(
-            Resource::new("ec2.Subnet", "my-subnet")
+            ManagedResource::new("ec2.Subnet", "my-subnet")
                 .with_binding("subnet")
                 .with_attribute(
                     "vpc_id",
@@ -197,10 +200,10 @@ mod tests {
     fn tree_connector_multiple_children() {
         let mut plan = Plan::new();
         plan.add(Effect::Create(
-            Resource::new("ec2.Vpc", "my-vpc").with_binding("vpc"),
+            ManagedResource::new("ec2.Vpc", "my-vpc").with_binding("vpc"),
         ));
         plan.add(Effect::Create(
-            Resource::new("ec2.Subnet", "subnet-a")
+            ManagedResource::new("ec2.Subnet", "subnet-a")
                 .with_binding("subnet_a")
                 .with_attribute(
                     "vpc_id",
@@ -208,7 +211,7 @@ mod tests {
                 ),
         ));
         plan.add(Effect::Create(
-            Resource::new("ec2.Subnet", "subnet-b")
+            ManagedResource::new("ec2.Subnet", "subnet-b")
                 .with_binding("subnet_b")
                 .with_attribute(
                     "vpc_id",

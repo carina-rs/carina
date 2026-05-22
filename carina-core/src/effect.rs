@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::resource::{Directives, Resource, ResourceId, State};
+use crate::resource::{DataSource, Directives, ManagedResource, ResourceId, ResourceLike, State};
 use crate::wait::predicate::WaitPredicate;
 
 /// Temporary name used during create-before-destroy replacement.
@@ -37,7 +37,7 @@ pub struct TemporaryName {
 pub struct CascadingUpdate {
     pub id: ResourceId,
     pub from: Box<State>,
-    pub to: Resource,
+    pub to: ManagedResource,
 }
 
 /// How an [`Effect::Wait`] obtains the cloud provider identifier its
@@ -82,16 +82,16 @@ pub enum WaitTarget {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Effect {
     /// Read the current state of a resource (data source)
-    Read { resource: Resource },
+    Read { resource: DataSource },
 
     /// Create a new resource
-    Create(Resource),
+    Create(ManagedResource),
 
     /// Update an existing resource
     Update {
         id: ResourceId,
         from: Box<State>,
-        to: Resource,
+        to: ManagedResource,
         /// Attribute names that changed (including removed attributes)
         changed_attributes: Vec<String>,
     },
@@ -100,7 +100,7 @@ pub enum Effect {
     Replace {
         id: ResourceId,
         from: Box<State>,
-        to: Resource,
+        to: ManagedResource,
         #[serde(default)]
         directives: Directives,
         /// Which create-only attributes forced the replacement
@@ -233,13 +233,13 @@ pub enum Effect {
 pub enum BasicEffect<'a> {
     Create {
         effect: &'a Effect,
-        resource: &'a Resource,
+        resource: &'a ManagedResource,
     },
     Update {
         effect: &'a Effect,
         id: &'a ResourceId,
         from: &'a State,
-        to: &'a Resource,
+        to: &'a ManagedResource,
         changed_attributes: &'a [String],
     },
     Delete {
@@ -284,8 +284,8 @@ impl Effect {
     ///
     /// ```compile_fail
     /// use carina_core::effect::{BasicEffect, Effect};
-    /// use carina_core::resource::Resource;
-    /// let effect = Effect::Create(Resource::new("test", "x"));
+    /// use carina_core::resource::ManagedResource;
+    /// let effect = Effect::Create(ManagedResource::new("test", "x"));
     /// // Was: a missed filter could pass a non-basic `&Effect` straight
     /// // into `execute_basic_effect` and trip `unreachable!()` at apply
     /// // time (carina#3164). The conversion no longer exists.
@@ -372,14 +372,57 @@ impl Effect {
         }
     }
 
-    /// Returns a reference to the resource for this effect, if it has one.
-    /// Delete, Import, Remove, Move, and Wait effects have no resource.
-    pub fn resource(&self) -> Option<&Resource> {
+    /// Returns a read-only [`ResourceLike`] view of the resource for this
+    /// effect, if it has one. Delete, Import, Remove, Move, and Wait
+    /// effects have no resource.
+    ///
+    /// carina#3181: the underlying payloads are typestate structs —
+    /// `Create`/`Update`/`Replace` carry a [`ManagedResource`], `Read`
+    /// carries a [`DataSource`]. Callers that need a concrete type match
+    /// the variant directly; this helper covers the shared
+    /// id/attributes/binding/dependency_bindings accessors.
+    pub fn resource_like(&self) -> Option<&dyn ResourceLike> {
         match self {
             Effect::Create(resource) => Some(resource),
             Effect::Update { to, .. } => Some(to),
             Effect::Replace { to, .. } => Some(to),
             Effect::Read { resource } => Some(resource),
+            Effect::Delete { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::Wait { .. } => None,
+        }
+    }
+
+    /// Bridge this effect's resource to a legacy [`Resource`], if it has
+    /// one. carina#3181 PR D: the payloads are typestate structs, but a
+    /// few executor/display call sites still want a `Resource` — this
+    /// rebuilds one via the `From<&ManagedResource>` / `From<&DataSource>`
+    /// bridges. Removed once those call sites are typestate-aware.
+    pub fn resource_as_legacy(&self) -> Option<crate::resource::Resource> {
+        match self {
+            Effect::Create(resource) => Some(resource.into()),
+            Effect::Update { to, .. } => Some(to.into()),
+            Effect::Replace { to, .. } => Some(to.into()),
+            Effect::Read { resource } => Some(resource.into()),
+            Effect::Delete { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::Wait { .. } => None,
+        }
+    }
+
+    /// Returns the `directives` block of this effect's resource, if it
+    /// has one. `Read` (data source) and the managed variants both carry
+    /// directives; state-only and `Wait` effects do not.
+    fn resource_directives(&self) -> Option<&Directives> {
+        match self {
+            Effect::Create(resource) => Some(&resource.directives),
+            Effect::Update { to, .. } => Some(&to.directives),
+            Effect::Replace { to, .. } => Some(&to.directives),
+            Effect::Read { resource } => Some(&resource.directives),
             Effect::Delete { .. }
             | Effect::Import { .. }
             | Effect::Remove { .. }
@@ -396,7 +439,8 @@ impl Effect {
         if let Effect::Wait { binding, .. } = self {
             return Some(binding.clone());
         }
-        self.resource().and_then(|r| r.binding.clone())
+        self.resource_like()
+            .and_then(|r| r.binding().map(str::to_string))
     }
 
     /// Returns the binding names this effect depends on **via explicit
@@ -413,8 +457,8 @@ impl Effect {
     /// State-only effects (Import, Remove, Move) return an empty set —
     /// they are scheduling primitives, not resource-state operations.
     pub fn explicit_dependencies(&self) -> HashSet<String> {
-        if let Some(res) = self.resource() {
-            return res.directives.depends_on.iter().cloned().collect();
+        if let Some(directives) = self.resource_directives() {
+            return directives.depends_on.iter().cloned().collect();
         }
         if let Effect::Delete {
             explicit_dependencies,
@@ -440,21 +484,21 @@ mod tests {
 
     #[test]
     fn read_is_not_mutating() {
-        let resource = Resource::new("test", "example").with_read_only(true);
+        let resource = DataSource::new("test", "example");
         let effect = Effect::Read { resource };
         assert!(!effect.is_mutating());
     }
 
     #[test]
     fn create_is_mutating() {
-        let resource = Resource::new("s3.Bucket", "my-bucket");
+        let resource = ManagedResource::new("s3.Bucket", "my-bucket");
         let effect = Effect::Create(resource);
         assert!(effect.is_mutating());
     }
 
     #[test]
     fn resource_id_returns_correct_id() {
-        let resource = Resource::new("s3.Bucket", "my-bucket").with_read_only(true);
+        let resource = DataSource::new("s3.Bucket", "my-bucket");
         let effect = Effect::Read {
             resource: resource.clone(),
         };
@@ -463,9 +507,9 @@ mod tests {
 
     #[test]
     fn resource_returns_some_for_create() {
-        let resource = Resource::new("s3.Bucket", "my-bucket");
+        let resource = ManagedResource::new("s3.Bucket", "my-bucket");
         let effect = Effect::Create(resource.clone());
-        assert_eq!(effect.resource().unwrap().id, resource.id);
+        assert_eq!(effect.resource_like().unwrap().id(), &resource.id);
     }
 
     #[test]
@@ -478,12 +522,12 @@ mod tests {
             dependencies: HashSet::new(),
             explicit_dependencies: std::collections::HashSet::new(),
         };
-        assert!(effect.resource().is_none());
+        assert!(effect.resource_like().is_none());
     }
 
     #[test]
     fn binding_name_returns_binding() {
-        let resource = Resource::new("test", "my_binding").with_binding("my_binding");
+        let resource = ManagedResource::new("test", "my_binding").with_binding("my_binding");
         let effect = Effect::Create(resource);
         assert_eq!(effect.binding_name(), Some("my_binding".to_string()));
     }
@@ -491,7 +535,7 @@ mod tests {
     #[test]
     fn binding_name_returns_none_without_binding() {
         use crate::resource::{ConcreteValue, Value};
-        let resource = Resource::new("test", "no_binding").with_attribute(
+        let resource = ManagedResource::new("test", "no_binding").with_attribute(
             "name",
             Value::Concrete(ConcreteValue::String("test".to_string())),
         );
@@ -505,9 +549,9 @@ mod tests {
         use std::collections::HashMap;
 
         let effects = vec![
-            Effect::Create(Resource::new("s3.Bucket", "my-bucket")),
+            Effect::Create(ManagedResource::new("s3.Bucket", "my-bucket")),
             Effect::Read {
-                resource: Resource::new("s3.Bucket", "existing").with_read_only(true),
+                resource: DataSource::new("s3.Bucket", "existing"),
             },
             Effect::Update {
                 id: ResourceId::new("s3.Bucket", "my-bucket"),
@@ -518,7 +562,7 @@ mod tests {
                         Value::Concrete(ConcreteValue::String("Disabled".to_string())),
                     )]),
                 )),
-                to: Resource::new("s3.Bucket", "my-bucket").with_attribute(
+                to: ManagedResource::new("s3.Bucket", "my-bucket").with_attribute(
                     "versioning",
                     Value::Concrete(ConcreteValue::String("Enabled".to_string())),
                 ),
@@ -533,13 +577,22 @@ mod tests {
                         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
                     )]),
                 )),
-                to: Resource::new("ec2.Vpc", "my-vpc").with_attribute(
+                to: ManagedResource::new("ec2.Vpc", "my-vpc").with_attribute(
                     "cidr_block",
                     Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
                 ),
                 directives: Directives::default(),
                 changed_create_only: vec!["cidr_block".to_string()],
-                cascading_updates: vec![],
+                // carina#3181 PR D: cover `CascadingUpdate.to:
+                // ManagedResource` in the serde round-trip.
+                cascading_updates: vec![CascadingUpdate {
+                    id: ResourceId::new("ec2.Subnet", "my-subnet"),
+                    from: Box::new(State::not_found(ResourceId::new("ec2.Subnet", "my-subnet"))),
+                    to: ManagedResource::new("ec2.Subnet", "my-subnet").with_attribute(
+                        "vpc_id",
+                        Value::Concrete(ConcreteValue::String("vpc.id".to_string())),
+                    ),
+                }],
                 temporary_name: None,
                 cascade_ref_hints: vec![],
             },
@@ -563,7 +616,7 @@ mod tests {
     #[test]
     fn explicit_dependencies_derived_from_resource_directives() {
         use crate::resource::Directives;
-        let mut bucket = Resource::new("s3.Bucket", "b");
+        let mut bucket = ManagedResource::new("s3.Bucket", "b");
         bucket.directives = Directives {
             depends_on: vec!["role".to_string(), "kms".to_string()],
             ..Directives::default()
@@ -745,7 +798,7 @@ mod tests {
         let rid = ResourceId::new("test", "x");
 
         // Basic variants must narrow.
-        let create = Effect::Create(Resource::new("test", "x"));
+        let create = Effect::Create(ManagedResource::new("test", "x"));
         assert!(matches!(
             create.as_basic(),
             Some(BasicEffect::Create { .. })
@@ -754,7 +807,7 @@ mod tests {
         let update = Effect::Update {
             id: rid.clone(),
             from: Box::new(ResState::not_found(rid.clone())),
-            to: Resource::new("test", "x"),
+            to: ManagedResource::new("test", "x"),
             changed_attributes: vec![],
         };
         assert!(matches!(
@@ -780,12 +833,12 @@ mod tests {
         // inside `as_basic` is what catches it at compile time; this
         // test catches misclassification of an existing variant.
         let read = Effect::Read {
-            resource: Resource::new("test", "x"),
+            resource: DataSource::new("test", "x"),
         };
         let replace = Effect::Replace {
             id: rid.clone(),
             from: Box::new(ResState::not_found(rid.clone())),
-            to: Resource::new("test", "x"),
+            to: ManagedResource::new("test", "x"),
             directives: Directives::default(),
             changed_create_only: vec![],
             cascading_updates: vec![],

@@ -28,7 +28,10 @@ pub(super) fn has_interdependent_replaces(effects: &[Effect]) -> bool {
 
     for effect in effects {
         if let Effect::Replace { to, .. } = effect {
-            for dep in get_resource_dependencies(to) {
+            // carina#3181 PR D: `Effect::Replace.to` is a
+            // `ManagedResource`; `get_resource_dependencies` still works
+            // in legacy `Resource` (it reads `directives.depends_on`).
+            for dep in get_resource_dependencies(&Resource::from(to)) {
                 if replace_bindings.contains(&dep) {
                     return true;
                 }
@@ -76,7 +79,7 @@ pub(super) fn topological_sort_replaces(
     for &idx in &replace_indices {
         let effect = &effects[idx];
         if let Effect::Replace { to, .. } = effect {
-            let dep_indices: Vec<usize> = get_resource_dependencies(to)
+            let dep_indices: Vec<usize> = get_resource_dependencies(&Resource::from(to))
                 .iter()
                 .filter(|b| replace_bindings.contains(b.as_str()))
                 .filter_map(|b| binding_to_idx.get(b))
@@ -158,8 +161,8 @@ pub(super) fn build_phase_dependency_map(
     for &idx in phase_indices {
         let mut dep_indices = HashSet::new();
         let effect = &effects[idx];
-        if let Some(resource) = effect.resource() {
-            resolver.collect_from_resource(resource, &mut dep_indices);
+        if let Some(resource) = effect.resource_as_legacy() {
+            resolver.collect_from_resource(&resource, &mut dep_indices);
             if let Some(unresolved) = unresolved_resources.get(effect.resource_id()) {
                 resolver.collect_from_resource(unresolved, &mut dep_indices);
             }
@@ -574,6 +577,10 @@ pub(super) async fn execute_effects_phased(
                         let started = Instant::now();
                         observer.on_event(&ExecutionEvent::EffectStarted { effect });
 
+                        // carina#3181 PR D: bridge the `ManagedResource`
+                        // payload to legacy `Resource` for the executor's
+                        // resolve pipeline and the `unresolved` map.
+                        let to = &Resource::from(to);
                         let resolve_source = unresolved.get(&to.id).unwrap_or(to);
                         let resolved = match resolve_resource_with_source(
                             to,
@@ -624,7 +631,7 @@ pub(super) async fn execute_effects_phased(
                                 let mut cascade_states = Vec::new();
                                 for cascade in cascading_updates {
                                     let resolved_to = match resolve_resource(
-                                        &cascade.to,
+                                        &Resource::from(&cascade.to),
                                         &local_bindings,
                                         &pipeline,
                                     )
@@ -760,9 +767,12 @@ pub(super) async fn execute_effects_phased(
                 } => {
                     let effect = &effects[idx];
                     if let Effect::Replace { to, .. } = effect {
+                        // carina#3181 PR D: `resolved_attributes` lives on
+                        // the legacy `Resource`; bridge the `ManagedResource`.
+                        let to_legacy = Resource::from(to);
                         input.bindings.record_applied(
                             to.binding.as_deref(),
-                            &to.resolved_attributes(),
+                            &to_legacy.resolved_attributes(),
                             &state,
                         );
                     }
@@ -847,8 +857,8 @@ pub(super) async fn execute_effects_phased(
         for &idx in &delete_indices {
             let effect = &effects[idx];
             let mut dep_indices = HashSet::new();
-            if let Some(resource) = effect.resource() {
-                resolver.collect_from_resource(resource, &mut dep_indices);
+            if let Some(resource) = effect.resource_as_legacy() {
+                resolver.collect_from_resource(&resource, &mut dep_indices);
                 if let Some(unresolved) = input.unresolved_resources.get(effect.resource_id()) {
                     resolver.collect_from_resource(unresolved, &mut dep_indices);
                 }
@@ -1178,6 +1188,10 @@ pub(super) async fn execute_effects_phased(
                         in_flight.push(Box::pin(async move {
                             if let Effect::Replace { to, .. } = effect {
                                 let started = effect_started;
+                                // carina#3181 PR D: bridge the
+                                // `ManagedResource` payload to legacy
+                                // `Resource` for the resolve pipeline.
+                                let to = &Resource::from(to);
                                 let resolve_source = unresolved.get(&to.id).unwrap_or(to);
                                 let resolved = match resolve_resource_with_source(
                                     to,
@@ -1369,8 +1383,8 @@ mod tests {
         );
 
         let effects = vec![
-            Effect::Create(role.clone()),
-            Effect::Create(role_policy.clone()),
+            Effect::Create(role.clone().try_into().unwrap()),
+            Effect::Create(role_policy.clone().try_into().unwrap()),
         ];
         let phase_indices: Vec<usize> = vec![0, 1];
 
@@ -1422,7 +1436,10 @@ mod tests {
             Value::resource_ref("outer", "role_name", vec![]),
         );
 
-        let effects = vec![Effect::Create(role.clone()), Effect::Create(caller.clone())];
+        let effects = vec![
+            Effect::Create(role.clone().try_into().unwrap()),
+            Effect::Create(caller.clone().try_into().unwrap()),
+        ];
         let phase_indices: Vec<usize> = vec![0, 1];
 
         let mut unresolved: HashMap<ResourceId, Resource> = HashMap::new();
@@ -1462,7 +1479,7 @@ mod tests {
         let role_replace = Effect::Replace {
             id: role.id.clone(),
             from: Box::new(role_state),
-            to: role.clone(),
+            to: role.clone().try_into().unwrap(),
             directives: Directives::default(),
             changed_create_only: vec!["role_name".to_string()],
             cascading_updates: vec![],
@@ -1472,7 +1489,7 @@ mod tests {
         let bucket_replace = Effect::Replace {
             id: bucket.id.clone(),
             from: Box::new(bucket_state),
-            to: bucket.clone(),
+            to: bucket.clone().try_into().unwrap(),
             directives: Directives::default(),
             changed_create_only: vec!["bucket_name".to_string()],
             cascading_updates: vec![],

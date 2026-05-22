@@ -56,6 +56,59 @@ pub struct DataSource {
     pub quoted_string_attrs: HashSet<String>,
 }
 
+impl DataSource {
+    /// Create a data source with an empty attribute map.
+    pub fn new(resource_type: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            id: ResourceId::new(resource_type, name),
+            attributes: IndexMap::new(),
+            directives: Directives::default(),
+            binding: None,
+            dependency_bindings: BTreeSet::new(),
+            module_source: None,
+            quoted_string_attrs: HashSet::new(),
+        }
+    }
+
+    /// Create a data source with a provider-qualified id.
+    pub fn with_provider(
+        provider: impl Into<String>,
+        resource_type: impl Into<String>,
+        name: impl Into<String>,
+        provider_instance: Option<String>,
+    ) -> Self {
+        Self {
+            id: ResourceId::with_provider(provider, resource_type, name, provider_instance),
+            attributes: IndexMap::new(),
+            directives: Directives::default(),
+            binding: None,
+            dependency_bindings: BTreeSet::new(),
+            module_source: None,
+            quoted_string_attrs: HashSet::new(),
+        }
+    }
+
+    /// Get an attribute value by key.
+    pub fn get_attr(&self, key: &str) -> Option<&Value> {
+        self.attributes.get(key)
+    }
+
+    /// Set an attribute value.
+    pub fn set_attr(&mut self, key: impl Into<String>, value: Value) {
+        self.attributes.insert(key.into(), value);
+    }
+
+    pub fn with_attribute(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.attributes.insert(key.into(), value);
+        self
+    }
+
+    pub fn with_binding(mut self, binding: impl Into<String>) -> Self {
+        self.binding = Some(binding.into());
+        self
+    }
+}
+
 impl TryFrom<&Resource> for DataSource {
     type Error = ResourceKindMismatch;
 
@@ -75,6 +128,17 @@ impl TryFrom<&Resource> for DataSource {
                 actual: res.kind.label(),
             }),
         }
+    }
+}
+
+/// Owned-`Resource` convenience over [`TryFrom<&Resource>`]. Symmetric
+/// with the `ManagedResource` impl; removed with the other transitional
+/// bridges when #3181 inline-merges `Resource`.
+impl TryFrom<Resource> for DataSource {
+    type Error = ResourceKindMismatch;
+
+    fn try_from(res: Resource) -> Result<Self, Self::Error> {
+        Self::try_from(&res)
     }
 }
 

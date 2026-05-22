@@ -18,6 +18,20 @@ use crate::wait::predicate::{AttrPath, WaitPredicate};
 
 use super::{Diff, diff};
 
+/// Bridge a legacy [`Resource`] to a [`ManagedResource`] at the
+/// differ/effect seam (carina#3181 PR D).
+///
+/// `Effect::Create` / `Update` / `Replace` and `CascadingUpdate` carry
+/// `ManagedResource`, but the differ's internal pipeline (`diff()`,
+/// `cascade_dependent_updates`'s unresolved set) still works in legacy
+/// `Resource`. Every resource that reaches a managed effect has already
+/// been classified as managed upstream, so the conversion cannot fail —
+/// `expect` documents that invariant.
+fn to_managed(resource: &Resource) -> ManagedResource {
+    ManagedResource::try_from(resource)
+        .expect("differ produced a non-managed resource for a managed effect")
+}
+
 /// A pending merge operation: cascade-triggered create-only attributes to add to an existing effect.
 struct CascadeMerge {
     resource_id: ResourceId,
@@ -196,7 +210,7 @@ pub fn create_plan(
     // longer reachable from this loop (carina#3179).
     for ds in data_sources {
         plan.add(Effect::Read {
-            resource: Resource::from(ds),
+            resource: ds.clone(),
         });
     }
 
@@ -228,7 +242,11 @@ pub fn create_plan(
         );
 
         match d {
-            Diff::Create(r) => plan.add(Effect::Create(r)),
+            // carina#3181 PR D: `Effect` payloads are typestate structs.
+            // `diff()` runs on a managed resource, so the legacy
+            // `Resource` it returns is always managed — bridge it to
+            // `ManagedResource` at the differ/effect seam.
+            Diff::Create(r) => plan.add(Effect::Create(to_managed(&r))),
             Diff::Update {
                 id,
                 from,
@@ -272,7 +290,7 @@ pub fn create_plan(
                     plan.add(Effect::Update {
                         id,
                         from,
-                        to,
+                        to: to_managed(&to),
                         changed_attributes,
                     });
                 } else {
@@ -314,7 +332,7 @@ pub fn create_plan(
                     plan.add(Effect::Replace {
                         id,
                         from,
-                        to,
+                        to: to_managed(&to),
                         directives,
                         changed_create_only,
                         cascading_updates: vec![],
@@ -808,7 +826,7 @@ pub fn cascade_dependent_updates(
                         .push(CascadingUpdate {
                             id: unresolved.id.clone(),
                             from: Box::new(from),
-                            to: (*unresolved).clone(),
+                            to: to_managed(unresolved),
                         });
                 } else if unresolved.directives.prevent_destroy {
                     // Cascade would promote to Replace (destroy + recreate),
@@ -842,7 +860,7 @@ pub fn cascade_dependent_updates(
                     promoted_replaces.push(Effect::Replace {
                         id: unresolved.id.clone(),
                         from: Box::new(from),
-                        to: (*unresolved).clone(),
+                        to: to_managed(unresolved),
                         directives: unresolved.directives.clone(),
                         changed_create_only: create_only_refs,
                         cascading_updates: vec![],

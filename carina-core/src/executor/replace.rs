@@ -156,8 +156,12 @@ pub(super) async fn execute_cbd_replace_parallel(
             // Execute cascading updates
             let mut cascade_failed = false;
             for cascade in ctx.cascading_updates {
-                let resolved_to = match resolve_resource(&cascade.to, &local_bindings, ctx.pipeline)
-                    .await
+                let resolved_to = match resolve_resource(
+                    &crate::resource::Resource::from(&cascade.to),
+                    &local_bindings,
+                    ctx.pipeline,
+                )
+                .await
                 {
                     Ok(r) => r,
                     Err(e) => {
