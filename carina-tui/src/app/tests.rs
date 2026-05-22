@@ -564,7 +564,7 @@ fn tab_complete_matches_middle_of_word() {
 
 #[test]
 fn tab_complete_with_provider_prefix() {
-    // ManagedResource types with provider prefix (e.g., "awscc.ec2.Vpc")
+    // Resource types with provider prefix (e.g., "awscc.ec2.Vpc")
     let mut plan = Plan::new();
     plan.add(Effect::Create(
         ManagedResource::with_provider("awscc", "ec2.Vpc", "my-vpc", None).with_binding("vpc"),

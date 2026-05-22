@@ -3,7 +3,7 @@ use super::*;
 use indexmap::IndexMap;
 
 use crate::explicit::ExplicitFields;
-use crate::resource::{ConcreteValue, ResourceKind};
+use crate::resource::ConcreteValue;
 
 /// Build an `ExplicitFields::Struct` whose children are all `Leaf` —
 /// the shape `state v5 → v6` reads produce, and a convenient way to
@@ -22,7 +22,7 @@ fn explicit_top_level(keys: &[&str]) -> ExplicitFields {
 fn create_before_destroy_generates_temporary_name_for_name_attribute() {
     use crate::schema::{AttributeSchema, AttributeType};
 
-    let mut resource = Resource::new("s3.Bucket", "my-bucket")
+    let mut resource = ManagedResource::new("s3.Bucket", "my-bucket")
         .with_attribute(
             "bucket_name",
             Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
@@ -61,10 +61,9 @@ fn create_before_destroy_generates_temporary_name_for_name_attribute() {
             .with_name_attribute("bucket_name"),
     );
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources,
+        &[],
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -108,7 +107,7 @@ fn create_before_destroy_generates_temporary_name_for_name_attribute() {
 fn create_before_destroy_generates_temporary_name_with_can_rename() {
     use crate::schema::{AttributeSchema, AttributeType};
 
-    let mut resource = Resource::new("logs.LogGroup", "my-log-group")
+    let mut resource = ManagedResource::new("logs.LogGroup", "my-log-group")
         .with_attribute(
             "log_group_name".to_string(),
             Value::Concrete(ConcreteValue::String("my-log-group".to_string())),
@@ -148,10 +147,9 @@ fn create_before_destroy_generates_temporary_name_with_can_rename() {
             .with_name_attribute("log_group_name"),
     );
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources,
+        &[],
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -180,7 +178,7 @@ fn no_temporary_name_without_create_before_destroy() {
 
     // Default directives (create_before_destroy = false)
     let resources = vec![
-        Resource::new("s3.Bucket", "my-bucket")
+        ManagedResource::new("s3.Bucket", "my-bucket")
             .with_attribute(
                 "bucket_name",
                 Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
@@ -217,10 +215,9 @@ fn no_temporary_name_without_create_before_destroy() {
             .with_name_attribute("bucket_name"),
     );
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources,
+        &[],
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -246,7 +243,7 @@ fn no_temporary_name_without_create_before_destroy() {
 fn no_temporary_name_when_name_prefix_is_used() {
     use crate::schema::{AttributeSchema, AttributeType};
 
-    let mut resource = Resource::new("s3.Bucket", "my-bucket")
+    let mut resource = ManagedResource::new("s3.Bucket", "my-bucket")
         .with_attribute(
             "bucket_name",
             Value::Concrete(ConcreteValue::String("my-app-abc12345".to_string())),
@@ -289,10 +286,9 @@ fn no_temporary_name_when_name_prefix_is_used() {
             .with_name_attribute("bucket_name"),
     );
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources,
+        &[],
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -318,7 +314,7 @@ fn no_temporary_name_when_name_prefix_is_used() {
 fn no_temporary_name_without_name_attribute_in_schema() {
     use crate::schema::{AttributeSchema, AttributeType};
 
-    let mut resource = Resource::new("ec2.Vpc", "my-vpc").with_attribute(
+    let mut resource = ManagedResource::new("ec2.Vpc", "my-vpc").with_attribute(
         "cidr_block",
         Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
     );
@@ -345,10 +341,9 @@ fn no_temporary_name_without_name_attribute_in_schema() {
         // No name_attribute set
     );
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources,
+        &[],
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -376,7 +371,7 @@ fn no_temporary_name_when_name_attribute_changes() {
 
     // name_attribute itself changed: old-bucket → new-bucket
     // No temporary name needed since names are already different
-    let mut resource = Resource::new("s3.Bucket", "my-bucket")
+    let mut resource = ManagedResource::new("s3.Bucket", "my-bucket")
         .with_attribute(
             "bucket_name",
             Value::Concrete(ConcreteValue::String("new-bucket".to_string())),
@@ -415,10 +410,9 @@ fn no_temporary_name_when_name_attribute_changes() {
             .with_name_attribute("bucket_name"),
     );
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources,
+        &[],
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -443,7 +437,7 @@ fn no_temporary_name_when_name_attribute_changes() {
 #[test]
 fn diff_detects_attribute_removal_with_prev_desired_keys() {
     // User previously had "region" and "tags" in .crn, now only has "region"
-    let desired = Resource::new("s3.Bucket", "test").with_attribute(
+    let desired = ManagedResource::new("s3.Bucket", "test").with_attribute(
         "region",
         Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
     );
@@ -484,7 +478,7 @@ fn diff_detects_attribute_removal_with_prev_desired_keys() {
 fn diff_ignores_attributes_not_in_prev_desired_keys() {
     // Current state has "arn" and "region" from provider, but user only ever
     // specified "region" — "arn" was never in prev_desired_keys
-    let desired = Resource::new("s3.Bucket", "test");
+    let desired = ManagedResource::new("s3.Bucket", "test");
 
     let mut current_attrs = HashMap::new();
     current_attrs.insert(
@@ -539,7 +533,7 @@ fn server_default_struct_field_does_not_appear_in_diff() {
             Value::Concrete(ConcreteValue::Map(rule))
         }])),
     );
-    let desired = Resource::new("s3.Bucket", "test").with_attribute(
+    let desired = ManagedResource::new("s3.Bucket", "test").with_attribute(
         "lifecycle_configuration",
         Value::Concrete(ConcreteValue::Map(desired_lc.clone())),
     );
@@ -592,7 +586,7 @@ fn explicit_top_level_removal_still_detected() {
     // gone from desired but still authored in prev_explicit) must
     // still produce an Update. This is the existing "explicit unset"
     // mechanism; the projection logic must not regress it.
-    let desired = Resource::new("s3.Bucket", "test");
+    let desired = ManagedResource::new("s3.Bucket", "test");
 
     let mut current_attrs = HashMap::new();
     current_attrs.insert(
@@ -624,7 +618,7 @@ fn explicit_top_level_removal_still_detected() {
 #[test]
 fn diff_no_change_without_prev_desired_keys() {
     // Without prev_desired_keys, removed attributes should NOT be detected
-    let desired = Resource::new("s3.Bucket", "test").with_attribute(
+    let desired = ManagedResource::new("s3.Bucket", "test").with_attribute(
         "region",
         Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
     );
@@ -653,9 +647,9 @@ fn diff_no_change_without_prev_desired_keys() {
 
 #[test]
 fn create_plan_detects_attribute_removal() {
-    // Resource in .crn has no "tags", but current state (from AWS) has tags.
+    // ManagedResource in .crn has no "tags", but current state (from AWS) has tags.
     // prev_desired_keys indicates user previously had "region" and "tags".
-    let resources = vec![Resource::new("s3.Bucket", "test").with_attribute(
+    let resources = vec![ManagedResource::new("s3.Bucket", "test").with_attribute(
         "region",
         Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
     )];
@@ -684,10 +678,9 @@ fn create_plan_detects_attribute_removal() {
         explicit_top_level(&["region", "tags"]),
     );
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources,
+        &[],
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -710,7 +703,7 @@ fn create_plan_filters_non_removable_attribute_removal() {
     use crate::schema::{AttributeSchema, AttributeType};
     // When schema is available, only removable attributes should trigger removal.
     // "region" is not removable, "tags" is removable.
-    let resources = vec![Resource::new("s3.Bucket", "test").with_attribute(
+    let resources = vec![ManagedResource::new("s3.Bucket", "test").with_attribute(
         "region",
         Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
     )];
@@ -752,10 +745,9 @@ fn create_plan_filters_non_removable_attribute_removal() {
             )),
     );
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources,
+        &[],
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -788,7 +780,7 @@ fn create_plan_skips_update_when_only_non_removable_removal() {
     use crate::schema::{AttributeSchema, AttributeType};
     // When the only "change" is a non-removable attribute removal,
     // the plan should have no effects (no spurious Update).
-    let resources = vec![Resource::new("s3.Bucket", "test").with_attribute(
+    let resources = vec![ManagedResource::new("s3.Bucket", "test").with_attribute(
         "bucket",
         Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
     )];
@@ -823,10 +815,9 @@ fn create_plan_skips_update_when_only_non_removable_removal() {
             .attribute(AttributeSchema::new("region", AttributeType::String).non_removable()),
     );
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources,
+        &[],
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -846,7 +837,7 @@ fn create_plan_skips_update_when_only_non_removable_removal() {
 #[test]
 fn diff_skips_internal_attributes_in_removal_detection() {
     // prev_desired_keys includes "_internal" but it should be skipped
-    let desired = Resource::new("s3.Bucket", "test").with_attribute(
+    let desired = ManagedResource::new("s3.Bucket", "test").with_attribute(
         "region",
         Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
     );
@@ -936,9 +927,9 @@ fn prevent_destroy_blocks_delete_for_orphaned_resource() {
 fn prevent_destroy_blocks_replace() {
     use crate::schema::{AttributeSchema, AttributeType};
 
-    // Resource with prevent_destroy that has a create-only attribute change
+    // ManagedResource with prevent_destroy that has a create-only attribute change
     // (which would normally trigger a Replace)
-    let mut resource = Resource::new("ec2.Vpc", "my-vpc").with_attribute(
+    let mut resource = ManagedResource::new("ec2.Vpc", "my-vpc").with_attribute(
         "cidr_block",
         Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
     );
@@ -964,10 +955,9 @@ fn prevent_destroy_blocks_replace() {
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
     );
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources,
+        &[],
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -999,9 +989,9 @@ fn prevent_destroy_blocks_replace() {
 
 #[test]
 fn prevent_destroy_does_not_block_update() {
-    // Resource with prevent_destroy that has a normal (non-create-only) attribute change
+    // ManagedResource with prevent_destroy that has a normal (non-create-only) attribute change
     // Updates don't destroy the resource, so they should be allowed
-    let mut resource = Resource::new("s3.Bucket", "my-bucket").with_attribute(
+    let mut resource = ManagedResource::new("s3.Bucket", "my-bucket").with_attribute(
         "versioning",
         Value::Concrete(ConcreteValue::String("Enabled".to_string())),
     );
@@ -1020,10 +1010,9 @@ fn prevent_destroy_does_not_block_update() {
         State::existing(ResourceId::new("s3.Bucket", "my-bucket"), attrs),
     );
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources,
+        &[],
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -1050,9 +1039,9 @@ fn prevent_destroy_does_not_block_update() {
 
 #[test]
 fn prevent_destroy_does_not_block_create() {
-    // Resource with prevent_destroy that doesn't exist yet
+    // ManagedResource with prevent_destroy that doesn't exist yet
     // Creates don't destroy anything, so they should be allowed
-    let mut resource = Resource::new("s3.Bucket", "my-bucket").with_attribute(
+    let mut resource = ManagedResource::new("s3.Bucket", "my-bucket").with_attribute(
         "bucket",
         Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
     );
@@ -1060,10 +1049,9 @@ fn prevent_destroy_does_not_block_create() {
 
     let resources = vec![resource];
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources,
+        &[],
         &HashMap::new(), // no current states (resource doesn't exist)
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -1185,45 +1173,11 @@ fn prevent_destroy_collects_multiple_errors() {
     );
 }
 
-#[test]
-fn virtual_resources_are_skipped_in_plan() {
-    // Virtual resources (module attribute containers) should not generate any effects
-    let mut virtual_resource = Resource::new("_virtual", "web").with_kind(ResourceKind::Virtual);
-
-    virtual_resource.virtual_module = Some(("web_tier".to_string(), "web".to_string()));
-    virtual_resource.binding = Some("web".to_string());
-    virtual_resource.set_attr(
-        "security_group".to_string(),
-        Value::Concrete(ConcreteValue::String("sg-123".to_string())),
-    );
-
-    let real_resource = Resource::new("ec2.SecurityGroup", "sg").with_attribute(
-        "group_name",
-        Value::Concrete(ConcreteValue::String("my-sg".to_string())),
-    );
-
-    let resources = vec![virtual_resource, real_resource];
-
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
-    let plan = create_plan(
-        &managed___,
-        &data_sources___,
-        &HashMap::new(),
-        &HashMap::new(),
-        &SchemaRegistry::new(),
-        &HashMap::new(),
-        &HashMap::new(),
-        &HashMap::new(),
-        &[],
-    );
-
-    // Only the real resource should generate an effect (Create)
-    assert_eq!(plan.effects().len(), 1);
-    assert_eq!(
-        plan.effects()[0].resource_id(),
-        &ResourceId::new("ec2.SecurityGroup", "sg")
-    );
-}
+// carina#3181: the former `virtual_resources_are_skipped_in_plan` test
+// is obsolete — `create_plan` now takes a `&[ManagedResource]` /
+// `&[DataSource]` pair, so a `VirtualResource` cannot be passed into the
+// plan input at all. The "virtuals produce no effect" invariant is now
+// enforced by the type system rather than a runtime skip.
 
 #[test]
 fn wait_binding_lowers_to_wait_effect() {
@@ -1231,11 +1185,11 @@ fn wait_binding_lowers_to_wait_effect() {
     use crate::parser::{UntilPredicateAst, WaitBinding};
     use crate::wait::predicate::{AttrPath, WaitPredicate};
 
-    let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
+    let cert = ManagedResource::new("acm.Certificate", "cert").with_binding("cert");
     // A downstream consumer that references the wait binding and is
     // itself a pending change (Create) — carina#3101: the wait is
     // emitted only when it gates a real downstream change.
-    let mut consumer = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
+    let mut consumer = ManagedResource::new("cloudfront.Distribution", "dist").with_binding("dist");
     consumer
         .dependency_bindings
         .insert("cert_issued".to_string());
@@ -1256,10 +1210,9 @@ fn wait_binding_lowers_to_wait_effect() {
         line: 1,
     };
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources,
+        &[],
         &HashMap::new(),
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -1312,10 +1265,10 @@ fn wait_uses_schema_default_timeout_when_omitted() {
     use crate::parser::{UntilPredicateAst, WaitBinding};
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
+    let cert = ManagedResource::new("acm.Certificate", "cert").with_binding("cert");
     // Downstream consumer with a pending change so the wait gates
     // something (carina#3101).
-    let mut consumer = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
+    let mut consumer = ManagedResource::new("cloudfront.Distribution", "dist").with_binding("dist");
     consumer
         .dependency_bindings
         .insert("cert_issued".to_string());
@@ -1343,10 +1296,9 @@ fn wait_uses_schema_default_timeout_when_omitted() {
         line: 1,
     };
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources,
+        &[],
         &HashMap::new(),
         &HashMap::new(),
         &schemas,
@@ -1373,7 +1325,7 @@ fn wait_uses_schema_default_timeout_when_omitted() {
 fn wait_with_unknown_target_emits_plan_error() {
     use crate::parser::{UntilPredicateAst, WaitBinding};
 
-    let resources: Vec<Resource> = vec![];
+    let resources: Vec<ManagedResource> = vec![];
 
     let wait = WaitBinding {
         binding: "cert_issued".into(),
@@ -1388,10 +1340,9 @@ fn wait_with_unknown_target_emits_plan_error() {
         line: 1,
     };
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources,
+        &[],
         &HashMap::new(),
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -1421,8 +1372,8 @@ fn wait_omitted_when_all_consumers_unchanged() {
     use crate::effect::Effect;
     use crate::parser::{UntilPredicateAst, WaitBinding};
 
-    let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
-    let mut dist = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
+    let cert = ManagedResource::new("acm.Certificate", "cert").with_binding("cert");
+    let mut dist = ManagedResource::new("cloudfront.Distribution", "dist").with_binding("dist");
     dist.dependency_bindings.insert("cert_issued".to_string());
     let resources = vec![cert, dist];
 
@@ -1454,10 +1405,9 @@ fn wait_omitted_when_all_consumers_unchanged() {
         line: 1,
     };
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources,
+        &[],
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -1487,9 +1437,9 @@ fn wait_emitted_when_a_consumer_has_a_pending_change() {
     use crate::effect::Effect;
     use crate::parser::{UntilPredicateAst, WaitBinding};
 
-    let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
+    let cert = ManagedResource::new("acm.Certificate", "cert").with_binding("cert");
     // `dist` is new (absent from current_states) → Create → mutating.
-    let mut dist = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
+    let mut dist = ManagedResource::new("cloudfront.Distribution", "dist").with_binding("dist");
     dist.dependency_bindings.insert("cert_issued".to_string());
     let resources = vec![cert, dist];
 
@@ -1506,10 +1456,9 @@ fn wait_emitted_when_a_consumer_has_a_pending_change() {
         line: 1,
     };
 
-    let (managed___, data_sources___) = crate::differ::split_resources_by_kind(&resources);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources,
+        &[],
         &HashMap::new(),
         &HashMap::new(),
         &SchemaRegistry::new(),

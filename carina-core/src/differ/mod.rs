@@ -8,7 +8,7 @@ mod plan;
 
 use std::collections::HashMap;
 
-use crate::resource::{Resource, ResourceId, State, Value};
+use crate::resource::{ManagedResource, ResourceId, State, Value};
 use crate::schema::ResourceSchema;
 
 pub use plan::{cascade_dependent_updates, create_plan};
@@ -34,18 +34,18 @@ pub(crate) use comparison::type_aware_equal;
 /// Result of a diff operation
 #[derive(Debug, Clone, PartialEq)]
 pub enum Diff {
-    /// Resource does not exist -> needs creation
-    Create(Resource),
-    /// Resource exists with differences -> needs update
+    /// ManagedResource does not exist -> needs creation
+    Create(ManagedResource),
+    /// ManagedResource exists with differences -> needs update
     Update {
         id: ResourceId,
         from: Box<State>,
-        to: Resource,
+        to: ManagedResource,
         changed_attributes: Vec<String>,
     },
-    /// Resource exists with no differences -> no action needed
+    /// ManagedResource exists with no differences -> no action needed
     NoChange(ResourceId),
-    /// Resource exists but not in desired state -> needs deletion
+    /// ManagedResource exists but not in desired state -> needs deletion
     Delete(ResourceId),
 }
 
@@ -67,7 +67,7 @@ impl Diff {
 /// If `schema` is provided, type-aware comparison is used (e.g., Int/Float coercion,
 /// case-insensitive enum matching).
 pub fn diff(
-    desired: &Resource,
+    desired: &ManagedResource,
     current: &State,
     saved: Option<&HashMap<String, Value>>,
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
@@ -96,50 +96,6 @@ pub fn diff(
             changed_attributes: changed,
         }
     }
-}
-
-/// Split a legacy `[Resource]` mix into the typed slices that
-/// [`create_plan`] now requires (carina#3179).
-///
-/// Virtuals are dropped — they are post-apply attribute containers and
-/// never participate in differ logic. Used by tests and other callers
-/// that still hold an unsorted `Vec<Resource>` while wiring/parser
-/// migration to typed inputs proceeds.
-pub fn split_resources_by_kind(
-    resources: &[Resource],
-) -> (
-    Vec<crate::resource::ManagedResource>,
-    Vec<crate::resource::DataSource>,
-) {
-    let (managed, data_sources, _virtuals) = split_resources_by_kind_with_virtuals(resources);
-    (managed, data_sources)
-}
-
-/// Like [`split_resources_by_kind`], but also returns the virtual slice
-/// instead of dropping it. Used by callers that need to handle all
-/// three kinds (inference binding map, validation diagnostics, etc.)
-/// so the `match resource.kind` per-iteration check is replaced by a
-/// single typed split at the top of the function (carina#3180).
-pub fn split_resources_by_kind_with_virtuals(
-    resources: &[Resource],
-) -> (
-    Vec<crate::resource::ManagedResource>,
-    Vec<crate::resource::DataSource>,
-    Vec<crate::resource::VirtualResource>,
-) {
-    let mut managed = Vec::new();
-    let mut data_sources = Vec::new();
-    let mut virtuals = Vec::new();
-    for r in resources {
-        if let Ok(ds) = crate::resource::DataSource::try_from(r) {
-            data_sources.push(ds);
-        } else if let Ok(v) = crate::resource::VirtualResource::try_from(r) {
-            virtuals.push(v);
-        } else if let Ok(m) = crate::resource::ManagedResource::try_from(r) {
-            managed.push(m);
-        }
-    }
-    (managed, data_sources, virtuals)
 }
 
 #[cfg(test)]

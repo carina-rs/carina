@@ -15,7 +15,7 @@ use carina_core::executor::{ExecutionInput, ExecutionResult};
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ReadRequest};
 use carina_core::resolver::resolve_refs_with_state_and_remote;
-use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, ManagedResource, ResourceId, State, Value};
 use carina_core::value::format_value;
 use carina_state::{LockInfo, StateBackend, StateFile, resolve_backend};
 
@@ -64,11 +64,13 @@ pub async fn execute_effects(
     schemas: &carina_core::schema::SchemaRegistry,
     bindings: &mut ResolvedBindings,
     current_states: &mut HashMap<ResourceId, State>,
-    unresolved_resources: &HashMap<ResourceId, Resource>,
+    unresolved_resources: &HashMap<ResourceId, ManagedResource>,
+    virtual_resources: &[carina_core::resource::VirtualResource],
 ) -> ApplyResult {
     let input = ExecutionInput {
         plan,
         unresolved_resources,
+        virtual_resources,
         bindings: std::mem::take(bindings),
         current_states: std::mem::take(current_states),
         normalizer,
@@ -302,6 +304,7 @@ pub(crate) async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), 
         state.exports = resolve_exports(
             params,
             input.sorted_resources,
+            input.data_sources,
             input.pre_resolve_virtuals,
             &state,
             input.wait_aliases,
@@ -353,11 +356,13 @@ pub async fn save_state_unlocked(
 /// Used when `plan.is_empty()` short-circuits apply: resources don't need
 /// any work, but exports may have changed. Rebuild the exports from the
 /// current state + desired `export_params` and write the state.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn persist_exports_only(
     backend: &dyn StateBackend,
     lock: Option<&LockInfo>,
     state_file: Option<StateFile>,
-    sorted_resources: &[Resource],
+    sorted_resources: &[ManagedResource],
+    data_sources: &[carina_core::resource::DataSource],
     pre_resolve_virtuals: &[carina_core::resource::VirtualResource],
     export_params: &[carina_core::parser::InferredExportParam],
     wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
@@ -366,6 +371,7 @@ pub(crate) async fn persist_exports_only(
     let exports = resolve_exports(
         export_params,
         sorted_resources,
+        data_sources,
         pre_resolve_virtuals,
         &state,
         wait_aliases,
@@ -386,7 +392,7 @@ pub(crate) async fn persist_exports_only(
 /// Returns `Ok(None)` if no drift is detected, or `Ok(Some(messages))` with drift details.
 /// Returns `Err` if a resource is missing from planned_states or if a provider read fails.
 pub async fn detect_drift(
-    sorted_resources: &[Resource],
+    sorted_resources: &[ManagedResource],
     planned_states: &HashMap<ResourceId, State>,
     provider: &dyn Provider,
 ) -> Result<Option<Vec<String>>, AppError> {
@@ -394,13 +400,9 @@ pub async fn detect_drift(
     let mut drift_messages: Vec<String> = Vec::new();
 
     for resource in sorted_resources {
-        // Skip virtual resources (module attribute containers).
-        // Typed kind gate (carina#3180): the drift check operates over
-        // provider-backed kinds only.
-        if carina_core::resource::VirtualResource::try_from(resource).is_ok() {
-            continue;
-        }
-
+        // carina#3181: `sorted_resources` is managed-only — drift
+        // detection only operates over provider-backed managed
+        // resources.
         let planned_state = planned_states.get(&resource.id);
         let identifier = planned_state.and_then(|s| s.identifier.as_deref());
 
@@ -475,7 +477,7 @@ pub async fn detect_drift(
             }
         } else {
             return Err(AppError::Config(format!(
-                "Resource {} is present in plan but missing from planned states. \
+                "ManagedResource {} is present in plan but missing from planned states. \
                  The plan file may be corrupted. Please re-run 'carina plan'.",
                 resource.id
             )));
@@ -813,12 +815,12 @@ async fn run_apply_locked(
     // source (e.g. `let cert`) is a normal top-level resource already
     // here and refreshed by phase 1, only the loop's generated children
     // are added later.
-    // carina#3181: `parsed.resources` is managed-only; rebuild the mixed
-    // legacy view (managed + virtual + data source) for the dependency
-    // sort and the StringEnum-lift passes below so data sources still
-    // reach `split_resources_by_kind` / `create_plan`.
-    let all_top_level_resources = parsed.legacy_top_level_resources();
-    let mut sorted_resources = sort_resources_by_dependencies(&all_top_level_resources)?;
+    // carina#3181: `parsed.resources` is managed-only and
+    // `parsed.data_sources` holds the `read`-keyword resources. Only
+    // managed resources are dependency-sorted; data sources are
+    // refreshed in a later phase against the populated `current_states`.
+    let mut sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
+    let data_sources: Vec<carina_core::resource::DataSource> = parsed.data_sources.clone();
 
     // Build state-file-derived maps up front so anonymous → let-bound
     // rename transfer (#1685) can run between refresh phases 1 and 2.
@@ -832,7 +834,7 @@ async fn run_apply_locked(
     // desired against un-lifted saved state. Same seam as the plan path.
     carina_core::utils::lift_saved_state_string_enums(
         &mut saved_attrs,
-        &all_top_level_resources,
+        &sorted_resources,
         ctx.schemas(),
     );
     let mut prev_explicit = state_file
@@ -867,33 +869,32 @@ async fn run_apply_locked(
         })
         .unwrap_or_default();
 
-    // Phase 1: refresh managed (non-data-source) resources in parallel.
-    // Typed kind gate (carina#3180).
-    let phase1_results: Vec<Result<(ResourceId, State), AppError>> = stream::iter(
-        sorted_resources
-            .iter()
-            .filter(|r| carina_core::resource::ManagedResource::try_from(*r).is_ok()),
-    )
-    .map(|resource| {
-        let progress = RefreshProgress::begin_multi(&multi, &resource.id);
-        let identifier = state_file
-            .as_ref()
-            .and_then(|sf| sf.get_identifier_for_resource(resource));
-        let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
-        async move {
-            let mut state = read_with_retry(provider_ref, &resource.id, identifier.as_deref())
-                .await
-                .map_err(AppError::Provider)?;
-            if let Some(deps) = dep_bindings {
-                state.dependency_bindings = deps;
-            }
-            progress.finish();
-            Ok((resource.id.clone(), state))
-        }
-    })
-    .buffer_unordered(5)
-    .collect()
-    .await;
+    // Phase 1: refresh managed resources in parallel. carina#3181:
+    // `sorted_resources` is managed-only — data sources are refreshed in
+    // phase 2 below.
+    let phase1_results: Vec<Result<(ResourceId, State), AppError>> =
+        stream::iter(sorted_resources.iter())
+            .map(|resource| {
+                let progress = RefreshProgress::begin_multi(&multi, &resource.id);
+                let identifier = state_file
+                    .as_ref()
+                    .and_then(|sf| sf.get_identifier_for_resource(resource));
+                let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
+                async move {
+                    let mut state =
+                        read_with_retry(provider_ref, &resource.id, identifier.as_deref())
+                            .await
+                            .map_err(AppError::Provider)?;
+                    if let Some(deps) = dep_bindings {
+                        state.dependency_bindings = deps;
+                    }
+                    progress.finish();
+                    Ok((resource.id.clone(), state))
+                }
+            })
+            .buffer_unordered(5)
+            .collect()
+            .await;
     for result in phase1_results {
         let (id, state) = result?;
         current_states.insert(id, state);
@@ -987,6 +988,7 @@ async fn run_apply_locked(
     // and refresh them via `read_data_source` (#1683, #1685).
     let resolved_data_sources = resolve_data_source_refs_for_refresh(
         &sorted_resources,
+        &data_sources,
         &current_states,
         &remote_bindings,
         ctx.schemas(),
@@ -1093,7 +1095,12 @@ async fn run_apply_locked(
     // populated `current_states` by here.
     carina_core::utils::lift_current_state_string_enums(
         &mut current_states,
-        &all_top_level_resources,
+        &sorted_resources,
+        ctx.schemas(),
+    );
+    carina_core::utils::lift_current_state_string_enums_for_data_sources(
+        &mut current_states,
+        &data_sources,
         ctx.schemas(),
     );
 
@@ -1106,10 +1113,10 @@ async fn run_apply_locked(
     // virtual ref is frozen at the pre-apply value and `state.exports`
     // captures stale data after any Replace on a referenced managed
     // resource.
-    let pre_resolve_virtuals: Vec<carina_core::resource::VirtualResource> = sorted_resources
-        .iter()
-        .filter_map(|r| carina_core::resource::VirtualResource::try_from(r).ok())
-        .collect();
+    // carina#3181: virtual resources live in `parsed.virtual_resources`
+    // as their own typed slice.
+    let pre_resolve_virtuals: Vec<carina_core::resource::VirtualResource> =
+        parsed.virtual_resources.clone();
 
     // Resolve references and enum identifiers, then create initial plan for display
     let mut resources_for_plan = sorted_resources.clone();
@@ -1120,9 +1127,25 @@ async fn run_apply_locked(
         &wait_aliases,
     )?;
 
+    // Resolve data-source input refs and canonicalize, so each `read`
+    // resource flows into `create_plan` with concrete attribute values
+    // (carina#3181).
+    let mut data_sources_for_plan = data_sources.clone();
+    carina_core::resolver::resolve_data_source_refs(
+        &mut data_sources_for_plan,
+        &resources_for_plan,
+        &current_states,
+        &remote_bindings,
+        &wait_aliases,
+    )?;
+
     // Type-level canonicalization for `Union[String, list(String)]`
     // fields (IAM-style `string_or_list_of_strings`). See #2481, #2511.
     carina_core::value::canonicalize_resources_with_schemas(&mut resources_for_plan, ctx.schemas());
+    carina_core::value::canonicalize_data_sources_with_schemas(
+        &mut data_sources_for_plan,
+        ctx.schemas(),
+    );
     // Same for actual-state side (#2481, #2513).
     carina_core::value::canonicalize_states_with_schemas(&mut current_states, ctx.schemas());
 
@@ -1141,10 +1164,8 @@ async fn run_apply_locked(
         .map(|sf| sf.build_directives())
         .unwrap_or_default();
     let schemas = ctx.schemas();
-    let (managed_for_plan, data_sources_for_plan) =
-        carina_core::differ::split_resources_by_kind(&resources_for_plan);
     let mut plan = create_plan(
-        &managed_for_plan,
+        &resources_for_plan,
         &data_sources_for_plan,
         &current_states,
         &directives_map,
@@ -1157,9 +1178,7 @@ async fn run_apply_locked(
 
     // Populate cascading updates for create_before_destroy Replace effects.
     // Uses unresolved resources (sorted_resources) so dependents retain ResourceRef values.
-    let (unresolved_managed, _unresolved_ds) =
-        carina_core::differ::split_resources_by_kind(&sorted_resources);
-    cascade_dependent_updates(&mut plan, &unresolved_managed, &current_states, schemas);
+    cascade_dependent_updates(&mut plan, &sorted_resources, &current_states, schemas);
 
     // Add state block effects (import/removed/moved) to the plan
     crate::wiring::add_state_block_effects(
@@ -1231,20 +1250,18 @@ async fn run_apply_locked(
             .cyan()
         );
         // No-op apply path: virtuals were never resolved (no head-of-
-        // pipeline pass ran), so `sorted_resources` still carries
-        // the authored `ResourceRef` snapshots. Pull pre-resolve
-        // virtuals straight from it — same shape `resolve_exports`
-        // expects from the post-apply path.
+        // pipeline pass ran). carina#3181: virtuals live in
+        // `parsed.virtual_resources` and still carry the authored
+        // `ResourceRef` snapshots — the shape `resolve_exports` expects
+        // from the post-apply path.
         let pre_resolve_virtuals_noop: Vec<carina_core::resource::VirtualResource> =
-            sorted_resources
-                .iter()
-                .filter_map(|r| carina_core::resource::VirtualResource::try_from(r).ok())
-                .collect();
+            parsed.virtual_resources.clone();
         persist_exports_only(
             backend,
             lock,
             state_file,
             &sorted_resources,
+            &data_sources,
             &pre_resolve_virtuals_noop,
             &parsed.export_params,
             &wait_aliases,
@@ -1308,7 +1325,7 @@ async fn run_apply_locked(
     println!();
 
     // Build unresolved resource map for re-resolution at apply time
-    let unresolved_resources: HashMap<ResourceId, Resource> = sorted_resources
+    let unresolved_resources: HashMap<ResourceId, ManagedResource> = sorted_resources
         .iter()
         .map(|r| (r.id.clone(), r.clone()))
         .collect();
@@ -1326,6 +1343,7 @@ async fn run_apply_locked(
         &mut bindings,
         &mut current_states,
         &unresolved_resources,
+        &parsed.virtual_resources,
     )
     .await;
 
@@ -1344,6 +1362,7 @@ async fn run_apply_locked(
         result: &result,
         state_file,
         sorted_resources: &resources_for_plan,
+        data_sources: &data_sources_for_plan,
         current_states: &current_states,
         plan: &plan,
         backend,
@@ -1646,7 +1665,7 @@ async fn run_apply_from_plan_locked(
     println!();
 
     // Build unresolved resource map for re-resolution at apply time
-    let unresolved_resources: HashMap<ResourceId, Resource> = sorted_resources
+    let unresolved_resources: HashMap<ResourceId, ManagedResource> = sorted_resources
         .iter()
         .map(|r| (r.id.clone(), r.clone()))
         .collect();
@@ -1663,6 +1682,9 @@ async fn run_apply_from_plan_locked(
         &mut bindings,
         &mut current_states,
         &unresolved_resources,
+        // Saved plan files do not persist virtual resources; the
+        // `apply --plan` path has no post-expansion virtual slice.
+        &[],
     )
     .await;
 
@@ -1680,6 +1702,9 @@ async fn run_apply_from_plan_locked(
         result: &result,
         state_file,
         sorted_resources,
+        // No export resolution runs from the `apply --plan` path, so an
+        // empty data-source slice is correct here.
+        data_sources: &[],
         current_states: &current_states,
         plan,
         backend,

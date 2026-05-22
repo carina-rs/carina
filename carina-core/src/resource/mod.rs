@@ -1,4 +1,4 @@
-//! Resource - Representing resources and their state
+//! ManagedResource - Representing resources and their state
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -79,7 +79,7 @@ pub struct ResourceId {
     pub provider: String,
     /// Resource type (e.g., "s3.Bucket", "ec2.Instance")
     pub resource_type: String,
-    /// Resource name (identifier specified in DSL).
+    /// ManagedResource name (identifier specified in DSL).
     ///
     /// `Pending` means the resource is anonymous and the `name`
     /// attribute has not yet been promoted into the `ResourceId`.
@@ -1131,11 +1131,11 @@ impl Value {
     }
 }
 
-/// Project an `IndexMap<String, Value>` (the shape `Resource.attributes`
+/// Project an `IndexMap<String, Value>` (the shape `ManagedResource.attributes`
 /// uses since #2222) into a plain `HashMap<String, Value>` for callers
 /// that only need key-based lookup (state merging, ResourceRef
 /// resolution, provider trait inputs). Source-order is dropped on
-/// purpose at this boundary — keep it on `Resource.attributes` itself
+/// purpose at this boundary — keep it on `ManagedResource.attributes` itself
 /// when iteration order matters.
 ///
 /// Despite the historical name (the helper used to operate on the now-removed
@@ -1573,9 +1573,9 @@ pub struct Directives {
 /// Source of a resource (root or from a module)
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ModuleSource {
-    /// Resource defined at the root level
+    /// ManagedResource defined at the root level
     Root,
-    /// Resource from a module instantiation
+    /// ManagedResource from a module instantiation
     Module {
         /// Module name (e.g., "web_tier")
         name: String,
@@ -1599,31 +1599,9 @@ impl ModuleSource {
     }
 }
 
-/// Classification of a resource in the IR.
-///
-/// Carina#3181 (step 2) flattened `Virtual { module_name, instance }`
-/// to a bare variant; the (`module_name`, `instance`) pair now lives on
-/// the [`Resource`] struct as `virtual_module: Option<(String, String)>`.
-/// The discriminator stays load-bearing while [`Effect`] payloads carry
-/// `Resource` (next step); both go away when the full inline-merge
-/// lands.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub enum ResourceKind {
-    /// A managed infrastructure resource with full CRUD lifecycle.
-    #[default]
-    Managed,
-    /// A virtual resource created by the module resolver to expose module attributes.
-    /// Virtual resources are not sent to providers; they exist only in the IR.
-    /// Pair with `Resource::virtual_module` for the originating module
-    /// data.
-    Virtual,
-    /// A data source (read-only) that is queried but not managed
-    DataSource,
-}
-
-/// Desired state declared in DSL
+/// A managed infrastructure resource declared in DSL.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Resource {
+pub struct ManagedResource {
     pub id: ResourceId,
     /// Source-order preserving map of attribute name → expression.
     ///
@@ -1632,9 +1610,6 @@ pub struct Resource {
     /// re-renders attributes — diagnostic messages, formatter output,
     /// plan display, snapshot tests — depends on this stability (#2222).
     pub attributes: IndexMap<String, Value>,
-    /// Classification of this resource (managed, virtual, or data source)
-    #[serde(default)]
-    pub kind: ResourceKind,
     /// `directives` meta-argument block: Carina-side instructions for
     /// how to handle this resource (force-delete, create-before-destroy,
     /// prevent-destroy).
@@ -1661,7 +1636,7 @@ pub struct Resource {
     /// Top-level attribute names whose value was written as a quoted
     /// string literal (`attr = "..."`) in the source `.crn`.
     ///
-    /// **Why on `Resource`, not on `Value`:** the alternative is a
+    /// **Why on `ManagedResource`, not on `Value`:** the alternative is a
     /// `Value::QuotedString` variant, but that ripples through every
     /// `match` arm in the codebase. Co-locating the bit with the
     /// owning resource is enough for the only consumer that needs it
@@ -1669,33 +1644,24 @@ pub struct Resource {
     /// radius. Sharing a struct with the attributes also makes the
     /// lookup rename-proof: there is no separate identifier keying
     /// the metadata, so `compute_anonymous_identifiers` can rewrite
-    /// `Resource.id.name` freely (#2229).
+    /// `ManagedResource.id.name` freely (#2229).
     ///
     /// Parse-time only; `#[serde(skip)]` keeps it out of state.
     #[serde(default, skip)]
     pub quoted_string_attrs: HashSet<String>,
-    /// For virtual resources, the `(module_name, instance)` data
-    /// previously encoded in `ResourceKind::Virtual { module_name,
-    /// instance }`. Hoisted to a struct field so the discriminant
-    /// can be flattened to a plain enum (carina#3181 step 1). Only
-    /// `Some` when `kind == ResourceKind::Virtual`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub virtual_module: Option<(String, String)>,
 }
 
-impl Resource {
+impl ManagedResource {
     pub fn new(resource_type: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             id: ResourceId::new(resource_type, name),
             attributes: IndexMap::new(),
-            kind: ResourceKind::Managed,
             directives: Directives::default(),
             prefixes: HashMap::new(),
             binding: None,
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             quoted_string_attrs: HashSet::new(),
-            virtual_module: None,
         }
     }
 
@@ -1708,14 +1674,12 @@ impl Resource {
         Self {
             id: ResourceId::with_provider(provider, resource_type, name, provider_instance),
             attributes: IndexMap::new(),
-            kind: ResourceKind::Managed,
             directives: Directives::default(),
             prefixes: HashMap::new(),
             binding: None,
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             quoted_string_attrs: HashSet::new(),
-            virtual_module: None,
         }
     }
 
@@ -1756,18 +1720,6 @@ impl Resource {
         self
     }
 
-    pub fn with_read_only(mut self, read_only: bool) -> Self {
-        if read_only {
-            self.kind = ResourceKind::DataSource;
-        }
-        self
-    }
-
-    pub fn with_kind(mut self, kind: ResourceKind) -> Self {
-        self.kind = kind;
-        self
-    }
-
     pub fn with_binding(mut self, binding: impl Into<String>) -> Self {
         self.binding = Some(binding.into());
         self
@@ -1781,20 +1733,6 @@ impl Resource {
     pub fn with_module_source(mut self, source: ModuleSource) -> Self {
         self.module_source = Some(source);
         self
-    }
-
-    /// Returns true if this resource is a data source (read-only)
-    pub fn is_data_source(&self) -> bool {
-        matches!(self.kind, ResourceKind::DataSource)
-    }
-
-    /// Returns true if this resource is a virtual resource (module attribute container).
-    ///
-    /// Virtual resources are created by the module resolver to expose module
-    /// `attributes` values as a structured record. They should not be sent to
-    /// providers for reading, creating, or updating.
-    pub fn is_virtual(&self) -> bool {
-        matches!(self.kind, ResourceKind::Virtual)
     }
 }
 
@@ -1810,7 +1748,7 @@ pub struct State {
     /// Binding names this resource depended on when it was last applied.
     /// Used by the executor to determine delete ordering during replace operations.
     ///
-    /// Set semantics (BTreeSet) — see Resource::dependency_bindings (#2228).
+    /// Set semantics (BTreeSet) — see ManagedResource::dependency_bindings (#2228).
     pub dependency_bindings: BTreeSet<String>,
 }
 
@@ -1850,62 +1788,12 @@ impl State {
 mod tests;
 
 #[cfg(test)]
-mod typestate_tests;
-
-#[cfg(test)]
 mod resource_like_tests;
 
 pub mod data_source;
-pub mod managed;
 pub mod resource_like;
 pub mod virtual_resource;
 
 pub use data_source::DataSource;
-pub use managed::ManagedResource;
 pub use resource_like::ResourceLike;
 pub use virtual_resource::VirtualResource;
-
-/// Type-level label for the three resource arms.
-///
-/// Used by [`ResourceKindMismatch`] (the `TryFrom<&Resource>` error)
-/// and [`ResourceKind::label`]. Encoding the label as an enum — rather
-/// than a `&'static str` — means a typo in any `expected:` / `actual:`
-/// initializer is a compile error, not a runtime mismatch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ResourceKindLabel {
-    Managed,
-    Virtual,
-    DataSource,
-}
-
-impl std::fmt::Display for ResourceKindLabel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Managed => "Managed",
-            Self::Virtual => "Virtual",
-            Self::DataSource => "DataSource",
-        })
-    }
-}
-
-impl ResourceKind {
-    /// Project this kind onto its `ResourceKindLabel`, discarding any
-    /// payload (`module_name` / `instance` for `Virtual`).
-    pub fn label(&self) -> ResourceKindLabel {
-        match self {
-            Self::Managed => ResourceKindLabel::Managed,
-            Self::Virtual { .. } => ResourceKindLabel::Virtual,
-            Self::DataSource => ResourceKindLabel::DataSource,
-        }
-    }
-}
-
-/// Error returned by `TryFrom<&Resource>` impls on
-/// [`ManagedResource`], [`VirtualResource`], and [`DataSource`] when
-/// the source `Resource`'s `kind` does not match the requested target.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("expected {expected} resource, got {actual}")]
-pub struct ResourceKindMismatch {
-    pub expected: ResourceKindLabel,
-    pub actual: ResourceKindLabel,
-}

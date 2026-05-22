@@ -15,11 +15,13 @@ use crate::parser::{
     is_static_value, next_pair, parse_expression, parse_module_call, parse_read_resource_expr,
     parse_resource_expr,
 };
-use crate::resource::{ConcreteValue, Resource, Value};
+use crate::resource::{ConcreteValue, DataSource, ManagedResource, Value};
 
-/// Result of parsing an if expression body: a resource, a module call, or a value
+/// Result of parsing an if expression body: a managed resource, a data
+/// source, a module call, or a value.
 pub(crate) enum IfBodyResult {
-    Resource(Box<Resource>),
+    ManagedResource(Box<ManagedResource>),
+    DataSource(Box<DataSource>),
     ModuleCall(ModuleCall),
     Value(Value),
 }
@@ -80,7 +82,13 @@ pub(crate) fn parse_if_expr(
     } else {
         // No else clause and condition is false: produce nothing
         let ref_value = Value::Concrete(ConcreteValue::String(format!("${{if:{}}}", binding_name)));
-        Ok((EvalValue::from_value(ref_value), vec![], vec![], None))
+        Ok((
+            EvalValue::from_value(ref_value),
+            vec![],
+            vec![],
+            vec![],
+            None,
+        ))
     }
 }
 
@@ -92,19 +100,36 @@ pub(crate) fn parse_if_body_to_rhs(
 ) -> Result<LetBindingRhs, ParseError> {
     let result = parse_if_body(pair, ctx, binding_name)?;
     match result {
-        IfBodyResult::Resource(r) => {
+        IfBodyResult::ManagedResource(r) => {
             let ref_value =
                 Value::Concrete(ConcreteValue::String(format!("${{{}}}", binding_name)));
-            Ok((EvalValue::from_value(ref_value), vec![*r], vec![], None))
+            Ok((
+                EvalValue::from_value(ref_value),
+                vec![*r],
+                vec![],
+                vec![],
+                None,
+            ))
+        }
+        IfBodyResult::DataSource(d) => {
+            let ref_value =
+                Value::Concrete(ConcreteValue::String(format!("${{{}}}", binding_name)));
+            Ok((
+                EvalValue::from_value(ref_value),
+                vec![],
+                vec![*d],
+                vec![],
+                None,
+            ))
         }
         IfBodyResult::ModuleCall(c) => {
             let value = Value::Concrete(ConcreteValue::String(format!(
                 "${{module:{}}}",
                 c.module_name
             )));
-            Ok((EvalValue::from_value(value), vec![], vec![c], None))
+            Ok((EvalValue::from_value(value), vec![], vec![], vec![c], None))
         }
-        IfBodyResult::Value(v) => Ok((EvalValue::from_value(v), vec![], vec![], None)),
+        IfBodyResult::Value(v) => Ok((EvalValue::from_value(v), vec![], vec![], vec![], None)),
     }
 }
 
@@ -131,11 +156,11 @@ pub(crate) fn parse_if_body(
             }
             Rule::resource_expr => {
                 let resource = parse_resource_expr(inner, &local_ctx, binding_name)?;
-                return Ok(IfBodyResult::Resource(Box::new(resource)));
+                return Ok(IfBodyResult::ManagedResource(Box::new(resource)));
             }
             Rule::read_resource_expr => {
-                let resource = parse_read_resource_expr(inner, &local_ctx, binding_name)?;
-                return Ok(IfBodyResult::Resource(Box::new(resource)));
+                let data_source = parse_read_resource_expr(inner, &local_ctx, binding_name)?;
+                return Ok(IfBodyResult::DataSource(Box::new(data_source)));
             }
             Rule::module_call => {
                 let mut call = parse_module_call(inner, &local_ctx)?;

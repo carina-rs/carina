@@ -9,8 +9,8 @@ use indexmap::IndexMap;
 
 use crate::binding_index::ResolvedBindings;
 use crate::resource::{
-    ConcreteValue, DeferredValue, InterpolationPart, ManagedResource, Resource, ResourceId, State,
-    Value, VirtualResource, contains_resource_ref, peel_secrets, rewrap_secrets,
+    ConcreteValue, DataSource, DeferredValue, InterpolationPart, ManagedResource, ResourceId,
+    State, Value, VirtualResource, contains_resource_ref, peel_secrets, rewrap_secrets,
 };
 
 /// Resolve all ResourceRef values in resources using current state.
@@ -26,7 +26,7 @@ use crate::resource::{
 /// Each entry maps an upstream_state binding name to a map of resource binding names
 /// to their attributes. For example, `network -> { vpc -> { vpc_id -> "vpc-123" } }`.
 pub fn resolve_refs_with_state(
-    resources: &mut [Resource],
+    resources: &mut [ManagedResource],
     current_states: &HashMap<ResourceId, State>,
 ) -> Result<(), String> {
     resolve_refs_with_state_and_remote(resources, current_states, &HashMap::new(), &[])
@@ -36,7 +36,7 @@ pub fn resolve_refs_with_state(
 /// upstream state bindings. `wait_aliases` makes `<wait-binding>.<attr>`
 /// resolve to `<target>.<attr>` (carina#3085 passthrough).
 pub fn resolve_refs_with_state_and_remote(
-    resources: &mut [Resource],
+    resources: &mut [ManagedResource],
     current_states: &HashMap<ResourceId, State>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     wait_aliases: &[crate::binding_index::WaitAliasSpec],
@@ -59,7 +59,7 @@ pub fn resolve_refs_with_state_and_remote(
 /// instead of the raw dot-form. `apply` continues to call the strict
 /// variant. See #2366 / RFC #2371.
 pub fn resolve_refs_for_plan(
-    resources: &mut [Resource],
+    resources: &mut [ManagedResource],
     current_states: &HashMap<ResourceId, State>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     wait_aliases: &[crate::binding_index::WaitAliasSpec],
@@ -74,7 +74,7 @@ pub fn resolve_refs_for_plan(
 }
 
 fn resolve_refs_inner(
-    resources: &mut [Resource],
+    resources: &mut [ManagedResource],
     current_states: &HashMap<ResourceId, State>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     wait_aliases: &[crate::binding_index::WaitAliasSpec],
@@ -147,35 +147,106 @@ fn resolve_refs_inner(
 /// [`resolve_refs_with_state_and_remote`] until #3176 ships a typed
 /// constructor that accepts both slices.
 ///
-/// Internally this currently round-trips through the legacy
-/// `&mut [Resource]` pipeline so behaviour matches
-/// [`resolve_refs_with_state_and_remote`] bit-for-bit when the inputs
-/// contain no managed→virtual references. The round-trip itself is
-/// removed once a managed-slice `ResolvedBindings` constructor lands;
-/// the `From<&ManagedResource> for Resource` bridge survives until
-/// #3181 inline-merges the two types.
 pub fn resolve_managed_refs_with_state_and_remote(
     managed: &mut [ManagedResource],
     current_states: &HashMap<ResourceId, State>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     wait_aliases: &[crate::binding_index::WaitAliasSpec],
 ) -> Result<(), String> {
-    let mut bridge: Vec<Resource> = managed.iter().map(Resource::from).collect();
     resolve_refs_inner(
-        &mut bridge,
+        managed,
         current_states,
         remote_bindings,
         wait_aliases,
         false,
-    )?;
-    // Invariant: `resolve_refs_inner` mutates ONLY `attributes` and
-    // `dependency_bindings` on each `Resource` (lines 86-91 and 109-121).
-    // If that contract is broadened, extend the write-back below — the
-    // bridge silently drops any other mutation otherwise. Removed
-    // entirely once #3181 lands and the bridge goes away.
-    for (m, r) in managed.iter_mut().zip(bridge) {
-        m.attributes = r.attributes;
-        m.dependency_bindings = r.dependency_bindings;
+    )
+}
+
+/// Resolve `ResourceRef` values in a slice of [`DataSource`]s against
+/// the binding view built from the managed resources plus
+/// `current_states` / `remote_bindings` (carina#3181).
+///
+/// Data sources are read-only; their input attributes (`read aws.iam.user
+/// { user_name = some_let.name }`) reference managed resources, so the
+/// binding map is built from the managed slice. Each data source's
+/// `dependency_bindings` is recorded before resolution destroys the
+/// `ResourceRef` values, mirroring [`resolve_refs_inner`].
+pub fn resolve_data_source_refs(
+    data_sources: &mut [DataSource],
+    managed: &[ManagedResource],
+    current_states: &HashMap<ResourceId, State>,
+    remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    wait_aliases: &[crate::binding_index::WaitAliasSpec],
+) -> Result<(), String> {
+    resolve_data_source_refs_inner(
+        data_sources,
+        managed,
+        current_states,
+        remote_bindings,
+        wait_aliases,
+        false,
+    )
+}
+
+/// Plan-only counterpart of [`resolve_data_source_refs`]: any surviving
+/// `Value::ResourceRef` whose root binding is named in `remote_bindings`
+/// is replaced with the unresolved-upstream marker so plan display can
+/// render it as `(known after upstream apply: <ref>)`. Mirrors
+/// [`resolve_refs_for_plan`] for data sources.
+pub fn resolve_data_source_refs_for_plan(
+    data_sources: &mut [DataSource],
+    managed: &[ManagedResource],
+    current_states: &HashMap<ResourceId, State>,
+    remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    wait_aliases: &[crate::binding_index::WaitAliasSpec],
+) -> Result<(), String> {
+    resolve_data_source_refs_inner(
+        data_sources,
+        managed,
+        current_states,
+        remote_bindings,
+        wait_aliases,
+        true,
+    )
+}
+
+fn resolve_data_source_refs_inner(
+    data_sources: &mut [DataSource],
+    managed: &[ManagedResource],
+    current_states: &HashMap<ResourceId, State>,
+    remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    wait_aliases: &[crate::binding_index::WaitAliasSpec],
+    mark_unresolved_upstream: bool,
+) -> Result<(), String> {
+    for data_source in data_sources.iter_mut() {
+        let deps = crate::deps::get_resource_value_ref_dependencies(data_source);
+        if !deps.is_empty() {
+            data_source.dependency_bindings = deps.into_iter().collect();
+        }
+    }
+    let bindings = ResolvedBindings::from_resources_with_state(
+        managed,
+        current_states,
+        remote_bindings,
+        wait_aliases,
+    );
+    let upstream_binding_names: std::collections::HashSet<&str> = if mark_unresolved_upstream {
+        remote_bindings.keys().map(String::as_str).collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+    for data_source in data_sources.iter_mut() {
+        let mut resolved_attrs: IndexMap<String, Value> = IndexMap::new();
+        for (key, value) in &data_source.attributes {
+            let resolved = resolve_ref_value(value, &bindings)?;
+            let final_value = if mark_unresolved_upstream {
+                stamp_unresolved_upstream(resolved, &upstream_binding_names)
+            } else {
+                resolved
+            };
+            resolved_attrs.insert(key.clone(), final_value);
+        }
+        data_source.attributes = resolved_attrs;
     }
     Ok(())
 }
@@ -480,8 +551,12 @@ mod tests {
     use super::*;
     use crate::resource::ResourceId;
 
-    fn make_resource(name: &str, binding: Option<&str>, attrs: Vec<(&str, Value)>) -> Resource {
-        let mut r = Resource::new("test.resource", name);
+    fn make_resource(
+        name: &str,
+        binding: Option<&str>,
+        attrs: Vec<(&str, Value)>,
+    ) -> ManagedResource {
+        let mut r = ManagedResource::new("test.resource", name);
         r.attributes = attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
         r.binding = binding.map(|b| b.to_string());
         r
@@ -492,7 +567,7 @@ mod tests {
     /// the resulting view is identical to what production code constructs
     /// — there is no test-only back door into the type.
     fn bindings_from(entries: Vec<(&str, Vec<(&str, Value)>)>) -> ResolvedBindings {
-        let resources: Vec<Resource> = entries
+        let resources: Vec<ManagedResource> = entries
             .into_iter()
             .map(|(binding, attrs)| {
                 make_resource(&format!("{}-resource", binding), Some(binding), attrs)

@@ -373,17 +373,18 @@ pub fn shorten_service_name<'a>(attr_name: &str, value: &'a str) -> Cow<'a, str>
 mod tests {
     use super::*;
     use crate::plan::Plan;
-    use crate::resource::Resource;
+    use crate::resource::ManagedResource;
 
     #[test]
     fn explicit_only_depends_on_edge_is_in_dependency_graph() {
-        let role = Resource::new("iam.Role", "role").with_binding("role".to_string());
-        let mut bucket = Resource::new("s3.Bucket", "bucket").with_binding("bucket".to_string());
+        let role = ManagedResource::new("iam.Role", "role").with_binding("role".to_string());
+        let mut bucket =
+            ManagedResource::new("s3.Bucket", "bucket").with_binding("bucket".to_string());
         bucket.directives.depends_on = vec!["role".to_string()];
 
         let mut plan = Plan::new();
-        plan.add(Effect::Create(role.try_into().unwrap()));
-        plan.add(Effect::Create(bucket.try_into().unwrap()));
+        plan.add(Effect::Create(role));
+        plan.add(Effect::Create(bucket));
         let graph = build_dependency_graph(&plan);
 
         let bucket_idx = *graph

@@ -7,13 +7,15 @@ use super::ast::{AttributeParameter, ExportParameter, ModuleCall, ParsedFile};
 use super::error::{ParseError, undefined_identifier_error};
 use super::static_eval::is_static_value;
 use crate::eval_value::EvalValue;
-use crate::resource::{ConcreteValue, DataSource, DeferredValue, Resource, ResourceLike, Value};
+use crate::resource::{
+    ConcreteValue, DataSource, DeferredValue, ManagedResource, ResourceLike, Value,
+};
 use indexmap::IndexMap;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Mutable pre-apply traversal — the resolver mutates `attributes` and
 /// `dependency_bindings` of every resource whose references are resolved
-/// **before** apply: managed [`Resource`]s and [`DataSource`]s.
+/// **before** apply: managed [`ManagedResource`]s and [`DataSource`]s.
 ///
 /// `VirtualResource` is excluded on purpose — a virtual resource's
 /// attributes may carry refs whose resolution is deferred to the
@@ -24,7 +26,7 @@ trait PreApplyResourceMut: ResourceLike {
     fn dependency_bindings_mut(&mut self) -> &mut BTreeSet<String>;
 }
 
-impl PreApplyResourceMut for Resource {
+impl PreApplyResourceMut for ManagedResource {
     fn attributes_mut(&mut self) -> &mut IndexMap<String, Value> {
         &mut self.attributes
     }
@@ -66,9 +68,11 @@ fn iter_pre_apply_resources_mut(
 /// not yet a known binding are stored as `String("identifier.member")`.
 /// This function walks all resource attributes, module call arguments, and attribute
 /// parameter values, converting matching strings to `ResourceRef`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn resolve_forward_references(
-    resource_bindings: &HashMap<String, Resource>,
-    resources: &mut [Resource],
+    resource_bindings: &HashSet<String>,
+    resources: &mut [ManagedResource],
+    data_sources: &mut [DataSource],
     attribute_params: &mut [AttributeParameter],
     module_calls: &mut [ModuleCall],
     export_params: &mut [ExportParameter],
@@ -80,6 +84,13 @@ pub(super) fn resolve_forward_references(
         // round-trip. The placeholder is overwritten on the next line,
         // so its identity doesn't matter.
         for (_, attr) in resource.attributes.iter_mut() {
+            let placeholder = Value::Concrete(ConcreteValue::Bool(false));
+            let value = std::mem::replace(attr, placeholder);
+            *attr = resolve_forward_ref_in_value(value, resource_bindings);
+        }
+    }
+    for data_source in data_sources.iter_mut() {
+        for (_, attr) in data_source.attributes.iter_mut() {
             let placeholder = Value::Concrete(ConcreteValue::Bool(false));
             let value = std::mem::replace(attr, placeholder);
             *attr = resolve_forward_ref_in_value(value, resource_bindings);
@@ -111,10 +122,7 @@ pub(super) fn resolve_forward_references(
 /// Strings in `"name.member"` format where `name` is a known resource binding
 /// are resolved to `ResourceRef`. This handles forward references that were
 /// stored as strings during single-pass parsing.
-fn resolve_forward_ref_in_value(
-    value: Value,
-    resource_bindings: &HashMap<String, Resource>,
-) -> Value {
+fn resolve_forward_ref_in_value(value: Value, resource_bindings: &HashSet<String>) -> Value {
     match value {
         Value::Concrete(ConcreteValue::String(ref s)) => {
             // A dotted string like "vpc.vpc_id" or "vpc.attr.nested" may be a
@@ -122,7 +130,7 @@ fn resolve_forward_ref_in_value(
             // parsing. Resolve it to ResourceRef if the first segment is a known
             // resource binding. Parts after the second become field_path.
             let parts: Vec<&str> = s.splitn(3, '.').collect();
-            if parts.len() >= 2 && resource_bindings.contains_key(parts[0]) {
+            if parts.len() >= 2 && resource_bindings.contains(parts[0]) {
                 let field_path = parts
                     .get(2)
                     .map(|rest| rest.split('.').map(|s| s.to_string()).collect())
@@ -209,10 +217,7 @@ pub fn resolve_resource_refs_with_config(
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
     for rref in parsed.iter_top_level_resources() {
         if let Some(binding_name) = rref.binding() {
-            binding_map.insert(
-                binding_name.to_string(),
-                rref.as_legacy_resource().resolved_attributes(),
-            );
+            binding_map.insert(binding_name.to_string(), rref.resolved_attributes());
         }
     }
 
@@ -292,13 +297,12 @@ pub fn resolve_resource_refs_with_config(
     // remain as Value::Concrete(ConcreteValue::String). Convert them to ResourceRef now that the full
     // binding map is available.
     // carina#3181: include data sources and virtuals — a sibling-file
-    // export can forward-reference any top-level binding.
-    let resource_bindings: HashMap<String, Resource> = parsed
+    // export can forward-reference any top-level binding. Only the
+    // binding-name set is needed (forward-ref resolution is keyed on
+    // the name).
+    let resource_bindings: HashSet<String> = parsed
         .iter_top_level_resources()
-        .filter_map(|rref| {
-            rref.binding()
-                .map(|b| (b.to_string(), rref.as_legacy_resource().into_owned()))
-        })
+        .filter_map(|rref| rref.binding().map(|b| b.to_string()))
         .collect();
     for export_param in &mut parsed.export_params {
         if let Some(value) = export_param.value.take() {
@@ -391,7 +395,7 @@ pub fn check_identifier_scope(parsed: &ParsedFile) -> Vec<ParseError> {
 /// - `provider = <binding>` whose binding's kind does not match the
 ///   resource's kind (e.g. `aws.s3.Bucket { directives { provider =
 ///   <awscc-binding> } }`).
-/// - Resource that omits `directives { provider = ... }` but whose
+/// - ManagedResource that omits `directives { provider = ... }` but whose
 ///   kind has no default instance (the kind was registered via a
 ///   top-level `provider <kind> { source = ..., version = ... }`
 ///   block with no instance attributes, and every instance of that
@@ -737,10 +741,7 @@ pub fn resolve_provider_unresolved_attributes<E>(
     // through the module-call virtual.
     for rref in parsed.iter_top_level_resources() {
         if let Some(binding_name) = rref.binding() {
-            binding_map.insert(
-                binding_name.to_string(),
-                rref.as_legacy_resource().resolved_attributes(),
-            );
+            binding_map.insert(binding_name.to_string(), rref.resolved_attributes());
         }
     }
     for arg in &parsed.arguments {

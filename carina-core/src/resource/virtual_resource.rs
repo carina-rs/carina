@@ -19,7 +19,7 @@ use std::collections::{BTreeSet, HashSet};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use super::{Resource, ResourceId, ResourceKind, ResourceKindLabel, ResourceKindMismatch, Value};
+use super::{ResourceId, Value};
 
 /// A virtual resource created by module-call expansion.
 ///
@@ -68,69 +68,14 @@ pub struct VirtualResource {
     /// Binding names this virtual depends on.
     #[serde(default)]
     pub dependency_bindings: BTreeSet<String>,
-    /// Module name from the originating `ResourceKind::Virtual` tag
+    /// Module name from the originating module-call expansion
     /// (e.g. "web_tier"). Always set for virtuals — see #2516.
     pub module_name: String,
     /// Module instance binding name (e.g. "web").
     pub instance: String,
     /// Parser-level: attributes whose value was written as a quoted
     /// string literal. Parse-time only; `#[serde(skip)]` keeps it out
-    /// of state — mirrors [`Resource::quoted_string_attrs`].
+    /// of state — mirrors [`ManagedResource::quoted_string_attrs`](super::ManagedResource).
     #[serde(default, skip)]
     pub quoted_string_attrs: HashSet<String>,
-}
-
-impl TryFrom<&Resource> for VirtualResource {
-    type Error = ResourceKindMismatch;
-
-    fn try_from(res: &Resource) -> Result<Self, Self::Error> {
-        match (&res.kind, &res.virtual_module) {
-            (ResourceKind::Virtual, Some((module_name, instance))) => Ok(Self {
-                id: res.id.clone(),
-                attributes: res.attributes.clone(),
-                binding: res.binding.clone(),
-                dependency_bindings: res.dependency_bindings.clone(),
-                module_name: module_name.clone(),
-                instance: instance.clone(),
-                quoted_string_attrs: res.quoted_string_attrs.clone(),
-            }),
-            (ResourceKind::Virtual, None) => Err(ResourceKindMismatch {
-                // Inconsistent: kind says Virtual but virtual_module is None.
-                // Treat as the kind label mismatch since the data is missing.
-                expected: ResourceKindLabel::Virtual,
-                actual: ResourceKindLabel::Virtual,
-            }),
-            (other, _) => Err(ResourceKindMismatch {
-                expected: ResourceKindLabel::Virtual,
-                actual: other.label(),
-            }),
-        }
-    }
-}
-
-/// Transitional bridge — rebuild a legacy [`Resource`] from a
-/// `VirtualResource`. Symmetric with [`From<&ManagedResource> for Resource`]
-/// in `managed.rs` and [`From<&DataSource> for Resource`] in
-/// `data_source.rs`; removed alongside them when #3181 inline-merges
-/// `Resource` into the typestate structs.
-///
-/// `directives` / `prefixes` are reconstructed empty — `VirtualResource`
-/// drops both fields as compile-time invariants (no `prevent_destroy` and
-/// no auto-generated names apply to a synthetic node). The flattened
-/// `module_name` + `instance` pair is restored into `virtual_module`.
-impl From<&VirtualResource> for Resource {
-    fn from(v: &VirtualResource) -> Self {
-        Self {
-            id: v.id.clone(),
-            attributes: v.attributes.clone(),
-            kind: ResourceKind::Virtual,
-            directives: super::Directives::default(),
-            prefixes: std::collections::HashMap::new(),
-            binding: v.binding.clone(),
-            dependency_bindings: v.dependency_bindings.clone(),
-            module_source: None,
-            quoted_string_attrs: v.quoted_string_attrs.clone(),
-            virtual_module: Some((v.module_name.clone(), v.instance.clone())),
-        }
-    }
 }

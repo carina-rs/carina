@@ -10,7 +10,7 @@
 //!         viewer_certificate = { acm_certificate_arn =
 //!                                cert_issued.certificate_arn } }
 //!
-//! Pre-fix: `expand_module_call` returns only `Vec<Resource>`, so the
+//! Pre-fix: `expand_module_call` returns only `Vec<ManagedResource>`, so the
 //! module's `wait_bindings` are silently dropped and the module
 //! resources' references to the wait binding are never instance-
 //! prefixed. `create_plan` emits no `Effect::Wait`, the Distribution
@@ -79,7 +79,7 @@ impl Provider for MockProvider {
 
     fn read_data_source(
         &self,
-        resource: &carina_core::resource::Resource,
+        resource: &carina_core::resource::DataSource,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id = resource.id.clone();
         Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
@@ -221,11 +221,9 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     .expect("resolve_refs should succeed");
 
     let registry = SchemaRegistry::new();
-    let (managed___, data_sources___) =
-        carina_core::differ::split_resources_by_kind(&resources_for_plan);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources_for_plan,
+        &[],
         &current_states,
         &HashMap::new(),
         &registry,
@@ -256,6 +254,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &unresolved_resources,
+        virtual_resources: &[],
         bindings: carina_core::binding_index::ResolvedBindings::default(),
         current_states,
         normalizer: &NoopNormalizer,
@@ -351,11 +350,9 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     .expect("resolve_refs should succeed");
 
     let registry = SchemaRegistry::new();
-    let (managed___, data_sources___) =
-        carina_core::differ::split_resources_by_kind(&resources_for_plan);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources_for_plan,
+        &[],
         &current_states,
         &HashMap::new(),
         &registry,
@@ -385,6 +382,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &unresolved_resources,
+        virtual_resources: &[],
         bindings: carina_core::binding_index::ResolvedBindings::default(),
         current_states,
         normalizer: &NoopNormalizer,
@@ -494,11 +492,9 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
 
     // ---- The dependency edge is intact: Effect::Wait still emitted.
     let registry = SchemaRegistry::new();
-    let (managed___, data_sources___) =
-        carina_core::differ::split_resources_by_kind(&resources_for_plan);
     let plan = create_plan(
-        &managed___,
-        &data_sources___,
+        &resources_for_plan,
+        &[],
         &current_states,
         &HashMap::new(),
         &registry,

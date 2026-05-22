@@ -367,13 +367,14 @@ pub fn build_detail_rows(
         return Vec::new();
     }
 
-    // carina#3181 PR D: `Effect` payloads are typestate structs; the
-    // row builders / schema lookup still take a legacy `&Resource`, so
-    // bridge through `Resource::from` at this display seam.
+    // carina#3181: `Effect` payloads are typestate structs — the
+    // managed variants carry `ManagedResource`, `Read` carries a
+    // `DataSource`. Schema lookup routes through the matching
+    // `get_for` / `get_for_data_source` registry method.
     match effect {
         Effect::Create(r) => {
-            let r = crate::resource::Resource::from(r);
-            build_create_rows(&r, registry, detail)
+            let schema = registry.and_then(|reg| reg.get_for(r));
+            build_create_rows(&r.attributes, schema, detail)
         }
         Effect::Update {
             from,
@@ -381,10 +382,9 @@ pub fn build_detail_rows(
             changed_attributes,
             ..
         } => {
-            let to = crate::resource::Resource::from(to);
             let explicit = prev_explicit.and_then(|map| map.get(&to.id));
-            let schema = registry.and_then(|r| r.get_for(&to));
-            build_update_rows(from, &to, changed_attributes, schema, detail, explicit)
+            let schema = registry.and_then(|r| r.get_for(to));
+            build_update_rows(from, to, changed_attributes, schema, detail, explicit)
         }
         Effect::Replace {
             from,
@@ -395,12 +395,11 @@ pub fn build_detail_rows(
             cascade_ref_hints,
             ..
         } => {
-            let to = crate::resource::Resource::from(to);
             let explicit = prev_explicit.and_then(|map| map.get(&to.id));
-            let schema = registry.and_then(|r| r.get_for(&to));
+            let schema = registry.and_then(|r| r.get_for(to));
             build_replace_rows(
                 from,
-                &to,
+                to,
                 changed_create_only,
                 cascading_updates,
                 temporary_name,
@@ -412,8 +411,8 @@ pub fn build_detail_rows(
         }
         Effect::Delete { id, .. } => build_delete_rows(id, delete_attributes),
         Effect::Read { resource } => {
-            let resource = crate::resource::Resource::from(resource);
-            build_create_rows(&resource, registry, detail)
+            let schema = registry.and_then(|reg| reg.get_for_data_source(resource));
+            build_create_rows(&resource.attributes, schema, detail)
         }
         Effect::Import { identifier, .. } => {
             vec![DetailRow::Attribute {
@@ -428,15 +427,14 @@ pub fn build_detail_rows(
 }
 
 fn build_create_rows(
-    r: &crate::resource::Resource,
-    registry: Option<&SchemaRegistry>,
+    attributes: &IndexMap<String, Value>,
+    schema: Option<&ResourceSchema>,
     detail: DetailLevel,
 ) -> Vec<DetailRow> {
     let mut rows = Vec::new();
 
     // Collect default_tag_keys for annotation
-    let default_tag_keys: HashSet<String> = r
-        .attributes
+    let default_tag_keys: HashSet<String> = attributes
         .get("_default_tag_keys")
         .and_then(|v| match v {
             Value::Concrete(ConcreteValue::List(items)) => Some(
@@ -452,15 +450,11 @@ fn build_create_rows(
         })
         .unwrap_or_default();
 
-    let mut keys: Vec<_> = r
-        .attributes
-        .keys()
-        .filter(|k| !k.starts_with('_'))
-        .collect();
+    let mut keys: Vec<_> = attributes.keys().filter(|k| !k.starts_with('_')).collect();
     keys.sort();
 
     for key in &keys {
-        let value = &r.attributes[*key];
+        let value = &attributes[*key];
         // Expand tags map into individual rows with default_tags annotation
         if key.as_str() == "tags"
             && !default_tag_keys.is_empty()
@@ -499,8 +493,7 @@ fn build_create_rows(
 
     // In Full mode, show defaults and read-only attributes
     if detail == DetailLevel::Full
-        && let Some(registry) = registry
-        && let Some(schema) = registry.get_for(r)
+        && let Some(schema) = schema
     {
         let user_keys: HashSet<&str> = keys.iter().map(|k| k.as_str()).collect();
 
@@ -568,7 +561,7 @@ fn build_expanded_tags_row(
 
 fn build_update_rows(
     from: &crate::resource::State,
-    to: &crate::resource::Resource,
+    to: &crate::resource::ManagedResource,
     changed_attributes: &[String],
     schema: Option<&ResourceSchema>,
     detail: DetailLevel,
@@ -702,7 +695,7 @@ fn build_update_rows(
 #[allow(clippy::too_many_arguments)]
 fn build_replace_rows(
     from: &crate::resource::State,
-    to: &crate::resource::Resource,
+    to: &crate::resource::ManagedResource,
     changed_create_only: &[String],
     cascading_updates: &[crate::effect::CascadingUpdate],
     temporary_name: &Option<crate::effect::TemporaryName>,
@@ -1433,7 +1426,7 @@ fn value_references_binding(value: &Value, binding: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::{Resource, ResourceId, State};
+    use crate::resource::{ManagedResource, ResourceId, State};
     use std::collections::HashSet;
 
     #[test]
@@ -1459,15 +1452,15 @@ mod tests {
 
     #[test]
     fn test_names_only_returns_empty() {
-        let resource = Resource::new("s3.Bucket", "my-bucket");
-        let effect = Effect::Create(resource.try_into().unwrap());
+        let resource = ManagedResource::new("s3.Bucket", "my-bucket");
+        let effect = Effect::Create(resource);
         let rows = build_detail_rows(&effect, None, DetailLevel::NamesOnly, None, None);
         assert!(rows.is_empty());
     }
 
     #[test]
     fn test_create_basic_attributes() {
-        let resource = Resource::new("s3.Bucket", "my-bucket")
+        let resource = ManagedResource::new("s3.Bucket", "my-bucket")
             .with_attribute(
                 "bucket",
                 Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
@@ -1476,7 +1469,7 @@ mod tests {
                 "region",
                 Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
             );
-        let effect = Effect::Create(resource.try_into().unwrap());
+        let effect = Effect::Create(resource);
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
         assert_eq!(rows.len(), 2);
         assert!(matches!(&rows[0], DetailRow::Attribute { key, .. } if key == "bucket"));
@@ -1494,14 +1487,14 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = Resource::new("s3.Bucket", "my-bucket").with_attribute(
+        let to = ManagedResource::new("s3.Bucket", "my-bucket").with_attribute(
             "versioning",
             Value::Concrete(ConcreteValue::String("Enabled".to_string())),
         );
         let effect = Effect::Update {
             id: ResourceId::new("s3.Bucket", "my-bucket"),
             from: Box::new(from),
-            to: to.try_into().unwrap(),
+            to,
             changed_attributes: vec!["versioning".to_string()],
         };
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
@@ -1531,7 +1524,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = Resource::new("s3.Bucket", "my-bucket")
+        let to = ManagedResource::new("s3.Bucket", "my-bucket")
             .with_attribute(
                 "name",
                 Value::Concrete(ConcreteValue::String("test".to_string())),
@@ -1547,7 +1540,7 @@ mod tests {
         let effect = Effect::Update {
             id: ResourceId::new("s3.Bucket", "my-bucket"),
             from: Box::new(from),
-            to: to.try_into().unwrap(),
+            to,
             changed_attributes: vec!["versioning".to_string()],
         };
         let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, None);
@@ -1585,7 +1578,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = Resource::new("s3.Bucket", "my-bucket")
+        let to = ManagedResource::new("s3.Bucket", "my-bucket")
             .with_attribute(
                 "authored",
                 Value::Concrete(ConcreteValue::String("a".to_string())),
@@ -1601,7 +1594,7 @@ mod tests {
         let effect = Effect::Update {
             id: ResourceId::new("s3.Bucket", "my-bucket"),
             from: Box::new(from),
-            to: to.try_into().unwrap(),
+            to,
             changed_attributes: vec!["trigger_diff".to_string()],
         };
 
@@ -1685,14 +1678,14 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = Resource::new("s3.Bucket", "my-bucket").with_attribute(
+        let to = ManagedResource::new("s3.Bucket", "my-bucket").with_attribute(
             "name",
             Value::Concrete(ConcreteValue::String("test".to_string())),
         );
         let effect = Effect::Update {
             id: ResourceId::new("s3.Bucket", "my-bucket"),
             from: Box::new(from),
-            to: to.try_into().unwrap(),
+            to,
             changed_attributes: vec!["removed_attr".to_string()],
         };
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
@@ -1711,9 +1704,9 @@ mod tests {
             "Environment".to_string(),
             Value::Concrete(ConcreteValue::String("prod".to_string())),
         );
-        let resource = Resource::new("s3.Bucket", "my-bucket")
+        let resource = ManagedResource::new("s3.Bucket", "my-bucket")
             .with_attribute("tags", Value::Concrete(ConcreteValue::Map(tags)));
-        let effect = Effect::Create(resource.try_into().unwrap());
+        let effect = Effect::Create(resource);
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
         assert_eq!(rows.len(), 1);
         match &rows[0] {
@@ -1774,11 +1767,11 @@ mod tests {
                 Value::Concrete(ConcreteValue::Map(statement2.clone())),
             ])),
         );
-        let resource = Resource::new("iam.RolePolicy", "test").with_attribute(
+        let resource = ManagedResource::new("iam.RolePolicy", "test").with_attribute(
             "policy_document",
             Value::Concrete(ConcreteValue::Map(policy)),
         );
-        let effect = Effect::Create(resource.try_into().unwrap());
+        let effect = Effect::Create(resource);
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
         let entries = rows
             .iter()
@@ -1919,14 +1912,14 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = Resource::new("ec2.Vpc", "my-vpc").with_attribute(
+        let to = ManagedResource::new("ec2.Vpc", "my-vpc").with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
         let effect = Effect::Replace {
             id: ResourceId::new("ec2.Vpc", "my-vpc"),
             from: Box::new(from),
-            to: to.try_into().unwrap(),
+            to,
             directives: crate::resource::Directives::default(),
             changed_create_only: vec!["cidr_block".to_string()],
             cascading_updates: vec![],
@@ -1988,13 +1981,13 @@ mod tests {
             "effect".to_string(),
             Value::Concrete(ConcreteValue::String("Allow".to_string())),
         );
-        let resource = Resource::new("iam.RolePolicy", "test").with_attribute(
+        let resource = ManagedResource::new("iam.RolePolicy", "test").with_attribute(
             "statement",
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                 ConcreteValue::Map(entry),
             )])),
         );
-        let effect = Effect::Create(resource.try_into().unwrap());
+        let effect = Effect::Create(resource);
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
 
         let pretty_value = rows.iter().find_map(|row| match row {
@@ -2016,11 +2009,11 @@ mod tests {
 
     #[test]
     fn create_row_scalar_attribute_unchanged() {
-        let resource = Resource::new("iam.Role", "test").with_attribute(
+        let resource = ManagedResource::new("iam.Role", "test").with_attribute(
             "role_name",
             Value::Concrete(ConcreteValue::String("foo".to_string())),
         );
-        let effect = Effect::Create(resource.try_into().unwrap());
+        let effect = Effect::Create(resource);
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
         assert!(
             rows.iter().any(|row| matches!(
@@ -2035,7 +2028,7 @@ mod tests {
     fn create_row_list_of_strings_emits_pretty_attribute() {
         // list-of-string must route through PrettyAttribute so
         // format_value_pretty's 80-col threshold can apply.
-        let resource = Resource::new("iam.Role", "test").with_attribute(
+        let resource = ManagedResource::new("iam.Role", "test").with_attribute(
             "managed_policy_arns",
             Value::Concrete(ConcreteValue::List(vec![
                 Value::Concrete(ConcreteValue::String(
@@ -2046,7 +2039,7 @@ mod tests {
                 )),
             ])),
         );
-        let effect = Effect::Create(resource.try_into().unwrap());
+        let effect = Effect::Create(resource);
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
 
         let pretty = rows.iter().find_map(|row| match row {
@@ -2070,9 +2063,9 @@ mod tests {
         // Pins down `tags = []` behavior — a regression that re-introduces
         // an `!items.is_empty()` guard would silently bypass the routing
         // for empty lists, breaking the formatting-path uniformity.
-        let resource = Resource::new("iam.Role", "test")
+        let resource = ManagedResource::new("iam.Role", "test")
             .with_attribute("tags", Value::Concrete(ConcreteValue::List(vec![])));
-        let effect = Effect::Create(resource.try_into().unwrap());
+        let effect = Effect::Create(resource);
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
         assert!(
             rows.iter().any(|row| matches!(
@@ -2176,7 +2169,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = Resource::new("iam.Role", "r").with_attribute(
+        let to = ManagedResource::new("iam.Role", "r").with_attribute(
             "policy",
             iam_policy_value(
                 ConcreteValue::String("Allow".to_string()),
@@ -2186,7 +2179,7 @@ mod tests {
         let effect = Effect::Update {
             id: ResourceId::new("iam.Role", "r"),
             from: Box::new(from),
-            to: to.try_into().unwrap(),
+            to,
             changed_attributes: vec!["policy".to_string()],
         };
         let registry = iam_policy_registry();
@@ -2220,7 +2213,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = Resource::new("iam.Role", "r")
+        let to = ManagedResource::new("iam.Role", "r")
             .with_attribute(
                 "policy",
                 iam_policy_value(
@@ -2235,7 +2228,7 @@ mod tests {
         let effect = Effect::Update {
             id: ResourceId::new("iam.Role", "r"),
             from: Box::new(from),
-            to: to.try_into().unwrap(),
+            to,
             changed_attributes: vec!["policy".to_string(), "description".to_string()],
         };
         let registry = iam_policy_registry();
@@ -2269,7 +2262,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = Resource::new("iam.Role", "r").with_attribute(
+        let to = ManagedResource::new("iam.Role", "r").with_attribute(
             "policy",
             iam_policy_value(
                 ConcreteValue::String("Allow".to_string()),
@@ -2279,7 +2272,7 @@ mod tests {
         let effect = Effect::Update {
             id: ResourceId::new("iam.Role", "r"),
             from: Box::new(from),
-            to: to.try_into().unwrap(),
+            to,
             changed_attributes: vec!["policy".to_string()],
         };
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
@@ -2309,7 +2302,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = Resource::new("iam.Role", "r").with_attribute(
+        let to = ManagedResource::new("iam.Role", "r").with_attribute(
             "policy",
             iam_policy_value(
                 ConcreteValue::String("Allow".to_string()),
@@ -2319,7 +2312,7 @@ mod tests {
         let effect = Effect::Update {
             id: ResourceId::new("iam.Role", "r"),
             from: Box::new(from),
-            to: to.try_into().unwrap(),
+            to,
             changed_attributes: vec!["policy".to_string()],
         };
         let registry = iam_policy_registry();
@@ -2378,12 +2371,12 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = Resource::new("x.Thing", "t")
+        let to = ManagedResource::new("x.Thing", "t")
             .with_attribute("modes", mk(ConcreteValue::String("On".to_string())));
         let effect = Effect::Update {
             id: ResourceId::new("x.Thing", "t"),
             from: Box::new(from),
-            to: to.try_into().unwrap(),
+            to,
             changed_attributes: vec!["modes".to_string()],
         };
         let rows = build_detail_rows(&effect, Some(&registry), DetailLevel::Explicit, None, None);
@@ -2413,7 +2406,7 @@ mod tests {
         );
         // Desired flips effect to the API-canonical `Deny` — a real
         // change, not a spelling alias of `allow`.
-        let to = Resource::new("iam.Role", "r").with_attribute(
+        let to = ManagedResource::new("iam.Role", "r").with_attribute(
             "policy",
             iam_policy_value(
                 ConcreteValue::String("Deny".to_string()),
@@ -2423,7 +2416,7 @@ mod tests {
         let effect = Effect::Update {
             id: ResourceId::new("iam.Role", "r"),
             from: Box::new(from),
-            to: to.try_into().unwrap(),
+            to,
             changed_attributes: vec!["policy".to_string()],
         };
         let registry = iam_policy_registry();
@@ -2465,7 +2458,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = Resource::new("iam.Role", "r")
+        let to = ManagedResource::new("iam.Role", "r")
             .with_attribute(
                 "policy",
                 iam_policy_value(
@@ -2484,7 +2477,7 @@ mod tests {
         let effect = Effect::Update {
             id: ResourceId::new("iam.Role", "r"),
             from: Box::new(from),
-            to: to.try_into().unwrap(),
+            to,
             changed_attributes: vec!["policy".to_string(), "description".to_string()],
         };
         let registry = iam_policy_registry();
@@ -2570,12 +2563,12 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        let to =
-            Resource::new("x.Thing", "t").with_attribute("modes", enum_list(&["Allow", "Deny"]));
+        let to = ManagedResource::new("x.Thing", "t")
+            .with_attribute("modes", enum_list(&["Allow", "Deny"]));
         let effect = Effect::Update {
             id: ResourceId::new("x.Thing", "t"),
             from: Box::new(from),
-            to: to.try_into().unwrap(),
+            to,
             changed_attributes: vec!["modes".to_string()],
         };
         let rows = build_detail_rows(&effect, Some(&registry), DetailLevel::Explicit, None, None);
@@ -2615,12 +2608,12 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        let to =
-            Resource::new("x.Thing", "t").with_attribute("modes", enum_list(&["Allow", "Deny"]));
+        let to = ManagedResource::new("x.Thing", "t")
+            .with_attribute("modes", enum_list(&["Allow", "Deny"]));
         let effect = Effect::Update {
             id: ResourceId::new("x.Thing", "t"),
             from: Box::new(from),
-            to: to.try_into().unwrap(),
+            to,
             changed_attributes: vec!["modes".to_string()],
         };
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);

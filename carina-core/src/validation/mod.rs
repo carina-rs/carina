@@ -11,7 +11,7 @@ use indexmap::IndexMap;
 use crate::binding_index::BindingIndex;
 use crate::parser::{ModuleCall, ProviderContext, ResourceRef, TypeExpr, validate_custom_type};
 use crate::provider::ProviderFactory;
-use crate::resource::{ConcreteValue, DeferredValue, Resource, Value};
+use crate::resource::{ConcreteValue, DeferredValue, ManagedResource, Value};
 use crate::schema::{AttributeType, SchemaRegistry, suggest_similar_name};
 
 /// Render the trailing `" Did you mean 'X'?"` segment for an unknown
@@ -51,37 +51,36 @@ pub fn validate_resources<E>(
         DataSource,
     }
     for rref in parsed.iter_all_resources() {
-        let kind = match rref {
+        // A deferred for-expression template body is always managed —
+        // `for` bodies never carry `read` / virtual.
+        let (kind, schema) = match rref {
             ResourceRef::Virtual(_) => continue,
-            ResourceRef::DataSource(_) => ValidatableKind::DataSource,
-            ResourceRef::Managed(_) => ValidatableKind::Managed,
-            // A deferred for-expression template body classifies by its
-            // own `kind` — same as the legacy `try_from` ladder did.
-            ResourceRef::Deferred { resource, .. } => match resource.kind {
-                crate::resource::ResourceKind::Virtual => continue,
-                crate::resource::ResourceKind::DataSource => ValidatableKind::DataSource,
-                crate::resource::ResourceKind::Managed => ValidatableKind::Managed,
-            },
+            ResourceRef::DataSource(d) => {
+                (ValidatableKind::DataSource, registry.get_for_data_source(d))
+            }
+            ResourceRef::Managed(m) | ResourceRef::Deferred { resource: m, .. } => {
+                (ValidatableKind::Managed, registry.get_for(m))
+            }
         };
-        let resource = rref.as_legacy_resource();
-        let resource = resource.as_ref();
+        let id = rref.id();
+        let quoted_string_attrs = rref.quoted_string_attrs();
 
-        match registry.get_for(resource) {
+        match schema {
             Some(schema) => {
-                let is_string_literal = |attr: &str| resource.quoted_string_attrs.contains(attr);
+                let is_string_literal = |attr: &str| quoted_string_attrs.contains(attr);
                 if let Err(errors) = schema.validate_with_origins_and_lookup(
-                    &resource.resolved_attributes(),
+                    &rref.resolved_attributes(),
                     &is_string_literal,
                     &lookup,
                 ) {
                     for error in errors {
-                        all_errors.push(format!("{}: {}", resource.id, error));
+                        all_errors.push(format!("{}: {}", id, error));
                     }
                 }
             }
             None => {
-                let provider = resource.id.provider.as_str();
-                let resource_type = resource.id.resource_type.as_str();
+                let provider = id.provider.as_str();
+                let resource_type = id.resource_type.as_str();
 
                 // No matching-kind entry. Skip if provider is not loaded —
                 // schemas are simply not available, not a configuration error.
@@ -143,10 +142,18 @@ pub fn validate_resource_ref_types<E>(
     let bindings = BindingIndex::from_parsed(parsed, registry);
 
     for rref in parsed.iter_all_resources() {
-        let resource = rref.as_legacy_resource();
-        let Some(schema) = registry.get_for(resource.as_ref()) else {
+        // A deferred for-expression template body is always managed.
+        let schema = match rref {
+            ResourceRef::Virtual(_) => continue,
+            ResourceRef::DataSource(d) => registry.get_for_data_source(d),
+            ResourceRef::Managed(m) | ResourceRef::Deferred { resource: m, .. } => {
+                registry.get_for(m)
+            }
+        };
+        let Some(schema) = schema else {
             continue;
         };
+        let resource_id = rref.id();
 
         for (attr_name, attr_value) in rref.attributes() {
             if attr_name.starts_with('_') {
@@ -182,7 +189,7 @@ pub fn validate_resource_ref_types<E>(
                 if !bindings.is_declared(ref_binding.as_str()) {
                     all_errors.push(format!(
                         "{}: unknown binding '{}' in reference {}.{}",
-                        resource.id, ref_binding, ref_binding, ref_attr,
+                        resource_id, ref_binding, ref_binding, ref_attr,
                     ));
                 }
                 continue;
@@ -193,7 +200,7 @@ pub fn validate_resource_ref_types<E>(
                     ref_schema.attributes.keys().map(|s| s.as_str()).collect();
                 all_errors.push(format!(
                     "{}: unknown attribute '{}' on '{}' in reference {}.{}{}",
-                    resource.id,
+                    resource_id,
                     ref_attr,
                     ref_binding,
                     ref_binding,
@@ -222,7 +229,7 @@ pub fn validate_resource_ref_types<E>(
                         all_errors.push(format!(
                             "{}: unknown field '{}' on struct '{}' in reference {}; \
                          known fields: {}.{}",
-                            resource.id,
+                            resource_id,
                             field,
                             struct_name,
                             ref_path.to_dot_string(),
@@ -244,7 +251,7 @@ pub fn validate_resource_ref_types<E>(
 
             all_errors.push(format!(
                 "{}: cannot assign {} to '{}': expected {}, got {} (from {}.{})",
-                resource.id,
+                resource_id,
                 ref_type_name,
                 attr_name,
                 expected_type_name,
@@ -269,10 +276,10 @@ pub fn validate_resource_ref_types<E>(
 /// be rejected because `role_name` is `String`, not `IamRoleArn`.
 pub fn validate_attribute_param_ref_types(
     attribute_params: &[crate::parser::AttributeParameter],
-    resources: &[Resource],
+    resources: &[ManagedResource],
     registry: &SchemaRegistry,
 ) -> Result<(), String> {
-    let mut binding_map: HashMap<String, &Resource> = HashMap::new();
+    let mut binding_map: HashMap<String, &ManagedResource> = HashMap::new();
     for resource in resources {
         if let Some(ref binding_name) = resource.binding {
             binding_map.insert(binding_name.clone(), resource);
@@ -340,10 +347,10 @@ pub fn validate_attribute_param_ref_types(
 /// `vpc_id` is a string attribute but the export declares `bool`.
 pub fn validate_export_param_ref_types(
     export_params: &[crate::parser::InferredExportParam],
-    resources: &[Resource],
+    resources: &[ManagedResource],
     registry: &SchemaRegistry,
 ) -> Result<(), String> {
-    let mut binding_map: HashMap<String, &Resource> = HashMap::new();
+    let mut binding_map: HashMap<String, &ManagedResource> = HashMap::new();
     for resource in resources {
         if let Some(ref binding_name) = resource.binding {
             binding_map.insert(binding_name.clone(), resource);
@@ -385,7 +392,7 @@ fn collect_ref_type_errors(
     type_expr: &crate::parser::TypeExpr,
     value: &Value,
     param_name: &str,
-    binding_map: &HashMap<String, &Resource>,
+    binding_map: &HashMap<String, &ManagedResource>,
     registry: &SchemaRegistry,
     errors: &mut Vec<String>,
 ) {

@@ -250,19 +250,30 @@ impl DiagnosticEngine {
             // attribute/type/enum validation fires inside `for` loops too.
             for rref in parsed.iter_all_resources() {
                 let ctx = rref.context();
-                // Bridge to the legacy `Resource` shape — `get_for`,
-                // `resolved_attributes`, and the id/attribute reads below
-                // are not yet typestate-aware (carina#3181 PR B).
-                let resource = rref.as_legacy_resource();
-                let resource = resource.as_ref();
-                let provider = &resource.id.provider;
-                let full_resource_type = format!("{}.{}", provider, resource.id.resource_type);
+                // carina#3181: schema lookup routes by the typestate arm.
+                // The `id` / `attributes` / `quoted_string_attrs` reads
+                // below go through the shared `ResourceRef` accessors.
+                let resource_id = rref.id();
+                let resource_attributes = rref.attributes();
+                let resource_quoted_string_attrs = rref.quoted_string_attrs();
+                let resource_schema = || match rref {
+                    carina_core::parser::ResourceRef::Managed(m)
+                    | carina_core::parser::ResourceRef::Deferred { resource: m, .. } => {
+                        self.schemas.get_for(m)
+                    }
+                    carina_core::parser::ResourceRef::DataSource(d) => {
+                        self.schemas.get_for_data_source(d)
+                    }
+                    carina_core::parser::ResourceRef::Virtual(_) => None,
+                };
+                let provider = &resource_id.provider;
+                let full_resource_type = format!("{}.{}", provider, resource_id.resource_type);
                 // Source-range hint for attribute position lookups. Without
                 // this, a `for`-body diagnostic like `mode = "aaa"` would
                 // anchor on the first top-level `mode =` in the file.
-                let scope = resource_source_range(doc, ctx, provider, &resource.id.resource_type);
+                let scope = resource_source_range(doc, ctx, provider, &resource_id.resource_type);
 
-                if self.schemas.get_for(resource).is_none() {
+                if resource_schema().is_none() {
                     let provider_loaded = self.provider_names.contains(&provider.to_string());
 
                     if let Some(reason) = self.provider_errors.get(provider) {
@@ -270,10 +281,10 @@ impl DiagnosticEngine {
                         if let Some((line, col)) = self.find_resource_type_position(
                             doc,
                             provider,
-                            &resource.id.resource_type,
+                            &resource_id.resource_type,
                         ) {
                             let end_col = col
-                                + resource.id.resource_type.len() as u32
+                                + resource_id.resource_type.len() as u32
                                 + provider.len() as u32
                                 + 1;
                             diagnostics.push(carina_diagnostic(
@@ -290,10 +301,10 @@ impl DiagnosticEngine {
                         if let Some((line, col)) = self.find_resource_type_position(
                             doc,
                             provider,
-                            &resource.id.resource_type,
+                            &resource_id.resource_type,
                         ) {
                             let end_col = col
-                                + resource.id.resource_type.len() as u32
+                                + resource_id.resource_type.len() as u32
                                 + provider.len() as u32
                                 + 1;
                             diagnostics.push(carina_diagnostic(
@@ -312,10 +323,10 @@ impl DiagnosticEngine {
                         if let Some((line, col)) = self.find_resource_type_position(
                             doc,
                             provider,
-                            &resource.id.resource_type,
+                            &resource_id.resource_type,
                         ) {
                             let end_col = col
-                                + resource.id.resource_type.len() as u32
+                                + resource_id.resource_type.len() as u32
                                 + provider.len() as u32
                                 + 1;
                             diagnostics.push(carina_diagnostic(
@@ -325,7 +336,7 @@ impl DiagnosticEngine {
                                 DiagnosticSeverity::WARNING,
                                 format!(
                                     "No schema for {}.{} — attribute validation skipped",
-                                    provider, resource.id.resource_type
+                                    provider, resource_id.resource_type
                                 ),
                             ));
                         }
@@ -333,7 +344,7 @@ impl DiagnosticEngine {
                 }
 
                 // Semantic validation using schema
-                let schema = self.schemas.get_for(resource).cloned();
+                let schema = resource_schema().cloned();
                 if let Some(schema) = &schema {
                     // Check data source without `read` keyword
                     if schema.is_data_source()
@@ -341,11 +352,11 @@ impl DiagnosticEngine {
                         && let Some((line, col)) = self.find_resource_type_position(
                             doc,
                             provider,
-                            &resource.id.resource_type,
+                            &resource_id.resource_type,
                         )
                     {
                         let end_col = col
-                            + resource.id.resource_type.len() as u32
+                            + resource_id.resource_type.len() as u32
                             + provider.len() as u32
                             + 1;
                         diagnostics.push(carina_diagnostic(
@@ -364,7 +375,7 @@ impl DiagnosticEngine {
                     // Build block_name -> canonical_name map for this schema
                     let bn_map = schema.block_name_map();
 
-                    for (attr_name, attr_value) in &resource.attributes {
+                    for (attr_name, attr_value) in resource_attributes {
                         if attr_name.starts_with('_') {
                             continue; // Skip internal attributes
                         }
@@ -379,7 +390,7 @@ impl DiagnosticEngine {
                         // Skip when block_name == canonical name (singular names like "statement")
                         if let Some(canon) = bn_map.get(attr_name)
                             && canon != attr_name
-                            && resource.attributes.contains_key(canon)
+                            && resource_attributes.contains_key(canon)
                         {
                             if let Some((line, col)) =
                                 self.find_attribute_position(doc, attr_name, scope)
@@ -419,7 +430,7 @@ impl DiagnosticEngine {
                                     DiagnosticSeverity::WARNING,
                                     format!(
                                         "Unknown attribute '{}' for resource type '{}'{}",
-                                        attr_name, resource.id.resource_type, suggestion
+                                        attr_name, resource_id.resource_type, suggestion
                                     ),
                                 ));
                             }
@@ -468,7 +479,7 @@ impl DiagnosticEngine {
                                     &attr_schema.attr_type,
                                     attr_value,
                                     attr_name,
-                                    resource.quoted_string_attrs.contains(attr_name),
+                                    resource_quoted_string_attrs.contains(attr_name),
                                     self.find_attribute_value_range(doc, attr_name, scope),
                                 )
                             {
@@ -528,7 +539,7 @@ impl DiagnosticEngine {
                                     attr_schema.attr_type.validate(value).err().map(|e| {
                                         let tagged = e.with_attribute(attr_name);
                                         let reshaped =
-                                            if resource.quoted_string_attrs.contains(attr_name) {
+                                            if resource_quoted_string_attrs.contains(attr_name) {
                                                 tagged.into_string_literal_diagnostic()
                                             } else {
                                                 tagged
@@ -587,7 +598,7 @@ impl DiagnosticEngine {
                                         let inner_msg = inner_err.to_string();
                                         if namespace.is_some()
                                             && matches!(value, Value::Concrete(ConcreteValue::String(s)) if !s.contains('.'))
-                                            && resource.quoted_string_attrs.contains(attr_name)
+                                            && resource_quoted_string_attrs.contains(attr_name)
                                         {
                                             let typed = match value {
                                                 Value::Concrete(ConcreteValue::String(s)) => s.as_str(),
@@ -708,11 +719,11 @@ impl DiagnosticEngine {
                     }
 
                     // Run resource-level validator (e.g., mutually exclusive required fields)
-                    let resolved_attrs = resource.resolved_attributes();
+                    let resolved_attrs = rref.resolved_attributes();
                     let lookup =
                         carina_core::parser::provider_context_lookup(&self.provider_context);
                     let is_string_literal =
-                        |attr: &str| resource.quoted_string_attrs.contains(attr);
+                        |attr: &str| resource_quoted_string_attrs.contains(attr);
                     if let Err(errors) = schema.validate_with_origins_and_lookup(
                         &resolved_attrs,
                         &is_string_literal,
@@ -749,7 +760,7 @@ impl DiagnosticEngine {
                                 self.find_resource_type_position(
                                     doc,
                                     provider,
-                                    &resource.id.resource_type,
+                                    &resource_id.resource_type,
                                 )
                             });
                             if let Some((line, col)) = position {

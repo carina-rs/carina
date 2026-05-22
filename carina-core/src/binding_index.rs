@@ -8,16 +8,16 @@
 //!   declaration kinds the parser tracks (resource, argument, module
 //!   call, upstream state, import alias, user function, variable,
 //!   structural binding from let-of-if/for/read).
-//! - [`BindingIndex`] — "what schema and which `Resource` does this
+//! - [`BindingIndex`] — "what schema and which `ManagedResource` does this
 //!   binding point at?" Schema-aware view. Used by validation and the
-//!   LSP. Each entry has both a `Resource` and a `ResourceSchema`.
+//!   LSP. Each entry has both a `ManagedResource` and a `ResourceSchema`.
 //! - [`ResolvedBindings`] — "what attribute values does this binding
 //!   actually carry?" Value-aware view. Used by the resolver and
-//!   executor. Includes upstream-state bindings that have no `Resource`
+//!   executor. Includes upstream-state bindings that have no `ManagedResource`
 //!   or `ResourceSchema`.
 //!
 //! The three are separate types rather than fields on one because their
-//! invariants differ — `BindingIndex` requires both `Resource` and
+//! invariants differ — `BindingIndex` requires both `ManagedResource` and
 //! `ResourceSchema`, `ResolvedBindings` requires only attribute values
 //! (no schema), `BindingNameSet` requires only the name and an origin
 //! tag. Callers that need more than one view hold them side by side.
@@ -39,8 +39,8 @@
 //! }
 //! ```
 
-use crate::parser::BindingName;
-use crate::resource::{ManagedResource, Resource, ResourceId, State, Value, VirtualResource};
+use crate::parser::{BindingName, ResourceRef};
+use crate::resource::{ManagedResource, ResourceId, State, Value, VirtualResource};
 use crate::schema::{ResourceSchema, SchemaRegistry};
 use std::collections::HashMap;
 
@@ -98,11 +98,19 @@ impl<'a> BindingIndex<'a> {
                 continue;
             };
             known_names.insert(binding_name.to_string());
-            // `get_for` is not yet typestate-aware — bridge through the
-            // legacy `Resource` shape. A virtual resource has no schema,
+            // Schema lookup routes by the typestate arm: managed
+            // resources via `get_for`, data sources via
+            // `get_for_data_source`. A virtual resource has no schema,
             // so it stays in `known_names` but gets no `entries` row,
             // matching the prior "known binding, schema absent" surface.
-            let Some(schema) = registry.get_for(&rref.as_legacy_resource()) else {
+            let schema = match rref {
+                ResourceRef::Managed(m) | ResourceRef::Deferred { resource: m, .. } => {
+                    registry.get_for(m)
+                }
+                ResourceRef::DataSource(d) => registry.get_for_data_source(d),
+                ResourceRef::Virtual(_) => None,
+            };
+            let Some(schema) = schema else {
                 continue;
             };
             entries.insert(binding_name.to_string(), BindingEntry { schema });
@@ -167,7 +175,7 @@ impl<'a> BindingIndex<'a> {
 #[non_exhaustive]
 pub enum BindingNameKind {
     /// `let <name> = ...` resource binding.
-    Resource,
+    ManagedResource,
     /// `argument <name> { ... }` module argument.
     Argument,
     /// `module <name> "..." { ... }` call site.
@@ -228,7 +236,7 @@ impl BindingNameSet {
     /// inserted in **most-specific-first** order and the first
     /// `insert` wins (later sources call `entry().or_insert`).
     ///
-    /// The order — `Resource` → `ModuleCall` → `UpstreamState` →
+    /// The order — `ManagedResource` → `ModuleCall` → `UpstreamState` →
     /// `Argument` → `Use` → `UserFunction` → `Structural` → `Variable`
     /// — keeps `Variable` last because `parsed.variables` is the
     /// catch-all "any `let`-RHS placeholder lives here" map, while the
@@ -238,15 +246,15 @@ impl BindingNameSet {
 
         // carina#3181: walk the typed top-level slices — managed
         // resources, data sources, and virtuals all register a
-        // `Resource`-kind binding name (a data source declared as
+        // `ManagedResource`-kind binding name (a data source declared as
         // `let x = read ...` is addressable by `ResourceRef`, and a
-        // virtual binding was a `Resource`-kind name before the
+        // virtual binding was a `ManagedResource`-kind name before the
         // typestate split too).
         for rref in parsed.iter_top_level_resources() {
             if let Some(name) = rref.binding() {
                 by_name
                     .entry(name.to_string())
-                    .or_insert(BindingNameKind::Resource);
+                    .or_insert(BindingNameKind::ManagedResource);
             }
         }
         // Wait bindings register right after resources: a wait binding
@@ -413,7 +421,7 @@ pub struct ResolvedBinding {
 /// why this is a separate type.
 ///
 /// Owned, not borrowed: building the merged map requires combining
-/// `Resource.attributes` with `State.attributes`, and there is no single
+/// `ManagedResource.attributes` with `State.attributes`, and there is no single
 /// upstream `HashMap<String, HashMap<String, Value>>` already on hand to
 /// borrow from. Owning the merged map avoids a self-referential
 /// structure.
@@ -441,7 +449,7 @@ impl ResolvedBindings {
     /// separately by `Effect::Wait` lowering; this only restores the
     /// value-identity half (design value semantics).
     pub fn from_resources_with_state(
-        resources: &[Resource],
+        resources: &[ManagedResource],
         current_states: &HashMap<ResourceId, State>,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         wait_aliases: &[WaitAliasSpec],
@@ -519,21 +527,13 @@ impl ResolvedBindings {
     /// caller builds via this constructor is the *only* view a
     /// pre-apply resolver should consult; virtuals layer in
     /// post-apply via [`Self::add_virtual_resources`].
-    ///
-    /// Implementation is intentionally a shallow wrapper that
-    /// rebridges each `ManagedResource` to a `Resource` (via the
-    /// existing `From<&ManagedResource>` impl, transitional until
-    /// #3181) so the binding-construction logic stays in one place.
-    /// The bridge disappears once the legacy `Resource` IR is
-    /// retired.
     pub fn from_managed_with_state(
         managed: &[ManagedResource],
         current_states: &HashMap<ResourceId, State>,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         wait_aliases: &[WaitAliasSpec],
     ) -> Self {
-        let bridge: Vec<Resource> = managed.iter().map(Resource::from).collect();
-        Self::from_resources_with_state(&bridge, current_states, remote_bindings, wait_aliases)
+        Self::from_resources_with_state(managed, current_states, remote_bindings, wait_aliases)
     }
 
     /// Typed post-apply layering (#3176): add virtual-resource
@@ -577,6 +577,29 @@ impl ResolvedBindings {
             );
         }
         Ok(())
+    }
+
+    /// Layer data-source bindings onto the view. carina#3181: a
+    /// `let x = read aws.iam.user { ... }` binding is addressable by a
+    /// `ResourceRef` (`x.user_id`), and an `exports { y = x.user_id }`
+    /// must see the data source's resolved attribute map. Data sources
+    /// are a distinct typestate from managed resources, so they are
+    /// layered in explicitly rather than collapsed into the managed
+    /// slice. The resolved attribute map is recorded verbatim — data
+    /// sources have no provider-side state to merge here.
+    pub fn add_data_sources(&mut self, data_sources: &[crate::resource::DataSource]) {
+        for d in data_sources.iter() {
+            let Some(binding_name) = d.binding.as_ref() else {
+                continue;
+            };
+            self.by_name.insert(
+                binding_name.clone(),
+                ResolvedBinding {
+                    attributes: crate::resource::attrs_to_hashmap(&d.attributes),
+                    source: BindingValueSource::Local,
+                },
+            );
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<&HashMap<String, Value>> {
@@ -877,11 +900,15 @@ let vpc = aws.ec2.Vpc {
 #[cfg(test)]
 mod resolved_bindings_tests {
     use super::*;
-    use crate::resource::{ConcreteValue, Resource, ResourceId, State, Value};
+    use crate::resource::{ConcreteValue, ManagedResource, ResourceId, State, Value};
     use std::collections::BTreeSet;
 
-    fn make_resource(name: &str, binding: Option<&str>, attrs: Vec<(&str, Value)>) -> Resource {
-        let mut r = Resource::new("test.resource", name);
+    fn make_resource(
+        name: &str,
+        binding: Option<&str>,
+        attrs: Vec<(&str, Value)>,
+    ) -> ManagedResource {
+        let mut r = ManagedResource::new("test.resource", name);
         r.attributes = attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
         r.binding = binding.map(|b| b.to_string());
         r
@@ -971,9 +998,9 @@ mod resolved_bindings_tests {
 
     #[test]
     fn upstream_state_binding_is_first_class() {
-        // Upstream-state bindings have no `Resource` and no `ResourceSchema`,
+        // Upstream-state bindings have no `ManagedResource` and no `ResourceSchema`,
         // which is the case `BindingIndex` cannot represent.
-        let resources: Vec<Resource> = Vec::new();
+        let resources: Vec<ManagedResource> = Vec::new();
         let states: HashMap<ResourceId, State> = HashMap::new();
         let mut remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
         let mut network_attrs = HashMap::new();
@@ -1454,7 +1481,7 @@ let vpc = aws.ec2.Vpc {
         let names = BindingNameSet::from_parsed(&parsed);
 
         assert!(names.contains("vpc"));
-        assert_eq!(names.kind("vpc"), Some(&BindingNameKind::Resource));
+        assert_eq!(names.kind("vpc"), Some(&BindingNameKind::ManagedResource));
     }
 
     #[test]
@@ -1636,6 +1663,6 @@ let cert_issued = wait cert {
             "wait binding must carry its typed target edge"
         );
         // The target itself is still a plain resource binding.
-        assert_eq!(names.kind("cert"), Some(&BindingNameKind::Resource));
+        assert_eq!(names.kind("cert"), Some(&BindingNameKind::ManagedResource));
     }
 }

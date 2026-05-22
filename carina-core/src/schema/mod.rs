@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 
-use crate::resource::{ConcreteValue, ConcreteValueRef, DeferredValue, Resource, Value};
+use crate::resource::{ConcreteValue, ConcreteValueRef, DeferredValue, ManagedResource, Value};
 use crate::utils::{extract_enum_value_with_values, validate_enum_namespace};
 use crate::value::format_value_with_key;
 
@@ -1909,7 +1909,7 @@ pub enum TypeError {
     #[error("Validation failed: {message}")]
     ValidationFailed { message: String },
 
-    #[error("Resource validation failed: {message}")]
+    #[error("ManagedResource validation failed: {message}")]
     ResourceValidationFailed {
         message: String,
         /// Optional attribute name for precise diagnostic positioning.
@@ -2320,7 +2320,7 @@ pub enum SchemaKind {
     DataSource,
 }
 
-/// Resource schema
+/// ManagedResource schema
 #[derive(Debug, Clone)]
 pub struct ResourceSchema {
     pub resource_type: String,
@@ -2611,7 +2611,7 @@ impl ResourceSchema {
         for (name, value) in attributes {
             // Skip parser-internal attributes (leading `_`, e.g.
             // `_type`, `_default_tag_keys`); they have no schema entry.
-            // Prefer a typed field on `Resource` for new internal state
+            // Prefer a typed field on `ManagedResource` for new internal state
             // — see #2224.
             if name.starts_with('_') {
                 continue;
@@ -2794,7 +2794,7 @@ fn resolve_block_names_in_map(
 ///
 /// Also recursively resolves block names in nested struct values.
 pub fn resolve_block_names(
-    resources: &mut [Resource],
+    resources: &mut [ManagedResource],
     registry: &SchemaRegistry,
 ) -> Result<(), String> {
     let mut all_errors = Vec::new();
@@ -3332,15 +3332,25 @@ impl SchemaRegistry {
         }
     }
 
-    /// Look up the schema appropriate for a given `Resource`. Picks the
-    /// `Managed` entry for normal resources and the `DataSource` entry for
-    /// `read`-keyword resources (`ResourceKind::DataSource`).
-    pub fn get_for(&self, resource: &crate::resource::Resource) -> Option<&ResourceSchema> {
-        let kind = match resource.kind {
-            crate::resource::ResourceKind::DataSource => SchemaKind::DataSource,
-            _ => SchemaKind::Managed,
-        };
-        self.get(&resource.id.provider, &resource.id.resource_type, kind)
+    /// Look up the `Managed` schema for a given [`ManagedResource`].
+    pub fn get_for(&self, resource: &crate::resource::ManagedResource) -> Option<&ResourceSchema> {
+        self.get(
+            &resource.id.provider,
+            &resource.id.resource_type,
+            SchemaKind::Managed,
+        )
+    }
+
+    /// Look up the `DataSource` schema for a given [`DataSource`].
+    pub fn get_for_data_source(
+        &self,
+        resource: &crate::resource::DataSource,
+    ) -> Option<&ResourceSchema> {
+        self.get(
+            &resource.id.provider,
+            &resource.id.resource_type,
+            SchemaKind::DataSource,
+        )
     }
 
     pub fn has_managed(&self, provider: &str, resource_type: &str) -> bool {

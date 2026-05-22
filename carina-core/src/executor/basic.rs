@@ -12,7 +12,7 @@ use crate::provider::{
     build_update_patch,
 };
 use crate::resolver::resolve_ref_value;
-use crate::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, State, Value};
+use crate::resource::{ConcreteValue, DeferredValue, ManagedResource, ResourceId, State, Value};
 
 use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
 
@@ -123,10 +123,10 @@ pub(super) async fn refresh_pending_states(
 /// that populate asynchronously (ACM `domain_validation_options`,
 /// CloudFront `domain_name`, etc.).
 pub(super) async fn resolve_resource(
-    resource: &Resource,
+    resource: &ManagedResource,
     bindings: &ResolvedBindings,
     pipeline: &RenormalizePipeline<'_>,
-) -> Result<Resource, String> {
+) -> Result<ManagedResource, String> {
     let mut resolved = resource.clone();
     for (key, expr) in &resource.attributes {
         let resolved_value = unwrap_secret(resolve_ref_value(expr, bindings)?);
@@ -142,11 +142,11 @@ pub(super) async fn resolve_resource(
 /// See [`resolve_resource`] for the fail-fast contract on
 /// still-deferred values.
 pub(super) async fn resolve_resource_with_source(
-    target: &Resource,
-    source: &Resource,
+    target: &ManagedResource,
+    source: &ManagedResource,
     bindings: &ResolvedBindings,
     pipeline: &RenormalizePipeline<'_>,
-) -> Result<Resource, String> {
+) -> Result<ManagedResource, String> {
     let mut resolved = target.clone();
     for (key, expr) in &source.attributes {
         let resolved_value = unwrap_secret(resolve_ref_value(expr, bindings)?);
@@ -203,9 +203,9 @@ pub(super) struct RenormalizePipeline<'a> {
 /// fail-fast earlier on still-`Deferred` values — so this stays the tail
 /// expression without forcing `Ok(...)` at every call site.
 async fn renormalize(
-    resolved: Resource,
+    resolved: ManagedResource,
     pipeline: &RenormalizePipeline<'_>,
-) -> Result<Resource, String> {
+) -> Result<ManagedResource, String> {
     let mut one = [resolved];
     crate::value::canonicalize_resources_with_schemas(&mut one, pipeline.schemas);
     pipeline.normalizer.normalize_desired(&mut one).await;
@@ -335,7 +335,7 @@ pub(super) fn count_actionable_effects(effects: &[Effect]) -> usize {
 pub(super) struct BasicEffectCtx<'a> {
     pub(super) provider: &'a dyn Provider,
     pub(super) bindings: &'a ResolvedBindings,
-    pub(super) unresolved: &'a HashMap<ResourceId, Resource>,
+    pub(super) unresolved: &'a HashMap<ResourceId, ManagedResource>,
     pub(super) pipeline: &'a RenormalizePipeline<'a>,
     pub(super) completed: &'a AtomicUsize,
     pub(super) total: usize,
@@ -376,10 +376,6 @@ pub(super) async fn execute_basic_effect<'a>(
 
     match basic {
         BasicEffect::Create { resource, .. } => {
-            // carina#3181 PR D: `BasicEffect::Create.resource` is a
-            // `ManagedResource`; the executor's resolve/renormalize
-            // pipeline still works in legacy `Resource`, so bridge here.
-            let resource = &Resource::from(resource);
             let resolved = match resolve_resource(resource, bindings, pipeline).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -440,10 +436,6 @@ pub(super) async fn execute_basic_effect<'a>(
             changed_attributes,
             ..
         } => {
-            // carina#3181 PR D: `BasicEffect::Update.to` is a
-            // `ManagedResource`; bridge to legacy `Resource` for the
-            // executor's resolve pipeline and the `unresolved` map.
-            let to = &Resource::from(to);
             let resolve_source = unresolved.get(id).unwrap_or(to);
             let resolved_to =
                 match resolve_resource_with_source(to, resolve_source, bindings, pipeline).await {

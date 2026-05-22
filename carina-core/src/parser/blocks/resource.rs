@@ -1,4 +1,4 @@
-//! Resource-expression parsers (`provider.service.Type "name" { ... }`,
+//! ManagedResource-expression parsers (`provider.service.Type "name" { ... }`,
 //! anonymous resources, `read` data sources) and the shared
 //! `parse_block_contents` traversal that backs both resources and the
 //! map-literal primary.
@@ -11,14 +11,14 @@ use crate::parser::context::{ParseContext, extract_key_string, first_inner, next
 use crate::parser::error::ParseError;
 use crate::parser::parse_expression;
 use crate::parser::util::expression_is_plain_string_literal;
-use crate::resource::{ConcreteValue, Resource, ResourceId, ResourceKind, Value};
+use crate::resource::{ConcreteValue, DataSource, ManagedResource, ResourceId, Value};
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 pub(in crate::parser) fn parse_anonymous_resource(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
-) -> Result<Resource, ParseError> {
+) -> Result<ManagedResource, ParseError> {
     let inner = pair.into_inner();
 
     let mut iter = inner;
@@ -59,17 +59,15 @@ pub(in crate::parser) fn parse_anonymous_resource(
         directives.provider_instance.clone(),
     );
 
-    Ok(Resource {
+    Ok(ManagedResource {
         id,
         attributes: attributes.into_iter().collect(),
-        kind: ResourceKind::Managed,
         directives,
         prefixes: HashMap::new(),
         binding: None,
         dependency_bindings: BTreeSet::new(),
         module_source: None,
         quoted_string_attrs,
-        virtual_module: None,
     })
 }
 
@@ -87,7 +85,7 @@ pub(crate) fn parse_block_contents(
 /// As [`parse_block_contents`], but if `quoted_out` is `Some`, populate it
 /// with the names of top-level attributes whose value is a plain quoted
 /// string literal (`attr = "..."`). Used by resource-level callers to
-/// build `Resource.quoted_string_attrs` for enum-attribute diagnostics
+/// build `ManagedResource.quoted_string_attrs` for enum-attribute diagnostics
 /// (#2094 / #2229) without re-walking the pest tree.
 pub(in crate::parser) fn parse_block_contents_with_quoted(
     pairs: pest::iterators::Pairs<Rule>,
@@ -95,7 +93,7 @@ pub(in crate::parser) fn parse_block_contents_with_quoted(
     quoted_out: &mut Option<HashSet<String>>,
 ) -> Result<IndexMap<String, Value>, ParseError> {
     // `IndexMap` so the order in which the user wrote attributes in the
-    // .crn file flows all the way to `Resource.attributes` and to
+    // .crn file flows all the way to `ManagedResource.attributes` and to
     // `Value::Concrete(ConcreteValue::Map)` payloads — anything that re-renders attributes
     // (formatter, plan display, diagnostics) sees a stable order.
     let mut attributes: IndexMap<String, Value> = IndexMap::new();
@@ -193,7 +191,7 @@ pub(crate) fn parse_resource_expr(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
     binding_name: &str,
-) -> Result<Resource, ParseError> {
+) -> Result<ManagedResource, ParseError> {
     let mut inner = pair.into_inner();
 
     let namespaced_type = next_pair(&mut inner, "resource type", "resource expression")?
@@ -232,17 +230,15 @@ pub(crate) fn parse_resource_expr(
         directives.provider_instance.clone(),
     );
 
-    Ok(Resource {
+    Ok(ManagedResource {
         id,
         attributes: attributes.into_iter().collect(),
-        kind: ResourceKind::Managed,
         directives,
         prefixes: HashMap::new(),
         binding: Some(binding_name.to_string()),
         dependency_bindings: BTreeSet::new(),
         module_source: None,
         quoted_string_attrs,
-        virtual_module: None,
     })
 }
 
@@ -251,7 +247,7 @@ pub(crate) fn parse_read_resource_expr(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
     binding_name: &str,
-) -> Result<Resource, ParseError> {
+) -> Result<DataSource, ParseError> {
     let mut inner = pair.into_inner();
 
     let namespaced_type = next_pair(&mut inner, "resource type", "read resource expression")?
@@ -290,17 +286,14 @@ pub(crate) fn parse_read_resource_expr(
         directives.provider_instance.clone(),
     );
 
-    Ok(Resource {
+    Ok(DataSource {
         id,
         attributes: attributes.into_iter().collect(),
-        kind: ResourceKind::DataSource,
         directives,
-        prefixes: HashMap::new(),
         binding: Some(binding_name.to_string()),
         dependency_bindings: BTreeSet::new(),
         module_source: None,
         quoted_string_attrs,
-        virtual_module: None,
     })
 }
 

@@ -13,10 +13,7 @@ use std::collections::{BTreeSet, HashSet};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use super::{
-    Directives, ModuleSource, Resource, ResourceId, ResourceKind, ResourceKindLabel,
-    ResourceKindMismatch, Value,
-};
+use super::{Directives, ModuleSource, ResourceId, Value};
 
 /// A read-only resource (data source).
 ///
@@ -51,7 +48,7 @@ pub struct DataSource {
     pub module_source: Option<ModuleSource>,
     /// Parser-level: attributes whose value was written as a quoted
     /// string literal. Parse-time only; `#[serde(skip)]` keeps it out
-    /// of state — mirrors [`Resource::quoted_string_attrs`].
+    /// of state — mirrors [`ManagedResource::quoted_string_attrs`](super::ManagedResource).
     #[serde(default, skip)]
     pub quoted_string_attrs: HashSet<String>,
 }
@@ -106,65 +103,5 @@ impl DataSource {
     pub fn with_binding(mut self, binding: impl Into<String>) -> Self {
         self.binding = Some(binding.into());
         self
-    }
-}
-
-impl TryFrom<&Resource> for DataSource {
-    type Error = ResourceKindMismatch;
-
-    fn try_from(res: &Resource) -> Result<Self, Self::Error> {
-        match res.kind {
-            ResourceKind::DataSource => Ok(Self {
-                id: res.id.clone(),
-                attributes: res.attributes.clone(),
-                directives: res.directives.clone(),
-                binding: res.binding.clone(),
-                dependency_bindings: res.dependency_bindings.clone(),
-                module_source: res.module_source.clone(),
-                quoted_string_attrs: res.quoted_string_attrs.clone(),
-            }),
-            _ => Err(ResourceKindMismatch {
-                expected: ResourceKindLabel::DataSource,
-                actual: res.kind.label(),
-            }),
-        }
-    }
-}
-
-/// Owned-`Resource` convenience over [`TryFrom<&Resource>`]. Symmetric
-/// with the `ManagedResource` impl; removed with the other transitional
-/// bridges when #3181 inline-merges `Resource`.
-impl TryFrom<Resource> for DataSource {
-    type Error = ResourceKindMismatch;
-
-    fn try_from(res: Resource) -> Result<Self, Self::Error> {
-        Self::try_from(&res)
-    }
-}
-
-/// Transitional bridge — rebuild a legacy [`Resource`] from a
-/// `DataSource`. Symmetric with [`From<&ManagedResource> for Resource`]
-/// in `managed.rs`; removed alongside it when #3181 inline-merges
-/// `Resource` into the typestate structs.
-///
-/// `prefixes` is reconstructed empty — `DataSource` drops the field as a
-/// compile-time invariant (auto-generated names do not apply to
-/// read-only lookups), and a `Resource` synthesized from a `DataSource`
-/// only flows into `Effect::Read { resource }` whose downstream
-/// consumers (executor read path) do not read `prefixes`.
-impl From<&DataSource> for Resource {
-    fn from(d: &DataSource) -> Self {
-        Self {
-            id: d.id.clone(),
-            attributes: d.attributes.clone(),
-            kind: ResourceKind::DataSource,
-            directives: d.directives.clone(),
-            prefixes: std::collections::HashMap::new(),
-            binding: d.binding.clone(),
-            dependency_bindings: d.dependency_bindings.clone(),
-            module_source: d.module_source.clone(),
-            quoted_string_attrs: d.quoted_string_attrs.clone(),
-            virtual_module: None,
-        }
     }
 }

@@ -1,6 +1,6 @@
 use super::*;
 use crate::binding_index::IterableBindings;
-use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Resource, Value};
+use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, ManagedResource, Value};
 use indexmap::IndexMap;
 use std::collections::HashMap;
 
@@ -119,19 +119,12 @@ fn iter_all_resources_classifies_managed_and_data_source_arms() {
     assert_eq!(data_sources.len(), 1);
     assert_eq!(managed[0].id().resource_type, "s3.Bucket");
     assert_eq!(data_sources[0].id().resource_type, "sts.caller_identity");
-    assert_eq!(managed[0].kind(), crate::resource::ResourceKind::Managed);
-    assert_eq!(
-        data_sources[0].kind(),
-        crate::resource::ResourceKind::DataSource
-    );
 }
 
-/// carina#3181 PR C: `legacy_top_level_resources` rebuilds the mixed
-/// `Vec<Resource>` from the typed slices — every kind present, each with
-/// the correct `ResourceKind` discriminant — for legacy `&[Resource]`
-/// APIs (`sort_resources_by_dependencies`, `split_resources_by_kind`).
+/// carina#3181: the parser routes managed resources and `read` data
+/// sources into separate typed slices on [`ParsedFile`].
 #[test]
-fn legacy_top_level_resources_rebuilds_mixed_vec() {
+fn parser_routes_managed_and_data_sources_to_typed_slices() {
     let src = r#"
         provider aws {
             region = aws.Region.ap_northeast_1
@@ -146,20 +139,11 @@ fn legacy_top_level_resources_rebuilds_mixed_vec() {
     // `resources` is managed-only, `data_sources` holds the read.
     assert_eq!(parsed.resources.len(), 1); // allow: direct — fixture test inspection
     assert_eq!(parsed.data_sources.len(), 1);
-
-    // The rebuilt legacy view holds both, each with the right kind.
-    let legacy = parsed.legacy_top_level_resources();
-    assert_eq!(legacy.len(), 2);
-    let managed = legacy
-        .iter()
-        .find(|r| r.kind == crate::resource::ResourceKind::Managed)
-        .expect("managed resource in legacy view");
-    let data_source = legacy
-        .iter()
-        .find(|r| r.kind == crate::resource::ResourceKind::DataSource)
-        .expect("data source in legacy view");
-    assert_eq!(managed.id.resource_type, "s3.Bucket");
-    assert_eq!(data_source.id.resource_type, "sts.caller_identity");
+    assert_eq!(parsed.resources[0].id.resource_type, "s3.Bucket"); // allow: direct — fixture test inspection
+    assert_eq!(
+        parsed.data_sources[0].id.resource_type,
+        "sts.caller_identity"
+    );
 }
 
 #[test]
@@ -7406,7 +7390,7 @@ fn expand_deferred_for_map_binding_substitutes_key_and_value() {
     assert_eq!(parsed.resources.len(), 2); // allow: direct — fixture test inspection
 
     // Verify both key and value are substituted.
-    let mut by_name: HashMap<String, &Resource> = HashMap::new();
+    let mut by_name: HashMap<String, &ManagedResource> = HashMap::new();
     for r in &parsed.resources {
         if let Some(Value::Concrete(ConcreteValue::String(s))) = r.get_attr("target_name") {
             by_name.insert(s.clone(), r);
@@ -8186,7 +8170,7 @@ fn reference_to_upstream_state_binding_is_allowed() {
 /// Anonymous resources start with an empty name; the post-parse
 /// identifier pass rewrites that name. A side-table keyed by
 /// `ResourceId` would silently miss after the rename. Co-locating
-/// the bit on the `Resource` (the same struct that carries the
+/// the bit on the `ManagedResource` (the same struct that carries the
 /// attributes) makes it impossible to lose.
 #[test]
 fn quoted_literal_marker_survives_anonymous_resource_rename() {
@@ -8218,8 +8202,8 @@ fn quoted_literal_marker_survives_anonymous_resource_rename() {
 /// bare identifiers and namespaced identifiers at the parser level,
 /// so downstream enum diagnostics can report shape mismatches
 /// ("got a string literal") vs. variant mismatches ("invalid enum
-/// variant"). After #2229 the marker lives on the `Resource` that
-/// owns the attributes (`Resource.quoted_string_attrs`); the
+/// variant"). After #2229 the marker lives on the `ManagedResource` that
+/// owns the attributes (`ManagedResource.quoted_string_attrs`); the
 /// previous `string_literal_paths` side-table is gone.
 #[test]
 fn quoted_string_attrs_distinguish_quoted_from_bare_and_namespaced() {

@@ -14,7 +14,7 @@ use indexmap::IndexMap;
 use super::*;
 use crate::parser::{ArgumentParameter, ModuleCall, ParsedFile, ProviderContext, TypeExpr};
 use crate::resource::{
-    ConcreteValue, DeferredValue, Directives, Resource, ResourceId, ResourceKind, Value,
+    ConcreteValue, DeferredValue, Directives, ManagedResource, ResourceId, Value,
 };
 
 fn create_test_module() -> ParsedFile {
@@ -22,7 +22,7 @@ fn create_test_module() -> ParsedFile {
         providers: vec![],
         data_sources: vec![],
         virtual_resources: vec![],
-        resources: vec![Resource {
+        resources: vec![ManagedResource {
             id: ResourceId::new("security_group", "sg"),
             attributes: {
                 let mut attrs = HashMap::new();
@@ -42,14 +42,12 @@ fn create_test_module() -> ParsedFile {
                 );
                 attrs.into_iter().collect()
             },
-            kind: ResourceKind::Managed,
             directives: Directives::default(),
             prefixes: HashMap::new(),
             binding: None,
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             quoted_string_attrs: std::collections::HashSet::new(),
-            virtual_module: None,
         }],
         variables: IndexMap::new(),
         uses: vec![],
@@ -141,7 +139,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
         providers: vec![],
         data_sources: vec![],
         virtual_resources: vec![],
-        resources: vec![Resource {
+        resources: vec![ManagedResource {
             id: ResourceId::with_provider("awscc", "iam.RolePolicy", "", None),
             attributes: {
                 let mut attrs = IndexMap::new();
@@ -151,14 +149,12 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
                 );
                 attrs
             },
-            kind: ResourceKind::Managed,
             directives: Directives::default(),
             prefixes: HashMap::new(),
             binding: None,
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             quoted_string_attrs: std::collections::HashSet::new(),
-            virtual_module: None,
         }],
         variables: IndexMap::new(),
         uses: vec![],
@@ -275,7 +271,7 @@ fn test_expand_module_call() {
 /// `(id.provider, id.provider_instance)`, so the lost binding made
 /// `create` dispatch to the kind's default instance even though
 /// state-writeback (which reads `directives.provider_instance` from
-/// the `Resource`, not the `id`) still recorded the routing
+/// the `ManagedResource`, not the `id`) still recorded the routing
 /// correctly. Net effect for users: an ACM cert that should live in
 /// `us-east-1` (where CloudFront viewer certs *must* live) lands in
 /// the default region instead, and subsequent `read` against the
@@ -285,7 +281,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
         providers: vec![],
         data_sources: vec![],
         virtual_resources: vec![],
-        resources: vec![Resource {
+        resources: vec![ManagedResource {
             id: ResourceId::with_provider("aws", "acm.Certificate", "cert", Some("us".to_string())),
             attributes: {
                 let mut attrs = IndexMap::new();
@@ -295,7 +291,6 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
                 );
                 attrs
             },
-            kind: ResourceKind::Managed,
             directives: Directives {
                 provider_instance: Some("us".to_string()),
                 ..Directives::default()
@@ -305,7 +300,6 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             quoted_string_attrs: std::collections::HashSet::new(),
-            virtual_module: None,
         }],
         variables: IndexMap::new(),
         uses: vec![],
@@ -372,13 +366,13 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
     // `provider_instance` before carina#3038. A close-but-different
     // SimHash in state triggers a name rewrite, so this test must
     // assert that the named-instance routing survives the rewrite.
-    use crate::resource::{ConcreteValue, Resource, ResourceId, ResourceKind, Value};
+    use crate::resource::{ConcreteValue, ManagedResource, ResourceId, Value};
 
     let current_prefix = format!("thing_{:016x}", 0xABCDu64);
     let state_hash = 0xABCDu64 ^ 1; // flip one bit — within SimHash threshold
     let state_name = format!("thing_{:016x}.role", state_hash);
 
-    let mut resources = vec![Resource {
+    let mut resources = vec![ManagedResource {
         id: ResourceId::with_provider(
             "aws",
             "iam.Role",
@@ -393,7 +387,6 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
             );
             attrs
         },
-        kind: ResourceKind::Managed,
         directives: Directives {
             provider_instance: Some("us".to_string()),
             ..Directives::default()
@@ -406,7 +399,6 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
             instance: current_prefix.clone(),
         }),
         quoted_string_attrs: std::collections::HashSet::new(),
-        virtual_module: None,
     }];
 
     let state_lookup = |_: &str, _: &str| vec![state_name.clone()];
@@ -433,7 +425,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
         data_sources: vec![],
         virtual_resources: vec![],
         resources: vec![
-            Resource {
+            ManagedResource {
                 id: ResourceId::new("ec2.Vpc", "main_vpc"),
                 attributes: {
                     let mut attrs = HashMap::new();
@@ -445,16 +437,14 @@ fn create_module_with_intra_refs() -> ParsedFile {
                     );
                     attrs.into_iter().collect()
                 },
-                kind: ResourceKind::Managed,
                 directives: Directives::default(),
                 prefixes: HashMap::new(),
                 binding: Some("vpc".to_string()),
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
                 quoted_string_attrs: std::collections::HashSet::new(),
-                virtual_module: None,
             },
-            Resource {
+            ManagedResource {
                 id: ResourceId::new("ec2.Subnet", "sub"),
                 attributes: {
                     let mut attrs = HashMap::new();
@@ -464,14 +454,12 @@ fn create_module_with_intra_refs() -> ParsedFile {
                     );
                     attrs.into_iter().collect()
                 },
-                kind: ResourceKind::Managed,
                 directives: Directives::default(),
                 prefixes: HashMap::new(),
                 binding: Some("subnet".to_string()),
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
                 quoted_string_attrs: std::collections::HashSet::new(),
-                virtual_module: None,
             },
         ],
         variables: IndexMap::new(),
@@ -583,7 +571,7 @@ fn test_multiple_module_instances_no_collision() {
         "Instance B subnet should reference staging.vpc, not bare vpc"
     );
 
-    // Resource names should also be distinct (dot notation)
+    // ManagedResource names should also be distinct (dot notation)
     assert_eq!(expanded_a[0].id.name_str(), "prod.main_vpc");
     assert_eq!(expanded_b[0].id.name_str(), "staging.main_vpc");
 }
@@ -596,7 +584,7 @@ fn create_module_with_attributes() -> ParsedFile {
         providers: vec![],
         data_sources: vec![],
         virtual_resources: vec![],
-        resources: vec![Resource {
+        resources: vec![ManagedResource {
             id: ResourceId::new("security_group", "sg"),
             attributes: {
                 let mut attrs = HashMap::new();
@@ -610,14 +598,12 @@ fn create_module_with_attributes() -> ParsedFile {
                 );
                 attrs.into_iter().collect()
             },
-            kind: ResourceKind::Managed,
             directives: Directives::default(),
             prefixes: HashMap::new(),
             binding: Some("sg".to_string()),
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             quoted_string_attrs: std::collections::HashSet::new(),
-            virtual_module: None,
         }],
         variables: IndexMap::new(),
         uses: vec![],
@@ -708,7 +694,6 @@ fn test_expand_module_call_populates_virtual_resources_slice() {
 
     // `resources` is managed-only — the synthetic virtual is NOT here.
     assert_eq!(expanded.resources.len(), 1);
-    assert!(!expanded.resources.iter().any(|r| r.is_virtual()));
 
     // The virtual resource lives only in the typed slice.
     assert_eq!(expanded.virtual_resources.len(), 1);
@@ -741,11 +726,9 @@ fn test_expand_module_call_without_binding_no_virtual() {
 
     let expanded = resolver
         .expand_module_call(&call, "web_tier", None)
-        .unwrap()
-        .resources;
-    // Only real resources, no virtual
-    let virtual_count = expanded.iter().filter(|r| r.is_virtual()).count();
-    assert_eq!(virtual_count, 0);
+        .unwrap();
+    // No `binding_name` ⇒ no synthetic virtual resource is created.
+    assert!(expanded.virtual_resources.is_empty());
 }
 
 /// Regression fixtures for #2197. Writes a minimal `modules/thing` module
@@ -1258,7 +1241,7 @@ fn test_expand_module_call_uses_dot_path_addressing() {
     assert_eq!(expanded.len(), 1);
 
     let sg = &expanded[0];
-    // Resource name should use dot notation, not underscore
+    // ManagedResource name should use dot notation, not underscore
     assert_eq!(sg.id.name_str(), "my_instance.sg");
 }
 
@@ -1289,7 +1272,7 @@ fn test_module_dot_path_bindings_and_refs() {
         .unwrap()
         .resources;
 
-    // Resource names should use dot notation
+    // ManagedResource names should use dot notation
     assert_eq!(expanded[0].id.name_str(), "prod.main_vpc");
     assert_eq!(expanded[1].id.name_str(), "prod.sub");
 
@@ -1320,7 +1303,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
         let mut m = create_module_with_intra_refs();
         // A resource that consumes the wait binding the same way the
         // real CloudFront Distribution consumes `cert_issued`.
-        m.resources.push(Resource {
+        m.resources.push(ManagedResource {
             id: ResourceId::new("cloudfront.Distribution", "distribution"),
             attributes: {
                 let mut attrs = HashMap::new();
@@ -1334,14 +1317,12 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
                 );
                 attrs.into_iter().collect()
             },
-            kind: ResourceKind::Managed,
             directives: Directives::default(),
             prefixes: HashMap::new(),
             binding: Some("distribution".to_string()),
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             quoted_string_attrs: std::collections::HashSet::new(),
-            virtual_module: None,
         });
         m.wait_bindings.push(WaitBinding {
             binding: "cert_issued".into(),
@@ -1558,7 +1539,7 @@ fn create_module_with_interpolation() -> ParsedFile {
         providers: vec![],
         data_sources: vec![],
         virtual_resources: vec![],
-        resources: vec![Resource {
+        resources: vec![ManagedResource {
             id: ResourceId::new("ec2.Vpc", "vpc"),
             attributes: {
                 let mut attrs = HashMap::new();
@@ -1585,14 +1566,12 @@ fn create_module_with_interpolation() -> ParsedFile {
                 );
                 attrs.into_iter().collect()
             },
-            kind: ResourceKind::Managed,
             directives: Directives::default(),
             prefixes: HashMap::new(),
             binding: Some("vpc".to_string()),
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             quoted_string_attrs: std::collections::HashSet::new(),
-            virtual_module: None,
         }],
         variables: IndexMap::new(),
         uses: vec![],
@@ -4056,17 +4035,15 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
         // intra-module-conditional prefix to apply (same condition as
         // `rewrite_intra_module_refs`). Add it so this unit faithfully
         // models the real `let cert = aws.acm.Certificate { … }` case.
-        m.resources.push(Resource {
+        m.resources.push(ManagedResource {
             id: ResourceId::new("acm.Certificate", "cert"),
             attributes: HashMap::new().into_iter().collect(),
-            kind: ResourceKind::Managed,
             directives: Directives::default(),
             prefixes: HashMap::new(),
             binding: Some("cert".to_string()),
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             quoted_string_attrs: std::collections::HashSet::new(),
-            virtual_module: None,
         });
         m.deferred_for_expressions.push(DeferredForExpression {
             file: None,
@@ -4078,7 +4055,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
             iterable_binding: "cert".to_string(),
             iterable_attr: "domain_validation_options".to_string(),
             binding: ForBinding::Map("_".to_string(), "opt".to_string()),
-            template_resource: Resource {
+            template_resource: ManagedResource {
                 id: ResourceId::new("route53.RecordSet", "placeholder"),
                 attributes: {
                     // The loop body references the module-internal
@@ -4096,14 +4073,12 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
                     );
                     a
                 },
-                kind: ResourceKind::Managed,
                 directives: Directives::default(),
                 prefixes: HashMap::new(),
                 binding: None,
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
                 quoted_string_attrs: std::collections::HashSet::new(),
-                virtual_module: None,
             },
         });
         m
@@ -4147,7 +4122,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
     // resource. Call instance is "r".
     //
     // `binding_name` is the generated-resource address prefix →
-    // prefixed unconditionally (mirrors `Resource.binding`).
+    // prefixed unconditionally (mirrors `ManagedResource.binding`).
     assert_eq!(
         d.binding_name, "r._domain_validation_options",
         "PR-B must instance-prefix binding_name"
@@ -4220,17 +4195,15 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
             iterable_binding: "accounts".to_string(),
             iterable_attr: "list".to_string(),
             binding: ForBinding::Map("_".to_string(), "a".to_string()),
-            template_resource: Resource {
+            template_resource: ManagedResource {
                 id: ResourceId::new("sso.Assignment", "placeholder"),
                 attributes: HashMap::new().into_iter().collect(),
-                kind: ResourceKind::Managed,
                 directives: Directives::default(),
                 prefixes: HashMap::new(),
                 binding: None,
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
                 quoted_string_attrs: std::collections::HashSet::new(),
-                virtual_module: None,
             },
         });
         m

@@ -15,7 +15,7 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
     // Schema is registered with provider-prefixed key
     schemas.insert("awscc", schema);
 
-    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
+    let mut resource = ManagedResource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
     resource.set_attr(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
@@ -93,8 +93,8 @@ fn build_state_after_apply_preserves_block_name_attribute() {
         );
     schemas.insert("awscc", schema);
 
-    // Resource with resolved block name (policy -> policies)
-    let mut resource = Resource::with_provider("awscc", "iam.role", "test-role", None);
+    // ManagedResource with resolved block name (policy -> policies)
+    let mut resource = ManagedResource::with_provider("awscc", "iam.role", "test-role", None);
     resource.set_attr(
         "role_name".to_string(),
         Value::Concrete(ConcreteValue::String("test-role".to_string())),
@@ -233,7 +233,7 @@ fn block_name_attribute_no_diff_when_hydrated() {
         );
 
     // Desired resource (after resolve_block_names: "policy" -> "policies")
-    let mut resource = Resource::with_provider("awscc", "iam.role", "test-role", None);
+    let mut resource = ManagedResource::with_provider("awscc", "iam.role", "test-role", None);
     resource.set_attr(
         "role_name".to_string(),
         Value::Concrete(ConcreteValue::String("test-role".to_string())),
@@ -342,8 +342,8 @@ fn block_name_attribute_state_roundtrip() {
         .attribute(AttributeSchema::new("description", AttributeType::String));
     schemas.insert("awscc", schema);
 
-    // Resource with resolved block name
-    let mut resource = Resource::with_provider("awscc", "ec2.ipam", "test-ipam", None);
+    // ManagedResource with resolved block name
+    let mut resource = ManagedResource::with_provider("awscc", "ec2.ipam", "test-ipam", None);
     resource.set_attr(
         "operating_regions".to_string(),
         Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
@@ -488,9 +488,9 @@ fn move_plus_replace_keeps_post_replace_identifier_and_attributes() {
         "rd.awscc_iam_role_policy_0cd2c914",
         None,
     );
-    let mut resource = Resource {
+    let mut resource = ManagedResource {
         id: new_id.clone(),
-        ..Resource::with_provider(
+        ..ManagedResource::with_provider(
             new_id.provider.clone(),
             new_id.resource_type.clone(),
             new_id.name.as_str(),
@@ -578,7 +578,7 @@ fn move_plus_replace_keeps_post_replace_identifier_and_attributes() {
     plan.add(Effect::Replace {
         id: new_id.clone(),
         from: Box::new(State::existing(from_id.clone(), HashMap::new())),
-        to: sorted_resources[0].clone().try_into().unwrap(),
+        to: sorted_resources[0].clone(),
         directives: Directives::default(),
         changed_create_only: vec!["role_name".to_string(), "policy_name".to_string()],
         cascading_updates: vec![],
@@ -661,7 +661,7 @@ fn move_plus_update_keeps_post_update_attributes() {
     schemas.insert("awscc", schema);
 
     let new_id = ResourceId::with_provider("awscc", "ec2.Tag", "tag_new", None);
-    let mut resource = Resource::with_provider("awscc", "ec2.Tag", "tag_new", None);
+    let mut resource = ManagedResource::with_provider("awscc", "ec2.Tag", "tag_new", None);
     resource.set_attr(
         "key".to_string(),
         Value::Concrete(ConcreteValue::String("env".to_string())),
@@ -698,7 +698,7 @@ fn move_plus_update_keeps_post_update_attributes() {
     plan.add(Effect::Update {
         id: new_id.clone(),
         from: Box::new(State::existing(from_id.clone(), HashMap::new())),
-        to: sorted_resources[0].clone().try_into().unwrap(),
+        to: sorted_resources[0].clone(),
         changed_attributes: vec!["value".to_string()],
     });
     plan.add(Effect::Move {
@@ -751,7 +751,7 @@ fn move_alone_carries_attributes_via_current_states() {
     );
 
     let new_id = ResourceId::with_provider("awscc", "s3.Bucket", "bucket_new", None);
-    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "bucket_new", None);
+    let mut resource = ManagedResource::with_provider("awscc", "s3.Bucket", "bucket_new", None);
     resource.set_attr(
         "bucket_name".to_string(),
         Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
@@ -866,7 +866,7 @@ fn failed_refresh_preserves_existing_row() {
     );
 
     let id = ResourceId::with_provider("awscc", "s3.Bucket", "stuck", None);
-    let resource = Resource::with_provider("awscc", "s3.Bucket", "stuck", None);
+    let resource = ManagedResource::with_provider("awscc", "s3.Bucket", "stuck", None);
     let sorted_resources = vec![resource];
 
     let mut failed_refreshes = HashSet::new();
@@ -918,7 +918,7 @@ fn move_from_overlapping_desired_resource_errors() {
     );
 
     let id = ResourceId::with_provider("awscc", "s3.Bucket", "collision", None);
-    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "collision", None);
+    let mut resource = ManagedResource::with_provider("awscc", "s3.Bucket", "collision", None);
     resource.set_attr(
         "bucket_name".to_string(),
         Value::Concrete(ConcreteValue::String("x".to_string())),
@@ -975,7 +975,7 @@ fn remove_overlapping_desired_resource_errors() {
     );
 
     let id = ResourceId::with_provider("awscc", "s3.Bucket", "collision", None);
-    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "collision", None);
+    let mut resource = ManagedResource::with_provider("awscc", "s3.Bucket", "collision", None);
     resource.set_attr(
         "bucket_name".to_string(),
         Value::Concrete(ConcreteValue::String("x".to_string())),
@@ -1026,7 +1026,7 @@ fn self_move_overlapping_desired_resource_errors() {
     );
 
     let id = ResourceId::with_provider("awscc", "s3.Bucket", "self", None);
-    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "self", None);
+    let mut resource = ManagedResource::with_provider("awscc", "s3.Bucket", "self", None);
     resource.set_attr(
         "bucket_name".to_string(),
         Value::Concrete(ConcreteValue::String("x".to_string())),
@@ -1133,11 +1133,12 @@ fn resolve_exports_resolves_cross_file_dot_notation_strings() {
     // with a binding; provider-returned attributes flow in via
     // `current_states` derived from `state.resources`.
     let mut registry_prod =
-        Resource::with_provider("awscc", "organizations.account", "registry-prod", None);
+        ManagedResource::with_provider("awscc", "organizations.account", "registry-prod", None);
     registry_prod.binding = Some("registry_prod".to_string());
     let sorted_resources = vec![registry_prod];
 
-    let exports = resolve_exports(&export_params, &sorted_resources, &[], &state, &[]).unwrap();
+    let exports =
+        resolve_exports(&export_params, &sorted_resources, &[], &[], &state, &[]).unwrap();
 
     assert_eq!(
         exports.get("account_id"),
@@ -1156,7 +1157,7 @@ fn resolve_exports_resolves_module_call_attribute_via_virtual_resource() {
     // referencing `<module_call>.<attr>` failed with
     // `unresolved reference <call>.<attr>`.
     use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
-    use carina_core::resource::{AccessPath, DeferredValue, ResourceKind, Value};
+    use carina_core::resource::{AccessPath, DeferredValue, Value, VirtualResource};
     use carina_state::StateFile;
 
     let state = {
@@ -1182,30 +1183,30 @@ fn resolve_exports_resolves_module_call_attribute_via_virtual_resource() {
     };
 
     let mut role_resource =
-        Resource::with_provider("awscc", "iam.Role", "github_actions_carina.role", None);
+        ManagedResource::with_provider("awscc", "iam.Role", "github_actions_carina.role", None);
     role_resource.binding = Some("github_actions_carina.role".to_string());
 
     // Virtual resource as `expand_module_call` produces it: binding is
     // the module-call alias, and each attribute is a ResourceRef into
-    // an expanded sub-resource.
-    let mut virtual_resource = Resource::new("_virtual", "github_actions_carina");
-    virtual_resource.binding = Some("github_actions_carina".to_string());
-    virtual_resource.kind = ResourceKind::Virtual;
-    virtual_resource.virtual_module = Some((
-        "github_module".to_string(),
-        "github_actions_carina".to_string(),
-    ));
-    virtual_resource.attributes.insert(
+    // an expanded sub-resource. carina#3181: virtuals are their own type.
+    let mut virt_attrs = indexmap::IndexMap::new();
+    virt_attrs.insert(
         "role_arn".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::new("github_actions_carina.role", "arn"),
         }),
     );
-    let sorted_resources = vec![role_resource, virtual_resource];
-    let pre_resolve_virtuals: Vec<carina_core::resource::VirtualResource> = sorted_resources
-        .iter()
-        .filter_map(|r| carina_core::resource::VirtualResource::try_from(r).ok())
-        .collect();
+    let virtual_resource = VirtualResource {
+        id: carina_core::resource::ResourceId::new("_virtual", "github_actions_carina"),
+        attributes: virt_attrs,
+        binding: Some("github_actions_carina".to_string()),
+        dependency_bindings: std::collections::BTreeSet::new(),
+        module_name: "github_module".to_string(),
+        instance: "github_actions_carina".to_string(),
+        quoted_string_attrs: std::collections::HashSet::new(),
+    };
+    let sorted_resources = vec![role_resource];
+    let pre_resolve_virtuals = vec![virtual_resource];
 
     let export_params = vec![ExportParameter {
         name: "role_arn".to_string(),
@@ -1218,6 +1219,7 @@ fn resolve_exports_resolves_module_call_attribute_via_virtual_resource() {
     let exports = resolve_exports(
         &export_params,
         &sorted_resources,
+        &[],
         &pre_resolve_virtuals,
         &state,
         &[],
@@ -1245,7 +1247,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_virtuals() {
     // role's `arn` from state. Pins the resolver's transitive walk so a
     // regression that broke after a single hop would surface.
     use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
-    use carina_core::resource::{AccessPath, DeferredValue, ResourceKind, Value};
+    use carina_core::resource::{AccessPath, DeferredValue, Value, VirtualResource};
     use carina_state::StateFile;
 
     let state = {
@@ -1270,32 +1272,45 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_virtuals() {
         serde_json::from_value::<StateFile>(json).unwrap()
     };
 
-    let mut role_resource = Resource::with_provider("awscc", "iam.Role", "outer.inner.role", None);
+    let mut role_resource =
+        ManagedResource::with_provider("awscc", "iam.Role", "outer.inner.role", None);
     role_resource.binding = Some("outer.inner.role".to_string());
 
-    let mut inner_virtual = Resource::new("_virtual", "outer.inner");
-    inner_virtual.binding = Some("outer.inner".to_string());
-    inner_virtual.kind = ResourceKind::Virtual;
-    inner_virtual.virtual_module = Some(("inner_module".to_string(), "outer.inner".to_string()));
-    inner_virtual.attributes.insert(
-        "role_arn".to_string(),
-        Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("outer.inner.role", "arn"),
-        }),
+    // carina#3181: virtuals are a distinct typestate.
+    let make_virtual = |id_name: &str, binding: &str, attr: &str, ref_b: &str, ref_a: &str| {
+        let mut attributes = indexmap::IndexMap::new();
+        attributes.insert(
+            attr.to_string(),
+            Value::Deferred(DeferredValue::ResourceRef {
+                path: AccessPath::new(ref_b, ref_a),
+            }),
+        );
+        VirtualResource {
+            id: carina_core::resource::ResourceId::new("_virtual", id_name),
+            attributes,
+            binding: Some(binding.to_string()),
+            dependency_bindings: std::collections::BTreeSet::new(),
+            module_name: "mod".to_string(),
+            instance: binding.to_string(),
+            quoted_string_attrs: std::collections::HashSet::new(),
+        }
+    };
+    let inner_virtual = make_virtual(
+        "outer.inner",
+        "outer.inner",
+        "role_arn",
+        "outer.inner.role",
+        "arn",
+    );
+    let outer_virtual = make_virtual(
+        "outer",
+        "outer",
+        "public_role_arn",
+        "outer.inner",
+        "role_arn",
     );
 
-    let mut outer_virtual = Resource::new("_virtual", "outer");
-    outer_virtual.binding = Some("outer".to_string());
-    outer_virtual.kind = ResourceKind::Virtual;
-    outer_virtual.virtual_module = Some(("outer_module".to_string(), "outer".to_string()));
-    outer_virtual.attributes.insert(
-        "public_role_arn".to_string(),
-        Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("outer.inner", "role_arn"),
-        }),
-    );
-
-    let sorted_resources = vec![role_resource, inner_virtual, outer_virtual];
+    let sorted_resources = vec![role_resource];
 
     let export_params = vec![ExportParameter {
         name: "role_arn".to_string(),
@@ -1305,13 +1320,11 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_virtuals() {
         })),
     }];
 
-    let pre_resolve_virtuals: Vec<carina_core::resource::VirtualResource> = sorted_resources
-        .iter()
-        .filter_map(|r| carina_core::resource::VirtualResource::try_from(r).ok())
-        .collect();
+    let pre_resolve_virtuals = vec![inner_virtual, outer_virtual];
     let exports = resolve_exports(
         &export_params,
         &sorted_resources,
+        &[],
         &pre_resolve_virtuals,
         &state,
         &[],
@@ -1372,10 +1385,10 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     // OLD_ARN. With the fix in place, the pre-resolve snapshot
     // kicks in and re-resolves against the post-apply state.
     use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
-    use carina_core::resolver::resolve_refs_with_state_and_remote;
+    use carina_core::resolver::resolve_managed_refs_with_state_and_remote;
     use carina_core::resource::{
-        AccessPath, ConcreteValue, DeferredValue, ResourceId, ResourceKind, State as ResourceState,
-        Value, VirtualResource,
+        AccessPath, ConcreteValue, DeferredValue, ResourceId, State as ResourceState, Value,
+        VirtualResource,
     };
     use carina_state::StateFile;
     use std::collections::HashMap;
@@ -1423,51 +1436,47 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
 
     // Build the authored resource graph: a managed `role` (DSL
     // does not inline `arn` — provider returns it) and a virtual
-    // module-call binding that references `role.arn`.
-    let mut role_managed = Resource::with_provider("awscc", "iam.Role", "carina_role", None);
+    // module-call binding that references `role.arn`. carina#3181:
+    // virtuals are a distinct typestate, untouched by the managed
+    // head-of-pipeline resolver — they keep their authored
+    // `ResourceRef`s, which is exactly the pre-resolve snapshot the
+    // #3177 fix needs.
+    let mut role_managed = ManagedResource::with_provider("awscc", "iam.Role", "carina_role", None);
     role_managed.binding = Some("role".to_string());
 
-    let mut virtual_resource = Resource::new("_virtual", "carina_module");
-    virtual_resource.binding = Some("carina_module".to_string());
-    virtual_resource.kind = ResourceKind::Virtual;
-    virtual_resource.virtual_module =
-        Some(("carina_module".to_string(), "carina_module".to_string()));
-    virtual_resource.attributes.insert(
+    let mut virt_attrs = indexmap::IndexMap::new();
+    virt_attrs.insert(
         "role_arn".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::new("role", "arn"),
         }),
     );
+    let virtual_resource = VirtualResource {
+        id: ResourceId::new("_virtual", "carina_module"),
+        attributes: virt_attrs,
+        binding: Some("carina_module".to_string()),
+        dependency_bindings: std::collections::BTreeSet::new(),
+        module_name: "carina_module".to_string(),
+        instance: "carina_module".to_string(),
+        quoted_string_attrs: std::collections::HashSet::new(),
+    };
 
-    let mut sorted_resources = vec![role_managed, virtual_resource];
+    let mut sorted_resources = vec![role_managed];
 
-    // Step (c): pre-resolve snapshot — same `apply/mod.rs` does
-    // before the head-of-pipeline resolver runs.
-    let pre_resolve_virtuals: Vec<VirtualResource> = sorted_resources
-        .iter()
-        .filter_map(|r| VirtualResource::try_from(r).ok())
-        .collect();
+    // Step (c): pre-resolve snapshot of the virtual — carries the
+    // authored `ref role.arn`.
+    let pre_resolve_virtuals: Vec<VirtualResource> = vec![virtual_resource];
 
-    // Step (d): head-of-pipeline resolver. After this call,
-    // `sorted_resources[1].attributes["role_arn"]` is
-    // `Value::Concrete(String(OLD_ARN))` — the bug-class state.
-    resolve_refs_with_state_and_remote(
+    // Step (d): head-of-pipeline resolver — runs over the managed
+    // slice only. Virtuals are not part of it, so the pre-resolve
+    // snapshot above is preserved verbatim.
+    resolve_managed_refs_with_state_and_remote(
         &mut sorted_resources,
         &pre_apply_current_states,
         &HashMap::new(),
         &[],
     )
     .unwrap();
-
-    // Sanity-check the bug condition is in place before the fix
-    // runs: the virtual now carries the stale OLD_ARN inline.
-    assert_eq!(
-        sorted_resources[1].attributes.get("role_arn"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            pre_apply_arn.to_string()
-        ))),
-        "head-of-pipeline must have frozen virtual.role_arn to pre-apply OLD_ARN",
-    );
 
     let export_params = vec![ExportParameter {
         name: "role_arn".to_string(),
@@ -1480,6 +1489,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     let exports = resolve_exports(
         &export_params,
         &sorted_resources,
+        &[],
         &pre_resolve_virtuals,
         &post_apply_state_file,
         &[],

@@ -12,7 +12,7 @@ use crate::parser::expressions::string_literal::parse_string_value;
 use crate::parser::expressions::validate_expr::parse_validate_expr;
 use crate::parser::parse_expression;
 use crate::parser::types::parse_type_expr;
-use crate::resource::{ConcreteValue, DeferredValue, Directives, Resource, Value};
+use crate::resource::{ConcreteValue, DeferredValue, Directives, ManagedResource, Value};
 use indexmap::IndexMap;
 
 /// Parse arguments block. See `register_argument_binding` for the
@@ -149,7 +149,7 @@ fn register_argument_binding(ctx: &mut ParseContext, name: &str) {
         binding: name.to_string(),
     });
     ctx.set_variable(name.to_string(), placeholder_ref);
-    let placeholder = Resource::new("_argument", name);
+    let placeholder = ManagedResource::new("_argument", name);
     ctx.set_resource_binding(name.to_string(), placeholder);
     // The local declaration is the real one for this file; drop the
     // seed mark (if any) so a later real duplicate (`let <name> = ...`

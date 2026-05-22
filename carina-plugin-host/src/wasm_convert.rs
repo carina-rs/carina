@@ -9,8 +9,9 @@ use carina_core::provider::{
     UpdatePatch as CoreUpdatePatch, UpdateRequest as CoreUpdateRequest,
 };
 use carina_core::resource::{
-    ConcreteValue, DeferredValue, Directives, Resource as CoreResource,
-    ResourceId as CoreResourceId, State as CoreState, Value as CoreValue,
+    ConcreteValue, DataSource as CoreDataSource, DeferredValue, Directives,
+    ManagedResource as CoreResource, ResourceId as CoreResourceId, State as CoreState,
+    Value as CoreValue,
 };
 use carina_core::schema::{
     AttributeSchema as CoreAttributeSchema, AttributeType as CoreAttributeType,
@@ -340,7 +341,7 @@ pub fn wit_to_core_state(state: &wit::State, id: &CoreResourceId) -> CoreState {
     core_state
 }
 
-// -- Resource --
+// -- ManagedResource --
 
 pub fn core_to_wit_resource(
     resource: &CoreResource,
@@ -348,6 +349,21 @@ pub fn core_to_wit_resource(
     Ok(wit::ResourceDef {
         id: core_to_wit_resource_id(&resource.id),
         attributes: core_to_wit_value_map(&resource.resolved_attributes())?,
+    })
+}
+
+/// Convert a [`CoreDataSource`] to the WIT `ResourceDef` carried over the
+/// plugin boundary. The WIT contract has a single `ResourceDef` record,
+/// so a data source maps to the same `{ id, attributes }` shape as a
+/// managed resource (carina#3181).
+pub fn core_data_source_to_wit_resource(
+    data_source: &CoreDataSource,
+) -> Result<wit::ResourceDef, SerializationError> {
+    Ok(wit::ResourceDef {
+        id: core_to_wit_resource_id(&data_source.id),
+        attributes: core_to_wit_value_map(&carina_core::resource::attrs_to_hashmap(
+            &data_source.attributes,
+        ))?,
     })
 }
 
@@ -1115,7 +1131,7 @@ mod tests {
         assert_eq!(map, back);
     }
 
-    // -- Resource roundtrip --
+    // -- ManagedResource roundtrip --
 
     #[test]
     fn test_resource_roundtrip() {
@@ -1195,7 +1211,7 @@ mod tests {
 
     #[test]
     fn test_provider_error_detail_fields_round_trip() {
-        // Resource id, cause string, and provider name must all
+        // ManagedResource id, cause string, and provider name must all
         // survive a host -> WIT -> host round trip. cause is
         // flattened to a string at the boundary because WIT cannot
         // carry `dyn std::error::Error`.

@@ -46,7 +46,7 @@ use std::collections::HashMap;
 
 use carina_core::differ::{Diff, diff};
 use carina_core::explicit::ExplicitFields;
-use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, ManagedResource, ResourceId, State, Value};
 
 fn load_dc(name: &str) -> Value {
     let path = format!(
@@ -93,7 +93,7 @@ fn carina3122_live_distribution_readback_defaults_are_projected_away() {
     let mut id = ResourceId::new("cloudfront.Distribution", "r.distribution");
     id.provider = "awscc".to_string();
 
-    let mut desired = Resource::new("cloudfront.Distribution", "r.distribution")
+    let mut desired = ManagedResource::new("cloudfront.Distribution", "r.distribution")
         .with_attribute("distribution_config", desired_dc);
     desired.id.provider = "awscc".to_string();
 

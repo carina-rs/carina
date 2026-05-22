@@ -9,8 +9,8 @@ use crate::parser::{
     ArgumentParameter, BindingName, DeferredForExpression, ModuleCall, ParsedFile, WaitBinding,
 };
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, Directives, Resource, ResourceId, ResourceKind,
-    ResourceName, Value, VirtualResource,
+    ConcreteValue, DataSource, DeferredValue, ManagedResource, ResourceId, ResourceName, Value,
+    VirtualResource,
 };
 
 use super::error::ModuleError;
@@ -22,8 +22,8 @@ impl ModuleResolver<'_> {
     /// Expand a module call into resources.
     ///
     /// If the module defines `attributes` and the call has a `binding_name`,
-    /// a virtual resource is created to expose the module's attribute values.
-    /// The virtual resource has `ResourceKind::Virtual` and is skipped by the differ.
+    /// a [`VirtualResource`] is created to expose the module's attribute
+    /// values. Virtual resources are skipped by the differ.
     ///
     /// `enclosing_args` is the argument signature of the module the call
     /// lives inside (`None` for a top-level call). When this call is being
@@ -208,6 +208,7 @@ impl ModuleResolver<'_> {
             .resources
             .iter()
             .filter_map(|r| r.binding.clone())
+            .chain(module.data_sources.iter().filter_map(|d| d.binding.clone()))
             .chain(
                 module
                     .wait_bindings
@@ -216,13 +217,37 @@ impl ModuleResolver<'_> {
             )
             .collect();
 
-        // Expand resources with substituted values
-        let mut expanded_resources = Vec::new();
+        // Expand managed resources with substituted values.
+        let mut managed_resources: Vec<ManagedResource> = Vec::new();
         for resource in &module.resources {
-            expanded_resources.push(prefix_module_resource(
+            managed_resources.push(prefix_module_resource(
                 resource,
                 instance_prefix,
                 &call.module_name,
+                &intra_module_bindings,
+                &argument_values,
+            ));
+        }
+
+        // Expand data sources with substituted values.
+        let mut data_sources: Vec<DataSource> = Vec::new();
+        for data_source in &module.data_sources {
+            data_sources.push(prefix_module_data_source(
+                data_source,
+                instance_prefix,
+                &call.module_name,
+                &intra_module_bindings,
+                &argument_values,
+            ));
+        }
+
+        // Propagate the module's own virtual resources (synthesized by
+        // nested module-call expansion), instance-prefixed.
+        let mut virtual_resources: Vec<VirtualResource> = Vec::new();
+        for virtual_resource in &module.virtual_resources {
+            virtual_resources.push(prefix_module_virtual_resource(
+                virtual_resource,
+                instance_prefix,
                 &intra_module_bindings,
                 &argument_values,
             ));
@@ -248,19 +273,16 @@ impl ModuleResolver<'_> {
                 }
             }
 
-            let virtual_resource = Resource {
+            let virtual_resource = VirtualResource {
                 id: ResourceId::new("_virtual", binding_name),
                 attributes: virtual_attrs,
-                kind: ResourceKind::Virtual,
-                directives: Directives::default(),
-                prefixes: HashMap::new(),
                 binding: Some(binding_name.clone()),
                 dependency_bindings: BTreeSet::new(),
-                module_source: None,
-                quoted_string_attrs: std::collections::HashSet::new(),
-                virtual_module: Some((call.module_name.clone(), instance_prefix.to_string())),
+                module_name: call.module_name.clone(),
+                instance: instance_prefix.to_string(),
+                quoted_string_attrs: HashSet::new(),
             };
-            expanded_resources.push(virtual_resource);
+            virtual_resources.push(virtual_resource);
         }
 
         // Propagate the module's `wait` declarations, instance-prefixed
@@ -292,24 +314,12 @@ impl ModuleResolver<'_> {
             })
             .collect();
 
-        // carina#3181 PR C: partition the expanded resources into the
-        // managed-only `resources` Vec and the typed `data_sources` /
-        // `virtual_resources` slices. A module instance contributes
-        // managed resources, exactly one `_virtual` attribute resource
-        // (built above), and possibly data sources — each lands in
-        // exactly one slice.
-        let mut managed_resources: Vec<Resource> = Vec::new();
-        let mut data_sources: Vec<DataSource> = Vec::new();
-        let mut virtual_resources: Vec<VirtualResource> = Vec::new();
-        for resource in expanded_resources {
-            if let Ok(ds) = DataSource::try_from(&resource) {
-                data_sources.push(ds);
-            } else if let Ok(vr) = VirtualResource::try_from(&resource) {
-                virtual_resources.push(vr);
-            } else {
-                managed_resources.push(resource);
-            }
-        }
+        // carina#3181: managed resources, data sources, and virtual
+        // resources are collected into separate typed `Vec`s above —
+        // `managed_resources` from `module.resources`, `data_sources`
+        // from `module.data_sources`, and `virtual_resources` from
+        // `module.virtual_resources` plus the `_virtual` attribute
+        // resource built above.
 
         // The contribution is a full `ParsedFile` built with an
         // **exhaustive struct literal** (no `..Default::default()`):
@@ -464,12 +474,12 @@ fn prefix_attr_value(
 /// `template_resource` so a loop body inside a module is prefixed
 /// identically to a top-level module resource (carina#3126 PR-B).
 fn prefix_module_resource(
-    resource: &Resource,
+    resource: &ManagedResource,
     instance_prefix: &str,
     module_name: &str,
     intra_module_bindings: &HashSet<String>,
     argument_values: &HashMap<String, Value>,
-) -> Resource {
+) -> ManagedResource {
     let mut new_resource = resource.clone();
 
     // Only Bound names take the prefix here. Pending names stay
@@ -508,6 +518,90 @@ fn prefix_module_resource(
     new_resource
 }
 
+/// Instance-prefix one module data source — the [`DataSource`] analogue
+/// of [`prefix_module_resource`]. A `DataSource` carries no `prefixes`
+/// field, so only its `Bound` id name, `binding`, `module_source`, and
+/// attributes take the module-boundary treatment.
+fn prefix_module_data_source(
+    data_source: &DataSource,
+    instance_prefix: &str,
+    module_name: &str,
+    intra_module_bindings: &HashSet<String>,
+    argument_values: &HashMap<String, Value>,
+) -> DataSource {
+    let mut new_data_source = data_source.clone();
+
+    if let ResourceName::Bound(name) = &new_data_source.id.name {
+        let new_name = apply_instance_prefix(instance_prefix, name);
+        new_data_source.id.set_name(new_name);
+    }
+
+    if let Some(ref binding) = new_data_source.binding {
+        new_data_source.binding = Some(apply_instance_prefix(instance_prefix, binding));
+    }
+
+    new_data_source.module_source = Some(crate::resource::ModuleSource::Module {
+        name: module_name.to_string(),
+        instance: instance_prefix.to_string(),
+    });
+
+    let mut substituted_attrs: IndexMap<String, Value> = IndexMap::new();
+    for (key, expr) in &new_data_source.attributes {
+        substituted_attrs.insert(
+            key.clone(),
+            prefix_attr_value(
+                expr,
+                instance_prefix,
+                intra_module_bindings,
+                argument_values,
+            ),
+        );
+    }
+    new_data_source.attributes = substituted_attrs;
+
+    new_data_source
+}
+
+/// Instance-prefix one virtual resource crossing a module boundary — the
+/// [`VirtualResource`] analogue of [`prefix_module_resource`]. A
+/// `VirtualResource` carries no `module_source` (it has the flattened
+/// `module_name` / `instance` fields, left unchanged as the synthetic
+/// node's own provenance) and no `prefixes` / `directives`, so only its
+/// `Bound` id name, `binding`, and attributes take the prefix treatment.
+fn prefix_module_virtual_resource(
+    virtual_resource: &VirtualResource,
+    instance_prefix: &str,
+    intra_module_bindings: &HashSet<String>,
+    argument_values: &HashMap<String, Value>,
+) -> VirtualResource {
+    let mut new_virtual = virtual_resource.clone();
+
+    if let ResourceName::Bound(name) = &new_virtual.id.name {
+        let new_name = apply_instance_prefix(instance_prefix, name);
+        new_virtual.id.set_name(new_name);
+    }
+
+    if let Some(ref binding) = new_virtual.binding {
+        new_virtual.binding = Some(apply_instance_prefix(instance_prefix, binding));
+    }
+
+    let mut substituted_attrs: IndexMap<String, Value> = IndexMap::new();
+    for (key, expr) in &new_virtual.attributes {
+        substituted_attrs.insert(
+            key.clone(),
+            prefix_attr_value(
+                expr,
+                instance_prefix,
+                intra_module_bindings,
+                argument_values,
+            ),
+        );
+    }
+    new_virtual.attributes = substituted_attrs;
+
+    new_virtual
+}
+
 /// Instance-prefix a [`DeferredForExpression`] crossing a module
 /// boundary, expanding its loop body the same way the
 /// `module.resources` expansion ([`prefix_module_resource`]) does.
@@ -525,7 +619,7 @@ fn prefix_module_resource(
 /// field:
 /// - `binding_name` (the generated-resource address prefix, e.g.
 ///   `_domain_validation_options`) → instance-prefixed
-///   unconditionally, exactly like `Resource.binding`, so each module
+///   unconditionally, exactly like `ManagedResource.binding`, so each module
 ///   instance's loop resources are uniquely addressed.
 /// - `iterable_binding` (the iterable's root binding, e.g. `cert`) →
 ///   instance-prefixed **only when it is a module-internal binding**,
@@ -587,7 +681,7 @@ fn prefix_deferred_for_expression(
         // `_domain_validation_options`), NOT a reference to a
         // pre-existing binding, so the caller-collision concern does
         // not apply: prefix it unconditionally (same as
-        // `Resource.binding`) to isolate each module instance's loop
+        // `ManagedResource.binding`) to isolate each module instance's loop
         // resources.
         binding_name: apply_instance_prefix(instance_prefix, binding_name),
         // Iterable root binding — this IS a reference to an existing
@@ -820,7 +914,7 @@ pub(super) fn split_instance_prefix(name: &str) -> Option<(&str, &str)> {
 /// `(provider, resource_type)` — the reconciler uses them to discover which
 /// instance prefixes already exist in state.
 pub fn reconcile_anonymous_module_instances(
-    resources: &mut [Resource],
+    resources: &mut [ManagedResource],
     find_state_names_by_type: &dyn Fn(&str, &str) -> Vec<String>,
 ) {
     use std::collections::{HashMap, HashSet};

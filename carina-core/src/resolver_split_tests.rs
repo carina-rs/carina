@@ -7,7 +7,7 @@
 //!
 //! Both are new entry points layered over the existing
 //! `resolve_refs_inner` logic; the legacy
-//! `resolve_refs_with_state_and_remote(&mut [Resource], …)` shim is
+//! `resolve_refs_with_state_and_remote(&mut [ManagedResource], …)` shim is
 //! unchanged.
 
 use std::collections::{BTreeSet, HashMap};
@@ -19,7 +19,7 @@ use crate::resolver::{
     resolve_managed_refs_with_state_and_remote, resolve_virtual_refs_post_apply,
 };
 use crate::resource::{
-    AccessPath, ConcreteValue, DeferredValue, ManagedResource, Resource, ResourceId, State, Value,
+    AccessPath, ConcreteValue, DeferredValue, ManagedResource, ResourceId, State, Value,
     VirtualResource,
 };
 
@@ -127,7 +127,7 @@ fn resolve_virtual_refs_post_apply_uses_provided_bindings() {
     // against the supplied view.
     let referenced = make_managed("a", &[("value", s("post_apply_value"))]);
     let bindings = ResolvedBindings::from_resources_with_state(
-        &[Resource::from(&referenced)],
+        std::slice::from_ref(&referenced),
         &HashMap::new(),
         &HashMap::new(),
         &[],
@@ -152,7 +152,7 @@ fn resolve_virtual_refs_post_apply_picks_post_apply_value_not_pre_apply() {
     // post-apply value when handed the post-apply bindings view.
     let role = make_managed("role", &[("arn", s("post_apply_arn"))]);
     let post_apply_bindings = ResolvedBindings::from_resources_with_state(
-        &[Resource::from(&role)],
+        std::slice::from_ref(&role),
         &HashMap::new(),
         &HashMap::new(),
         &[],
@@ -210,7 +210,7 @@ fn resolve_virtual_refs_post_apply_with_empty_slice_is_ok() {
 #[test]
 fn resolve_managed_refs_legacy_shim_produces_identical_result() {
     // Equivalence guard: feeding the same managed-only inputs through
-    // the new typed entry and the legacy `&mut [Resource]` shim must
+    // the new typed entry and the legacy `&mut [ManagedResource]` shim must
     // produce identical attributes.
     let a_new = make_managed("a", &[("value", s("hi"))]);
     let b_new = make_managed("b", &[("dep", ref_to("a", "value"))]);
@@ -219,7 +219,7 @@ fn resolve_managed_refs_legacy_shim_produces_identical_result() {
     resolve_managed_refs_with_state_and_remote(&mut managed, &HashMap::new(), &HashMap::new(), &[])
         .expect("resolve managed");
 
-    let mut legacy: Vec<Resource> = vec![Resource::from(&a_new), Resource::from(&b_new)];
+    let mut legacy: Vec<ManagedResource> = vec![a_new.clone(), b_new.clone()];
     crate::resolver::resolve_refs_with_state_and_remote(
         &mut legacy,
         &HashMap::new(),

@@ -25,7 +25,7 @@ use std::sync::Arc;
 use carina_core::provider::{
     BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer,
 };
-use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, DataSource, ResourceId, State, Value};
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField, legacy_validator,
     noop_validator,
@@ -217,7 +217,7 @@ impl Provider for NoopProvider {
     }
     fn read_data_source(
         &self,
-        _r: &Resource,
+        _r: &DataSource,
     ) -> BoxFuture<'_, carina_core::provider::ProviderResult<State>> {
         Box::pin(async { unimplemented!("e2e parity tests do not exercise apply") })
     }

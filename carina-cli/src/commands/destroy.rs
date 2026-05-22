@@ -16,7 +16,7 @@ use carina_core::deps::{
 use carina_core::effect::Effect;
 use carina_core::plan::Plan;
 use carina_core::provider::Provider;
-use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, ManagedResource, ResourceId, State, Value};
 use carina_state::{LockInfo, StateBackend, resolve_backend};
 
 use carina_core::parser::ProviderContext;
@@ -167,7 +167,7 @@ async fn run_destroy_locked(
 
     // Collect all resources (managed + orphans) before sorting.
     // We use the unsorted list for state reads, then sort once at the end.
-    let mut all_resources: Vec<Resource> = parsed.resources.clone(); // allow: direct — plan-time reconciliation
+    let mut all_resources: Vec<ManagedResource> = parsed.resources.clone(); // allow: direct — plan-time reconciliation
 
     if !refresh {
         eprintln!(
@@ -186,16 +186,11 @@ async fn run_destroy_locked(
         RefreshProgress::start_header();
         let multi = refresh_multi_progress();
 
-        // Read states for managed resources concurrently using identifier from state.
-        // Skip data sources (read-only) and virtual resources -- they won't be destroyed.
-        // The `ManagedResource::try_from(r).is_ok()` filter expresses
-        // the kind constraint through the typed wrapper instead of
-        // chained `is_data_source()` / `is_virtual()` runtime checks
-        // (carina#3180).
-        let managed_resources: Vec<&Resource> = all_resources
-            .iter()
-            .filter(|r| carina_core::resource::ManagedResource::try_from(*r).is_ok())
-            .collect();
+        // Read states for managed resources concurrently using identifier
+        // from state. carina#3181: `all_resources` is sourced from
+        // `parsed.resources`, which is managed-only — data sources and
+        // virtual resources are not destroyed and never enter this list.
+        let managed_resources: Vec<&ManagedResource> = all_resources.iter().collect();
         let provider_ref = &provider;
         let results: Vec<Result<(ResourceId, State), AppError>> = stream::iter(&managed_resources)
             .map(|resource| {
@@ -253,13 +248,9 @@ async fn run_destroy_locked(
         }
     } else if let Some(sf) = state_file.as_ref() {
         // --refresh=false: build states from state file without AWS calls.
-        // Typed filter (carina#3180): non-managed kinds have no
-        // identifier shape to lift from the state file.
+        // carina#3181: `all_resources` is managed-only.
         for resource in &all_resources {
-            if carina_core::resource::ManagedResource::try_from(resource).is_err() {
-                continue;
-            }
-            let state = sf.build_state_for_resource(resource);
+            let state = sf.build_state_for_resource(&resource.id);
             current_states.insert(resource.id.clone(), state);
         }
 
@@ -275,22 +266,18 @@ async fn run_destroy_locked(
     // Sort all resources (managed + orphans) for destroy ordering.
     // Uses depth-based pre-sorting to ensure stable ordering for independent
     // branches, then reverses for destroy order (dependents before dependencies).
-    let destroy_order: Vec<Resource> =
+    let destroy_order: Vec<ManagedResource> =
         sort_resources_for_destroy(&all_resources).map_err(AppError::Config)?;
 
     // Collect resources that exist and will be destroyed
     // Skip the state bucket if it matches the backend bucket
-    let mut protected_resources: Vec<&Resource> = Vec::new();
-    let mut prevent_destroy_resources: Vec<&Resource> = Vec::new();
-    let resources_to_destroy: Vec<&Resource> = destroy_order
+    let mut protected_resources: Vec<&ManagedResource> = Vec::new();
+    let mut prevent_destroy_resources: Vec<&ManagedResource> = Vec::new();
+    let resources_to_destroy: Vec<&ManagedResource> = destroy_order
         .iter()
         .filter(|r| {
-            // Skip data sources (read-only) and virtual resources -- nothing to destroy.
-            // Typed kind gate (carina#3180).
-            if carina_core::resource::ManagedResource::try_from(*r).is_err() {
-                return false;
-            }
-
+            // carina#3181: `destroy_order` is managed-only — data
+            // sources and virtuals never enter the destroy set.
             if !current_states.get(&r.id).map(|s| s.exists).unwrap_or(false) {
                 return false;
             }
@@ -955,6 +942,7 @@ async fn run_destroy_locked(
 mod tests {
     use super::*;
     use carina_core::provider::{BoxFuture, Provider, ProviderError, ProviderResult};
+    use carina_core::resource::DataSource;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A mock provider whose `read()` returns a sequence of results.
@@ -1000,7 +988,7 @@ mod tests {
             })
         }
 
-        fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+        fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
             self.read(&resource.id, None, carina_core::provider::ReadRequest)
         }
 
@@ -1165,7 +1153,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_deletion_succeeds_after_transient_exists() {
-        // Resource exists on first poll, then disappears on second.
+        // ManagedResource exists on first poll, then disappears on second.
         let id = ResourceId::new("s3.Bucket", "test");
         let existing_state = State::existing(id.clone(), HashMap::new());
         let provider =

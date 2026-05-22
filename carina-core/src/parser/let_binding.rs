@@ -22,22 +22,27 @@ use super::parse_expression;
 use super::static_eval::is_static_value;
 use super::util::eval_type_name;
 use crate::eval_value::EvalValue;
-use crate::resource::{ConcreteValue, DeferredValue, Resource, Value};
+use crate::resource::{ConcreteValue, DataSource, DeferredValue, ManagedResource, Value};
 
 /// Tuple returned by the let-binding parser. The RHS is `EvalValue`
 /// rather than `Value` so partial applications (closures) can survive
 /// until a later pipe finishes them; the surrounding parse pass lowers
 /// each binding to `Value` at the end of `parse(...)`.
+///
+/// Managed resources and data sources are carried in separate `Vec`s so
+/// the caller can route each into the matching typed slice of
+/// [`ParsedFile`](super::ast::ParsedFile) (carina#3181).
 pub(crate) type LetBindingRhs = (
     EvalValue,
-    Vec<Resource>,
+    Vec<ManagedResource>,
+    Vec<DataSource>,
     Vec<ModuleCall>,
     Option<UseStatement>,
 );
 
 /// Extended parse_let_binding that also handles module calls, imports, and for expressions.
 ///
-/// Returns `(name, value, resources, module_calls, import, is_structural)`.
+/// Returns `(name, value, resources, data_sources, module_calls, import, is_structural)`.
 /// `is_structural` is true when the RHS is an if/for/read expression, meaning the
 /// `let` binding is structurally required and should not trigger unused-binding warnings.
 #[allow(clippy::type_complexity)]
@@ -48,7 +53,8 @@ pub(super) fn parse_let_binding_extended(
     (
         String,
         EvalValue,
-        Vec<Resource>,
+        Vec<ManagedResource>,
+        Vec<DataSource>,
         Vec<ModuleCall>,
         Option<UseStatement>,
         bool,
@@ -72,6 +78,7 @@ pub(super) fn parse_let_binding_extended(
             EvalValue::from_value(value),
             vec![],
             vec![],
+            vec![],
             Some(use_stmt),
             false,
         ));
@@ -81,13 +88,14 @@ pub(super) fn parse_let_binding_extended(
     let is_structural = detect_structural_rhs(&rhs_pair);
 
     // Check if it's a module call, resource expression, or for expression
-    let (value, expanded_resources, module_calls, maybe_import) =
+    let (value, expanded_resources, data_sources, module_calls, maybe_import) =
         parse_expression_with_resource_or_module(rhs_pair, ctx, &name)?;
 
     Ok((
         name,
         value,
         expanded_resources,
+        data_sources,
         module_calls,
         maybe_import,
         is_structural,
@@ -151,7 +159,7 @@ fn parse_pipe_expr_with_resource_or_module(
         "primary expression",
         "compose expression",
     )?;
-    let (mut value, expanded_resources, module_calls, maybe_import) =
+    let (mut value, expanded_resources, data_sources, module_calls, maybe_import) =
         parse_primary_with_resource_or_module(primary, ctx, binding_name)?;
 
     // Handle >> composition within the compose_expr
@@ -290,7 +298,13 @@ fn parse_pipe_expr_with_resource_or_module(
         }));
     }
 
-    Ok((value, expanded_resources, module_calls, maybe_import))
+    Ok((
+        value,
+        expanded_resources,
+        data_sources,
+        module_calls,
+        maybe_import,
+    ))
 }
 
 fn parse_primary_with_resource_or_module(
@@ -302,12 +316,13 @@ fn parse_primary_with_resource_or_module(
 
     match inner.as_rule() {
         Rule::read_resource_expr => {
-            let resource = parse_read_resource_expr(inner, ctx, binding_name)?;
+            let data_source = parse_read_resource_expr(inner, ctx, binding_name)?;
             let ref_value =
                 Value::Concrete(ConcreteValue::String(format!("${{{}}}", binding_name)));
             Ok((
                 EvalValue::from_value(ref_value),
-                vec![resource],
+                vec![],
+                vec![data_source],
                 vec![],
                 None,
             ))
@@ -324,7 +339,13 @@ fn parse_primary_with_resource_or_module(
             ctx.upstream_states.insert(us.binding.clone(), us);
             let ref_value =
                 Value::Concrete(ConcreteValue::String(format!("${{{}}}", binding_name)));
-            Ok((EvalValue::from_value(ref_value), vec![], vec![], None))
+            Ok((
+                EvalValue::from_value(ref_value),
+                vec![],
+                vec![],
+                vec![],
+                None,
+            ))
         }
         Rule::provider_expr => {
             let (line, _) = inner.as_span().start_pos().line_col();
@@ -342,7 +363,13 @@ fn parse_primary_with_resource_or_module(
             ctx.named_provider_instances.push(config);
             let ref_value =
                 Value::Concrete(ConcreteValue::String(format!("${{{}}}", binding_name)));
-            Ok((EvalValue::from_value(ref_value), vec![], vec![], None))
+            Ok((
+                EvalValue::from_value(ref_value),
+                vec![],
+                vec![],
+                vec![],
+                None,
+            ))
         }
         Rule::wait_expr => {
             let (line, _) = inner.as_span().start_pos().line_col();
@@ -362,7 +389,13 @@ fn parse_primary_with_resource_or_module(
             // a placeholder `${binding}` reference.
             let ref_value =
                 Value::Concrete(ConcreteValue::String(format!("${{{}}}", binding_name)));
-            Ok((EvalValue::from_value(ref_value), vec![], vec![], None))
+            Ok((
+                EvalValue::from_value(ref_value),
+                vec![],
+                vec![],
+                vec![],
+                None,
+            ))
         }
         Rule::resource_expr => {
             let resource = parse_resource_expr(inner, ctx, binding_name)?;
@@ -372,23 +405,26 @@ fn parse_primary_with_resource_or_module(
                 EvalValue::from_value(ref_value),
                 vec![resource],
                 vec![],
+                vec![],
                 None,
             ))
         }
         Rule::for_expr => {
-            let (resources, module_calls) = parse_for_expr(inner, ctx, binding_name)?;
+            let (resources, data_sources, module_calls) = parse_for_expr(inner, ctx, binding_name)?;
             let ref_value =
                 Value::Concrete(ConcreteValue::String(format!("${{for:{}}}", binding_name)));
             Ok((
                 EvalValue::from_value(ref_value),
                 resources,
+                data_sources,
                 module_calls,
                 None,
             ))
         }
         Rule::if_expr => {
-            let (value, resources, module_calls, import) = parse_if_expr(inner, ctx, binding_name)?;
-            Ok((value, resources, module_calls, import))
+            let (value, resources, data_sources, module_calls, import) =
+                parse_if_expr(inner, ctx, binding_name)?;
+            Ok((value, resources, data_sources, module_calls, import))
         }
         Rule::module_call => {
             let call = parse_module_call(inner, ctx)?;
@@ -396,15 +432,21 @@ fn parse_primary_with_resource_or_module(
                 "${{module:{}}}",
                 call.module_name
             )));
-            Ok((EvalValue::from_value(value), vec![], vec![call], None))
+            Ok((
+                EvalValue::from_value(value),
+                vec![],
+                vec![],
+                vec![call],
+                None,
+            ))
         }
         Rule::function_call => {
             let value = parse_primary_eval(inner, ctx)?;
-            Ok((value, vec![], vec![], None))
+            Ok((value, vec![], vec![], vec![], None))
         }
         _ => {
             let value = parse_primary_eval(inner, ctx)?;
-            Ok((value, vec![], vec![], None))
+            Ok((value, vec![], vec![], vec![], None))
         }
     }
 }

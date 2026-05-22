@@ -8,8 +8,7 @@ use crate::identifier::generate_random_suffix;
 use crate::parser::WaitBinding;
 use crate::plan::{Plan, PlanError};
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, Directives, ManagedResource, Resource, ResourceId,
-    ResourceKind, State, Value,
+    ConcreteValue, DataSource, DeferredValue, Directives, ManagedResource, ResourceId, State, Value,
 };
 use crate::schema::{
     ResourceSchema, SchemaKind, SchemaRegistry, WAIT_DEFAULT_INTERVAL, WAIT_DEFAULT_TIMEOUT,
@@ -17,20 +16,6 @@ use crate::schema::{
 use crate::wait::predicate::{AttrPath, WaitPredicate};
 
 use super::{Diff, diff};
-
-/// Bridge a legacy [`Resource`] to a [`ManagedResource`] at the
-/// differ/effect seam (carina#3181 PR D).
-///
-/// `Effect::Create` / `Update` / `Replace` and `CascadingUpdate` carry
-/// `ManagedResource`, but the differ's internal pipeline (`diff()`,
-/// `cascade_dependent_updates`'s unresolved set) still works in legacy
-/// `Resource`. Every resource that reaches a managed effect has already
-/// been classified as managed upstream, so the conversion cannot fail —
-/// `expect` documents that invariant.
-fn to_managed(resource: &Resource) -> ManagedResource {
-    ManagedResource::try_from(resource)
-        .expect("differ produced a non-managed resource for a managed effect")
-}
 
 /// A pending merge operation: cascade-triggered create-only attributes to add to an existing effect.
 struct CascadeMerge {
@@ -66,7 +51,7 @@ fn find_changed_create_only(
 fn filter_non_removable_removals(
     provider: &str,
     resource_type: &str,
-    to: &Resource,
+    to: &ManagedResource,
     changed_attributes: Vec<String>,
     registry: &SchemaRegistry,
 ) -> Vec<String> {
@@ -100,7 +85,7 @@ fn filter_non_removable_removals(
 /// the resource already uses name_prefix for that attribute, or
 /// the name_attribute value changed between `from` and `to`).
 fn generate_temporary_name(
-    resource: &Resource,
+    resource: &ManagedResource,
     from: &State,
     schema: &ResourceSchema,
 ) -> Option<TemporaryName> {
@@ -145,7 +130,7 @@ fn generate_temporary_name(
 ///
 /// The `directives_map` provides Carina-side directives for orphaned
 /// resources (resources in state but not in desired). For desired
-/// resources, the directives are read directly from the `Resource`
+/// resources, the directives are read directly from the `ManagedResource`
 /// struct.
 ///
 /// The `saved_attrs` map provides the last-known attribute values from the state file.
@@ -214,13 +199,7 @@ pub fn create_plan(
         });
     }
 
-    for managed_res in managed {
-        // Bridge to the legacy `Resource` shape at the differ/effect
-        // seam. `Effect::Create | Update | Replace | Delete` still
-        // carries `Resource` over the saved-plan and provider WIT
-        // wire formats; flipping those payloads is deferred to a
-        // later cleanup (see #3181 design non-goals).
-        let resource: Resource = Resource::from(managed_res);
+    for resource in managed {
         let current = current_states
             .get(&resource.id)
             .cloned()
@@ -234,7 +213,7 @@ pub fn create_plan(
             SchemaKind::Managed,
         );
         let d = diff(
-            &resource,
+            resource,
             &current,
             saved,
             prev_explicit_for_resource,
@@ -242,11 +221,7 @@ pub fn create_plan(
         );
 
         match d {
-            // carina#3181 PR D: `Effect` payloads are typestate structs.
-            // `diff()` runs on a managed resource, so the legacy
-            // `Resource` it returns is always managed — bridge it to
-            // `ManagedResource` at the differ/effect seam.
-            Diff::Create(r) => plan.add(Effect::Create(to_managed(&r))),
+            Diff::Create(r) => plan.add(Effect::Create(r)),
             Diff::Update {
                 id,
                 from,
@@ -290,7 +265,7 @@ pub fn create_plan(
                     plan.add(Effect::Update {
                         id,
                         from,
-                        to: to_managed(&to),
+                        to,
                         changed_attributes,
                     });
                 } else {
@@ -332,7 +307,7 @@ pub fn create_plan(
                     plan.add(Effect::Replace {
                         id,
                         from,
-                        to: to_managed(&to),
+                        to,
                         directives,
                         changed_create_only,
                         cascading_updates: vec![],
@@ -357,7 +332,7 @@ pub fn create_plan(
                     .unwrap_or_default();
                 let directives = resource.directives.clone();
                 let binding = resource.binding.clone();
-                let dependencies = get_resource_dependencies(&resource);
+                let dependencies = get_resource_dependencies(resource);
                 let explicit_dependencies =
                     resource.directives.depends_on.iter().cloned().collect();
                 plan.add(Effect::Delete {
@@ -395,7 +370,7 @@ pub fn create_plan(
             let dependencies = if let Some(dep_bindings) = orphan_dependencies.get(id) {
                 dep_bindings.iter().cloned().collect()
             } else {
-                let temp_resource = Resource {
+                let temp_resource = ManagedResource {
                     id: id.clone(),
                     // `state.attributes` is `HashMap` — no source order
                     // survives round-tripping through the provider. The
@@ -403,14 +378,12 @@ pub fn create_plan(
                     // matter (it only feeds the dependency walker), so
                     // a plain clone-through `wrap_map` is fine.
                     attributes: state.attributes.clone().into_iter().collect(),
-                    kind: ResourceKind::Managed,
                     directives: directives.clone(),
                     prefixes: HashMap::new(),
                     binding: None,
                     dependency_bindings: BTreeSet::new(),
                     module_source: None,
                     quoted_string_attrs: std::collections::HashSet::new(),
-                    virtual_module: None,
                 };
                 get_resource_dependencies(&temp_resource)
             };
@@ -487,27 +460,19 @@ pub fn create_plan(
         // (carina#3101). A genuinely pending consumer change still
         // produces the wait + its dependency edge (carina#3085 /
         // carina#3061 behavior preserved).
-        let gates_a_pending_change =
-            managed
-                .iter()
-                .map(|m| (&m.id, Resource::from(m)))
-                .any(|(id, r)| {
-                    get_resource_dependencies(&r).contains(wb.binding.as_str())
-                        && plan
-                            .effects()
-                            .iter()
-                            .any(|e| e.resource_id() == id && e.is_mutating())
-                })
-                || data_sources
+        let gates_a_pending_change = managed.iter().any(|m| {
+            get_resource_dependencies(m).contains(wb.binding.as_str())
+                && plan
+                    .effects()
                     .iter()
-                    .map(|d| (&d.id, Resource::from(d)))
-                    .any(|(id, r)| {
-                        get_resource_dependencies(&r).contains(wb.binding.as_str())
-                            && plan
-                                .effects()
-                                .iter()
-                                .any(|e| e.resource_id() == id && e.is_mutating())
-                    });
+                    .any(|e| e.resource_id() == &m.id && e.is_mutating())
+        }) || data_sources.iter().any(|d| {
+            crate::deps::get_data_source_dependencies(d).contains(wb.binding.as_str())
+                && plan
+                    .effects()
+                    .iter()
+                    .any(|e| e.resource_id() == &d.id && e.is_mutating())
+        });
         if !gates_a_pending_change {
             continue;
         }
@@ -590,18 +555,11 @@ pub fn cascade_dependent_updates(
     current_states: &HashMap<ResourceId, State>,
     registry: &SchemaRegistry,
 ) {
-    // Bridge to legacy `Resource` once. `get_resource_dependencies` and
-    // the per-attribute `ResourceRef` walks downstream still consume
-    // `&Resource`; flipping them is out of scope for the differ-only
-    // pass that this function lives in (carina#3179).
-    let unresolved_resources: Vec<Resource> =
-        unresolved_managed.iter().map(Resource::from).collect();
-
     // Build binding/key -> unresolved resource mapping.
     // Uses the same key logic as the dependent lookup below so anonymous resources
     // (without _binding) are also found.
-    let mut binding_to_unresolved: HashMap<String, &Resource> = HashMap::new();
-    for resource in &unresolved_resources {
+    let mut binding_to_unresolved: HashMap<String, &ManagedResource> = HashMap::new();
+    for resource in unresolved_managed {
         let key = resource
             .binding
             .clone()
@@ -633,7 +591,7 @@ pub fn cascade_dependent_updates(
             .collect();
 
         if !all_replace_bindings.is_empty() {
-            for resource in &unresolved_resources {
+            for resource in unresolved_managed {
                 let deps = get_resource_dependencies(resource);
                 for dep in &deps {
                     if let Some(resource_id) = all_replace_bindings.get(dep) {
@@ -672,7 +630,7 @@ pub fn cascade_dependent_updates(
 
     // For each unresolved resource, check if it depends on a replaced binding.
     // Resources already in the plan are handled separately below.
-    for resource in &unresolved_resources {
+    for resource in unresolved_managed {
         if planned_ids.contains(&resource.id) {
             continue;
         }
@@ -695,7 +653,7 @@ pub fn cascade_dependent_updates(
     // attributes need to be merged into their existing effects.
     let mut merge_operations: Vec<CascadeMerge> = Vec::new();
 
-    for resource in &unresolved_resources {
+    for resource in unresolved_managed {
         if !planned_ids.contains(&resource.id) {
             continue;
         }
@@ -826,7 +784,7 @@ pub fn cascade_dependent_updates(
                         .push(CascadingUpdate {
                             id: unresolved.id.clone(),
                             from: Box::new(from),
-                            to: to_managed(unresolved),
+                            to: (*unresolved).clone(),
                         });
                 } else if unresolved.directives.prevent_destroy {
                     // Cascade would promote to Replace (destroy + recreate),
@@ -860,7 +818,7 @@ pub fn cascade_dependent_updates(
                     promoted_replaces.push(Effect::Replace {
                         id: unresolved.id.clone(),
                         from: Box::new(from),
-                        to: to_managed(unresolved),
+                        to: (*unresolved).clone(),
                         directives: unresolved.directives.clone(),
                         changed_create_only: create_only_refs,
                         cascading_updates: vec![],

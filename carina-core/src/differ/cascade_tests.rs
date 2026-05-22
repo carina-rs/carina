@@ -11,14 +11,14 @@ fn cascade_dependent_updates_adds_update_for_dependent() {
     let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
     // Unresolved resources (before ref resolution)
-    let vpc = Resource::new("ec2.Vpc", "my-vpc")
+    let vpc = ManagedResource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
 
-    let subnet = Resource::new("ec2.Subnet", "my-subnet")
+    let subnet = ManagedResource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -66,7 +66,7 @@ fn cascade_dependent_updates_adds_update_for_dependent() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: (vpc.clone().with_binding("vpc")).try_into().unwrap(),
+        to: (vpc.clone().with_binding("vpc")),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -79,9 +79,7 @@ fn cascade_dependent_updates_adds_update_for_dependent() {
 
     // Apply cascade
     let schemas = SchemaRegistry::new();
-    let (unresolved_managed___, _ds___) =
-        crate::differ::split_resources_by_kind(&unresolved_resources);
-    cascade_dependent_updates(&mut plan, &unresolved_managed___, &current_states, &schemas);
+    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
 
     // Verify the Replace effect now has a cascading update for the subnet
     let effects = plan.effects();
@@ -117,14 +115,14 @@ fn cascade_skips_resources_already_in_plan() {
     let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
     let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
-    let vpc = Resource::new("ec2.Vpc", "my-vpc")
+    let vpc = ManagedResource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
 
-    let subnet = Resource::new("ec2.Subnet", "my-subnet")
+    let subnet = ManagedResource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -166,7 +164,7 @@ fn cascade_skips_resources_already_in_plan() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: (vpc.clone()).try_into().unwrap(),
+        to: (vpc.clone()),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -179,14 +177,12 @@ fn cascade_skips_resources_already_in_plan() {
     plan.add(Effect::Update {
         id: subnet_id.clone(),
         from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
-        to: (subnet.clone()).try_into().unwrap(),
+        to: (subnet.clone()),
         changed_attributes: vec!["cidr_block".to_string()],
     });
 
     let schemas = SchemaRegistry::new();
-    let (unresolved_managed___, _ds___) =
-        crate::differ::split_resources_by_kind(&unresolved_resources);
-    cascade_dependent_updates(&mut plan, &unresolved_managed___, &current_states, &schemas);
+    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
 
     // The Replace should have NO cascading updates since subnet already has an Update
     if let Effect::Replace {
@@ -208,14 +204,14 @@ fn cascade_no_op_without_create_before_destroy() {
 
     let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
 
-    let vpc = Resource::new("ec2.Vpc", "my-vpc")
+    let vpc = ManagedResource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
 
-    let subnet = Resource::new("ec2.Subnet", "my-subnet")
+    let subnet = ManagedResource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -239,7 +235,7 @@ fn cascade_no_op_without_create_before_destroy() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: (vpc.clone()).try_into().unwrap(),
+        to: (vpc.clone()),
         directives: Directives::default(), // create_before_destroy = false
         changed_create_only: vec!["cidr_block".to_string()],
         cascading_updates: vec![],
@@ -248,9 +244,7 @@ fn cascade_no_op_without_create_before_destroy() {
     });
 
     let schemas = SchemaRegistry::new();
-    let (unresolved_managed___, _ds___) =
-        crate::differ::split_resources_by_kind(&unresolved_resources);
-    cascade_dependent_updates(&mut plan, &unresolved_managed___, &current_states, &schemas);
+    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
 
     if let Effect::Replace {
         cascading_updates, ..
@@ -269,21 +263,21 @@ fn cascade_transitive_dependencies() {
     let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
     let instance_id = ResourceId::new("ec2.Instance", "my-instance");
 
-    let vpc = Resource::new("ec2.Vpc", "my-vpc")
+    let vpc = ManagedResource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
 
-    let subnet = Resource::new("ec2.Subnet", "my-subnet")
+    let subnet = ManagedResource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
             Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         );
 
-    let instance = Resource::new("ec2.Instance", "my-instance")
+    let instance = ManagedResource::new("ec2.Instance", "my-instance")
         .with_binding("instance")
         .with_attribute(
             "subnet_id",
@@ -333,7 +327,7 @@ fn cascade_transitive_dependencies() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: (vpc.clone()).try_into().unwrap(),
+        to: (vpc.clone()),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -345,9 +339,7 @@ fn cascade_transitive_dependencies() {
     });
 
     let schemas = SchemaRegistry::new();
-    let (unresolved_managed___, _ds___) =
-        crate::differ::split_resources_by_kind(&unresolved_resources);
-    cascade_dependent_updates(&mut plan, &unresolved_managed___, &current_states, &schemas);
+    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
 
     // Only subnet directly depends on VPC, so only subnet gets cascading update
     // Instance depends on subnet, not VPC directly
@@ -370,7 +362,7 @@ fn cascade_anonymous_resource_dependent() {
     let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
     let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
-    let vpc = Resource::new("ec2.Vpc", "my-vpc")
+    let vpc = ManagedResource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
@@ -378,7 +370,7 @@ fn cascade_anonymous_resource_dependent() {
         );
 
     // Anonymous subnet (no _binding) with a ResourceRef to the VPC
-    let subnet = Resource::new("ec2.Subnet", "my-subnet").with_attribute(
+    let subnet = ManagedResource::new("ec2.Subnet", "my-subnet").with_attribute(
         "vpc_id",
         Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
     );
@@ -414,7 +406,7 @@ fn cascade_anonymous_resource_dependent() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: (vpc.clone()).try_into().unwrap(),
+        to: (vpc.clone()),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -426,9 +418,7 @@ fn cascade_anonymous_resource_dependent() {
     });
 
     let schemas = SchemaRegistry::new();
-    let (unresolved_managed___, _ds___) =
-        crate::differ::split_resources_by_kind(&unresolved_resources);
-    cascade_dependent_updates(&mut plan, &unresolved_managed___, &current_states, &schemas);
+    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
 
     if let Effect::Replace {
         cascading_updates, ..
@@ -459,14 +449,14 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
     let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
     // Unresolved resources (before ref resolution)
-    let vpc = Resource::new("ec2.Vpc", "my-vpc")
+    let vpc = ManagedResource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
 
-    let subnet = Resource::new("ec2.Subnet", "my-subnet")
+    let subnet = ManagedResource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -526,7 +516,7 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: (vpc.clone().with_binding("vpc")).try_into().unwrap(),
+        to: (vpc.clone().with_binding("vpc")),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -538,9 +528,7 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
     });
 
     // Apply cascade with schemas so it can detect create-only attributes
-    let (unresolved_managed___, _ds___) =
-        crate::differ::split_resources_by_kind(&unresolved_resources);
-    cascade_dependent_updates(&mut plan, &unresolved_managed___, &current_states, &schemas);
+    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
 
     // After cascading, the subnet should appear as a separate Replace effect in the plan,
     // NOT as a CascadingUpdate inside the VPC's Replace effect.
@@ -617,14 +605,14 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
     let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
     // Unresolved resources (before ref resolution)
-    let vpc = Resource::new("ec2.Vpc", "my-vpc")
+    let vpc = ManagedResource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
 
-    let subnet = Resource::new("ec2.Subnet", "my-subnet")
+    let subnet = ManagedResource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -699,7 +687,7 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: (vpc.clone().with_binding("vpc")).try_into().unwrap(),
+        to: (vpc.clone().with_binding("vpc")),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -712,7 +700,7 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
     plan.add(Effect::Replace {
         id: subnet_id.clone(),
         from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
-        to: (subnet.clone().with_binding("subnet")).try_into().unwrap(),
+        to: (subnet.clone().with_binding("subnet")),
         directives: Directives::default(),
         changed_create_only: vec!["availability_zone".to_string()],
         cascading_updates: vec![],
@@ -721,9 +709,7 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
     });
 
     // Apply cascade
-    let (unresolved_managed___, _ds___) =
-        crate::differ::split_resources_by_kind(&unresolved_resources);
-    cascade_dependent_updates(&mut plan, &unresolved_managed___, &current_states, &schemas);
+    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
 
     // After cascading, the subnet Replace should have BOTH availability_zone AND vpc_id
     // in changed_create_only, because vpc_id is a create-only ref to the replaced VPC.
@@ -776,14 +762,14 @@ fn auto_detect_create_before_destroy_when_resource_has_dependents() {
     let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
     // Unresolved resources (before ref resolution)
-    let vpc = Resource::new("ec2.Vpc", "my-vpc")
+    let vpc = ManagedResource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
 
-    let subnet = Resource::new("ec2.Subnet", "my-subnet")
+    let subnet = ManagedResource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -846,7 +832,7 @@ fn auto_detect_create_before_destroy_when_resource_has_dependents() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: (vpc.clone().with_binding("vpc")).try_into().unwrap(),
+        to: (vpc.clone().with_binding("vpc")),
         directives: Directives::default(), // create_before_destroy = false (user didn't set it)
         changed_create_only: vec!["cidr_block".to_string()],
         cascading_updates: vec![],
@@ -856,9 +842,7 @@ fn auto_detect_create_before_destroy_when_resource_has_dependents() {
 
     // Apply cascade — this should auto-detect that VPC has dependents and
     // promote it to create_before_destroy
-    let (unresolved_managed___, _ds___) =
-        crate::differ::split_resources_by_kind(&unresolved_resources);
-    cascade_dependent_updates(&mut plan, &unresolved_managed___, &current_states, &schemas);
+    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
 
     // The VPC Replace should now have create_before_destroy = true
     // because the subnet references it
@@ -895,14 +879,14 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
     let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
     // Unresolved resources (before ref resolution)
-    let vpc = Resource::new("ec2.Vpc", "my-vpc")
+    let vpc = ManagedResource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
 
-    let subnet = Resource::new("ec2.Subnet", "my-subnet")
+    let subnet = ManagedResource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -973,7 +957,7 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: (vpc.clone().with_binding("vpc")).try_into().unwrap(),
+        to: (vpc.clone().with_binding("vpc")),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -986,14 +970,12 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
     plan.add(Effect::Update {
         id: subnet_id.clone(),
         from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
-        to: (subnet.clone().with_binding("subnet")).try_into().unwrap(),
+        to: (subnet.clone().with_binding("subnet")),
         changed_attributes: vec!["tags".to_string()],
     });
 
     // Apply cascade
-    let (unresolved_managed___, _ds___) =
-        crate::differ::split_resources_by_kind(&unresolved_resources);
-    cascade_dependent_updates(&mut plan, &unresolved_managed___, &current_states, &schemas);
+    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
 
     // After cascading, the subnet should be UPGRADED from Update to Replace,
     // because vpc_id is a create-only attribute referencing the replaced VPC.
@@ -1033,14 +1015,14 @@ fn cascade_prevent_destroy_blocks_promotion_to_replace() {
     let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
     let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
-    let vpc = Resource::new("ec2.Vpc", "my-vpc")
+    let vpc = ManagedResource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
 
-    let mut subnet = Resource::new("ec2.Subnet", "my-subnet")
+    let mut subnet = ManagedResource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -1100,7 +1082,7 @@ fn cascade_prevent_destroy_blocks_promotion_to_replace() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: (vpc.clone().with_binding("vpc")).try_into().unwrap(),
+        to: (vpc.clone().with_binding("vpc")),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -1112,9 +1094,7 @@ fn cascade_prevent_destroy_blocks_promotion_to_replace() {
     });
 
     // Apply cascade
-    let (unresolved_managed___, _ds___) =
-        crate::differ::split_resources_by_kind(&unresolved_resources);
-    cascade_dependent_updates(&mut plan, &unresolved_managed___, &current_states, &schemas);
+    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
 
     // The subnet should NOT be promoted to Replace because it has prevent_destroy.
     // Instead, a PlanError should be generated.
@@ -1154,14 +1134,14 @@ fn cascade_prevent_destroy_blocks_merge_upgrade_to_replace() {
     let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
     let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
-    let vpc = Resource::new("ec2.Vpc", "my-vpc")
+    let vpc = ManagedResource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
 
-    let mut subnet = Resource::new("ec2.Subnet", "my-subnet")
+    let mut subnet = ManagedResource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -1230,7 +1210,7 @@ fn cascade_prevent_destroy_blocks_merge_upgrade_to_replace() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: (vpc.clone().with_binding("vpc")).try_into().unwrap(),
+        to: (vpc.clone().with_binding("vpc")),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -1243,14 +1223,12 @@ fn cascade_prevent_destroy_blocks_merge_upgrade_to_replace() {
     plan.add(Effect::Update {
         id: subnet_id.clone(),
         from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
-        to: (subnet.clone().with_binding("subnet")).try_into().unwrap(),
+        to: (subnet.clone().with_binding("subnet")),
         changed_attributes: vec!["tags".to_string()],
     });
 
     // Apply cascade
-    let (unresolved_managed___, _ds___) =
-        crate::differ::split_resources_by_kind(&unresolved_resources);
-    cascade_dependent_updates(&mut plan, &unresolved_managed___, &current_states, &schemas);
+    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
 
     // The subnet should NOT be upgraded to Replace because it has prevent_destroy.
     // A PlanError should be generated instead.

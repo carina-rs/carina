@@ -749,7 +749,7 @@ pub fn lift_saved_state_string_enums(
         crate::resource::ResourceId,
         std::collections::HashMap<String, Value>,
     >,
-    resources: &[crate::resource::Resource],
+    resources: &[crate::resource::ManagedResource],
     registry: &crate::schema::SchemaRegistry,
 ) {
     for resource in resources {
@@ -785,12 +785,33 @@ pub fn lift_current_state_string_enums(
         crate::resource::ResourceId,
         crate::resource::State,
     >,
-    resources: &[crate::resource::Resource],
+    resources: &[crate::resource::ManagedResource],
     registry: &crate::schema::SchemaRegistry,
 ) {
     for resource in resources {
         if let Some(schema) = registry.get_for(resource)
             && let Some(state) = current_states.get_mut(&resource.id)
+        {
+            lift_state_string_enums_to_identifiers(&mut state.attributes, schema);
+        }
+    }
+}
+
+/// [`DataSource`](crate::resource::DataSource) counterpart of
+/// [`lift_current_state_string_enums`]. Schema lookup routes through the
+/// data-source registry (`get_for_data_source`) so a `read` resource's
+/// provider-returned state is StringEnum-lifted too (carina#3181).
+pub fn lift_current_state_string_enums_for_data_sources(
+    current_states: &mut std::collections::HashMap<
+        crate::resource::ResourceId,
+        crate::resource::State,
+    >,
+    data_sources: &[crate::resource::DataSource],
+    registry: &crate::schema::SchemaRegistry,
+) {
+    for data_source in data_sources {
+        if let Some(schema) = registry.get_for_data_source(data_source)
+            && let Some(state) = current_states.get_mut(&data_source.id)
         {
             lift_state_string_enums_to_identifiers(&mut state.attributes, schema);
         }
@@ -2188,7 +2209,7 @@ mod tests {
     /// absent from the registry is skipped without panic.
     #[test]
     fn lift_saved_state_string_enums_resolves_schema_per_resource() {
-        use crate::resource::{ConcreteValue, Resource, ResourceId, Value};
+        use crate::resource::{ConcreteValue, ManagedResource, ResourceId, Value};
         use crate::schema::{
             AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
         };
@@ -2211,8 +2232,8 @@ mod tests {
                 .attribute(AttributeSchema::new("policy_document", policy_struct)),
         );
 
-        let known = Resource::with_provider("awscc", "iam.RolePolicy", "rp", None);
-        let unknown = Resource::with_provider("awscc", "iam.Unknown", "x", None);
+        let known = ManagedResource::with_provider("awscc", "iam.RolePolicy", "rp", None);
+        let unknown = ManagedResource::with_provider("awscc", "iam.Unknown", "x", None);
 
         let mut pd = indexmap::IndexMap::new();
         pd.insert(
@@ -2258,7 +2279,7 @@ mod tests {
     /// failed the strict validator.
     #[test]
     fn lift_current_state_string_enums_lifts_provider_read_state() {
-        use crate::resource::{ConcreteValue, Resource, ResourceId, State, Value};
+        use crate::resource::{ConcreteValue, ManagedResource, ResourceId, State, Value};
         use crate::schema::{
             AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
         };
@@ -2283,7 +2304,7 @@ mod tests {
             )),
         );
 
-        let role = Resource::with_provider("awscc", "iam.Role", "bs.bootstrap.role", None);
+        let role = ManagedResource::with_provider("awscc", "iam.Role", "bs.bootstrap.role", None);
 
         let mut pd = indexmap::IndexMap::new();
         pd.insert(

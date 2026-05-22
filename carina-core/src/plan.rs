@@ -136,12 +136,8 @@ impl Plan {
                 Effect::Update { id, .. } if id == resource_id => {
                     // Take ownership of the Update fields and upgrade to Replace.
                     // The `Create` here is a throwaway placeholder overwritten
-                    // on the next line — carina#3181 PR D: `Effect::Create`
-                    // carries `ManagedResource`, so bridge a bare `Resource`.
-                    let placeholder = crate::resource::ManagedResource::try_from(
-                        &crate::resource::Resource::new("", ""),
-                    )
-                    .expect("bare Resource::new is always managed");
+                    // on the next line.
+                    let placeholder = crate::resource::ManagedResource::new("", "");
                     let old = std::mem::replace(effect, Effect::Create(placeholder));
                     if let Effect::Update { id, from, to, .. } = old {
                         *effect = Effect::Replace {
@@ -413,7 +409,7 @@ fn format_effect_brief(effect: &Effect) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::Resource;
+    use crate::resource::ManagedResource;
 
     #[test]
     fn empty_plan() {
@@ -454,9 +450,10 @@ mod tests {
         use std::time::Duration;
 
         let mut plan = Plan::new();
-        plan.add(Effect::Create(
-            Resource::new("acm.Certificate", "cert").try_into().unwrap(),
-        ));
+        plan.add(Effect::Create(ManagedResource::new(
+            "acm.Certificate",
+            "cert",
+        )));
         plan.add(Effect::Wait {
             binding: "cert_issued".to_string(),
             target_id: ResourceId::new("acm.Certificate", "cert"),
@@ -478,12 +475,8 @@ mod tests {
     #[test]
     fn plan_summary() {
         let mut plan = Plan::new();
-        plan.add(Effect::Create(
-            Resource::new("s3.Bucket", "a").try_into().unwrap(),
-        ));
-        plan.add(Effect::Create(
-            Resource::new("s3.Bucket", "b").try_into().unwrap(),
-        ));
+        plan.add(Effect::Create(ManagedResource::new("s3.Bucket", "a")));
+        plan.add(Effect::Create(ManagedResource::new("s3.Bucket", "b")));
         plan.add(Effect::Delete {
             id: crate::resource::ResourceId::new("s3.Bucket", "c"),
             identifier: String::new(),
@@ -503,17 +496,16 @@ mod tests {
         let mut plan = Plan::new();
 
         // Root resource
-        plan.add(Effect::Create(
-            Resource::new("vpc", "main").try_into().unwrap(),
-        ));
+        plan.add(Effect::Create(ManagedResource::new("vpc", "main")));
 
         // Module resource
-        let module_resource =
-            Resource::new("security_group", "web_sg").with_module_source(ModuleSource::Module {
+        let module_resource = ManagedResource::new("security_group", "web_sg").with_module_source(
+            ModuleSource::Module {
                 name: "web_tier".to_string(),
                 instance: "web".to_string(),
-            });
-        plan.add(Effect::Create(module_resource.try_into().unwrap()));
+            },
+        );
+        plan.add(Effect::Create(module_resource));
 
         let modular = ModularPlan::from_plan(plan);
 
@@ -532,20 +524,17 @@ mod tests {
         let mut plan = Plan::new();
 
         // Two root resources
-        plan.add(Effect::Create(
-            Resource::new("vpc", "main").try_into().unwrap(),
-        ));
-        plan.add(Effect::Create(
-            Resource::new("subnet", "public").try_into().unwrap(),
-        ));
+        plan.add(Effect::Create(ManagedResource::new("vpc", "main")));
+        plan.add(Effect::Create(ManagedResource::new("subnet", "public")));
 
         // Module resource
-        let module_resource =
-            Resource::new("security_group", "web_sg").with_module_source(ModuleSource::Module {
+        let module_resource = ManagedResource::new("security_group", "web_sg").with_module_source(
+            ModuleSource::Module {
                 name: "web_tier".to_string(),
                 instance: "web".to_string(),
-            });
-        plan.add(Effect::Create(module_resource.try_into().unwrap()));
+            },
+        );
+        plan.add(Effect::Create(module_resource));
 
         let modular = ModularPlan::from_plan(plan);
         let groups = modular.group_by_module();
@@ -570,19 +559,19 @@ mod tests {
 
         // A Replace effect with one cascading update
         let from = State::not_found(ResourceId::new("ec2.Vpc", "vpc")).with_identifier("vpc-123");
-        let to = Resource::new("ec2.Vpc", "vpc");
+        let to = ManagedResource::new("ec2.Vpc", "vpc");
         let cascading = CascadingUpdate {
             id: ResourceId::new("ec2.Subnet", "subnet"),
             from: Box::new(
                 State::not_found(ResourceId::new("ec2.Subnet", "subnet"))
                     .with_identifier("subnet-123"),
             ),
-            to: (Resource::new("ec2.Subnet", "subnet")).try_into().unwrap(),
+            to: (ManagedResource::new("ec2.Subnet", "subnet")),
         };
         plan.add(Effect::Replace {
             id: ResourceId::new("ec2.Vpc", "vpc"),
             from: Box::new(from),
-            to: to.try_into().unwrap(),
+            to,
             directives: Directives::default(),
             changed_create_only: vec!["cidr_block".to_string()],
             cascading_updates: vec![cascading],
@@ -606,19 +595,19 @@ mod tests {
         let mut plan = Plan::new();
 
         let from = State::not_found(ResourceId::new("ec2.Vpc", "vpc")).with_identifier("vpc-123");
-        let to = Resource::new("ec2.Vpc", "vpc");
+        let to = ManagedResource::new("ec2.Vpc", "vpc");
         let cascading = CascadingUpdate {
             id: ResourceId::new("ec2.Subnet", "subnet"),
             from: Box::new(
                 State::not_found(ResourceId::new("ec2.Subnet", "subnet"))
                     .with_identifier("subnet-123"),
             ),
-            to: (Resource::new("ec2.Subnet", "subnet")).try_into().unwrap(),
+            to: (ManagedResource::new("ec2.Subnet", "subnet")),
         };
         plan.add(Effect::Replace {
             id: ResourceId::new("ec2.Vpc", "vpc"),
             from: Box::new(from),
-            to: to.try_into().unwrap(),
+            to,
             directives: Directives::default(),
             changed_create_only: vec!["cidr_block".to_string()],
             cascading_updates: vec![cascading],
@@ -644,9 +633,7 @@ mod tests {
         use crate::resource::ResourceId;
 
         let mut plan = Plan::new();
-        plan.add(Effect::Create(
-            Resource::new("s3.Bucket", "a").try_into().unwrap(),
-        ));
+        plan.add(Effect::Create(ManagedResource::new("s3.Bucket", "a")));
         plan.add(Effect::Delete {
             id: ResourceId::new("s3.Bucket", "b"),
             identifier: "b-id".to_string(),

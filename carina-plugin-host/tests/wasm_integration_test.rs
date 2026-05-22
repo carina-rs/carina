@@ -7,7 +7,7 @@ use carina_core::provider::{
     CreateRequest, DeleteRequest, PatchOp, PatchOpKind, Provider, ProviderFactory, ReadRequest,
     UpdatePatch, UpdateRequest,
 };
-use carina_core::resource::{ConcreteValue, Resource, ResourceId, Value};
+use carina_core::resource::{ConcreteValue, DataSource, ManagedResource, ResourceId, Value};
 use carina_plugin_host::WasmProviderFactory;
 
 fn wasm_path() -> Option<PathBuf> {
@@ -86,7 +86,7 @@ async fn test_wasm_mock_provider_create_and_read() {
     assert!(state.attributes.is_empty());
 
     // Create a resource
-    let mut resource = Resource::with_provider("mock", "test.resource", "my-resource", None);
+    let mut resource = ManagedResource::with_provider("mock", "test.resource", "my-resource", None);
     resource.attributes = indexmap::IndexMap::from([
         (
             "name".into(),
@@ -158,7 +158,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
     let id = ResourceId::with_provider("mock", "test.resource", "updatable", None);
 
     // Create first
-    let mut resource = Resource::with_provider("mock", "test.resource", "updatable", None);
+    let mut resource = ManagedResource::with_provider("mock", "test.resource", "updatable", None);
     resource.attributes = indexmap::IndexMap::from([
         (
             "color".into(),
@@ -273,7 +273,7 @@ async fn test_wasm_mock_provider_normalizer() {
 
     // normalize_desired: mock provider returns resources unchanged
     let mut resources = vec![{
-        let mut r = Resource::with_provider("mock", "test.resource", "norm-test", None);
+        let mut r = ManagedResource::with_provider("mock", "test.resource", "norm-test", None);
         r.attributes = indexmap::IndexMap::from([(
             "key".into(),
             Value::Concrete(ConcreteValue::String("value".into())),
@@ -316,7 +316,7 @@ async fn test_wasm_mock_provider_merge_default_tags_dispatches_through_wit() {
         .await;
 
     let registry = carina_core::schema::SchemaRegistry::new();
-    let mut resources = vec![Resource::with_provider(
+    let mut resources = vec![ManagedResource::with_provider(
         "mock",
         "test.resource",
         "tag-test",
@@ -357,7 +357,7 @@ async fn test_wasm_mock_provider_merge_default_tags_empty_short_circuits() {
         .await;
 
     let registry = carina_core::schema::SchemaRegistry::new();
-    let mut resources = vec![Resource::with_provider(
+    let mut resources = vec![ManagedResource::with_provider(
         "mock",
         "test.resource",
         "no-tags",
@@ -389,9 +389,9 @@ async fn test_wasm_mock_provider_merge_default_tags_preserves_order() {
 
     let registry = carina_core::schema::SchemaRegistry::new();
     let mut resources = vec![
-        Resource::with_provider("mock", "test.resource", "alpha", None),
-        Resource::with_provider("mock", "test.resource", "beta", None),
-        Resource::with_provider("mock", "test.resource", "gamma", None),
+        ManagedResource::with_provider("mock", "test.resource", "alpha", None),
+        ManagedResource::with_provider("mock", "test.resource", "beta", None),
+        ManagedResource::with_provider("mock", "test.resource", "gamma", None),
     ];
     let default_tags = indexmap::IndexMap::from([(
         "Env".to_string(),
@@ -429,7 +429,7 @@ async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
         .await
         .expect("provider should init");
 
-    let mut resource = Resource::with_provider("mock", "test.data_source", "example", None);
+    let mut resource = DataSource::with_provider("mock", "test.data_source", "example", None);
     resource.attributes = indexmap::IndexMap::from([
         (
             "identity_store_id".into(),

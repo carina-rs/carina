@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use carina_core::effect::Effect;
 use carina_core::executor::ExecutionResult;
 use carina_core::plan::Plan;
-use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, ManagedResource, ResourceId, State, Value};
 use carina_core::schema::SchemaRegistry;
 use carina_state::{LockInfo, ResourceState, StateBackend, StateFile};
 
@@ -20,7 +20,10 @@ use crate::error::AppError;
 /// When a create_before_destroy replacement produces a non-renameable temporary name
 /// (can_rename=false), the state stores the permanent name. This function applies
 /// those overrides so the plan doesn't detect a false diff.
-pub(crate) fn apply_name_overrides(resources: &mut [Resource], state_file: &Option<StateFile>) {
+pub(crate) fn apply_name_overrides(
+    resources: &mut [ManagedResource],
+    state_file: &Option<StateFile>,
+) {
     let state_file = match state_file {
         Some(sf) => sf,
         None => return,
@@ -65,7 +68,11 @@ pub(crate) fn queue_state_refresh(
 pub(crate) struct FinalizeApplyInput<'a> {
     pub result: &'a ExecutionResult,
     pub state_file: Option<StateFile>,
-    pub sorted_resources: &'a [Resource],
+    pub sorted_resources: &'a [ManagedResource],
+    /// Data sources (`read`-keyword resources). Layered into the
+    /// export-resolution binding view so `exports { x = some_read.attr }`
+    /// resolves (carina#3181).
+    pub data_sources: &'a [carina_core::resource::DataSource],
     pub current_states: &'a HashMap<ResourceId, State>,
     pub plan: &'a Plan,
     pub backend: &'a dyn StateBackend,
@@ -114,7 +121,7 @@ pub(crate) struct FinalizeApplyInput<'a> {
 /// Resolve export expressions using bindings built from applied state.
 ///
 /// `sorted_resources` carries the in-memory resource graph including any
-/// `ResourceKind::Virtual` resources synthesised by module-call expansion
+/// virtual resources synthesised by module-call expansion
 /// (`expand_module_call`). Virtual resources are not persisted to
 /// `state.resources` because they have no provider-side identity, so a
 /// writeback that consults `state.resources` alone misses module-call
@@ -151,14 +158,15 @@ pub(crate) struct FinalizeApplyInput<'a> {
 /// 6. Resolve export expressions against the combined view.
 pub(crate) fn resolve_exports(
     export_params: &[carina_core::parser::InferredExportParam],
-    sorted_resources: &[Resource],
+    sorted_resources: &[ManagedResource],
+    data_sources: &[carina_core::resource::DataSource],
     pre_resolve_virtuals: &[carina_core::resource::VirtualResource],
     state: &StateFile,
     wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
 ) -> Result<HashMap<String, serde_json::Value>, AppError> {
     use carina_core::binding_index::ResolvedBindings;
     use carina_core::resolver::resolve_virtual_refs_post_apply;
-    use carina_core::resource::{ManagedResource, ResourceKind, Value};
+    use carina_core::resource::Value;
 
     // Step 1: rebuild post-apply `current_states` from
     // `state.resources` (the writeback already wrote the post-apply
@@ -187,43 +195,6 @@ pub(crate) fn resolve_exports(
         })
         .collect::<HashMap<_, _>>();
 
-    // Step 2: extract the managed view from `sorted_resources`.
-    // `sorted_resources` carries the *resolved* working copy that
-    // the apply pipeline mutated — its virtual entries have already
-    // had `ResourceRef`s collapsed to pre-apply concrete values, so
-    // we ignore them here and pull virtuals from
-    // `pre_resolve_virtuals` instead. DataSources are collapsed
-    // onto a `ManagedResource` view because the binding index only
-    // cares about (binding name, attribute map, state merge) —
-    // DataSources share that shape with managed resources. See
-    // The `Virtual must not pass through here` invariant holds because
-    // the `match` routes `Virtual` to its own branch above.
-    let mut managed: Vec<ManagedResource> = Vec::with_capacity(sorted_resources.len());
-    for r in sorted_resources {
-        match r.kind {
-            ResourceKind::Virtual => {
-                // Virtuals come from `pre_resolve_virtuals` below.
-                continue;
-            }
-            ResourceKind::Managed | ResourceKind::DataSource => {
-                // DataSources are collapsed onto a `ManagedResource`
-                // view: the binding index only cares about
-                // (binding name, attribute map, state merge), a shape
-                // DataSources share with managed resources.
-                managed.push(ManagedResource {
-                    id: r.id.clone(),
-                    attributes: r.attributes.clone(),
-                    directives: r.directives.clone(),
-                    prefixes: r.prefixes.clone(),
-                    binding: r.binding.clone(),
-                    dependency_bindings: r.dependency_bindings.clone(),
-                    module_source: r.module_source.clone(),
-                    quoted_string_attrs: r.quoted_string_attrs.clone(),
-                });
-            }
-        }
-    }
-
     // Virtuals: fresh clone of the **pre-resolve** snapshot. Their
     // attributes still carry `ResourceRef`s, so the post-apply
     // resolver below can pick up the post-apply state values for
@@ -232,14 +203,20 @@ pub(crate) fn resolve_exports(
     let mut virtuals: Vec<carina_core::resource::VirtualResource> = pre_resolve_virtuals.to_vec();
 
     // Step 3: build the bindings view from the managed slice plus
-    // post-apply states. Wait aliases land at the end of construction
-    // and snapshot whatever binding the alias targets (carina#3085).
+    // post-apply states. carina#3181: `sorted_resources` is the
+    // managed-only resolved working copy. Wait aliases land at the end
+    // of construction and snapshot whatever binding the alias targets
+    // (carina#3085).
     let mut bindings = ResolvedBindings::from_managed_with_state(
-        &managed,
+        sorted_resources,
         &post_apply_states,
         &HashMap::new(),
         wait_aliases,
     );
+    // Layer the data-source bindings so `exports { x = some_read.attr }`
+    // resolves against the `read` resource's resolved attributes
+    // (carina#3181).
+    bindings.add_data_sources(data_sources);
 
     // Step 4: re-resolve each virtual's attributes against the
     // post-apply bindings view. After this, a virtual's
@@ -370,7 +347,7 @@ pub(crate) fn dsl_value_to_json(
 
 pub(crate) struct ApplyStateSave<'a> {
     pub state_file: Option<StateFile>,
-    pub sorted_resources: &'a [Resource],
+    pub sorted_resources: &'a [ManagedResource],
     pub current_states: &'a HashMap<ResourceId, State>,
     pub applied_states: &'a HashMap<ResourceId, State>,
     pub permanent_name_overrides: &'a HashMap<ResourceId, HashMap<String, String>>,
@@ -401,13 +378,13 @@ pub(crate) struct WritebackPlan<'a> {
     cleanups: HashSet<ResourceId>,
 }
 
-/// One planned upsert. Carrying the desired `&Resource` here (rather
+/// One planned upsert. Carrying the desired `&ManagedResource` here (rather
 /// than re-deriving it from `sorted_resources` in the apply loop)
 /// makes the "every upsert has a desired resource" invariant
 /// representable in the type — there is no separate lookup that can
 /// miss.
 struct PlannedUpsert<'a> {
-    resource: &'a Resource,
+    resource: &'a ManagedResource,
     source: UpsertSource<'a>,
 }
 
@@ -451,7 +428,7 @@ impl<'a> WritebackPlan<'a> {
     /// `UpsertCleanupOverlap`.
     fn add_upsert(
         &mut self,
-        resource: &'a Resource,
+        resource: &'a ManagedResource,
         source: UpsertSource<'a>,
     ) -> Result<(), WritebackConflict> {
         let id = &resource.id;
@@ -487,7 +464,7 @@ impl<'a> WritebackPlan<'a> {
 /// `Effect::Move` deliberately does **not** touch the `to` slot — that
 /// is Phase 1's job.
 fn decompose<'a>(
-    sorted_resources: &'a [Resource],
+    sorted_resources: &'a [ManagedResource],
     current_states: &'a HashMap<ResourceId, State>,
     applied_states: &'a HashMap<ResourceId, State>,
     plan: &Plan,
@@ -608,12 +585,15 @@ pub(crate) fn apply_destroy_to_state(
     state.exports.clear();
 }
 
-/// Build a minimal `Resource` for an orphaned resource from the state file.
+/// Build a minimal `ManagedResource` for an orphaned resource from the state file.
 ///
-/// This creates a Resource with attributes reconstructed from state data,
+/// This creates a ManagedResource with attributes reconstructed from state data,
 /// including `_binding` and `_dependency_bindings` so that dependency ordering
 /// and tree display work correctly.
-pub(crate) fn build_orphan_resource(sf: &carina_state::StateFile, id: &ResourceId) -> Resource {
+pub(crate) fn build_orphan_resource(
+    sf: &carina_state::StateFile,
+    id: &ResourceId,
+) -> ManagedResource {
     let rs = sf
         .find_resource(&id.provider, &id.resource_type, id.name_str())
         .expect("orphan must exist in state file");
@@ -622,17 +602,15 @@ pub(crate) fn build_orphan_resource(sf: &carina_state::StateFile, id: &ResourceI
         .iter()
         .filter_map(|(k, v)| carina_core::value::json_to_dsl_value(v).map(|val| (k.clone(), val)))
         .collect();
-    Resource {
+    ManagedResource {
         id: id.clone(),
         attributes: attributes.into_iter().collect(),
-        kind: carina_core::resource::ResourceKind::Managed,
         directives: rs.directives.clone(),
         prefixes: rs.prefixes.clone(),
         binding: rs.binding.clone(),
         dependency_bindings: rs.dependency_bindings.clone(),
         module_source: None,
         quoted_string_attrs: std::collections::HashSet::new(),
-        virtual_module: None,
     }
 }
 

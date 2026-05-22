@@ -9,7 +9,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use crate::deps::find_failed_dependency;
 use crate::effect::{Effect, WaitTarget};
 use crate::provider::Provider;
-use crate::resource::{Resource, ResourceId, State, Value};
+use crate::resource::{ManagedResource, ResourceId, State, Value};
 
 use super::basic::{
     BasicEffectCtx, ExecutionState, RenormalizePipeline, count_actionable_effects,
@@ -22,7 +22,8 @@ use super::{ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, 
 /// Build a dependency map: for each effect index, which other effect indices it depends on.
 pub(super) fn build_dependency_map(
     effects: &[Effect],
-    unresolved_resources: &HashMap<ResourceId, Resource>,
+    unresolved_resources: &HashMap<ResourceId, ManagedResource>,
+    virtual_resources: &[crate::resource::VirtualResource],
 ) -> HashMap<usize, HashSet<usize>> {
     // Build binding -> effect index mapping
     let mut binding_to_idx: HashMap<String, usize> = HashMap::new();
@@ -43,13 +44,13 @@ pub(super) fn build_dependency_map(
         }
     }
 
-    let resolver = DepResolver::new(&binding_to_idx, unresolved_resources, None);
+    let resolver = DepResolver::new(&binding_to_idx, virtual_resources, None);
 
     let mut deps_of: HashMap<usize, HashSet<usize>> = HashMap::new();
     for (idx, effect) in effects.iter().enumerate() {
         let mut dep_indices = HashSet::new();
-        if let Some(resource) = effect.resource_as_legacy() {
-            resolver.collect_from_resource(&resource, &mut dep_indices);
+        if effect.resource_like().is_some() {
+            resolver.collect_from_effect(effect, &mut dep_indices);
             if let Some(unresolved) = unresolved_resources.get(effect.resource_id()) {
                 resolver.collect_from_resource(unresolved, &mut dep_indices);
             }
@@ -130,9 +131,10 @@ pub(super) fn build_dependency_map(
 #[cfg(test)]
 pub(super) fn build_dependency_levels(
     effects: &[Effect],
-    unresolved_resources: &HashMap<ResourceId, Resource>,
+    unresolved_resources: &HashMap<ResourceId, ManagedResource>,
+    virtual_resources: &[crate::resource::VirtualResource],
 ) -> Vec<Vec<usize>> {
-    let deps_of = build_dependency_map(effects, unresolved_resources);
+    let deps_of = build_dependency_map(effects, unresolved_resources, virtual_resources);
 
     // Assign levels: each effect's level is max(deps' levels) + 1, or 0 if no deps
     let mut levels: HashMap<usize, usize> = HashMap::new();
@@ -201,7 +203,8 @@ pub(super) async fn execute_effects_sequential(
     let total = count_actionable_effects(effects);
     let completed = AtomicUsize::new(0);
 
-    let deps_of = build_dependency_map(effects, input.unresolved_resources);
+    let deps_of =
+        build_dependency_map(effects, input.unresolved_resources, input.virtual_resources);
 
     // Build effect index -> binding name mapping for resolving dependency names
     let idx_to_binding: HashMap<usize, String> = effects
@@ -369,17 +372,13 @@ pub(super) async fn execute_effects_sequential(
                             };
                             observer.on_event(&ExecutionEvent::EffectStarted { effect });
 
-                            // carina#3181 PR D: bridge the `ManagedResource`
-                            // payload to legacy `Resource` for `ReplaceContext`.
-                            let to = Resource::from(to);
-
                             execute_replace_parallel(
                                 provider,
                                 &ReplaceContext {
                                     effect,
                                     id,
                                     from,
-                                    to: &to,
+                                    to,
                                     directives,
                                     cascading_updates,
                                     temporary_name: temporary_name.as_ref(),
@@ -590,43 +589,48 @@ pub(super) async fn execute_effects_sequential(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::{ResourceKind, Value};
+    use crate::resource::{Value, VirtualResource};
 
     /// Mirror of #2543's phased-executor test for the unphased dependency map:
     /// virtual module-attribute proxies must be transparently followed to the
     /// underlying resources their attributes reference.
     #[test]
     fn build_dependency_map_follows_virtual_module_binding() {
-        let mut role = Resource::with_provider("awscc", "iam.Role", "bootstrap.role", None);
+        let mut role = ManagedResource::with_provider("awscc", "iam.Role", "bootstrap.role", None);
         role.binding = Some("bootstrap.role".to_string());
 
-        let mut virt = Resource::with_provider("_virtual", "_virtual", "bootstrap", None);
-        virt.binding = Some("bootstrap".to_string());
-        virt.kind = ResourceKind::Virtual;
-
-        virt.virtual_module = Some(("github-oidc".to_string(), "bootstrap".to_string()));
-        virt.set_attr(
-            "role_name",
+        // carina#3181: virtual resources are a distinct typestate.
+        let mut virt_attrs = indexmap::IndexMap::new();
+        virt_attrs.insert(
+            "role_name".to_string(),
             Value::resource_ref("bootstrap.role", "role_name", vec![]),
         );
+        let virt = VirtualResource {
+            id: ResourceId::with_provider("_virtual", "_virtual", "bootstrap", None),
+            attributes: virt_attrs,
+            binding: Some("bootstrap".to_string()),
+            dependency_bindings: std::collections::BTreeSet::new(),
+            module_name: "github-oidc".to_string(),
+            instance: "bootstrap".to_string(),
+            quoted_string_attrs: std::collections::HashSet::new(),
+        };
 
-        let mut role_policy = Resource::with_provider("awscc", "iam.RolePolicy", "rp", None);
+        let mut role_policy = ManagedResource::with_provider("awscc", "iam.RolePolicy", "rp", None);
         role_policy.set_attr(
             "role_name",
             Value::resource_ref("bootstrap", "role_name", vec![]),
         );
 
         let effects = vec![
-            Effect::Create(role.clone().try_into().unwrap()),
-            Effect::Create(role_policy.clone().try_into().unwrap()),
+            Effect::Create(role.clone()),
+            Effect::Create(role_policy.clone()),
         ];
 
-        let mut unresolved: HashMap<ResourceId, Resource> = HashMap::new();
+        let mut unresolved: HashMap<ResourceId, ManagedResource> = HashMap::new();
         unresolved.insert(role.id.clone(), role.clone());
-        unresolved.insert(virt.id.clone(), virt);
         unresolved.insert(role_policy.id.clone(), role_policy);
 
-        let deps_of = build_dependency_map(&effects, &unresolved);
+        let deps_of = build_dependency_map(&effects, &unresolved, &[virt]);
 
         assert!(
             deps_of[&1].contains(&0),

@@ -9,7 +9,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use crate::deps::{find_failed_dependency, get_resource_dependencies};
 use crate::effect::Effect;
 use crate::provider::{CreateRequest, DeleteRequest, Provider, UpdateRequest};
-use crate::resource::{ConcreteValue, Resource, ResourceId, State, Value};
+use crate::resource::{ConcreteValue, ManagedResource, ResourceId, State, Value};
 
 use super::basic::{
     BasicEffectCtx, BasicEffectResult, ExecutionState, RenormalizePipeline,
@@ -28,10 +28,7 @@ pub(super) fn has_interdependent_replaces(effects: &[Effect]) -> bool {
 
     for effect in effects {
         if let Effect::Replace { to, .. } = effect {
-            // carina#3181 PR D: `Effect::Replace.to` is a
-            // `ManagedResource`; `get_resource_dependencies` still works
-            // in legacy `Resource` (it reads `directives.depends_on`).
-            for dep in get_resource_dependencies(&Resource::from(to)) {
+            for dep in get_resource_dependencies(to) {
                 if replace_bindings.contains(&dep) {
                     return true;
                 }
@@ -79,7 +76,7 @@ pub(super) fn topological_sort_replaces(
     for &idx in &replace_indices {
         let effect = &effects[idx];
         if let Effect::Replace { to, .. } = effect {
-            let dep_indices: Vec<usize> = get_resource_dependencies(&Resource::from(to))
+            let dep_indices: Vec<usize> = get_resource_dependencies(to)
                 .iter()
                 .filter(|b| replace_bindings.contains(b.as_str()))
                 .filter_map(|b| binding_to_idx.get(b))
@@ -144,7 +141,8 @@ pub(super) fn topological_sort_replaces(
 pub(super) fn build_phase_dependency_map(
     effects: &[Effect],
     phase_indices: &[usize],
-    unresolved_resources: &HashMap<ResourceId, Resource>,
+    unresolved_resources: &HashMap<ResourceId, ManagedResource>,
+    virtual_resources: &[crate::resource::VirtualResource],
 ) -> HashMap<usize, HashSet<usize>> {
     // Build binding -> effect index mapping for effects in this phase
     let phase_set: HashSet<usize> = phase_indices.iter().copied().collect();
@@ -155,14 +153,14 @@ pub(super) fn build_phase_dependency_map(
         }
     }
 
-    let resolver = DepResolver::new(&binding_to_idx, unresolved_resources, Some(&phase_set));
+    let resolver = DepResolver::new(&binding_to_idx, virtual_resources, Some(&phase_set));
 
     let mut deps_of: HashMap<usize, HashSet<usize>> = HashMap::new();
     for &idx in phase_indices {
         let mut dep_indices = HashSet::new();
         let effect = &effects[idx];
-        if let Some(resource) = effect.resource_as_legacy() {
-            resolver.collect_from_resource(&resource, &mut dep_indices);
+        if effect.resource_like().is_some() {
+            resolver.collect_from_effect(effect, &mut dep_indices);
             if let Some(unresolved) = unresolved_resources.get(effect.resource_id()) {
                 resolver.collect_from_resource(unresolved, &mut dep_indices);
             }
@@ -176,20 +174,15 @@ pub(super) fn build_phase_dependency_map(
 /// expanding any [`VirtualResource`] proxy bindings transparently
 /// through their own attribute references (#2543).
 ///
-/// `virtuals_by_binding` now holds only virtuals (typestate-split
-/// #3178): the previous mixed `HashMap<&str, &Resource>` plus a
-/// runtime `matches!(res.kind, Virtual { .. })` check is replaced
-/// by a slice of one type. A binding being present in
-/// `virtuals_by_binding` *is* the "this is a virtual" condition; no
-/// runtime kind probe is needed.
+/// carina#3181: virtual resources are a distinct typestate, supplied to
+/// [`DepResolver::new`] as their own slice and indexed by `binding`
+/// name. A binding present in `virtuals_by_binding` *is* the "this is a
+/// virtual" condition — the `expand` walk follows such a binding through
+/// the virtual's own attribute references.
 pub(super) struct DepResolver<'a> {
     binding_to_idx: &'a HashMap<String, usize>,
     /// Virtual resources owned by the resolver, keyed by their
-    /// `binding` name. Owned rather than `&'a VirtualResource`
-    /// because `VirtualResource::try_from(&Resource)` returns an
-    /// owned wrapper — keeping a borrow would force a
-    /// self-referential struct. The clone cost is bounded by the
-    /// number of virtuals in the config (typically small).
+    /// `binding` name.
     virtuals_by_binding: HashMap<String, crate::resource::VirtualResource>,
     /// `Some` filters output indices to those in the phase; `None` retains
     /// every reachable index.
@@ -199,32 +192,17 @@ pub(super) struct DepResolver<'a> {
 impl<'a> DepResolver<'a> {
     pub(super) fn new(
         binding_to_idx: &'a HashMap<String, usize>,
-        unresolved_resources: &'a HashMap<ResourceId, Resource>,
+        virtual_resources: &[crate::resource::VirtualResource],
         phase_set: Option<&'a HashSet<usize>>,
     ) -> Self {
-        // Project the mixed `unresolved_resources` map to a
-        // virtual-only `virtuals_by_binding` view via
-        // `VirtualResource::try_from`. Managed / DataSource arms
-        // fail the conversion and are silently filtered — that is
-        // the typestate-split equivalent of the legacy
-        // `matches!(res.kind, Virtual { .. })` check inside
-        // `expand`.
-        //
-        // The legacy code recorded all kinds in
-        // `binding_to_resource` and gated virtual-expansion on a
-        // runtime kind check at lookup time. Restricting the map
-        // to virtuals at construction time keeps the observable
-        // behaviour identical (only virtuals were ever traversed
-        // by the legacy gate) and removes the runtime probe.
+        // carina#3181: virtual resources are a distinct typestate, so
+        // they arrive as their own slice. Index them by `binding` name —
+        // a binding being present in `virtuals_by_binding` *is* the
+        // "this is a virtual" condition the `expand` walk checks.
         let virtuals_by_binding: HashMap<String, crate::resource::VirtualResource> =
-            unresolved_resources
-                .values()
-                .filter_map(|r| {
-                    let binding = r.binding.clone()?;
-                    crate::resource::VirtualResource::try_from(r)
-                        .ok()
-                        .map(|v| (binding, v))
-                })
+            virtual_resources
+                .iter()
+                .filter_map(|v| v.binding.clone().map(|b| (b, v.clone())))
                 .collect();
         Self {
             binding_to_idx,
@@ -235,8 +213,34 @@ impl<'a> DepResolver<'a> {
 
     /// Walk a resource's dependencies (via `get_resource_dependencies`) and
     /// merge the reached effect indices into `out`.
-    pub(super) fn collect_from_resource(&self, resource: &Resource, out: &mut HashSet<usize>) {
+    pub(super) fn collect_from_resource(
+        &self,
+        resource: &ManagedResource,
+        out: &mut HashSet<usize>,
+    ) {
         let dep_bindings = get_resource_dependencies(resource);
+        let mut visited: HashSet<&str> = HashSet::new();
+        for binding in &dep_bindings {
+            self.expand(binding.as_str(), out, &mut visited);
+        }
+    }
+
+    /// Walk an effect's dependencies and merge the reached effect indices
+    /// into `out`.
+    ///
+    /// carina#3181: `Effect` payloads are typestate structs (managed
+    /// resources / data sources), so the dependency set is the union of
+    /// the `ResourceLike` value-ref + `dependency_bindings` view and the
+    /// effect's explicit `depends_on` edges — the same set
+    /// `get_resource_dependencies` computes for a managed resource.
+    /// State-only / `Wait` effects have no resource and contribute
+    /// nothing.
+    pub(super) fn collect_from_effect(&self, effect: &Effect, out: &mut HashSet<usize>) {
+        let Some(resource) = effect.resource_like() else {
+            return;
+        };
+        let mut dep_bindings = crate::deps::get_resource_value_ref_dependencies(resource);
+        dep_bindings.extend(effect.explicit_dependencies());
         let mut visited: HashSet<&str> = HashSet::new();
         for binding in &dep_bindings {
             self.expand(binding.as_str(), out, &mut visited);
@@ -372,8 +376,12 @@ pub(super) async fn execute_effects_phased(
             .filter(|&idx| !matches!(&effects[idx], Effect::Replace { .. } | Effect::Read { .. }))
             .collect();
 
-        let deps_of =
-            build_phase_dependency_map(effects, &phase1_indices, input.unresolved_resources);
+        let deps_of = build_phase_dependency_map(
+            effects,
+            &phase1_indices,
+            input.unresolved_resources,
+            input.virtual_resources,
+        );
         let mut completed_indices: HashSet<usize> = HashSet::new();
         let mut dispatched: HashSet<usize> = HashSet::new();
         let mut in_flight = FuturesUnordered::new();
@@ -522,7 +530,12 @@ pub(super) async fn execute_effects_phased(
             })
             .collect();
 
-        let deps_of = build_phase_dependency_map(effects, &cbd_indices, input.unresolved_resources);
+        let deps_of = build_phase_dependency_map(
+            effects,
+            &cbd_indices,
+            input.unresolved_resources,
+            input.virtual_resources,
+        );
         let mut completed_indices: HashSet<usize> = HashSet::new();
         let mut dispatched: HashSet<usize> = HashSet::new();
         let mut in_flight = FuturesUnordered::new();
@@ -577,10 +590,6 @@ pub(super) async fn execute_effects_phased(
                         let started = Instant::now();
                         observer.on_event(&ExecutionEvent::EffectStarted { effect });
 
-                        // carina#3181 PR D: bridge the `ManagedResource`
-                        // payload to legacy `Resource` for the executor's
-                        // resolve pipeline and the `unresolved` map.
-                        let to = &Resource::from(to);
                         let resolve_source = unresolved.get(&to.id).unwrap_or(to);
                         let resolved = match resolve_resource_with_source(
                             to,
@@ -631,7 +640,7 @@ pub(super) async fn execute_effects_phased(
                                 let mut cascade_states = Vec::new();
                                 for cascade in cascading_updates {
                                     let resolved_to = match resolve_resource(
-                                        &Resource::from(&cascade.to),
+                                        &cascade.to,
                                         &local_bindings,
                                         &pipeline,
                                     )
@@ -767,12 +776,9 @@ pub(super) async fn execute_effects_phased(
                 } => {
                     let effect = &effects[idx];
                     if let Effect::Replace { to, .. } = effect {
-                        // carina#3181 PR D: `resolved_attributes` lives on
-                        // the legacy `Resource`; bridge the `ManagedResource`.
-                        let to_legacy = Resource::from(to);
                         input.bindings.record_applied(
                             to.binding.as_deref(),
-                            &to_legacy.resolved_attributes(),
+                            &to.resolved_attributes(),
                             &state,
                         );
                     }
@@ -848,17 +854,13 @@ pub(super) async fn execute_effects_phased(
                 binding_to_idx.insert(binding, idx);
             }
         }
-        let resolver = DepResolver::new(
-            &binding_to_idx,
-            input.unresolved_resources,
-            Some(&phase_set),
-        );
+        let resolver = DepResolver::new(&binding_to_idx, input.virtual_resources, Some(&phase_set));
         let mut deps_of: HashMap<usize, HashSet<usize>> = HashMap::new();
         for &idx in &delete_indices {
             let effect = &effects[idx];
             let mut dep_indices = HashSet::new();
-            if let Some(resource) = effect.resource_as_legacy() {
-                resolver.collect_from_resource(&resource, &mut dep_indices);
+            if effect.resource_like().is_some() {
+                resolver.collect_from_effect(effect, &mut dep_indices);
                 if let Some(unresolved) = input.unresolved_resources.get(effect.resource_id()) {
                     resolver.collect_from_resource(unresolved, &mut dep_indices);
                 }
@@ -1012,8 +1014,12 @@ pub(super) async fn execute_effects_phased(
     {
         let phase4_indices: Vec<usize> = sorted_indices.clone();
 
-        let deps_of =
-            build_phase_dependency_map(effects, &phase4_indices, input.unresolved_resources);
+        let deps_of = build_phase_dependency_map(
+            effects,
+            &phase4_indices,
+            input.unresolved_resources,
+            input.virtual_resources,
+        );
         let mut completed_indices: HashSet<usize> = HashSet::new();
         let mut dispatched: HashSet<usize> = HashSet::new();
         type PhaseFuture<'a> =
@@ -1188,10 +1194,6 @@ pub(super) async fn execute_effects_phased(
                         in_flight.push(Box::pin(async move {
                             if let Effect::Replace { to, .. } = effect {
                                 let started = effect_started;
-                                // carina#3181 PR D: bridge the
-                                // `ManagedResource` payload to legacy
-                                // `Resource` for the resolve pipeline.
-                                let to = &Resource::from(to);
                                 let resolve_source = unresolved.get(&to.id).unwrap_or(to);
                                 let resolved = match resolve_resource_with_source(
                                     to,
@@ -1351,7 +1353,7 @@ pub(super) async fn execute_effects_phased(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::{ResourceId, ResourceKind, Value};
+    use crate::resource::{ResourceId, Value, VirtualResource};
 
     /// Reproduces #2543: when a resource depends on `<module-instance>.<attr>`
     /// (where the module-instance binding is a `Virtual` resource exposing the
@@ -1359,41 +1361,62 @@ mod tests {
     /// the dep silently — virtual resources have no Effect entry to look up.
     /// The fix must follow the virtual binding through to the underlying
     /// resource(s) it references.
+    /// Build a [`VirtualResource`] with a single `ResourceRef` attribute.
+    fn make_virtual(
+        id_name: &str,
+        binding: &str,
+        attr: &str,
+        ref_binding: &str,
+        ref_attr: &str,
+    ) -> VirtualResource {
+        let mut attributes = indexmap::IndexMap::new();
+        attributes.insert(
+            attr.to_string(),
+            Value::resource_ref(ref_binding, ref_attr, vec![]),
+        );
+        VirtualResource {
+            id: ResourceId::with_provider("_virtual", "_virtual", id_name, None),
+            attributes,
+            binding: Some(binding.to_string()),
+            dependency_bindings: std::collections::BTreeSet::new(),
+            module_name: "mod".to_string(),
+            instance: binding.to_string(),
+            quoted_string_attrs: std::collections::HashSet::new(),
+        }
+    }
+
     #[test]
     fn build_phase_dependency_map_follows_virtual_module_binding() {
-        let mut role = Resource::with_provider("awscc", "iam.Role", "bootstrap.role", None);
+        let mut role = ManagedResource::with_provider("awscc", "iam.Role", "bootstrap.role", None);
         role.binding = Some("bootstrap.role".to_string());
 
-        let mut virt = Resource::with_provider("_virtual", "_virtual", "bootstrap", None);
-        virt.binding = Some("bootstrap".to_string());
-        virt.kind = ResourceKind::Virtual;
-
-        virt.virtual_module = Some(("github-oidc".to_string(), "bootstrap".to_string()));
-        // The virtual exposes `role_name = role.role_name`, which after intra-module
-        // rewriting becomes `bootstrap.role.role_name`.
-        virt.set_attr(
+        // carina#3181: the virtual exposes `role_name = role.role_name`,
+        // which after intra-module rewriting refs `bootstrap.role`.
+        let virt = make_virtual(
+            "bootstrap",
+            "bootstrap",
             "role_name",
-            Value::resource_ref("bootstrap.role", "role_name", vec![]),
+            "bootstrap.role",
+            "role_name",
         );
 
-        let mut role_policy = Resource::with_provider("awscc", "iam.RolePolicy", "rp", None);
+        let mut role_policy = ManagedResource::with_provider("awscc", "iam.RolePolicy", "rp", None);
         role_policy.set_attr(
             "role_name",
             Value::resource_ref("bootstrap", "role_name", vec![]),
         );
 
         let effects = vec![
-            Effect::Create(role.clone().try_into().unwrap()),
-            Effect::Create(role_policy.clone().try_into().unwrap()),
+            Effect::Create(role.clone()),
+            Effect::Create(role_policy.clone()),
         ];
         let phase_indices: Vec<usize> = vec![0, 1];
 
-        let mut unresolved: HashMap<ResourceId, Resource> = HashMap::new();
+        let mut unresolved: HashMap<ResourceId, ManagedResource> = HashMap::new();
         unresolved.insert(role.id.clone(), role.clone());
-        unresolved.insert(virt.id.clone(), virt.clone());
         unresolved.insert(role_policy.id.clone(), role_policy.clone());
 
-        let deps_of = build_phase_dependency_map(&effects, &phase_indices, &unresolved);
+        let deps_of = build_phase_dependency_map(&effects, &phase_indices, &unresolved, &[virt]);
 
         assert!(
             deps_of[&1].contains(&0),
@@ -1407,48 +1430,38 @@ mod tests {
     /// through both layers to the underlying resource.
     #[test]
     fn build_phase_dependency_map_follows_nested_virtual_module_bindings() {
-        let mut role = Resource::with_provider("awscc", "iam.Role", "outer.inner.role", None);
+        let mut role =
+            ManagedResource::with_provider("awscc", "iam.Role", "outer.inner.role", None);
         role.binding = Some("outer.inner.role".to_string());
 
-        let mut inner_virt = Resource::with_provider("_virtual", "_virtual", "outer.inner", None);
-        inner_virt.binding = Some("outer.inner".to_string());
-        inner_virt.kind = ResourceKind::Virtual;
-
-        inner_virt.virtual_module = Some(("inner-mod".to_string(), "outer.inner".to_string()));
-        inner_virt.set_attr(
+        let inner_virt = make_virtual(
+            "outer.inner",
+            "outer.inner",
             "role_name",
-            Value::resource_ref("outer.inner.role", "role_name", vec![]),
-        );
-
-        let mut outer_virt = Resource::with_provider("_virtual", "_virtual", "outer", None);
-        outer_virt.binding = Some("outer".to_string());
-        outer_virt.kind = ResourceKind::Virtual;
-
-        outer_virt.virtual_module = Some(("outer-mod".to_string(), "outer".to_string()));
-        outer_virt.set_attr(
+            "outer.inner.role",
             "role_name",
-            Value::resource_ref("outer.inner", "role_name", vec![]),
         );
+        let outer_virt = make_virtual("outer", "outer", "role_name", "outer.inner", "role_name");
 
-        let mut caller = Resource::with_provider("awscc", "iam.RolePolicy", "rp", None);
+        let mut caller = ManagedResource::with_provider("awscc", "iam.RolePolicy", "rp", None);
         caller.set_attr(
             "role_name",
             Value::resource_ref("outer", "role_name", vec![]),
         );
 
-        let effects = vec![
-            Effect::Create(role.clone().try_into().unwrap()),
-            Effect::Create(caller.clone().try_into().unwrap()),
-        ];
+        let effects = vec![Effect::Create(role.clone()), Effect::Create(caller.clone())];
         let phase_indices: Vec<usize> = vec![0, 1];
 
-        let mut unresolved: HashMap<ResourceId, Resource> = HashMap::new();
+        let mut unresolved: HashMap<ResourceId, ManagedResource> = HashMap::new();
         unresolved.insert(role.id.clone(), role);
-        unresolved.insert(inner_virt.id.clone(), inner_virt);
-        unresolved.insert(outer_virt.id.clone(), outer_virt);
         unresolved.insert(caller.id.clone(), caller);
 
-        let deps_of = build_phase_dependency_map(&effects, &phase_indices, &unresolved);
+        let deps_of = build_phase_dependency_map(
+            &effects,
+            &phase_indices,
+            &unresolved,
+            &[inner_virt, outer_virt],
+        );
 
         assert!(
             deps_of[&1].contains(&0),
@@ -1464,9 +1477,9 @@ mod tests {
     fn topological_sort_replaces_respects_depends_on() {
         use crate::resource::{Directives, State};
 
-        let mut role = Resource::with_provider("test", "iam.Role", "role", None);
+        let mut role = ManagedResource::with_provider("test", "iam.Role", "role", None);
         role.binding = Some("role".to_string());
-        let mut bucket = Resource::with_provider("test", "s3.Bucket", "bucket", None);
+        let mut bucket = ManagedResource::with_provider("test", "s3.Bucket", "bucket", None);
         bucket.binding = Some("bucket".to_string());
         bucket.directives = Directives {
             depends_on: vec!["role".to_string()],
@@ -1479,7 +1492,7 @@ mod tests {
         let role_replace = Effect::Replace {
             id: role.id.clone(),
             from: Box::new(role_state),
-            to: role.clone().try_into().unwrap(),
+            to: role.clone(),
             directives: Directives::default(),
             changed_create_only: vec!["role_name".to_string()],
             cascading_updates: vec![],
@@ -1489,7 +1502,7 @@ mod tests {
         let bucket_replace = Effect::Replace {
             id: bucket.id.clone(),
             from: Box::new(bucket_state),
-            to: bucket.clone().try_into().unwrap(),
+            to: bucket.clone(),
             directives: Directives::default(),
             changed_create_only: vec!["bucket_name".to_string()],
             cascading_updates: vec![],

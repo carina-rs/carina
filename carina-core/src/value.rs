@@ -706,16 +706,16 @@ pub fn redact_secrets_in_attributes(
         .collect()
 }
 
-/// Redact all secrets in a `Resource`, returning a new Resource with secrets replaced by hashes.
+/// Redact all secrets in a `ManagedResource`, returning a new ManagedResource with secrets replaced by hashes.
 pub fn redact_secrets_in_resource(
-    resource: &crate::resource::Resource,
-) -> Result<crate::resource::Resource, SerializationError> {
+    resource: &crate::resource::ManagedResource,
+) -> Result<crate::resource::ManagedResource, SerializationError> {
     let attributes: Result<_, _> = resource
         .attributes
         .iter()
         .map(|(k, e)| redact_secrets_in_value(e).map(|rv| (k.clone(), rv)))
         .collect();
-    Ok(crate::resource::Resource {
+    Ok(crate::resource::ManagedResource {
         attributes: attributes?,
         ..resource.clone()
     })
@@ -1336,10 +1336,10 @@ fn canonicalize_to_string_list(value: Value) -> Value {
 /// validation surfaces the mismatch elsewhere.
 ///
 /// Call this once after `resolver::resolve_refs_*` and before the
-/// differ runs, so every `Resource` flowing into the plan / state /
+/// differ runs, so every `ManagedResource` flowing into the plan / state /
 /// provider boundary carries the canonical shape. See #2481, #2511.
 pub fn canonicalize_resources_with_schemas(
-    resources: &mut [crate::resource::Resource],
+    resources: &mut [crate::resource::ManagedResource],
     registry: &crate::schema::SchemaRegistry,
 ) {
     for resource in resources.iter_mut() {
@@ -1355,6 +1355,30 @@ pub fn canonicalize_resources_with_schemas(
             new_attrs.insert(key, canon);
         }
         resource.attributes = new_attrs;
+    }
+}
+
+/// [`DataSource`](crate::resource::DataSource) counterpart of
+/// [`canonicalize_resources_with_schemas`]. Schema lookup routes through
+/// the data-source registry (`get_for_data_source`); data sources whose
+/// schema is not registered are skipped (carina#3181).
+pub fn canonicalize_data_sources_with_schemas(
+    data_sources: &mut [crate::resource::DataSource],
+    registry: &crate::schema::SchemaRegistry,
+) {
+    for data_source in data_sources.iter_mut() {
+        let Some(schema) = registry.get_for_data_source(data_source) else {
+            continue;
+        };
+        let mut new_attrs: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
+        for (key, value) in std::mem::take(&mut data_source.attributes) {
+            let canon = match schema.attributes.get(&key) {
+                Some(attr_schema) => canonicalize_with_type(value, &attr_schema.attr_type),
+                None => value,
+            };
+            new_attrs.insert(key, canon);
+        }
+        data_source.attributes = new_attrs;
     }
 }
 
@@ -1446,7 +1470,7 @@ pub fn resolve_value_alias(
 /// path (`executor::renormalize`) so the two cannot diverge on this
 /// stage again (carina#3063).
 pub fn resolve_enum_aliases_for_resources(
-    resources: &mut [crate::resource::Resource],
+    resources: &mut [crate::resource::ManagedResource],
     factories: &[Box<dyn crate::provider::ProviderFactory>],
 ) {
     for resource in resources.iter_mut() {
@@ -3395,14 +3419,14 @@ mod tests {
         reg
     }
 
-    fn make_resource(attrs: Vec<(&str, Value)>) -> crate::resource::Resource {
-        use crate::resource::{Resource, ResourceId, ResourceKind, ResourceName};
+    fn make_resource(attrs: Vec<(&str, Value)>) -> crate::resource::ManagedResource {
+        use crate::resource::{ManagedResource, ResourceId, ResourceName};
         use std::collections::{BTreeSet, HashMap, HashSet};
         let mut attributes = IndexMap::new();
         for (k, v) in attrs {
             attributes.insert(k.to_string(), v);
         }
-        Resource {
+        ManagedResource {
             id: ResourceId {
                 provider: "aws".to_string(),
                 resource_type: "iam.policy".to_string(),
@@ -3410,14 +3434,12 @@ mod tests {
                 provider_instance: None,
             },
             attributes,
-            kind: ResourceKind::Managed,
             directives: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("p1".to_string()),
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             quoted_string_attrs: HashSet::new(),
-            virtual_module: None,
         }
     }
 

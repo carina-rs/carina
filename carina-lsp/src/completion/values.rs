@@ -1643,7 +1643,7 @@ impl CompletionProvider {
                 let description = schema
                     .description
                     .as_deref()
-                    .unwrap_or("Resource reference");
+                    .unwrap_or("ManagedResource reference");
                 type_completion_item(key, format!("{} reference", description), replacement_range)
             });
 

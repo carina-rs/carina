@@ -63,7 +63,15 @@ pub fn run_lint(path: &Path, provider_context: &ProviderContext) -> Result<(), A
     // source schemas can both carry List<Struct> attributes. Virtuals
     // have no schema, so `get_for` returns `None` for them.
     for rref in parsed.iter_top_level_resources() {
-        if let Some(schema) = schemas.get_for(rref.as_legacy_resource().as_ref()) {
+        let schema = match rref {
+            carina_core::parser::ResourceRef::Managed(m) => schemas.get_for(m),
+            carina_core::parser::ResourceRef::DataSource(d) => schemas.get_for_data_source(d),
+            carina_core::parser::ResourceRef::Virtual(_) => None,
+            carina_core::parser::ResourceRef::Deferred { resource, .. } => {
+                schemas.get_for(resource)
+            }
+        };
+        if let Some(schema) = schema {
             all_list_struct_attrs.extend(list_struct_attr_names(schema));
             for (attr_name, attr_schema) in &schema.attributes {
                 if let Some(bn) = &attr_schema.block_name {

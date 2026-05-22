@@ -24,7 +24,7 @@ use carina_core::provider::{
     BoxFuture, CreateRequest, DeleteRequest, Provider, ProviderError, ProviderFactory,
     ProviderNormalizer, ProviderResult, ReadRequest, SavedAttrs, UpdateRequest,
 };
-use carina_core::resource::{Resource, ResourceId, State, Value};
+use carina_core::resource::{DataSource, ManagedResource, ResourceId, State, Value};
 use carina_core::schema::{CompletionValue, ResourceSchema};
 use carina_core::value::SerializationError;
 
@@ -1581,8 +1581,8 @@ impl Provider for WasmProvider {
         }))
     }
 
-    fn read_data_source(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-        let wit_resource = match wasm_convert::core_to_wit_resource(resource) {
+    fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+        let wit_resource = match wasm_convert::core_data_source_to_wit_resource(resource) {
             Ok(v) => v,
             Err(e) => return early_provider_err(e),
         };
@@ -1754,7 +1754,7 @@ unsafe impl Sync for WasmProviderNormalizer {}
 impl ProviderNormalizer for WasmProviderNormalizer {
     fn normalize_desired<'a>(
         &'a self,
-        resources: &'a mut [Resource],
+        resources: &'a mut [ManagedResource],
     ) -> carina_core::provider::BoxFuture<'a, ()> {
         Box::pin(async move {
             let wit_resources: Vec<_> = expect_unresolvable_absent(
@@ -1895,7 +1895,7 @@ impl ProviderNormalizer for WasmProviderNormalizer {
 
     fn merge_default_tags<'a>(
         &'a self,
-        resources: &'a mut [Resource],
+        resources: &'a mut [ManagedResource],
         default_tags: &'a IndexMap<String, Value>,
         _registry: &'a carina_core::schema::SchemaRegistry,
     ) -> carina_core::provider::BoxFuture<'a, ()> {

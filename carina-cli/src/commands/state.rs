@@ -11,7 +11,7 @@ use carina_core::effect::Effect;
 use carina_core::parser::ProviderContext;
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
-use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, ManagedResource, ResourceId, State, Value};
 use carina_core::value::{format_value, json_to_dsl_value};
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, LockInfo, ResourceState, StateBackend,
@@ -300,7 +300,10 @@ fn format_state_lookup(
     };
 
     let rs = find_resource_by_query(state, resource_name).ok_or_else(|| {
-        AppError::Config(format!("Resource '{}' not found in state.", resource_name))
+        AppError::Config(format!(
+            "ManagedResource '{}' not found in state.",
+            resource_name
+        ))
     })?;
 
     match attribute {
@@ -798,19 +801,15 @@ pub(crate) async fn run_state_refresh_locked(
             .iter()
             .map(carina_core::binding_index::WaitAliasSpec::from)
             .collect();
-        // State refresh path: `sorted_resources` has not been
-        // mutated by a head-of-pipeline resolver pass, so its
-        // virtuals still carry the authored `ResourceRef` snapshots
-        // and we can lift them straight out for `resolve_exports`'s
-        // post-apply re-resolution (#3169 / #3177).
-        let pre_resolve_virtuals: Vec<carina_core::resource::VirtualResource> = sorted_resources
-            .iter()
-            .filter_map(|r| carina_core::resource::VirtualResource::try_from(r).ok())
-            .collect();
+        // State refresh path: no head-of-pipeline resolver pass has run,
+        // so `parsed.virtual_resources` still carry the authored
+        // `ResourceRef` snapshots that `resolve_exports`'s post-apply
+        // re-resolution needs (#3169 / #3177).
         state.exports = crate::commands::shared::state_writeback::resolve_exports(
             &parsed.export_params,
             &sorted_resources,
-            &pre_resolve_virtuals,
+            &parsed.data_sources,
+            &parsed.virtual_resources,
             &state,
             &wait_aliases,
         )?;
@@ -841,14 +840,14 @@ pub(crate) async fn run_state_refresh_locked(
 ///
 /// When `resource` is `Some`, directives, prefixes, and desired keys
 /// are preserved from it. When `None` (orphan resources), a minimal
-/// `Resource` is constructed from the id.
+/// `ManagedResource` is constructed from the id.
 ///
 /// `label_suffix` is appended to the resource header (e.g., `" (orphan)"`).
 fn diff_display_update_resource(
     id: &ResourceId,
     fresh_state: &State,
     state: &mut carina_state::StateFile,
-    resource: Option<&Resource>,
+    resource: Option<&ManagedResource>,
     label_suffix: &str,
     updated_count: &mut u32,
     unchanged_count: &mut u32,
@@ -942,7 +941,7 @@ fn diff_display_update_resource(
         let res = match resource {
             Some(r) => r,
             None => {
-                owned_resource = Resource::with_provider(
+                owned_resource = ManagedResource::with_provider(
                     &id.provider,
                     &id.resource_type,
                     id.name_str(),
@@ -1108,7 +1107,7 @@ mod tests {
         let err = format_state_lookup(&state, "nonexistent", false).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("Resource 'nonexistent' not found"),
+            msg.contains("ManagedResource 'nonexistent' not found"),
             "unexpected error: {}",
             msg
         );

@@ -5,7 +5,7 @@
 //! - `ResolvedBindings::add_virtual_resources(&mut self, &[VirtualResource])` —
 //!   layer virtual bindings on top, called only after managed bindings exist.
 //!
-//! The legacy `from_resources_with_state(&[Resource], …)` constructor is
+//! The legacy `from_resources_with_state(&[ManagedResource], …)` constructor is
 //! a thin shim over the two new entry points.
 
 use std::collections::{BTreeSet, HashMap};
@@ -13,9 +13,7 @@ use std::collections::{BTreeSet, HashMap};
 use indexmap::IndexMap;
 
 use crate::binding_index::ResolvedBindings;
-use crate::resource::{
-    ConcreteValue, ManagedResource, Resource, ResourceId, State, Value, VirtualResource,
-};
+use crate::resource::{ConcreteValue, ManagedResource, ResourceId, State, Value, VirtualResource};
 
 fn s(s: &str) -> Value {
     Value::Concrete(ConcreteValue::String(s.into()))
@@ -147,15 +145,14 @@ fn add_virtual_resources_skips_unbound() {
 }
 
 #[test]
-fn legacy_constructor_equivalence_managed_plus_virtual() {
-    // Feeding the same inputs through the legacy `from_resources_with_state`
-    // (mixed Resource slice) and through the new managed+virtual pair
-    // must yield identical bindings views — same binding names, same
-    // attribute maps, same source kinds.
+fn managed_plus_virtual_layering() {
+    // carina#3181: managed resources and virtual resources are
+    // separate typestates. `from_managed_with_state` builds the
+    // pre-apply view from the managed slice; `add_virtual_resources`
+    // layers the virtual bindings on top.
     let managed = make_managed("a", &[("value", s("hello"))]);
     let virt = make_virtual("v", &[("forwarded", s("via_virtual"))]);
 
-    // New typed path:
     let mut typed = ResolvedBindings::from_managed_with_state(
         std::slice::from_ref(&managed),
         &HashMap::new(),
@@ -166,31 +163,14 @@ fn legacy_constructor_equivalence_managed_plus_virtual() {
         .add_virtual_resources(std::slice::from_ref(&virt))
         .expect("add_virtual_resources");
 
-    // Legacy mixed-slice path:
-    let mixed: Vec<Resource> = vec![Resource::from(&managed), virtual_as_resource(&virt)];
-    let legacy =
-        ResolvedBindings::from_resources_with_state(&mixed, &HashMap::new(), &HashMap::new(), &[]);
-
-    assert_eq!(typed.get("a"), legacy.get("a"), "managed binding mismatch");
-    assert_eq!(typed.get("v"), legacy.get("v"), "virtual binding mismatch");
-}
-
-/// Reverse of [`From<&ManagedResource> for Resource`]: rebuild a
-/// `Resource` from a `VirtualResource` for the legacy-path equivalence
-/// test. Local to the test — production code lives behind the typed
-/// entry once #3177+ migrates the call sites.
-fn virtual_as_resource(v: &VirtualResource) -> Resource {
-    use crate::resource::ResourceKind;
-    Resource {
-        id: v.id.clone(),
-        attributes: v.attributes.clone(),
-        kind: ResourceKind::Virtual,
-        directives: Default::default(),
-        prefixes: HashMap::new(),
-        binding: v.binding.clone(),
-        dependency_bindings: v.dependency_bindings.clone(),
-        module_source: None,
-        quoted_string_attrs: v.quoted_string_attrs.clone(),
-        virtual_module: Some((v.module_name.clone(), v.instance.clone())),
-    }
+    assert_eq!(
+        typed.get("a").and_then(|m| m.get("value")),
+        Some(&s("hello")),
+        "managed binding mismatch",
+    );
+    assert_eq!(
+        typed.get("v").and_then(|m| m.get("forwarded")),
+        Some(&s("via_virtual")),
+        "virtual binding mismatch",
+    );
 }
