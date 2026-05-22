@@ -6,12 +6,13 @@ use super::ast::{FnParam, TypeExpr, UserFunction, UserFunctionBody};
 use super::context::{ParseContext, next_pair};
 use super::error::{ParseError, ParseWarning};
 use super::types::parse_type_expr;
-use super::util::{pascal_to_snake, value_type_name};
+use super::util::{snake_to_pascal, value_type_name};
 use super::{ProviderContext, Rule, parse_expression};
 use crate::eval_value::EvalValue;
 use crate::resource::{ConcreteValue, DeferredValue, Value};
 use crate::schema::{
-    validate_ipv4_address, validate_ipv4_cidr, validate_ipv6_address, validate_ipv6_cidr,
+    TypeIdentity, validate_ipv4_address, validate_ipv4_cidr, validate_ipv6_address,
+    validate_ipv6_cidr,
 };
 use indexmap::IndexMap;
 use std::collections::HashMap;
@@ -194,53 +195,57 @@ pub(super) fn prepare_user_function_call<'cfg>(
 
 /// Adapter that turns a [`ProviderContext`] into the
 /// [`crate::schema::CustomTypeLookup`] shape consumed by the schema-walk
-/// validator. PascalCase semantic names (e.g. `VpcId`) are normalized to
-/// snake_case (`vpc_id`) before lookup, then [`validate_custom_type`]
-/// runs the registered validator chain. The returned closure may be
-/// hoisted out of any per-resource loop — it borrows the context only.
+/// validator. The lookup is keyed on a structured [`TypeIdentity`], so
+/// [`validate_custom_type`] runs the registered validator chain against
+/// the exact provider-scoped identity — no flat-string normalization.
+/// The returned closure may be hoisted out of any per-resource loop —
+/// it borrows the context only.
 pub fn provider_context_lookup(
     ctx: &ProviderContext,
-) -> impl Fn(&str, &Value) -> Result<(), crate::schema::TypeError> + use<'_> {
-    move |type_name, value| {
-        let key = pascal_to_snake(type_name);
-        validate_custom_type(&key, value, ctx)
+) -> impl Fn(&TypeIdentity, &Value) -> Result<(), crate::schema::TypeError> + use<'_> {
+    move |identity, value| {
+        validate_custom_type(identity, value, ctx)
             .map_err(|message| crate::schema::TypeError::ValidationFailed { message })
     }
 }
 
-/// Validate a value against a custom type (ipv4_cidr, ipv4_address, etc.).
-/// Returns Ok(()) if the value passes validation or cannot be validated statically
-/// (e.g., ResourceRef, FunctionCall, Interpolation are deferred).
+/// Validate a value against a custom type (`Ipv4Cidr`, `Ipv4Address`, …).
+/// Returns Ok(()) if the value passes validation or cannot be validated
+/// statically (e.g., ResourceRef, FunctionCall, Interpolation are
+/// deferred).
 ///
-/// Checks built-in validators first, then falls back to custom validators
-/// registered in the [`ProviderContext`].
+/// Checks built-in validators first (matched on the identity's `kind`),
+/// then falls back to custom validators registered in the
+/// [`ProviderContext`], keyed by the full structured [`TypeIdentity`].
 pub fn validate_custom_type(
-    type_name: &str,
+    identity: &TypeIdentity,
     value: &Value,
     config: &ProviderContext,
 ) -> Result<(), String> {
-    match (type_name, value) {
+    // Built-in DSL custom types carry no provider axis — match on `kind`.
+    let builtin = identity.provider.is_none() && identity.segments.is_empty();
+    match (builtin.then_some(identity.kind.as_str()), value) {
         (
-            "ipv4_cidr",
+            Some("Ipv4Cidr"),
             Value::Concrete(ConcreteValue::String(s) | ConcreteValue::EnumIdentifier(s)),
         ) => validate_ipv4_cidr(s),
         (
-            "ipv4_address",
+            Some("Ipv4Address"),
             Value::Concrete(ConcreteValue::String(s) | ConcreteValue::EnumIdentifier(s)),
         ) => validate_ipv4_address(s),
         (
-            "ipv6_cidr",
+            Some("Ipv6Cidr"),
             Value::Concrete(ConcreteValue::String(s) | ConcreteValue::EnumIdentifier(s)),
         ) => validate_ipv6_cidr(s),
         (
-            "ipv6_address",
+            Some("Ipv6Address"),
             Value::Concrete(ConcreteValue::String(s) | ConcreteValue::EnumIdentifier(s)),
         ) => validate_ipv6_address(s),
         (_, Value::Deferred(DeferredValue::ResourceRef { .. })) => Ok(()), // will be resolved later
         (_, Value::Deferred(DeferredValue::FunctionCall { .. })) => Ok(()), // will be resolved later
         (_, Value::Deferred(DeferredValue::Interpolation(_))) => Ok(()), // will be resolved later
         (_, Value::Deferred(DeferredValue::Unknown(_))) => Ok(()), // resolved at upstream apply
-        (name, Value::Concrete(ConcreteValue::String(s) | ConcreteValue::EnumIdentifier(s))) => {
+        (_, Value::Concrete(ConcreteValue::String(s) | ConcreteValue::EnumIdentifier(s))) => {
             // Both `String` (quoted-literal source) and `EnumIdentifier`
             // (bare or namespaced identifier source) are accepted: this
             // lookup runs from `walk_custom_lookup`, which is reached
@@ -249,20 +254,22 @@ pub fn validate_custom_type(
             // quoted literals on namespaced Custom types happens in the
             // LSP / CLI surface code (carina#2986 Phase 4), not here —
             // this fallback validator just needs the textual payload.
-            // Check custom validators from config (schema-extracted)
-            if let Some(validator) = config.validators.get(name) {
+            // Check custom validators from config (schema-extracted),
+            // keyed by the full structured identity so two providers'
+            // same-named types do not collide.
+            if let Some(validator) = config.validators.get(identity) {
                 validator(s)?;
             }
             // Fall back to factory-based validator (e.g., WASM providers)
             if let Some(ref factory_validator) = config.custom_type_validator {
-                factory_validator(name, s)
+                factory_validator(identity, s)
             } else {
                 Ok(())
             }
         }
         (_, value) => Err(format!(
             "expected {}, got {}",
-            type_name,
+            identity,
             value_type_name(value)
         )),
     }
@@ -305,8 +312,11 @@ fn check_fn_arg_type(
             ) {
                 false
             } else {
-                // Validate the actual value against the custom type
-                if let Err(e) = validate_custom_type(name, value, ctx.config) {
+                // `Simple` annotations name a built-in DSL custom type
+                // (snake-cased, e.g. `ipv4_cidr`); project it onto a
+                // bare, provider-agnostic identity.
+                let identity = TypeIdentity::bare(snake_to_pascal(name));
+                if let Err(e) = validate_custom_type(&identity, value, ctx.config) {
                     return Err(ParseError::UserFunctionError(format!(
                         "function '{fn_name}': parameter '{param_name}' type '{name}' validation failed: {e}"
                     )));
@@ -337,7 +347,11 @@ fn check_fn_arg_type(
             true
         }
         // Schema types (awscc.ec2.VpcId, etc.) are string subtypes with provider validators
-        TypeExpr::SchemaType { type_name, .. } => {
+        TypeExpr::SchemaType {
+            provider,
+            path,
+            type_name,
+        } => {
             if !matches!(
                 value,
                 Value::Concrete(ConcreteValue::String(_))
@@ -346,9 +360,8 @@ fn check_fn_arg_type(
             ) {
                 false
             } else {
-                // Convert PascalCase type_name to snake_case for validator lookup
-                let validator_key = pascal_to_snake(type_name);
-                if let Err(e) = validate_custom_type(&validator_key, value, ctx.config) {
+                let identity = TypeIdentity::from_schema_type(provider, path, type_name);
+                if let Err(e) = validate_custom_type(&identity, value, ctx.config) {
                     return Err(ParseError::UserFunctionError(format!(
                         "function '{fn_name}': parameter '{param_name}' type '{type_expr}' validation failed: {e}"
                     )));
@@ -429,7 +442,8 @@ fn check_fn_return_type(
             ) {
                 false
             } else {
-                if let Err(e) = validate_custom_type(name, value, config) {
+                let identity = TypeIdentity::bare(snake_to_pascal(name));
+                if let Err(e) = validate_custom_type(&identity, value, config) {
                     return Err(ParseError::UserFunctionError(format!(
                         "function '{fn_name}': return type '{name}' validation failed: {e}"
                     )));
@@ -440,7 +454,11 @@ fn check_fn_return_type(
         // Resource type refs: not applicable for value functions
         TypeExpr::Ref(_) => true,
         // Schema types: validate returned value against the provider validator
-        TypeExpr::SchemaType { type_name, .. } => {
+        TypeExpr::SchemaType {
+            provider,
+            path,
+            type_name,
+        } => {
             if !matches!(
                 value,
                 Value::Concrete(ConcreteValue::String(_))
@@ -449,8 +467,8 @@ fn check_fn_return_type(
             ) {
                 false
             } else {
-                let validator_key = pascal_to_snake(type_name);
-                if let Err(e) = validate_custom_type(&validator_key, value, config) {
+                let identity = TypeIdentity::from_schema_type(provider, path, type_name);
+                if let Err(e) = validate_custom_type(&identity, value, config) {
                     return Err(ParseError::UserFunctionError(format!(
                         "function '{fn_name}': return type '{type_name}' validation failed: {e}"
                     )));

@@ -136,7 +136,7 @@ fn region_schemas() -> SchemaRegistry {
     }
 
     let region_custom = AttributeType::Custom {
-        semantic_name: Some("Region".to_string()),
+        identity: Some(carina_core::schema::TypeIdentity::bare("Region")),
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,

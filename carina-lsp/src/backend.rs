@@ -65,8 +65,14 @@ impl ProviderState {
             .iter()
             .flat_map(|f| f.config_completions().remove("region").unwrap_or_default())
             .collect();
-        // Extract custom type names from provider schemas for completion
-        let custom_type_names = provider_mod::collect_custom_type_names(&schemas);
+        // Extract custom type names from provider schemas for completion.
+        // The structured identities render to their dotted display form
+        // (`aws.iam.Role.Arn`, `Ipv4Cidr`), which is also the spelling a
+        // user writes in a type annotation.
+        let custom_type_names: Vec<String> = provider_mod::collect_custom_type_names(&schemas)
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
         let factories_arc = Arc::new(factories);
         Self {
             diagnostic_engine: DiagnosticEngine::new(

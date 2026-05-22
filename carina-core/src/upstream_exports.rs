@@ -731,7 +731,7 @@ fn check_resource_ref_at_position(
     // strict compat check above accepts `Simple(name) → String` /
     // `Union<plain Strings>` directly via subtyping (#2643), so this
     // fallback only handles the receivers it doesn't yet cover —
-    // `Custom { semantic_name: None }`-shaped wrappers and
+    // `Custom { identity: None }`-shaped wrappers and
     // `StringEnum` receivers — and the non-`Simple` string-shaped
     // values (e.g. `SchemaType` / scalar `String` literal) the
     // strict path also doesn't recognise. The reverse direction
@@ -2086,7 +2086,7 @@ mod tests {
         // Consumer attribute is `Custom { name: "KmsKeyArn", base: Arn }`;
         // export declares plain `TypeExpr::Simple("arn")`. The type checker
         // walks Custom's base chain, so `arn` accepts `KmsKeyArn`.
-        use crate::schema::{AttributeType, noop_validator};
+        use crate::schema::{AttributeType, TypeIdentity, noop_validator};
         let parsed = parse_project_with_provider(
             r#"
                 let orgs = upstream_state { source = "../organizations" }
@@ -2099,9 +2099,9 @@ mod tests {
         let exports =
             mk_typed_exports(&[("orgs", &[("key_arn", TypeExpr::Simple("arn".to_string()))])]);
         let kms_arn = AttributeType::Custom {
-            semantic_name: Some("KmsKeyArn".to_string()),
+            identity: Some(TypeIdentity::bare("KmsKeyArn")),
             base: Box::new(AttributeType::Custom {
-                semantic_name: Some("Arn".to_string()),
+                identity: Some(TypeIdentity::bare("Arn")),
                 base: Box::new(AttributeType::String),
                 pattern: None,
                 length: None,
@@ -2135,7 +2135,7 @@ mod tests {
         // narrowing the comparison fires `map(AwsAccountId)` against the
         // receiver and (when the receiver is anything but a compatible map)
         // false-flags the position. Issue #2447.
-        use crate::schema::{AttributeType, noop_validator};
+        use crate::schema::{AttributeType, TypeIdentity, noop_validator};
         let parsed = parse_project_with_provider(
             r#"
                 let orgs = upstream_state { source = "../organizations" }
@@ -2156,7 +2156,7 @@ mod tests {
         // compares against `String` and fails. With narrowing,
         // `AwsAccountId` (Custom over String) is accepted.
         let aws_account_id = AttributeType::Custom {
-            semantic_name: Some("AwsAccountId".to_string()),
+            identity: Some(TypeIdentity::bare("AwsAccountId")),
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,

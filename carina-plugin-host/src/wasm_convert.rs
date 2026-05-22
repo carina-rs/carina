@@ -555,6 +555,22 @@ pub fn wit_to_core_patch_op(op: &wit::PatchOp) -> CorePatchOp {
     }
 }
 
+/// Convert a host-side [`carina_core::schema::TypeIdentity`] to the
+/// WIT [`wit::TypeIdentity`] record.
+///
+/// The WIT record has no `option` provider field; an absent provider
+/// axis is encoded as an empty string (see the `type-identity` record
+/// doc in `provider.wit`).
+pub fn core_type_identity_to_wit(
+    identity: &carina_core::schema::TypeIdentity,
+) -> wit::TypeIdentity {
+    wit::TypeIdentity {
+        provider: identity.provider.clone().unwrap_or_default(),
+        segments: identity.segments.clone(),
+        kind: identity.kind.clone(),
+    }
+}
+
 /// Deserialize JSON to (name, display_name, version) tuple from ProviderInfo.
 pub fn json_to_provider_info(json: &str) -> (String, String, String) {
     if let Ok(info) = serde_json::from_str::<proto::ProviderInfo>(json) {
@@ -719,10 +735,10 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
             base,
             namespace,
         } => CoreAttributeType::Custom {
-            semantic_name: if name.is_empty() {
+            identity: if name.is_empty() {
                 None
             } else {
-                Some(name.clone())
+                Some(carina_core::schema::TypeIdentity::from_dotted(name))
             },
             base: Box::new(proto_attr_type_to_core(base)),
             pattern: None,

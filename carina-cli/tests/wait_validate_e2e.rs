@@ -40,7 +40,11 @@ impl ProviderFactory for WaitTestFactory {
     fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
         Ok(())
     }
-    fn validate_custom_type(&self, _type_name: &str, _value: &str) -> Result<(), String> {
+    fn validate_custom_type(
+        &self,
+        _type_name: &carina_core::schema::TypeIdentity,
+        _value: &str,
+    ) -> Result<(), String> {
         Ok(())
     }
     fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {

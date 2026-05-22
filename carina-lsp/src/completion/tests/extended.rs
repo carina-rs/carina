@@ -2673,7 +2673,7 @@ fn exports_map_value_offers_matching_resource_refs() {
         Ok(())
     }
     let account_id = AttributeType::Custom {
-        semantic_name: Some("AwsAccountId".to_string()),
+        identity: Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
@@ -2758,7 +2758,7 @@ fn exports_map_value_multiple_entries_returns_refs() {
         Ok(())
     }
     let account_id = AttributeType::Custom {
-        semantic_name: Some("AwsAccountId".to_string()),
+        identity: Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
@@ -2816,7 +2816,7 @@ fn exports_map_value_includes_bindings_from_sibling_files() {
         Ok(())
     }
     let account_id = AttributeType::Custom {
-        semantic_name: Some("AwsAccountId".to_string()),
+        identity: Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
@@ -2874,7 +2874,7 @@ fn custom_type_value_ref_includes_sibling_file_bindings() {
         Ok(())
     }
     let account_id = AttributeType::Custom {
-        semantic_name: Some("AwsAccountId".to_string()),
+        identity: Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
@@ -2975,7 +2975,7 @@ fn binding_dot_completion_resolves_sibling_file_binding() {
         Ok(())
     }
     let account_id = AttributeType::Custom {
-        semantic_name: Some("AwsAccountId".to_string()),
+        identity: Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
@@ -3211,7 +3211,7 @@ fn upstream_state_string_export_not_offered_to_specific_custom_receiver() {
         Ok(())
     }
     let vpc_id_type = AttributeType::Custom {
-        semantic_name: Some("VpcId".to_string()),
+        identity: Some(carina_core::schema::TypeIdentity::bare("VpcId")),
         pattern: None,
         length: None,
         base: Box::new(AttributeType::String),
@@ -4104,7 +4104,7 @@ awscc.ec2.SecurityGroup {
 #[test]
 fn value_position_filters_generic_string_arg_against_specific_custom_target() {
     // Motivating case from #2640's report: `vpc_id` is a
-    // `Custom { semantic_name: Some("VpcId"), base: String }`. A
+    // `Custom { identity: Some(carina_core::schema::TypeIdentity::bare("VpcId")), base: String }`. A
     // generic-`String` argument cannot satisfy that — the receiver
     // names a specific identity, and any `String` value would erase
     // that proof. Conversely, an argument typed `vpc_id` (Simple) is

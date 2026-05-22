@@ -139,7 +139,7 @@ pub(super) fn test_engine_with_custom_namespaced_attr() -> DiagnosticEngine {
     }
 
     let mode_custom = AttributeType::Custom {
-        semantic_name: Some("Mode".to_string()),
+        identity: Some(carina_core::schema::TypeIdentity::bare("Mode")),
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,

@@ -1510,7 +1510,12 @@ impl DiagnosticEngine {
                 if builtin.contains(&name.as_str()) {
                     return None;
                 }
-                if self.provider_context.validators.contains_key(name) {
+                // `Simple` annotations name a built-in custom type; key
+                // the validator lookup on the bare structured identity.
+                let identity = carina_core::schema::TypeIdentity::bare(
+                    carina_core::parser::snake_to_pascal(name),
+                );
+                if self.provider_context.validators.contains_key(&identity) {
                     return None;
                 }
                 Some(format!("Unknown type '{name}'."))

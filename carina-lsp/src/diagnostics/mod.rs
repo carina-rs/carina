@@ -78,12 +78,14 @@ impl DiagnosticEngine {
         let provider_context = carina_core::parser::ProviderContext {
             decryptor: None,
             validators: carina_core::provider::collect_custom_type_validators(&schemas),
-            custom_type_validator: Some(Box::new(move |type_name: &str, value: &str| {
-                for factory in factories_clone.iter() {
-                    factory.validate_custom_type(type_name, value)?;
-                }
-                Ok(())
-            })),
+            custom_type_validator: Some(Box::new(
+                move |identity: &carina_core::schema::TypeIdentity, value: &str| {
+                    for factory in factories_clone.iter() {
+                        factory.validate_custom_type(identity, value)?;
+                    }
+                    Ok(())
+                },
+            )),
             schema_types: Default::default(),
         };
         Self {
@@ -549,7 +551,7 @@ impl DiagnosticEngine {
                                 }
                                 (
                                     carina_core::schema::AttributeType::Custom {
-                                        semantic_name,
+                                        identity,
                                         validate,
                                         namespace,
                                         ..
@@ -566,13 +568,16 @@ impl DiagnosticEngine {
                                     ) {
                                         None
                                     } else {
-                                        let name = semantic_name.as_deref().unwrap_or("");
+                                        let kind = identity
+                                            .as_ref()
+                                            .map(|id| id.kind.as_str())
+                                            .unwrap_or("");
                                         // Handle bare/shorthand enum identifiers by expanding to full namespace format.
                                         // These are String values like "dedicated" or "InstanceTenancy.dedicated".
                                         let resolved_value =
                                             carina_core::utils::expand_enum_shorthand(
                                                 value,
-                                                name,
+                                                kind,
                                                 namespace.as_deref(),
                                             );
 
@@ -585,9 +590,9 @@ impl DiagnosticEngine {
                                         validate(&resolved_value)
                                         .err()
                                         .or_else(|| {
-                                            (!name.is_empty())
-                                                .then(|| lookup(name, &resolved_value).err())
-                                                .flatten()
+                                            identity
+                                                .as_ref()
+                                                .and_then(|id| lookup(id, &resolved_value).err())
                                         })
                                         .map(|inner_err| {
                                         // For namespaced Custom types (enum-like), mirror
@@ -606,7 +611,7 @@ impl DiagnosticEngine {
                                             };
                                             format!(
                                                 "'{}' ({}) expects an enum identifier, got a string literal \"{}\". {}",
-                                                attr_name, name, typed, inner_msg
+                                                attr_name, kind, typed, inner_msg
                                             )
                                         } else {
                                             inner_msg

@@ -991,7 +991,9 @@ fn type_expr_to_attribute_type(
         parser::TypeExpr::Float => Some(AttributeType::Float),
         parser::TypeExpr::Duration => Some(AttributeType::Duration),
         parser::TypeExpr::Simple(name) => Some(AttributeType::Custom {
-            semantic_name: Some(parser::snake_to_pascal(name)),
+            identity: Some(carina_core::schema::TypeIdentity::bare(
+                parser::snake_to_pascal(name),
+            )),
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,

@@ -133,12 +133,14 @@ fn enrich_provider_context(
     ProviderContext {
         decryptor: None,
         validators: carina_core::provider::collect_custom_type_validators(schemas),
-        custom_type_validator: Some(Box::new(move |type_name: &str, value: &str| {
-            for factory in factories.iter() {
-                factory.validate_custom_type(type_name, value)?;
-            }
-            Ok(())
-        })),
+        custom_type_validator: Some(Box::new(
+            move |identity: &carina_core::schema::TypeIdentity, value: &str| {
+                for factory in factories.iter() {
+                    factory.validate_custom_type(identity, value)?;
+                }
+                Ok(())
+            },
+        )),
         schema_types: Default::default(),
     }
 }

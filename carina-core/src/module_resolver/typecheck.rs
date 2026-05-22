@@ -166,10 +166,14 @@ pub(super) fn check_type_match(
                     | Value::Deferred(DeferredValue::ResourceRef { .. })
             ) {
                 TypeCheckResult::Mismatch
-            } else if let Err(e) = validate_custom_type(name, value, config) {
-                TypeCheckResult::ValidationError(e)
             } else {
-                TypeCheckResult::Ok
+                let identity =
+                    crate::schema::TypeIdentity::bare(crate::parser::snake_to_pascal(name));
+                if let Err(e) = validate_custom_type(&identity, value, config) {
+                    TypeCheckResult::ValidationError(e)
+                } else {
+                    TypeCheckResult::Ok
+                }
             }
         }
         // Resource type refs and schema types: accept strings (validated elsewhere)

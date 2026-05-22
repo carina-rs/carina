@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::resource::{ConcreteValue, DeferredValue, Value};
-use crate::schema::noop_validator;
+use crate::schema::{TypeIdentity, noop_validator};
 use indexmap::IndexMap;
 
 #[test]
@@ -108,7 +108,7 @@ fn type_aware_union_numeric() {
 #[test]
 fn type_aware_custom_delegates_to_base() {
     let custom_type = AttributeType::Custom {
-        semantic_name: Some("Port".to_string()),
+        identity: Some(TypeIdentity::bare("Port")),
         base: Box::new(AttributeType::Float),
         pattern: None,
         length: None,
@@ -345,7 +345,7 @@ fn type_aware_struct_ignores_default_custom_type() {
             StructField::new(
                 "port",
                 AttributeType::Custom {
-                    semantic_name: Some("Port".to_string()),
+                    identity: Some(TypeIdentity::bare("Port")),
                     base: Box::new(AttributeType::Int),
                     pattern: None,
                     length: None,
@@ -1025,7 +1025,7 @@ fn union_string_or_list_through_custom_wrapper() {
     // the comparator delegates `Custom { base, .. }` to its `base`.
     let inner = string_or_list_of_strings_type();
     let custom = AttributeType::Custom {
-        semantic_name: Some("PolicyConditionValue".to_string()),
+        identity: Some(TypeIdentity::bare("PolicyConditionValue")),
         base: Box::new(inner),
         pattern: None,
         length: None,

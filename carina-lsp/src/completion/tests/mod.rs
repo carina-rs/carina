@@ -218,7 +218,7 @@ pub(super) fn test_provider_with_vpc_and_security_group() -> CompletionProvider 
         Ok(())
     }
     let vpc_id_custom = AttributeType::Custom {
-        semantic_name: Some("VpcId".to_string()),
+        identity: Some(carina_core::schema::TypeIdentity::bare("VpcId")),
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
@@ -247,7 +247,7 @@ pub(super) fn test_provider_with_custom_semantic_attr() -> CompletionProvider {
         Ok(())
     }
     let account_id = AttributeType::Custom {
-        semantic_name: Some("aws_account_id".to_string()),
+        identity: Some(carina_core::schema::TypeIdentity::bare("aws_account_id")),
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,

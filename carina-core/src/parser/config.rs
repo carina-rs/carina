@@ -5,6 +5,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::schema::TypeIdentity;
+
 /// Signature for a custom type validator function.
 ///
 /// Takes a string value and returns `Ok(())` if valid, or `Err(message)` if invalid.
@@ -12,9 +14,12 @@ pub type ValidatorFn = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
 /// Signature for a factory-based custom type validator.
 ///
-/// Takes `(type_name, value)` and returns `Ok(())` if valid or unknown,
-/// or `Err(message)` if invalid.
-pub type CustomTypeValidatorFn = Box<dyn Fn(&str, &str) -> Result<(), String> + Send + Sync>;
+/// Takes `(identity, value)` and returns `Ok(())` if valid or unknown,
+/// or `Err(message)` if invalid. The identity is structured so the
+/// factory (e.g. a WASM provider) resolves the exact provider-scoped
+/// type instead of splitting a flat name string.
+pub type CustomTypeValidatorFn =
+    Box<dyn Fn(&TypeIdentity, &str) -> Result<(), String> + Send + Sync>;
 
 /// Signature for a decryptor function.
 ///
@@ -30,8 +35,10 @@ pub type DecryptorFn = Box<dyn Fn(&str, Option<&str>) -> Result<String, String> 
 pub struct ProviderContext {
     /// Optional decryptor for the `decrypt()` built-in function.
     pub decryptor: Option<DecryptorFn>,
-    /// Custom type validators keyed by type name (e.g., "arn", "availability_zone").
-    pub validators: HashMap<String, ValidatorFn>,
+    /// Custom type validators keyed by structured [`TypeIdentity`], so
+    /// two providers' same-named custom types resolve to distinct
+    /// validators instead of colliding first-wins.
+    pub validators: HashMap<TypeIdentity, ValidatorFn>,
     /// Factory-based custom type validator that calls through to provider factories
     /// (e.g., WASM plugins) for types not covered by `validators`.
     pub custom_type_validator: Option<CustomTypeValidatorFn>,

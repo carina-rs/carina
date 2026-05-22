@@ -13,6 +13,9 @@ use crate::resource::{ConcreteValue, ConcreteValueRef, DeferredValue, ManagedRes
 use crate::utils::{extract_enum_value_with_values, validate_enum_namespace};
 use crate::value::format_value_with_key;
 
+mod type_identity;
+pub use type_identity::TypeIdentity;
+
 /// Type alias for resource validator functions
 pub type ResourceValidator = fn(&HashMap<String, Value>) -> Result<(), Vec<TypeError>>;
 
@@ -52,17 +55,17 @@ pub fn noop_validator() -> CustomValidator {
     validator(|_| Ok(()))
 }
 
-/// External validator looked up by `AttributeType::Custom.semantic_name`
+/// External validator looked up by `AttributeType::Custom.identity`
 /// at validation time. Used to bridge to provider-supplied validators
 /// (the `ProviderContext.validators` map and WASM factory's
 /// `validate_custom_type`) that the schema itself cannot carry across
 /// the WASM boundary — see #2354.
 ///
-/// Implementors normalize the type name as needed (typically PascalCase
-/// → snake_case via `parser::pascal_to_snake`) before looking up the
-/// real validator.
+/// The lookup is keyed on a structured [`TypeIdentity`], not a flat
+/// type-name string, so two providers' same-named custom types resolve
+/// to distinct validators instead of colliding first-wins.
 pub type CustomTypeLookup<'a> =
-    &'a (dyn Fn(&str, &Value) -> Result<(), TypeError> + Send + Sync + 'a);
+    &'a (dyn Fn(&TypeIdentity, &Value) -> Result<(), TypeError> + Send + Sync + 'a);
 
 /// A [`CustomTypeLookup`] that approves every value. Pass to
 /// `validate_with_origins_and_lookup` from contexts that have no
@@ -154,9 +157,9 @@ fn walk_custom_lookup(
         return;
     }
     match attr_type {
-        AttributeType::Custom { semantic_name, .. } => {
-            if let Some(name) = semantic_name
-                && let Err(e) = lookup(name, value)
+        AttributeType::Custom { identity, .. } => {
+            if let Some(id) = identity
+                && let Err(e) = lookup(id, value)
             {
                 // Re-wrap as `ResourceValidationFailed` so the attribute
                 // slot survives. `with_attribute` only enriches the two
@@ -411,10 +414,16 @@ pub enum AttributeType {
     },
     /// Custom type (with validation function)
     Custom {
-        /// Some(name) when this type carries a semantic identity (e.g. "VpcId",
-        /// "AwsAccountId"). None when this is a generic string/int pattern type
-        /// synthesized by codegen for a property without a named semantic.
-        semantic_name: Option<String>,
+        /// `Some(identity)` when this type carries a structured type
+        /// identity (e.g. `aws.iam.Role.Arn`, `aws.VpcId`). `None` when
+        /// this is a generic string/int pattern type synthesized by
+        /// codegen for a property without a named semantic.
+        ///
+        /// Replaces the former flat `semantic_name: Option<String>`:
+        /// keying identity on discrete `provider + segments + kind`
+        /// axes keeps two providers' same-named types distinct. See
+        /// [`TypeIdentity`].
+        identity: Option<TypeIdentity>,
         base: Box<AttributeType>,
         /// Optional regex pattern constraint (for structural comparison).
         pattern: Option<String>,
@@ -478,7 +487,7 @@ impl fmt::Debug for AttributeType {
                 .field("dsl_aliases", dsl_aliases)
                 .finish(),
             AttributeType::Custom {
-                semantic_name,
+                identity,
                 base,
                 pattern,
                 length,
@@ -487,7 +496,7 @@ impl fmt::Debug for AttributeType {
                 validate: _,
             } => f
                 .debug_struct("Custom")
-                .field("semantic_name", semantic_name)
+                .field("identity", identity)
                 .field("base", base)
                 .field("pattern", pattern)
                 .field("length", length)
@@ -664,11 +673,11 @@ impl AttributeType {
                 ..
             } => Some((name, namespace, DslMap::Aliases(dsl_aliases))),
             AttributeType::Custom {
-                semantic_name: Some(name),
+                identity: Some(id),
                 namespace: Some(namespace),
                 to_dsl,
                 ..
-            } => Some((name, namespace, DslMap::Closure(*to_dsl))),
+            } => Some((&id.kind, namespace, DslMap::Closure(*to_dsl))),
             _ => None,
         }
     }
@@ -1094,7 +1103,7 @@ impl AttributeType {
     fn validate_custom(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
         let AttributeType::Custom {
             validate,
-            semantic_name,
+            identity,
             namespace,
             ..
         } = self
@@ -1102,7 +1111,7 @@ impl AttributeType {
             unreachable!("validate_custom called on non-Custom");
         };
 
-        let name_for_resolve = semantic_name.as_deref().unwrap_or("");
+        let name_for_resolve = identity.as_ref().map(|id| id.kind.as_str()).unwrap_or("");
         let resolved_value =
             Self::resolve_enum_input(name_for_resolve, namespace.as_deref(), value);
         validate(&resolved_value)
@@ -1312,15 +1321,11 @@ impl AttributeType {
             AttributeType::Duration => "Duration".to_string(),
             AttributeType::StringEnum { name, .. } => name.clone(),
             AttributeType::Custom {
-                semantic_name,
+                identity,
                 pattern,
                 length,
                 ..
-            } => custom_display_name(
-                semantic_name.as_deref(),
-                pattern.as_deref(),
-                length.as_ref(),
-            ),
+            } => custom_display_name(identity.as_ref(), pattern.as_deref(), length.as_ref()),
             AttributeType::List { inner, .. } => format!("List<{}>", inner.type_name()),
             AttributeType::Map { value: inner, .. } => format!("Map<{}>", inner.type_name()),
             AttributeType::Struct { name, .. } => format!("Struct({})", name),
@@ -1355,12 +1360,16 @@ impl AttributeType {
     /// Rules (first match wins):
     /// 1. Union sink: OK if source is assignable to any member.
     /// 2. Union source: OK iff source is assignable to sink for every member.
-    /// 3. Custom→Custom with both `semantic_name: Some` and names differ: NG.
+    /// 3. Custom→Custom with both `identity: Some` that are not the
+    ///    [`TypeIdentity::same_type`]: NG. Per-axis identity equality —
+    ///    an empty axis on either side is the wider type, so the
+    ///    generic `aws.Arn` stays assignable against `aws.iam.Role.Arn`
+    ///    while `aws.Region` and `gcp.Region` are rejected.
     /// 4. Custom→Custom: check pattern (pat-1 literal equality) and length
     ///    containment (source ⊆ sink), then recurse on base.
     /// 5. Custom source → non-Custom sink: recurse on `source.base`.
     /// 6. non-Custom source → Custom sink: NG (source has no proof of
-    ///    satisfying the sink's semantic/pattern/length).
+    ///    satisfying the sink's identity/pattern/length).
     /// 7. Otherwise: same primitive type names.
     ///
     /// # Conservative pattern/length policy
@@ -1395,23 +1404,19 @@ impl AttributeType {
         match (self, sink) {
             (
                 Custom {
-                    semantic_name: Some(s_name),
+                    identity: Some(s_id),
                     ..
                 },
                 Custom {
-                    semantic_name: Some(k_name),
+                    identity: Some(k_id),
                     ..
                 },
-            ) if s_name != k_name => false,
-            // Anonymous source → semantic sink has no proof of identity.
+            ) if !s_id.same_type(k_id) => false,
+            // Anonymous source → identified sink has no proof of identity.
             (
+                Custom { identity: None, .. },
                 Custom {
-                    semantic_name: None,
-                    ..
-                },
-                Custom {
-                    semantic_name: Some(_),
-                    ..
+                    identity: Some(_), ..
                 },
             ) => false,
             (
@@ -1609,12 +1614,12 @@ impl fmt::Display for AttributeType {
 }
 
 fn custom_display_name(
-    semantic_name: Option<&str>,
+    identity: Option<&TypeIdentity>,
     pattern: Option<&str>,
     length: Option<&(Option<u64>, Option<u64>)>,
 ) -> String {
-    if let Some(n) = semantic_name {
-        return n.to_string();
+    if let Some(id) = identity {
+        return id.to_string();
     }
     let mut s = String::from("String");
     let has_pattern = pattern.is_some();
@@ -1689,7 +1694,7 @@ fn reshape_for_string_literal(
     // `extra_message` so its detail (which often lists valid forms)
     // stays visible without polluting the structured candidates list.
     if let AttributeType::Custom {
-        semantic_name: Some(name),
+        identity: Some(id),
         namespace: Some(_),
         ..
     } = attr_type
@@ -1699,7 +1704,7 @@ fn reshape_for_string_literal(
         return TypeError::StringLiteralExpectedEnum {
             user_typed: typed.clone(),
             attribute: Some(attr_name.to_string()),
-            type_name: name.clone(),
+            type_name: id.kind.clone(),
             expected: Vec::new(),
             extra_message: Some(message.clone()),
         };
@@ -2901,7 +2906,7 @@ pub mod types {
     /// Positive integer type
     pub fn positive_int() -> AttributeType {
         AttributeType::Custom {
-            semantic_name: Some("PositiveInt".to_string()),
+            identity: Some(TypeIdentity::bare("PositiveInt")),
             base: Box::new(AttributeType::Int),
             pattern: None,
             length: None,
@@ -2924,7 +2929,7 @@ pub mod types {
     /// IPv4 CIDR block type (e.g., "10.0.0.0/16")
     pub fn ipv4_cidr() -> AttributeType {
         AttributeType::Custom {
-            semantic_name: Some("Ipv4Cidr".to_string()),
+            identity: Some(TypeIdentity::bare("Ipv4Cidr")),
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,
@@ -2943,7 +2948,7 @@ pub mod types {
     /// IPv4 address type (e.g., "10.0.1.5", "192.168.0.1")
     pub fn ipv4_address() -> AttributeType {
         AttributeType::Custom {
-            semantic_name: Some("Ipv4Address".to_string()),
+            identity: Some(TypeIdentity::bare("Ipv4Address")),
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,
@@ -2962,7 +2967,7 @@ pub mod types {
     /// IPv6 address type (e.g., "2001:db8::1", "::1")
     pub fn ipv6_address() -> AttributeType {
         AttributeType::Custom {
-            semantic_name: Some("Ipv6Address".to_string()),
+            identity: Some(TypeIdentity::bare("Ipv6Address")),
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,
@@ -2981,7 +2986,7 @@ pub mod types {
     /// IPv6 CIDR block type (e.g., "2001:db8::/32", "::/0")
     pub fn ipv6_cidr() -> AttributeType {
         AttributeType::Custom {
-            semantic_name: Some("Ipv6Cidr".to_string()),
+            identity: Some(TypeIdentity::bare("Ipv6Cidr")),
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,
@@ -3009,7 +3014,7 @@ pub mod types {
     /// contains at least one dot with non-empty labels.
     pub fn email() -> AttributeType {
         AttributeType::Custom {
-            semantic_name: Some("Email".to_string()),
+            identity: Some(TypeIdentity::bare("Email")),
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,

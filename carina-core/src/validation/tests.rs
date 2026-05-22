@@ -1,7 +1,7 @@
 use super::*;
 use crate::parser::{ParsedFile, ProviderContext};
 use crate::resource::ManagedResource;
-use crate::schema::{ResourceSchema, SchemaRegistry, noop_validator};
+use crate::schema::{ResourceSchema, SchemaRegistry, TypeIdentity, noop_validator};
 
 fn empty_parsed() -> ParsedFile {
     ParsedFile {
@@ -30,9 +30,9 @@ fn empty_parsed() -> ParsedFile {
 fn context_with_iam_policy_arn_validator() -> ProviderContext {
     use crate::parser::ValidatorFn;
 
-    let mut validators: HashMap<String, ValidatorFn> = HashMap::new();
+    let mut validators: HashMap<TypeIdentity, ValidatorFn> = HashMap::new();
     validators.insert(
-        "iam_policy_arn".to_string(),
+        TypeIdentity::bare("IamPolicyArn"),
         Box::new(|s: &str| {
             if s.starts_with("arn:aws:iam::") {
                 Ok(())
@@ -1394,7 +1394,7 @@ fn is_type_expr_compatible_unknown_rejects_custom_receiver() {
         Ok(())
     }
     let custom = AttributeType::Custom {
-        semantic_name: Some("VpcId".to_string()),
+        identity: Some(TypeIdentity::bare("VpcId")),
         pattern: None,
         length: None,
         base: Box::new(AttributeType::String),
@@ -1415,7 +1415,7 @@ fn is_type_expr_compatible_string_rejects_custom_with_semantic_name() {
         Ok(())
     }
     let schema = AttributeType::Custom {
-        semantic_name: Some("VpcId".to_string()),
+        identity: Some(TypeIdentity::bare("VpcId")),
         pattern: None,
         length: None,
         base: Box::new(AttributeType::String),
@@ -1440,7 +1440,7 @@ fn is_type_expr_compatible_string_accepts_custom_without_semantic_name() {
         Ok(())
     }
     let schema = AttributeType::Custom {
-        semantic_name: None,
+        identity: None,
         pattern: Some("^.+$".to_string()),
         length: None,
         base: Box::new(AttributeType::String),
@@ -1467,7 +1467,7 @@ fn is_type_expr_compatible_string_rejects_union_containing_specific_custom() {
     let schema = AttributeType::Union(vec![
         AttributeType::String,
         AttributeType::Custom {
-            semantic_name: Some("VpcId".to_string()),
+            identity: Some(TypeIdentity::bare("VpcId")),
             pattern: None,
             length: None,
             base: Box::new(AttributeType::String),
@@ -1492,7 +1492,7 @@ fn is_type_expr_compatible_string_rejects_union_of_only_specific_customs() {
         Ok(())
     }
     let mk = |name: &str| AttributeType::Custom {
-        semantic_name: Some(name.to_string()),
+        identity: Some(TypeIdentity::bare(name)),
         pattern: None,
         length: None,
         base: Box::new(AttributeType::String),
@@ -1537,7 +1537,7 @@ fn is_type_expr_compatible_simple_vpcid_accepts_custom_vpcid() {
         Ok(())
     }
     let schema = AttributeType::Custom {
-        semantic_name: Some("VpcId".to_string()),
+        identity: Some(TypeIdentity::bare("VpcId")),
         pattern: None,
         length: None,
         base: Box::new(AttributeType::String),
@@ -1611,7 +1611,7 @@ fn attribute_param_ref_type_mismatch_detected() {
     role_schema = role_schema.attribute(AttributeSchema::new(
         "arn",
         AttributeType::Custom {
-            semantic_name: Some("IamRoleArn".to_string()),
+            identity: Some(TypeIdentity::bare("IamRoleArn")),
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,
@@ -1763,9 +1763,9 @@ fn validate_export_params_rejects_type_mismatch() {
 fn type_compat_subtype_accepted() {
     // arn accepts KmsKeyArn (subtype via base chain: KmsKeyArn → Arn)
     let kms_key_arn = AttributeType::Custom {
-        semantic_name: Some("KmsKeyArn".to_string()),
+        identity: Some(TypeIdentity::bare("KmsKeyArn")),
         base: Box::new(AttributeType::Custom {
-            semantic_name: Some("Arn".to_string()),
+            identity: Some(TypeIdentity::bare("Arn")),
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,
@@ -1789,9 +1789,9 @@ fn type_compat_subtype_accepted() {
 fn type_compat_sibling_rejected() {
     // kms_key_arn rejects IamRoleArn (sibling: IamRoleArn → Arn, not KmsKeyArn)
     let iam_role_arn = AttributeType::Custom {
-        semantic_name: Some("IamRoleArn".to_string()),
+        identity: Some(TypeIdentity::bare("IamRoleArn")),
         base: Box::new(AttributeType::Custom {
-            semantic_name: Some("Arn".to_string()),
+            identity: Some(TypeIdentity::bare("Arn")),
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,
@@ -1815,9 +1815,9 @@ fn type_compat_sibling_rejected() {
 fn type_compat_resource_id_subtype() {
     // aws_resource_id accepts VpcId (subtype)
     let vpc_id = AttributeType::Custom {
-        semantic_name: Some("VpcId".to_string()),
+        identity: Some(TypeIdentity::bare("VpcId")),
         base: Box::new(AttributeType::Custom {
-            semantic_name: Some("AwsResourceId".to_string()),
+            identity: Some(TypeIdentity::bare("AwsResourceId")),
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,
@@ -1841,9 +1841,9 @@ fn type_compat_resource_id_subtype() {
 fn type_compat_resource_id_siblings_rejected() {
     // vpc_id rejects SubnetId (sibling)
     let subnet_id = AttributeType::Custom {
-        semantic_name: Some("SubnetId".to_string()),
+        identity: Some(TypeIdentity::bare("SubnetId")),
         base: Box::new(AttributeType::Custom {
-            semantic_name: Some("AwsResourceId".to_string()),
+            identity: Some(TypeIdentity::bare("AwsResourceId")),
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,
@@ -1866,7 +1866,7 @@ fn type_compat_resource_id_siblings_rejected() {
 #[test]
 fn type_compat_exact_match() {
     let arn = AttributeType::Custom {
-        semantic_name: Some("Arn".to_string()),
+        identity: Some(TypeIdentity::bare("Arn")),
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
@@ -2000,7 +2000,7 @@ fn type_compat_simple_rejected_when_union_has_no_plain_string() {
 #[test]
 fn type_compat_simple_rejected_when_union_has_string_shaped_peer() {
     let arn = AttributeType::Custom {
-        semantic_name: Some("Arn".to_string()),
+        identity: Some(TypeIdentity::bare("Arn")),
         base: Box::new(AttributeType::String),
         pattern: None,
         length: None,
