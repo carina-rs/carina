@@ -341,7 +341,7 @@ pub fn wit_to_core_state(state: &wit::State, id: &CoreResourceId) -> CoreState {
     core_state
 }
 
-// -- ManagedResource --
+// -- Resource --
 
 pub fn core_to_wit_resource(
     resource: &CoreResource,
@@ -1131,7 +1131,7 @@ mod tests {
         assert_eq!(map, back);
     }
 
-    // -- ManagedResource roundtrip --
+    // -- Resource roundtrip --
 
     #[test]
     fn test_resource_roundtrip() {
@@ -1211,7 +1211,7 @@ mod tests {
 
     #[test]
     fn test_provider_error_detail_fields_round_trip() {
-        // ManagedResource id, cause string, and provider name must all
+        // Resource id, cause string, and provider name must all
         // survive a host -> WIT -> host round trip. cause is
         // flattened to a string at the boundary because WIT cannot
         // carry `dyn std::error::Error`.

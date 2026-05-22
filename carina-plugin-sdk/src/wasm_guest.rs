@@ -219,15 +219,15 @@ macro_rules! export_provider {
                 }
             }
 
-            fn wit_to_proto_resource(res: &wit_types::ResourceDef) -> proto::ManagedResource {
-                proto::ManagedResource {
+            fn wit_to_proto_resource(res: &wit_types::ResourceDef) -> proto::Resource {
+                proto::Resource {
                     id: wit_to_proto_resource_id(&res.id),
                     attributes: wit_to_proto_value_map(&res.attributes),
                     directives: proto::Directives::default(),
                 }
             }
 
-            fn proto_to_wit_resource(res: &proto::ManagedResource) -> wit_types::ResourceDef {
+            fn proto_to_wit_resource(res: &proto::Resource) -> wit_types::ResourceDef {
                 wit_types::ResourceDef {
                     id: proto_to_wit_resource_id(&res.id),
                     attributes: proto_to_wit_value_map(&res.attributes),
@@ -690,15 +690,15 @@ macro_rules! export_provider {
                 }
             }
 
-            fn wit_to_proto_resource(res: &wit_types::ResourceDef) -> proto::ManagedResource {
-                proto::ManagedResource {
+            fn wit_to_proto_resource(res: &wit_types::ResourceDef) -> proto::Resource {
+                proto::Resource {
                     id: wit_to_proto_resource_id(&res.id),
                     attributes: wit_to_proto_value_map(&res.attributes),
                     directives: proto::Directives::default(),
                 }
             }
 
-            fn proto_to_wit_resource(res: &proto::ManagedResource) -> wit_types::ResourceDef {
+            fn proto_to_wit_resource(res: &proto::Resource) -> wit_types::ResourceDef {
                 wit_types::ResourceDef {
                     id: proto_to_wit_resource_id(&res.id),
                     attributes: proto_to_wit_value_map(&res.attributes),
