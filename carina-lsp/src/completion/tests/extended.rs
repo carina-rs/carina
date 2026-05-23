@@ -2,12 +2,31 @@ use super::*;
 use tower_lsp::lsp_types::{InsertTextFormat, TextEdit};
 
 #[test]
-#[ignore = "requires provider schemas"]
 fn availability_zone_completions_use_dynamic_prefix() {
-    let provider = test_provider();
+    use carina_core::schema::TypeIdentity;
 
-    // availability_zone_completions should use the namespace and type_name to build the prefix
-    let completions = provider.availability_zone_completions("awscc", "AvailabilityZone");
+    // Self-contained: hand-built region data lets this test exercise the
+    // emitter without depending on a real provider factory's
+    // `region_completions_data`. The prior #[ignore] guard skipped the
+    // test in CI; the migration to the structured `TypeIdentity` makes
+    // it easy enough to wire region data inline.
+    let region_completions: Vec<CompletionValue> = vec![CompletionValue {
+        value: "awscc.Region.ap_northeast_1".to_string(),
+        description: "Asia Pacific (Tokyo)".to_string(),
+    }];
+    let provider = CompletionProvider::new(
+        Arc::new(SchemaRegistry::new()),
+        vec!["awscc".to_string()],
+        region_completions,
+        vec![],
+    );
+
+    // S2.5a/b: AZ identity is `{provider}.AvailabilityZone.ZoneName`,
+    // with `"AvailabilityZone"` living in `segments` and `"ZoneName"` /
+    // `"ZoneId"` as the kind. Labels follow the unified value form
+    // `{provider}.{segments...}.{kind}.{value}`.
+    let identity = TypeIdentity::new(Some("awscc"), ["AvailabilityZone"], "ZoneName");
+    let completions = provider.availability_zone_completions(&identity);
 
     // Should have completions
     assert!(
@@ -15,25 +34,32 @@ fn availability_zone_completions_use_dynamic_prefix() {
         "Should generate AZ completions from region data"
     );
 
-    // All completions should use the dynamic prefix
+    // All completions should use the dynamic prefix derived from the
+    // structured identity — never the legacy 3-part form.
     for item in &completions {
         assert!(
-            item.label.starts_with("awscc.AvailabilityZone."),
-            "Label should start with 'awscc.AvailabilityZone.', got: {}",
+            item.label.starts_with("awscc.AvailabilityZone.ZoneName."),
+            "Label should start with 'awscc.AvailabilityZone.ZoneName.', got: {}",
+            item.label
+        );
+        // Guard against the legacy 3-part form leaking back.
+        assert!(
+            !item.label.starts_with("awscc.AvailabilityZone.ap_"),
+            "Label must not use the legacy `{{provider}}.AvailabilityZone.{{value}}` form, got: {}",
             item.label
         );
     }
 
-    // Should include specific regions from the factory data
+    // Should include specific regions from the inline region data
     let has_tokyo = completions
         .iter()
-        .any(|c| c.label == "awscc.AvailabilityZone.ap_northeast_1a");
+        .any(|c| c.label == "awscc.AvailabilityZone.ZoneName.ap_northeast_1a");
     assert!(has_tokyo, "Should include Tokyo region AZs");
 
     // Detail should include region display name
     let tokyo_a = completions
         .iter()
-        .find(|c| c.label == "awscc.AvailabilityZone.ap_northeast_1a")
+        .find(|c| c.label == "awscc.AvailabilityZone.ZoneName.ap_northeast_1a")
         .unwrap();
     assert_eq!(
         tokyo_a.detail.as_deref(),

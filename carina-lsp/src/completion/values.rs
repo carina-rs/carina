@@ -8,7 +8,7 @@ use tower_lsp::lsp_types::{
 
 use carina_core::builtins;
 use carina_core::parser::snake_to_pascal;
-use carina_core::schema::{AttributeType, legacy_validator};
+use carina_core::schema::{AttributeType, TypeIdentity, legacy_validator};
 
 use super::{CompletionProvider, DslSource};
 
@@ -622,12 +622,18 @@ impl CompletionProvider {
             AttributeType::Custom {
                 identity: Some(id), ..
             } if id.kind == "Arn" => self.arn_completions(),
+            // AvailabilityZone is split into two distinct types post-S2.5:
+            // `aws.AvailabilityZone.ZoneName` and `aws.AvailabilityZone.ZoneId`.
+            // The `kind` axis is `"ZoneName"` / `"ZoneId"`; `"AvailabilityZone"`
+            // lives in `segments`. We surface AZ-letter completions only for
+            // zone-name typed sinks — zone-id values look like `usw2-az1` and
+            // are not derivable from region code + letter.
             AttributeType::Custom {
-                identity: Some(id),
-                namespace,
-                ..
-            } if id.kind == "AvailabilityZone" => {
-                self.availability_zone_completions(namespace.as_deref().unwrap_or(""), &id.kind)
+                identity: Some(id), ..
+            } if id.kind == "ZoneName"
+                && id.segments.first().map(String::as_str) == Some("AvailabilityZone") =>
+            {
+                self.availability_zone_completions(id)
             }
             // List(non-Struct): delegate to inner type completions
             AttributeType::List { inner, .. } => self.completions_for_type(inner, resource_type),
@@ -1647,19 +1653,27 @@ impl CompletionProvider {
         basic.chain(generic).chain(custom).chain(resource).collect()
     }
 
+    /// Emit completion items for an availability-zone typed sink, in the
+    /// unified value form `{provider}.{segments...}.{kind}.{az}` derived
+    /// straight from the [`TypeIdentity`] (S2.5a/b convention — see
+    /// `notes/specs/2026-05-16-semantic-name-redesign-design.md`).
+    ///
+    /// For `aws.AvailabilityZone.ZoneName` (identity: provider=`aws`,
+    /// segments=`["AvailabilityZone"]`, kind=`"ZoneName"`) the emitted
+    /// labels look like `aws.AvailabilityZone.ZoneName.us_east_1a`.
     pub(super) fn availability_zone_completions(
         &self,
-        namespace: &str,
-        type_name: &str,
+        identity: &TypeIdentity,
     ) -> Vec<CompletionItem> {
-        let prefix = if namespace.is_empty() {
-            type_name.to_string()
-        } else {
-            format!("{}.{}", namespace, type_name)
+        // Region prefix is derived from the same provider axis as the
+        // sink identity, so the AZ candidates align with the regions the
+        // provider actually exposes. A bare (provider: None) AZ identity
+        // — should one ever appear — falls back to the unqualified
+        // `Region.` prefix.
+        let region_prefix = match identity.provider.as_deref() {
+            Some(p) => format!("{}.Region.", p),
+            None => "Region.".to_string(),
         };
-
-        // Build region display names from region_completions_data, filtered by namespace
-        let region_prefix = format!("{}.Region.", namespace);
         let region_names: std::collections::HashMap<String, String> = self
             .region_completions_data
             .iter()
@@ -1687,7 +1701,10 @@ impl CompletionProvider {
         for (region_code, region_name) in &region_names {
             for &zone_letter in &zone_letters {
                 let az = format!("{}{}", region_code, zone_letter);
-                let label = format!("{}.{}", prefix, az);
+                // Identity's Display impl renders the dotted type form
+                // (`aws.AvailabilityZone.ZoneName`); the value form
+                // simply appends the bare value as the trailing segment.
+                let label = format!("{}.{}", identity, az);
                 let detail = format!("{} Zone {}", region_name, zone_letter);
                 completions.push(CompletionItem {
                     label: label.clone(),
@@ -1714,10 +1731,18 @@ impl CompletionProvider {
         match namespace {
             Some(ns) => {
                 // Offer the fully-qualified form
-                // `<namespace>.<TypeName>.<Variant>`. The bare tail alone
-                // used to leak into sibling-attribute popups via the
-                // generic identifier pool; the qualified form is always
-                // valid and unambiguous.
+                // `<namespace>.<TypeName>.<Variant>`. With `namespace`
+                // carrying the dotted `{provider}.{segments...}` prefix
+                // (e.g. `"aws.s3.Bucket"`) and `type_name` the enum's
+                // kind (e.g. `"VersioningStatus"`), this composes the
+                // unified `{provider}.{segments...}.{kind}.{value}`
+                // value form established by S2.5a/b. Cases with no
+                // segments (e.g. `aws.Region`) render as
+                // `aws.Region.<v>` — still the new form, since `segments`
+                // is allowed to be empty. The bare tail alone used to
+                // leak into sibling-attribute popups via the generic
+                // identifier pool; the qualified form is always valid
+                // and unambiguous.
                 values
                     .iter()
                     .map(|value| {
