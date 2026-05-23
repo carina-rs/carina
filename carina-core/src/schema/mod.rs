@@ -1377,11 +1377,16 @@ impl AttributeType {
     /// Rules (first match wins):
     /// 1. Union sink: OK if source is assignable to any member.
     /// 2. Union source: OK iff source is assignable to sink for every member.
-    /// 3. Custom→Custom with both `identity: Some` that are not the
-    ///    [`TypeIdentity::same_type`]: NG. Per-axis identity equality —
-    ///    an empty axis on either side is the wider type, so the
-    ///    generic `aws.Arn` stays assignable against `aws.iam.Role.Arn`
-    ///    while `aws.Region` and `gcp.Region` are rejected.
+    /// 3. Custom→Custom with both `identity: Some` where the source's
+    ///    identity is not [`TypeIdentity::assignable_to`] the sink's:
+    ///    NG. Directional per-axis subsumption — an empty axis on the
+    ///    **sink** widens (any source matches), but an empty axis on
+    ///    the **source** against a populated sink is rejected (no
+    ///    evidence). So `aws.iam.Role.Arn` flows into `aws.Arn` (sink
+    ///    is wider) but `aws.Arn` does not flow into `aws.iam.Role.Arn`
+    ///    (source has no Role-specific evidence). `aws.Region` and
+    ///    `gcp.Region` are rejected both ways (populated providers
+    ///    differ). Closes carina#3218.
     /// 4. Custom→Custom: check pattern (pat-1 literal equality) and length
     ///    containment (source ⊆ sink), then recurse on base.
     /// 5. Custom source → non-Custom sink: recurse on `source.base`.
@@ -1428,7 +1433,7 @@ impl AttributeType {
                     identity: Some(k_id),
                     ..
                 },
-            ) if !s_id.same_type(k_id) => false,
+            ) if !s_id.assignable_to(k_id) => false,
             // Anonymous source → identified sink has no proof of identity.
             (
                 Custom { identity: None, .. },
