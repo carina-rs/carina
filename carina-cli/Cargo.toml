@@ -60,3 +60,9 @@ portable-pty = "0.8"
 regex-lite = "0.1"
 tempfile = "3"
 tower-lsp = "0.20"
+# In-process AWS service emulator: the KMS decryptor's integration test
+# injects a winterbaume-backed KMS client and exercises the real
+# base64 → KMS:Decrypt → UTF-8 path with no real AWS and no external
+# process (#3227, follow-up to #3206).
+winterbaume-core = "0.2"
+winterbaume-kms = "0.2"

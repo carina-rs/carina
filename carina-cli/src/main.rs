@@ -4,7 +4,6 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{CompleteEnv, Shell, generate};
 use colored::Colorize;
 
-use base64::Engine;
 use carina_cli::DetailLevel;
 use carina_cli::commands;
 use carina_cli::commands::apply::{run_apply, run_apply_from_plan};
@@ -250,8 +249,14 @@ enum SkillsCommands {
 /// Create the parser configuration with AWS KMS decryptor.
 ///
 /// Uses the tokio runtime to call KMS synchronously from within the parse-time
-/// builtin evaluation. AWS credentials are loaded from the default chain
-/// (environment variables, profiles, instance metadata, etc.).
+/// builtin evaluation. AWS credentials are loaded lazily on the first
+/// `decrypt()` call from the default chain (environment variables, profiles,
+/// instance metadata, etc.) and cached in a process-wide `OnceCell` so the
+/// SDK is never initialised for commands that do not use `decrypt()`.
+///
+/// The per-call body (base64 → `KMS:Decrypt` → UTF-8) lives in
+/// [`carina_cli::kms::decrypt_one`] so an integration test can drive it
+/// with a mock client (#3227).
 fn create_provider_context() -> carina_core::parser::ProviderContext {
     static KMS_CLIENT: tokio::sync::OnceCell<aws_sdk_kms::Client> =
         tokio::sync::OnceCell::const_new();
@@ -260,7 +265,6 @@ fn create_provider_context() -> carina_core::parser::ProviderContext {
         decryptor: Some(Box::new(|ciphertext, key| {
             let ciphertext = ciphertext.to_string();
             let key = key.map(|k| k.to_string());
-
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
                     let client = KMS_CLIENT
@@ -271,29 +275,7 @@ fn create_provider_context() -> carina_core::parser::ProviderContext {
                             aws_sdk_kms::Client::new(&config)
                         })
                         .await;
-
-                    let blob = base64::engine::general_purpose::STANDARD
-                        .decode(&ciphertext)
-                        .map_err(|e| format!("decrypt(): invalid base64 ciphertext: {e}"))?;
-
-                    let mut req = client
-                        .decrypt()
-                        .ciphertext_blob(aws_sdk_kms::primitives::Blob::new(blob));
-                    if let Some(k) = key {
-                        req = req.key_id(k);
-                    }
-
-                    let resp = req
-                        .send()
-                        .await
-                        .map_err(|e| format!("decrypt(): KMS decrypt failed: {e}"))?;
-
-                    let plaintext = resp.plaintext().ok_or_else(|| {
-                        "decrypt(): KMS response contained no plaintext".to_string()
-                    })?;
-
-                    String::from_utf8(plaintext.as_ref().to_vec())
-                        .map_err(|e| format!("decrypt(): decrypted value is not valid UTF-8: {e}"))
+                    carina_cli::kms::decrypt_one(client, &ciphertext, key.as_deref()).await
                 })
             })
         })),

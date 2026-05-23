@@ -3,6 +3,7 @@ pub mod cursor;
 pub mod display;
 pub mod error;
 pub mod fixture_plan;
+pub mod kms;
 pub mod signal;
 pub mod wiring;
 
