@@ -1776,6 +1776,7 @@ fn distinct_semantic_customs_are_rejected() {
                 pattern: None,
                 length: None,
                 validate: legacy_validator(validate_account_id),
+                to_dsl: None,
             },
         ));
 
@@ -1792,6 +1793,7 @@ fn distinct_semantic_customs_are_rejected() {
             pattern: None,
             length: None,
             validate: legacy_validator(validate_target_id),
+            to_dsl: None,
         },
     ));
 
@@ -1844,6 +1846,7 @@ fn exports_cross_file_ref_no_false_positive() {
             )),
             _ => Err("expected string".to_string()),
         }),
+        to_dsl: None,
     };
     let schema = ResourceSchema::new("organizations.account")
         .attribute(AttributeSchema::new("account_id", aws_account_id_type));

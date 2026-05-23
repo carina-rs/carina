@@ -759,6 +759,7 @@ mod tests {
             length: None,
             base: Box::new(AttributeType::String),
             validate: legacy_validator(noop),
+            to_dsl: None,
         }
     }
 

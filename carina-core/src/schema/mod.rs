@@ -469,6 +469,18 @@ pub enum AttributeType {
         /// Optional length bounds (min, max).
         length: Option<(Option<u64>, Option<u64>)>,
         validate: CustomValidator,
+        /// Optional value-level normalization callback applied when
+        /// the provider reads a state value back from the SDK. For
+        /// example, `route53.hosted_zone.name` arrives with a trailing
+        /// `.` that the DSL form does not carry — the closure strips
+        /// it so the differ does not report a phantom diff.
+        ///
+        /// Distinct from [`AttributeType::CustomEnum`]'s `to_dsl`,
+        /// which expands the *DSL spelling* of enum variants. Here
+        /// the closure is a generic state→DSL normalizer.
+        /// `Option<fn>` because closures cannot cross the WASM
+        /// boundary; structural normalization is host-side only.
+        to_dsl: Option<fn(&str) -> String>,
     },
     /// Enum-shaped custom type — values are written in namespaced
     /// shorthand (`us_east_1`, `dedicated`, `us_east_1a`) and flow
@@ -543,6 +555,7 @@ impl fmt::Debug for AttributeType {
                 base,
                 pattern,
                 length,
+                to_dsl,
                 validate: _,
             } => f
                 .debug_struct("Custom")
@@ -550,6 +563,7 @@ impl fmt::Debug for AttributeType {
                 .field("base", base)
                 .field("pattern", pattern)
                 .field("length", length)
+                .field("to_dsl", to_dsl)
                 .field("validate", &"<closure>")
                 .finish(),
             AttributeType::CustomEnum {
@@ -3058,6 +3072,7 @@ pub mod types {
                     Err("Expected integer".to_string())
                 }
             }),
+            to_dsl: None,
         }
     }
 
@@ -3075,6 +3090,7 @@ pub mod types {
                     Err("Expected string".to_string())
                 }
             }),
+            to_dsl: None,
         }
     }
 
@@ -3092,6 +3108,7 @@ pub mod types {
                     Err("Expected string".to_string())
                 }
             }),
+            to_dsl: None,
         }
     }
 
@@ -3109,6 +3126,7 @@ pub mod types {
                     Err("Expected string".to_string())
                 }
             }),
+            to_dsl: None,
         }
     }
 
@@ -3126,6 +3144,7 @@ pub mod types {
                     Err("Expected string".to_string())
                 }
             }),
+            to_dsl: None,
         }
     }
 
@@ -3152,6 +3171,7 @@ pub mod types {
                     Err("Expected string".to_string())
                 }
             }),
+            to_dsl: None,
         }
     }
 }

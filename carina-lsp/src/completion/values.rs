@@ -2017,6 +2017,7 @@ fn parse_exports_type_text(text: &str) -> Option<AttributeType> {
                 pattern: None,
                 length: None,
                 validate: legacy_validator(noop_validate),
+                to_dsl: None,
             })
         }
         _ => None,
