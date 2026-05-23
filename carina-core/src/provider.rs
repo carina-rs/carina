@@ -464,7 +464,7 @@ pub trait ProviderNormalizer: Send + Sync {
     ///
     /// Converts raw values in current state (e.g., `"ap-northeast-1a"`) to
     /// the same DSL enum format that `normalize_desired` produces
-    /// (e.g., `"awscc.ec2.Subnet.AvailabilityZone.ap_northeast_1a"`).
+    /// (e.g., `"awscc.AvailabilityZone.ZoneName.ap_northeast_1a"`).
     /// This prevents false diffs when state stores raw AWS values but
     /// desired state has been normalized.
     /// Providers without enum types return [`ready_noop`].
