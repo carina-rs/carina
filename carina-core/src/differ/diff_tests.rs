@@ -1034,7 +1034,10 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
                         "-1".to_string(),
                         "all".to_string(),
                     ],
-                    namespace: Some("awscc.ec2.SecurityGroup".to_string()),
+                    identity: Some(crate::schema::string_enum_identity(
+                        "IpProtocol",
+                        Some("awscc.ec2.SecurityGroup"),
+                    )),
                     dsl_aliases: vec![("-1".to_string(), "all".to_string())],
                 },
             ),
@@ -1361,7 +1364,10 @@ fn diff_no_change_for_compound_word_dsl_alias() {
                     "BucketOwnerPreferred".to_string(),
                     "ObjectWriter".to_string(),
                 ],
-                namespace: Some("aws.s3.BucketOwnershipControls".to_string()),
+                identity: Some(crate::schema::string_enum_identity(
+                    "ObjectOwnership",
+                    Some("aws.s3.BucketOwnershipControls"),
+                )),
                 dsl_aliases: vec![
                     (
                         "BucketOwnerEnforced".to_string(),

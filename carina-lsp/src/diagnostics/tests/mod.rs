@@ -77,7 +77,7 @@ pub(super) fn test_engine_with_enum_attr() -> DiagnosticEngine {
     let mode_enum = AttributeType::StringEnum {
         name: "Mode".to_string(),
         values: vec!["fast".to_string(), "slow".to_string()],
-        namespace: None,
+        identity: None,
         dsl_aliases: vec![],
     };
 
@@ -104,7 +104,10 @@ pub(super) fn test_engine_with_namespaced_enum_attr() -> DiagnosticEngine {
     let mode_enum = AttributeType::StringEnum {
         name: "Mode".to_string(),
         values: vec!["fast".to_string(), "slow".to_string()],
-        namespace: Some("test.r".to_string()),
+        identity: Some(carina_core::schema::string_enum_identity(
+            "Mode",
+            Some("test.r"),
+        )),
         dsl_aliases: vec![],
     };
 
@@ -138,13 +141,10 @@ pub(super) fn test_engine_with_custom_namespaced_attr() -> DiagnosticEngine {
         }
     }
 
-    let mode_custom = AttributeType::Custom {
-        identity: Some(carina_core::schema::TypeIdentity::bare("Mode")),
+    let mode_custom = AttributeType::CustomEnum {
+        identity: carina_core::schema::string_enum_identity("Mode", Some("test.r")),
         base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
         validate: legacy_validator(validate_mode),
-        namespace: Some("test.r".to_string()),
         to_dsl: None,
     };
 

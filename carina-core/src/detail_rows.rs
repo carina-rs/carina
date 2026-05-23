@@ -2089,7 +2089,7 @@ mod tests {
         let effect = AttributeType::StringEnum {
             name: "Effect".to_string(),
             values: vec!["Allow".to_string(), "Deny".to_string()],
-            namespace: None,
+            identity: None,
             dsl_aliases: vec![
                 ("Allow".to_string(), "allow".to_string()),
                 ("Deny".to_string(), "deny".to_string()),
@@ -2098,7 +2098,7 @@ mod tests {
         let version = AttributeType::StringEnum {
             name: "Version".to_string(),
             values: vec!["2012-10-17".to_string(), "2008-10-17".to_string()],
-            namespace: None,
+            identity: None,
             dsl_aliases: vec![
                 ("2012-10-17".to_string(), "2012_10_17".to_string()),
                 ("2008-10-17".to_string(), "2008_10_17".to_string()),
@@ -2343,7 +2343,7 @@ mod tests {
         let enum_t = AttributeType::StringEnum {
             name: "Mode".to_string(),
             values: vec!["On".to_string(), "Off".to_string()],
-            namespace: None,
+            identity: None,
             dsl_aliases: vec![
                 ("On".to_string(), "on".to_string()),
                 ("Off".to_string(), "off".to_string()),
@@ -2513,7 +2513,7 @@ mod tests {
         let mode = AttributeType::StringEnum {
             name: "Mode".to_string(),
             values: vec!["Allow".to_string(), "Deny".to_string()],
-            namespace: None,
+            identity: None,
             dsl_aliases: vec![
                 ("Allow".to_string(), "allow".to_string()),
                 ("Deny".to_string(), "deny".to_string()),

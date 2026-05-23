@@ -46,7 +46,10 @@ fn invalid_enum_variant_namespaced_display() {
             AttributeType::StringEnum {
                 name: "VersioningStatus".to_string(),
                 values: vec!["Enabled".to_string(), "Suspended".to_string()],
-                namespace: Some("aws.s3.Bucket".to_string()),
+                identity: Some(carina_core::schema::string_enum_identity(
+                    "VersioningStatus",
+                    Some("aws.s3.Bucket"),
+                )),
                 dsl_aliases: vec![],
             },
         )
@@ -75,7 +78,7 @@ fn invalid_enum_variant_bare_display() {
     let t = AttributeType::StringEnum {
         name: "Mode".to_string(),
         values: vec!["fast".to_string(), "slow".to_string()],
-        namespace: None,
+        identity: None,
         dsl_aliases: vec![],
     };
     let err = t
@@ -92,7 +95,10 @@ fn invalid_enum_variant_with_dsl_aliases_display() {
     let t = AttributeType::StringEnum {
         name: "VersioningStatus".to_string(),
         values: vec!["Enabled".to_string(), "Suspended".to_string()],
-        namespace: Some("aws.s3.Bucket".to_string()),
+        identity: Some(carina_core::schema::string_enum_identity(
+            "VersioningStatus",
+            Some("aws.s3.Bucket"),
+        )),
         dsl_aliases: vec![
             ("Enabled".to_string(), "enabled".to_string()),
             ("Suspended".to_string(), "suspended".to_string()),
@@ -114,7 +120,10 @@ fn string_literal_expected_enum_string_enum_display() {
             AttributeType::StringEnum {
                 name: "TargetType".to_string(),
                 values: vec!["AWS_ACCOUNT".to_string(), "GROUP".to_string()],
-                namespace: Some("awscc.sso.Assignment".to_string()),
+                identity: Some(carina_core::schema::string_enum_identity(
+                    "TargetType",
+                    Some("awscc.sso.Assignment"),
+                )),
                 dsl_aliases: vec![],
             },
         )
@@ -142,21 +151,14 @@ fn string_literal_expected_enum_custom_namespaced_display() {
     let schema = ResourceSchema::new("test.r.mode_holder").attribute(
         AttributeSchema::new(
             "mode",
-            AttributeType::Custom {
+            AttributeType::CustomEnum {
                 // Structured identity matching the legacy `namespace: "test.r"`
                 // shorthand prefix: provider=test, segments=[r], kind=Mode.
                 // The dotted display is `test.r.Mode`, which is the prefix
                 // `expand_enum_shorthand` now derives from `identity`.
-                identity: Some(carina_core::schema::TypeIdentity::new(
-                    Some("test"),
-                    ["r"],
-                    "Mode",
-                )),
+                identity: carina_core::schema::TypeIdentity::new(Some("test"), ["r"], "Mode"),
                 base: Box::new(AttributeType::String),
-                pattern: None,
-                length: None,
                 validate: legacy_validator(validate_mode),
-                namespace: Some("test.r".to_string()),
                 to_dsl: None,
             },
         )

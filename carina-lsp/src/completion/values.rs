@@ -555,11 +555,16 @@ impl CompletionProvider {
             AttributeType::StringEnum {
                 name,
                 values,
-                namespace,
+                identity,
                 dsl_aliases,
             } => {
-                // Use explicit namespace if available, otherwise derive from resource_type
-                let effective_ns = namespace.as_deref().or(if !name.is_empty() {
+                // Derive the dotted prefix from the structured
+                // identity. Fall back to the surrounding resource
+                // type when the enum has no provider scope of its
+                // own — this matches the pre-#3222 `namespace`
+                // fallback rule for bare enums.
+                let id_prefix = identity.as_ref().and_then(|id| id.dotted_prefix());
+                let effective_ns = id_prefix.as_deref().or(if !name.is_empty() {
                     resource_type
                 } else {
                     None
@@ -1948,8 +1953,10 @@ fn return_type_fits(ret: builtins::BuiltinReturnType, attr_type: &AttributeType)
         // Custom types carry a semantic meaning (Cidr, AwsAccountId, Arn,
         // …) that built-ins don't declare. Not even `Any` fits — we need
         // a semantic return annotation before a built-in can be suggested
-        // here.
-        AttributeType::Custom { .. } => false,
+        // here. CustomEnum (carina#3222) is even more specific — the
+        // value must be a namespaced enum identifier, which no built-in
+        // can synthesise.
+        AttributeType::Custom { .. } | AttributeType::CustomEnum { .. } => false,
         // Float, Duration, and Struct attributes — no matching built-in today.
         AttributeType::Float => false,
         AttributeType::Duration => false,
@@ -2010,8 +2017,6 @@ fn parse_exports_type_text(text: &str) -> Option<AttributeType> {
                 pattern: None,
                 length: None,
                 validate: legacy_validator(noop_validate),
-                namespace: None,
-                to_dsl: None,
             })
         }
         _ => None,

@@ -198,6 +198,28 @@ impl TypeIdentity {
         }
         true
     }
+
+    /// The dotted form of `provider + segments`, without the trailing
+    /// `kind`. Returns `None` when the identity has no provider axis
+    /// (a bare type — there is no namespace prefix to render).
+    ///
+    /// `aws.iam.Role.Arn` ⇒ `Some("aws.iam.Role")`.
+    /// `aws.Arn` ⇒ `Some("aws")`.
+    /// `Ipv4Cidr` ⇒ `None`.
+    ///
+    /// Replaces the load-bearing string lookups against the
+    /// pre-carina#3222 `Custom.namespace` / `StringEnum.namespace`
+    /// fields. Where the legacy field was `Some(prefix)`, the prefix
+    /// is the value this returns; where it was `None`, this returns
+    /// `None`.
+    pub fn dotted_prefix(&self) -> Option<String> {
+        let provider = self.provider.as_deref()?;
+        if self.segments.is_empty() {
+            Some(provider.to_string())
+        } else {
+            Some(format!("{}.{}", provider, self.segments.join(".")))
+        }
+    }
 }
 
 impl fmt::Display for TypeIdentity {
@@ -358,6 +380,21 @@ mod tests {
         let vpc_id = TypeIdentity::new(Some("aws"), Vec::<String>::new(), "VpcId");
         assert!(!arn.assignable_to(&vpc_id));
         assert!(!vpc_id.assignable_to(&arn));
+    }
+
+    #[test]
+    fn dotted_prefix_drops_kind_and_handles_bare_identity() {
+        // Provider + segments + kind → `provider.segments...`.
+        let role_arn = TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn");
+        assert_eq!(role_arn.dotted_prefix().as_deref(), Some("aws.iam.Role"));
+
+        // Provider + kind only → just the provider.
+        let generic_arn = TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Arn");
+        assert_eq!(generic_arn.dotted_prefix().as_deref(), Some("aws"));
+
+        // No provider axis → no prefix to render.
+        let bare = TypeIdentity::bare("Ipv4Cidr");
+        assert_eq!(bare.dotted_prefix(), None);
     }
 
     #[test]

@@ -1399,8 +1399,6 @@ fn is_type_expr_compatible_unknown_rejects_custom_receiver() {
         length: None,
         base: Box::new(AttributeType::String),
         validate: legacy_validator(noop),
-        namespace: None,
-        to_dsl: None,
     };
     assert!(!is_type_expr_compatible_with_schema(
         &TypeExpr::Unknown,
@@ -1420,8 +1418,6 @@ fn is_type_expr_compatible_string_rejects_custom_with_semantic_name() {
         length: None,
         base: Box::new(AttributeType::String),
         validate: legacy_validator(noop),
-        namespace: None,
-        to_dsl: None,
     };
     assert!(
         !is_type_expr_compatible_with_schema(&TypeExpr::String, &schema),
@@ -1445,8 +1441,6 @@ fn is_type_expr_compatible_string_accepts_custom_without_semantic_name() {
         length: None,
         base: Box::new(AttributeType::String),
         validate: legacy_validator(noop),
-        namespace: None,
-        to_dsl: None,
     };
     assert!(
         is_type_expr_compatible_with_schema(&TypeExpr::String, &schema),
@@ -1472,8 +1466,6 @@ fn is_type_expr_compatible_string_rejects_union_containing_specific_custom() {
             length: None,
             base: Box::new(AttributeType::String),
             validate: legacy_validator(noop),
-            namespace: None,
-            to_dsl: None,
         },
     ]);
     assert!(
@@ -1497,8 +1489,6 @@ fn is_type_expr_compatible_string_rejects_union_of_only_specific_customs() {
         length: None,
         base: Box::new(AttributeType::String),
         validate: legacy_validator(noop),
-        namespace: None,
-        to_dsl: None,
     };
     let schema = AttributeType::Union(vec![mk("VpcId"), mk("SubnetId")]);
     assert!(
@@ -1517,7 +1507,7 @@ fn is_type_expr_compatible_string_accepts_union_of_only_strings() {
         AttributeType::StringEnum {
             name: "Mode".to_string(),
             values: vec!["A".to_string(), "B".to_string()],
-            namespace: None,
+            identity: None,
             dsl_aliases: vec![],
         },
     ]);
@@ -1542,8 +1532,6 @@ fn is_type_expr_compatible_simple_vpcid_accepts_custom_vpcid() {
         length: None,
         base: Box::new(AttributeType::String),
         validate: legacy_validator(noop),
-        namespace: None,
-        to_dsl: None,
     };
     // Parser normalizes `: VpcId` to TypeExpr::Simple("vpc_id") (snake).
     let expr = TypeExpr::Simple("vpc_id".to_string());
@@ -1616,8 +1604,6 @@ fn attribute_param_ref_type_mismatch_detected() {
             pattern: None,
             length: None,
             validate: noop_validator(),
-            namespace: None,
-            to_dsl: None,
         },
     ));
 
@@ -1770,14 +1756,10 @@ fn type_compat_subtype_accepted() {
             pattern: None,
             length: None,
             validate: noop_validator(),
-            namespace: None,
-            to_dsl: None,
         }),
         pattern: None,
         length: None,
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     };
     assert!(is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("arn".to_string()),
@@ -1796,14 +1778,10 @@ fn type_compat_sibling_rejected() {
             pattern: None,
             length: None,
             validate: noop_validator(),
-            namespace: None,
-            to_dsl: None,
         }),
         pattern: None,
         length: None,
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     };
     assert!(!is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("kms_key_arn".to_string()),
@@ -1822,14 +1800,10 @@ fn type_compat_resource_id_subtype() {
             pattern: None,
             length: None,
             validate: noop_validator(),
-            namespace: None,
-            to_dsl: None,
         }),
         pattern: None,
         length: None,
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     };
     assert!(is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("aws_resource_id".to_string()),
@@ -1848,14 +1822,10 @@ fn type_compat_resource_id_siblings_rejected() {
             pattern: None,
             length: None,
             validate: noop_validator(),
-            namespace: None,
-            to_dsl: None,
         }),
         pattern: None,
         length: None,
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     };
     assert!(!is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("vpc_id".to_string()),
@@ -1871,8 +1841,6 @@ fn type_compat_exact_match() {
         pattern: None,
         length: None,
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     };
     assert!(is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("arn".to_string()),
@@ -2005,8 +1973,6 @@ fn type_compat_simple_rejected_when_union_has_string_shaped_peer() {
         pattern: None,
         length: None,
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     };
     let with_custom = AttributeType::Union(vec![AttributeType::String, arn]);
     assert!(!is_type_expr_compatible_with_schema(
@@ -2018,7 +1984,7 @@ fn type_compat_simple_rejected_when_union_has_string_shaped_peer() {
         AttributeType::StringEnum {
             name: "Status".to_string(),
             values: vec!["enabled".to_string(), "disabled".to_string()],
-            namespace: None,
+            identity: None,
             dsl_aliases: vec![],
         },
     ]);
@@ -2379,7 +2345,7 @@ fn enum_membership_violation_in_for_body_is_flagged() {
                 AttributeType::StringEnum {
                     name: "Mode".to_string(),
                     values: vec!["on".to_string(), "off".to_string()],
-                    namespace: None,
+                    identity: None,
                     dsl_aliases: vec![],
                 },
             )],
@@ -2414,7 +2380,7 @@ fn mode_schema() -> SchemaRegistry {
                 AttributeType::StringEnum {
                     name: "Mode".to_string(),
                     values: vec!["fast".to_string(), "slow".to_string()],
-                    namespace: Some("test.r".to_string()),
+                    identity: Some(crate::schema::string_enum_identity("Mode", Some("test.r"))),
                     dsl_aliases: vec![],
                 },
             )],

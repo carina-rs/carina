@@ -113,8 +113,6 @@ fn type_aware_custom_delegates_to_base() {
         pattern: None,
         length: None,
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     };
     assert!(type_aware_equal(
         &Value::Concrete(ConcreteValue::Int(8080)),
@@ -244,7 +242,10 @@ fn type_aware_string_enum_namespaced_vs_raw() {
             "AES256".to_string(),
             "aws:kms:dsse".to_string(),
         ],
-        namespace: Some("awscc.s3.Bucket".to_string()),
+        identity: Some(crate::schema::string_enum_identity(
+            "ServerSideEncryptionByDefaultSseAlgorithm",
+            Some("awscc.s3.Bucket"),
+        )),
         dsl_aliases: vec![],
     };
 
@@ -303,7 +304,7 @@ fn type_aware_struct_ignores_default_string_enum_empty() {
                 AttributeType::StringEnum {
                     name: "Status".to_string(),
                     values: vec!["Active".to_string(), "Inactive".to_string()],
-                    namespace: None,
+                    identity: None,
                     dsl_aliases: vec![],
                 },
             ),
@@ -350,8 +351,6 @@ fn type_aware_struct_ignores_default_custom_type() {
                     pattern: None,
                     length: None,
                     validate: noop_validator(),
-                    namespace: None,
-                    to_dsl: None,
                 },
             ),
         ],
@@ -1030,8 +1029,6 @@ fn union_string_or_list_through_custom_wrapper() {
         pattern: None,
         length: None,
         validate: std::sync::Arc::new(|_| Ok(())),
-        namespace: None,
-        to_dsl: None,
     };
     let a = Value::Concrete(ConcreteValue::StringList(vec!["x".to_string()]));
     let b = Value::Concrete(ConcreteValue::StringList(vec!["x".to_string()]));
@@ -1159,7 +1156,10 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
     let method_enum = |name: &str, values: &[&str]| AttributeType::StringEnum {
         name: name.to_string(),
         values: values.iter().map(|s| s.to_string()).collect(),
-        namespace: Some("awscc.cloudfront.Distribution".to_string()),
+        identity: Some(crate::schema::string_enum_identity(
+            name,
+            Some("awscc.cloudfront.Distribution"),
+        )),
         dsl_aliases: values
             .iter()
             .map(|s| (s.to_string(), s.to_lowercase()))
@@ -1405,7 +1405,10 @@ fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline()
     let method_enum = |name: &str, values: &[&str]| AttributeType::StringEnum {
         name: name.to_string(),
         values: values.iter().map(|s| s.to_string()).collect(),
-        namespace: Some("awscc.cloudfront.Distribution".to_string()),
+        identity: Some(crate::schema::string_enum_identity(
+            name,
+            Some("awscc.cloudfront.Distribution"),
+        )),
         dsl_aliases: values
             .iter()
             .map(|s| (s.to_string(), s.to_lowercase()))
