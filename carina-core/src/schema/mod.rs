@@ -1026,7 +1026,8 @@ impl AttributeType {
                     // Fall back to strict namespace validation, which
                     // produces a clear error for the common bare form.
                     let user_form = user_input.unwrap_or(s.as_str());
-                    validate_enum_namespace(s, name, ns).map_err(|message| {
+                    let identity = string_enum_identity(name, Some(ns));
+                    validate_enum_namespace(s, &identity).map_err(|message| {
                         TypeError::ValidationFailed {
                             message: format!("Invalid {} '{}': {}", name, user_form, message),
                         }
