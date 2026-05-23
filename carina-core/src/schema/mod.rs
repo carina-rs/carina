@@ -1111,10 +1111,25 @@ impl AttributeType {
             unreachable!("validate_custom called on non-Custom");
         };
 
-        let _ = namespace; // superseded by `identity`; kept as a field for now (FIXME: remove `Custom.namespace`)
+        // `Custom.namespace.is_some()` is the load-bearing flag that
+        // distinguishes enum-shaped Customs (`aws.Region`,
+        // `aws.AvailabilityZone.ZoneName` — values written in the
+        // namespaced shorthand `dedicated`, `us_east_1a`) from
+        // structurally-validated Customs (`aws.Arn`,
+        // `aws.ec2.Vpc.Id` — values that already carry their own
+        // format like `arn:aws:s3:...` or `vpc-12345678`). Only the
+        // enum-shaped arm should pass the value through
+        // `expand_enum_shorthand`; the structural arm hands the raw
+        // text to the validator. See carina#3215 follow-up: the
+        // `namespace` field stays for now as the enum-marker; folding
+        // it into the structured identity is S2.5b's job.
         let bare = TypeIdentity::bare("");
         let id_for_resolve = identity.as_ref().unwrap_or(&bare);
-        let resolved_value = Self::resolve_enum_input(id_for_resolve, value);
+        let resolved_value = if namespace.is_some() {
+            Self::resolve_enum_input(id_for_resolve, value)
+        } else {
+            value.to_owned_value()
+        };
         validate(&resolved_value)
     }
 

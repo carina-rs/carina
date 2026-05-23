@@ -568,17 +568,24 @@ impl DiagnosticEngine {
                                     ) {
                                         None
                                     } else {
-                                        let _ = namespace; // superseded by structured `identity` (see carina-core::utils::expand_enum_shorthand)
                                         let bare = carina_core::schema::TypeIdentity::bare("");
                                         let id_for_resolve = identity.as_ref().unwrap_or(&bare);
                                         let kind = id_for_resolve.kind.as_str();
-                                        // Handle bare/shorthand enum identifiers by expanding to full namespace format.
-                                        // These are String values like "dedicated" or "InstanceTenancy.dedicated".
-                                        let resolved_value =
+                                        // `Custom.namespace.is_some()` marks enum-shaped Customs
+                                        // (`aws.Region`, `aws.AvailabilityZone.ZoneName`) whose
+                                        // values are written in the namespaced shorthand
+                                        // (`dedicated`, `us_east_1a`). Structurally-validated
+                                        // Customs (`aws.Arn`, `aws.ec2.Vpc.Id`) carry their own
+                                        // format and must reach the validator verbatim — see
+                                        // carina#3215 follow-up.
+                                        let resolved_value = if namespace.is_some() {
                                             carina_core::utils::expand_enum_shorthand(
                                                 value,
                                                 id_for_resolve,
-                                            );
+                                            )
+                                        } else {
+                                            value.clone()
+                                        };
 
                                         // Run the schema-attached validator first; for WASM-plugin
                                         // types it is a noop, so fall back to the provider-context
