@@ -151,7 +151,7 @@ pub(super) fn test_provider_with_enum_and_regions() -> CompletionProvider {
     let status_enum = AttributeType::StringEnum {
         name: "VersioningStatus".to_string(),
         values: vec!["Enabled".to_string(), "Suspended".to_string()],
-        namespace: None,
+        identity: None,
         dsl_aliases: vec![],
     };
     let schema = ResourceSchema::new("s3.Bucket")
@@ -184,7 +184,7 @@ pub(super) fn test_provider_with_nameless_enum() -> CompletionProvider {
     let status_enum = AttributeType::StringEnum {
         name: "VersioningStatus".to_string(),
         values: vec!["Enabled".to_string(), "Suspended".to_string()],
-        namespace: None,
+        identity: None,
         dsl_aliases: vec![],
     };
 
@@ -223,8 +223,6 @@ pub(super) fn test_provider_with_vpc_and_security_group() -> CompletionProvider 
         pattern: None,
         length: None,
         validate: legacy_validator(noop_validate),
-        namespace: None,
-        to_dsl: None,
     };
     let vpc = ResourceSchema::new("ec2.Vpc")
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
@@ -252,13 +250,14 @@ pub(super) fn test_provider_with_custom_semantic_attr() -> CompletionProvider {
         pattern: None,
         length: None,
         validate: legacy_validator(noop_validate),
-        namespace: None,
-        to_dsl: None,
     };
     let principal_type = AttributeType::StringEnum {
         name: "PrincipalType".to_string(),
         values: vec!["GROUP".to_string(), "USER".to_string()],
-        namespace: Some("awscc.sso.Assignment".to_string()),
+        identity: Some(carina_core::schema::string_enum_identity(
+            "PrincipalType",
+            Some("awscc.sso.Assignment"),
+        )),
         dsl_aliases: vec![],
     };
     let schema = ResourceSchema::new("sso.Assignment")

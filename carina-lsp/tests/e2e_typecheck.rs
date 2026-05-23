@@ -42,7 +42,10 @@ fn enum_schemas() -> SchemaRegistry {
     let mode = AttributeType::StringEnum {
         name: "Mode".to_string(),
         values: vec!["fast".to_string(), "slow".to_string()],
-        namespace: Some("test.r".to_string()),
+        identity: Some(carina_core::schema::string_enum_identity(
+            "Mode",
+            Some("test.r"),
+        )),
         dsl_aliases: vec![],
     };
     single_schema_map(
@@ -135,13 +138,10 @@ fn region_schemas() -> SchemaRegistry {
         s.replace('-', "_")
     }
 
-    let region_custom = AttributeType::Custom {
-        identity: Some(carina_core::schema::TypeIdentity::bare("Region")),
+    let region_custom = AttributeType::CustomEnum {
+        identity: carina_core::schema::string_enum_identity("Region", Some("test")),
         base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
         validate: legacy_validator(validate_region),
-        namespace: Some("test".to_string()),
         to_dsl: Some(to_dsl),
     };
 

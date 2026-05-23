@@ -604,6 +604,18 @@ fn attribute_type_to_type_expr(attr_type: &AttributeType) -> TypeExpr {
             None => TypeExpr::Simple(crate::parser::pascal_to_snake(&id.kind)),
         },
         AttributeType::Custom { base, .. } => attribute_type_to_type_expr(base),
+        // CustomEnum's identity is mandatory and always provider-
+        // scoped (an enum-shorthand needs the dotted prefix), so the
+        // bare-identity / fall-through-to-base arms above do not
+        // apply.
+        AttributeType::CustomEnum { identity, .. } => match &identity.provider {
+            Some(provider) => TypeExpr::SchemaType {
+                provider: provider.clone(),
+                path: identity.segments.join("."),
+                type_name: identity.kind.clone(),
+            },
+            None => TypeExpr::Simple(crate::parser::pascal_to_snake(&identity.kind)),
+        },
         AttributeType::StringEnum { .. } => TypeExpr::String,
         AttributeType::List { inner, .. } => {
             TypeExpr::List(Box::new(attribute_type_to_type_expr(inner)))
@@ -747,8 +759,6 @@ mod tests {
             length: None,
             base: Box::new(AttributeType::String),
             validate: legacy_validator(noop),
-            namespace: None,
-            to_dsl: None,
         }
     }
 

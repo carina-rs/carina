@@ -367,6 +367,15 @@ pub enum AttributeType {
         /// DSL namespace prefix for enum validation (e.g., `"awscc"`).
         /// When present, values may be written as
         /// `{namespace}.{name}.{value}` in the DSL.
+        ///
+        /// Carried as a flat dotted string over the JSON wire form;
+        /// the host reconstructs the structured
+        /// [`carina_core::schema::TypeIdentity`] via
+        /// `string_enum_identity(name, namespace.as_deref())` when
+        /// projecting back into the core schema. Pre-#3222 the core
+        /// `StringEnum` carried the same flat string; with #3222 the
+        /// core form carries a structured identity but the wire form
+        /// stays flat — splitting the boundary cost in one place.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         namespace: Option<String>,
         /// API-canonical -> DSL spelling pairs, for every value where the
@@ -400,16 +409,32 @@ pub enum AttributeType {
     Union {
         members: Vec<AttributeType>,
     },
-    /// Custom type with a name and base type. The validation function is
-    /// resolved on the host side; the protocol only carries the type name
-    /// and underlying base type.
+    /// Structurally-validated custom type: values carry their own
+    /// format (`arn:aws:s3:::bucket-name`, `vpc-12345678`) and reach
+    /// the host-side validator verbatim. Sibling of
+    /// [`AttributeType::CustomEnum`].
+    ///
+    /// The pre-#3222 wire shape carried a single `Custom` variant
+    /// with a runtime `namespace: Option<String>` flag distinguishing
+    /// enum-shaped vs structural; the variant split makes that a
+    /// type-level fact (see the corresponding split in
+    /// `carina_core::schema::AttributeType`).
     #[serde(rename = "custom")]
     Custom {
         name: String,
         base: Box<AttributeType>,
-        /// Optional namespace for enum-style validation
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        namespace: Option<String>,
+    },
+    /// Enum-shaped custom type: values are written as namespaced
+    /// shorthand and expanded host-side via `expand_enum_shorthand`
+    /// before the validator runs. `namespace` is the dotted prefix
+    /// (`"aws"`, `"awscc.s3.Bucket"`) — the host reconstructs the
+    /// structured [`carina_core::schema::TypeIdentity`] from
+    /// `(name, namespace)`.
+    #[serde(rename = "custom_enum")]
+    CustomEnum {
+        name: String,
+        base: Box<AttributeType>,
+        namespace: String,
     },
 }
 

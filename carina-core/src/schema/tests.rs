@@ -48,7 +48,10 @@ fn validate_string_enum_type() {
     let t = AttributeType::StringEnum {
         name: "AddressFamily".to_string(),
         values: vec!["IPv4".to_string(), "IPv6".to_string()],
-        namespace: Some("awscc.ec2.ipam_pool".to_string()),
+        identity: Some(crate::schema::string_enum_identity(
+            "AddressFamily",
+            Some("awscc.ec2.ipam_pool"),
+        )),
         dsl_aliases: vec![],
     };
     assert!(
@@ -87,7 +90,10 @@ fn validate_string_enum_rejects_quoted_string_literal() {
     let t = AttributeType::StringEnum {
         name: "AddressFamily".to_string(),
         values: vec!["IPv4".to_string(), "IPv6".to_string()],
-        namespace: Some("awscc.ec2.ipam_pool".to_string()),
+        identity: Some(crate::schema::string_enum_identity(
+            "AddressFamily",
+            Some("awscc.ec2.ipam_pool"),
+        )),
         dsl_aliases: vec![],
     };
     let err = t
@@ -104,7 +110,10 @@ fn string_enum_type_name_uses_declared_name() {
     let t = AttributeType::StringEnum {
         name: "VersioningStatus".to_string(),
         values: vec!["Enabled".to_string(), "Suspended".to_string()],
-        namespace: Some("aws.s3.Bucket".to_string()),
+        identity: Some(crate::schema::string_enum_identity(
+            "VersioningStatus",
+            Some("aws.s3.Bucket"),
+        )),
         dsl_aliases: vec![],
     };
     assert_eq!(t.type_name(), "VersioningStatus");
@@ -121,7 +130,10 @@ fn validate_string_enum_accepts_dsl_alias() {
             "icmpv6".to_string(),
             "-1".to_string(),
         ],
-        namespace: Some("awscc.ec2.SecurityGroup".to_string()),
+        identity: Some(crate::schema::string_enum_identity(
+            "IpProtocol",
+            Some("awscc.ec2.SecurityGroup"),
+        )),
         dsl_aliases: vec![("-1".to_string(), "all".to_string())],
     };
     // Canonical "-1" is rewritten to DSL "all" — the DSL surface must
@@ -171,7 +183,7 @@ fn validate_string_enum_all_without_dsl_aliases_requires_explicit_variant() {
             "icmpv6".to_string(),
             "-1".to_string(),
         ],
-        namespace: None,
+        identity: None,
         dsl_aliases: vec![],
     };
     // Without "all" in values and no dsl_aliases entry mapping to "all", it is rejected
@@ -194,7 +206,7 @@ fn validate_string_enum_all_without_dsl_aliases_requires_explicit_variant() {
             "-1".to_string(),
             "all".to_string(),
         ],
-        namespace: None,
+        identity: None,
         dsl_aliases: vec![],
     };
     assert!(
@@ -213,7 +225,10 @@ fn validate_string_enum_accepts_values_with_dots() {
     let t = AttributeType::StringEnum {
         name: "Type".to_string(),
         values: vec!["ipsec.1".to_string()],
-        namespace: Some("awscc.ec2.vpn_gateway".to_string()),
+        identity: Some(crate::schema::string_enum_identity(
+            "Type",
+            Some("awscc.ec2.vpn_gateway"),
+        )),
         dsl_aliases: vec![],
     };
     // Bare identifier with dot should match directly (carried as
@@ -254,7 +269,10 @@ fn invalid_enum_error_preserves_user_typed_string_literal() {
     let t = AttributeType::StringEnum {
         name: "TargetType".to_string(),
         values: vec!["AWS_ACCOUNT".to_string()],
-        namespace: Some("awscc.sso.Assignment".to_string()),
+        identity: Some(crate::schema::string_enum_identity(
+            "TargetType",
+            Some("awscc.sso.Assignment"),
+        )),
         dsl_aliases: vec![],
     };
     let err = t
@@ -280,7 +298,10 @@ fn invalid_enum_error_names_the_enum_type_and_fully_qualified_variants() {
     let t = AttributeType::StringEnum {
         name: "TargetType".to_string(),
         values: vec!["AWS_ACCOUNT".to_string()],
-        namespace: Some("awscc.sso.Assignment".to_string()),
+        identity: Some(crate::schema::string_enum_identity(
+            "TargetType",
+            Some("awscc.sso.Assignment"),
+        )),
         dsl_aliases: vec![],
     };
     let err = t
@@ -307,7 +328,10 @@ fn with_attribute_adds_attribute_name_to_enum_error() {
     let t = AttributeType::StringEnum {
         name: "TargetType".to_string(),
         values: vec!["AWS_ACCOUNT".to_string()],
-        namespace: Some("awscc.sso.Assignment".to_string()),
+        identity: Some(crate::schema::string_enum_identity(
+            "TargetType",
+            Some("awscc.sso.Assignment"),
+        )),
         dsl_aliases: vec![],
     };
     // String-literal path (strict-mode rejection): rendered as
@@ -375,7 +399,10 @@ fn schema_validate_wraps_enum_error_with_attribute_name() {
             AttributeType::StringEnum {
                 name: "TargetType".to_string(),
                 values: vec!["AWS_ACCOUNT".to_string()],
-                namespace: Some("awscc.sso.Assignment".to_string()),
+                identity: Some(crate::schema::string_enum_identity(
+                    "TargetType",
+                    Some("awscc.sso.Assignment"),
+                )),
                 dsl_aliases: vec![],
             },
         )
@@ -505,7 +532,10 @@ fn schema_validate_with_origins_emits_string_literal_diagnostic_for_quoted_enum(
             AttributeType::StringEnum {
                 name: "TargetType".to_string(),
                 values: vec!["AWS_ACCOUNT".to_string()],
-                namespace: Some("awscc.sso.Assignment".to_string()),
+                identity: Some(crate::schema::string_enum_identity(
+                    "TargetType",
+                    Some("awscc.sso.Assignment"),
+                )),
                 dsl_aliases: vec![],
             },
         )
@@ -554,7 +584,10 @@ fn schema_validate_with_origins_leaves_valid_values_alone() {
             AttributeType::StringEnum {
                 name: "TargetType".to_string(),
                 values: vec!["AWS_ACCOUNT".to_string()],
-                namespace: Some("awscc.sso.Assignment".to_string()),
+                identity: Some(crate::schema::string_enum_identity(
+                    "TargetType",
+                    Some("awscc.sso.Assignment"),
+                )),
                 dsl_aliases: vec![],
             },
         )
@@ -591,13 +624,10 @@ fn schema_validate_with_origins_reshapes_custom_namespaced_type() {
     let schema = ResourceSchema::new("test.r.mode_holder").attribute(
         AttributeSchema::new(
             "mode",
-            AttributeType::Custom {
-                identity: Some(TypeIdentity::bare("Mode")),
+            AttributeType::CustomEnum {
+                identity: crate::schema::string_enum_identity("Mode", Some("test.r")),
                 base: Box::new(AttributeType::String),
-                pattern: None,
-                length: None,
                 validate: legacy_validator(validate_mode),
-                namespace: Some("test.r".to_string()),
                 to_dsl: None,
             },
         )
@@ -634,7 +664,7 @@ fn invalid_enum_error_without_namespace_uses_bare_variants() {
     let t = AttributeType::StringEnum {
         name: "Mode".to_string(),
         values: vec!["fast".to_string(), "slow".to_string()],
-        namespace: None,
+        identity: None,
         dsl_aliases: vec![],
     };
     let err = t
@@ -661,7 +691,10 @@ fn invalid_enum_error_preserves_bare_identifier_form() {
     let t = AttributeType::StringEnum {
         name: "TargetType".to_string(),
         values: vec!["AWS_ACCOUNT".to_string()],
-        namespace: Some("awscc.sso.Assignment".to_string()),
+        identity: Some(crate::schema::string_enum_identity(
+            "TargetType",
+            Some("awscc.sso.Assignment"),
+        )),
         dsl_aliases: vec![],
     };
     let input = "awscc.sso.Assignment.TargetType.NOT_REAL".to_string();
@@ -684,7 +717,10 @@ fn validate_string_enum_rejects_double_namespace() {
             "dedicated".to_string(),
             "host".to_string(),
         ],
-        namespace: Some("awscc.ec2.Vpc".to_string()),
+        identity: Some(crate::schema::string_enum_identity(
+            "InstanceTenancy",
+            Some("awscc.ec2.Vpc"),
+        )),
         dsl_aliases: vec![],
     };
     // Double-namespace must be rejected
@@ -1780,8 +1816,6 @@ fn validate_union_type() {
                 Err("Expected string".to_string())
             }
         }),
-        namespace: None,
-        to_dsl: None,
     };
     let type_b = AttributeType::Custom {
         identity: Some(TypeIdentity::bare("TypeB")),
@@ -1799,8 +1833,6 @@ fn validate_union_type() {
                 Err("Expected string".to_string())
             }
         }),
-        namespace: None,
-        to_dsl: None,
     };
 
     let union_type = AttributeType::Union(vec![type_a, type_b]);
@@ -1886,8 +1918,6 @@ fn union_type_name() {
         pattern: None,
         length: None,
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     };
     let type_b = AttributeType::Custom {
         identity: Some(TypeIdentity::bare("TypeB")),
@@ -1895,8 +1925,6 @@ fn union_type_name() {
         pattern: None,
         length: None,
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     };
 
     let union_type = AttributeType::Union(vec![type_a, type_b]);
@@ -1911,8 +1939,6 @@ fn union_accepts_type_name() {
         pattern: None,
         length: None,
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     };
     let type_b = AttributeType::Custom {
         identity: Some(TypeIdentity::bare("TypeB")),
@@ -1920,8 +1946,6 @@ fn union_accepts_type_name() {
         pattern: None,
         length: None,
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     };
 
     let union_type = AttributeType::Union(vec![type_a, type_b]);
@@ -2657,8 +2681,6 @@ fn make_custom(name: &str, base: AttributeType) -> AttributeType {
         pattern: None,
         length: None,
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     }
 }
 
@@ -2669,8 +2691,6 @@ fn make_custom_anon_pattern(pattern: &str) -> AttributeType {
         pattern: Some(pattern.to_string()),
         length: None,
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     }
 }
 
@@ -2681,8 +2701,6 @@ fn make_custom_anon_len(min: u64, max: u64) -> AttributeType {
         pattern: None,
         length: Some((Some(min), Some(max))),
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     }
 }
 
@@ -2726,8 +2744,6 @@ fn assignable_rejects_same_kind_across_providers() {
         pattern: None,
         length: None,
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     };
     let aws_region = provider_custom("aws");
     let gcp_region = provider_custom("gcp");
@@ -2748,8 +2764,6 @@ fn assignable_specific_arn_flows_into_generic_arn() {
         pattern: None,
         length: None,
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     };
     let generic = mk(&[]);
     let role_arn = mk(&["iam", "Role"]);
@@ -2778,8 +2792,6 @@ fn assignable_identity_axis_directionality() {
         pattern: None,
         length: None,
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     };
 
     // provider: None source → Some sink rejected
@@ -2806,8 +2818,6 @@ fn assignable_narrow_to_anonymous_unconstrained_sink() {
         pattern: None,
         length: None,
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     };
     assert!(account.is_assignable_to(&anon));
 }
@@ -2859,8 +2869,6 @@ fn assignable_union_source_requires_all_members_assignable() {
         pattern: None,
         length: None,
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     };
     let both_ok = AttributeType::Union(vec![vpc.clone(), vpc.clone()]);
     assert!(both_ok.is_assignable_to(&vpc));
@@ -2885,8 +2893,6 @@ fn semantic_custom_assigns_to_anonymous_unconstrained_sink() {
         pattern: None,
         length: None,
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     };
     assert!(vpc.is_assignable_to(&anon));
     // Reverse: anon has no proof it's a VpcId → NG.
@@ -2925,8 +2931,6 @@ fn make_custom_anon_pattern_and_len(
         pattern: pattern.map(str::to_string),
         length,
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     }
 }
 
@@ -3036,8 +3040,6 @@ fn custom_carries_semantic_name_pattern_length() {
         pattern: Some("^vpc-[a-f0-9]+$".to_string()),
         length: Some((Some(8), Some(21))),
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     };
     match t {
         AttributeType::Custom {
@@ -3062,8 +3064,6 @@ fn custom_type_name_anonymous_pattern_only() {
         pattern: Some("^foo$".to_string()),
         length: None,
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     };
     assert_eq!(t.type_name(), "String(pattern)");
 }
@@ -3076,8 +3076,6 @@ fn custom_type_name_anonymous_length_only() {
         pattern: None,
         length: Some((Some(1), Some(64))),
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     };
     assert_eq!(t.type_name(), "String(len: 1..=64)");
 }
@@ -3090,8 +3088,6 @@ fn custom_type_name_anonymous_pattern_and_length() {
         pattern: Some("^.*$".to_string()),
         length: Some((Some(1), Some(64))),
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     };
     assert_eq!(t.type_name(), "String(pattern, len: 1..=64)");
 }
@@ -3440,7 +3436,10 @@ fn expected_includes_to_dsl_aliases_with_alias_flag() {
     let t = AttributeType::StringEnum {
         name: "VersioningStatus".to_string(),
         values: vec!["Enabled".to_string(), "Suspended".to_string()],
-        namespace: Some("aws.s3.Bucket".to_string()),
+        identity: Some(crate::schema::string_enum_identity(
+            "VersioningStatus",
+            Some("aws.s3.Bucket"),
+        )),
         dsl_aliases: vec![
             ("Enabled".to_string(), "enabled".to_string()),
             ("Suspended".to_string(), "suspended".to_string()),
@@ -3500,13 +3499,10 @@ fn custom_namespaced_string_literal_routes_validator_text_to_extra_message() {
     let schema = ResourceSchema::new("test.r.mode_holder").attribute(
         AttributeSchema::new(
             "mode",
-            AttributeType::Custom {
-                identity: Some(TypeIdentity::bare("Mode")),
+            AttributeType::CustomEnum {
+                identity: crate::schema::string_enum_identity("Mode", Some("test.r")),
                 base: Box::new(AttributeType::String),
-                pattern: None,
-                length: None,
                 validate: legacy_validator(validate_mode),
-                namespace: Some("test.r".to_string()),
                 to_dsl: None,
             },
         )
@@ -3612,7 +3608,7 @@ fn union_string_vs_string_enum_picks_enum_error_for_string_input() {
         AttributeType::StringEnum {
             name: "Mode".to_string(),
             values: vec!["fast".to_string(), "slow".to_string()],
-            namespace: None,
+            identity: None,
             dsl_aliases: vec![],
         },
     ]);
@@ -3685,8 +3681,6 @@ fn union_string_vs_custom_picks_custom_error_for_string_input() {
             pattern: None,
             length: None,
             validate: legacy_validator(must_be_arn),
-            namespace: None,
-            to_dsl: None,
         },
     ]);
     let err = union_type
@@ -3753,8 +3747,6 @@ fn union_custom_with_int_base_picks_custom_error_for_int_input() {
             pattern: None,
             length: None,
             validate: legacy_validator(must_be_positive),
-            namespace: None,
-            to_dsl: None,
         },
         AttributeType::Bool,
     ]);
@@ -3829,8 +3821,6 @@ fn custom_validator_can_capture_external_state() {
                 got: other.type_name(),
             }),
         }),
-        namespace: None,
-        to_dsl: None,
     };
     assert!(
         attr.validate(&Value::Concrete(ConcreteValue::String(
@@ -3878,8 +3868,6 @@ fn custom_validator_returns_structured_type_error_directly() {
                 got: other.type_name(),
             }),
         }),
-        namespace: None,
-        to_dsl: None,
     };
     let err = attr
         .validate(&Value::Concrete(ConcreteValue::String(
@@ -4009,10 +3997,8 @@ fn walk_custom_lookup_skips_value_unknown() {
         base: Box::new(AttributeType::String),
         validate: always_fail,
         identity: Some(TypeIdentity::bare("vpc_id")),
-        namespace: None,
         pattern: None,
         length: None,
-        to_dsl: None,
     };
 
     let mut errors = Vec::new();
@@ -4053,10 +4039,8 @@ fn union_walk_custom_lookup_succeeds_when_any_member_accepts() {
         base: Box::new(AttributeType::String),
         validate: validator(|_v: &Value| Ok(())),
         identity: Some(TypeIdentity::bare(name)),
-        namespace: None,
         pattern: None,
         length: None,
-        to_dsl: None,
     };
     let union = AttributeType::Union(vec![custom("ok_arm"), custom("fail_arm")]);
 
@@ -4094,10 +4078,8 @@ fn union_walk_custom_lookup_emits_smallest_error_set_when_all_fail() {
         base: Box::new(AttributeType::String),
         validate: validator(|_v: &Value| Ok(())),
         identity: Some(TypeIdentity::bare(name)),
-        namespace: None,
         pattern: None,
         length: None,
-        to_dsl: None,
     };
     let union = AttributeType::Union(vec![custom("a"), custom("b")]);
 
@@ -4191,7 +4173,10 @@ fn dsl_aliases_validator_accepts_dsl_spellings_only() {
             "BucketOwnerPreferred".to_string(),
             "BucketOwnerEnforced".to_string(),
         ],
-        namespace: Some("awscc.s3.Bucket".to_string()),
+        identity: Some(crate::schema::string_enum_identity(
+            "ObjectOwnership",
+            Some("awscc.s3.Bucket"),
+        )),
         dsl_aliases: vec![
             ("ObjectWriter".to_string(), "object_writer".to_string()),
             (
@@ -4277,7 +4262,10 @@ fn enum_without_dsl_aliases_accepts_api_spelling_as_before() {
             "REJECT".to_string(),
             "ALL".to_string(),
         ],
-        namespace: Some("aws.ec2.FlowLog".to_string()),
+        identity: Some(crate::schema::string_enum_identity(
+            "TrafficType",
+            Some("aws.ec2.FlowLog"),
+        )),
         dsl_aliases: vec![],
     };
     assert!(
@@ -4297,7 +4285,10 @@ fn dsl_aliases_diagnostic_tags_alias_entries_distinct_from_canonical() {
     let t = AttributeType::StringEnum {
         name: "VersioningStatus".to_string(),
         values: vec!["Enabled".to_string(), "Suspended".to_string()],
-        namespace: Some("aws.s3.Bucket".to_string()),
+        identity: Some(crate::schema::string_enum_identity(
+            "VersioningStatus",
+            Some("aws.s3.Bucket"),
+        )),
         dsl_aliases: vec![
             ("Enabled".to_string(), "enabled".to_string()),
             ("Suspended".to_string(), "suspended".to_string()),
@@ -4338,7 +4329,10 @@ fn dsl_aliases_empty_keeps_api_only_validation() {
     let t = AttributeType::StringEnum {
         name: "Status".to_string(),
         values: vec!["active".to_string(), "inactive".to_string()],
-        namespace: Some("test.r".to_string()),
+        identity: Some(crate::schema::string_enum_identity(
+            "Status",
+            Some("test.r"),
+        )),
         dsl_aliases: vec![],
     };
     assert!(
@@ -4379,7 +4373,10 @@ mod string_enum_binding_collision {
                 "Subnet".to_string(),
                 "VPC".to_string(),
             ],
-            namespace: Some("awscc.ec2.FlowLog".to_string()),
+            identity: Some(crate::schema::string_enum_identity(
+                "ResourceType",
+                Some("awscc.ec2.FlowLog"),
+            )),
             dsl_aliases: vec![
                 (
                     "NetworkInterface".to_string(),
@@ -4598,7 +4595,10 @@ fn condition_operator_map(value: AttributeType) -> AttributeType {
                 "string_not_equals".to_string(),
                 "arn_like".to_string(),
             ],
-            namespace: Some("aws.iam.ConditionOperator".to_string()),
+            identity: Some(crate::schema::string_enum_identity(
+                "ConditionOperator",
+                Some("aws.iam.ConditionOperator"),
+            )),
             dsl_aliases: vec![],
         }),
         value: Box::new(value),
@@ -4634,7 +4634,10 @@ fn validate_map_with_string_enum_key_accepts_dsl_alias_spelling() {
         key: Box::new(AttributeType::StringEnum {
             name: "IpProtocol".to_string(),
             values: vec!["tcp".to_string(), "-1".to_string()],
-            namespace: Some("awscc.ec2.SecurityGroup".to_string()),
+            identity: Some(crate::schema::string_enum_identity(
+                "IpProtocol",
+                Some("awscc.ec2.SecurityGroup"),
+            )),
             dsl_aliases: vec![("-1".to_string(), "all".to_string())],
         }),
         value: Box::new(AttributeType::String),
@@ -4683,7 +4686,10 @@ fn lift_state_string_enums_to_identifiers_fixes_awscc251() {
     let version_enum = AttributeType::StringEnum {
         name: "Version".to_string(),
         values: vec!["2012-10-17".to_string(), "2008-10-17".to_string()],
-        namespace: Some("aws.iam.PolicyDocument".to_string()),
+        identity: Some(crate::schema::string_enum_identity(
+            "Version",
+            Some("aws.iam.PolicyDocument"),
+        )),
         dsl_aliases: vec![
             ("2012-10-17".to_string(), "2012_10_17".to_string()),
             ("2008-10-17".to_string(), "2008_10_17".to_string()),
@@ -4692,7 +4698,10 @@ fn lift_state_string_enums_to_identifiers_fixes_awscc251() {
     let effect_enum = AttributeType::StringEnum {
         name: "Effect".to_string(),
         values: vec!["Allow".to_string(), "Deny".to_string()],
-        namespace: Some("aws.iam.PolicyDocument".to_string()),
+        identity: Some(crate::schema::string_enum_identity(
+            "Effect",
+            Some("aws.iam.PolicyDocument"),
+        )),
         dsl_aliases: vec![
             ("Allow".to_string(), "allow".to_string()),
             ("Deny".to_string(), "deny".to_string()),
@@ -4799,7 +4808,10 @@ fn lift_state_string_enums_is_idempotent_and_preserves_invalid() {
     let version_enum = AttributeType::StringEnum {
         name: "Version".to_string(),
         values: vec!["2012-10-17".to_string()],
-        namespace: Some("aws.iam.PolicyDocument".to_string()),
+        identity: Some(crate::schema::string_enum_identity(
+            "Version",
+            Some("aws.iam.PolicyDocument"),
+        )),
         dsl_aliases: vec![("2012-10-17".to_string(), "2012_10_17".to_string())],
     };
     let policy_struct = AttributeType::Struct {

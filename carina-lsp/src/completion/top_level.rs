@@ -998,8 +998,6 @@ fn type_expr_to_attribute_type(
             pattern: None,
             length: None,
             validate: legacy_validator(noop),
-            namespace: None,
-            to_dsl: None,
         }),
         parser::TypeExpr::List(inner) => {
             type_expr_to_attribute_type(inner).map(AttributeType::list)

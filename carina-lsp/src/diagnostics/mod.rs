@@ -553,7 +553,6 @@ impl DiagnosticEngine {
                                     carina_core::schema::AttributeType::Custom {
                                         identity,
                                         validate,
-                                        namespace,
                                         ..
                                     },
                                     value,
@@ -568,61 +567,77 @@ impl DiagnosticEngine {
                                     ) {
                                         None
                                     } else {
-                                        let bare = carina_core::schema::TypeIdentity::bare("");
-                                        let id_for_resolve = identity.as_ref().unwrap_or(&bare);
-                                        let kind = id_for_resolve.kind.as_str();
-                                        // `Custom.namespace.is_some()` marks enum-shaped Customs
-                                        // (`aws.Region`, `aws.AvailabilityZone.ZoneName`) whose
-                                        // values are written in the namespaced shorthand
-                                        // (`dedicated`, `us_east_1a`). Structurally-validated
-                                        // Customs (`aws.Arn`, `aws.ec2.Vpc.Id`) carry their own
-                                        // format and must reach the validator verbatim — see
-                                        // carina#3215 follow-up.
-                                        let resolved_value = if namespace.is_some() {
-                                            carina_core::utils::expand_enum_shorthand(
-                                                value,
-                                                id_for_resolve,
-                                            )
-                                        } else {
-                                            value.clone()
-                                        };
-
-                                        // Run the schema-attached validator first; for WASM-plugin
-                                        // types it is a noop, so fall back to the provider-context
-                                        // lookup which reaches the factory's `validate_custom_type`.
+                                        // Structural Custom: values reach the validator
+                                        // verbatim. CustomEnum has its own arm below — the
+                                        // pre-#3222 `namespace.is_some()` gate is now a
+                                        // type-level split.
                                         let lookup = carina_core::parser::provider_context_lookup(
                                             &self.provider_context,
                                         );
+                                        validate(value)
+                                            .err()
+                                            .or_else(|| {
+                                                identity
+                                                    .as_ref()
+                                                    .and_then(|id| lookup(id, value).err())
+                                            })
+                                            .map(|inner_err| inner_err.to_string())
+                                    }
+                                }
+                                (
+                                    carina_core::schema::AttributeType::CustomEnum {
+                                        identity,
+                                        validate,
+                                        ..
+                                    },
+                                    value,
+                                ) => {
+                                    if matches!(
+                                        value,
+                                        carina_core::resource::Value::Deferred(
+                                            carina_core::resource::DeferredValue::Unknown(_)
+                                        )
+                                    ) {
+                                        None
+                                    } else {
+                                        // Enum-shaped Custom: expand the namespaced
+                                        // shorthand before validating. The pre-#3222
+                                        // gate (`Custom.namespace.is_some()`) is
+                                        // structurally captured by this arm — values for
+                                        // structural `Custom` never reach here, so the
+                                        // carina#3216 class of mis-expansion is impossible.
+                                        let resolved_value =
+                                            carina_core::utils::expand_enum_shorthand(
+                                                value, identity,
+                                            );
+                                        let lookup = carina_core::parser::provider_context_lookup(
+                                            &self.provider_context,
+                                        );
+                                        let kind = identity.kind.as_str();
                                         validate(&resolved_value)
-                                        .err()
-                                        .or_else(|| {
-                                            identity
-                                                .as_ref()
-                                                .and_then(|id| lookup(id, &resolved_value).err())
-                                        })
-                                        .map(|inner_err| {
-                                        // For namespaced Custom types (enum-like), mirror
-                                        // the CLI shape-mismatch diagnostic when the user
-                                        // wrote a quoted string literal. The validator
-                                        // returns a structured `TypeError`; render it as a
-                                        // string when wrapping for the LSP message. See #2094.
-                                        let inner_msg = inner_err.to_string();
-                                        if namespace.is_some()
-                                            && matches!(value, Value::Concrete(ConcreteValue::String(s)) if !s.contains('.'))
-                                            && resource_quoted_string_attrs.contains(attr_name)
-                                        {
-                                            let typed = match value {
-                                                Value::Concrete(ConcreteValue::String(s)) => s.as_str(),
-                                                _ => "",
-                                            };
-                                            format!(
-                                                "'{}' ({}) expects an enum identifier, got a string literal \"{}\". {}",
-                                                attr_name, kind, typed, inner_msg
-                                            )
-                                        } else {
-                                            inner_msg
-                                        }
-                                    })
+                                            .err()
+                                            .or_else(|| lookup(identity, &resolved_value).err())
+                                            .map(|inner_err| {
+                                                // Mirror the CLI shape-mismatch
+                                                // diagnostic when the user wrote a
+                                                // quoted string literal on an enum-
+                                                // shaped Custom. See #2094.
+                                                let inner_msg = inner_err.to_string();
+                                                if matches!(value, Value::Concrete(ConcreteValue::String(s)) if !s.contains('.'))
+                                                    && resource_quoted_string_attrs.contains(attr_name)
+                                                {
+                                                    let typed = match value {
+                                                        Value::Concrete(ConcreteValue::String(s)) => s.as_str(),
+                                                        _ => "",
+                                                    };
+                                                    format!(
+                                                        "'{}' ({}) expects an enum identifier, got a string literal \"{}\". {}",
+                                                        attr_name, kind, typed, inner_msg
+                                                    )
+                                                } else {
+                                                    inner_msg
+                                                }
+                                            })
                                     }
                                 }
                                 // String type - check for bare resource binding

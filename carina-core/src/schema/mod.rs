@@ -176,6 +176,23 @@ fn walk_custom_lookup(
                 });
             }
         }
+        AttributeType::CustomEnum { identity, .. } => {
+            // CustomEnum carries a mandatory identity; the lookup
+            // path is otherwise identical to the structural Custom
+            // arm above. (The split exists only at the validate /
+            // diagnostic level — at the registry lookup level the
+            // two variants behave the same way.)
+            if let Err(e) = lookup(identity, value) {
+                let message = match e {
+                    TypeError::ValidationFailed { message } => message,
+                    other => other.to_string(),
+                };
+                errors.push(TypeError::ResourceValidationFailed {
+                    message,
+                    attribute: Some(attr_name.to_string()),
+                });
+            }
+        }
         AttributeType::List { inner, .. } => {
             if let Value::Concrete(ConcreteValue::List(items)) = value {
                 for item in items {
@@ -237,9 +254,13 @@ fn walk_custom_lookup(
     }
 }
 
-pub type StringEnumParts<'a> = (&'a str, &'a [String], Option<&'a str>, DslMap<'a>);
+pub type StringEnumParts<'a> = (&'a str, &'a [String], Option<&'a TypeIdentity>, DslMap<'a>);
 
-pub type NamespacedEnumParts<'a> = (&'a str, &'a str, DslMap<'a>);
+/// `(kind, dotted_prefix, dsl_map)` for an enum-shaped type — either a
+/// `StringEnum` with an `identity` or a `CustomEnum`. The dotted
+/// prefix is freshly composed from the `TypeIdentity`, so this tuple
+/// carries an owned `String` rather than a borrowed slice.
+pub type NamespacedEnumParts<'a> = (&'a str, String, DslMap<'a>);
 
 /// API-canonical → DSL-spelling mapping carried by a `StringEnum`
 /// (data) or a `Custom` (closure). Both sources answer the same
@@ -393,7 +414,7 @@ pub enum AttributeType {
     /// (`75min`, `1h`, `30s`); internally a `std::time::Duration`.
     /// Serialised as integer seconds at every value-tree boundary.
     Duration,
-    /// String enum with optional namespace-aware DSL syntax support.
+    /// String enum with namespace-aware DSL syntax support.
     ///
     /// `dsl_aliases` is a list of `(api, dsl)` pairs that map a canonical
     /// (API) value to the DSL spelling, for every value where the two
@@ -406,13 +427,31 @@ pub enum AttributeType {
     /// because `fn` pointers are not serializable, so provider plugins
     /// silently lost their alias map and validation rejected legitimate
     /// DSL spellings (carina#2831, awscc#199, aws#247).
+    ///
+    /// The legacy `namespace: Option<String>` field was replaced by
+    /// `identity: Option<TypeIdentity>` in carina#3222
+    /// (S2.5c-followup); the dotted prefix is now derived from the
+    /// structure (`identity.dotted_prefix()`) rather than carried as
+    /// a separate string.
     StringEnum {
         name: String,
         values: Vec<String>,
-        namespace: Option<String>,
+        /// Structured identity. `Some(_)` when the enum has a provider
+        /// scope (the namespaced shorthand path); `None` for a bare
+        /// enum without a namespace (legacy / built-in shape).
+        identity: Option<TypeIdentity>,
         dsl_aliases: Vec<(String, String)>,
     },
-    /// Custom type (with validation function)
+    /// Structurally-validated custom type — values carry their own
+    /// format (e.g. `arn:aws:s3:::bucket-name`, `vpc-12345678`) and
+    /// reach the validator verbatim. Distinct from [`AttributeType::CustomEnum`],
+    /// which gates the value through `expand_enum_shorthand` first.
+    ///
+    /// The split was introduced in carina#3222 (S2.5c-followup) so the
+    /// enum-shorthand vs structural divide is a compile-time fact
+    /// rather than a runtime `namespace.is_some()` check — the
+    /// carina#3216 class of mis-expansion (`aws.Arn.arn:aws:s3:...`)
+    /// is structurally impossible under this shape.
     Custom {
         /// `Some(identity)` when this type carries a structured type
         /// identity (e.g. `aws.iam.Role.Arn`, `aws.VpcId`). `None` when
@@ -430,9 +469,22 @@ pub enum AttributeType {
         /// Optional length bounds (min, max).
         length: Option<(Option<u64>, Option<u64>)>,
         validate: CustomValidator,
-        /// Namespace for resolving shorthand enum values (e.g., "aws.vpc")
-        /// When set, allows `dedicated` to be resolved to `aws.vpc.InstanceTenancy.dedicated`
-        namespace: Option<String>,
+    },
+    /// Enum-shaped custom type — values are written in namespaced
+    /// shorthand (`us_east_1`, `dedicated`, `us_east_1a`) and flow
+    /// through `expand_enum_shorthand` to a fully-qualified form
+    /// (`aws.Region.us_east_1`, …) before reaching the validator.
+    ///
+    /// Sibling of [`AttributeType::Custom`]; both replace the older
+    /// single `Custom` variant whose `namespace.is_some()` flag
+    /// distinguished the two cases at runtime. Identity is mandatory
+    /// here — without one there is no namespace to expand into.
+    CustomEnum {
+        /// Structured identity. Always populated (unlike `Custom`):
+        /// the namespace expansion needs the dotted prefix.
+        identity: TypeIdentity,
+        base: Box<AttributeType>,
+        validate: CustomValidator,
         /// Optional callback to normalize AWS values to DSL format.
         /// For example, availability_zone uses `|s| s.replace('-', "_")` to convert
         /// "ap-northeast-1a" to "ap_northeast_1a" for DSL identifier form.
@@ -477,13 +529,13 @@ impl fmt::Debug for AttributeType {
             AttributeType::StringEnum {
                 name,
                 values,
-                namespace,
+                identity,
                 dsl_aliases,
             } => f
                 .debug_struct("StringEnum")
                 .field("name", name)
                 .field("values", values)
-                .field("namespace", namespace)
+                .field("identity", identity)
                 .field("dsl_aliases", dsl_aliases)
                 .finish(),
             AttributeType::Custom {
@@ -491,8 +543,6 @@ impl fmt::Debug for AttributeType {
                 base,
                 pattern,
                 length,
-                namespace,
-                to_dsl,
                 validate: _,
             } => f
                 .debug_struct("Custom")
@@ -500,7 +550,17 @@ impl fmt::Debug for AttributeType {
                 .field("base", base)
                 .field("pattern", pattern)
                 .field("length", length)
-                .field("namespace", namespace)
+                .field("validate", &"<closure>")
+                .finish(),
+            AttributeType::CustomEnum {
+                identity,
+                base,
+                to_dsl,
+                validate: _,
+            } => f
+                .debug_struct("CustomEnum")
+                .field("identity", identity)
+                .field("base", base)
                 .field("to_dsl", to_dsl)
                 .field("validate", &"<closure>")
                 .finish(),
@@ -648,12 +708,12 @@ impl AttributeType {
             AttributeType::StringEnum {
                 name,
                 values,
-                namespace,
+                identity,
                 dsl_aliases,
             } => Some((
                 name,
                 values,
-                namespace.as_deref(),
+                identity.as_ref(),
                 DslMap::Aliases(dsl_aliases),
             )),
             _ => None,
@@ -664,16 +724,23 @@ impl AttributeType {
         match self {
             AttributeType::StringEnum {
                 name,
-                namespace: Some(namespace),
+                identity: Some(id),
                 dsl_aliases,
                 ..
-            } => Some((name, namespace, DslMap::Aliases(dsl_aliases))),
-            AttributeType::Custom {
-                identity: Some(id),
-                namespace: Some(namespace),
-                to_dsl,
-                ..
-            } => Some((&id.kind, namespace, DslMap::Closure(*to_dsl))),
+            } => {
+                let prefix = id.dotted_prefix()?;
+                Some((name, prefix, DslMap::Aliases(dsl_aliases)))
+            }
+            AttributeType::CustomEnum {
+                identity, to_dsl, ..
+            } => {
+                // `CustomEnum` always carries an identity with a
+                // populated provider axis; if `dotted_prefix` is `None`
+                // the identity is malformed and we treat the type as
+                // non-namespaced (the pre-#3222 `namespace: None` case).
+                let prefix = identity.dotted_prefix()?;
+                Some((&identity.kind, prefix, DslMap::Closure(*to_dsl)))
+            }
             _ => None,
         }
     }
@@ -708,17 +775,18 @@ impl AttributeType {
         if let AttributeType::StringEnum {
             name,
             values,
-            namespace,
+            identity,
             dsl_aliases,
         } = self
             && let Some(binding) = bare_binding_name(value)
             && enum_alias_collides_with(binding, values, dsl_aliases)
         {
+            let prefix = identity.as_ref().and_then(|id| id.dotted_prefix());
             return Err(TypeError::ValidationFailed {
                 message: enum_binding_collision_message(
                     binding,
                     name,
-                    namespace.as_deref(),
+                    prefix.as_deref(),
                     values,
                     dsl_aliases,
                 ),
@@ -734,6 +802,7 @@ impl AttributeType {
         match self {
             AttributeType::StringEnum { .. } => self.validate_string_enum(value),
             AttributeType::Custom { .. } => self.validate_custom(value),
+            AttributeType::CustomEnum { .. } => self.validate_custom_enum(value),
             AttributeType::List { .. } => self.validate_list(value),
             AttributeType::Map { .. } => self.validate_map(value),
             AttributeType::Struct { .. } => self.validate_struct(value),
@@ -940,12 +1009,19 @@ impl AttributeType {
         let AttributeType::StringEnum {
             name,
             values,
-            namespace,
+            identity,
             dsl_aliases,
         } = self
         else {
             unreachable!("validate_string_enum called on non-StringEnum");
         };
+
+        // Dotted `{provider}.{segments...}` prefix derived from the
+        // structured identity, mirroring the pre-#3222
+        // `namespace.as_deref()` shape (which was a flat string
+        // carried alongside `name`).
+        let prefix = identity.as_ref().and_then(|id| id.dotted_prefix());
+        let prefix_ref = prefix.as_deref();
 
         // Phase 4 of carina#2986: enum attributes accept only DSL
         // identifiers (`ConcreteValue::EnumIdentifier`), never quoted
@@ -958,12 +1034,8 @@ impl AttributeType {
         if let ConcreteValueRef::String(s) = value {
             let mut expected: Vec<ExpectedEnumVariant> = Vec::new();
             let mut push = |variant_value: &str, is_alias: bool| {
-                let entry = ExpectedEnumVariant::from_namespaced(
-                    namespace.as_deref(),
-                    name,
-                    variant_value,
-                    is_alias,
-                );
+                let entry =
+                    ExpectedEnumVariant::from_namespaced(prefix_ref, name, variant_value, is_alias);
                 if !expected.contains(&entry) {
                     expected.push(entry);
                 }
@@ -985,11 +1057,13 @@ impl AttributeType {
             });
         }
 
-        // Build a structured identity from the legacy `name + namespace`
-        // pair so the shorthand-expansion helper can reuse the same
-        // `TypeIdentity`-keyed projection as `Custom`.
-        let identity = string_enum_identity(name, namespace.as_deref());
-        let resolved_value = Self::resolve_enum_input(&identity, value);
+        // `identity` is the structured form; fall back to a bare
+        // identity for `StringEnum`s without a provider scope so the
+        // shorthand-expansion helper still has something to key on.
+        let owned_identity = identity
+            .clone()
+            .unwrap_or_else(|| TypeIdentity::bare(name.as_str()));
+        let resolved_value = Self::resolve_enum_input(&owned_identity, value);
         // Capture the user's original input for diagnostics. The parser
         // emits `ConcreteValue::EnumIdentifier` for bare identifier short
         // forms (`dedicated`) and dotted forms (`aws.s3.Bucket.VersioningStatus.Enabled`).
@@ -1018,7 +1092,10 @@ impl AttributeType {
             // `{namespace}.{name}.{variant}`. This rejects malformed
             // inputs like double-namespaced values while still allowing
             // enum values that themselves contain dots (e.g., "ipsec.1").
-            if !direct_match && let Some(ns) = namespace.as_deref() {
+            if !direct_match
+                && let Some(ns) = prefix_ref
+                && let Some(id) = identity.as_ref()
+            {
                 let expected_prefix = format!("{}.{}.", ns, name);
                 let prefix_matches =
                     s.starts_with(&expected_prefix) && &s[expected_prefix.len()..] == variant;
@@ -1026,8 +1103,7 @@ impl AttributeType {
                     // Fall back to strict namespace validation, which
                     // produces a clear error for the common bare form.
                     let user_form = user_input.unwrap_or(s.as_str());
-                    let identity = string_enum_identity(name, Some(ns));
-                    validate_enum_namespace(s, &identity).map_err(|message| {
+                    validate_enum_namespace(s, id).map_err(|message| {
                         TypeError::ValidationFailed {
                             message: format!("Invalid {} '{}': {}", name, user_form, message),
                         }
@@ -1063,7 +1139,7 @@ impl AttributeType {
                 let mut expected: Vec<ExpectedEnumVariant> = Vec::new();
                 let mut push = |variant_value: &str, is_alias: bool| {
                     let entry = ExpectedEnumVariant::from_namespaced(
-                        namespace.as_deref(),
+                        prefix_ref,
                         name,
                         variant_value,
                         is_alias,
@@ -1095,42 +1171,44 @@ impl AttributeType {
         }
     }
 
-    /// Validate against a `Custom` variant by delegating to its `validate`
-    /// closure after expanding any enum-shorthand identifier in `value`.
+    /// Validate against a `Custom` variant by delegating to its
+    /// `validate` closure on the raw value.
+    ///
+    /// Pre-carina#3222 this function also handled enum-shaped Customs
+    /// (gated on `namespace.is_some()`); those are now
+    /// [`AttributeType::CustomEnum`] and dispatched separately by
+    /// [`Self::validate_custom_enum`], so the enum-shorthand gate is
+    /// gone — the structurally-validated arm is the only thing left.
     ///
     /// Phase 2 of RFC #2972: takes [`ConcreteValueRef`]. The deferred-skip
     /// guard for `Value::Deferred(DeferredValue::ResourceRef)`/`Value::Deferred(DeferredValue::Interpolation)` is gone —
     /// the dispatcher filters them out in [`Self::validate`].
     fn validate_custom(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
-        let AttributeType::Custom {
-            validate,
-            identity,
-            namespace,
-            ..
-        } = self
-        else {
+        let AttributeType::Custom { validate, .. } = self else {
             unreachable!("validate_custom called on non-Custom");
         };
+        validate(&value.to_owned_value())
+    }
 
-        // `Custom.namespace.is_some()` is the load-bearing flag that
-        // distinguishes enum-shaped Customs (`aws.Region`,
-        // `aws.AvailabilityZone.ZoneName` — values written in the
-        // namespaced shorthand `dedicated`, `us_east_1a`) from
-        // structurally-validated Customs (`aws.Arn`,
-        // `aws.ec2.Vpc.Id` — values that already carry their own
-        // format like `arn:aws:s3:...` or `vpc-12345678`). Only the
-        // enum-shaped arm should pass the value through
-        // `expand_enum_shorthand`; the structural arm hands the raw
-        // text to the validator. See carina#3215 follow-up: the
-        // `namespace` field stays for now as the enum-marker; folding
-        // it into the structured identity is S2.5b's job.
-        let bare = TypeIdentity::bare("");
-        let id_for_resolve = identity.as_ref().unwrap_or(&bare);
-        let resolved_value = if namespace.is_some() {
-            Self::resolve_enum_input(id_for_resolve, value)
-        } else {
-            value.to_owned_value()
+    /// Validate against a `CustomEnum` variant: expand the namespaced
+    /// shorthand using the structured identity, then delegate to the
+    /// `validate` closure on the resolved value.
+    ///
+    /// Sibling of [`Self::validate_custom`]; the split was introduced
+    /// in carina#3222 so the enum-shorthand vs structural divide is a
+    /// type-level fact rather than a runtime `namespace.is_some()`
+    /// check. The carina#3216 class of mis-expansion (`aws.Arn`
+    /// values being silently rewritten into `aws.Arn.arn:aws:s3:...`)
+    /// is structurally impossible here because structural `Custom`
+    /// cannot reach this dispatch.
+    fn validate_custom_enum(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
+        let AttributeType::CustomEnum {
+            validate, identity, ..
+        } = self
+        else {
+            unreachable!("validate_custom_enum called on non-CustomEnum");
         };
+        let resolved_value = Self::resolve_enum_input(identity, value);
         validate(&resolved_value)
     }
 
@@ -1343,6 +1421,11 @@ impl AttributeType {
                 length,
                 ..
             } => custom_display_name(identity.as_ref(), pattern.as_deref(), length.as_ref()),
+            AttributeType::CustomEnum { identity, .. } => {
+                // CustomEnum carries no pattern/length — the value form
+                // is a namespaced enum, fully described by its identity.
+                custom_display_name(Some(identity), None, None)
+            }
             AttributeType::List { inner, .. } => format!("List<{}>", inner.type_name()),
             AttributeType::Map { value: inner, .. } => format!("Map<{}>", inner.type_name()),
             AttributeType::Struct { name, .. } => format!("Struct({})", name),
@@ -1474,15 +1557,23 @@ impl AttributeType {
     }
 }
 
-/// Build a structured [`TypeIdentity`] from a `StringEnum`'s
-/// `name + namespace` pair.
+/// Build a structured [`TypeIdentity`] from a `(name, namespace)`
+/// pair — the inverse of [`TypeIdentity::dotted_prefix`].
 ///
-/// The legacy `namespace` field is a dot-joined string of
-/// `provider.<segments...>`; this helper splits it back so the
-/// shorthand-expansion helper can derive the dotted prefix from the
-/// structure rather than parsing a flat string. Once `StringEnum`
-/// itself carries a `TypeIdentity`, this function disappears.
-fn string_enum_identity(name: &str, namespace: Option<&str>) -> TypeIdentity {
+/// `namespace` is a dot-joined `provider.<segments...>` string of the
+/// shape providers used to carry on the pre-#3222 `Custom.namespace` /
+/// `StringEnum.namespace` field. The provider segment is the head and
+/// every following segment goes into `segments`; `name` becomes the
+/// `kind`. A bare `name` with no namespace yields
+/// `TypeIdentity::bare(name)`.
+///
+/// Kept as a public helper because provider repositories
+/// (`carina-aws-types`, `carina-provider-{aws,awscc}`) still build
+/// `StringEnum.identity` / `CustomEnum.identity` from the same dotted
+/// inputs their codegen has carried for years; expressing that as
+/// "the inverse of `dotted_prefix`" is clearer than re-splitting at
+/// every call site.
+pub fn string_enum_identity(name: &str, namespace: Option<&str>) -> TypeIdentity {
     match namespace {
         Some(ns) if !ns.is_empty() => {
             let mut parts = ns.split('.');
@@ -1732,25 +1823,25 @@ fn reshape_for_string_literal(
         return tagged.into_string_literal_diagnostic();
     }
 
-    // Namespaced Custom: manually build the shape-mismatch diagnostic from
+    // CustomEnum: manually build the shape-mismatch diagnostic from
     // the semantic name. `ValidationFailed` has no attribute slot so
     // `with_attribute` is a no-op; we thread the attribute name in
     // explicitly. `expected` stays empty — custom validators don't
     // enumerate variants — and the original validator message rides on
     // `extra_message` so its detail (which often lists valid forms)
     // stays visible without polluting the structured candidates list.
-    if let AttributeType::Custom {
-        identity: Some(id),
-        namespace: Some(_),
-        ..
-    } = attr_type
+    //
+    // Pre-#3222 this matched on `Custom { namespace: Some(_), .. }`
+    // — the runtime enum-marker form. The shape moved to a sibling
+    // variant, so the match is now structural.
+    if let AttributeType::CustomEnum { identity, .. } = attr_type
         && let Value::Concrete(ConcreteValue::String(typed)) = value
         && let TypeError::ValidationFailed { message } = &tagged
     {
         return TypeError::StringLiteralExpectedEnum {
             user_typed: typed.clone(),
             attribute: Some(attr_name.to_string()),
-            type_name: id.kind.clone(),
+            type_name: identity.kind.clone(),
             expected: Vec::new(),
             extra_message: Some(message.clone()),
         };
@@ -2967,8 +3058,6 @@ pub mod types {
                     Err("Expected integer".to_string())
                 }
             }),
-            namespace: None,
-            to_dsl: None,
         }
     }
 
@@ -2986,8 +3075,6 @@ pub mod types {
                     Err("Expected string".to_string())
                 }
             }),
-            namespace: None,
-            to_dsl: None,
         }
     }
 
@@ -3005,8 +3092,6 @@ pub mod types {
                     Err("Expected string".to_string())
                 }
             }),
-            namespace: None,
-            to_dsl: None,
         }
     }
 
@@ -3024,8 +3109,6 @@ pub mod types {
                     Err("Expected string".to_string())
                 }
             }),
-            namespace: None,
-            to_dsl: None,
         }
     }
 
@@ -3043,8 +3126,6 @@ pub mod types {
                     Err("Expected string".to_string())
                 }
             }),
-            namespace: None,
-            to_dsl: None,
         }
     }
 
@@ -3071,8 +3152,6 @@ pub mod types {
                     Err("Expected string".to_string())
                 }
             }),
-            namespace: None,
-            to_dsl: None,
         }
     }
 }

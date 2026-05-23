@@ -254,7 +254,10 @@ fn enum_schemas() -> SchemaRegistry {
     let mode = AttributeType::StringEnum {
         name: "Mode".to_string(),
         values: vec!["fast".to_string(), "slow".to_string()],
-        namespace: Some("test.r".to_string()),
+        identity: Some(carina_core::schema::string_enum_identity(
+            "Mode",
+            Some("test.r"),
+        )),
         dsl_aliases: vec![],
     };
     single_schema_map(
@@ -350,13 +353,10 @@ fn region_schemas() -> SchemaRegistry {
         s.replace('-', "_")
     }
 
-    let region_custom = AttributeType::Custom {
-        identity: Some(carina_core::schema::TypeIdentity::bare("Region")),
+    let region_custom = AttributeType::CustomEnum {
+        identity: carina_core::schema::string_enum_identity("Region", Some("test")),
         base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
         validate: legacy_validator(validate_region),
-        namespace: Some("test".to_string()),
         to_dsl: Some(to_dsl),
     };
 
@@ -851,8 +851,6 @@ fn wasm_style_vpc_schema() -> ResourceSchema {
         length: None,
         base: Box::new(AttributeType::String),
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     };
     ResourceSchema::new("ec2.security_group")
         .attribute(AttributeSchema::new(
@@ -943,8 +941,6 @@ fn wasm_style_subnet_schema() -> ResourceSchema {
         length: None,
         base: Box::new(AttributeType::String),
         validate: noop_validator(),
-        namespace: None,
-        to_dsl: None,
     };
     ResourceSchema::new("ec2.subnet").attribute(AttributeSchema::new(
         "vpc_ids",
@@ -1058,8 +1054,6 @@ fn vpc_id_custom_type_2358() -> AttributeType {
         length: None,
         base: Box::new(AttributeType::String),
         validate: legacy_validator(vpc_id_validate_2358),
-        namespace: None,
-        to_dsl: None,
     }
 }
 

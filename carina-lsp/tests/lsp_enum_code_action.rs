@@ -25,7 +25,10 @@ fn versioning_schema() -> SchemaRegistry {
     let versioning = AttributeType::StringEnum {
         name: "VersioningStatus".to_string(),
         values: vec!["Enabled".to_string(), "Suspended".to_string()],
-        namespace: Some("aws.s3.Bucket".to_string()),
+        identity: Some(carina_core::schema::string_enum_identity(
+            "VersioningStatus",
+            Some("aws.s3.Bucket"),
+        )),
         dsl_aliases: vec![
             ("Enabled".to_string(), "enabled".to_string()),
             ("Suspended".to_string(), "suspended".to_string()),
@@ -172,7 +175,7 @@ fn bare_mode_schema() -> SchemaRegistry {
     let mode = AttributeType::StringEnum {
         name: "Mode".to_string(),
         values: vec!["fast".to_string(), "slow".to_string()],
-        namespace: None,
+        identity: None,
         dsl_aliases: vec![],
     };
     let mut schemas = SchemaRegistry::new();

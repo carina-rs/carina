@@ -2106,14 +2106,10 @@ mod tests {
                 pattern: None,
                 length: None,
                 validate: noop_validator(),
-                namespace: None,
-                to_dsl: None,
             }),
             pattern: None,
             length: None,
             validate: noop_validator(),
-            namespace: None,
-            to_dsl: None,
         };
         let schemas = schema_with_attr("name", kms_arn);
         let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
@@ -2161,8 +2157,6 @@ mod tests {
             pattern: None,
             length: None,
             validate: noop_validator(),
-            namespace: None,
-            to_dsl: None,
         };
         let schemas = schema_with_attr("name", aws_account_id);
         let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);

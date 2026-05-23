@@ -667,7 +667,7 @@ pub fn resolve_enum_value(value: &Value, parts: &NamespacedEnumParts<'_>) -> Opt
 /// let status_enum = AttributeType::StringEnum {
 ///     name: "VersioningStatus".to_string(),
 ///     values: vec!["Enabled".to_string(), "Suspended".to_string()],
-///     namespace: Some("aws.s3.Bucket".to_string()),
+///     identity: Some(carina_core::schema::string_enum_identity("VersioningStatus", Some("aws.s3.Bucket"))),
 ///     dsl_aliases: vec![],
 /// };
 /// let config = AttributeType::Struct {
@@ -2022,7 +2022,10 @@ mod tests {
             AttributeType::StringEnum {
                 name: "VersioningStatus".to_string(),
                 values: vec!["Enabled".to_string(), "Suspended".to_string()],
-                namespace: Some("aws.s3.Bucket".to_string()),
+                identity: Some(crate::schema::string_enum_identity(
+                    "VersioningStatus",
+                    Some("aws.s3.Bucket"),
+                )),
                 dsl_aliases: vec![],
             }
         }
@@ -2047,7 +2050,10 @@ mod tests {
             let aliased = AttributeType::StringEnum {
                 name: "Effect".to_string(),
                 values: vec!["Allow".to_string(), "Deny".to_string()],
-                namespace: Some("aws.iam.PolicyDocument".to_string()),
+                identity: Some(crate::schema::string_enum_identity(
+                    "Effect",
+                    Some("aws.iam.PolicyDocument"),
+                )),
                 dsl_aliases: vec![
                     ("Allow".to_string(), "allow".to_string()),
                     ("Deny".to_string(), "deny".to_string()),
@@ -2250,7 +2256,10 @@ mod tests {
             let aliased = AttributeType::StringEnum {
                 name: "VersioningStatus".to_string(),
                 values: vec!["Enabled".to_string()],
-                namespace: Some("aws.s3.Bucket".to_string()),
+                identity: Some(crate::schema::string_enum_identity(
+                    "VersioningStatus",
+                    Some("aws.s3.Bucket"),
+                )),
                 dsl_aliases: vec![("Enabled".to_string(), "enabled".to_string())],
             };
             let resolved = resolve_enum_value_recursive(&s("Enabled"), &aliased).unwrap();
@@ -2377,7 +2386,10 @@ mod tests {
         let version_enum = AttributeType::StringEnum {
             name: "Version".to_string(),
             values: vec!["2012-10-17".to_string()],
-            namespace: Some("aws.iam.PolicyDocument".to_string()),
+            identity: Some(crate::schema::string_enum_identity(
+                "Version",
+                Some("aws.iam.PolicyDocument"),
+            )),
             dsl_aliases: vec![("2012-10-17".to_string(), "2012_10_17".to_string())],
         };
         let policy_struct = AttributeType::Struct {
@@ -2447,7 +2459,10 @@ mod tests {
         let version_enum = AttributeType::StringEnum {
             name: "Version".to_string(),
             values: vec!["2012-10-17".to_string()],
-            namespace: Some("aws.iam.PolicyDocument".to_string()),
+            identity: Some(crate::schema::string_enum_identity(
+                "Version",
+                Some("aws.iam.PolicyDocument"),
+            )),
             dsl_aliases: vec![("2012-10-17".to_string(), "2012_10_17".to_string())],
         };
         let policy_struct = AttributeType::Struct {

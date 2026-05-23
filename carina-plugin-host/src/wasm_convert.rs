@@ -712,7 +712,16 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
         } => CoreAttributeType::StringEnum {
             name: name.clone(),
             values: values.clone(),
-            namespace: namespace.clone(),
+            // Lift the wire-form flat dotted prefix into the
+            // structured `TypeIdentity` the core schema now carries
+            // (carina#3222). The pre-#3222 core form mirrored the
+            // wire form one-to-one; with the split, the wire form
+            // remains flat while the core form is structural — the
+            // boundary cost lives here.
+            identity: namespace
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|ns| carina_core::schema::string_enum_identity(name, Some(ns))),
             dsl_aliases: dsl_aliases.clone(),
         },
         proto::AttributeType::List { inner, ordered } => CoreAttributeType::List {
@@ -730,11 +739,7 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
         proto::AttributeType::Union { members } => {
             CoreAttributeType::Union(members.iter().map(proto_attr_type_to_core).collect())
         }
-        proto::AttributeType::Custom {
-            name,
-            base,
-            namespace,
-        } => CoreAttributeType::Custom {
+        proto::AttributeType::Custom { name, base } => CoreAttributeType::Custom {
             identity: if name.is_empty() {
                 None
             } else {
@@ -744,7 +749,21 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
             pattern: None,
             length: None,
             validate: noop_validator(), // Validation is handled via ProviderContext.validators
-            namespace: namespace.clone(),
+        },
+        proto::AttributeType::CustomEnum {
+            name,
+            base,
+            namespace,
+        } => CoreAttributeType::CustomEnum {
+            // CustomEnum requires a populated identity (the
+            // shorthand expansion needs the dotted prefix);
+            // `string_enum_identity` is the inverse of
+            // `TypeIdentity::dotted_prefix` and recovers the
+            // structured form from the wire's flat `namespace + name`
+            // shape.
+            identity: carina_core::schema::string_enum_identity(name, Some(namespace.as_str())),
+            base: Box::new(proto_attr_type_to_core(base)),
+            validate: noop_validator(), // Validation is handled via ProviderContext.validators
             to_dsl: None,
         },
     }

@@ -267,7 +267,7 @@ fn list_item_type_validation() {
     let list_enum = AttributeType::list(AttributeType::StringEnum {
         name: "Protocol".to_string(),
         values: vec!["tcp".to_string(), "udp".to_string()],
-        namespace: None,
+        identity: None,
         dsl_aliases: vec![],
     });
 
@@ -353,7 +353,7 @@ fn union_static_value_validated() {
                 AttributeType::StringEnum {
                     name: "Mode".to_string(),
                     values: vec!["active".to_string(), "passive".to_string()],
-                    namespace: None,
+                    identity: None,
                     dsl_aliases: vec![],
                 },
                 AttributeType::Int,
@@ -406,7 +406,7 @@ fn union_valid_static_value_no_warning() {
                 AttributeType::StringEnum {
                     name: "Mode".to_string(),
                     values: vec!["active".to_string(), "passive".to_string()],
-                    namespace: None,
+                    identity: None,
                     dsl_aliases: vec![],
                 },
                 AttributeType::Int,
@@ -452,7 +452,7 @@ fn union_valid_int_value_no_warning() {
                 AttributeType::StringEnum {
                     name: "Mode".to_string(),
                     values: vec!["active".to_string(), "passive".to_string()],
-                    namespace: None,
+                    identity: None,
                     dsl_aliases: vec![],
                 },
                 AttributeType::Int,
@@ -1303,13 +1303,10 @@ fn resource_ref_type_check_helper_regression() {
         .attribute(AttributeSchema::new("name", AttributeType::String))
         .attribute(AttributeSchema::new(
             "my_id",
-            AttributeType::Custom {
-                identity: Some(carina_core::schema::TypeIdentity::bare("MyId")),
+            AttributeType::CustomEnum {
+                identity: carina_core::schema::string_enum_identity("MyId", Some("test")),
                 base: Box::new(AttributeType::String),
-                pattern: None,
-                length: None,
                 validate: legacy_validator(dummy_validate),
-                namespace: Some("test".to_string()),
                 to_dsl: None,
             },
         ));
@@ -1325,19 +1322,16 @@ fn resource_ref_type_check_helper_regression() {
             AttributeType::StringEnum {
                 name: "Status".to_string(),
                 values: vec!["active".to_string(), "inactive".to_string()],
-                namespace: None,
+                identity: None,
                 dsl_aliases: vec![],
             },
         ))
         .attribute(AttributeSchema::new(
             "custom_attr",
-            AttributeType::Custom {
-                identity: Some(carina_core::schema::TypeIdentity::bare("MyId")),
+            AttributeType::CustomEnum {
+                identity: carina_core::schema::string_enum_identity("MyId", Some("test")),
                 base: Box::new(AttributeType::String),
-                pattern: None,
-                length: None,
                 validate: legacy_validator(dummy_validate),
-                namespace: Some("test".to_string()),
                 to_dsl: None,
             },
         ));
@@ -1684,7 +1678,7 @@ fn map_key_validation_warns_on_invalid_key() {
         AttributeType::StringEnum {
             name: "ConditionOperator".to_string(),
             values: vec!["string_equals".to_string(), "string_like".to_string()],
-            namespace: None,
+            identity: None,
             dsl_aliases: vec![],
         },
         AttributeType::map(AttributeType::String),
@@ -1773,13 +1767,15 @@ fn distinct_semantic_customs_are_rejected() {
         .attribute(AttributeSchema::new(
             "account_id",
             AttributeType::Custom {
-                identity: Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
+                identity: Some(carina_core::schema::TypeIdentity::new(
+                    Some("aws"),
+                    Vec::<String>::new(),
+                    "AwsAccountId",
+                )),
                 base: Box::new(AttributeType::String),
                 pattern: None,
                 length: None,
                 validate: legacy_validator(validate_account_id),
-                namespace: Some("aws".to_string()),
-                to_dsl: None,
             },
         ));
 
@@ -1787,13 +1783,15 @@ fn distinct_semantic_customs_are_rejected() {
     let target_schema = ResourceSchema::new("sso.Assignment").attribute(AttributeSchema::new(
         "target_id",
         AttributeType::Custom {
-            identity: Some(carina_core::schema::TypeIdentity::bare("TargetId")),
+            identity: Some(carina_core::schema::TypeIdentity::new(
+                Some("awscc"),
+                Vec::<String>::new(),
+                "TargetId",
+            )),
             base: Box::new(AttributeType::String),
             pattern: None,
             length: None,
             validate: legacy_validator(validate_target_id),
-            namespace: Some("awscc".to_string()),
-            to_dsl: None,
         },
     ));
 
@@ -1846,8 +1844,6 @@ fn exports_cross_file_ref_no_false_positive() {
             )),
             _ => Err("expected string".to_string()),
         }),
-        namespace: None,
-        to_dsl: None,
     };
     let schema = ResourceSchema::new("organizations.account")
         .attribute(AttributeSchema::new("account_id", aws_account_id_type));
