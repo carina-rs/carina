@@ -638,13 +638,9 @@ impl AttributeType {
     /// Phase 2 of RFC #2972: the pre-Phase-2 `ResourceRef` short-circuit
     /// is gone — deferred values are filtered by the dispatcher in
     /// [`Self::validate`] and cannot reach this path.
-    fn resolve_enum_input(
-        name: &str,
-        namespace: Option<&str>,
-        value: ConcreteValueRef<'_>,
-    ) -> Value {
+    fn resolve_enum_input(identity: &TypeIdentity, value: ConcreteValueRef<'_>) -> Value {
         let owned = value.to_owned_value();
-        crate::utils::expand_enum_shorthand(&owned, name, namespace)
+        crate::utils::expand_enum_shorthand(&owned, identity)
     }
 
     pub fn string_enum_parts(&self) -> Option<StringEnumParts<'_>> {
@@ -989,7 +985,11 @@ impl AttributeType {
             });
         }
 
-        let resolved_value = Self::resolve_enum_input(name, namespace.as_deref(), value);
+        // Build a structured identity from the legacy `name + namespace`
+        // pair so the shorthand-expansion helper can reuse the same
+        // `TypeIdentity`-keyed projection as `Custom`.
+        let identity = string_enum_identity(name, namespace.as_deref());
+        let resolved_value = Self::resolve_enum_input(&identity, value);
         // Capture the user's original input for diagnostics. The parser
         // emits `ConcreteValue::EnumIdentifier` for bare identifier short
         // forms (`dedicated`) and dotted forms (`aws.s3.Bucket.VersioningStatus.Enabled`).
@@ -1111,9 +1111,10 @@ impl AttributeType {
             unreachable!("validate_custom called on non-Custom");
         };
 
-        let name_for_resolve = identity.as_ref().map(|id| id.kind.as_str()).unwrap_or("");
-        let resolved_value =
-            Self::resolve_enum_input(name_for_resolve, namespace.as_deref(), value);
+        let _ = namespace; // superseded by `identity`; kept as a field for now (FIXME: remove `Custom.namespace`)
+        let bare = TypeIdentity::bare("");
+        let id_for_resolve = identity.as_ref().unwrap_or(&bare);
+        let resolved_value = Self::resolve_enum_input(id_for_resolve, value);
         validate(&resolved_value)
     }
 
@@ -1449,6 +1450,30 @@ impl AttributeType {
             (_non_custom, Custom { .. }) => false,
             (a, b) => a.type_name() == b.type_name(),
         }
+    }
+}
+
+/// Build a structured [`TypeIdentity`] from a `StringEnum`'s
+/// `name + namespace` pair.
+///
+/// The legacy `namespace` field is a dot-joined string of
+/// `provider.<segments...>`; this helper splits it back so the
+/// shorthand-expansion helper can derive the dotted prefix from the
+/// structure rather than parsing a flat string. Once `StringEnum`
+/// itself carries a `TypeIdentity`, this function disappears.
+fn string_enum_identity(name: &str, namespace: Option<&str>) -> TypeIdentity {
+    match namespace {
+        Some(ns) if !ns.is_empty() => {
+            let mut parts = ns.split('.');
+            let provider = parts.next().map(String::from);
+            let segments: Vec<String> = parts.map(String::from).collect();
+            TypeIdentity {
+                provider,
+                segments,
+                kind: name.to_string(),
+            }
+        }
+        _ => TypeIdentity::bare(name),
     }
 }
 
