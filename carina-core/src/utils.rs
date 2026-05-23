@@ -247,15 +247,12 @@ pub fn expand_enum_shorthand(value: &Value, identity: &crate::schema::TypeIdenti
         Value::Concrete(ConcreteValue::EnumIdentifier(s)) => Some(s.as_str()),
         _ => None,
     };
-    // The legacy `name` argument used to be the enum type name —
-    // typically the last service/resource segment (or the kind if
-    // segments are empty). We still need it to recognise the
-    // `TypeName.value` 2-part shorthand below.
-    let enum_type_name: &str = identity
-        .segments
-        .last()
-        .map(String::as_str)
-        .unwrap_or(&identity.kind);
+    // The kind is the type's own name and matches the leading
+    // `TypeName` of the 2-part `TypeName.value` shorthand:
+    // `InstanceTenancy.dedicated` against a Custom whose kind is
+    // `InstanceTenancy`, or `ZoneName.us_east_1a` against the
+    // zone-name AvailabilityZone type.
+    let enum_type_name: &str = &identity.kind;
     match text_form {
         Some(s) if !s.contains('.') => {
             if identity.provider.is_some() {
