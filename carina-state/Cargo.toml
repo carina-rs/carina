@@ -26,3 +26,13 @@ hostname = "0.4"
 [dev-dependencies]
 indexmap = "2"
 tempfile = "3"
+# In-process AWS service emulator: the S3 backend's integration tests
+# inject a winterbaume-backed S3 client and exercise the StateBackend
+# I/O path with no real AWS and no external process (#3203).
+winterbaume-core = "0.2"
+winterbaume-s3 = "0.2"
+# Lets the s3.rs unit tests build a real HTTP response (with a status
+# code) so the HTTP-status-based not-found classifier can be exercised
+# directly.
+aws-smithy-runtime-api = { version = "1", features = ["http-1x"] }
+aws-smithy-types = "1"
