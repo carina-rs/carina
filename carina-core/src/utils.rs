@@ -205,18 +205,28 @@ fn is_intermediate_segment(s: &str) -> bool {
 
 /// Expand a user-written enum value into its fully-qualified DSL form.
 ///
+/// `identity` is the structured [`crate::schema::TypeIdentity`] of the
+/// receiving attribute; the expanded form is the identity's dotted
+/// display followed by the value — `aws.iam.Role.Arn.<v>` for a
+/// fully-segmented identity, `aws.Region.<v>` for a bare-segment one,
+/// `aws.AvailabilityZone.ZoneName.<v>` for the segments + kind case
+/// users now write. The 2-part `TypeName.member` shorthand is
+/// recognised when `TypeName` matches the identity's enum type name
+/// (its last segment, or the kind if segments are empty).
+///
 /// Accepts the three input shapes the DSL allows for `StringEnum` and
 /// enum-like `Custom` attributes:
 ///
-/// - bare member (`dedicated`) → `<namespace>.<name>.dedicated`
+/// - bare member (`dedicated`) → `{identity}.dedicated`
 /// - `TypeName.member` shorthand (`InstanceTenancy.dedicated`) →
-///   `<namespace>.<name>.dedicated`, only when `TypeName == name`
-/// - any other input (already-qualified, foreign type name, missing
-///   namespace, non-string) → returned unchanged
+///   `{identity}.dedicated`, only when the type name matches the
+///   identity's enum type name
+/// - any other input (already-qualified, foreign type name, identity
+///   with no provider axis, non-string) → returned unchanged
 ///
 /// Used by both `AttributeType::resolve_value` and the LSP diagnostic
 /// pipeline so the two paths cannot drift.
-pub fn expand_enum_shorthand(value: &Value, name: &str, namespace: Option<&str>) -> Value {
+pub fn expand_enum_shorthand(value: &Value, identity: &crate::schema::TypeIdentity) -> Value {
     // Phase 4 of carina#2986: `EnumIdentifier` carries the same textual
     // payload as `String` (only the source-shape tag differs) and goes
     // through the same namespace expansion. The result is materialized as
@@ -226,28 +236,40 @@ pub fn expand_enum_shorthand(value: &Value, name: &str, namespace: Option<&str>)
     // `Value::Concrete(ConcreteValue::String)` arm. The `EnumIdentifier`
     // distinction is a parser-level signal used for strict shape
     // enforcement at the validator entry, not a wire-level form.
+    //
+    // The expanded form is the dotted display of the structured
+    // identity followed by the value: `{provider}.{segments...}.{kind}.{value}`
+    // — same shape as the type's `TypeIdentity::Display`. For a bare
+    // identity with no provider axis the shorthand passes through
+    // unchanged (no namespace to prefix).
     let text_form: Option<&str> = match value {
         Value::Concrete(ConcreteValue::String(s)) => Some(s.as_str()),
         Value::Concrete(ConcreteValue::EnumIdentifier(s)) => Some(s.as_str()),
         _ => None,
     };
+    // The kind is the type's own name and matches the leading
+    // `TypeName` of the 2-part `TypeName.value` shorthand:
+    // `InstanceTenancy.dedicated` against a Custom whose kind is
+    // `InstanceTenancy`, or `ZoneName.us_east_1a` against the
+    // zone-name AvailabilityZone type.
+    let enum_type_name: &str = &identity.kind;
     match text_form {
-        Some(s) if !s.contains('.') => match namespace {
-            Some(ns) => Value::Concrete(ConcreteValue::String(format!("{}.{}.{}", ns, name, s))),
-            None => Value::Concrete(ConcreteValue::String(s.to_string())),
-        },
+        Some(s) if !s.contains('.') => {
+            if identity.provider.is_some() {
+                Value::Concrete(ConcreteValue::String(format!("{}.{}", identity, s)))
+            } else {
+                Value::Concrete(ConcreteValue::String(s.to_string()))
+            }
+        }
         Some(s) => {
             if let Some(NamespacedId::TypeQualified {
                 type_name: ident,
                 value: member,
             }) = NamespacedId::parse(s)
-                && let Some(ns) = namespace
-                && ident == name
+                && identity.provider.is_some()
+                && ident == enum_type_name
             {
-                Value::Concrete(ConcreteValue::String(format!(
-                    "{}.{}.{}",
-                    ns, ident, member
-                )))
+                Value::Concrete(ConcreteValue::String(format!("{}.{}", identity, member)))
             } else {
                 Value::Concrete(ConcreteValue::String(s.to_string()))
             }
@@ -1688,31 +1710,30 @@ mod tests {
     // function must keep on both sides.
     #[test]
     fn expand_enum_shorthand_table() {
-        // (input, name, namespace, expected_output_string_or_passthrough)
-        // `None` for namespace means "no namespace" — bare and 2-part inputs
-        // pass through unchanged.
-        let cases: &[(Value, &str, Option<&str>, Value)] = &[
-            // bare member + namespace → fully qualified
+        use crate::schema::TypeIdentity;
+        // (input, identity, expected_output)
+        // A bare identity (no provider axis) passes shorthand through;
+        // a provider-scoped identity expands bare/2-part inputs into the
+        // full `{identity}.{value}` form.
+        let cases: &[(Value, TypeIdentity, Value)] = &[
+            // bare member + provider-scoped identity → fully qualified
             (
                 Value::Concrete(ConcreteValue::String("dedicated".into())),
-                "InstanceTenancy",
-                Some("awscc.ec2.Vpc"),
+                TypeIdentity::new(Some("awscc"), ["ec2", "Vpc"], "InstanceTenancy"),
                 Value::Concrete(ConcreteValue::String(
                     "awscc.ec2.Vpc.InstanceTenancy.dedicated".into(),
                 )),
             ),
-            // bare member, no namespace → passthrough
+            // bare member, bare identity → passthrough
             (
                 Value::Concrete(ConcreteValue::String("dedicated".into())),
-                "InstanceTenancy",
-                None,
+                TypeIdentity::bare("InstanceTenancy"),
                 Value::Concrete(ConcreteValue::String("dedicated".into())),
             ),
-            // TypeName.member matching `name` → fully qualified
+            // TypeName.member matching the enum type name → fully qualified
             (
                 Value::Concrete(ConcreteValue::String("InstanceTenancy.dedicated".into())),
-                "InstanceTenancy",
-                Some("awscc.ec2.Vpc"),
+                TypeIdentity::new(Some("awscc"), ["ec2", "Vpc"], "InstanceTenancy"),
                 Value::Concrete(ConcreteValue::String(
                     "awscc.ec2.Vpc.InstanceTenancy.dedicated".into(),
                 )),
@@ -1720,8 +1741,7 @@ mod tests {
             // TypeName.member with foreign type name → passthrough
             (
                 Value::Concrete(ConcreteValue::String("Tenancy.dedicated".into())),
-                "InstanceTenancy",
-                Some("awscc.ec2.Vpc"),
+                TypeIdentity::new(Some("awscc"), ["ec2", "Vpc"], "InstanceTenancy"),
                 Value::Concrete(ConcreteValue::String("Tenancy.dedicated".into())),
             ),
             // Already-fully-qualified → passthrough (parser returns
@@ -1730,8 +1750,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::String(
                     "awscc.ec2.Vpc.InstanceTenancy.dedicated".into(),
                 )),
-                "InstanceTenancy",
-                Some("awscc.ec2.Vpc"),
+                TypeIdentity::new(Some("awscc"), ["ec2", "Vpc"], "InstanceTenancy"),
                 Value::Concrete(ConcreteValue::String(
                     "awscc.ec2.Vpc.InstanceTenancy.dedicated".into(),
                 )),
@@ -1739,21 +1758,29 @@ mod tests {
             // Lowercase first segment → not a TypeName; passthrough
             (
                 Value::Concrete(ConcreteValue::String("instanceTenancy.dedicated".into())),
-                "InstanceTenancy",
-                Some("awscc.ec2.Vpc"),
+                TypeIdentity::new(Some("awscc"), ["ec2", "Vpc"], "InstanceTenancy"),
                 Value::Concrete(ConcreteValue::String("instanceTenancy.dedicated".into())),
             ),
             // Non-string → passthrough
             (
                 Value::Concrete(ConcreteValue::Bool(true)),
-                "Whatever",
-                Some("aws"),
+                TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Whatever"),
                 Value::Concrete(ConcreteValue::Bool(true)),
             ),
+            // Provider-scoped identity with `segments` (typical S2.5 form
+            // — `aws.AvailabilityZone.ZoneName.us_east_1a`): bare value
+            // expands into the full dotted form including the kind.
+            (
+                Value::Concrete(ConcreteValue::String("us_east_1a".into())),
+                TypeIdentity::new(Some("aws"), ["AvailabilityZone"], "ZoneName"),
+                Value::Concrete(ConcreteValue::String(
+                    "aws.AvailabilityZone.ZoneName.us_east_1a".into(),
+                )),
+            ),
         ];
-        for (input, name, ns, expected) in cases {
-            let actual = expand_enum_shorthand(input, name, *ns);
-            assert_eq!(actual, *expected, "input={input:?} name={name:?} ns={ns:?}",);
+        for (input, identity, expected) in cases {
+            let actual = expand_enum_shorthand(input, identity);
+            assert_eq!(actual, *expected, "input={input:?} identity={identity:?}",);
         }
     }
 

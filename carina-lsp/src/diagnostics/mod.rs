@@ -568,17 +568,16 @@ impl DiagnosticEngine {
                                     ) {
                                         None
                                     } else {
-                                        let kind = identity
-                                            .as_ref()
-                                            .map(|id| id.kind.as_str())
-                                            .unwrap_or("");
+                                        let _ = namespace; // superseded by structured `identity` (see carina-core::utils::expand_enum_shorthand)
+                                        let bare = carina_core::schema::TypeIdentity::bare("");
+                                        let id_for_resolve = identity.as_ref().unwrap_or(&bare);
+                                        let kind = id_for_resolve.kind.as_str();
                                         // Handle bare/shorthand enum identifiers by expanding to full namespace format.
                                         // These are String values like "dedicated" or "InstanceTenancy.dedicated".
                                         let resolved_value =
                                             carina_core::utils::expand_enum_shorthand(
                                                 value,
-                                                kind,
-                                                namespace.as_deref(),
+                                                id_for_resolve,
                                             );
 
                                         // Run the schema-attached validator first; for WASM-plugin

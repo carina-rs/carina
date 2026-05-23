@@ -143,7 +143,15 @@ fn string_literal_expected_enum_custom_namespaced_display() {
         AttributeSchema::new(
             "mode",
             AttributeType::Custom {
-                identity: Some(carina_core::schema::TypeIdentity::bare("Mode")),
+                // Structured identity matching the legacy `namespace: "test.r"`
+                // shorthand prefix: provider=test, segments=[r], kind=Mode.
+                // The dotted display is `test.r.Mode`, which is the prefix
+                // `expand_enum_shorthand` now derives from `identity`.
+                identity: Some(carina_core::schema::TypeIdentity::new(
+                    Some("test"),
+                    ["r"],
+                    "Mode",
+                )),
                 base: Box::new(AttributeType::String),
                 pattern: None,
                 length: None,
