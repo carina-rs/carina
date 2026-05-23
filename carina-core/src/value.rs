@@ -3245,6 +3245,7 @@ mod tests {
             pattern: None,
             length: None,
             validate: std::sync::Arc::new(|_| Ok(())),
+            to_dsl: None,
         };
         let v = Value::Concrete(ConcreteValue::String("x".to_string()));
         let canon = canonicalize_with_type(v, &t);

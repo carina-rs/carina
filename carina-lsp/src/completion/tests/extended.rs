@@ -2704,6 +2704,7 @@ fn exports_map_value_offers_matching_resource_refs() {
         pattern: None,
         length: None,
         validate: legacy_validator(validate_noop),
+        to_dsl: None,
     };
     let schema = ResourceSchema::new("organizations.account")
         .attribute(AttributeSchema::new("account_id", account_id));
@@ -2787,6 +2788,7 @@ fn exports_map_value_multiple_entries_returns_refs() {
         pattern: None,
         length: None,
         validate: legacy_validator(validate_noop),
+        to_dsl: None,
     };
     let schema = ResourceSchema::new("organizations.account")
         .attribute(AttributeSchema::new("account_id", account_id));
@@ -2843,6 +2845,7 @@ fn exports_map_value_includes_bindings_from_sibling_files() {
         pattern: None,
         length: None,
         validate: legacy_validator(validate_noop),
+        to_dsl: None,
     };
     let schema = ResourceSchema::new("organizations.account")
         .attribute(AttributeSchema::new("account_id", account_id));
@@ -2899,6 +2902,7 @@ fn custom_type_value_ref_includes_sibling_file_bindings() {
         pattern: None,
         length: None,
         validate: legacy_validator(validate_noop),
+        to_dsl: None,
     };
     let account_schema = ResourceSchema::new("organizations.account")
         .attribute(AttributeSchema::new("account_id", account_id.clone()));
@@ -2998,6 +3002,7 @@ fn binding_dot_completion_resolves_sibling_file_binding() {
         pattern: None,
         length: None,
         validate: legacy_validator(validate_noop),
+        to_dsl: None,
     };
     let account_schema = ResourceSchema::new("organizations.account")
         .attribute(AttributeSchema::new("account_id", account_id.clone()));
@@ -3232,6 +3237,7 @@ fn upstream_state_string_export_not_offered_to_specific_custom_receiver() {
         length: None,
         base: Box::new(AttributeType::String),
         validate: legacy_validator(noop),
+        to_dsl: None,
     };
     let schema = ResourceSchema::new("ec2.SecurityGroup")
         .attribute(AttributeSchema::new("vpc_id", vpc_id_type));

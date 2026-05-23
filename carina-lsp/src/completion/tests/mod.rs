@@ -223,6 +223,7 @@ pub(super) fn test_provider_with_vpc_and_security_group() -> CompletionProvider 
         pattern: None,
         length: None,
         validate: legacy_validator(noop_validate),
+        to_dsl: None,
     };
     let vpc = ResourceSchema::new("ec2.Vpc")
         .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
@@ -250,6 +251,7 @@ pub(super) fn test_provider_with_custom_semantic_attr() -> CompletionProvider {
         pattern: None,
         length: None,
         validate: legacy_validator(noop_validate),
+        to_dsl: None,
     };
     let principal_type = AttributeType::StringEnum {
         name: "PrincipalType".to_string(),

@@ -749,6 +749,11 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
             pattern: None,
             length: None,
             validate: noop_validator(), // Validation is handled via ProviderContext.validators
+            // `to_dsl` is a `fn` pointer that does not survive the
+            // WASM-component boundary; host-side normalization for
+            // plugin-provided types is registered separately, so this
+            // arm always sees `None` after the proto→core lift.
+            to_dsl: None,
         },
         proto::AttributeType::CustomEnum {
             name,

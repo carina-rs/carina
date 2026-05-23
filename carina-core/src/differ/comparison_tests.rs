@@ -113,6 +113,7 @@ fn type_aware_custom_delegates_to_base() {
         pattern: None,
         length: None,
         validate: noop_validator(),
+        to_dsl: None,
     };
     assert!(type_aware_equal(
         &Value::Concrete(ConcreteValue::Int(8080)),
@@ -351,6 +352,7 @@ fn type_aware_struct_ignores_default_custom_type() {
                     pattern: None,
                     length: None,
                     validate: noop_validator(),
+                    to_dsl: None,
                 },
             ),
         ],
@@ -1029,6 +1031,7 @@ fn union_string_or_list_through_custom_wrapper() {
         pattern: None,
         length: None,
         validate: std::sync::Arc::new(|_| Ok(())),
+        to_dsl: None,
     };
     let a = Value::Concrete(ConcreteValue::StringList(vec!["x".to_string()]));
     let b = Value::Concrete(ConcreteValue::StringList(vec!["x".to_string()]));

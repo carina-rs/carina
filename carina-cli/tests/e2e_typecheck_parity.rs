@@ -851,6 +851,7 @@ fn wasm_style_vpc_schema() -> ResourceSchema {
         length: None,
         base: Box::new(AttributeType::String),
         validate: noop_validator(),
+        to_dsl: None,
     };
     ResourceSchema::new("ec2.security_group")
         .attribute(AttributeSchema::new(
@@ -941,6 +942,7 @@ fn wasm_style_subnet_schema() -> ResourceSchema {
         length: None,
         base: Box::new(AttributeType::String),
         validate: noop_validator(),
+        to_dsl: None,
     };
     ResourceSchema::new("ec2.subnet").attribute(AttributeSchema::new(
         "vpc_ids",
@@ -1054,6 +1056,7 @@ fn vpc_id_custom_type_2358() -> AttributeType {
         length: None,
         base: Box::new(AttributeType::String),
         validate: legacy_validator(vpc_id_validate_2358),
+        to_dsl: None,
     }
 }
 

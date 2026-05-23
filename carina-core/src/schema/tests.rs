@@ -1816,6 +1816,8 @@ fn validate_union_type() {
                 Err("Expected string".to_string())
             }
         }),
+
+        to_dsl: None,
     };
     let type_b = AttributeType::Custom {
         identity: Some(TypeIdentity::bare("TypeB")),
@@ -1833,6 +1835,8 @@ fn validate_union_type() {
                 Err("Expected string".to_string())
             }
         }),
+
+        to_dsl: None,
     };
 
     let union_type = AttributeType::Union(vec![type_a, type_b]);
@@ -1918,6 +1922,7 @@ fn union_type_name() {
         pattern: None,
         length: None,
         validate: noop_validator(),
+        to_dsl: None,
     };
     let type_b = AttributeType::Custom {
         identity: Some(TypeIdentity::bare("TypeB")),
@@ -1925,6 +1930,7 @@ fn union_type_name() {
         pattern: None,
         length: None,
         validate: noop_validator(),
+        to_dsl: None,
     };
 
     let union_type = AttributeType::Union(vec![type_a, type_b]);
@@ -1939,6 +1945,7 @@ fn union_accepts_type_name() {
         pattern: None,
         length: None,
         validate: noop_validator(),
+        to_dsl: None,
     };
     let type_b = AttributeType::Custom {
         identity: Some(TypeIdentity::bare("TypeB")),
@@ -1946,6 +1953,7 @@ fn union_accepts_type_name() {
         pattern: None,
         length: None,
         validate: noop_validator(),
+        to_dsl: None,
     };
 
     let union_type = AttributeType::Union(vec![type_a, type_b]);
@@ -2681,6 +2689,7 @@ fn make_custom(name: &str, base: AttributeType) -> AttributeType {
         pattern: None,
         length: None,
         validate: noop_validator(),
+        to_dsl: None,
     }
 }
 
@@ -2691,6 +2700,7 @@ fn make_custom_anon_pattern(pattern: &str) -> AttributeType {
         pattern: Some(pattern.to_string()),
         length: None,
         validate: noop_validator(),
+        to_dsl: None,
     }
 }
 
@@ -2701,6 +2711,7 @@ fn make_custom_anon_len(min: u64, max: u64) -> AttributeType {
         pattern: None,
         length: Some((Some(min), Some(max))),
         validate: noop_validator(),
+        to_dsl: None,
     }
 }
 
@@ -2744,6 +2755,7 @@ fn assignable_rejects_same_kind_across_providers() {
         pattern: None,
         length: None,
         validate: noop_validator(),
+        to_dsl: None,
     };
     let aws_region = provider_custom("aws");
     let gcp_region = provider_custom("gcp");
@@ -2764,6 +2776,7 @@ fn assignable_specific_arn_flows_into_generic_arn() {
         pattern: None,
         length: None,
         validate: noop_validator(),
+        to_dsl: None,
     };
     let generic = mk(&[]);
     let role_arn = mk(&["iam", "Role"]);
@@ -2792,6 +2805,7 @@ fn assignable_identity_axis_directionality() {
         pattern: None,
         length: None,
         validate: noop_validator(),
+        to_dsl: None,
     };
 
     // provider: None source → Some sink rejected
@@ -2818,6 +2832,7 @@ fn assignable_narrow_to_anonymous_unconstrained_sink() {
         pattern: None,
         length: None,
         validate: noop_validator(),
+        to_dsl: None,
     };
     assert!(account.is_assignable_to(&anon));
 }
@@ -2869,6 +2884,7 @@ fn assignable_union_source_requires_all_members_assignable() {
         pattern: None,
         length: None,
         validate: noop_validator(),
+        to_dsl: None,
     };
     let both_ok = AttributeType::Union(vec![vpc.clone(), vpc.clone()]);
     assert!(both_ok.is_assignable_to(&vpc));
@@ -2893,6 +2909,7 @@ fn semantic_custom_assigns_to_anonymous_unconstrained_sink() {
         pattern: None,
         length: None,
         validate: noop_validator(),
+        to_dsl: None,
     };
     assert!(vpc.is_assignable_to(&anon));
     // Reverse: anon has no proof it's a VpcId → NG.
@@ -2931,6 +2948,7 @@ fn make_custom_anon_pattern_and_len(
         pattern: pattern.map(str::to_string),
         length,
         validate: noop_validator(),
+        to_dsl: None,
     }
 }
 
@@ -3040,6 +3058,7 @@ fn custom_carries_semantic_name_pattern_length() {
         pattern: Some("^vpc-[a-f0-9]+$".to_string()),
         length: Some((Some(8), Some(21))),
         validate: noop_validator(),
+        to_dsl: None,
     };
     match t {
         AttributeType::Custom {
@@ -3064,6 +3083,7 @@ fn custom_type_name_anonymous_pattern_only() {
         pattern: Some("^foo$".to_string()),
         length: None,
         validate: noop_validator(),
+        to_dsl: None,
     };
     assert_eq!(t.type_name(), "String(pattern)");
 }
@@ -3076,6 +3096,7 @@ fn custom_type_name_anonymous_length_only() {
         pattern: None,
         length: Some((Some(1), Some(64))),
         validate: noop_validator(),
+        to_dsl: None,
     };
     assert_eq!(t.type_name(), "String(len: 1..=64)");
 }
@@ -3088,6 +3109,7 @@ fn custom_type_name_anonymous_pattern_and_length() {
         pattern: Some("^.*$".to_string()),
         length: Some((Some(1), Some(64))),
         validate: noop_validator(),
+        to_dsl: None,
     };
     assert_eq!(t.type_name(), "String(pattern, len: 1..=64)");
 }
@@ -3681,6 +3703,7 @@ fn union_string_vs_custom_picks_custom_error_for_string_input() {
             pattern: None,
             length: None,
             validate: legacy_validator(must_be_arn),
+            to_dsl: None,
         },
     ]);
     let err = union_type
@@ -3747,6 +3770,7 @@ fn union_custom_with_int_base_picks_custom_error_for_int_input() {
             pattern: None,
             length: None,
             validate: legacy_validator(must_be_positive),
+            to_dsl: None,
         },
         AttributeType::Bool,
     ]);
@@ -3821,6 +3845,8 @@ fn custom_validator_can_capture_external_state() {
                 got: other.type_name(),
             }),
         }),
+
+        to_dsl: None,
     };
     assert!(
         attr.validate(&Value::Concrete(ConcreteValue::String(
@@ -3868,6 +3894,8 @@ fn custom_validator_returns_structured_type_error_directly() {
                 got: other.type_name(),
             }),
         }),
+
+        to_dsl: None,
     };
     let err = attr
         .validate(&Value::Concrete(ConcreteValue::String(
@@ -3999,6 +4027,7 @@ fn walk_custom_lookup_skips_value_unknown() {
         identity: Some(TypeIdentity::bare("vpc_id")),
         pattern: None,
         length: None,
+        to_dsl: None,
     };
 
     let mut errors = Vec::new();
@@ -4041,6 +4070,7 @@ fn union_walk_custom_lookup_succeeds_when_any_member_accepts() {
         identity: Some(TypeIdentity::bare(name)),
         pattern: None,
         length: None,
+        to_dsl: None,
     };
     let union = AttributeType::Union(vec![custom("ok_arm"), custom("fail_arm")]);
 
@@ -4080,6 +4110,7 @@ fn union_walk_custom_lookup_emits_smallest_error_set_when_all_fail() {
         identity: Some(TypeIdentity::bare(name)),
         pattern: None,
         length: None,
+        to_dsl: None,
     };
     let union = AttributeType::Union(vec![custom("a"), custom("b")]);
 
