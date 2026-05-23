@@ -1,13 +1,15 @@
 # `Custom.namespace` / `StringEnum.namespace` Removal — Design
 
-Status: **One open decision.** The legacy `namespace: Option<String>`
-field is fully derivable from the structured `TypeIdentity` on the
-content axis, but it also carries an **enum-marker** meaning
-(introduced by the S2.5a hotfix, carina#3216) that `TypeIdentity` does
-not express. Removing the field cleanly requires picking a structured
-replacement for the marker. This document inventories the read
-surface, the cross-repo blast radius, and the two replacement shapes
-under consideration.
+Status: **All policy decided — Option A (`CustomEnum` variant).** The
+legacy `namespace: Option<String>` field is fully derivable from the
+structured `TypeIdentity` on the content axis, but it also carries
+an **enum-marker** meaning (introduced by the S2.5a hotfix,
+carina#3216) that `TypeIdentity` does not express. The enum-marker
+is replaced by promoting "enum-shaped Custom" to its own
+`AttributeType::CustomEnum` variant — lifting the marker from a
+runtime invariant to a compile-time fact. This document inventories
+the read surface, the cross-repo blast radius, and records the
+Option A vs Option B comparison that produced the decision.
 
 Date: 2026-05-23
 
@@ -135,11 +137,11 @@ takes `type-identity` (carina-plugin-wit#16, merged in S1), so the
 host-plugin in-process boundary is not affected by this change beyond
 the schema-transport JSON surface.
 
-## Open decision: how to replace the enum-marker
+## Decision: how to replace the enum-marker
 
 Bucket M needs a structured indicator that means *"this Custom's
-values are written in namespaced shorthand."* Two shapes are under
-consideration.
+values are written in namespaced shorthand."* Two shapes were
+considered; Option A is the adopted shape.
 
 ### Option A — `CustomEnum` as a sibling variant of `Custom`
 
@@ -263,10 +265,10 @@ enum AttributeType {
   closely; the schema's `match` retains a runtime branch where the
   LSP code has a structural one.
 
-### Recommendation
+### Decision: Option A
 
-**Option A (`CustomEnum` variant)**, weighting long-term
-maintainability and type safety per
+**Adopted 2026-05-23.** Option A (`CustomEnum` variant), weighting
+long-term maintainability and type safety per
 `[[feedback_long_term_and_type_safety]]`:
 
 - The enum-shorthand vs structurally-validated split is not a
@@ -285,40 +287,42 @@ maintainability and type safety per
   `[[feedback_type_safety_push_in_scope]]`: prove the invariant in
   the type system when you can, rather than at runtime.
 
-Option B is the smaller change today and the larger debt later.
-
-The recommendation is the **default** for the implementation PR. The
-user has the final call before the design doc merges; switching to
-Option B at that gate is cheap (just changes the implementation PR's
-plan, not the inventory above).
+Option B was rejected because it is the smaller change today and the
+larger debt later — the marker stays a runtime invariant where the
+type system could express it.
 
 ## Implementation sequence (post-design-merge)
 
 These are not part of this PR; they are the agreed scope for the
-follow-up implementation PR(s), gated on the design decision above.
-Listed here so the design doc captures the full plan.
+follow-up implementation PR(s). Listed here so the design doc
+captures the full plan. The chosen marker shape is Option A —
+`CustomEnum` variant.
 
 1. **carina-plugin-wit** — no change. The WIT boundary already carries
    `type-identity` for the only use that crosses it
    (`validate-custom-type`).
-2. **carina-core** — introduce the chosen replacement (`CustomEnum`
-   variant **or** `enum_shorthand: bool`); drop `Custom.namespace` and
-   `StringEnum.namespace`; derive the legacy dotted prefix via
+2. **carina-core** — introduce `AttributeType::CustomEnum`; drop
+   `Custom.namespace` and `StringEnum.namespace`; route the 31
+   `AttributeType::Custom { ... }` match sites either to the new
+   variant or to a combined arm where the marker meaning is
+   irrelevant; derive the legacy dotted prefix via
    `identity.dotted_prefix()` at the remaining `string_enum_parts` /
    diagnostic call sites.
 3. **carina-provider-protocol** — mirror the carina-core shape change
    on the JSON wire form. The protocol's `Custom { name, base,
-   namespace }` becomes either `Custom` + `CustomEnum` (Option A) or
-   `Custom { name, base, enum_shorthand }` (Option B).
+   namespace }` becomes `Custom` + `CustomEnum`.
    `carina-plugin-host::wasm_convert` updates accordingly.
 4. **carina-lsp** — update site 3 (the `validate_custom` mirror) to
-   the new marker; update `string_enum_parts`-style callers in
-   completion/diagnostics.
+   match on the new variant; update `string_enum_parts`-style
+   callers in completion/diagnostics.
 5. **carina-provider-aws** (carina-rs/carina-provider-aws) — mechanical
    per-site replacement in `carina-aws-types/src/lib.rs`,
    `src/factory.rs`, `src/convert.rs`, `src/schemas/types.rs`,
-   `src/main.rs`. Codegen template change if applicable. Regenerate
-   schemas; verify-diff against pre-rewrite snapshots.
+   `src/main.rs`. Legacy `namespace: Some(_)` constructors become
+   `CustomEnum { ... }`; `namespace: None` constructors keep the
+   `Custom` variant minus the field. Codegen template change if
+   applicable. Regenerate schemas; verify-diff against pre-rewrite
+   snapshots.
 6. **carina-provider-awscc** (carina-rs/carina-provider-awscc) — same
    plus the `src/bin/codegen.rs` template. The 145 sites include the
    generated `src/schemas/generated/*.rs` files; the template
