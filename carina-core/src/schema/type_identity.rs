@@ -147,6 +147,57 @@ impl TypeIdentity {
         }
         true
     }
+
+    /// Whether a value of `self`'s type can be assigned into a sink of
+    /// `other`'s type — **directional** per-axis subsumption.
+    ///
+    /// Unlike [`same_type`](Self::same_type), which is symmetric and
+    /// answers "do these denote the same type?", this method asks
+    /// "does the source carry enough provenance to satisfy the sink?".
+    /// The two rules are deliberately separate (see carina#3218): the
+    /// symmetric equivalence is correct for display and schema-registry
+    /// lookup, but the assignment check inside
+    /// [`AttributeType::is_assignable_to`] needs the directional shape.
+    ///
+    /// Rules, per-axis:
+    ///
+    /// - `kind` must match (the `kind` axis is never empty).
+    /// - `provider`: if the sink populates it (`Some(_)`), the source
+    ///   must populate it with the same value. A sink `None` (the
+    ///   provider-agnostic kind) accepts any provider on the source —
+    ///   widening is OK, narrowing is not.
+    /// - `segments`: if the sink populates `segments`, the source must
+    ///   carry **the same** segments. An empty source `segments` on a
+    ///   populated sink is rejected — the source carries no segment
+    ///   evidence that it satisfies the sink's resource scope (mirror
+    ///   of the existing "anonymous source → semantic sink" rule on
+    ///   `Custom.identity` itself). An empty sink `segments` accepts
+    ///   any source (the sink does not distinguish at this axis).
+    ///
+    /// This yields:
+    /// - `aws.iam.Role.Arn` (source) → `aws.Arn` (sink): **accepted**
+    ///   (narrower → wider on the segments axis).
+    /// - `aws.Arn` (source) → `aws.iam.Role.Arn` (sink): **rejected**
+    ///   (the empty `segments` source carries no evidence of being an
+    ///   IAM Role ARN).
+    /// - `aws.iam.Role.Arn` ↔ `aws.acm.Certificate.Arn`: rejected both
+    ///   ways (populated segments differ).
+    /// - `aws.Region` ↔ `gcp.Region`: rejected both ways (populated
+    ///   providers differ).
+    pub fn assignable_to(&self, sink: &TypeIdentity) -> bool {
+        if self.kind != sink.kind {
+            return false;
+        }
+        if let Some(sink_provider) = &sink.provider
+            && self.provider.as_deref() != Some(sink_provider.as_str())
+        {
+            return false;
+        }
+        if !sink.segments.is_empty() && self.segments != sink.segments {
+            return false;
+        }
+        true
+    }
 }
 
 impl fmt::Display for TypeIdentity {
@@ -264,6 +315,49 @@ mod tests {
         for s in ["aws.iam.Role.Arn", "aws.VpcId", "Ipv4Cidr"] {
             assert_eq!(TypeIdentity::from_dotted(s).to_string(), s);
         }
+    }
+
+    #[test]
+    fn assignable_to_is_directional_on_segments() {
+        let generic = TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Arn");
+        let role = TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn");
+        // narrower (populated segments) → wider (empty segments): OK
+        assert!(role.assignable_to(&generic));
+        // wider (empty segments) → narrower (populated segments): NG
+        assert!(!generic.assignable_to(&role));
+    }
+
+    #[test]
+    fn assignable_to_is_directional_on_provider() {
+        let bare = TypeIdentity::bare("Arn");
+        let scoped = TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Arn");
+        // narrower (Some provider) → wider (None provider): OK
+        assert!(scoped.assignable_to(&bare));
+        // wider (None provider) → narrower (Some provider): NG
+        assert!(!bare.assignable_to(&scoped));
+    }
+
+    #[test]
+    fn assignable_to_rejects_distinct_populated_axes() {
+        // aws.Region vs gcp.Region: providers differ → both directions NG.
+        let aws_region = TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region");
+        let gcp_region = TypeIdentity::new(Some("gcp"), Vec::<String>::new(), "Region");
+        assert!(!aws_region.assignable_to(&gcp_region));
+        assert!(!gcp_region.assignable_to(&aws_region));
+
+        // aws.iam.Role.Arn vs aws.acm.Certificate.Arn: segments differ.
+        let role = TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn");
+        let cert = TypeIdentity::new(Some("aws"), ["acm", "Certificate"], "Arn");
+        assert!(!role.assignable_to(&cert));
+        assert!(!cert.assignable_to(&role));
+    }
+
+    #[test]
+    fn assignable_to_kind_must_match() {
+        let arn = TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Arn");
+        let vpc_id = TypeIdentity::new(Some("aws"), Vec::<String>::new(), "VpcId");
+        assert!(!arn.assignable_to(&vpc_id));
+        assert!(!vpc_id.assignable_to(&arn));
     }
 
     #[test]

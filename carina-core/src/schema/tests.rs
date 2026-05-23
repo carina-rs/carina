@@ -2737,9 +2737,11 @@ fn assignable_rejects_same_kind_across_providers() {
 
 /// The generic provider-scoped `aws.Arn` (no service/resource segments)
 /// stays assignable against a more specific `aws.iam.Role.Arn`: an
-/// empty `segments` axis is the wider type, not a wildcard mismatch.
+/// `segments` is **directional**: an empty `segments` source carries
+/// no evidence of satisfying a populated `segments` sink. Closes
+/// carina#3218.
 #[test]
-fn assignable_allows_generic_arn_against_specific_arn() {
+fn assignable_specific_arn_flows_into_generic_arn() {
     let mk = |segments: &[&str]| AttributeType::Custom {
         identity: Some(TypeIdentity::new(Some("aws"), segments.to_vec(), "Arn")),
         base: Box::new(AttributeType::String),
@@ -2751,12 +2753,47 @@ fn assignable_allows_generic_arn_against_specific_arn() {
     };
     let generic = mk(&[]);
     let role_arn = mk(&["iam", "Role"]);
-    assert!(generic.is_assignable_to(&role_arn));
+
+    // Specific → generic: narrower source satisfies wider sink.
     assert!(role_arn.is_assignable_to(&generic));
 
-    // …but two specific ARNs with different service/resource differ.
+    // Generic → specific: the empty-segments source carries no
+    // evidence of being an IAM Role ARN. Must be rejected.
+    assert!(!generic.is_assignable_to(&role_arn));
+
+    // …and two specific ARNs with different service/resource differ.
     let cert_arn = mk(&["acm", "Certificate"]);
     assert!(!role_arn.is_assignable_to(&cert_arn));
+    assert!(!cert_arn.is_assignable_to(&role_arn));
+}
+
+/// Directional per-axis subsumption: source missing a populated sink
+/// axis (provider or segments) is rejected; sink missing a populated
+/// source axis is accepted (widening).
+#[test]
+fn assignable_identity_axis_directionality() {
+    let mk = |provider: Option<&str>, segments: &[&str]| AttributeType::Custom {
+        identity: Some(TypeIdentity::new(provider, segments.to_vec(), "Arn")),
+        base: Box::new(AttributeType::String),
+        pattern: None,
+        length: None,
+        validate: noop_validator(),
+        namespace: None,
+        to_dsl: None,
+    };
+
+    // provider: None source → Some sink rejected
+    let bare = mk(None, &[]);
+    let scoped = mk(Some("aws"), &[]);
+    assert!(!bare.is_assignable_to(&scoped));
+    // The reverse (sink None) is the widening case and is accepted.
+    assert!(scoped.is_assignable_to(&bare));
+
+    // segments: [] source → ["iam", "Role"] sink rejected
+    let generic = mk(Some("aws"), &[]);
+    let role = mk(Some("aws"), &["iam", "Role"]);
+    assert!(!generic.is_assignable_to(&role));
+    assert!(role.is_assignable_to(&generic));
 }
 
 #[test]
