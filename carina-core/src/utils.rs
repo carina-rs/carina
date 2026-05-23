@@ -176,6 +176,61 @@ impl<'a> NamespacedId<'a> {
             }
         }
     }
+
+    /// Match this parsed identifier against the expected
+    /// [`TypeIdentity`].
+    ///
+    /// The structured form unifies the old `(namespace, type_name)` pair
+    /// into a single axis-bearing record. Under the new value-name-space
+    /// convention (`{provider}.{segments...}.{kind}.{value}`), the
+    /// identifier's `type_name` must equal the identity's `kind`, the
+    /// `provider` segments must match, and `segments_str` must match the
+    /// identity's `segments` joined with `.`.
+    pub fn matches_identity(&self, expected: &crate::schema::TypeIdentity) -> bool {
+        match self {
+            // 2-part `TypeName.value` shorthand matches when the leading
+            // TypeName equals the identity's kind. The provider axis is
+            // not yet known at this point — the caller decides whether
+            // the shorthand is acceptable in context.
+            Self::TypeQualified { type_name, .. } => *type_name == expected.kind,
+            Self::ProviderQualified {
+                provider,
+                type_name,
+                ..
+            } => {
+                // 3-part `provider.TypeName.value` matches only when the
+                // expected identity has no `segments` (a provider-scoped
+                // bare-kind type like `aws.Region`).
+                expected.segments.is_empty()
+                    && expected.provider.as_deref() == Some(*provider)
+                    && *type_name == expected.kind
+            }
+            Self::FullyQualified {
+                provider,
+                segments_str,
+                type_name,
+                ..
+            } => {
+                if *type_name != expected.kind {
+                    return false;
+                }
+                if expected.provider.as_deref() != Some(*provider) {
+                    return false;
+                }
+                // Compare the parsed `segments_str` to the identity's
+                // `segments` slice without allocating a Vec.
+                let mut expected_iter = expected.segments.iter().map(String::as_str);
+                let mut actual_iter = segments_str.split('.');
+                loop {
+                    match (expected_iter.next(), actual_iter.next()) {
+                        (Some(a), Some(b)) if a == b => continue,
+                        (None, None) => return true,
+                        _ => return false,
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// A `provider` segment — lowercase ASCII only.
@@ -455,17 +510,18 @@ pub fn is_dsl_enum_format(s: &str) -> bool {
 /// - Full namespaced form: exactly `namespace_parts + 2` parts, matching
 ///   `<namespace>.<TypeName>.<value>` with no extra segments
 ///
-/// The expected full form length is determined by the namespace:
-/// - `"aws"` (1 segment) → 3 parts: `aws.Region.value`
-/// - `"aws.s3"` (2 segments) → 4 parts: `aws.s3.VersioningStatus.value`
+/// The expected full form is the identity's dotted display followed by
+/// a value: for `aws.Region` (identity with no segments) the full form
+/// is `aws.Region.value`; for `aws.AvailabilityZone.ZoneName` the full
+/// form is `aws.AvailabilityZone.ZoneName.us_east_1a`.
 ///
-/// Callers that need to accept enum values containing dots (e.g., `"ipsec.1"`)
-/// must handle that case themselves before calling this function.
+/// Callers that need to accept enum values containing dots (e.g.,
+/// `"ipsec.1"`) must handle that case themselves before calling this
+/// function.
 ///
 /// # Arguments
 /// * `s` - The input string to validate
-/// * `type_name` - Expected type name (e.g., `"Region"`, `"InstanceTenancy"`)
-/// * `namespace` - Expected namespace prefix (e.g., `"aws"`, `"aws.s3.Bucket"`, `"awscc.ec2.Vpc"`)
+/// * `identity` - The receiving attribute's [`crate::schema::TypeIdentity`]
 ///
 /// # Returns
 /// * `Ok(())` if namespace is valid or string has no dots
@@ -474,39 +530,47 @@ pub fn is_dsl_enum_format(s: &str) -> bool {
 /// # Examples
 ///
 /// ```
+/// use carina_core::schema::TypeIdentity;
 /// use carina_core::utils::validate_enum_namespace;
 ///
+/// let region = TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region");
+/// let bucket_ver = TypeIdentity::new(Some("aws"), ["s3", "Bucket"], "VersioningStatus");
+///
 /// // No dots — passes through
-/// assert!(validate_enum_namespace("Enabled", "VersioningStatus", "aws.s3").is_ok());
+/// assert!(validate_enum_namespace("Enabled", &bucket_ver).is_ok());
 ///
-/// // 2-part: TypeName.value
-/// assert!(validate_enum_namespace("Region.ap_northeast_1", "Region", "aws").is_ok());
-/// assert!(validate_enum_namespace("Location.ap_northeast_1", "Region", "aws").is_err());
+/// // 2-part: TypeName.value (TypeName must equal `identity.kind`)
+/// assert!(validate_enum_namespace("Region.ap_northeast_1", &region).is_ok());
+/// assert!(validate_enum_namespace("Location.ap_northeast_1", &region).is_err());
 ///
-/// // Full namespaced form
-/// assert!(validate_enum_namespace("aws.Region.ap_northeast_1", "Region", "aws").is_ok());
-/// assert!(validate_enum_namespace("aws.s3.Bucket.VersioningStatus.Enabled", "VersioningStatus", "aws.s3.Bucket").is_ok());
+/// // Full namespaced form: equals `{identity}.<value>`
+/// assert!(validate_enum_namespace("aws.Region.ap_northeast_1", &region).is_ok());
+/// assert!(validate_enum_namespace("aws.s3.Bucket.VersioningStatus.Enabled", &bucket_ver).is_ok());
 /// ```
-pub fn validate_enum_namespace(s: &str, type_name: &str, namespace: &str) -> Result<(), String> {
+pub fn validate_enum_namespace(
+    s: &str,
+    identity: &crate::schema::TypeIdentity,
+) -> Result<(), String> {
     if !s.contains('.') {
         return Ok(());
     }
 
-    // Reject dotted values that exceed the strict part count for the
-    // expected namespace shape — callers must strip those before validating.
+    // The full form has one segment per identity axis plus the value:
+    // identity provider + segments + kind + value.
+    let prefix = identity.to_string();
     let actual_parts = s.split('.').count();
-    let expected_full_len = namespace.split('.').count() + 2;
+    let expected_full_len = prefix.split('.').count() + 1;
     let is_two_part = actual_parts == 2;
     let is_full_form = actual_parts == expected_full_len;
     if !is_two_part && !is_full_form {
         return Err(format!(
-            "expected format: value, {}.value, or {}.{}.value",
-            type_name, namespace, type_name
+            "expected format: value, {}.value, or {}.value",
+            identity.kind, prefix
         ));
     }
 
     if let Some(id) = NamespacedId::parse(s)
-        && id.matches_namespace(namespace, type_name)
+        && id.matches_identity(identity)
     {
         return Ok(());
     }
@@ -514,11 +578,11 @@ pub fn validate_enum_namespace(s: &str, type_name: &str, namespace: &str) -> Res
     // "or full form" hint, full-form inputs get only the full form.
     if is_two_part {
         Err(format!(
-            "expected format {}.value or {}.{}.value",
-            type_name, namespace, type_name
+            "expected format {}.value or {}.value",
+            identity.kind, prefix
         ))
     } else {
-        Err(format!("expected format {}.{}.value", namespace, type_name))
+        Err(format!("expected format {}.value", prefix))
     }
 }
 
@@ -1134,6 +1198,23 @@ pub fn pretty_with_newline_bytes<T: serde::Serialize>(value: &T) -> serde_json::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::TypeIdentity;
+
+    /// Build a `TypeIdentity` from the legacy `(name, namespace)` pair
+    /// the pre-S2.5b test corpus used. Provider is the first segment of
+    /// `namespace`; the remainder become the structured segments; the
+    /// enum type name becomes the kind. Keeps the existing assertions
+    /// readable while the call sites migrate to the structured form.
+    fn legacy_identity(name: &str, namespace: &str) -> TypeIdentity {
+        let mut parts = namespace.split('.');
+        let provider = parts.next().map(String::from);
+        let segments: Vec<String> = parts.map(String::from).collect();
+        TypeIdentity {
+            provider,
+            segments,
+            kind: name.to_string(),
+        }
+    }
 
     #[test]
     fn test_extract_enum_value_with_dots() {
@@ -1229,27 +1310,42 @@ mod tests {
     #[test]
     fn test_validate_namespace_no_dots() {
         // Plain values pass through without validation
-        assert!(validate_enum_namespace("Enabled", "VersioningStatus", "aws.s3.Bucket").is_ok());
-        assert!(validate_enum_namespace("ap-northeast-1", "Region", "aws").is_ok());
-        assert!(validate_enum_namespace("default", "InstanceTenancy", "awscc.ec2.Vpc").is_ok());
+        assert!(
+            validate_enum_namespace(
+                "Enabled",
+                &legacy_identity("VersioningStatus", "aws.s3.Bucket")
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_enum_namespace("ap-northeast-1", &legacy_identity("Region", "aws")).is_ok()
+        );
+        assert!(
+            validate_enum_namespace(
+                "default",
+                &legacy_identity("InstanceTenancy", "awscc.ec2.Vpc")
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn test_validate_namespace_2_part_valid() {
-        assert!(validate_enum_namespace("Region.ap_northeast_1", "Region", "aws").is_ok());
+        assert!(
+            validate_enum_namespace("Region.ap_northeast_1", &legacy_identity("Region", "aws"))
+                .is_ok()
+        );
         assert!(
             validate_enum_namespace(
                 "VersioningStatus.Enabled",
-                "VersioningStatus",
-                "aws.s3.Bucket"
+                &legacy_identity("VersioningStatus", "aws.s3.Bucket")
             )
             .is_ok()
         );
         assert!(
             validate_enum_namespace(
                 "InstanceTenancy.default",
-                "InstanceTenancy",
-                "awscc.ec2.Vpc"
+                &legacy_identity("InstanceTenancy", "awscc.ec2.Vpc")
             )
             .is_ok()
         );
@@ -1257,28 +1353,56 @@ mod tests {
 
     #[test]
     fn test_validate_namespace_2_part_invalid() {
-        assert!(validate_enum_namespace("Location.ap_northeast_1", "Region", "aws").is_err());
         assert!(
-            validate_enum_namespace("Versioning.Enabled", "VersioningStatus", "aws.s3.Bucket")
+            validate_enum_namespace("Location.ap_northeast_1", &legacy_identity("Region", "aws"))
                 .is_err()
         );
         assert!(
-            validate_enum_namespace("Tenancy.default", "InstanceTenancy", "awscc.ec2.Vpc").is_err()
+            validate_enum_namespace(
+                "Versioning.Enabled",
+                &legacy_identity("VersioningStatus", "aws.s3.Bucket")
+            )
+            .is_err()
+        );
+        assert!(
+            validate_enum_namespace(
+                "Tenancy.default",
+                &legacy_identity("InstanceTenancy", "awscc.ec2.Vpc")
+            )
+            .is_err()
         );
     }
 
     #[test]
     fn test_validate_namespace_3_part_valid() {
         // 3-part is valid for 1-segment namespace (e.g., "aws")
-        assert!(validate_enum_namespace("aws.Region.ap_northeast_1", "Region", "aws").is_ok());
+        assert!(
+            validate_enum_namespace(
+                "aws.Region.ap_northeast_1",
+                &legacy_identity("Region", "aws")
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn test_validate_namespace_3_part_invalid() {
         // Wrong provider
-        assert!(validate_enum_namespace("gcp.Region.ap_northeast_1", "Region", "aws").is_err());
+        assert!(
+            validate_enum_namespace(
+                "gcp.Region.ap_northeast_1",
+                &legacy_identity("Region", "aws")
+            )
+            .is_err()
+        );
         // Wrong type name
-        assert!(validate_enum_namespace("aws.Location.ap_northeast_1", "Region", "aws").is_err());
+        assert!(
+            validate_enum_namespace(
+                "aws.Location.ap_northeast_1",
+                &legacy_identity("Region", "aws")
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1287,8 +1411,7 @@ mod tests {
         assert!(
             validate_enum_namespace(
                 "aws.s3.VersioningStatus.Enabled",
-                "VersioningStatus",
-                "aws.s3"
+                &legacy_identity("VersioningStatus", "aws.s3")
             )
             .is_ok()
         );
@@ -1300,8 +1423,7 @@ mod tests {
         assert!(
             validate_enum_namespace(
                 "gcp.s3.VersioningStatus.Enabled",
-                "VersioningStatus",
-                "aws.s3"
+                &legacy_identity("VersioningStatus", "aws.s3")
             )
             .is_err()
         );
@@ -1309,15 +1431,17 @@ mod tests {
         assert!(
             validate_enum_namespace(
                 "aws.s.VersioningStatus.Enabled",
-                "VersioningStatus",
-                "aws.s3"
+                &legacy_identity("VersioningStatus", "aws.s3")
             )
             .is_err()
         );
         // Wrong type name
         assert!(
-            validate_enum_namespace("aws.s3.Versioning.Enabled", "VersioningStatus", "aws.s3")
-                .is_err()
+            validate_enum_namespace(
+                "aws.s3.Versioning.Enabled",
+                &legacy_identity("VersioningStatus", "aws.s3")
+            )
+            .is_err()
         );
     }
 
@@ -1326,16 +1450,14 @@ mod tests {
         assert!(
             validate_enum_namespace(
                 "aws.s3.Bucket.VersioningStatus.Enabled",
-                "VersioningStatus",
-                "aws.s3.Bucket"
+                &legacy_identity("VersioningStatus", "aws.s3.Bucket")
             )
             .is_ok()
         );
         assert!(
             validate_enum_namespace(
                 "awscc.ec2.Vpc.InstanceTenancy.default",
-                "InstanceTenancy",
-                "awscc.ec2.Vpc"
+                &legacy_identity("InstanceTenancy", "awscc.ec2.Vpc")
             )
             .is_ok()
         );
@@ -1344,8 +1466,7 @@ mod tests {
         assert!(
             validate_enum_namespace(
                 "aws.iam.PolicyDocument.Version.2012_10_17",
-                "Version",
-                "aws.iam.PolicyDocument"
+                &legacy_identity("Version", "aws.iam.PolicyDocument")
             )
             .is_ok()
         );
@@ -1379,8 +1500,7 @@ mod tests {
         assert!(
             validate_enum_namespace(
                 "gcp.ec2.vpc.InstanceTenancy.default",
-                "InstanceTenancy",
-                "awscc.ec2.Vpc"
+                &legacy_identity("InstanceTenancy", "awscc.ec2.Vpc")
             )
             .is_err()
         );
@@ -1388,8 +1508,7 @@ mod tests {
         assert!(
             validate_enum_namespace(
                 "awscc.ec2.Vpc.Tenancy.default",
-                "InstanceTenancy",
-                "awscc.ec2.Vpc"
+                &legacy_identity("InstanceTenancy", "awscc.ec2.Vpc")
             )
             .is_err()
         );
@@ -1398,10 +1517,20 @@ mod tests {
     #[test]
     fn test_validate_namespace_wrong_part_count() {
         // Too many parts for 1-segment namespace
-        assert!(validate_enum_namespace("foo.bar.baz.ap_northeast_1", "Region", "aws").is_err());
+        assert!(
+            validate_enum_namespace(
+                "foo.bar.baz.ap_northeast_1",
+                &legacy_identity("Region", "aws")
+            )
+            .is_err()
+        );
         // 6-part is invalid for 3-segment namespace
         assert!(
-            validate_enum_namespace("a.b.c.d.e.f", "VersioningStatus", "aws.s3.Bucket").is_err()
+            validate_enum_namespace(
+                "a.b.c.d.e.f",
+                &legacy_identity("VersioningStatus", "aws.s3.Bucket")
+            )
+            .is_err()
         );
     }
 
@@ -1497,8 +1626,7 @@ mod tests {
         assert!(
             validate_enum_namespace(
                 "awscc.ec2.vpn_gateway.Type.ipsec.1",
-                "Type",
-                "awscc.ec2.vpn_gateway"
+                &legacy_identity("Type", "awscc.ec2.vpn_gateway")
             )
             .is_err()
         );
@@ -1506,13 +1634,16 @@ mod tests {
         assert!(
             validate_enum_namespace(
                 "awscc.Region.awscc.Region.ap_northeast_1",
-                "Region",
-                "awscc"
+                &legacy_identity("Region", "awscc")
             )
             .is_err()
         );
         assert!(
-            validate_enum_namespace("aws.Region.aws.Region.us_west_2", "Region", "aws").is_err()
+            validate_enum_namespace(
+                "aws.Region.aws.Region.us_west_2",
+                &legacy_identity("Region", "aws")
+            )
+            .is_err()
         );
     }
 
@@ -1695,7 +1826,8 @@ mod tests {
             ),
         ];
         for (input, type_name, namespace, ok) in cases {
-            let result = validate_enum_namespace(input, type_name, namespace);
+            let identity = legacy_identity(type_name, namespace);
+            let result = validate_enum_namespace(input, &identity);
             assert_eq!(
                 result.is_ok(),
                 *ok,
