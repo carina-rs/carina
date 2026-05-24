@@ -73,8 +73,18 @@ fn resolve_managed_refs_resolves_resource_ref_against_managed_sibling() {
     let b = make_managed("b", &[("dep", ref_to("a", "value"))]);
     let mut managed = vec![a, b];
 
-    resolve_managed_refs_with_state_and_remote(&mut managed, &HashMap::new(), &HashMap::new(), &[])
-        .expect("resolve managed");
+    {
+        let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+            managed: &managed,
+            virtuals: &[],
+            data_sources: &[],
+            current_states: &HashMap::new(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        });
+        resolve_managed_refs_with_state_and_remote(&mut managed, &bindings)
+    }
+    .expect("resolve managed");
 
     // After resolution `b.dep` should be the literal string from `a`.
     let dep = managed[1].attributes.get("dep").expect("dep present");
@@ -87,8 +97,18 @@ fn resolve_managed_refs_records_dependency_bindings() {
     let b = make_managed("b", &[("dep", ref_to("a", "value"))]);
     let mut managed = vec![a, b];
 
-    resolve_managed_refs_with_state_and_remote(&mut managed, &HashMap::new(), &HashMap::new(), &[])
-        .expect("resolve managed");
+    {
+        let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+            managed: &managed,
+            virtuals: &[],
+            data_sources: &[],
+            current_states: &HashMap::new(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        });
+        resolve_managed_refs_with_state_and_remote(&mut managed, &bindings)
+    }
+    .expect("resolve managed");
 
     assert!(
         managed[1].dependency_bindings.contains("a"),
@@ -113,8 +133,18 @@ fn resolve_managed_refs_falls_through_state_attributes() {
         State::existing(managed[0].id.clone(), state_attrs),
     );
 
-    resolve_managed_refs_with_state_and_remote(&mut managed, &current_states, &HashMap::new(), &[])
-        .expect("resolve managed");
+    {
+        let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+            managed: &managed,
+            virtuals: &[],
+            data_sources: &[],
+            current_states: &current_states,
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        });
+        resolve_managed_refs_with_state_and_remote(&mut managed, &bindings)
+    }
+    .expect("resolve managed");
 
     let dep = managed[1].attributes.get("dep").expect("dep present");
     assert_eq!(*dep, s("from_state"), "expected state value, got {dep:?}");
@@ -126,12 +156,14 @@ fn resolve_virtual_refs_post_apply_uses_provided_bindings() {
     // that the post-apply entry resolves `VirtualResource` refs
     // against the supplied view.
     let referenced = make_managed("a", &[("value", s("post_apply_value"))]);
-    let bindings = ResolvedBindings::from_resources_with_state(
-        std::slice::from_ref(&referenced),
-        &HashMap::new(),
-        &HashMap::new(),
-        &[],
-    );
+    let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+        managed: std::slice::from_ref(&referenced),
+        virtuals: &[],
+        data_sources: &[],
+        current_states: &HashMap::new(),
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
 
     let mut virtuals = vec![make_virtual("v", &[("forwarded", ref_to("a", "value"))])];
     resolve_virtual_refs_post_apply(&mut virtuals, &bindings).expect("resolve virtuals");
@@ -151,12 +183,14 @@ fn resolve_virtual_refs_post_apply_picks_post_apply_value_not_pre_apply() {
     // the post-apply state. Verify the post-apply entry selects the
     // post-apply value when handed the post-apply bindings view.
     let role = make_managed("role", &[("arn", s("post_apply_arn"))]);
-    let post_apply_bindings = ResolvedBindings::from_resources_with_state(
-        std::slice::from_ref(&role),
-        &HashMap::new(),
-        &HashMap::new(),
-        &[],
-    );
+    let post_apply_bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+        managed: std::slice::from_ref(&role),
+        virtuals: &[],
+        data_sources: &[],
+        current_states: &HashMap::new(),
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
 
     let mut virtuals = vec![make_virtual("rd", &[("role_arn", ref_to("role", "arn"))])];
     resolve_virtual_refs_post_apply(&mut virtuals, &post_apply_bindings).expect("resolve virtuals");
@@ -176,8 +210,14 @@ fn resolve_virtual_refs_post_apply_picks_post_apply_value_not_pre_apply() {
 fn resolve_virtual_refs_post_apply_leaves_non_ref_values_intact() {
     // A literal attribute on a `VirtualResource` should be preserved
     // verbatim by the post-apply pass.
-    let bindings =
-        ResolvedBindings::from_resources_with_state(&[], &HashMap::new(), &HashMap::new(), &[]);
+    let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+        managed: &[],
+        virtuals: &[],
+        data_sources: &[],
+        current_states: &HashMap::new(),
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
     let mut virtuals = vec![make_virtual("v", &[("literal", s("kept"))])];
 
     resolve_virtual_refs_post_apply(&mut virtuals, &bindings).expect("resolve virtuals");
@@ -192,15 +232,31 @@ fn resolve_virtual_refs_post_apply_leaves_non_ref_values_intact() {
 #[test]
 fn resolve_managed_refs_with_empty_slice_is_ok() {
     let mut managed: Vec<ManagedResource> = Vec::new();
-    resolve_managed_refs_with_state_and_remote(&mut managed, &HashMap::new(), &HashMap::new(), &[])
-        .expect("empty managed slice resolves cleanly");
+    {
+        let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+            managed: &managed,
+            virtuals: &[],
+            data_sources: &[],
+            current_states: &HashMap::new(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        });
+        resolve_managed_refs_with_state_and_remote(&mut managed, &bindings)
+    }
+    .expect("empty managed slice resolves cleanly");
     assert!(managed.is_empty());
 }
 
 #[test]
 fn resolve_virtual_refs_post_apply_with_empty_slice_is_ok() {
-    let bindings =
-        ResolvedBindings::from_resources_with_state(&[], &HashMap::new(), &HashMap::new(), &[]);
+    let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+        managed: &[],
+        virtuals: &[],
+        data_sources: &[],
+        current_states: &HashMap::new(),
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
     let mut virtuals: Vec<VirtualResource> = Vec::new();
     resolve_virtual_refs_post_apply(&mut virtuals, &bindings)
         .expect("empty virtual slice resolves cleanly");
@@ -216,17 +272,32 @@ fn resolve_managed_refs_legacy_shim_produces_identical_result() {
     let b_new = make_managed("b", &[("dep", ref_to("a", "value"))]);
     let mut managed = vec![a_new.clone(), b_new.clone()];
 
-    resolve_managed_refs_with_state_and_remote(&mut managed, &HashMap::new(), &HashMap::new(), &[])
-        .expect("resolve managed");
+    {
+        let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+            managed: &managed,
+            virtuals: &[],
+            data_sources: &[],
+            current_states: &HashMap::new(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        });
+        resolve_managed_refs_with_state_and_remote(&mut managed, &bindings)
+    }
+    .expect("resolve managed");
 
     let mut legacy: Vec<ManagedResource> = vec![a_new.clone(), b_new.clone()];
-    crate::resolver::resolve_refs_with_state_and_remote(
-        &mut legacy,
-        &HashMap::new(),
-        &HashMap::new(),
-        &[],
-    )
-    .expect("resolve legacy");
+    {
+        let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+            managed: &legacy,
+            virtuals: &[],
+            data_sources: &[],
+            current_states: &HashMap::new(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        });
+        crate::resolver::resolve_refs_with_state_and_remote(&mut legacy, &bindings)
+            .expect("resolve legacy");
+    }
 
     for (m, l) in managed.iter().zip(legacy.iter()) {
         assert_eq!(

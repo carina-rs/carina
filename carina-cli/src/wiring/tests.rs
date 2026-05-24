@@ -512,6 +512,7 @@ fn resolve_data_source_refs_replaces_resource_ref_with_concrete_value() {
     let empty_registry = carina_core::schema::SchemaRegistry::new();
     let resolved = resolve_data_source_refs_for_refresh(
         &[sso],
+        &[],
         &[mizzy],
         &current_states,
         &HashMap::new(),

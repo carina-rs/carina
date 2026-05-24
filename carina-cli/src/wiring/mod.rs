@@ -10,7 +10,7 @@ use std::time::Duration;
 use colored::Colorize;
 use futures::stream::{self, StreamExt};
 
-use carina_core::binding_index::{ResolvedBindings, WaitAliasSpec};
+use carina_core::binding_index::{PreApplyInputs, ResolvedBindings, WaitAliasSpec};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
 use carina_core::effect::Effect;
@@ -1270,12 +1270,14 @@ pub fn expand_same_config_deferred_for<E: Clone>(
         });
     }
 
-    let iterable_bindings = ResolvedBindings::from_resources_with_state(
-        sorted_resources,
+    let iterable_bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+        managed: sorted_resources,
+        virtuals: &parsed.virtual_resources,
+        data_sources: &parsed.data_sources,
         current_states,
         remote_bindings,
         wait_aliases,
-    )
+    })
     .project_iterable_bindings();
 
     // `expand_deferred_for_expressions` is a `&mut self` method that
@@ -1562,6 +1564,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
             .collect();
         let resolved_data_sources = resolve_data_source_refs_for_refresh(
             &sorted_resources,
+            &parsed.virtual_resources,
             &data_sources,
             &current_states,
             remote_bindings,
@@ -1759,22 +1762,33 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         &data_sources,
         ctx.schemas(),
     );
-    resolve_refs_for_plan(
-        &mut resources,
-        &current_states,
-        remote_bindings,
-        &wait_aliases,
-    )?;
+    // Build the unified pre-apply bindings view once (carina#3248):
+    // every kind of binding the configuration declares (managed,
+    // virtual, data source) is in the same view, so a managed
+    // attribute referencing `<module_instance>.<attr>` (a virtual)
+    // chains through to the managed sibling literal instead of
+    // surviving as an unresolved `ResourceRef` (carina#3246).
+    let upstream_binding_names: std::collections::HashSet<&str> =
+        remote_bindings.keys().map(String::as_str).collect();
+    let plan_bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
+        carina_core::binding_index::PreApplyInputs {
+            managed: &resources,
+            virtuals: &parsed.virtual_resources,
+            data_sources: &data_sources,
+            current_states: &current_states,
+            remote_bindings,
+            wait_aliases: &wait_aliases,
+        },
+    );
+    resolve_refs_for_plan(&mut resources, &plan_bindings, &upstream_binding_names)?;
     // Resolve data-source input refs for the plan and canonicalize, so
     // each `read` resource flows into `create_plan` with concrete
     // attribute values (carina#3181).
     let mut data_sources_for_plan = data_sources.clone();
     carina_core::resolver::resolve_data_source_refs_for_plan(
         &mut data_sources_for_plan,
-        &resources,
-        &current_states,
-        remote_bindings,
-        &wait_aliases,
+        &plan_bindings,
+        &upstream_binding_names,
     )?;
     carina_core::value::canonicalize_data_sources_with_schemas(
         &mut data_sources_for_plan,
@@ -2247,6 +2261,7 @@ pub async fn read_data_source_with_retry(
 /// `binding` — data sources reference those.
 pub(crate) fn resolve_data_source_refs_for_refresh(
     managed: &[ManagedResource],
+    virtuals: &[carina_core::resource::VirtualResource],
     data_sources: &[carina_core::resource::DataSource],
     current_states: &HashMap<ResourceId, State>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
@@ -2254,14 +2269,19 @@ pub(crate) fn resolve_data_source_refs_for_refresh(
     wait_aliases: &[WaitAliasSpec],
 ) -> Result<Vec<carina_core::resource::DataSource>, AppError> {
     let mut resolved = data_sources.to_vec();
-    carina_core::resolver::resolve_data_source_refs(
-        &mut resolved,
+    // carina#3248: unified pre-apply bindings include virtuals so a
+    // data-source input referencing `<module_instance>.<attr>` chains
+    // through the virtual layer to the managed sibling literal.
+    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
         managed,
+        virtuals,
+        data_sources,
         current_states,
         remote_bindings,
         wait_aliases,
-    )
-    .map_err(AppError::Validation)?;
+    });
+    carina_core::resolver::resolve_data_source_refs(&mut resolved, &bindings)
+        .map_err(AppError::Validation)?;
     carina_core::value::canonicalize_data_sources_with_schemas(&mut resolved, schemas);
     Ok(resolved)
 }

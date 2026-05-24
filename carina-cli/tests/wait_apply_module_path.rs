@@ -381,13 +381,18 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         .iter()
         .map(carina_core::binding_index::WaitAliasSpec::from)
         .collect();
-    carina_core::resolver::resolve_refs_with_state_and_remote(
-        &mut resources_for_plan,
-        &current_states,
-        &remote_bindings,
-        &wait_aliases,
-    )
-    .expect("resolve_refs");
+    let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
+        carina_core::binding_index::PreApplyInputs {
+            managed: &resources_for_plan.clone(),
+            virtuals: &parsed.virtual_resources,
+            data_sources: &[],
+            current_states: &current_states,
+            remote_bindings: &remote_bindings,
+            wait_aliases: &wait_aliases,
+        },
+    );
+    carina_core::resolver::resolve_refs_with_state_and_remote(&mut resources_for_plan, &bindings)
+        .expect("resolve_refs");
 
     carina_core::value::canonicalize_resources_with_schemas(&mut resources_for_plan, ctx.schemas());
     carina_core::value::canonicalize_states_with_schemas(&mut current_states, ctx.schemas());

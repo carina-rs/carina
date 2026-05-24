@@ -29,56 +29,56 @@ pub fn resolve_refs_with_state(
     resources: &mut [ManagedResource],
     current_states: &HashMap<ResourceId, State>,
 ) -> Result<(), String> {
-    resolve_refs_with_state_and_remote(resources, current_states, &HashMap::new(), &[])
+    let bindings =
+        crate::binding_index::ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+            managed: resources,
+            virtuals: &[],
+            data_sources: &[],
+            current_states,
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        });
+    resolve_refs_with_state_and_remote(resources, &bindings)
 }
 
-/// Resolve all ResourceRef values in resources using current state and
-/// upstream state bindings. `wait_aliases` makes `<wait-binding>.<attr>`
-/// resolve to `<target>.<attr>` (carina#3085 passthrough).
+/// Resolve all `ResourceRef` values in `resources` against a
+/// pre-built `ResolvedBindings` view. carina#3248: the caller is
+/// responsible for assembling the bindings view via
+/// [`ResolvedBindings::pre_apply`], so this entry point is a pure
+/// transform that takes the view as input.
+///
+/// Use this on the apply path. Use [`resolve_refs_for_plan`] on the
+/// plan path — it additionally stamps any surviving
+/// `ResourceRef` whose root binding is named in
+/// `bindings_upstream_keys` as
+/// `Value::Unknown(UnknownReason::UpstreamRef { path })` so plan
+/// display can render it as `(known after upstream apply: <ref>)`
+/// instead of the raw dot-form.
 pub fn resolve_refs_with_state_and_remote(
     resources: &mut [ManagedResource],
-    current_states: &HashMap<ResourceId, State>,
-    remote_bindings: &HashMap<String, HashMap<String, Value>>,
-    wait_aliases: &[crate::binding_index::WaitAliasSpec],
+    bindings: &ResolvedBindings,
 ) -> Result<(), String> {
-    resolve_refs_inner(
-        resources,
-        current_states,
-        remote_bindings,
-        wait_aliases,
-        false,
-    )
+    resolve_refs_inner(resources, bindings, &std::collections::HashSet::new())
 }
 
-/// Plan-only counterpart used when an upstream's state file is missing or
-/// its export is absent. Behaves like
-/// [`resolve_refs_with_state_and_remote`], but any surviving
-/// `Value::ResourceRef` whose root binding is named in `remote_bindings`
-/// is replaced with `Value::Unknown(UnknownReason::UpstreamRef { path })`
-/// so plan display can render it as `(known after upstream apply: <ref>)`
-/// instead of the raw dot-form. `apply` continues to call the strict
-/// variant. See #2366 / RFC #2371.
+/// Plan-only counterpart of [`resolve_refs_with_state_and_remote`].
+/// Same input/output shape (pre-built `ResolvedBindings`), with the
+/// addition of `unresolved_upstream_bindings`: the set of upstream-
+/// state binding names whose surviving refs should be stamped as
+/// `Value::Unknown(UnknownReason::UpstreamRef { path })` for display.
+/// `apply` continues to call the strict variant. See #2366 / RFC #2371.
 pub fn resolve_refs_for_plan(
     resources: &mut [ManagedResource],
-    current_states: &HashMap<ResourceId, State>,
-    remote_bindings: &HashMap<String, HashMap<String, Value>>,
-    wait_aliases: &[crate::binding_index::WaitAliasSpec],
+    bindings: &ResolvedBindings,
+    unresolved_upstream_bindings: &std::collections::HashSet<&str>,
 ) -> Result<(), String> {
-    resolve_refs_inner(
-        resources,
-        current_states,
-        remote_bindings,
-        wait_aliases,
-        true,
-    )
+    resolve_refs_inner(resources, bindings, unresolved_upstream_bindings)
 }
 
 fn resolve_refs_inner(
     resources: &mut [ManagedResource],
-    current_states: &HashMap<ResourceId, State>,
-    remote_bindings: &HashMap<String, HashMap<String, Value>>,
-    wait_aliases: &[crate::binding_index::WaitAliasSpec],
-    mark_unresolved_upstream: bool,
+    bindings: &ResolvedBindings,
+    unresolved_upstream_bindings: &std::collections::HashSet<&str>,
 ) -> Result<(), String> {
     // Save dependency bindings before resolution destroys ResourceRef values.
     // This metadata is used by plan tree building to recover parent-child
@@ -90,18 +90,7 @@ fn resolve_refs_inner(
         }
     }
 
-    let bindings = ResolvedBindings::from_resources_with_state(
-        resources,
-        current_states,
-        remote_bindings,
-        wait_aliases,
-    );
-
-    let upstream_binding_names: std::collections::HashSet<&str> = if mark_unresolved_upstream {
-        remote_bindings.keys().map(String::as_str).collect()
-    } else {
-        std::collections::HashSet::new()
-    };
+    let mark_unresolved_upstream = !unresolved_upstream_bindings.is_empty();
 
     // Resolve ResourceRef values in all resources. Stay in `IndexMap`
     // so the user's authored attribute order survives resolution
@@ -109,9 +98,9 @@ fn resolve_refs_inner(
     for resource in resources.iter_mut() {
         let mut resolved_attrs: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
         for (key, value) in &resource.attributes {
-            let resolved = resolve_ref_value(value, &bindings)?;
+            let resolved = resolve_ref_value(value, bindings)?;
             let final_value = if mark_unresolved_upstream {
-                stamp_unresolved_upstream(resolved, &upstream_binding_names)
+                stamp_unresolved_upstream(resolved, unresolved_upstream_bindings)
             } else {
                 resolved
             };
@@ -129,94 +118,55 @@ fn resolve_refs_inner(
 /// Pre-apply path: resolve `ResourceRef` values across a slice of
 /// `ManagedResource`s.
 ///
-/// Encodes the design-doc invariant ("`VirtualResource`s are never
-/// resolved against pre-apply state") at the type level: the slice
-/// type rejects virtuals at compile time. For virtuals, use
-/// [`resolve_virtual_refs_post_apply`] from `finalize_apply` (#3177).
-///
-/// # Scope limitation
-///
-/// Bindings are built from the managed slice alone — virtual bindings
-/// are **not** in the binding map. A managed attribute that references
-/// a virtual binding pre-apply (`managed_x.attr = ref some_module.role_arn`)
-/// will leave its ResourceRef un-resolved. The typestate split treats
-/// this as a non-case: in the migration target, managed inputs that
-/// depend on virtual outputs are routed via `wait` bindings or
-/// upstream-state passthroughs. If a real call site needs the
-/// mixed-bindings shape, prefer the legacy shim
-/// [`resolve_refs_with_state_and_remote`] until #3176 ships a typed
-/// constructor that accepts both slices.
-///
+/// carina#3248: virtuals and data sources are first-class binding
+/// sources on the pre-apply path. `bindings` must therefore include
+/// all kinds the configuration declares, via
+/// [`ResolvedBindings::pre_apply`]. A managed attribute referencing
+/// `<module_instance>.<attr>` (a virtual binding) chains through the
+/// virtual's attribute map to the managed sibling literal that backs
+/// it. The earlier "wait / upstream-state passthrough" guidance for
+/// this shape (referring to cross-stack consumption) does not apply
+/// to same-stack module attribute references — those resolve through
+/// the in-process virtual binding directly.
 pub fn resolve_managed_refs_with_state_and_remote(
     managed: &mut [ManagedResource],
-    current_states: &HashMap<ResourceId, State>,
-    remote_bindings: &HashMap<String, HashMap<String, Value>>,
-    wait_aliases: &[crate::binding_index::WaitAliasSpec],
+    bindings: &ResolvedBindings,
 ) -> Result<(), String> {
-    resolve_refs_inner(
-        managed,
-        current_states,
-        remote_bindings,
-        wait_aliases,
-        false,
-    )
+    resolve_refs_inner(managed, bindings, &std::collections::HashSet::new())
 }
 
 /// Resolve `ResourceRef` values in a slice of [`DataSource`]s against
-/// the binding view built from the managed resources plus
-/// `current_states` / `remote_bindings` (carina#3181).
+/// a pre-built `ResolvedBindings` view (carina#3248).
 ///
 /// Data sources are read-only; their input attributes (`read aws.iam.user
-/// { user_name = some_let.name }`) reference managed resources, so the
-/// binding map is built from the managed slice. Each data source's
-/// `dependency_bindings` is recorded before resolution destroys the
-/// `ResourceRef` values, mirroring [`resolve_refs_inner`].
+/// { user_name = some_let.name }`) reference managed resources, virtuals,
+/// or other data sources, so the binding map the caller passes must
+/// include all kinds via [`ResolvedBindings::pre_apply`]. Each data
+/// source's `dependency_bindings` is recorded before resolution
+/// destroys the `ResourceRef` values, mirroring [`resolve_refs_inner`].
 pub fn resolve_data_source_refs(
     data_sources: &mut [DataSource],
-    managed: &[ManagedResource],
-    current_states: &HashMap<ResourceId, State>,
-    remote_bindings: &HashMap<String, HashMap<String, Value>>,
-    wait_aliases: &[crate::binding_index::WaitAliasSpec],
+    bindings: &ResolvedBindings,
 ) -> Result<(), String> {
-    resolve_data_source_refs_inner(
-        data_sources,
-        managed,
-        current_states,
-        remote_bindings,
-        wait_aliases,
-        false,
-    )
+    resolve_data_source_refs_inner(data_sources, bindings, &std::collections::HashSet::new())
 }
 
-/// Plan-only counterpart of [`resolve_data_source_refs`]: any surviving
-/// `Value::ResourceRef` whose root binding is named in `remote_bindings`
-/// is replaced with the unresolved-upstream marker so plan display can
-/// render it as `(known after upstream apply: <ref>)`. Mirrors
-/// [`resolve_refs_for_plan`] for data sources.
+/// Plan-only counterpart of [`resolve_data_source_refs`]. Mirrors
+/// [`resolve_refs_for_plan`]: takes the set of upstream-binding
+/// names whose surviving refs should be stamped as
+/// `Value::Unknown(UnknownReason::UpstreamRef { path })`.
 pub fn resolve_data_source_refs_for_plan(
     data_sources: &mut [DataSource],
-    managed: &[ManagedResource],
-    current_states: &HashMap<ResourceId, State>,
-    remote_bindings: &HashMap<String, HashMap<String, Value>>,
-    wait_aliases: &[crate::binding_index::WaitAliasSpec],
+    bindings: &ResolvedBindings,
+    unresolved_upstream_bindings: &std::collections::HashSet<&str>,
 ) -> Result<(), String> {
-    resolve_data_source_refs_inner(
-        data_sources,
-        managed,
-        current_states,
-        remote_bindings,
-        wait_aliases,
-        true,
-    )
+    resolve_data_source_refs_inner(data_sources, bindings, unresolved_upstream_bindings)
 }
 
 fn resolve_data_source_refs_inner(
     data_sources: &mut [DataSource],
-    managed: &[ManagedResource],
-    current_states: &HashMap<ResourceId, State>,
-    remote_bindings: &HashMap<String, HashMap<String, Value>>,
-    wait_aliases: &[crate::binding_index::WaitAliasSpec],
-    mark_unresolved_upstream: bool,
+    bindings: &ResolvedBindings,
+    unresolved_upstream_bindings: &std::collections::HashSet<&str>,
 ) -> Result<(), String> {
     for data_source in data_sources.iter_mut() {
         let deps = crate::deps::get_resource_value_ref_dependencies(data_source);
@@ -224,23 +174,13 @@ fn resolve_data_source_refs_inner(
             data_source.dependency_bindings = deps.into_iter().collect();
         }
     }
-    let bindings = ResolvedBindings::from_resources_with_state(
-        managed,
-        current_states,
-        remote_bindings,
-        wait_aliases,
-    );
-    let upstream_binding_names: std::collections::HashSet<&str> = if mark_unresolved_upstream {
-        remote_bindings.keys().map(String::as_str).collect()
-    } else {
-        std::collections::HashSet::new()
-    };
+    let mark_unresolved_upstream = !unresolved_upstream_bindings.is_empty();
     for data_source in data_sources.iter_mut() {
         let mut resolved_attrs: IndexMap<String, Value> = IndexMap::new();
         for (key, value) in &data_source.attributes {
-            let resolved = resolve_ref_value(value, &bindings)?;
+            let resolved = resolve_ref_value(value, bindings)?;
             let final_value = if mark_unresolved_upstream {
-                stamp_unresolved_upstream(resolved, &upstream_binding_names)
+                stamp_unresolved_upstream(resolved, unresolved_upstream_bindings)
             } else {
                 resolved
             };
@@ -563,9 +503,9 @@ mod tests {
     }
 
     /// Build a `ResolvedBindings` from a flat `binding_name → attributes`
-    /// map. Each entry is dropped in via `from_resources_with_state` so
-    /// the resulting view is identical to what production code constructs
-    /// — there is no test-only back door into the type.
+    /// map. Each entry is dropped in via `pre_apply` so the resulting
+    /// view is identical to what production code constructs — there is
+    /// no test-only back door into the type.
     fn bindings_from(entries: Vec<(&str, Vec<(&str, Value)>)>) -> ResolvedBindings {
         let resources: Vec<ManagedResource> = entries
             .into_iter()
@@ -573,12 +513,56 @@ mod tests {
                 make_resource(&format!("{}-resource", binding), Some(binding), attrs)
             })
             .collect();
-        ResolvedBindings::from_resources_with_state(
-            &resources,
-            &HashMap::new(),
-            &HashMap::new(),
-            &[],
-        )
+        ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+            managed: &resources,
+            virtuals: &[],
+            data_sources: &[],
+            current_states: &HashMap::new(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        })
+    }
+
+    /// Test-only adapter that preserves the pre-#3248 four-arg
+    /// signature so the bulky test corpus migrates mechanically.
+    /// Builds the bindings view here, then delegates to the new
+    /// signature.
+    fn resolve_refs_with_state_and_remote_legacy(
+        resources: &mut [ManagedResource],
+        current_states: &HashMap<ResourceId, State>,
+        remote_bindings: &HashMap<String, HashMap<String, Value>>,
+        wait_aliases: &[crate::binding_index::WaitAliasSpec],
+    ) -> Result<(), String> {
+        let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+            managed: resources,
+            virtuals: &[],
+            data_sources: &[],
+            current_states,
+            remote_bindings,
+            wait_aliases,
+        });
+        resolve_refs_with_state_and_remote(resources, &bindings)
+    }
+
+    /// Test-only adapter for the plan-path resolver (mirrors
+    /// `resolve_refs_with_state_and_remote_legacy`).
+    fn resolve_refs_for_plan_legacy(
+        resources: &mut [ManagedResource],
+        current_states: &HashMap<ResourceId, State>,
+        remote_bindings: &HashMap<String, HashMap<String, Value>>,
+        wait_aliases: &[crate::binding_index::WaitAliasSpec],
+    ) -> Result<(), String> {
+        let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+            managed: resources,
+            virtuals: &[],
+            data_sources: &[],
+            current_states,
+            remote_bindings,
+            wait_aliases,
+        });
+        let upstream_keys: std::collections::HashSet<&str> =
+            remote_bindings.keys().map(String::as_str).collect();
+        resolve_refs_for_plan(resources, &bindings, &upstream_keys)
     }
 
     #[test]
@@ -1602,8 +1586,13 @@ mod tests {
         );
         remote_bindings.insert("network".to_string(), network_map);
 
-        resolve_refs_with_state_and_remote(&mut resources, &current_states, &remote_bindings, &[])
-            .unwrap();
+        resolve_refs_with_state_and_remote_legacy(
+            &mut resources,
+            &current_states,
+            &remote_bindings,
+            &[],
+        )
+        .unwrap();
 
         assert_eq!(
             resources[0].get_attr("vpc_id"),
@@ -1655,8 +1644,13 @@ mod tests {
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
-        resolve_refs_with_state_and_remote(&mut resources, &HashMap::new(), &remote_bindings, &[])
-            .unwrap();
+        resolve_refs_with_state_and_remote_legacy(
+            &mut resources,
+            &HashMap::new(),
+            &remote_bindings,
+            &[],
+        )
+        .unwrap();
 
         assert_eq!(
             resources[0].get_attr("principal_arn"),
@@ -1708,7 +1702,7 @@ mod tests {
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
-        let err = resolve_refs_with_state_and_remote(
+        let err = resolve_refs_with_state_and_remote_legacy(
             &mut resources,
             &HashMap::new(),
             &remote_bindings,
@@ -1756,7 +1750,7 @@ mod tests {
                 }),
             )],
         )];
-        let err = resolve_refs_with_state_and_remote(
+        let err = resolve_refs_with_state_and_remote_legacy(
             &mut resources,
             &HashMap::new(),
             &remote_bindings,
@@ -1796,8 +1790,13 @@ mod tests {
         )];
 
         let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
-        resolve_refs_with_state_and_remote(&mut resources, &HashMap::new(), &remote_bindings, &[])
-            .expect("unloaded upstream subscript must not error");
+        resolve_refs_with_state_and_remote_legacy(
+            &mut resources,
+            &HashMap::new(),
+            &remote_bindings,
+            &[],
+        )
+        .expect("unloaded upstream subscript must not error");
         assert!(
             matches!(
                 resources[0].get_attr("principal_arn"),
@@ -1845,8 +1844,13 @@ mod tests {
                 }),
             )],
         )];
-        resolve_refs_with_state_and_remote(&mut resources, &HashMap::new(), &remote_bindings, &[])
-            .unwrap();
+        resolve_refs_with_state_and_remote_legacy(
+            &mut resources,
+            &HashMap::new(),
+            &remote_bindings,
+            &[],
+        )
+        .unwrap();
         assert_eq!(
             resources[0].get_attr("az"),
             Some(&Value::Concrete(ConcreteValue::String("aza".to_string())))
@@ -1893,7 +1897,7 @@ mod tests {
                 }),
             )],
         )];
-        let err = resolve_refs_with_state_and_remote(
+        let err = resolve_refs_with_state_and_remote_legacy(
             &mut resources,
             &HashMap::new(),
             &remote_bindings,
@@ -1926,8 +1930,13 @@ mod tests {
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         remote_bindings.insert("network".to_string(), HashMap::new());
 
-        resolve_refs_with_state_and_remote(&mut resources, &current_states, &remote_bindings, &[])
-            .unwrap();
+        resolve_refs_with_state_and_remote_legacy(
+            &mut resources,
+            &current_states,
+            &remote_bindings,
+            &[],
+        )
+        .unwrap();
 
         // Should remain as ResourceRef since "nonexistent" binding is not found
         assert!(matches!(
@@ -1957,7 +1966,8 @@ mod tests {
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         remote_bindings.insert("network".to_string(), HashMap::new());
 
-        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings, &[]).unwrap();
+        resolve_refs_for_plan_legacy(&mut resources, &HashMap::new(), &remote_bindings, &[])
+            .unwrap();
 
         match resources[0].get_attr("vpc_id") {
             Some(Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef { path }))) => {
@@ -1988,8 +1998,13 @@ mod tests {
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         remote_bindings.insert("network".to_string(), HashMap::new());
 
-        resolve_refs_with_state_and_remote(&mut resources, &HashMap::new(), &remote_bindings, &[])
-            .unwrap();
+        resolve_refs_with_state_and_remote_legacy(
+            &mut resources,
+            &HashMap::new(),
+            &remote_bindings,
+            &[],
+        )
+        .unwrap();
 
         assert!(matches!(
             resources[0].get_attr("vpc_id"),
@@ -2020,7 +2035,8 @@ mod tests {
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         remote_bindings.insert("bootstrap".to_string(), HashMap::new());
 
-        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings, &[]).unwrap();
+        resolve_refs_for_plan_legacy(&mut resources, &HashMap::new(), &remote_bindings, &[])
+            .unwrap();
 
         match resources[0].get_attr("raw") {
             Some(Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamBareRef {
@@ -2058,7 +2074,8 @@ mod tests {
         remote_bindings.insert("bootstrap".to_string(), HashMap::new());
         remote_bindings.insert("secondary".to_string(), HashMap::new());
 
-        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings, &[]).unwrap();
+        resolve_refs_for_plan_legacy(&mut resources, &HashMap::new(), &remote_bindings, &[])
+            .unwrap();
 
         match resources[0].get_attr("raws") {
             Some(Value::Concrete(ConcreteValue::List(items))) => {
@@ -2092,7 +2109,8 @@ mod tests {
         )];
         let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
-        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings, &[]).unwrap();
+        resolve_refs_for_plan_legacy(&mut resources, &HashMap::new(), &remote_bindings, &[])
+            .unwrap();
 
         assert!(matches!(
             resources[0].get_attr("vpc_id"),
@@ -2122,7 +2140,8 @@ mod tests {
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         remote_bindings.insert("network".to_string(), HashMap::new());
 
-        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings, &[]).unwrap();
+        resolve_refs_for_plan_legacy(&mut resources, &HashMap::new(), &remote_bindings, &[])
+            .unwrap();
 
         match resources[0].get_attr("security_group_ids") {
             Some(Value::Concrete(ConcreteValue::List(items))) => {
@@ -2161,7 +2180,8 @@ mod tests {
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         remote_bindings.insert("network".to_string(), HashMap::new());
 
-        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings, &[]).unwrap();
+        resolve_refs_for_plan_legacy(&mut resources, &HashMap::new(), &remote_bindings, &[])
+            .unwrap();
 
         assert!(
             resources[0].dependency_bindings.contains("network"),
@@ -2189,7 +2209,8 @@ mod tests {
         let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         remote_bindings.insert("network".to_string(), HashMap::new());
 
-        resolve_refs_for_plan(&mut resources, &HashMap::new(), &remote_bindings, &[]).unwrap();
+        resolve_refs_for_plan_legacy(&mut resources, &HashMap::new(), &remote_bindings, &[])
+            .unwrap();
 
         match resources[0].get_attr("tags") {
             Some(Value::Concrete(ConcreteValue::Map(m))) => match m.get("VpcId") {
@@ -2217,15 +2238,17 @@ mod tests {
                 )),
             )],
         );
-        let bindings = ResolvedBindings::from_resources_with_state(
-            &[cert],
-            &HashMap::new(),
-            &HashMap::new(),
-            &[crate::binding_index::WaitAliasSpec {
+        let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+            managed: &[cert],
+            virtuals: &[],
+            data_sources: &[],
+            current_states: &HashMap::new(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[crate::binding_index::WaitAliasSpec {
                 binding: crate::parser::BindingName::new("cert_issued"),
                 target: crate::parser::BindingName::new("cert"),
             }],
-        );
+        });
         let path = crate::resource::AccessPath::new("cert_issued", "certificate_arn");
         let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
         let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
@@ -2244,15 +2267,17 @@ mod tests {
     /// PlanError path — not a panic — surfaces it.
     #[test]
     fn resolve_ref_value_wait_binding_absent_target_left_intact() {
-        let bindings = ResolvedBindings::from_resources_with_state(
-            &[],
-            &HashMap::new(),
-            &HashMap::new(),
-            &[crate::binding_index::WaitAliasSpec {
+        let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+            managed: &[],
+            virtuals: &[],
+            data_sources: &[],
+            current_states: &HashMap::new(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[crate::binding_index::WaitAliasSpec {
                 binding: crate::parser::BindingName::new("cert_issued"),
                 target: crate::parser::BindingName::new("nonexistent"),
             }],
-        );
+        });
         let path = crate::resource::AccessPath::new("cert_issued", "certificate_arn");
         let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
         let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();

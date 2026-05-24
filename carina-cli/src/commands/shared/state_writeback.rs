@@ -154,7 +154,7 @@ pub(crate) struct FinalizeApplyInput<'a> {
 ///    [`resolve_virtual_refs_post_apply`] (#3175), so a virtual that
 ///    references a Replaced managed gets the *post*-replace value.
 /// 5. Layer the re-resolved virtuals onto the bindings view via
-///    `add_virtual_resources` (#3176).
+///    `layer_virtuals_post_apply` (#3176).
 /// 6. Resolve export expressions against the combined view.
 pub(crate) fn resolve_exports(
     export_params: &[carina_core::parser::InferredExportParam],
@@ -203,20 +203,22 @@ pub(crate) fn resolve_exports(
     let mut virtuals: Vec<carina_core::resource::VirtualResource> = pre_resolve_virtuals.to_vec();
 
     // Step 3: build the bindings view from the managed slice plus
-    // post-apply states. carina#3181: `sorted_resources` is the
-    // managed-only resolved working copy. Wait aliases land at the end
-    // of construction and snapshot whatever binding the alias targets
-    // (carina#3085).
-    let mut bindings = ResolvedBindings::from_managed_with_state(
-        sorted_resources,
-        &post_apply_states,
-        &HashMap::new(),
+    // post-apply states, **with data sources but no virtuals yet**.
+    // The virtuals' attribute maps still hold pre-apply
+    // `ResourceRef`s and need to be re-resolved against the
+    // post-apply state in Step 4; only after that re-resolution can
+    // they be layered into the bindings view. We use `pre_apply`
+    // with `virtuals: &[]` here, then call
+    // `layer_virtuals_post_apply` once the re-resolution is done.
+    // (carina#3181, carina#3248)
+    let mut bindings = ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
+        managed: sorted_resources,
+        virtuals: &[],
+        data_sources,
+        current_states: &post_apply_states,
+        remote_bindings: &HashMap::new(),
         wait_aliases,
-    );
-    // Layer the data-source bindings so `exports { x = some_read.attr }`
-    // resolves against the `read` resource's resolved attributes
-    // (carina#3181).
-    bindings.add_data_sources(data_sources);
+    });
 
     // Step 4: re-resolve each virtual's attributes against the
     // post-apply bindings view. After this, a virtual's
@@ -227,7 +229,7 @@ pub(crate) fn resolve_exports(
     // Step 5: layer the re-resolved virtuals onto the bindings view.
     // Now `exports { foo = some_module.role_arn }` resolves against
     // a binding whose `role_arn` is the post-apply value.
-    bindings.add_virtual_resources(&virtuals)?;
+    bindings.layer_virtuals_post_apply(&virtuals)?;
 
     // Step 6: resolve the export expressions against the combined
     // view.

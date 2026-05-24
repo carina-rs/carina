@@ -156,22 +156,30 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         .iter()
         .map(carina_core::binding_index::WaitAliasSpec::from)
         .collect();
-    resolve_refs_for_plan(
-        &mut resources,
-        &current_states,
-        &remote_bindings,
-        &wait_aliases,
-    )
-    .expect("Failed to resolve refs with state");
+    // carina#3248: build unified pre-apply bindings (managed +
+    // virtual + data sources) so virtual-rooted refs in the fixture
+    // resolve through the virtual layer to the managed sibling.
+    let upstream_binding_names: std::collections::HashSet<&str> =
+        remote_bindings.keys().map(String::as_str).collect();
+    let plan_bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
+        carina_core::binding_index::PreApplyInputs {
+            managed: &resources,
+            virtuals: &parsed.virtual_resources,
+            data_sources: &data_sources,
+            current_states: &current_states,
+            remote_bindings: &remote_bindings,
+            wait_aliases: &wait_aliases,
+        },
+    );
+    resolve_refs_for_plan(&mut resources, &plan_bindings, &upstream_binding_names)
+        .expect("Failed to resolve refs with state");
 
     // Resolve data-source input refs for the plan (carina#3181).
     let mut data_sources_for_plan = data_sources.clone();
     carina_core::resolver::resolve_data_source_refs_for_plan(
         &mut data_sources_for_plan,
-        &resources,
-        &current_states,
-        &remote_bindings,
-        &wait_aliases,
+        &plan_bindings,
+        &upstream_binding_names,
     )
     .expect("Failed to resolve data source refs with state");
 

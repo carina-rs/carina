@@ -212,12 +212,19 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         .iter()
         .map(carina_core::binding_index::WaitAliasSpec::from)
         .collect();
-    resolve_refs_with_state_and_remote(
-        &mut resources_for_plan,
-        &current_states,
-        &remote_bindings,
-        &wait_aliases,
-    )
+    {
+        let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
+            carina_core::binding_index::PreApplyInputs {
+                managed: &resources_for_plan.clone(),
+                virtuals: &[],
+                data_sources: &[],
+                current_states: &current_states,
+                remote_bindings: &remote_bindings,
+                wait_aliases: &wait_aliases,
+            },
+        );
+        resolve_refs_with_state_and_remote(&mut resources_for_plan, &bindings)
+    }
     .expect("resolve_refs should succeed");
 
     let registry = SchemaRegistry::new();
@@ -341,12 +348,19 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         .iter()
         .map(carina_core::binding_index::WaitAliasSpec::from)
         .collect();
-    resolve_refs_with_state_and_remote(
-        &mut resources_for_plan,
-        &current_states,
-        &remote_bindings,
-        &wait_aliases,
-    )
+    {
+        let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
+            carina_core::binding_index::PreApplyInputs {
+                managed: &resources_for_plan.clone(),
+                virtuals: &[],
+                data_sources: &[],
+                current_states: &current_states,
+                remote_bindings: &remote_bindings,
+                wait_aliases: &wait_aliases,
+            },
+        );
+        resolve_refs_with_state_and_remote(&mut resources_for_plan, &bindings)
+    }
     .expect("resolve_refs should succeed");
 
     let registry = SchemaRegistry::new();
@@ -453,12 +467,19 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
         .collect();
 
     let mut resources_for_plan = sorted_resources.clone();
-    resolve_refs_with_state_and_remote(
-        &mut resources_for_plan,
-        &current_states,
-        &remote_bindings,
-        &wait_aliases,
-    )
+    {
+        let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
+            carina_core::binding_index::PreApplyInputs {
+                managed: &resources_for_plan.clone(),
+                virtuals: &[],
+                data_sources: &[],
+                current_states: &current_states,
+                remote_bindings: &remote_bindings,
+                wait_aliases: &wait_aliases,
+            },
+        );
+        resolve_refs_with_state_and_remote(&mut resources_for_plan, &bindings)
+    }
     .expect("resolve_refs should succeed");
 
     // ---- The phantom is gone: the Distribution's nested

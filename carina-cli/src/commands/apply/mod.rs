@@ -1001,6 +1001,7 @@ async fn run_apply_locked(
     // and refresh them via `read_data_source` (#1683, #1685).
     let resolved_data_sources = resolve_data_source_refs_for_refresh(
         &sorted_resources,
+        &parsed.virtual_resources,
         &data_sources,
         &current_states,
         &remote_bindings,
@@ -1092,15 +1093,6 @@ async fn run_apply_locked(
             .await;
     }
 
-    // Build initial bindings for reference resolution (wait_aliases
-    // defined above before Phase 2).
-    let mut bindings = ResolvedBindings::from_resources_with_state(
-        &sorted_resources,
-        &current_states,
-        &remote_bindings,
-        &wait_aliases,
-    );
-
     // awscc#251: lift the provider-read `current_states` (not just
     // `saved_attrs` above) — a refresh whose `provider.read()` returns
     // plain-`String` IAM enum values must be lifted before the differ
@@ -1119,38 +1111,41 @@ async fn run_apply_locked(
 
     // Snapshot each virtual resource's *pre-resolve* attributes
     // (still carrying `ResourceRef`s) before the head-of-pipeline
-    // `resolve_refs_with_state_and_remote` call below replaces them
-    // with pre-apply concrete values. `finalize_apply`'s export
-    // resolution needs this snapshot to re-resolve virtuals against
-    // the post-apply state — see #3169 / #3177. Without it, every
-    // virtual ref is frozen at the pre-apply value and `state.exports`
-    // captures stale data after any Replace on a referenced managed
-    // resource.
+    // resolver call below replaces them with pre-apply concrete
+    // values. `finalize_apply`'s export resolution needs this
+    // snapshot to re-resolve virtuals against the post-apply state —
+    // see #3169 / #3177. Without it, every virtual ref is frozen at
+    // the pre-apply value and `state.exports` captures stale data
+    // after any Replace on a referenced managed resource.
     // carina#3181: virtual resources live in `parsed.virtual_resources`
     // as their own typed slice.
     let pre_resolve_virtuals: Vec<carina_core::resource::VirtualResource> =
         parsed.virtual_resources.clone();
 
+    // Build the unified pre-apply bindings view (carina#3248): every
+    // kind of binding the configuration declares (managed, virtual,
+    // data source) is in the same view, so a managed attribute
+    // referencing `<module_instance>.<attr>` chains through the
+    // virtual's attribute map to the managed sibling literal
+    // (carina#3246).
+    let mut bindings = ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
+        managed: &sorted_resources,
+        virtuals: &pre_resolve_virtuals,
+        data_sources: &data_sources,
+        current_states: &current_states,
+        remote_bindings: &remote_bindings,
+        wait_aliases: &wait_aliases,
+    });
+
     // Resolve references and enum identifiers, then create initial plan for display
     let mut resources_for_plan = sorted_resources.clone();
-    resolve_refs_with_state_and_remote(
-        &mut resources_for_plan,
-        &current_states,
-        &remote_bindings,
-        &wait_aliases,
-    )?;
+    resolve_refs_with_state_and_remote(&mut resources_for_plan, &bindings)?;
 
     // Resolve data-source input refs and canonicalize, so each `read`
     // resource flows into `create_plan` with concrete attribute values
     // (carina#3181).
     let mut data_sources_for_plan = data_sources.clone();
-    carina_core::resolver::resolve_data_source_refs(
-        &mut data_sources_for_plan,
-        &resources_for_plan,
-        &current_states,
-        &remote_bindings,
-        &wait_aliases,
-    )?;
+    carina_core::resolver::resolve_data_source_refs(&mut data_sources_for_plan, &bindings)?;
 
     // Type-level canonicalization for `Union[String, list(String)]`
     // fields (IAM-style `string_or_list_of_strings`). See #2481, #2511.
@@ -1219,6 +1214,8 @@ async fn run_apply_locked(
         let resolved_exports = crate::commands::plan::resolve_export_values_for_display(
             &parsed.export_params,
             &sorted_resources,
+            &parsed.virtual_resources,
+            &parsed.data_sources,
             &current_states,
             &wait_aliases,
         );
@@ -1306,6 +1303,8 @@ async fn run_apply_locked(
     let resolved_exports = crate::commands::plan::resolve_export_values_for_display(
         &parsed.export_params,
         &sorted_resources,
+        &parsed.virtual_resources,
+        &parsed.data_sources,
         &current_states,
         &wait_aliases,
     );
@@ -1422,16 +1421,16 @@ pub async fn run_apply_from_plan(
     let plan_file: PlanFile =
         serde_json::from_str(&content).map_err(|e| format!("Failed to parse plan file: {}", e))?;
 
-    // Validate version compatibility. Plan-file version 3 (carina#3181)
-    // changed the saved `Effect` payload shapes — managed effects carry
-    // `ManagedResource`, `Read` carries `DataSource`, neither serializes
-    // the legacy `kind` / `virtual_module` fields. Older plans
-    // (version 2 and below) deserialize into a different `Effect` shape
-    // and cannot be applied, so they are rejected outright per the
-    // repo's no-backward-compat policy.
-    if plan_file.version != 3 {
+    // Validate version compatibility. Plan-file version 4
+    // (carina#3248) persists `virtual_resources` so the saved-plan
+    // apply path can rebuild the same `ResolvedBindings` view as the
+    // live-apply path (carina#3246). Older plans (version 3 and
+    // below) lack the `virtual_resources` field and cannot be applied
+    // by the post-#3248 binding-construction path, so they are
+    // rejected outright per the repo's no-backward-compat policy.
+    if plan_file.version != 4 {
         return Err(AppError::Config(format!(
-            "Unsupported plan file version: {} (expected 3). \
+            "Unsupported plan file version: {} (expected 4). \
              Re-run 'carina plan' to produce a plan in the current format.",
             plan_file.version
         )));
@@ -1667,12 +1666,24 @@ async fn run_apply_from_plan_locked(
             target: carina_core::parser::BindingName::new(wb.target.clone()),
         })
         .collect();
-    let mut bindings = ResolvedBindings::from_resources_with_state(
-        sorted_resources,
-        &current_states,
-        &upstream_snapshot,
-        &wait_aliases,
-    );
+    // carina#3248: saved plans (version 4) persist both
+    // `virtual_resources` and `data_sources`, so the saved-plan apply
+    // path builds the same unified pre-apply bindings view as the
+    // live-apply path. The view includes virtuals so a managed
+    // attribute referencing `<module_instance>.<attr>` chains through
+    // to the managed sibling literal (carina#3246), and includes data
+    // sources so a managed attribute referencing `<read_binding>.<attr>`
+    // resolves through the data source's attribute map.
+    let plan_virtuals: &[carina_core::resource::VirtualResource] = &plan_file.virtual_resources;
+    let plan_data_sources: &[carina_core::resource::DataSource] = &plan_file.data_sources;
+    let mut bindings = ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
+        managed: sorted_resources,
+        virtuals: plan_virtuals,
+        data_sources: plan_data_sources,
+        current_states: &current_states,
+        remote_bindings: &upstream_snapshot,
+        wait_aliases: &wait_aliases,
+    });
 
     println!("{}", "Applying changes...".cyan().bold());
     println!();
@@ -1695,9 +1706,7 @@ async fn run_apply_from_plan_locked(
         &mut bindings,
         &mut current_states,
         &unresolved_resources,
-        // Saved plan files do not persist virtual resources; the
-        // `apply --plan` path has no post-expansion virtual slice.
-        &[],
+        plan_virtuals,
     )
     .await;
 
@@ -1715,9 +1724,7 @@ async fn run_apply_from_plan_locked(
         result: &result,
         state_file,
         sorted_resources,
-        // No export resolution runs from the `apply --plan` path, so an
-        // empty data-source slice is correct here.
-        data_sources: &[],
+        data_sources: plan_data_sources,
         current_states: &current_states,
         plan,
         backend,

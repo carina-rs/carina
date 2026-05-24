@@ -53,6 +53,43 @@ pub struct PlanFile {
     pub plan: Plan,
     /// Resources sorted by dependencies (for post-apply state saving)
     pub sorted_resources: Vec<ManagedResource>,
+    /// Virtual resources (module-call attribute containers) emitted
+    /// by module expansion at plan time (carina#3248). Persisted so
+    /// the saved-plan apply path builds the same `ResolvedBindings`
+    /// view as the live-apply path: an attribute referencing
+    /// `<module_instance>.<attr>` chains through the virtual's
+    /// attribute map to the managed sibling literal that backs it.
+    ///
+    /// Pre-carina#3248 saved plans (version `3`) did not persist
+    /// virtuals and apply-from-plan passed `&[]` into the executor —
+    /// any virtual-rooted ref would survive resolution as a
+    /// `ResourceRef` and fail-fast at the executor's
+    /// `assert_fully_resolved` check, or produce a spurious diff if
+    /// it reached the differ (carina#3246).
+    ///
+    /// Empty when the configuration declares no module calls /
+    /// `attributes { ... }` blocks.
+    #[serde(default)]
+    pub virtual_resources: Vec<carina_core::resource::VirtualResource>,
+    /// Data sources (`let x = read aws.iam.user { ... }`) emitted by
+    /// module expansion at plan time (carina#3248). Persisted so the
+    /// saved-plan apply path can re-create the same unified
+    /// `ResolvedBindings` view as the live-apply path: a managed
+    /// attribute referencing `<read_binding>.<attr>` resolves through
+    /// the data source's attribute map.
+    ///
+    /// Pre-carina#3248 saved plans did not persist data sources
+    /// separately (the field was missing); a managed→data-source ref
+    /// would have left a `ResourceRef` unresolved at apply time. The
+    /// typed-split (#3181) moved data sources out of
+    /// `sorted_resources`, so persisting them explicitly is the only
+    /// way to keep the saved-plan apply path consistent with the
+    /// live-apply path.
+    ///
+    /// Empty when the configuration declares no `read`-bound
+    /// bindings.
+    #[serde(default)]
+    pub data_sources: Vec<carina_core::resource::DataSource>,
     /// Current states (for binding_map + state saving)
     pub current_states: Vec<CurrentStateEntry>,
     /// `upstream_state` bindings as resolved at plan time (#2303).
@@ -124,10 +161,12 @@ fn build_plan_file<E>(
     ctx: &crate::wiring::PlanContext,
 ) -> Result<PlanFile, carina_core::value::SerializationError> {
     Ok(PlanFile {
-        // carina#3181 PR D: bumped 2→3 — Effect payloads are now typestate
-        // structs, so the saved-plan JSON shape changed (managed/data-source
-        // payloads no longer carry `kind` / `virtual_module`).
-        version: 3,
+        // carina#3248: bumped 3→4 — saved plans now persist
+        // `virtual_resources` so the saved-plan apply path can rebuild
+        // the same `ResolvedBindings` view as the live-apply path.
+        // Older plans (version `3` and below) are rejected with a
+        // clear message pointing the user at re-running `plan`.
+        version: 4,
         carina_version: env!("CARGO_PKG_VERSION").to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
         source_path: path.display().to_string(),
@@ -140,6 +179,16 @@ fn build_plan_file<E>(
             .sorted_resources
             .iter()
             .map(redact_secrets_in_resource)
+            .collect::<Result<Vec<_>, _>>()?,
+        virtual_resources: parsed
+            .virtual_resources
+            .iter()
+            .map(carina_core::value::redact_secrets_in_virtual)
+            .collect::<Result<Vec<_>, _>>()?,
+        data_sources: parsed
+            .data_sources
+            .iter()
+            .map(carina_core::value::redact_secrets_in_data_source)
             .collect::<Result<Vec<_>, _>>()?,
         current_states: ctx
             .current_states
@@ -576,6 +625,8 @@ pub async fn run_plan(
         let resolved_exports = resolve_export_values_for_display(
             &parsed.export_params,
             &ctx.sorted_resources,
+            &parsed.virtual_resources,
+            &parsed.data_sources,
             &ctx.current_states,
             &export_wait_aliases,
         );
@@ -638,14 +689,23 @@ pub async fn run_plan(
 pub(crate) fn resolve_export_values_for_display(
     export_params: &[carina_core::parser::InferredExportParam],
     resources: &[ManagedResource],
+    virtuals: &[carina_core::resource::VirtualResource],
+    data_sources: &[carina_core::resource::DataSource],
     current_states: &HashMap<ResourceId, State>,
     wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
 ) -> Vec<carina_core::parser::InferredExportParam> {
-    let bindings = carina_core::binding_index::ResolvedBindings::from_resources_with_state(
-        resources,
-        current_states,
-        &HashMap::new(),
-        wait_aliases,
+    // carina#3248: build the unified pre-apply bindings view so an
+    // export referencing `<module_instance>.<attr>` chains through the
+    // virtual to the managed sibling literal (carina#3246).
+    let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
+        carina_core::binding_index::PreApplyInputs {
+            managed: resources,
+            virtuals,
+            data_sources,
+            current_states,
+            remote_bindings: &HashMap::new(),
+            wait_aliases,
+        },
     );
 
     export_params
