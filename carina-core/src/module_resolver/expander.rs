@@ -203,7 +203,11 @@ impl ModuleResolver<'_> {
         // resource bindings so a downstream resource referencing
         // `<wait_binding>.<attr>` is instance-prefixed the same way —
         // otherwise its dependency edge to the wait is lost
-        // (carina#3061; see `prefix_wait_binding`).
+        // (carina#3061; see `prefix_wait_binding`). Module-call bindings
+        // (`let x = inner { ... }`) need the same treatment so a sibling
+        // resource referencing `x.<attr>` lines up with the
+        // `_virtual.<prefix>.x` row produced by the inner expansion
+        // (carina#3243).
         let intra_module_bindings: HashSet<String> = module
             .resources
             .iter()
@@ -214,6 +218,12 @@ impl ModuleResolver<'_> {
                     .wait_bindings
                     .iter()
                     .map(|w| w.binding.as_str().to_string()),
+            )
+            .chain(
+                module
+                    .module_calls
+                    .iter()
+                    .filter_map(|c| c.binding_name.clone()),
             )
             .collect();
 
