@@ -26,12 +26,42 @@ pub(super) fn check_module_arg_type(
             module: module_name.to_string(),
             argument: arg_name.to_string(),
             expected: type_expr.to_string(),
+            actual: describe_value_shape(value).to_string(),
         }),
         TypeCheckResult::ValidationError(e) => Err(ModuleError::InvalidArgumentType {
             module: module_name.to_string(),
             argument: arg_name.to_string(),
             expected: format!("{} ({})", type_expr, e),
+            actual: describe_value_shape(value).to_string(),
         }),
+    }
+}
+
+/// One-word description of a value's shape for error messages.
+///
+/// The previous `expected list(T)`-only message was misleading because
+/// it didn't say what the user actually passed — a string, a map, a
+/// reference to another resource's attribute, etc. Naming the actual
+/// shape lets the reader see at a glance whether the mismatch is
+/// element-type or value-shape (carina#3238).
+fn describe_value_shape(value: &Value) -> &'static str {
+    match value {
+        Value::Concrete(ConcreteValue::String(_)) => "string",
+        Value::Concrete(ConcreteValue::Int(_)) => "int",
+        Value::Concrete(ConcreteValue::Float(_)) => "float",
+        Value::Concrete(ConcreteValue::Bool(_)) => "bool",
+        Value::Concrete(ConcreteValue::Duration(_)) => "duration",
+        Value::Concrete(ConcreteValue::List(_)) | Value::Concrete(ConcreteValue::StringList(_)) => {
+            "list"
+        }
+        Value::Concrete(ConcreteValue::Map(_)) => "map",
+        Value::Concrete(ConcreteValue::EnumIdentifier(_)) => "enum identifier",
+        Value::Deferred(DeferredValue::ResourceRef { .. }) => "resource reference",
+        Value::Deferred(DeferredValue::BindingRef { .. }) => "binding reference",
+        Value::Deferred(DeferredValue::Interpolation(_)) => "interpolation",
+        Value::Deferred(DeferredValue::FunctionCall { .. }) => "function call",
+        Value::Deferred(DeferredValue::Secret(_)) => "secret",
+        Value::Deferred(DeferredValue::Unknown(_)) => "unknown",
     }
 }
 
@@ -131,8 +161,8 @@ pub(super) fn check_type_match(
                 TypeCheckResult::Mismatch
             }
         }
-        TypeExpr::List(inner) => {
-            if let Value::Concrete(ConcreteValue::List(items)) = value {
+        TypeExpr::List(inner) => match value {
+            Value::Concrete(ConcreteValue::List(items)) => {
                 for item in items {
                     match check_type_match(inner, item, config, enclosing_args) {
                         TypeCheckResult::Ok => {}
@@ -140,12 +170,35 @@ pub(super) fn check_type_match(
                     }
                 }
                 TypeCheckResult::Ok
-            } else {
-                TypeCheckResult::Mismatch
             }
-        }
-        TypeExpr::Map(inner) => {
-            if let Value::Concrete(ConcreteValue::Map(entries)) = value {
+            // `StringList` is the canonical form for the
+            // `string_or_list_of_strings` union shape (#2481, #2510);
+            // structurally it is a list of strings, so accept it where
+            // `list(T)` is declared and recurse so the inner type
+            // arm applies the same check it would for a regular list
+            // of string-shaped values.
+            Value::Concrete(ConcreteValue::StringList(items)) => {
+                for s in items {
+                    let item = Value::Concrete(ConcreteValue::String(s.clone()));
+                    match check_type_match(inner, &item, config, enclosing_args) {
+                        TypeCheckResult::Ok => {}
+                        other => return other,
+                    }
+                }
+                TypeCheckResult::Ok
+            }
+            // A reference to another resource's attribute (e.g.
+            // `roles.arns` from `read aws.iam.Roles`) is a deferred
+            // value whose element type cannot be checked here. The
+            // scalar arms (`String`, `Simple`, `Ref`, `SchemaType`)
+            // already accept `ResourceRef` for the same reason;
+            // collection arms must do the same so a `list(T)` argument
+            // can receive a list-typed attribute (carina#3238).
+            Value::Deferred(DeferredValue::ResourceRef { .. }) => TypeCheckResult::Ok,
+            _ => TypeCheckResult::Mismatch,
+        },
+        TypeExpr::Map(inner) => match value {
+            Value::Concrete(ConcreteValue::Map(entries)) => {
                 for v in entries.values() {
                     match check_type_match(inner, v, config, enclosing_args) {
                         TypeCheckResult::Ok => {}
@@ -153,10 +206,11 @@ pub(super) fn check_type_match(
                     }
                 }
                 TypeCheckResult::Ok
-            } else {
-                TypeCheckResult::Mismatch
             }
-        }
+            // Sibling case to the `List` arm above (carina#3238).
+            Value::Deferred(DeferredValue::ResourceRef { .. }) => TypeCheckResult::Ok,
+            _ => TypeCheckResult::Mismatch,
+        },
         // Simple types (cidr, arn, iam_policy_arn, etc.) are string subtypes
         TypeExpr::Simple(name) => {
             if !matches!(
@@ -190,6 +244,13 @@ pub(super) fn check_type_match(
             }
         }
         TypeExpr::Struct { fields } => {
+            // Sibling case to the `List` / `Map` arms above (carina#3238):
+            // a struct-typed argument fed from another resource's
+            // attribute can't have its fields checked here. Defer to
+            // expansion time, same as List/Map.
+            if matches!(value, Value::Deferred(DeferredValue::ResourceRef { .. })) {
+                return TypeCheckResult::Ok;
+            }
             let Value::Concrete(ConcreteValue::Map(entries)) = value else {
                 return TypeCheckResult::Mismatch;
             };
