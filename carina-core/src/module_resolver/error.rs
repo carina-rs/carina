@@ -14,11 +14,20 @@ pub enum ModuleError {
     #[error("Missing required argument '{argument}' for module '{module}'")]
     MissingArgument { module: String, argument: String },
 
-    #[error("Invalid argument type for '{argument}' in module '{module}': expected {expected}")]
+    #[error(
+        "Invalid argument type for '{argument}' in module '{module}': expected {expected}, got {actual}"
+    )]
     InvalidArgumentType {
         module: String,
         argument: String,
         expected: String,
+        /// Short, human-readable description of the value shape that was
+        /// passed (e.g. `string`, `int`, `list`, `map`, `resource reference`).
+        /// Surfacing the actual shape avoids the misleading
+        /// `expected list(...)` reading that sent issue #3238's reporter
+        /// hunting for an element-type mismatch when the real cause was
+        /// a value-shape mismatch.
+        actual: String,
     },
 
     #[error("IO error: {0}")]

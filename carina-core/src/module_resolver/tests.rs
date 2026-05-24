@@ -4343,3 +4343,260 @@ let r = registry {
     assert_eq!(parsed.wait_bindings[0].binding, "r.cert_issued");
     assert_eq!(parsed.wait_bindings[0].target, "r.cert");
 }
+
+/// carina#3238: a `list(T)`-typed module argument must accept a bare
+/// `ResourceRef` whose runtime value is a list (e.g. the `arns` output
+/// of `read aws.iam.Roles`). Before the fix the `TypeExpr::List` arm of
+/// the module-arg typecheck only accepted `ConcreteValue::List`, so
+/// passing `roles.arns` was rejected with a misleading
+/// `expected list(...)` error — forcing the user to wrap it in a
+/// literal `[roles.arns[0]]` that silently drops every element past
+/// index 0. The scalar arms (`String`, `Simple`, `Ref`, `SchemaType`)
+/// already accepted `ResourceRef`; only the collection arms didn't.
+#[test]
+fn argument_type_list_accepts_resource_ref() {
+    let mut module = create_test_module();
+    module.arguments = vec![ArgumentParameter {
+        name: "role_arns".to_string(),
+        type_expr: TypeExpr::List(Box::new(TypeExpr::Simple("arn".to_string()))),
+        default: None,
+        description: None,
+        validations: Vec::new(),
+    }];
+
+    let resolver = {
+        let mut r = ModuleResolver::new(".");
+        r.imported_modules.insert("test_module".to_string(), module);
+        r
+    };
+
+    let call = ModuleCall {
+        module_name: "test_module".to_string(),
+        binding_name: Some("a".to_string()),
+        arguments: {
+            let mut args = HashMap::new();
+            args.insert(
+                "role_arns".to_string(),
+                Value::resource_ref("admin_access_roles", "arns", Vec::new()),
+            );
+            args
+        },
+    };
+
+    let result = resolver.expand_module_call(&call, "a", None);
+    assert!(
+        result.is_ok(),
+        "list(T) argument should accept ResourceRef (carina#3238); got {:?}",
+        result
+    );
+}
+
+/// carina#3238 sibling case: `map(T)` arguments must also accept a
+/// `ResourceRef` whose runtime value is a map. Same root cause and same
+/// fix as the list case — the collection arms were symmetric in
+/// rejecting deferred refs.
+#[test]
+fn argument_type_map_accepts_resource_ref() {
+    let mut module = create_test_module();
+    module.arguments = vec![ArgumentParameter {
+        name: "tags".to_string(),
+        type_expr: TypeExpr::Map(Box::new(TypeExpr::String)),
+        default: None,
+        description: None,
+        validations: Vec::new(),
+    }];
+
+    let resolver = {
+        let mut r = ModuleResolver::new(".");
+        r.imported_modules.insert("test_module".to_string(), module);
+        r
+    };
+
+    let call = ModuleCall {
+        module_name: "test_module".to_string(),
+        binding_name: Some("a".to_string()),
+        arguments: {
+            let mut args = HashMap::new();
+            args.insert(
+                "tags".to_string(),
+                Value::resource_ref("some_resource", "tags", Vec::new()),
+            );
+            args
+        },
+    };
+
+    let result = resolver.expand_module_call(&call, "a", None);
+    assert!(
+        result.is_ok(),
+        "map(T) argument should accept ResourceRef (carina#3238); got {:?}",
+        result
+    );
+}
+
+/// carina#3238 sibling case: `struct { ... }` arguments must also
+/// accept a `ResourceRef`. Same root cause and same fix as List/Map —
+/// the collection arms were symmetric in rejecting deferred refs.
+#[test]
+fn argument_type_struct_accepts_resource_ref() {
+    let mut module = create_test_module();
+    module.arguments = vec![ArgumentParameter {
+        name: "options".to_string(),
+        type_expr: TypeExpr::Struct {
+            fields: vec![("name".to_string(), TypeExpr::String)],
+        },
+        default: None,
+        description: None,
+        validations: Vec::new(),
+    }];
+
+    let resolver = {
+        let mut r = ModuleResolver::new(".");
+        r.imported_modules.insert("test_module".to_string(), module);
+        r
+    };
+
+    let call = ModuleCall {
+        module_name: "test_module".to_string(),
+        binding_name: Some("a".to_string()),
+        arguments: {
+            let mut args = HashMap::new();
+            args.insert(
+                "options".to_string(),
+                Value::resource_ref("some_resource", "options", Vec::new()),
+            );
+            args
+        },
+    };
+
+    let result = resolver.expand_module_call(&call, "a", None);
+    assert!(
+        result.is_ok(),
+        "struct argument should accept ResourceRef (carina#3238); got {:?}",
+        result
+    );
+}
+
+/// carina#3238 end-to-end: a multi-file directory fixture that mirrors
+/// the real `infra-deploy` reproducer — a usecase module declares
+/// `list(T)` and `map(T)` arguments, and the root caller feeds them
+/// from a `read` data source's attributes (a list-typed and a
+/// map-typed `ResourceRef`). Before the fix, `resolve_modules` failed
+/// with `Invalid argument type ... expected list(...)`; the workaround
+/// was `[xs[0]]` which silently dropped every element past index 0.
+#[test]
+fn list_and_map_args_accept_read_attribute_passthrough_directory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Usecase module: declares list(String) + map(String) arguments,
+    // split across the multi-file shape used in carina-rs/infra (the
+    // issue's real reproducer lived in `usecases/registry/infra-deploy`).
+    let usecase_dir = tmp.path().join("usecases/infra_deploy");
+    fs::create_dir_all(&usecase_dir).unwrap();
+    fs::write(
+        usecase_dir.join("arguments.crn"),
+        r#"
+arguments {
+  sso_admin_role_arns: list(String)
+  account_tags:        map(String)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        usecase_dir.join("main.crn"),
+        r#"
+let r = awscc.iam.Role {
+  role_name = 'r'
+  assume_role_policy_document = {}
+}
+"#,
+    )
+    .unwrap();
+
+    // Root caller: feeds a `read` data source's list-typed and map-typed
+    // attributes directly into the usecase's list/map args. Pre-fix, the
+    // module-arg typecheck rejected the bare ResourceRef.
+    let root_dir = tmp.path().join("root");
+    fs::create_dir_all(&root_dir).unwrap();
+    fs::write(
+        root_dir.join("main.crn"),
+        r#"
+let admin_access_roles = read aws.iam.Roles {
+  path_prefix = '/aws-reserved/sso.amazonaws.com/'
+  name_regex  = '^AWSReservedSSO_AdministratorAccess_[0-9a-f]{16}$'
+}
+
+let infra_deploy = use {
+  source = '../usecases/infra_deploy'
+}
+
+let rd = infra_deploy {
+  sso_admin_role_arns = admin_access_roles.arns
+  account_tags        = admin_access_roles.tags
+}
+"#,
+    )
+    .unwrap();
+
+    let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
+    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let result = resolve_modules(&mut parsed, &root_dir);
+    assert!(
+        result.is_ok(),
+        "list(T)/map(T) usecase arguments must accept a `read`'s \
+         list/map-typed attribute via bare ResourceRef (carina#3238); \
+         got {:?}",
+        result
+    );
+}
+
+/// carina#3238: the error message for a true list-vs-scalar mismatch
+/// must show the actual value shape, not just the expected type. The
+/// previous wording (`expected list(aws.iam.Role.Arn)`) sent the
+/// reporter hunting for an element-type mismatch when the actual cause
+/// was a value-shape mismatch. The fix surfaces both sides.
+#[test]
+fn argument_type_mismatch_error_shows_actual_value_shape() {
+    let mut module = create_test_module();
+    module.arguments = vec![ArgumentParameter {
+        name: "role_arns".to_string(),
+        type_expr: TypeExpr::List(Box::new(TypeExpr::Simple("arn".to_string()))),
+        default: None,
+        description: None,
+        validations: Vec::new(),
+    }];
+
+    let resolver = {
+        let mut r = ModuleResolver::new(".");
+        r.imported_modules.insert("test_module".to_string(), module);
+        r
+    };
+
+    let call = ModuleCall {
+        module_name: "test_module".to_string(),
+        binding_name: Some("a".to_string()),
+        arguments: {
+            let mut args = HashMap::new();
+            // Pass a plain string where list is expected.
+            args.insert(
+                "role_arns".to_string(),
+                Value::Concrete(ConcreteValue::String("arn:aws:iam::123:role/A".to_string())),
+            );
+            args
+        },
+    };
+
+    let result = resolver.expand_module_call(&call, "a", None);
+    let Err(err) = result else {
+        panic!("expected InvalidArgumentType error, got Ok");
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("got"),
+        "error should include the actual value shape (carina#3238); got: {msg}"
+    );
+    assert!(
+        msg.contains("string"),
+        "error should name the actual value shape (string) for a string-into-list mismatch (carina#3238); got: {msg}"
+    );
+}
