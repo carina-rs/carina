@@ -651,10 +651,35 @@ fn build_update_rows(
             let old_str = old_value
                 .map(|v| format_value_with_key(v, Some(key)))
                 .unwrap_or_else(|| "(none)".to_string());
+            let new_str = format_value_with_key(new_value, Some(key));
+            // carina#3258: if the attribute's two sides render
+            // identically, `~ key: X → X` is a lie — the upstream
+            // differ flagged the attribute as changed but the display
+            // layer collapses both sides to the same string (commonly
+            // a value-shape mismatch like `StringList` vs
+            // `List<String>` that the renderer cannot draw). Fold
+            // into the hidden-unchanged tally instead. Sibling guards
+            // live in `compute_map_diff_entries` and
+            // `compute_list_of_maps_diff_parts` below.
+            //
+            // Skip the guard when either side contains a secret:
+            // `format_value` collapses every secret to the literal
+            // `"(secret)"`, so display equality is meaningless and
+            // suppression would hide a real secret rotation
+            // (e.g. `Secret(hash_A) → Secret(hash_B)`) — pre-fix the
+            // user saw an uninformative `~ … (secret) → (secret)` row;
+            // suppressing it would silently hide the rotation.
+            if old_str == new_str
+                && old_value.is_none_or(|v| !crate::value::contains_secret(v))
+                && !crate::value::contains_secret(new_value)
+            {
+                effectively_unchanged += 1;
+                continue;
+            }
             rows.push(DetailRow::Changed {
                 key: key.to_string(),
                 old: old_str,
-                new: format_value_with_key(new_value, Some(key)),
+                new: new_str,
             });
         }
     }
@@ -1064,10 +1089,24 @@ fn compute_map_diff_entries(
                         removed: diff.removed,
                     });
                 } else {
+                    let old_s = format_value_with_key(&e.old_value, Some(&e.key));
+                    let new_s = format_value_with_key(&e.new_value, Some(&e.key));
+                    // carina#3258: see the renderer-truth note in
+                    // `build_update_rows` (including the secret
+                    // bypass). Map-level hidden counts roll up at the
+                    // attribute level, so silently dropping the entry
+                    // (matching the schema-aware leaf-skip arm above)
+                    // is the correct behavior here.
+                    if old_s == new_s
+                        && !crate::value::contains_secret(&e.old_value)
+                        && !crate::value::contains_secret(&e.new_value)
+                    {
+                        continue;
+                    }
                     entries.push(MapDiffEntryIR::Changed {
                         key: e.key.clone(),
-                        old: format_value_with_key(&e.old_value, Some(&e.key)),
-                        new: format_value_with_key(&e.new_value, Some(&e.key)),
+                        old: old_s,
+                        new: new_s,
                     });
                 }
             }
@@ -1280,10 +1319,24 @@ fn compute_list_of_maps_diff_parts(
                     let old_v = old_val
                         .map(format_value)
                         .unwrap_or_else(|| "(none)".to_string());
+                    let new_v = format_value(&new_map[k]);
+                    // carina#3258: see the renderer-truth note in
+                    // `build_update_rows` (including the secret
+                    // bypass). Fold display-equal peers into the
+                    // per-element hidden-unchanged count so the
+                    // summary stays consistent with the rendered
+                    // evidence.
+                    if old_v == new_v
+                        && old_val.is_none_or(|v| !crate::value::contains_secret(v))
+                        && !crate::value::contains_secret(&new_map[k])
+                    {
+                        unchanged_count += 1;
+                        continue;
+                    }
                     fields.push(ListOfMapsDiffField::Changed {
                         key: k.to_string(),
                         old: old_v,
-                        new: format_value(&new_map[k]),
+                        new: new_v,
                     });
                 }
             }
@@ -2612,6 +2665,335 @@ mod tests {
         assert!(
             added[0].eq_ignore_ascii_case("deny"),
             "the genuine add is Deny, got: {added:?}"
+        );
+    }
+
+    /// carina#3258: when `compute_list_of_maps_diff_parts` pairs two
+    /// list elements by similarity (because exact-match in Phase 1
+    /// failed on ONE field that has a true shape mismatch — e.g.
+    /// `String` vs `StringList` — but `format_value` renders both sides
+    /// identically), the OTHER unchanged-by-display fields must NOT
+    /// appear as `ListOfMapsDiffField::Changed { old, new }` rows
+    /// whose `old` and `new` are byte-identical. They must fold into
+    /// `hidden_unchanged_count` like genuine unchanged fields.
+    ///
+    /// Real-world trigger (issue #3258 reproduction): an
+    /// `awscc.iam.Role.assume_role_policy_document.statement` element
+    /// has a sibling-changed peer added to the list. The existing
+    /// (unchanged) OIDC statement reaches the differ with at least one
+    /// shape-mismatched field (e.g. `principal.federated` as
+    /// `List([String])` on one side and `StringList` on the other),
+    /// which makes `Value::semantically_equal` return false and breaks
+    /// Phase 1. Phase 2 pairs by similarity. Every other field
+    /// `format_value`-renders identically, but the schema-blind
+    /// `semantically_equal` says "different" so they all emit phantom
+    /// `~ key: X → X` rows.
+    #[test]
+    fn list_of_maps_modified_drops_display_equal_peer_fields() {
+        // `List([String])` vs `StringList(_)` both render as `["x"]`
+        // via `format_value` but compare unequal under
+        // `semantically_equal` (different discriminants) — the
+        // shape mismatch the renderer must hide.
+        let mut old_oidc = indexmap::IndexMap::new();
+        old_oidc.insert(
+            "action".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("sts:AssumeRoleWithWebIdentity".to_string()),
+            )])),
+        );
+        // The shape-mismatched field that breaks Phase 1 exact match.
+        old_oidc.insert(
+            "principal_federated".to_string(),
+            Value::Concrete(ConcreteValue::StringList(vec![
+                "arn:aws:iam::123:oidc-provider/token.example.com".to_string(),
+            ])),
+        );
+
+        let mut new_oidc = indexmap::IndexMap::new();
+        new_oidc.insert(
+            "action".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("sts:AssumeRoleWithWebIdentity".to_string()),
+            )])),
+        );
+        new_oidc.insert(
+            "principal_federated".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String(
+                    "arn:aws:iam::123:oidc-provider/token.example.com".to_string(),
+                ),
+            )])),
+        );
+
+        // A second wholly-new statement so the desired list grows; this
+        // is what makes Phase 1's exact-match step actually fail for the
+        // OIDC pair (length mismatch never reached — but the per-pair
+        // check still runs and fails for the shape-mismatched field).
+        let mut new_admin = indexmap::IndexMap::new();
+        new_admin.insert(
+            "action".to_string(),
+            Value::Concrete(ConcreteValue::String("sts:AssumeRole".to_string())),
+        );
+
+        let old_value = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(old_oidc),
+        )]));
+        let new_value = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::Map(new_oidc)),
+            Value::Concrete(ConcreteValue::Map(new_admin)),
+        ]));
+
+        let (_unchanged, modified, _added, _removed) =
+            compute_list_of_maps_diff_parts(Some(&old_value), &new_value, None, DetailLevel::Full);
+
+        // The paired OIDC element must NOT report `action` as Changed:
+        // both sides render to the same `["sts:AssumeRoleWithWebIdentity"]`
+        // string. The renderer cannot honestly mark it as `~`.
+        for m in &modified {
+            for field in m.fields.as_slice() {
+                if let ListOfMapsDiffField::Changed { key, old, new } = field {
+                    assert_ne!(
+                        old, new,
+                        "field `{key}` rendered as Changed with old == new = {old:?}; \
+                         a display-equal field must fold into hidden_unchanged_count \
+                         instead of emitting a phantom `~ {key}: X → X` row"
+                    );
+                }
+            }
+        }
+    }
+
+    /// carina#3258 (recursion site): inside `compute_map_diff_entries`,
+    /// when `compute_map_diff` flags a key as Changed via schema-blind
+    /// `semantically_equal` but the two values `format_value` to the
+    /// same string, the renderer must not emit a phantom
+    /// `MapDiffEntryIR::Changed { old, new }` with `old == new`.
+    #[test]
+    fn map_diff_entries_drops_display_equal_changed_keys() {
+        // Nested map (the `principal` shape in the issue). One side has
+        // a `StringList` value, the other a `List([String])` — display-
+        // equal but `semantically_equal` returns false.
+        let mut old_principal = indexmap::IndexMap::new();
+        old_principal.insert(
+            "federated".to_string(),
+            Value::Concrete(ConcreteValue::StringList(vec![
+                "arn:aws:iam::123:oidc-provider/x".to_string(),
+            ])),
+        );
+        // A genuinely different sibling key forces the parent map onto
+        // the Changed path so the recursion is exercised.
+        old_principal.insert(
+            "service".to_string(),
+            Value::Concrete(ConcreteValue::String("old.example.com".to_string())),
+        );
+
+        let mut new_principal = indexmap::IndexMap::new();
+        new_principal.insert(
+            "federated".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("arn:aws:iam::123:oidc-provider/x".to_string()),
+            )])),
+        );
+        new_principal.insert(
+            "service".to_string(),
+            Value::Concrete(ConcreteValue::String("new.example.com".to_string())),
+        );
+
+        let old_value = Value::Concrete(ConcreteValue::Map(old_principal));
+        let new_value = Value::Concrete(ConcreteValue::Map(new_principal));
+
+        let entries =
+            compute_map_diff_entries(Some(&old_value), &new_value, None, DetailLevel::Full);
+
+        for entry in &entries {
+            if let MapDiffEntryIR::Changed { key, old, new } = entry {
+                assert_ne!(
+                    old, new,
+                    "key `{key}` rendered as Changed with old == new = {old:?}; \
+                     a display-equal map entry must be suppressed instead of \
+                     emitting a phantom `~ {key}: X → X` row"
+                );
+            }
+        }
+    }
+
+    /// carina#3258 (top-level attribute site): the same display-equal
+    /// guard applies to `DetailRow::Changed` rows emitted directly for
+    /// an attribute (not nested inside a list-of-maps / map-diff). A
+    /// schema-blind differ that flagged the attribute as changed but
+    /// renders both sides identically must fold into the
+    /// `HiddenUnchanged` tally rather than emit `~ key: X → X`.
+    #[test]
+    fn top_level_changed_drops_display_equal_attribute() {
+        // Schema-blind: no registry, so `find_changed_attributes`
+        // uses `Value::semantically_equal`, which compares
+        // `StringList(["x"])` to `List([String("x")])` as unequal even
+        // though both `format_value` to `["x"]`.
+        let from = State::existing(
+            ResourceId::new("x.Thing", "t"),
+            [(
+                "tags".to_string(),
+                Value::Concrete(ConcreteValue::StringList(vec!["only-one".to_string()])),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let to = ManagedResource::new("x.Thing", "t").with_attribute(
+            "tags",
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("only-one".to_string()),
+            )])),
+        );
+        let effect = Effect::Update {
+            id: ResourceId::new("x.Thing", "t"),
+            from: Box::new(from),
+            to,
+            changed_attributes: vec!["tags".to_string()],
+        };
+        let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, None);
+        for row in &rows {
+            if let DetailRow::Changed { key, old, new } = row {
+                assert_ne!(
+                    old, new,
+                    "top-level attribute `{key}` rendered as Changed with old == new = {old:?}"
+                );
+            }
+        }
+    }
+
+    /// carina#3258 (negative — secret bypass): every secret value
+    /// renders as the literal `(secret)` via `format_value`, so the
+    /// display-equal guard would silently hide a secret rotation
+    /// (`Secret(A) → Secret(B)`). The guard must explicitly bypass
+    /// when either side contains a secret — preserving the pre-fix
+    /// "uninformative but visible" `~ key: (secret) → (secret)` row
+    /// rather than dropping the change entirely.
+    #[test]
+    fn top_level_changed_keeps_secret_rotation_visible() {
+        let from = State::existing(
+            ResourceId::new("x.Thing", "t"),
+            [(
+                "password".to_string(),
+                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                    ConcreteValue::String("old-secret".to_string()),
+                )))),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let to = ManagedResource::new("x.Thing", "t").with_attribute(
+            "password",
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("new-secret".to_string()),
+            )))),
+        );
+        let effect = Effect::Update {
+            id: ResourceId::new("x.Thing", "t"),
+            from: Box::new(from),
+            to,
+            changed_attributes: vec!["password".to_string()],
+        };
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
+        assert!(
+            rows.iter().any(|r| matches!(
+                r,
+                DetailRow::Changed { key, .. } if key == "password"
+            )),
+            "secret rotation must still produce a Changed row, got: {rows:?}"
+        );
+    }
+
+    /// carina#3258 (negative — secret bypass at map-diff site):
+    /// mirrors `top_level_changed_keeps_secret_rotation_visible` at
+    /// `compute_map_diff_entries`. A nested `Secret(A) → Secret(B)`
+    /// inside a `MapDiff` must not be silently dropped.
+    #[test]
+    fn map_diff_entries_keeps_secret_rotation_visible() {
+        let mut old_map = indexmap::IndexMap::new();
+        old_map.insert(
+            "password".to_string(),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("old".to_string()),
+            )))),
+        );
+        let mut new_map = indexmap::IndexMap::new();
+        new_map.insert(
+            "password".to_string(),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("new".to_string()),
+            )))),
+        );
+        let old_value = Value::Concrete(ConcreteValue::Map(old_map));
+        let new_value = Value::Concrete(ConcreteValue::Map(new_map));
+        let entries =
+            compute_map_diff_entries(Some(&old_value), &new_value, None, DetailLevel::Full);
+        assert!(
+            entries.iter().any(|e| matches!(
+                e,
+                MapDiffEntryIR::Changed { key, .. } if key == "password"
+            )),
+            "secret rotation under a map-diff must still produce a Changed entry, got: {entries:?}"
+        );
+    }
+
+    /// carina#3258 (negative — secret bypass at list-of-maps site):
+    /// mirrors the above for `compute_list_of_maps_diff_parts`. Two
+    /// statements paired by similarity where the unchanged-by-display
+    /// peer holds a rotated secret must keep that peer as a Changed
+    /// field, not fold into the hidden-count.
+    #[test]
+    fn list_of_maps_modified_keeps_secret_rotation_visible() {
+        let secret_old = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("old".to_string()),
+        ))));
+        let secret_new = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("new".to_string()),
+        ))));
+
+        // Same `sid` on both sides so `map_similarity > 0` → Phase 2
+        // pairs them. A different `effect` key forces Phase 1
+        // exact-match to fail so the pair is *modified*, not unchanged.
+        let mut old_stmt = indexmap::IndexMap::new();
+        old_stmt.insert(
+            "sid".to_string(),
+            Value::Concrete(ConcreteValue::String("shared".to_string())),
+        );
+        old_stmt.insert(
+            "effect".to_string(),
+            Value::Concrete(ConcreteValue::String("Allow".to_string())),
+        );
+        old_stmt.insert("password".to_string(), secret_old);
+
+        let mut new_stmt = indexmap::IndexMap::new();
+        new_stmt.insert(
+            "sid".to_string(),
+            Value::Concrete(ConcreteValue::String("shared".to_string())),
+        );
+        new_stmt.insert(
+            "effect".to_string(),
+            Value::Concrete(ConcreteValue::String("Deny".to_string())),
+        );
+        new_stmt.insert("password".to_string(), secret_new);
+
+        let old_value = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(old_stmt),
+        )]));
+        let new_value = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(new_stmt),
+        )]));
+
+        let (_unchanged, modified, _added, _removed) =
+            compute_list_of_maps_diff_parts(Some(&old_value), &new_value, None, DetailLevel::Full);
+
+        let password_changed = modified.iter().any(|m| {
+            m.fields
+                .as_slice()
+                .iter()
+                .any(|f| matches!(f, ListOfMapsDiffField::Changed { key, .. } if key == "password"))
+        });
+        assert!(
+            password_changed,
+            "secret rotation as a paired-element peer must keep its Changed field, got: {modified:?}"
         );
     }
 
