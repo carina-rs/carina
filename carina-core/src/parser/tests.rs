@@ -6362,6 +6362,7 @@ fn parse_decrypt_uses_config_decryptor() {
         validators: HashMap::new(),
         custom_type_validator: None,
         schema_types: Default::default(),
+        customs_loaded: false,
     };
 
     // decrypt() in resource attributes is resolved during resolve_resource_refs,
@@ -6424,6 +6425,7 @@ fn parse_custom_validator_accepts_valid() {
         validators,
         custom_type_validator: None,
         schema_types: Default::default(),
+        customs_loaded: false,
     };
 
     let result = validate_custom_type(
@@ -6465,6 +6467,7 @@ fn parse_custom_validator_rejects_invalid() {
         validators,
         custom_type_validator: None,
         schema_types: Default::default(),
+        customs_loaded: false,
     };
 
     // Test validate_custom_type directly since the grammar may not accept

@@ -142,6 +142,9 @@ fn enrich_provider_context(
             },
         )),
         schema_types: Default::default(),
+        // carina#3239: schemas are loaded at this point, so the strict
+        // "unknown custom type in type position" parser check applies.
+        customs_loaded: true,
     }
 }
 
@@ -253,6 +256,23 @@ pub fn validate_and_resolve_errors_with_factories(
 
     // Enrich provider context with custom type validators from loaded schemas
     let enriched_context = enrich_provider_context(ctx.schemas(), ctx.factories_arc());
+
+    // carina#3239: reject `arguments { foo: TotallyMadeUpType }`-shaped
+    // unknown bare custom-type names in the root parse. The root
+    // config was parsed up in `load_configuration_with_config` with
+    // the bootstrap context (`customs_loaded = false`) — schemas had
+    // not been collected yet, so the parser-side `customs_loaded` gate
+    // could not fire there. This post-parse walk re-applies the same
+    // predicate against the now-enriched context, closing the
+    // standalone-module-validate path so a typo or renamed-then-
+    // removed type cannot ride into apply. Imported modules
+    // re-parsed below by `resolve_modules_with_config` see the
+    // enriched context directly and the parser gate covers them.
+    for finding in
+        carina_core::validation::validate_argument_custom_types(parsed, &enriched_context)
+    {
+        errors.push(AppError::Validation(finding));
+    }
 
     // Validate module call arguments before expansion (needs enriched
     // context for custom type validators)

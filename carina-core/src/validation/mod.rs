@@ -671,6 +671,115 @@ pub fn validate_no_arguments_in_root<E>(parsed: &crate::parser::File<E>) -> Resu
     Ok(())
 }
 
+/// Reject module-level type declarations whose type position names an
+/// unknown bare custom type (carina#3239).
+///
+/// Walks every typed parameter `parsed` carries — `arguments`,
+/// `attributes`, `exports` (when typed) — and applies the same
+/// predicate the parser's `customs_loaded` gate uses.
+///
+/// The parser already rejects unknown `TypeExpr::Simple` names when
+/// it is handed a `ProviderContext` with `customs_loaded = true`. That
+/// gate fires for every parse path *after* the provider-registration
+/// phase has populated the context — imported modules re-parsed by
+/// `module_resolver::resolve_modules_with_config` and every LSP
+/// diagnostic pass.
+///
+/// The root-config parse is the one exception: `load_configuration_with_config`
+/// runs with the bootstrap context (`customs_loaded = false`) because
+/// schemas have not been collected yet, so a standalone-module
+/// validate (`carina validate ./my_module/`) would let an unknown
+/// custom-type name in `arguments { foo: TotallyMadeUpType }` slip
+/// through. This post-parse walk re-applies the same predicate against
+/// the now-enriched context, closing the gap without re-parsing.
+///
+/// `attributes` and `exports` are covered for the same reason as
+/// `arguments`: all three are module-boundary type declarations, all
+/// three are reached through the same root-config parse, and an
+/// unknown bare custom type in any of them surfaces the identical
+/// silent-accept bug.
+///
+/// The check is restricted to bare PascalCase names that parsed as
+/// `TypeExpr::Simple`. Provider-scoped customs (`aws.iam.Role.Arn`)
+/// travel through `TypeExpr::SchemaType` and have their own
+/// `schema_types`-based validation; they are out of scope here.
+pub fn validate_argument_custom_types<E: crate::parser::ExportParamLike>(
+    parsed: &crate::parser::File<E>,
+    config: &ProviderContext,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for arg in &parsed.arguments {
+        collect_unknown_simple_types_in(&arg.type_expr, config, "argument", &arg.name, &mut errors);
+    }
+    for ap in &parsed.attribute_params {
+        if let Some(ty) = &ap.type_expr {
+            collect_unknown_simple_types_in(ty, config, "attribute", &ap.name, &mut errors);
+        }
+    }
+    for ep in &parsed.export_params {
+        if let Some(ty) = ep.type_expr_opt() {
+            collect_unknown_simple_types_in(ty, config, "export", ep.name(), &mut errors);
+        }
+    }
+    errors
+}
+
+/// Recursively walk a [`TypeExpr`] and push one diagnostic per
+/// [`TypeExpr::Simple`] whose name is not a known bare custom type
+/// under `config`. Helper for [`validate_argument_custom_types`].
+///
+/// Each emitted message is a single line (no embedded newlines) so the
+/// caller can `split('\n')` to lift findings into individual errors.
+///
+/// Variants that carry no nested `TypeExpr` are listed explicitly
+/// rather than caught by a wildcard: a future variant that *does* nest
+/// a `TypeExpr` should be a compile error here, not a silent
+/// type-checking gap.
+fn collect_unknown_simple_types_in(
+    ty: &crate::parser::TypeExpr,
+    config: &ProviderContext,
+    decl_kind: &str,
+    decl_name: &str,
+    errors: &mut Vec<String>,
+) {
+    use crate::parser::TypeExpr;
+    match ty {
+        TypeExpr::Simple(snake) => {
+            if !crate::parser::is_known_bare_custom_type(snake, config) {
+                let pascal = crate::parser::snake_to_pascal(snake);
+                errors.push(format!(
+                    "{decl_kind} '{decl_name}': unknown custom type '{pascal}'"
+                ));
+            }
+        }
+        TypeExpr::List(inner) | TypeExpr::Map(inner) => {
+            collect_unknown_simple_types_in(inner, config, decl_kind, decl_name, errors);
+        }
+        TypeExpr::Union(members) => {
+            for m in members {
+                collect_unknown_simple_types_in(m, config, decl_kind, decl_name, errors);
+            }
+        }
+        TypeExpr::Struct { fields } => {
+            for (_, field_ty) in fields {
+                collect_unknown_simple_types_in(field_ty, config, decl_kind, decl_name, errors);
+            }
+        }
+        // Leaves with no nested `TypeExpr` to recurse into. Listed
+        // explicitly so a future variant that *does* nest one fails to
+        // compile here instead of silently bypassing the walk.
+        TypeExpr::String
+        | TypeExpr::Bool
+        | TypeExpr::Int
+        | TypeExpr::Float
+        | TypeExpr::Duration
+        | TypeExpr::Ref(_)
+        | TypeExpr::SchemaType { .. }
+        | TypeExpr::StringLiteral(_)
+        | TypeExpr::Unknown => {}
+    }
+}
+
 /// Check that a module file does not contain provider blocks.
 ///
 /// Provider configuration should only be defined at the root configuration level,

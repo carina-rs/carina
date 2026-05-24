@@ -46,6 +46,7 @@ fn context_with_iam_policy_arn_validator() -> ProviderContext {
         validators,
         custom_type_validator: None,
         schema_types: Default::default(),
+        customs_loaded: false,
     }
 }
 
@@ -3039,5 +3040,164 @@ fn value_contains_unresolved_ref_unwraps_secret() {
     assert!(
         !value_contains_unresolved_ref(&secret_literal),
         "Secret(literal) must not be flagged",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// carina#3239: post-parse argument-side unknown-custom-type walker.
+// These cover the validator unit; the end-to-end CLI / LSP wiring is
+// exercised by `carina-cli/tests/validate_unknown_custom_type_e2e.rs`.
+// ---------------------------------------------------------------------------
+
+fn enriched_context_with_iam_policy_arn() -> ProviderContext {
+    let mut ctx = context_with_iam_policy_arn_validator();
+    ctx.customs_loaded = true;
+    ctx
+}
+
+#[test]
+fn validate_argument_custom_types_rejects_unknown_in_arguments() {
+    use crate::parser::{ArgumentParameter, TypeExpr};
+
+    let mut parsed = empty_parsed();
+    parsed.arguments.push(ArgumentParameter {
+        name: "bad_arg".to_string(),
+        type_expr: TypeExpr::Simple("totally_made_up_type".to_string()),
+        default: None,
+        description: None,
+        validations: Vec::new(),
+    });
+
+    let findings = validate_argument_custom_types(&parsed, &enriched_context_with_iam_policy_arn());
+
+    assert_eq!(findings.len(), 1, "expected one finding, got {findings:?}");
+    let only = &findings[0];
+    assert!(
+        only.contains("argument 'bad_arg'")
+            && only.contains("unknown custom type")
+            && only.contains("TotallyMadeUpType"),
+        "diagnostic must name the offending arg and the offending PascalCase type; got: {only}"
+    );
+}
+
+#[test]
+fn validate_argument_custom_types_accepts_registered_bare_identity() {
+    use crate::parser::{ArgumentParameter, TypeExpr};
+
+    let mut parsed = empty_parsed();
+    parsed.arguments.push(ArgumentParameter {
+        name: "policy".to_string(),
+        // The fixture registers `IamPolicyArn` as a bare-identity
+        // validator; this is the round-trip "name a registered custom
+        // type and have it pass" path that proves the walker isn't
+        // over-firing.
+        type_expr: TypeExpr::Simple("iam_policy_arn".to_string()),
+        default: None,
+        description: None,
+        validations: Vec::new(),
+    });
+
+    let findings = validate_argument_custom_types(&parsed, &enriched_context_with_iam_policy_arn());
+    assert!(
+        findings.is_empty(),
+        "registered bare custom type must pass the walker; got: {findings:?}"
+    );
+}
+
+#[test]
+fn validate_argument_custom_types_walks_into_list_map_union_struct() {
+    use crate::parser::{ArgumentParameter, TypeExpr};
+
+    let mut parsed = empty_parsed();
+
+    // List<UnknownA>
+    parsed.arguments.push(ArgumentParameter {
+        name: "in_list".to_string(),
+        type_expr: TypeExpr::List(Box::new(TypeExpr::Simple("unknown_a".to_string()))),
+        default: None,
+        description: None,
+        validations: Vec::new(),
+    });
+
+    // Map<UnknownB>
+    parsed.arguments.push(ArgumentParameter {
+        name: "in_map".to_string(),
+        type_expr: TypeExpr::Map(Box::new(TypeExpr::Simple("unknown_b".to_string()))),
+        default: None,
+        description: None,
+        validations: Vec::new(),
+    });
+
+    // Union of two unknowns. Each member is reported independently —
+    // this is intentional: the union shape is ambiguous about which
+    // member the user "meant", so calling out every unknown helps
+    // the user pinpoint the typo.
+    parsed.arguments.push(ArgumentParameter {
+        name: "in_union".to_string(),
+        type_expr: TypeExpr::Union(vec![
+            TypeExpr::Simple("unknown_c".to_string()),
+            TypeExpr::Simple("unknown_d".to_string()),
+        ]),
+        default: None,
+        description: None,
+        validations: Vec::new(),
+    });
+
+    // Struct { nested: UnknownE }
+    parsed.arguments.push(ArgumentParameter {
+        name: "in_struct".to_string(),
+        type_expr: TypeExpr::Struct {
+            fields: vec![(
+                "nested".to_string(),
+                TypeExpr::Simple("unknown_e".to_string()),
+            )],
+        },
+        default: None,
+        description: None,
+        validations: Vec::new(),
+    });
+
+    let findings = validate_argument_custom_types(&parsed, &enriched_context_with_iam_policy_arn());
+
+    let joined = findings.join("\n");
+    for expected in ["UnknownA", "UnknownB", "UnknownC", "UnknownD", "UnknownE"] {
+        assert!(
+            joined.contains(expected),
+            "walker must descend into List/Map/Union/Struct and surface {expected}; got: {joined}"
+        );
+    }
+}
+
+#[test]
+fn validate_argument_custom_types_is_independent_of_customs_loaded_flag() {
+    use crate::parser::{ArgumentParameter, TypeExpr};
+
+    let mut parsed = empty_parsed();
+    parsed.arguments.push(ArgumentParameter {
+        name: "bad_arg".to_string(),
+        type_expr: TypeExpr::Simple("totally_made_up_type".to_string()),
+        default: None,
+        description: None,
+        validations: Vec::new(),
+    });
+
+    // Bootstrap context — `customs_loaded` defaults to `false`. The
+    // walker delegates to `is_known_bare_custom_type`, whose contract
+    // is "true iff snake matches a built-in or a bare-registered
+    // validator"; on an empty validator set the only accepted names
+    // are the four built-ins, so an unknown name still produces a
+    // finding even with the parser gate inactive. This pins that the
+    // walker is *independent* of `customs_loaded` — only the parser
+    // is gated; the post-parse walker always reports. Callers that
+    // need the bootstrap-context exemption (e.g. LSP orphaned-file
+    // diagnostics) must withhold the call themselves.
+    let mut ctx = ProviderContext::default();
+    assert!(!ctx.customs_loaded);
+    ctx.validators = HashMap::new();
+    let findings = validate_argument_custom_types(&parsed, &ctx);
+    assert_eq!(
+        findings.len(),
+        1,
+        "walker always reports unknowns; gating is the caller's choice"
     );
 }
