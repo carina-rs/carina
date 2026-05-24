@@ -250,6 +250,10 @@ macro_rules! export_provider {
                     resource_id: err.resource_id.as_ref().map(proto_to_wit_resource_id),
                     cause: err.cause,
                     provider_name: err.provider_name,
+                    operation: err.operation,
+                    status: err.status,
+                    code: err.code,
+                    request_id: err.request_id,
                 };
                 match err.kind {
                     proto::ProviderErrorKind::InvalidInput => {
@@ -278,6 +282,10 @@ macro_rules! export_provider {
                     resource_id: None,
                     cause: None,
                     provider_name: None,
+                    operation: None,
+                    status: None,
+                    code: None,
+                    request_id: None,
                 })
             }
 
@@ -733,6 +741,10 @@ macro_rules! export_provider {
                     resource_id: err.resource_id.as_ref().map(proto_to_wit_resource_id),
                     cause: err.cause,
                     provider_name: err.provider_name,
+                    operation: err.operation,
+                    status: err.status,
+                    code: err.code,
+                    request_id: err.request_id,
                 };
                 match err.kind {
                     proto::ProviderErrorKind::InvalidInput => {
@@ -761,6 +773,10 @@ macro_rules! export_provider {
                     resource_id: None,
                     cause: None,
                     provider_name: None,
+                    operation: None,
+                    status: None,
+                    code: None,
+                    request_id: None,
                 })
             }
 
