@@ -2,6 +2,19 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Type Safety First
+
+- When fixing bugs, prefer type-level solutions (newtypes, tagged unions, typestate) over runtime validation/filters.
+- Type safety is part of the same 'topic' as the bug fix - do not defer it to a separate PR.
+- For enums/variants that carry different data, use tagged unions rather than optional fields with runtime checks.
+
+## Communication Style
+
+- Be terse. Do not ask permission for obvious actions (e.g., using the correct AWS profile, standard build commands).
+- When opening/merging a PR, always include the GitHub URL directly in the response.
+- No sycophantic phrasing ('Great question!', 'You're absolutely right!').
+- Do not over-explain hypothetical design options before checking the actual real-world case (screenshots, real output).
+
 ## Build and Test Commands
 
 ```bash
@@ -601,6 +614,13 @@ fix passed unit tests but never ran against the real infra fixture.
 
 ## Git Workflow
 
+### Worktree Workflow (REQUIRED)
+
+- All PR work must happen in a git worktree, not the main repo.
+- After `cd` into a worktree, verify cwd before running build/test commands.
+- Never stash changes without explicit user instruction.
+- Clean up worktrees after PR merge.
+
 ### Worktree-Based Development
 
 **IMPORTANT: Use `git wt` (NOT `git worktree`).** `git wt` is a separate tool (`/opt/homebrew/bin/git-wt`) with its own syntax. NEVER use `git worktree` commands.
@@ -640,6 +660,12 @@ git remote prune origin           # Remove stale remote tracking branches
 
 - **Commit messages**: Write in English
 - **Code comments**: Write in English
+
+## TDD for Bug Fixes
+
+- Always write a failing reproducing test BEFORE implementing the fix.
+- For TTY/rendering bugs, use PTY-based reproduction.
+- Run full verify/review/CI gates before merge.
 
 <!-- dagayn MCP tools -->
 ## MCP Tools: dagayn
