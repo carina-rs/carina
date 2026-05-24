@@ -1702,6 +1702,51 @@ fn test_nested_module_two_level() {
 }
 
 #[test]
+fn test_nested_module_intra_ref_to_module_call_is_prefixed() {
+    // carina#3243 regression: `outer_module` declares
+    //   let net = inner { ... }          (module call → virtual resource)
+    //   let sg  = ... { vpc_id = net.vpc_id }
+    // When the *outer* module is itself expanded (root.crn calls
+    // `outer` with binding `web`), the `net.vpc_id` reference inside
+    // `sg` must be rewritten to `web.net.vpc_id`. Pre-fix, only
+    // `module.resources` / `module.data_sources` / `module.wait_bindings`
+    // were treated as intra-module bindings, so a module-call binding
+    // like `net` was left bare and the downstream validation step
+    // reported `unknown binding 'net' in reference net.vpc_id`.
+    let fixtures_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nested_modules");
+    let content = fs::read_to_string(fixtures_dir.join("root.crn")).unwrap();
+    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+
+    resolve_modules(&mut parsed, &fixtures_dir).unwrap();
+
+    // Find the SecurityGroup resource and read its `vpc_id` attribute.
+    let sg = parsed
+        .resources
+        .iter()
+        .find(|r| r.id.resource_type == "ec2.SecurityGroup")
+        .expect("SecurityGroup from outer module must be present");
+    let vpc_id = sg
+        .get_attr("vpc_id")
+        .expect("SecurityGroup must carry the vpc_id attribute");
+
+    // After expansion the binding must be instance-prefixed (`web.net`),
+    // not the bare intra-module name (`net`).
+    match vpc_id {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+            assert_eq!(
+                path.binding(),
+                "web.net",
+                "expected instance-prefixed binding, got: {}",
+                path.binding()
+            );
+            assert_eq!(path.attribute(), "vpc_id");
+        }
+        other => panic!("expected ResourceRef for sg.vpc_id, got: {:?}", other),
+    }
+}
+
+#[test]
 fn test_nested_module_three_level() {
     // root -> middle_module -> inner_module
     let fixtures_dir =
