@@ -1242,6 +1242,33 @@ fn snapshot_list_diff_string_list_grew() {
     insta::assert_snapshot!(output);
 }
 
+/// #3234: a `List<String>` field nested inside a Map (`principal`) which
+/// is itself inside a list-of-maps element (`statement`) must render the
+/// list growth multi-line with `+` markers, not as a single inline
+/// `aws: [...] → [...]` overflow line. The pre-fix `MapDiffEntryIR`
+/// only had `Changed` for the non-map / non-list-of-maps fallthrough,
+/// which collapsed long IAM principal lists onto one unscannable line.
+#[test]
+fn snapshot_map_field_string_list_grew() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("map_field_string_list_grew");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+    ));
+    assert!(
+        !output.lines().any(|l| l.len() > 200),
+        "string-list diff inside a nested map field should not render inline; got: {}",
+        output
+    );
+    insta::assert_snapshot!(output);
+}
+
 // #2881 follow-on: exercises the modified-with-nested branch where the
 // only changed field is a nested Map (`config`). Locks in the
 // `~ { ... }` block-style layout: nested map diff first, then

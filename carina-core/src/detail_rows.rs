@@ -180,6 +180,17 @@ pub enum MapDiffEntryIR {
         key: String,
         block: NonEmptyListOfMapsBlock,
     },
+    /// Per-element `List<String>` field diff inside a nested map (#3234).
+    /// Mirrors `ListOfMapsDiffField::StringListChanged` but lives at the
+    /// map-entry layer so a list-valued struct field (e.g.
+    /// `principal.aws`) renders as multi-line `+` / `-` markers instead
+    /// of the inline `[A] → [A, B]` form that overflows the terminal.
+    StringListChanged {
+        key: String,
+        unchanged: Vec<String>,
+        added: Vec<String>,
+        removed: Vec<String>,
+    },
 }
 
 /// A list-of-maps diff bundle whose constructor refuses the
@@ -1042,6 +1053,16 @@ fn compute_map_diff_entries(
                             block,
                         });
                     }
+                } else if let Some(diff) =
+                    compute_string_list_change(Some(&e.old_value), &e.new_value, entry_type)
+                {
+                    // #3234: see MapDiffEntryIR::StringListChanged docs.
+                    entries.push(MapDiffEntryIR::StringListChanged {
+                        key: e.key.clone(),
+                        unchanged: diff.unchanged,
+                        added: diff.added,
+                        removed: diff.removed,
+                    });
                 } else {
                     entries.push(MapDiffEntryIR::Changed {
                         key: e.key.clone(),

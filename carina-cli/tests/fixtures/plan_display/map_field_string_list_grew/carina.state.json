@@ -1,0 +1,51 @@
+{
+  "version": 6,
+  "serial": 1,
+  "lineage": "test-lineage-map-field-string-list-grew",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "iam.RolePolicy",
+      "name": "policy",
+      "provider": "awscc",
+      "identifier": "delegation-writer|trust-policy",
+      "attributes": {
+        "policy_name": "trust-policy",
+        "role_name": "delegation-writer",
+        "statement": [
+          {
+            "sid": "AllowAssumeRole",
+            "effect": "Allow",
+            "principal": {
+              "aws": [
+                "arn:aws:iam::151116838382:role/carina-registry-infra-deploy"
+              ]
+            },
+            "action": "sts:AssumeRole",
+            "resource": "*"
+          }
+        ]
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "policy",
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "policy_name": {
+            "kind": "leaf"
+          },
+          "role_name": {
+            "kind": "leaf"
+          },
+          "statement": {
+            "kind": "leaf"
+          }
+        }
+      }
+    }
+  ]
+}
