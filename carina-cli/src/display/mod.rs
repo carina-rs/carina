@@ -1411,6 +1411,17 @@ fn render_map_diff_entries(out: &mut String, entries: &[MapDiffEntryIR], attr_pr
                     &nested_prefix,
                 );
             }
+            MapDiffEntryIR::StringListChanged {
+                key,
+                unchanged,
+                added,
+                removed,
+            } => {
+                // #3234: nested List<scalar> in a Map.
+                writeln!(out, "{}    {}:", attr_prefix, key).unwrap();
+                let nested_prefix = format!("{}    ", attr_prefix);
+                render_string_list_diff_entries(out, unchanged, added, removed, &nested_prefix);
+            }
         }
     }
 }

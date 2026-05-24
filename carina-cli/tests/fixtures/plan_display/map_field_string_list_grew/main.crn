@@ -1,0 +1,39 @@
+# Update plan: a List<String> field nested inside a Map (struct) field,
+# which is itself nested inside a list-of-maps element, grew by one
+# trailing entry (issue #3234). Pre-fix this rendered as a single
+# inline `aws: ["arn..."] → ["arn...", "arn..."]` line that overflowed
+# the terminal for realistic IAM principal lists. Post-fix it is laid
+# out multi-line with `+` lines for added entries.
+#
+# The shape is statement[0].principal.aws: statement is list-of-maps,
+# principal is a struct/map, aws is a list. Pre-fix the principal-map
+# diff path emitted `MapDiffEntryIR::Changed` for `aws` (the inline
+# form); post-fix it emits the new `MapDiffEntryIR::StringListChanged`
+# variant for per-element +/- rendering.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let policy = awscc.iam.RolePolicy {
+  policy_name = 'trust-policy'
+  role_name   = 'delegation-writer'
+  statement = [
+    {
+      sid    = 'AllowAssumeRole'
+      effect = 'Allow'
+      principal = {
+        aws = [
+          'arn:aws:iam::151116838382:role/carina-registry-infra-deploy',
+          'arn:aws:iam::412038850359:role/aws-reserved/sso.amazonaws.com/ap-northeast-1/AWSReservedSSO_AdministratorAccess_1ade6440f2d3bcdd',
+        ]
+      }
+      action   = 'sts:AssumeRole'
+      resource = '*'
+    },
+  ]
+}
+
+exports {
+  policy_name = policy.policy_name
+}
