@@ -34,6 +34,27 @@ pub struct ErrorDetail {
     /// Display ignores this field; CLI renderers can read it to label
     /// structured output.
     pub provider_name: Option<String>,
+    /// Service-qualified cloud-API operation that failed, e.g.
+    /// `"iam.ListRoles"`, `"s3.HeadBucket"`. Populating this field —
+    /// or any of the sibling `status` / `code` / `request_id`
+    /// fields — flips `Display` into the multi-line, labeled render
+    /// shape introduced in carina#3242; see
+    /// [`ErrorDetail::has_structured_cloud_fields`] for the exact gate.
+    pub operation: Option<String>,
+    /// HTTP status code from the cloud-API response, when the error
+    /// came from an HTTP-based service call.
+    pub status: Option<u16>,
+    /// Application-level error code, e.g. `"AccessDenied"`,
+    /// `"NoSuchBucket"`. Distinct from `status` — multiple codes can
+    /// share a status (HTTP 403 covers `AccessDenied`,
+    /// `InvalidAccessKeyId`, `SignatureDoesNotMatch`, etc.), so both
+    /// belong in the rendered output.
+    pub code: Option<String>,
+    /// Correlation id from the cloud-API response (AWS
+    /// `x-amzn-RequestId`, GCP `X-Goog-Request-Id`, Azure
+    /// `x-ms-request-id`, …). Operators paste this into support
+    /// tickets so the provider can look up server-side logs.
+    pub request_id: Option<String>,
 }
 
 /// Structured error returned by every provider operation.
@@ -41,41 +62,67 @@ pub struct ErrorDetail {
 /// Variants mirror `provider-error` in `wit/types.wit`. Host-side code
 /// can match exhaustively to dispatch retry / abort / not-found /
 /// escalate strategies in a type-safe way.
+///
+/// Each variant boxes its [`ErrorDetail`] payload so the enum itself
+/// stays at 16 bytes regardless of how many optional fields
+/// `ErrorDetail` accumulates (4 new ones in carina#3242). Without the
+/// box, every `Result<T, ProviderError>` return type pays the cost of
+/// the largest variant on the stack — `clippy::result_large_err`
+/// flags this at ≥128 bytes. Boxing now keeps the lint quiet and
+/// makes future field additions to `ErrorDetail` free at the variant
+/// layer.
 #[derive(Debug)]
 pub enum ProviderError {
     /// User-supplied input is invalid (bad attribute value, schema
     /// violation, configuration mismatch). Not retriable.
-    InvalidInput(ErrorDetail),
+    InvalidInput(Box<ErrorDetail>),
     /// The cloud API rejected the request (HTTP 4xx/5xx, server-side
     /// error). May be retriable depending on the cause.
-    ApiError(ErrorDetail),
+    ApiError(Box<ErrorDetail>),
     /// Resource was not found at the cloud API. `read` returns this
     /// instead of an empty state when the underlying resource has been
     /// deleted out-of-band. `delete` returns this when the resource is
     /// already gone.
-    NotFound(ErrorDetail),
+    NotFound(Box<ErrorDetail>),
     /// Operation timed out before completing. Retriable with backoff.
-    Timeout(ErrorDetail),
+    Timeout(Box<ErrorDetail>),
     /// Provider-internal failure (panic, unexpected state, missing
     /// schema entry, etc.). Should be escalated as a bug rather than
     /// retried.
-    Internal(ErrorDetail),
+    Internal(Box<ErrorDetail>),
 }
 
 impl std::fmt::Display for ProviderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let detail = self.detail();
+
+        // Header line: always the `[type.name] message` form when a
+        // resource id is attached, plain message otherwise. Shared
+        // between the structured multi-line render and the legacy
+        // chain-walk render so non-AWS errors keep the same shape.
         if let Some(ref id) = detail.resource_id {
             write!(f, "[{}.{}] {}", id.resource_type, id.name, detail.message)?;
         } else {
             write!(f, "{}", detail.message)?;
         }
-        // carina-rs/carina#2603: walk the entire `source()` chain
-        // rather than printing only the first level. AWS SDK errors
-        // typically carry the actionable detail (error code, raw
-        // response message, request id) two or three levels deep;
-        // a single `: {cause}` would still hide e.g. "AccessDenied"
-        // behind a generic "service error" wrapper.
+
+        // carina#3242: when any of the structured cloud-API fields are
+        // populated, render the multi-line labeled shape and skip the
+        // legacy chain walk (the structured fields carry the same
+        // information without the SDK-internal scaffolding). When all
+        // four are `None`, fall through to the legacy chain walk so
+        // unmigrated provider call sites and non-cloud errors render
+        // exactly as they did before.
+        if detail.has_structured_cloud_fields() {
+            return render_structured_cloud_fields(f, detail);
+        }
+
+        // carina#2603: walk the entire `source()` chain rather than
+        // printing only the first level. AWS SDK errors typically carry
+        // the actionable detail (error code, raw response message,
+        // request id) two or three levels deep; a single `: {cause}`
+        // would still hide e.g. "AccessDenied" behind a generic
+        // "service error" wrapper.
         if let Some(ref cause) = detail.cause {
             let mut current: Option<&(dyn std::error::Error + 'static)> = Some(cause.as_ref());
             while let Some(c) = current {
@@ -85,6 +132,59 @@ impl std::fmt::Display for ProviderError {
         }
         Ok(())
     }
+}
+
+/// Render the multi-line, labeled cloud-API error shape introduced in
+/// carina#3242. The header line has already been written by the caller;
+/// this function writes only the indented label lines that follow.
+///
+/// Field order is fixed: `operation`, then `status`/`code` (combined on
+/// one line because they're semantically a pair), then `request_id`,
+/// then `cause` if present. Optional fields are skipped entirely when
+/// absent — no placeholder `(unknown)` lines.
+///
+/// `cause` is appended **even when the structured fields are present**
+/// because transport-level failures (DNS, TLS handshake, network
+/// timeout) carry their diagnostic only in the cause chain — there was
+/// no HTTP response, so `status` / `code` / `request_id` aren't set,
+/// but `operation` may still be. Without appending `cause`, the
+/// operator would see `[s3.Bucket.foo] Failed / operation: s3.HeadBucket`
+/// with no hint that the underlying error was `connection refused`.
+fn render_structured_cloud_fields(
+    f: &mut std::fmt::Formatter<'_>,
+    detail: &ErrorDetail,
+) -> std::fmt::Result {
+    if let Some(ref op) = detail.operation {
+        write!(f, "\n  operation: {op}")?;
+    }
+    match (detail.status, detail.code.as_deref()) {
+        (Some(s), Some(c)) => write!(f, "\n  status: {s} {c}")?,
+        (Some(s), None) => write!(f, "\n  status: {s}")?,
+        (None, Some(c)) => write!(f, "\n  code: {c}")?,
+        (None, None) => {}
+    }
+    if let Some(ref id) = detail.request_id {
+        write!(f, "\n  request_id: {id}")?;
+    }
+    if let Some(ref cause) = detail.cause {
+        // Walk the source chain (same shape as the legacy fallback)
+        // and join with `: ` on the same `cause:` line. Keeps
+        // transport-level diagnostics visible without bringing back
+        // the SDK-scaffolding multi-line wall that motivated #3241.
+        write!(f, "\n  cause: ")?;
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(cause.as_ref());
+        let mut first = true;
+        while let Some(c) = current {
+            if first {
+                write!(f, "{c}")?;
+                first = false;
+            } else {
+                write!(f, ": {c}")?;
+            }
+            current = c.source();
+        }
+    }
+    Ok(())
 }
 
 impl std::error::Error for ProviderError {
@@ -137,27 +237,27 @@ impl ProviderError {
 
     /// User-supplied input is invalid.
     pub fn invalid_input(message: impl Into<String>) -> Self {
-        ProviderError::InvalidInput(ErrorDetail::new(message))
+        ProviderError::InvalidInput(Box::new(ErrorDetail::new(message)))
     }
 
     /// The cloud API rejected the request.
     pub fn api_error(message: impl Into<String>) -> Self {
-        ProviderError::ApiError(ErrorDetail::new(message))
+        ProviderError::ApiError(Box::new(ErrorDetail::new(message)))
     }
 
     /// Resource was not found at the cloud API.
     pub fn not_found(message: impl Into<String>) -> Self {
-        ProviderError::NotFound(ErrorDetail::new(message))
+        ProviderError::NotFound(Box::new(ErrorDetail::new(message)))
     }
 
     /// Operation timed out.
     pub fn timeout(message: impl Into<String>) -> Self {
-        ProviderError::Timeout(ErrorDetail::new(message))
+        ProviderError::Timeout(Box::new(ErrorDetail::new(message)))
     }
 
     /// Provider-internal failure / unexpected state.
     pub fn internal(message: impl Into<String>) -> Self {
-        ProviderError::Internal(ErrorDetail::new(message))
+        ProviderError::Internal(Box::new(ErrorDetail::new(message)))
     }
 
     /// Attach a resource id to the inner detail.
@@ -180,16 +280,64 @@ impl ProviderError {
         self.detail_mut().provider_name = Some(provider_name.into());
         self
     }
+
+    /// Attach the service-qualified cloud-API operation that failed
+    /// (e.g. `"iam.ListRoles"`, `"s3.HeadBucket"`). Populating this —
+    /// or any of [`Self::with_status`] / [`Self::with_code`] /
+    /// [`Self::with_request_id`] — flips `Display` into the multi-line
+    /// labeled render shape introduced in carina#3242.
+    pub fn with_operation(mut self, operation: impl Into<String>) -> Self {
+        self.detail_mut().operation = Some(operation.into());
+        self
+    }
+
+    /// Attach the HTTP status code from the cloud-API response.
+    pub fn with_status(mut self, status: u16) -> Self {
+        self.detail_mut().status = Some(status);
+        self
+    }
+
+    /// Attach the application-level error code from the cloud API
+    /// (e.g. `"AccessDenied"`, `"NoSuchBucket"`).
+    pub fn with_code(mut self, code: impl Into<String>) -> Self {
+        self.detail_mut().code = Some(code.into());
+        self
+    }
+
+    /// Attach the correlation id from the cloud-API response so the
+    /// operator can paste it into support tickets.
+    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.detail_mut().request_id = Some(request_id.into());
+        self
+    }
 }
 
 impl ErrorDetail {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            resource_id: None,
-            cause: None,
-            provider_name: None,
+            ..Self::default()
         }
+    }
+
+    /// Returns `true` when at least one of the cloud-API metadata
+    /// fields (`operation`, `status`, `code`, `request_id`) is set.
+    ///
+    /// `Display` uses this as the gate for the multi-line labeled
+    /// render (carina#3242): any of the four flips the renderer into
+    /// the structured shape. When none are set the error keeps the
+    /// existing chain-walking single-line render — that's the
+    /// fallback path for unmigrated provider call sites and for
+    /// non-cloud errors.
+    ///
+    /// `pub(crate)` until a second use site materializes outside
+    /// `carina-core`; the name still has "cloud" baked in and is
+    /// likely to refactor before stabilising as public API.
+    pub(crate) fn has_structured_cloud_fields(&self) -> bool {
+        self.operation.is_some()
+            || self.status.is_some()
+            || self.code.is_some()
+            || self.request_id.is_some()
     }
 }
 
@@ -1458,6 +1606,278 @@ mod tests {
             display.contains("s3.Bucket"),
             "Display should include resource type, got: {}",
             display
+        );
+    }
+
+    /// carina#3242: when the AWS-style structured fields (operation,
+    /// status, code, request_id) are populated, `Display` renders the
+    /// new multi-line, labeled shape. The header still uses the
+    /// existing `[type.name] message` form for consistency with
+    /// non-AWS errors.
+    #[test]
+    fn provider_error_display_multi_line_when_structured_fields_populated() {
+        let id = ResourceId::new("iam.Roles", "admin_access_roles");
+        let err = ProviderError::api_error("Failed to list IAM roles")
+            .for_resource(id)
+            .with_operation("iam.ListRoles")
+            .with_status(403)
+            .with_code("AccessDenied")
+            .with_request_id("997aa923-2aa4-4d2b-8d16-44fd21c81368");
+
+        let rendered = format!("{}", err);
+        let lines: Vec<&str> = rendered.lines().collect();
+
+        // Header line is the existing `[type.name] message` form.
+        assert_eq!(
+            lines.first().copied(),
+            Some("[iam.Roles.admin_access_roles] Failed to list IAM roles"),
+            "header line must keep the existing [type.name] message form, got: {}",
+            rendered
+        );
+
+        // status and code go on the same line, as `<status> <code>`.
+        assert!(
+            lines.contains(&"  status: 403 AccessDenied"),
+            "status and code must render on one line as `<status> <code>`, got: {}",
+            rendered
+        );
+
+        // operation gets its own labeled line.
+        assert!(
+            lines.contains(&"  operation: iam.ListRoles"),
+            "operation must render on its own labeled line, got: {}",
+            rendered
+        );
+
+        // request_id is the last labeled line, no blank line before it.
+        assert!(
+            lines.contains(&"  request_id: 997aa923-2aa4-4d2b-8d16-44fd21c81368"),
+            "request_id must render on its own labeled line, got: {}",
+            rendered
+        );
+
+        // The raw `Debug`-style scaffolding (`ServiceError`, `SdkBody`,
+        // `Headers`, `Extensions`) must not appear. Use a substring
+        // that would only show up if we were `Debug`-printing an SDK
+        // error.
+        assert!(
+            !rendered.contains("SdkBody"),
+            "multi-line render must not leak SDK scaffolding, got: {}",
+            rendered
+        );
+    }
+
+    /// carina#3242: when only `status` is populated (no `code`), the
+    /// status line still renders cleanly without a trailing space or
+    /// `unknown` placeholder.
+    #[test]
+    fn provider_error_display_multi_line_status_without_code() {
+        let err = ProviderError::api_error("Failed")
+            .with_operation("s3.HeadBucket")
+            .with_status(500);
+        let rendered = format!("{}", err);
+        assert!(
+            rendered.lines().any(|l| l == "  status: 500"),
+            "status-only line must render without a trailing space or placeholder, got: {}",
+            rendered
+        );
+    }
+
+    /// carina#3242: when only `code` is populated (no `status`), the
+    /// code line renders on its own.
+    #[test]
+    fn provider_error_display_multi_line_code_without_status() {
+        let err = ProviderError::api_error("Failed")
+            .with_operation("s3.HeadBucket")
+            .with_code("NoSuchBucket");
+        let rendered = format!("{}", err);
+        assert!(
+            rendered.lines().any(|l| l == "  code: NoSuchBucket"),
+            "code-only line must render on its own, got: {}",
+            rendered
+        );
+    }
+
+    /// carina#3242: with `operation` alone (no status/code/request_id),
+    /// only that one labeled line follows the header — the status/code
+    /// match arm collapses to its `(None, None)` branch and produces
+    /// nothing.
+    #[test]
+    fn provider_error_display_multi_line_operation_only() {
+        let err = ProviderError::api_error("Failed").with_operation("iam.ListRoles");
+        let rendered = format!("{}", err);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected exactly 2 lines, got: {}",
+            rendered
+        );
+        assert_eq!(lines[0], "Failed");
+        assert_eq!(lines[1], "  operation: iam.ListRoles");
+    }
+
+    /// carina#3242: when structured fields are populated but no
+    /// `resource_id` is attached, the header degenerates to the bare
+    /// `message`, with the labeled lines unaffected. Locks the no-id
+    /// branch of the header so future renderer changes can't silently
+    /// drop the message text.
+    #[test]
+    fn provider_error_display_multi_line_without_resource_id() {
+        let err = ProviderError::api_error("Failed to list IAM roles")
+            .with_operation("iam.ListRoles")
+            .with_status(403)
+            .with_code("AccessDenied");
+        let rendered = format!("{}", err);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(
+            lines.first().copied(),
+            Some("Failed to list IAM roles"),
+            "header must be bare message when resource_id is absent, got: {}",
+            rendered
+        );
+        assert!(
+            lines.contains(&"  status: 403 AccessDenied"),
+            "structured lines must still render without resource_id, got: {}",
+            rendered
+        );
+    }
+
+    /// carina#3242: when both `cause` and structured cloud fields are
+    /// populated, the renderer emits `cause:` as its OWN labeled line
+    /// at the bottom (not joined to the header). Transport failures
+    /// (DNS, TLS handshake, network timeouts) only carry their
+    /// diagnostic in the cause chain — there was no HTTP response, so
+    /// `status`/`code`/`request_id` are `None` but `operation` may
+    /// still be set. Without preserving cause, the operator loses
+    /// visibility into the underlying error. The labeled-line shape
+    /// keeps the new multi-line aesthetic while still surfacing the
+    /// diagnostic.
+    #[test]
+    fn provider_error_display_multi_line_appends_cause_as_labeled_line() {
+        let cause = std::io::Error::other("connection refused");
+        let err = ProviderError::api_error("Failed to list IAM roles")
+            .with_cause(cause)
+            .with_operation("iam.ListRoles");
+        let rendered = format!("{}", err);
+        let lines: Vec<&str> = rendered.lines().collect();
+
+        // Header line stays clean.
+        assert_eq!(
+            lines.first().copied(),
+            Some("Failed to list IAM roles"),
+            "header line must not be extended by the chain-walk, got: {}",
+            rendered
+        );
+
+        // operation labeled line.
+        assert!(
+            lines.contains(&"  operation: iam.ListRoles"),
+            "operation labeled line must appear, got: {}",
+            rendered
+        );
+
+        // cause is appended as its own labeled line — NOT joined to
+        // the header — so transport diagnostics stay visible.
+        assert!(
+            lines.contains(&"  cause: connection refused"),
+            "cause must render as its own labeled line at the bottom, got: {}",
+            rendered
+        );
+    }
+
+    /// carina#3242: realistic provider-aws shape after migration —
+    /// resource_id + all four structured fields + cause all populated
+    /// at once. Locks in the full line ordering so a future change to
+    /// `render_structured_cloud_fields` can't silently reshuffle the
+    /// output: header → operation → status+code → request_id → cause.
+    #[test]
+    fn provider_error_display_multi_line_all_fields_including_cause() {
+        let cause = std::io::Error::other("tls handshake failed");
+        let id = ResourceId::new("iam.Roles", "admin_access_roles");
+        let err = ProviderError::api_error("Failed to list IAM roles")
+            .with_cause(cause)
+            .for_resource(id)
+            .with_operation("iam.ListRoles")
+            .with_status(403)
+            .with_code("AccessDenied")
+            .with_request_id("997aa923-2aa4-4d2b-8d16-44fd21c81368");
+
+        let rendered = format!("{}", err);
+        let lines: Vec<&str> = rendered.lines().collect();
+
+        assert_eq!(
+            lines,
+            vec![
+                "[iam.Roles.admin_access_roles] Failed to list IAM roles",
+                "  operation: iam.ListRoles",
+                "  status: 403 AccessDenied",
+                "  request_id: 997aa923-2aa4-4d2b-8d16-44fd21c81368",
+                "  cause: tls handshake failed",
+            ],
+            "full structured render must lock the line ordering, got: {}",
+            rendered
+        );
+    }
+
+    /// carina#3242: when the cause itself carries a source chain, the
+    /// `cause:` line joins the levels with `: ` exactly like the
+    /// legacy fallback (carina#2603) — same shape, same content,
+    /// just on a labeled line instead of appended to the header.
+    #[test]
+    fn provider_error_display_multi_line_cause_walks_source_chain() {
+        #[derive(Debug)]
+        struct ChainErr {
+            msg: &'static str,
+            source: Option<Box<dyn std::error::Error + Send + Sync>>,
+        }
+        impl std::fmt::Display for ChainErr {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.msg)
+            }
+        }
+        impl std::error::Error for ChainErr {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.source
+                    .as_deref()
+                    .map(|e| e as &(dyn std::error::Error + 'static))
+            }
+        }
+
+        let inner = ChainErr {
+            msg: "dns lookup failed",
+            source: None,
+        };
+        let outer = ChainErr {
+            msg: "transport error",
+            source: Some(Box::new(inner)),
+        };
+        let err = ProviderError::api_error("Failed")
+            .with_cause(outer)
+            .with_operation("iam.ListRoles");
+        let rendered = format!("{}", err);
+        assert!(
+            rendered.contains("\n  cause: transport error: dns lookup failed"),
+            "cause line must walk the full source chain, got: {}",
+            rendered
+        );
+    }
+
+    /// carina#3242: when **none** of the structured fields are
+    /// populated, `Display` must fall back to the existing
+    /// chain-walking single-line form. This is the path that
+    /// unmigrated provider call sites still hit during the
+    /// migration period.
+    #[test]
+    fn provider_error_display_falls_back_to_chain_walk_when_unstructured() {
+        let cause = std::io::Error::other("connection refused");
+        let err = ProviderError::api_error("Failed to create resource").with_cause(cause);
+        let rendered = format!("{}", err);
+        // The existing render is a single line with `: <cause>` appended.
+        assert_eq!(
+            rendered, "Failed to create resource: connection refused",
+            "fallback render must match the existing form exactly, got: {}",
+            rendered
         );
     }
 

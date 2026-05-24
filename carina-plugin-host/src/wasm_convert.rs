@@ -404,6 +404,10 @@ pub fn core_to_wit_provider_error(err: &CoreProviderError) -> wit::ProviderError
             .map(|id| core_to_wit_resource_id(id)),
         cause: detail.cause.as_ref().map(|c| c.to_string()),
         provider_name: detail.provider_name.clone(),
+        operation: detail.operation.clone(),
+        status: detail.status,
+        code: detail.code.clone(),
+        request_id: detail.request_id.clone(),
     };
     match err {
         CoreProviderError::InvalidInput(_) => wit::ProviderError::InvalidInput(wit_detail),
@@ -419,7 +423,10 @@ pub fn core_to_wit_provider_error(err: &CoreProviderError) -> wit::ProviderError
 /// `cause` string is rehydrated as an `Option<String>` inside
 /// [`CoreErrorDetail`].
 pub fn wit_to_core_provider_error(err: wit::ProviderError) -> CoreProviderError {
-    let (detail, ctor): (wit::ErrorDetail, fn(CoreErrorDetail) -> CoreProviderError) = match err {
+    let (detail, ctor): (
+        wit::ErrorDetail,
+        fn(Box<CoreErrorDetail>) -> CoreProviderError,
+    ) = match err {
         wit::ProviderError::InvalidInput(d) => (d, CoreProviderError::InvalidInput),
         wit::ProviderError::ApiError(d) => (d, CoreProviderError::ApiError),
         wit::ProviderError::NotFound(d) => (d, CoreProviderError::NotFound),
@@ -435,8 +442,12 @@ pub fn wit_to_core_provider_error(err: wit::ProviderError) -> CoreProviderError 
             .cause
             .map(|s| Box::new(FlattenedCause(s)) as Box<dyn std::error::Error + Send + Sync>),
         provider_name: detail.provider_name,
+        operation: detail.operation,
+        status: detail.status,
+        code: detail.code,
+        request_id: detail.request_id,
     };
-    ctor(core_detail)
+    ctor(Box::new(core_detail))
 }
 
 /// Synthetic `Error` wrapping a flattened-cause string from the WIT
@@ -1278,6 +1289,31 @@ mod tests {
             .map(|c| c.to_string())
             .expect("cause preserved as string");
         assert_eq!(cause_str, "inner io error");
+    }
+
+    /// carina#3242: the new structured cloud-API metadata fields
+    /// (operation, status, code, request_id) must survive the
+    /// host → WIT → host round trip. Without this, provider-aws would
+    /// populate the fields, the host renderer would never see them,
+    /// and the operator would still get the legacy single-line dump.
+    #[test]
+    fn test_provider_error_structured_cloud_fields_round_trip() {
+        let err = CoreProviderError::api_error("Failed to list IAM roles")
+            .with_operation("iam.ListRoles")
+            .with_status(403)
+            .with_code("AccessDenied")
+            .with_request_id("997aa923-2aa4-4d2b-8d16-44fd21c81368");
+
+        let wit_err = core_to_wit_provider_error(&err);
+        let back = wit_to_core_provider_error(wit_err);
+        let detail = back.detail();
+        assert_eq!(detail.operation.as_deref(), Some("iam.ListRoles"));
+        assert_eq!(detail.status, Some(403));
+        assert_eq!(detail.code.as_deref(), Some("AccessDenied"));
+        assert_eq!(
+            detail.request_id.as_deref(),
+            Some("997aa923-2aa4-4d2b-8d16-44fd21c81368"),
+        );
     }
 
     #[test]

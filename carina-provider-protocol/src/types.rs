@@ -234,6 +234,14 @@ pub enum ProviderErrorKind {
 /// Mirrors `(provider-error, error-detail)` in `wit/types.wit`. The
 /// variant lives in [`ProviderErrorKind`]; the metadata fields mirror
 /// `error-detail`.
+///
+/// The `operation` / `status` / `code` / `request_id` quartet carries
+/// cloud-API metadata in a cloud-agnostic shape so the host can render
+/// a multi-line, labeled error display without providers doing ad-hoc
+/// string formatting. All four are optional — providers leave them
+/// empty when the error doesn't come from an HTTP cloud API call, and
+/// the host falls back to the legacy chain-walking render in that
+/// case. See carina-rs/carina#3242 for the full design.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderError {
     #[serde(default)]
@@ -247,6 +255,19 @@ pub struct ProviderError {
     /// Provider name (e.g. `"aws"`, `"awscc"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_name: Option<String>,
+    /// Service-qualified cloud-API operation that failed
+    /// (e.g. `"iam.ListRoles"`, `"s3.HeadBucket"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+    /// HTTP status code from the cloud-API response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// Application-level error code (e.g. `"AccessDenied"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// Correlation id from the cloud-API response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 /// Serializable validator types that can cross the WASM boundary.
