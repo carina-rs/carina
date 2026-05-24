@@ -64,6 +64,41 @@ pub(super) fn parse_type_expr(
     }
 }
 
+/// The set of bare PascalCase custom types built into the DSL itself.
+/// These are accepted in a type position regardless of which providers
+/// (if any) have registered, because their validators live in
+/// `carina-core` rather than in any provider — see the matching arms in
+/// [`crate::parser::functions::validate_custom_type`].
+const BUILTIN_BARE_CUSTOM_TYPES: &[&str] =
+    &["ipv4_cidr", "ipv4_address", "ipv6_cidr", "ipv6_address"];
+
+/// True iff a snake-cased bare type name resolves to a known custom
+/// type — either a `carina-core` built-in or an identity registered in
+/// `config.validators` with no provider/segment axis. The carina#3239
+/// strict-parse gate consults this when
+/// [`ProviderContext::customs_loaded`] is `true`.
+///
+/// `TypeExpr::Simple` only carries the bare axis, so this check is
+/// deliberately scoped to bare identities — provider-scoped types like
+/// `aws.iam.Role.Arn` arrive through the `TypeExpr::SchemaType` path
+/// instead and are validated by `schema_types`.
+///
+/// Exposed at the crate root so the validation layer
+/// (`crate::validation`) can apply the same predicate to argument
+/// declarations parsed earlier with a bootstrap context — the
+/// standalone-module-validate path where the strict parse-time gate
+/// did not fire.
+pub(crate) fn is_known_bare_custom_type(snake: &str, config: &ProviderContext) -> bool {
+    if BUILTIN_BARE_CUSTOM_TYPES.contains(&snake) {
+        return true;
+    }
+    let pascal = snake_to_pascal(snake);
+    config
+        .validators
+        .keys()
+        .any(|id| id.provider.is_none() && id.segments.is_empty() && id.kind == pascal)
+}
+
 fn parse_type_expr_atom(
     pair: pest::iterators::Pair<Rule>,
     config: &ProviderContext,
@@ -109,7 +144,21 @@ fn parse_type_expr_atom(
                     ),
                 }),
                 other if other.chars().next().is_some_and(|c| c.is_ascii_uppercase()) => {
-                    Ok(TypeExpr::Simple(pascal_to_snake(other)))
+                    let snake = pascal_to_snake(other);
+                    // carina#3239: when the provider-registration phase
+                    // has populated `config`, an unknown bare custom-type
+                    // name in a type position is a parse error. Before
+                    // this gate, any PascalCase identifier became
+                    // `TypeExpr::Simple(snake)` and downstream `validate`
+                    // silently treated unknowns as untyped strings — so
+                    // typos and renamed-then-removed types went unnoticed.
+                    if config.customs_loaded && !is_known_bare_custom_type(&snake, config) {
+                        return Err(ParseError::InvalidExpression {
+                            line,
+                            message: format!("unknown custom type '{other}'"),
+                        });
+                    }
+                    Ok(TypeExpr::Simple(snake))
                 }
                 other => Err(ParseError::InvalidExpression {
                     line,
@@ -261,5 +310,79 @@ mod tests {
         assert_eq!(parse_type_expr_str("!!!", &ctx), None);
         assert_eq!(parse_type_expr_str("List(", &ctx), None);
         assert_eq!(parse_type_expr_str("", &ctx), None);
+    }
+
+    /// Default `ProviderContext` (no provider phase has run yet, so
+    /// `customs_loaded` is false) keeps the legacy lax behavior: any
+    /// PascalCase identifier becomes `TypeExpr::Simple(snake_case)`. This
+    /// preserves the LSP early-parse path that runs before schemas are
+    /// loaded — without it, every mid-edit buffer would lose all
+    /// `Simple`-shaped type completions.
+    #[test]
+    fn parse_type_expr_str_accepts_unknown_when_customs_not_loaded() {
+        let ctx = ProviderContext::default();
+        assert!(matches!(
+            parse_type_expr_str("TotallyMadeUpType", &ctx),
+            Some(TypeExpr::Simple(ref s)) if s == "totally_made_up_type"
+        ));
+    }
+
+    /// After the provider phase has run (`customs_loaded = true`), an
+    /// unknown bare PascalCase custom-type name in a type position is
+    /// rejected at parse time rather than silently accepted as
+    /// `TypeExpr::Simple`. This is the carina#3239 fix: typos and
+    /// renamed-then-removed types stop being silent.
+    #[test]
+    fn parse_type_expr_str_rejects_unknown_when_customs_loaded() {
+        let ctx = ProviderContext {
+            customs_loaded: true,
+            ..Default::default()
+        };
+        // No validators registered → only the four built-ins are valid.
+        // A clearly-fake name is rejected.
+        assert_eq!(parse_type_expr_str("TotallyMadeUpType", &ctx), None);
+        // A historical-but-removed name is rejected the same way — the
+        // bug-headline example from carina#3239.
+        assert_eq!(parse_type_expr_str("IamOidcProviderArn", &ctx), None);
+    }
+
+    /// Built-in DSL custom types (`Ipv4Cidr`, `Ipv4Address`, `Ipv6Cidr`,
+    /// `Ipv6Address`) are always accepted, even when no provider has
+    /// registered any validators — they are part of `carina-core` itself.
+    #[test]
+    fn parse_type_expr_str_accepts_builtins_when_customs_loaded() {
+        let ctx = ProviderContext {
+            customs_loaded: true,
+            ..Default::default()
+        };
+        for name in ["Ipv4Cidr", "Ipv4Address", "Ipv6Cidr", "Ipv6Address"] {
+            assert!(
+                matches!(parse_type_expr_str(name, &ctx), Some(TypeExpr::Simple(_))),
+                "built-in custom type '{name}' must parse with customs_loaded=true"
+            );
+        }
+    }
+
+    /// A bare custom-type identity registered in `ProviderContext.validators`
+    /// makes the corresponding PascalCase name acceptable in a type
+    /// position. Provider-scoped identities (`aws.iam.Role.Arn`) live on
+    /// the `TypeExpr::SchemaType` path, not here — `TypeExpr::Simple`
+    /// only carries the *bare* axis.
+    #[test]
+    fn parse_type_expr_str_accepts_registered_bare_custom_when_customs_loaded() {
+        use crate::schema::TypeIdentity;
+
+        let mut ctx = ProviderContext {
+            customs_loaded: true,
+            ..Default::default()
+        };
+        ctx.validators
+            .insert(TypeIdentity::bare("EmailAddress"), Box::new(|_| Ok(())));
+        assert!(matches!(
+            parse_type_expr_str("EmailAddress", &ctx),
+            Some(TypeExpr::Simple(ref s)) if s == "email_address"
+        ));
+        // A bare key does NOT make an unrelated name valid.
+        assert_eq!(parse_type_expr_str("TotallyMadeUpType", &ctx), None);
     }
 }

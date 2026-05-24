@@ -442,6 +442,15 @@ pub type ExportParameter = ParsedExportParam;
 pub trait ExportParamLike {
     fn name(&self) -> &str;
     fn value(&self) -> Option<&Value>;
+    /// The export's declared type, when one is available.
+    ///
+    /// The parser phase carries `Option<TypeExpr>` (the user may have
+    /// omitted the annotation, inference fills it later); the post-
+    /// inference phase carries a bare `TypeExpr` and the impl returns
+    /// `Some(&type_expr)` unconditionally. Carina#3239's argument-side
+    /// custom-type walk uses this so it can validate both phases through
+    /// the same trait.
+    fn type_expr_opt(&self) -> Option<&TypeExpr>;
 }
 
 impl ExportParamLike for ParsedExportParam {
@@ -450,6 +459,9 @@ impl ExportParamLike for ParsedExportParam {
     }
     fn value(&self) -> Option<&Value> {
         self.value.as_ref()
+    }
+    fn type_expr_opt(&self) -> Option<&TypeExpr> {
+        self.type_expr.as_ref()
     }
 }
 
@@ -764,6 +776,9 @@ impl ExportParamLike for InferredExportParam {
     }
     fn value(&self) -> Option<&Value> {
         self.value.as_ref()
+    }
+    fn type_expr_opt(&self) -> Option<&TypeExpr> {
+        Some(&self.type_expr)
     }
 }
 

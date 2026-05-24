@@ -94,6 +94,7 @@ mod tests {
             validators: HashMap::new(),
             custom_type_validator: None,
             schema_types: Default::default(),
+            customs_loaded: false,
         }
     }
 

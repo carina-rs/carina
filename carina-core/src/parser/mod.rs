@@ -36,6 +36,7 @@ pub use resolve::{
     resolve_provider_unresolved_attributes, resolve_resource_refs,
     resolve_resource_refs_with_config,
 };
+pub(crate) use types::is_known_bare_custom_type;
 pub use types::parse_type_expr_str;
 pub(crate) use util::{eval_type_name, value_type_name};
 pub use util::{pascal_to_snake, snake_to_pascal};

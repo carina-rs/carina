@@ -75,6 +75,25 @@ impl DiagnosticEngine {
         factories: Arc<Vec<Box<dyn ProviderFactory>>>,
     ) -> Self {
         let factories_clone = Arc::clone(&factories);
+        // carina#3239 gate: the strict "unknown custom type in type
+        // position" parser check requires the project to actually
+        // *have* a provider surface to compare against. The LSP
+        // backend keeps an *empty* fallback `ProviderState` for files
+        // that don't belong to any known config directory and aren't
+        // reachable through the import map (`carina-lsp/src/backend.rs`'s
+        // `ProviderStates::empty`); for that fallback, no provider
+        // was ever declared and the orphaned file has no way to
+        // resolve a custom type name, so disabling the strict check
+        // avoids a flood of false positives.
+        //
+        // The flag keys off `provider_names` rather than
+        // `factories.is_empty()` so a project whose declared
+        // providers failed to load (network error, missing install,
+        // …) still gets the strict check — the user sees the provider
+        // load error and the unknown-custom-type error together
+        // instead of having the carina#3239 fix silently masked by an
+        // unrelated install failure.
+        let customs_loaded = !provider_names.is_empty();
         let provider_context = carina_core::parser::ProviderContext {
             decryptor: None,
             validators: carina_core::provider::collect_custom_type_validators(&schemas),
@@ -87,6 +106,7 @@ impl DiagnosticEngine {
                 },
             )),
             schema_types: Default::default(),
+            customs_loaded,
         };
         Self {
             schemas,
@@ -158,6 +178,73 @@ impl DiagnosticEngine {
         if let Some(merged) = merged.as_ref() {
             for err in carina_core::parser::check_provider_instance_routing(merged) {
                 diagnostics.push(parse_error_to_diagnostic(&err));
+            }
+        }
+
+        // carina#3239: surface unknown bare custom-type names in
+        // `arguments` / `attributes` / `exports` declarations as
+        // editor diagnostics. Two paths feed the walker:
+        //
+        // 1. The directory-merged parse (`merged`) — when present,
+        //    it carries every sibling `.crn`'s declarations so an
+        //    `arguments { foo: TotallyMadeUpType }` in
+        //    `args.crn` is caught while editing `main.crn`.
+        //
+        // 2. The buffer-only parse (`doc.parsed()`) — load-bearing
+        //    fallback when the merged parse failed. The merged parse
+        //    uses the enriched `customs_loaded=true` context, so the
+        //    parser's strict gate raises `ParseError::InvalidExpression`
+        //    on the very unknown-type-name shape we want to report.
+        //    `parse_merged_with_buffer` swallows that error through
+        //    `.ok()?`, so without this fallback the diagnostic would
+        //    silently disappear exactly when the user introduces the
+        //    bug. The buffer-only parse uses the bootstrap context
+        //    (`customs_loaded=false`), so it always succeeds and
+        //    `doc.parsed()` is `Some`, letting the walker still run
+        //    against the user's in-flight edits.
+        //
+        // Both paths walk the same `arguments` set when the edited
+        // file is the one declaring them, so the merged path is the
+        // strict preference and the fallback only fires on its
+        // failure — no double-report.
+        //
+        // Position note: the diagnostic uses `Range::default()`
+        // (line 0). The AST parameter structs do not carry a source
+        // span, so threading a precise location requires a wider
+        // change (extend `ArgumentParameter` / `AttributeParameter`
+        // / `ParsedExportParam` with a `line: usize` field and update
+        // every constructor). The CLI emits the same message without
+        // a span — we accept the same trade-off here so the LSP
+        // reaches CLI parity in this PR; precise spans can land as a
+        // follow-up.
+        // Gate on `customs_loaded`. The walker itself is unconditional
+        // by design (the carina-core helper "always reports unknowns;
+        // gating is the caller's choice"); the orphaned-file
+        // fallback context turns this flag off so its diagnostics
+        // don't over-fire for `arguments {}` blocks in files outside
+        // any known project root.
+        if self.provider_context.customs_loaded {
+            let custom_type_findings = match merged.as_ref() {
+                Some(m) => carina_core::validation::validate_argument_custom_types(
+                    m,
+                    &self.provider_context,
+                ),
+                None => doc
+                    .parsed()
+                    .map(|p| {
+                        carina_core::validation::validate_argument_custom_types(
+                            p,
+                            &self.provider_context,
+                        )
+                    })
+                    .unwrap_or_default(),
+            };
+            for msg in custom_type_findings {
+                diagnostics.push(carina_diagnostic_range(
+                    tower_lsp::lsp_types::Range::default(),
+                    tower_lsp::lsp_types::DiagnosticSeverity::ERROR,
+                    msg,
+                ));
             }
         }
 

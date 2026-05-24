@@ -51,6 +51,22 @@ pub struct ProviderContext {
     /// path as `TypeExpr::SchemaType`; otherwise it falls back to
     /// `TypeExpr::Ref`.
     pub schema_types: HashSet<(String, String, String)>,
+    /// Whether the provider-registration phase has populated this
+    /// context with the full custom-type set. When `true`, the parser
+    /// rejects any bare PascalCase type name that is not a built-in DSL
+    /// custom type and is not present in [`validators`] as a bare
+    /// identity — the carina#3239 root-cause fix that turns "silent
+    /// accept of unknown custom types" into a parse error.
+    ///
+    /// The default is `false` so that early-parse paths that legitimately
+    /// run before any provider has registered (LSP mid-edit reparse,
+    /// `parse_type_expr_str` for completion ranking, unit tests built
+    /// from string fixtures) keep their pre-#3239 behavior and do not
+    /// lose every `Simple`-shaped type name to a hard error. CLI / LSP
+    /// validation that *has* loaded schemas sets this to `true` so the
+    /// strict check takes effect; see `enrich_provider_context` in the
+    /// CLI command surface.
+    pub customs_loaded: bool,
 }
 
 impl ProviderContext {
@@ -88,6 +104,7 @@ impl std::fmt::Debug for ProviderContext {
                 &self.custom_type_validator.as_ref().map(|_| "..."),
             )
             .field("schema_types", &self.schema_types)
+            .field("customs_loaded", &self.customs_loaded)
             .finish()
     }
 }

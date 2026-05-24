@@ -857,6 +857,54 @@ fn arguments_literal_union_type_does_not_surface_parser_error() {
     );
 }
 
+/// carina#3239 LSP parity: when a project has at least one provider
+/// registered (`provider_names` non-empty), an unknown bare custom-type
+/// name in an `arguments { ... }` declaration must surface as an
+/// editor diagnostic — the same finding the CLI's `carina validate`
+/// produces. Without this coverage the bug-headline case
+/// (`IamOidcProviderArn` left over from a provider rename) shows zero
+/// diagnostics in the editor and only fails at validate time, breaking
+/// the [[feedback_validate_lsp_parity]] contract.
+///
+/// The test path runs `analyze(&doc, None)` which short-circuits the
+/// directory-merged parse and forces the buffer-only fallback in the
+/// LSP walker wiring — the load-bearing path Round 5 review caught.
+#[test]
+fn arguments_unknown_custom_type_surfaces_lsp_diagnostic() {
+    let engine = test_engine_with_wait_target();
+    let doc = create_document("arguments {\n  oidc_provider_arn: IamOidcProviderArn\n}\n");
+    let diagnostics = engine.analyze(&doc, None);
+    assert!(
+        diagnostics.iter().any(|d| {
+            d.message.contains("unknown custom type") && d.message.contains("IamOidcProviderArn")
+        }),
+        "LSP must surface the unknown bare custom-type name when at \
+         least one provider is registered; got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+/// Companion to the test above: when no provider is registered
+/// (`provider_names` empty — the LSP's orphaned-file fallback), the
+/// strict check must *not* fire, otherwise every user-defined custom
+/// type in an orphaned file would redline. This pins the
+/// `customs_loaded = !provider_names.is_empty()` guard in
+/// `DiagnosticEngine::new`.
+#[test]
+fn arguments_unknown_custom_type_silent_without_providers() {
+    let engine = test_engine();
+    let doc = create_document("arguments {\n  oidc_provider_arn: IamOidcProviderArn\n}\n");
+    let diagnostics = engine.analyze(&doc, None);
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|d| d.message.contains("unknown custom type")),
+        "LSP must not surface unknown-custom-type errors when no \
+         provider is registered (orphaned-file fallback); got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
 /// Issue #2623 regression: a single-literal annotation
 /// (`'dev'` alone) is the degenerate case of the same grammar
 /// production. Pinning it separately so a future tightening of the
