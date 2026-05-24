@@ -59,13 +59,15 @@ pub enum BackendError {
 
     /// AWS SDK error with structured context.
     ///
-    /// The bucket/key/operation labels and the full source-chain
-    /// rendering of `source` (e.g. AWS error `code`, message,
-    /// request id) make the failure actionable at first glance —
-    /// see carina-rs/carina#2603. The earlier `Aws(String)` shape
-    /// flattened SDK errors via `.to_string()`, which collapses to
-    /// the literal `"service error"` for most `SdkError::ServiceError`
-    /// values and drops the entire context chain on the floor.
+    /// `AwsError` extracts the actionable fields up-front
+    /// (`operation`, `bucket`/`key`, `status`/`code`, AWS-side
+    /// `message`, `request_id`, `extended_request_id`) so the
+    /// renderer can surface them as labeled lines — see
+    /// carina-rs/carina#3235. The legacy `cause[N]:` chain that
+    /// collapsed everything behind SDK-internal scaffolding is
+    /// gone; transport-level diagnostics (DNS / TLS / timeout) that
+    /// produce no HTTP response are preserved via a `cause:` line
+    /// appended to the structured output.
     #[error("{}", aws_err_display(.0))]
     Aws(Box<AwsError>),
 
@@ -77,9 +79,12 @@ pub enum BackendError {
 /// Structured context attached to a [`BackendError::Aws`].
 ///
 /// Each AWS SDK call site populates `operation` (e.g. `"s3.HeadObject"`)
-/// and the relevant resource fields (`bucket`, `key`); `source` keeps
-/// the underlying SDK error so the `Display` impl can walk the full
-/// chain and surface the AWS error code, message, and request id.
+/// and the relevant resource fields (`bucket`, `key`). The
+/// `status` / `code` / `aws_message` / `request_id` quartet carries
+/// the SDK response metadata that the renderer surfaces as labeled
+/// lines (carina#3235); `source` keeps the underlying SDK error so
+/// transport-level diagnostics (DNS, TLS, timeout) still reach the
+/// operator via a `cause:` line when no HTTP response was received.
 #[derive(Debug)]
 pub struct AwsError {
     /// Service-qualified API operation, e.g. `"s3.HeadObject"`,
@@ -89,13 +94,43 @@ pub struct AwsError {
     pub bucket: Option<String>,
     /// S3 object key the call targeted, when applicable.
     pub key: Option<String>,
-    /// The underlying SDK error chain.
+    /// HTTP status code extracted from the SDK error's raw response.
+    pub status: Option<u16>,
+    /// AWS error code (e.g. `"AccessDenied"`, `"NoSuchBucket"`) from
+    /// `ErrorMetadata::code`. Distinct from `status` — multiple codes
+    /// can share a status (HTTP 403 covers `AccessDenied`,
+    /// `InvalidAccessKeyId`, `SignatureDoesNotMatch`, …) and the code
+    /// is what makes the diagnosis actionable.
+    pub code: Option<String>,
+    /// AWS error message extracted from `ErrorMetadata::message` —
+    /// the human-readable body the operator needs ("User: arn:aws:…
+    /// is not authorized to perform: …"). Field name avoids
+    /// collision with the outer `BackendError` message context.
+    pub aws_message: Option<String>,
+    /// AWS request id (`x-amzn-RequestId`) — what operators paste
+    /// into support tickets and what the server-side log search
+    /// keys off.
+    pub request_id: Option<String>,
+    /// S3 extended request id (`x-amz-id-2`). S3-specific second id
+    /// that AWS Support routinely asks for alongside the primary
+    /// `request_id`; carina-rs/carina#3235 names it explicitly as an
+    /// acceptance criterion. Empty for non-S3 services that don't
+    /// return the header.
+    pub extended_request_id: Option<String>,
+    /// The underlying SDK error chain. Kept even when the structured
+    /// fields above are populated, so the renderer can append a
+    /// `cause:` line that preserves transport-level diagnostics
+    /// (DNS / TLS / timeouts) when no HTTP response landed.
     pub source: Box<dyn std::error::Error + Send + Sync>,
 }
 
 impl AwsError {
     /// Build a new structured AWS error. Use the `bucket`/`key`
-    /// builders to attach resource context.
+    /// builders to attach resource context and the
+    /// `with_status` / `with_code` / `with_aws_message` /
+    /// `with_request_id` / `with_extended_request_id` builders (or
+    /// [`Self::from_sdk_error`]) to attach the SDK response metadata
+    /// that the renderer surfaces as labeled lines.
     pub fn new(
         operation: &'static str,
         source: impl std::error::Error + Send + Sync + 'static,
@@ -104,7 +139,54 @@ impl AwsError {
             operation,
             bucket: None,
             key: None,
+            status: None,
+            code: None,
+            aws_message: None,
+            request_id: None,
+            extended_request_id: None,
             source: Box::new(source),
+        }
+    }
+
+    /// Extract `status` / `code` / `aws_message` / `request_id` /
+    /// `extended_request_id` from an AWS SDK error and attach them
+    /// to a fresh `AwsError`. The SDK error itself is preserved in
+    /// `source` so transport-level failures (which don't populate
+    /// the structured fields because no HTTP response landed) still
+    /// surface via the `cause:` line.
+    pub fn from_sdk_error<E>(operation: &'static str, err: aws_sdk_s3::error::SdkError<E>) -> Self
+    where
+        E: std::error::Error + Send + Sync + aws_sdk_s3::error::ProvideErrorMetadata + 'static,
+        aws_sdk_s3::error::SdkError<E>:
+            aws_sdk_s3::operation::RequestId + aws_sdk_s3::operation::RequestIdExt,
+    {
+        use aws_sdk_s3::error::ProvideErrorMetadata;
+        use aws_sdk_s3::operation::{RequestId, RequestIdExt};
+        let status = err.raw_response().map(|r| r.status().as_u16());
+        let code = err.code().map(str::to_owned);
+        let aws_message = err.message().map(str::to_owned);
+        // `request_id` is exposed via `RequestId::request_id()`
+        // when the SDK provides it; fall back to extracting it from
+        // `ErrorMetadata::extra("aws_request_id")` otherwise.
+        let request_id = err
+            .request_id()
+            .map(str::to_owned)
+            .or_else(|| err.meta().extra("aws_request_id").map(str::to_owned));
+        // S3 second-id (carina-rs/carina#3235); AWS Support asks for
+        // both ids together. Non-S3 SDK error variants don't
+        // implement `ExtendedRequestId`, but every S3 op error does
+        // (see aws-sdk-s3's per-op `error_meta.rs`).
+        let extended_request_id = err.extended_request_id().map(str::to_owned);
+        Self {
+            operation,
+            bucket: None,
+            key: None,
+            status,
+            code,
+            aws_message,
+            request_id,
+            extended_request_id,
+            source: Box::new(err),
         }
     }
 
@@ -117,38 +199,141 @@ impl AwsError {
         self.key = Some(key.into());
         self
     }
+
+    pub fn with_status(mut self, status: u16) -> Self {
+        self.status = Some(status);
+        self
+    }
+
+    pub fn with_code(mut self, code: impl Into<String>) -> Self {
+        self.code = Some(code.into());
+        self
+    }
+
+    pub fn with_aws_message(mut self, msg: impl Into<String>) -> Self {
+        self.aws_message = Some(msg.into());
+        self
+    }
+
+    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
+        self
+    }
+
+    pub fn with_extended_request_id(mut self, ext: impl Into<String>) -> Self {
+        self.extended_request_id = Some(ext.into());
+        self
+    }
+
+    /// Returns `true` when at least one structured *response* field
+    /// (`status` / `code` / `aws_message` / `request_id` /
+    /// `extended_request_id`) is set — gates the renderer's
+    /// multi-line labeled output. When none are set, the renderer
+    /// falls back to walking the SDK source chain so transport-level
+    /// diagnostics still surface.
+    ///
+    /// Note: `bucket` / `key` always render when set, in both
+    /// branches — they're operational context, not response shape.
+    fn has_structured_response_fields(&self) -> bool {
+        self.status.is_some()
+            || self.code.is_some()
+            || self.aws_message.is_some()
+            || self.request_id.is_some()
+            || self.extended_request_id.is_some()
+    }
 }
 
-/// Render an [`AwsError`] as a multi-line, fully-expanded message:
-/// service/operation, the targeted bucket/key (if known), and the
-/// full source-chain text from the SDK error. Used by
-/// `BackendError::Aws`'s `Display` impl.
+/// Render an [`AwsError`] as a multi-line, labeled message that
+/// surfaces the structured response fields (`status`, `code`,
+/// `message`, `request_id`, `extended_request_id`) and the
+/// bucket/key context — replacing the legacy `cause[N]: …` chain
+/// (the depth-numbered per-level lines) that buried the actionable
+/// parts behind SDK-internal scaffolding. carina#3235.
+///
+/// When the structured response fields are absent (transport-level
+/// failures: DNS, TLS handshake, network timeout — no HTTP response
+/// landed), falls back to a single `cause:` labeled line that joins
+/// the full source chain with `: ` — same render shape as the
+/// structured branch's appended cause, just without the labeled
+/// HTTP-response fields above it. A multi-level wrapping that used
+/// to render as `cause[0]: foo\n  cause[1]: bar` now renders as
+/// `cause: foo: bar`; the information is preserved, only the
+/// per-level line break is gone.
+///
+/// When BOTH structured fields AND a cause chain are populated, the
+/// cause chain is appended as a single `cause:` labeled line at the
+/// bottom so transport-level diagnostics aren't lost — same shape as
+/// carina-core's renderer (carina#3242 design D5).
 fn aws_err_display(err: &AwsError) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let _ = writeln!(out, "AWS error");
     let _ = writeln!(out, "  operation: {}", err.operation);
     if let Some(bucket) = &err.bucket {
-        let _ = writeln!(out, "  bucket: {}", bucket);
+        let _ = writeln!(out, "  bucket: {bucket}");
     }
     if let Some(key) = &err.key {
-        let _ = writeln!(out, "  key: {}", key);
+        let _ = writeln!(out, "  key: {key}");
     }
-    // Walk the source chain so the AWS error code, message, request
-    // id, and any wrapped causes all surface.
-    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err.source.as_ref());
-    let mut depth = 0usize;
-    while let Some(e) = current {
-        let _ = writeln!(out, "  cause[{}]: {}", depth, e);
-        depth += 1;
-        current = e.source();
+
+    if err.has_structured_response_fields() {
+        match (err.status, err.code.as_deref()) {
+            (Some(s), Some(c)) => {
+                let _ = writeln!(out, "  status: {s} {c}");
+            }
+            (Some(s), None) => {
+                let _ = writeln!(out, "  status: {s}");
+            }
+            (None, Some(c)) => {
+                let _ = writeln!(out, "  code: {c}");
+            }
+            (None, None) => {}
+        }
+        if let Some(msg) = &err.aws_message {
+            let _ = writeln!(out, "  message: {msg}");
+        }
+        if let Some(id) = &err.request_id {
+            let _ = writeln!(out, "  request_id: {id}");
+        }
+        if let Some(ext) = &err.extended_request_id {
+            let _ = writeln!(out, "  extended_request_id: {ext}");
+        }
     }
+
+    // `cause:` line is the same in both branches — it preserves
+    // transport-level diagnostics that the structured HTTP-response
+    // fields can't capture (DNS / TLS / timeouts have no HTTP
+    // response) and serves as the only diagnostic in the fallback
+    // branch.
+    write_cause_line(&mut out, err.source.as_ref());
+
     // Drop the trailing newline so the formatter ("Error: {}") does
     // not emit a blank line at the very end.
     while out.ends_with('\n') {
         out.pop();
     }
     out
+}
+
+/// Append a `cause: A: B: C` labeled line that walks the entire
+/// `source()` chain. Extracted from `aws_err_display` so the
+/// structured branch and the fallback branch can share the same
+/// chain-walk shape and stay in sync (review round 1).
+fn write_cause_line(out: &mut String, source: &(dyn std::error::Error + 'static)) {
+    use std::fmt::Write;
+    let _ = write!(out, "  cause: ");
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(source);
+    let mut first = true;
+    while let Some(e) = current {
+        if first {
+            let _ = write!(out, "{e}");
+            first = false;
+        } else {
+            let _ = write!(out, ": {e}");
+        }
+        current = e.source();
+    }
+    out.push('\n');
 }
 
 impl BackendError {
@@ -393,6 +578,13 @@ mod tests {
         }
     }
 
+    /// Legacy chain-walk fallback shape (no structured response
+    /// fields populated): operation + bucket appear as labeled
+    /// lines, the source chain is joined into a single `cause:`
+    /// line that walks the full `source()` chain. Updated for
+    /// carina#3235 — the `cause[N]:` depth-numbered form is gone,
+    /// replaced by a single labeled line that still surfaces every
+    /// level joined with `: `.
     #[test]
     fn aws_error_display_renders_operation_and_source_chain() {
         let inner = ChainErr {
@@ -419,13 +611,16 @@ mod tests {
             rendered
         );
         assert!(
-            rendered.contains("cause[0]: service error"),
-            "outer cause must be visible. got:\n{}",
+            rendered.contains("  cause: service error: AccessDenied"),
+            "outer cause + deeper source chain must both surface on the \
+             single `cause:` line, got:\n{}",
             rendered
         );
+        // Negative assertion: the legacy depth-numbered `cause[N]:`
+        // shape that #3235 wanted gone must not reappear.
         assert!(
-            rendered.contains("AccessDenied"),
-            "the deeper source chain (AWS error code) must surface. got:\n{}",
+            !rendered.contains("cause[0]:"),
+            "legacy cause[N] shape must not reappear, got:\n{}",
             rendered
         );
     }
@@ -450,6 +645,181 @@ mod tests {
                 && rendered.contains("key: path/to/state.json"),
             "operation/bucket/key must all be present. got:\n{}",
             rendered
+        );
+    }
+
+    /// carina#3235: when the SDK error metadata is populated, the
+    /// rendered message must surface `status`, `code` (combined on
+    /// one line), AWS error `message`, and `request_id` as labeled
+    /// lines instead of the legacy `cause[N]: …` chain that buries
+    /// them behind SDK-internal scaffolding.
+    #[test]
+    fn aws_error_display_renders_structured_fields() {
+        let aws = AwsError::new(
+            "s3.HeadBucket",
+            ChainErr {
+                msg: "AccessDenied (deep chain, suppressed by structured render)",
+                source: None,
+            },
+        )
+        .bucket("carina-rs-state")
+        .with_status(403)
+        .with_code("AccessDenied")
+        .with_aws_message(
+            "User: arn:aws:sts::151116838382:assumed-role/carina-bootstrap/GitHubActions \
+             is not authorized to perform: s3:ListBucket on resource: \
+             \"arn:aws:s3:::carina-rs-state\"",
+        )
+        .with_request_id("K0Q1D04FARNCQD7P");
+        let err = BackendError::Aws(Box::new(aws));
+        let rendered = err.to_string();
+        let lines: Vec<&str> = rendered.lines().collect();
+
+        assert!(
+            lines.contains(&"  status: 403 AccessDenied"),
+            "status+code must render on one line as `<status> <code>`, got:\n{}",
+            rendered
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("  message: User: arn:aws:sts::")),
+            "message must render as its own labeled line, got:\n{}",
+            rendered
+        );
+        assert!(
+            lines.contains(&"  request_id: K0Q1D04FARNCQD7P"),
+            "request_id must render on its own labeled line, got:\n{}",
+            rendered
+        );
+        // The legacy `cause[N]:` chain output must NOT appear once
+        // structured fields are present — that was the noise #3235
+        // wanted gone.
+        assert!(
+            !rendered.contains("cause[0]:"),
+            "legacy cause[N] chain must be suppressed when structured \
+             fields are set, got:\n{}",
+            rendered
+        );
+    }
+
+    /// carina#3235: transport-level failures (DNS, TLS handshake,
+    /// network timeout) have no HTTP response, so `status`/`code`/
+    /// `message`/`request_id` won't be set. The renderer must fall
+    /// back to walking the source chain so the underlying
+    /// `connection refused` etc. is still visible.
+    #[test]
+    fn aws_error_display_falls_back_to_chain_walk_when_no_structured_fields() {
+        let aws = AwsError::new(
+            "s3.HeadBucket",
+            ChainErr {
+                msg: "connection refused",
+                source: None,
+            },
+        )
+        .bucket("carina-rs-state");
+        let err = BackendError::Aws(Box::new(aws));
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("connection refused"),
+            "transport diagnostic must surface via the legacy chain walk \
+             when no structured fields are set, got:\n{}",
+            rendered
+        );
+    }
+
+    /// carina#3235: when both structured fields AND a cause chain are
+    /// populated (the realistic shape after `from_sdk_error` is
+    /// added — the SDK error itself stays in `source` even after
+    /// extraction), the renderer surfaces both — structured fields as
+    /// labeled lines, then `cause: <chain>` at the bottom so transport
+    /// detail isn't lost. This mirrors carina-core's renderer
+    /// (carina#3242 design D5).
+    #[test]
+    fn aws_error_display_appends_cause_chain_when_both_populated() {
+        let aws = AwsError::new(
+            "s3.HeadBucket",
+            ChainErr {
+                msg: "transport: tls handshake failed",
+                source: None,
+            },
+        )
+        .bucket("carina-rs-state")
+        .with_status(500)
+        .with_code("InternalError")
+        .with_aws_message("Server error");
+        let err = BackendError::Aws(Box::new(aws));
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("\n  cause: transport: tls handshake failed"),
+            "cause must render as its own labeled line at the bottom when \
+             both structured fields and cause are populated, got:\n{}",
+            rendered
+        );
+    }
+
+    /// carina#3235: S3 returns a second id (`x-amz-id-2`) alongside
+    /// the primary `x-amzn-RequestId`; AWS Support routinely asks
+    /// for both. The rendered output must include
+    /// `extended_request_id:` when populated.
+    #[test]
+    fn aws_error_display_includes_extended_request_id_when_set() {
+        let aws = AwsError::new(
+            "s3.HeadBucket",
+            ChainErr {
+                msg: "AccessDenied (deep chain, suppressed by structured render)",
+                source: None,
+            },
+        )
+        .bucket("carina-rs-state")
+        .with_status(403)
+        .with_code("AccessDenied")
+        .with_request_id("K0Q1D04FARNCQD7P")
+        .with_extended_request_id("abc123def456==");
+        let err = BackendError::Aws(Box::new(aws));
+        let rendered = err.to_string();
+        assert!(
+            rendered
+                .lines()
+                .any(|l| l == "  extended_request_id: abc123def456=="),
+            "extended_request_id must render on its own labeled line, got:\n{}",
+            rendered
+        );
+    }
+
+    /// carina#3235: `from_sdk_error` extracts `status` / `code` /
+    /// `aws_message` / `request_id` / `extended_request_id` from a
+    /// real `SdkError::ServiceError`. This is the path provider call
+    /// sites take (vs. the builder-style construction the renderer
+    /// tests use), so a direct unit test on the extraction is
+    /// load-bearing.
+    #[test]
+    fn from_sdk_error_extracts_metadata_from_service_error() {
+        use aws_sdk_s3::error::SdkError;
+        use aws_sdk_s3::operation::head_bucket::HeadBucketError;
+        use aws_sdk_s3::types::error::NotFound;
+        use aws_smithy_runtime_api::http::Response;
+        use aws_smithy_runtime_api::http::StatusCode;
+        use aws_smithy_types::body::SdkBody;
+        use aws_smithy_types::error::ErrorMetadata;
+
+        // Build a synthetic SDK error: NotFound with status 404 +
+        // metadata code/message + a populated x-amzn-RequestId
+        // header so the request-id extraction can be exercised.
+        let meta = ErrorMetadata::builder()
+            .code("NoSuchBucket")
+            .message("The specified bucket does not exist")
+            .build();
+        let inner_err = HeadBucketError::NotFound(NotFound::builder().meta(meta).build());
+        let raw = Response::new(StatusCode::try_from(404u16).unwrap(), SdkBody::empty());
+        let sdk_err = SdkError::service_error(inner_err, raw);
+
+        let aws = AwsError::from_sdk_error("s3.HeadBucket", sdk_err);
+        assert_eq!(aws.status, Some(404));
+        assert_eq!(aws.code.as_deref(), Some("NoSuchBucket"));
+        assert_eq!(
+            aws.aws_message.as_deref(),
+            Some("The specified bucket does not exist"),
         );
     }
 

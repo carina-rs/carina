@@ -143,7 +143,7 @@ impl S3Backend {
                     Ok(None)
                 } else {
                     Err(BackendError::Aws(Box::new(
-                        AwsError::new("s3.GetObject", err)
+                        AwsError::from_sdk_error("s3.GetObject", err)
                             .bucket(&self.bucket)
                             .key(self.lock_key()),
                     )))
@@ -207,7 +207,7 @@ impl S3Backend {
             Ok(_) => Ok(true),
             Err(err) if is_conditional_write_conflict(&err) => Ok(false),
             Err(err) => Err(BackendError::Aws(Box::new(
-                AwsError::new("s3.PutObject", err)
+                AwsError::from_sdk_error("s3.PutObject", err)
                     .bucket(&self.bucket)
                     .key(self.lock_key()),
             ))),
@@ -225,7 +225,7 @@ impl S3Backend {
             .await
             .map_err(|e| {
                 BackendError::Aws(Box::new(
-                    AwsError::new("s3.DeleteObject", e)
+                    AwsError::from_sdk_error("s3.DeleteObject", e)
                         .bucket(&self.bucket)
                         .key(&lock_key),
                 ))
@@ -272,7 +272,7 @@ impl StateBackend for S3Backend {
                     Ok(None)
                 } else {
                     Err(BackendError::Aws(Box::new(
-                        AwsError::new("s3.GetObject", err)
+                        AwsError::from_sdk_error("s3.GetObject", err)
                             .bucket(&self.bucket)
                             .key(&self.key),
                     )))
@@ -298,7 +298,7 @@ impl StateBackend for S3Backend {
 
         request.send().await.map_err(|e| {
             BackendError::Aws(Box::new(
-                AwsError::new("s3.PutObject", e)
+                AwsError::from_sdk_error("s3.PutObject", e)
                     .bucket(&self.bucket)
                     .key(&self.key),
             ))
@@ -435,7 +435,7 @@ impl StateBackend for S3Backend {
                     Ok(false)
                 } else {
                     Err(BackendError::Aws(Box::new(
-                        AwsError::new("s3.HeadBucket", err).bucket(&self.bucket),
+                        AwsError::from_sdk_error("s3.HeadBucket", err).bucket(&self.bucket),
                     )))
                 }
             }
@@ -489,7 +489,7 @@ impl StateBackend for S3Backend {
             .await
             .map_err(|e| {
                 BackendError::Aws(Box::new(
-                    AwsError::new("s3.PutPublicAccessBlock", e).bucket(&self.bucket),
+                    AwsError::from_sdk_error("s3.PutPublicAccessBlock", e).bucket(&self.bucket),
                 ))
             })?;
 
