@@ -430,33 +430,78 @@ pub struct ResolvedBindings {
     by_name: HashMap<String, ResolvedBinding>,
 }
 
+/// Required inputs for [`ResolvedBindings::pre_apply`] (carina#3248).
+///
+/// All fields are mandatory; no `Default`, no `Option`. This shape
+/// turns "forgot virtuals at a new call site" into a compile error —
+/// a struct-literal with a missing field fails to compile, so the
+/// pre-apply path cannot be silently constructed without the kind
+/// of binding sources it needs (carina#3246).
+///
+/// Slices and maps are borrowed: the constructor reads them once and
+/// stores owned copies internally, so the caller retains ownership
+/// without forcing a clone at the API boundary.
+pub struct PreApplyInputs<'a> {
+    pub managed: &'a [ManagedResource],
+    pub virtuals: &'a [VirtualResource],
+    pub data_sources: &'a [crate::resource::DataSource],
+    pub current_states: &'a HashMap<ResourceId, State>,
+    pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
+    pub wait_aliases: &'a [WaitAliasSpec],
+}
+
 impl ResolvedBindings {
-    /// Build the resolved view from the same three inputs the resolver
-    /// already takes: top-level resources (DSL), the last-known state map,
-    /// and upstream-state bindings.
+    /// Single typed pre-apply constructor (carina#3248).
     ///
-    /// DSL keys win over state keys on conflict. Upstream bindings are
-    /// inserted last and overwrite any local binding of the same name.
+    /// Builds the bindings view from every kind of binding that
+    /// reference resolution can name — managed resources, virtual
+    /// resources (module-call attribute containers), and data
+    /// sources — plus the same `current_states`, `remote_bindings`,
+    /// and `wait_aliases` inputs the legacy entries took.
     ///
-    /// `wait_aliases` materialises each `wait` binding as a passthrough
-    /// alias to its target: an entry whose attributes are a snapshot of
-    /// the target's resolved attributes and whose source is
-    /// [`BindingValueSource::WaitAlias`] (carina#3085). Materialising
-    /// the alias here — rather than via a second lookup in
-    /// `resolve_ref_value` — means a wait binding is resolved by exactly
-    /// the same code path as a resource binding (it simply *has* an
-    /// entry). The wait's *dependency edge* is independent and handled
-    /// separately by `Effect::Wait` lowering; this only restores the
-    /// value-identity half (design value semantics).
-    pub fn from_resources_with_state(
-        resources: &[ManagedResource],
+    /// The required-fields `PreApplyInputs` struct turns "forgot to
+    /// include virtuals at a new call site" into a compile error
+    /// rather than a runtime symptom: any missing field on the
+    /// struct-literal fails to compile, so a new pre-apply call site
+    /// cannot accidentally lose the virtual / data-source layer the
+    /// way the previous managed-only constructor + opt-in
+    /// `add_virtual_resources` shape allowed (carina#3246).
+    ///
+    /// Layering order: managed first (merged with `current_states`,
+    /// DSL-wins-on-collision), then data sources, then virtuals,
+    /// then wait aliases. The post-apply layering in
+    /// `state_writeback.rs` uses the same order, so a same-stack
+    /// collision resolves identically on the pre-apply and post-apply
+    /// sides. (Same-name collisions are independently rejected by the
+    /// parser's `DuplicateBinding` check, so the order is observable
+    /// only in test code that constructs colliding inputs by hand.)
+    pub fn pre_apply(inputs: PreApplyInputs<'_>) -> Self {
+        let mut bindings = Self::build_managed_core(
+            inputs.managed,
+            inputs.current_states,
+            inputs.remote_bindings,
+        );
+        bindings.layer_data_sources_post_apply(inputs.data_sources);
+        bindings
+            .layer_virtuals_post_apply(inputs.virtuals)
+            .expect("layer_virtuals_post_apply is currently infallible");
+        bindings.layer_wait_aliases(inputs.wait_aliases);
+        bindings
+    }
+
+    /// Shared managed + remote-bindings layering used by both the
+    /// pre-apply constructor and the legacy entries during the
+    /// migration window. Wait-aliases are layered separately by the
+    /// caller after data sources / virtuals so a wait whose target is
+    /// a data source or virtual still snapshots the resolved attrs.
+    fn build_managed_core(
+        managed: &[ManagedResource],
         current_states: &HashMap<ResourceId, State>,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
-        wait_aliases: &[WaitAliasSpec],
     ) -> Self {
         let mut by_name: HashMap<String, ResolvedBinding> = HashMap::new();
 
-        for resource in resources.iter() {
+        for resource in managed.iter() {
             let Some(binding_name) = resource.binding.as_ref() else {
                 continue;
             };
@@ -487,23 +532,20 @@ impl ResolvedBindings {
             );
         }
 
-        // Wait aliases materialise last, after both local and upstream
-        // entries exist, so a wait whose target is *either* a resource
-        // or an upstream binding sees the target's resolved attributes.
-        // The alias attributes are an independent snapshot (clone), not
-        // a shared reference: a later `set("target", …)` write-back
-        // must not mutate the alias and vice versa (design: the alias
-        // is a read-time snapshot). If the target has no entry (typo /
-        // scoped-out — the same condition `create_plan` reports as a
-        // `PlanError`), no alias is created: the ref stays unresolved
-        // and that existing error surfaces it, rather than a panic or a
-        // phantom.
+        Self { by_name }
+    }
+
+    /// Layer wait aliases on the view. Extracted from
+    /// `pre_apply` so `pre_apply` can sequence the
+    /// layering (managed → data sources → virtuals → wait aliases)
+    /// without duplicating the alias logic.
+    fn layer_wait_aliases(&mut self, wait_aliases: &[WaitAliasSpec]) {
         for spec in wait_aliases {
-            let Some(target_entry) = by_name.get(spec.target.as_str()) else {
+            let Some(target_entry) = self.by_name.get(spec.target.as_str()) else {
                 continue;
             };
             let snapshot = target_entry.attributes.clone();
-            by_name.insert(
+            self.by_name.insert(
                 spec.binding.as_str().to_string(),
                 ResolvedBinding {
                     attributes: snapshot,
@@ -513,31 +555,19 @@ impl ResolvedBindings {
                 },
             );
         }
-
-        Self { by_name }
-    }
-
-    /// Typed pre-apply constructor (#3176): build the bindings view
-    /// from a `ManagedResource` slice plus the same `current_states`,
-    /// `remote_bindings`, and `wait_aliases` inputs that
-    /// [`Self::from_resources_with_state`] consumes.
-    ///
-    /// Encodes the typestate-split invariant at the input side:
-    /// virtuals cannot be passed here. The pre-apply binding view a
-    /// caller builds via this constructor is the *only* view a
-    /// pre-apply resolver should consult; virtuals layer in
-    /// post-apply via [`Self::add_virtual_resources`].
-    pub fn from_managed_with_state(
-        managed: &[ManagedResource],
-        current_states: &HashMap<ResourceId, State>,
-        remote_bindings: &HashMap<String, HashMap<String, Value>>,
-        wait_aliases: &[WaitAliasSpec],
-    ) -> Self {
-        Self::from_resources_with_state(managed, current_states, remote_bindings, wait_aliases)
     }
 
     /// Typed post-apply layering (#3176): add virtual-resource
     /// bindings onto an existing view.
+    ///
+    /// **Scope:** post-apply increment layering (carina#3248). The
+    /// canonical caller is `state_writeback.rs`, which re-resolves
+    /// virtuals against post-apply state via
+    /// `resolve_virtual_refs_post_apply` and then layers them on top
+    /// of the pre-apply binding view for export resolution. Pre-apply
+    /// call sites must use [`ResolvedBindings::pre_apply`] instead —
+    /// that constructor lays virtuals in once at the start and makes
+    /// "forgot virtuals" a compile error.
     ///
     /// **Ordering contract**: must be called *after* the managed-side
     /// bindings have been constructed, so any virtual whose
@@ -546,7 +576,7 @@ impl ResolvedBindings {
     /// responsible for that ordering; the function itself just
     /// appends.
     ///
-    /// Unlike `from_managed_with_state`, this entry does **not** merge
+    /// Unlike `pre_apply`, this entry does **not** merge
     /// `current_states`: virtuals have no provider-side state to
     /// merge. The virtual's own attribute map (as authored, after
     /// `resolve_virtual_refs_post_apply` materialised any refs) is
@@ -563,7 +593,10 @@ impl ResolvedBindings {
     /// hard error on a same-name collision when the post-apply layer
     /// expects to merge rather than overwrite) be added without
     /// breaking the signature.
-    pub fn add_virtual_resources(&mut self, virtuals: &[VirtualResource]) -> Result<(), String> {
+    pub fn layer_virtuals_post_apply(
+        &mut self,
+        virtuals: &[VirtualResource],
+    ) -> Result<(), String> {
         for v in virtuals.iter() {
             let Some(binding_name) = v.binding.as_ref() else {
                 continue;
@@ -587,7 +620,12 @@ impl ResolvedBindings {
     /// layered in explicitly rather than collapsed into the managed
     /// slice. The resolved attribute map is recorded verbatim — data
     /// sources have no provider-side state to merge here.
-    pub fn add_data_sources(&mut self, data_sources: &[crate::resource::DataSource]) {
+    ///
+    /// **Scope:** post-apply increment layering (carina#3248). Same
+    /// as [`Self::layer_virtuals_post_apply`] — pre-apply call sites
+    /// must use [`ResolvedBindings::pre_apply`] instead so the
+    /// data-source layer is established at construction time.
+    pub fn layer_data_sources_post_apply(&mut self, data_sources: &[crate::resource::DataSource]) {
         for d in data_sources.iter() {
             let Some(binding_name) = d.binding.as_ref() else {
                 continue;
@@ -617,7 +655,7 @@ impl ResolvedBindings {
     /// what the provider just reported. **State wins on key collision** —
     /// the provider's freshly-returned values (e.g. an auto-assigned
     /// `id`) are by definition the source of truth for the binding's
-    /// downstream consumers. This is the inverse of `from_resources_with_state`'s
+    /// downstream consumers. This is the inverse of `pre_apply`'s
     /// "DSL wins" pre-apply rule: pre-apply we trust the DSL, post-apply
     /// we trust the provider.
     ///
@@ -670,7 +708,7 @@ impl ResolvedBindings {
     ///
     /// Every entry's merged attribute map (local DSL ⊕ refreshed state,
     /// with upstream and wait-alias entries already folded in by
-    /// [`Self::from_resources_with_state`]) is exposed under its binding
+    /// [`Self::pre_apply`]) is exposed under its binding
     /// name. This is the *only* same-config-aware constructor of
     /// `IterableBindings`: a deferred-for iterable resolves against the
     /// exact post-refresh view every non-loop `ResourceRef` resolves
@@ -927,8 +965,14 @@ mod resolved_bindings_tests {
         let states: HashMap<ResourceId, State> = HashMap::new();
         let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
-        let resolved =
-            ResolvedBindings::from_resources_with_state(&resources, &states, &remote, &[]);
+        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+            managed: &resources,
+            virtuals: &[],
+            data_sources: &[],
+            current_states: &states,
+            remote_bindings: &remote,
+            wait_aliases: &[],
+        });
 
         let attrs = resolved.get("vpc").expect("vpc binding present");
         assert_eq!(
@@ -976,8 +1020,14 @@ mod resolved_bindings_tests {
         );
         let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
-        let resolved =
-            ResolvedBindings::from_resources_with_state(&resources, &states, &remote, &[]);
+        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+            managed: &resources,
+            virtuals: &[],
+            data_sources: &[],
+            current_states: &states,
+            remote_bindings: &remote,
+            wait_aliases: &[],
+        });
 
         let attrs = resolved.get("vpc").expect("vpc binding present");
         assert_eq!(
@@ -1010,8 +1060,14 @@ mod resolved_bindings_tests {
         );
         remote.insert("network".to_string(), network_attrs);
 
-        let resolved =
-            ResolvedBindings::from_resources_with_state(&resources, &states, &remote, &[]);
+        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+            managed: &resources,
+            virtuals: &[],
+            data_sources: &[],
+            current_states: &states,
+            remote_bindings: &remote,
+            wait_aliases: &[],
+        });
 
         let attrs = resolved.get("network").expect("upstream binding present");
         assert_eq!(
@@ -1039,8 +1095,14 @@ mod resolved_bindings_tests {
         let states: HashMap<ResourceId, State> = HashMap::new();
         let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
-        let resolved =
-            ResolvedBindings::from_resources_with_state(&resources, &states, &remote, &[]);
+        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+            managed: &resources,
+            virtuals: &[],
+            data_sources: &[],
+            current_states: &states,
+            remote_bindings: &remote,
+            wait_aliases: &[],
+        });
         assert!(resolved.get("anonymous").is_none());
     }
 
@@ -1070,8 +1132,14 @@ mod resolved_bindings_tests {
             .collect(),
         );
 
-        let resolved =
-            ResolvedBindings::from_resources_with_state(&resources, &states, &remote, &[]);
+        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+            managed: &resources,
+            virtuals: &[],
+            data_sources: &[],
+            current_states: &states,
+            remote_bindings: &remote,
+            wait_aliases: &[],
+        });
         let attrs = resolved.get("shared").expect("shared binding present");
         assert_eq!(
             attrs.get("kind"),
@@ -1118,8 +1186,14 @@ mod resolved_bindings_tests {
         );
         let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
-        let resolved =
-            ResolvedBindings::from_resources_with_state(&resources, &states, &remote, &[]);
+        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+            managed: &resources,
+            virtuals: &[],
+            data_sources: &[],
+            current_states: &states,
+            remote_bindings: &remote,
+            wait_aliases: &[],
+        });
         let attrs = resolved.get("vpc").expect("vpc binding present");
         assert!(
             attrs.get("id").is_none(),
@@ -1227,7 +1301,14 @@ mod resolved_bindings_tests {
         )];
         let states: HashMap<ResourceId, State> = HashMap::new();
         let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
-        let parent = ResolvedBindings::from_resources_with_state(&resources, &states, &remote, &[]);
+        let parent = ResolvedBindings::pre_apply(PreApplyInputs {
+            managed: &resources,
+            virtuals: &[],
+            data_sources: &[],
+            current_states: &states,
+            remote_bindings: &remote,
+            wait_aliases: &[],
+        });
 
         let mut child = parent.clone();
         let extra_state = State {
@@ -1317,12 +1398,14 @@ mod resolved_bindings_tests {
                 )),
             )],
         );
-        let resolved = ResolvedBindings::from_resources_with_state(
-            &[cert],
-            &HashMap::new(),
-            &HashMap::new(),
-            &[wait_spec("cert_issued", "cert")],
-        );
+        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+            managed: &[cert],
+            virtuals: &[],
+            data_sources: &[],
+            current_states: &HashMap::new(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[wait_spec("cert_issued", "cert")],
+        });
         assert_eq!(
             resolved
                 .get("cert_issued")
@@ -1346,12 +1429,14 @@ mod resolved_bindings_tests {
     /// and the existing PlanError path (not a panic) surfaces it.
     #[test]
     fn wait_alias_absent_target_creates_no_entry() {
-        let resolved = ResolvedBindings::from_resources_with_state(
-            &[],
-            &HashMap::new(),
-            &HashMap::new(),
-            &[wait_spec("cert_issued", "nonexistent")],
-        );
+        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+            managed: &[],
+            virtuals: &[],
+            data_sources: &[],
+            current_states: &HashMap::new(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[wait_spec("cert_issued", "nonexistent")],
+        });
         assert!(
             resolved.get("cert_issued").is_none(),
             "no alias when target is absent (ref stays unresolved → existing PlanError)"
@@ -1370,12 +1455,14 @@ mod resolved_bindings_tests {
             Value::Concrete(ConcreteValue::String("up-1".to_string())),
         );
         remote.insert("up".to_string(), attrs);
-        let resolved = ResolvedBindings::from_resources_with_state(
-            &[],
-            &HashMap::new(),
-            &remote,
-            &[wait_spec("waited", "up")],
-        );
+        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+            managed: &[],
+            virtuals: &[],
+            data_sources: &[],
+            current_states: &HashMap::new(),
+            remote_bindings: &remote,
+            wait_aliases: &[wait_spec("waited", "up")],
+        });
         assert_eq!(
             resolved.get("waited").and_then(|a| a.get("id")),
             Some(&Value::Concrete(ConcreteValue::String("up-1".to_string())))
@@ -1395,12 +1482,14 @@ mod resolved_bindings_tests {
                 Value::Concrete(ConcreteValue::String("arn:old".to_string())),
             )],
         );
-        let mut resolved = ResolvedBindings::from_resources_with_state(
-            &[cert],
-            &HashMap::new(),
-            &HashMap::new(),
-            &[wait_spec("cert_issued", "cert")],
-        );
+        let mut resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+            managed: &[cert],
+            virtuals: &[],
+            data_sources: &[],
+            current_states: &HashMap::new(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[wait_spec("cert_issued", "cert")],
+        });
         let mut new_attrs = HashMap::new();
         new_attrs.insert(
             "certificate_arn".to_string(),
@@ -1435,12 +1524,14 @@ mod resolved_bindings_tests {
                 Value::Concrete(ConcreteValue::String("arn:shared".to_string())),
             )],
         );
-        let resolved = ResolvedBindings::from_resources_with_state(
-            &[cert],
-            &HashMap::new(),
-            &HashMap::new(),
-            &[wait_spec("cert_issued", "cert")],
-        );
+        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+            managed: &[cert],
+            virtuals: &[],
+            data_sources: &[],
+            current_states: &HashMap::new(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[wait_spec("cert_issued", "cert")],
+        });
         // Two independent consumers both resolve the same value.
         let a = resolved
             .get("cert_issued")
@@ -1619,12 +1710,14 @@ let chosen = if true { "primary" } else { "fallback" }
 
         // Value-side: `ResolvedBindings` does NOT carry an entry for
         // `chosen`, so a `ResourceRef` to `chosen.foo` cannot resolve.
-        let resolved = ResolvedBindings::from_resources_with_state(
-            &parsed.resources,
-            &HashMap::new(),
-            &HashMap::new(),
-            &[],
-        );
+        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+            managed: &parsed.resources,
+            virtuals: &[],
+            data_sources: &[],
+            current_states: &HashMap::new(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        });
         assert!(
             resolved.get("chosen").is_none(),
             "structural bindings must stay invisible to ResourceRef resolution",

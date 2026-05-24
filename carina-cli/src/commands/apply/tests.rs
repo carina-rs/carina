@@ -1368,7 +1368,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     // `sorted_resources`) to build a fresh post-apply
     // `ResolvedBindings` view via the typestate-split API
     // (`from_managed_with_state` + `resolve_virtual_refs_post_apply`
-    // + `add_virtual_resources`). Exports then resolve against the
+    // + `layer_virtuals_post_apply`). Exports then resolve against the
     // post-apply view.
     //
     // **The test** mirrors that production pipeline: it (1)
@@ -1470,13 +1470,17 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     // Step (d): head-of-pipeline resolver — runs over the managed
     // slice only. Virtuals are not part of it, so the pre-resolve
     // snapshot above is preserved verbatim.
-    resolve_managed_refs_with_state_and_remote(
-        &mut sorted_resources,
-        &pre_apply_current_states,
-        &HashMap::new(),
-        &[],
-    )
-    .unwrap();
+    let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
+        carina_core::binding_index::PreApplyInputs {
+            managed: &sorted_resources.clone(),
+            virtuals: &[],
+            data_sources: &[],
+            current_states: &pre_apply_current_states,
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        },
+    );
+    resolve_managed_refs_with_state_and_remote(&mut sorted_resources, &bindings).unwrap();
 
     let export_params = vec![ExportParameter {
         name: "role_arn".to_string(),
@@ -1812,6 +1816,67 @@ mod apply_deferred_for_parity {
             !out.refreshable_child_ids.contains(&child_id),
             "apply: a `moved` target child must be excluded from \
              refreshable_child_ids (carina#3141 parity with plan path)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod saved_plan_version_tests {
+    //! carina#3248: saved plans now persist `virtual_resources` and
+    //! `data_sources` (version `4`). Older plans (version `3` and
+    //! below) are rejected outright per the repo's
+    //! no-backward-compat policy — re-running `carina plan` is the
+    //! supported migration path.
+
+    use tempfile::TempDir;
+
+    /// A `version: 3` saved plan must be rejected by
+    /// `run_apply_from_plan` with a message that names the expected
+    /// version and points the user at re-running `plan`.
+    ///
+    /// The test writes a minimal v3-shaped JSON to disk and asserts
+    /// the rejection. The plan body is deliberately tiny — the
+    /// version gate runs first, before any field is consumed, so a
+    /// stub `effects: []` / `sorted_resources: []` is enough.
+    #[tokio::test]
+    async fn version_3_saved_plan_is_rejected() {
+        let dir = TempDir::new().expect("tempdir");
+        let plan_path = dir.path().join("plan.json");
+        // A v3 plan: everything required by the pre-#3248 PlanFile
+        // shape, no `virtual_resources` field.
+        let v3 = serde_json::json!({
+            "version": 3,
+            "carina_version": "0.4.0",
+            "timestamp": "2026-05-24T00:00:00Z",
+            "source_path": "test.crn",
+            "state_lineage": null,
+            "state_serial": null,
+            "provider_configs": [],
+            "backend_config": null,
+            "plan": { "effects": [] },
+            "sorted_resources": [],
+            "current_states": [],
+            "upstream_snapshot": {},
+            "upstream_sources": [],
+            "wait_bindings": [],
+        });
+        std::fs::write(&plan_path, serde_json::to_string(&v3).unwrap()).expect("write plan");
+
+        let result = crate::commands::apply::run_apply_from_plan(&plan_path, true, false).await;
+
+        let err = result.expect_err("v3 saved plan must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Unsupported plan file version: 3"),
+            "error must name the rejected version, got: {msg}",
+        );
+        assert!(
+            msg.contains("expected 4"),
+            "error must name the expected version, got: {msg}",
+        );
+        assert!(
+            msg.contains("Re-run 'carina plan'"),
+            "error must point the user at the supported migration path, got: {msg}",
         );
     }
 }

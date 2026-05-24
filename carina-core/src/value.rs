@@ -754,6 +754,33 @@ pub fn redact_secrets_in_data_source(
     })
 }
 
+/// Redact all secrets in a
+/// [`VirtualResource`](crate::resource::VirtualResource) (carina#3248).
+///
+/// Virtuals are now persisted in saved plan files (`PlanFile`
+/// version `4`) so the saved-plan apply path can rebuild the same
+/// `ResolvedBindings` view as the live-apply path (carina#3246). A
+/// virtual's attribute map can hold values copied through from an
+/// inner module's `attributes { ... }` block — including literal
+/// secrets — so it must pass through the same per-kind redaction as
+/// managed resources / data sources / state before serialization.
+/// The `IndexMap<String, Value>` shape (vs `HashMap` for managed
+/// resources) is preserved so the user-authored attribute order
+/// survives redaction.
+pub fn redact_secrets_in_virtual(
+    resource: &crate::resource::VirtualResource,
+) -> Result<crate::resource::VirtualResource, SerializationError> {
+    let attributes: Result<indexmap::IndexMap<String, Value>, _> = resource
+        .attributes
+        .iter()
+        .map(|(k, e)| redact_secrets_in_value(e).map(|rv| (k.clone(), rv)))
+        .collect();
+    Ok(crate::resource::VirtualResource {
+        attributes: attributes?,
+        ..resource.clone()
+    })
+}
+
 /// Redact all secrets in a `State`, returning a new State with secrets replaced by hashes.
 pub fn redact_secrets_in_state(
     state: &crate::resource::State,
@@ -2328,6 +2355,68 @@ mod tests {
             "Serialized output must not contain plaintext secret, got: {}",
             json
         );
+    }
+
+    #[test]
+    fn test_redact_secrets_in_virtual_redacts_attribute_secrets() {
+        // carina#3248: virtuals are now persisted in saved plans, so
+        // a literal secret authored inside a module's `attributes { ... }`
+        // block (which lands as a `Value::Secret` in the virtual's
+        // attribute map) must be redacted before serialization, the
+        // same way managed-resource attributes are redacted.
+        use crate::resource::{ResourceId, VirtualResource};
+        use std::collections::{BTreeSet, HashSet};
+        let mut attrs = indexmap::IndexMap::new();
+        attrs.insert(
+            "non_secret".to_string(),
+            Value::Concrete(ConcreteValue::String("kept".to_string())),
+        );
+        attrs.insert(
+            "secret_field".to_string(),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("plaintext-must-not-leak".to_string()),
+            )))),
+        );
+        let virt = VirtualResource {
+            id: ResourceId::new("_virtual", "module_instance"),
+            attributes: attrs,
+            binding: Some("module_instance".to_string()),
+            dependency_bindings: BTreeSet::new(),
+            module_name: "m".to_string(),
+            instance: "module_instance".to_string(),
+            quoted_string_attrs: HashSet::new(),
+        };
+
+        let redacted = redact_secrets_in_virtual(&virt).expect("redact virtual");
+
+        // The non-secret attribute survives verbatim.
+        assert_eq!(
+            redacted.attributes.get("non_secret"),
+            Some(&Value::Concrete(ConcreteValue::String("kept".to_string()))),
+        );
+
+        // The secret attribute is replaced with the hash prefix, not the
+        // plaintext.
+        match redacted.attributes.get("secret_field") {
+            Some(Value::Concrete(ConcreteValue::String(s))) => {
+                assert!(
+                    s.starts_with(SECRET_PREFIX),
+                    "expected redacted hash prefix, got: {}",
+                    s
+                );
+                assert!(
+                    !s.contains("plaintext-must-not-leak"),
+                    "redacted form must not leak plaintext, got: {}",
+                    s
+                );
+            }
+            other => panic!("expected redacted secret, got: {:?}", other),
+        }
+
+        // The rest of the VirtualResource (id, binding, etc.) is
+        // preserved verbatim.
+        assert_eq!(redacted.binding.as_deref(), Some("module_instance"));
+        assert_eq!(redacted.id.resource_type, "_virtual");
     }
 
     #[test]
