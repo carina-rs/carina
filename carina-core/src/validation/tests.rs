@@ -2837,3 +2837,207 @@ fn ref_with_chained_field_on_struct_flags_unknown_field() {
         "known fields list must enumerate all siblings, got: {err}",
     );
 }
+
+type ValidateConfigCallLog = std::sync::Arc<std::sync::Mutex<Vec<IndexMap<String, Value>>>>;
+
+/// Test-only factory that records every call to `validate_config` so a
+/// test can assert what attributes did or didn't cross the WASM-equivalent
+/// boundary. carina#3182.
+struct RecordingFactory {
+    name: String,
+    seen: ValidateConfigCallLog,
+}
+
+impl RecordingFactory {
+    fn new(name: &str) -> (Self, ValidateConfigCallLog) {
+        let seen: ValidateConfigCallLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let f = Self {
+            name: name.to_string(),
+            seen: std::sync::Arc::clone(&seen),
+        };
+        (f, seen)
+    }
+}
+
+impl crate::provider::ProviderFactory for RecordingFactory {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn display_name(&self) -> &str {
+        &self.name
+    }
+
+    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+        HashMap::new()
+    }
+
+    fn validate_config(&self, attributes: &IndexMap<String, Value>) -> Result<(), String> {
+        self.seen.lock().unwrap().push(attributes.clone());
+        Ok(())
+    }
+
+    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+        String::new()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _attributes: &IndexMap<String, Value>,
+    ) -> futures::future::BoxFuture<
+        '_,
+        crate::provider::ProviderResult<Box<dyn crate::provider::Provider>>,
+    > {
+        unimplemented!("RecordingFactory::create_provider is not used in these tests")
+    }
+
+    fn schemas(&self) -> Vec<crate::schema::ResourceSchema> {
+        Vec::new()
+    }
+}
+
+#[test]
+fn validate_provider_config_skips_attributes_with_deferred_refs() {
+    // carina#3182: an attribute carrying an unresolved ref (e.g.
+    // `assume_role = { role_arn = upstream.arn }` before
+    // `load_upstream_states` has resolved it) must be dropped before
+    // the plugin-side `validate_config` runs, so the WASM serializer
+    // never sees the deferred value. Concrete sibling attributes
+    // (`region`) must still reach the plugin.
+    use crate::parser::ProviderConfig;
+    use crate::resource::{AccessPath, DeferredValue};
+
+    let role_arn = Value::Deferred(DeferredValue::ResourceRef {
+        path: AccessPath::new("mgmt", "role_arn"),
+    });
+    let mut assume_inner: IndexMap<String, Value> = IndexMap::new();
+    assume_inner.insert("role_arn".to_string(), role_arn);
+    assume_inner.insert(
+        "session_name".to_string(),
+        Value::Concrete(ConcreteValue::String("sess".to_string())),
+    );
+
+    let mut attrs: IndexMap<String, Value> = IndexMap::new();
+    attrs.insert(
+        "region".to_string(),
+        Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
+    );
+    attrs.insert(
+        "assume_role".to_string(),
+        Value::Concrete(ConcreteValue::Map(assume_inner)),
+    );
+
+    let pc = ProviderConfig {
+        name: "aws".to_string(),
+        attributes: attrs,
+        default_tags: IndexMap::new(),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
+    };
+    let mut parsed = empty_parsed();
+    parsed.providers.push(pc);
+
+    let (factory, seen_handle) = RecordingFactory::new("aws");
+    let factories: Vec<Box<dyn crate::provider::ProviderFactory>> = vec![Box::new(factory)];
+
+    validate_provider_config(&parsed, &factories).expect("validate must not error");
+
+    let seen = seen_handle
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("validate_config must have been called once");
+    assert!(
+        seen.contains_key("region"),
+        "literal attribute must reach validate_config; got: {seen:?}",
+    );
+    assert!(
+        !seen.contains_key("assume_role"),
+        "attribute containing a deferred ref must be filtered out; got: {seen:?}",
+    );
+}
+
+#[test]
+fn value_contains_unresolved_ref_detects_nested_resource_ref() {
+    // carina#3182: a `ResourceRef` nested inside a Map (the
+    // `assume_role = { role_arn = upstream.arn }` shape) must be
+    // detected so the validate path drops that attribute from the
+    // WASM `validate_config` payload.
+    use crate::resource::{AccessPath, DeferredValue};
+
+    let role_arn = Value::Deferred(DeferredValue::ResourceRef {
+        path: AccessPath::new("mgmt", "role_arn"),
+    });
+    let mut inner: IndexMap<String, Value> = IndexMap::new();
+    inner.insert("role_arn".to_string(), role_arn);
+    inner.insert(
+        "session_name".to_string(),
+        Value::Concrete(ConcreteValue::String("sess".to_string())),
+    );
+    let assume_role = Value::Concrete(ConcreteValue::Map(inner));
+
+    assert!(
+        value_contains_unresolved_ref(&assume_role),
+        "nested ResourceRef inside a Map must be detected",
+    );
+}
+
+#[test]
+fn value_contains_unresolved_ref_false_for_pure_literal() {
+    let mut m: IndexMap<String, Value> = IndexMap::new();
+    m.insert(
+        "region".to_string(),
+        Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
+    );
+    let v = Value::Concrete(ConcreteValue::Map(m));
+
+    assert!(
+        !value_contains_unresolved_ref(&v),
+        "fully-literal value must not be flagged",
+    );
+}
+
+#[test]
+fn value_contains_unresolved_ref_detects_list_element() {
+    use crate::resource::{AccessPath, DeferredValue};
+
+    let v = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::String("ok".to_string())),
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new("x", "y"),
+        }),
+    ]));
+    assert!(
+        value_contains_unresolved_ref(&v),
+        "ResourceRef inside a List element must be detected",
+    );
+}
+
+#[test]
+fn value_contains_unresolved_ref_unwraps_secret() {
+    use crate::resource::{AccessPath, DeferredValue};
+
+    let secret_with_ref = Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
+        DeferredValue::ResourceRef {
+            path: AccessPath::new("vault", "token"),
+        },
+    ))));
+    assert!(
+        value_contains_unresolved_ref(&secret_with_ref),
+        "Secret(ResourceRef) must propagate the unresolved signal",
+    );
+
+    let secret_literal = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String("plaintext".to_string()),
+    ))));
+    assert!(
+        !value_contains_unresolved_ref(&secret_literal),
+        "Secret(literal) must not be flagged",
+    );
+}

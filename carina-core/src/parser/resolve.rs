@@ -774,6 +774,52 @@ pub fn resolve_provider_unresolved_attributes<E>(
     Ok(())
 }
 
+/// Resolve `ResourceRef` values inside provider blocks' `attributes`
+/// against a binding map built from `parsed`'s resources and `remote_bindings`
+/// (the values fetched by `load_upstream_states` at plan/apply time).
+///
+/// This is the plan/apply-time counterpart to
+/// [`resolve_provider_unresolved_attributes`], which only touches the
+/// parse-time `unresolved_attributes` bucket (default_tags etc.). The
+/// regular `provider.attributes` map can contain refs nested inside
+/// struct literals — `assume_role = { role_arn = upstream.arn }` is the
+/// motivating case (carina#3182) — and those refs need to be substituted
+/// before the attributes cross the WASM provider boundary in
+/// `create_provider`.
+///
+/// Refs whose binding is unknown (neither a top-level resource nor an
+/// upstream binding) are left in place so the caller can decide whether
+/// that is a fatal error or expected (validate path tolerates it; the
+/// post-resolution WASM boundary rejects it on plan/apply).
+pub fn resolve_provider_attributes_with_remote<E>(
+    parsed: &mut super::File<E>,
+    remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    config: &ProviderContext,
+) -> Result<(), ParseError> {
+    let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+    for rref in parsed.iter_top_level_resources() {
+        if let Some(binding_name) = rref.binding() {
+            binding_map.insert(binding_name.to_string(), rref.resolved_attributes());
+        }
+    }
+    for (binding, attrs) in remote_bindings {
+        binding_map.insert(binding.clone(), attrs.clone());
+    }
+
+    let mut fn_ctx = super::ParseContext::new(config);
+    fn_ctx.user_functions = parsed.user_functions.clone();
+
+    for provider in &mut parsed.providers {
+        let mut resolved: IndexMap<String, Value> = IndexMap::new();
+        for (key, expr) in &provider.attributes {
+            let r = resolve_value_with_config(expr, &binding_map, &fn_ctx)?;
+            resolved.insert(key.clone(), r);
+        }
+        provider.attributes = resolved;
+    }
+    Ok(())
+}
+
 /// Drain `ProviderConfig.unresolved_attributes` and promote resolved
 /// well-known attributes into their typed fields. Run **after**
 /// [`resolve_resource_refs`] (and, for module-call deferrals,

@@ -791,11 +791,12 @@ async fn run_apply_locked(
     }
     apply_name_overrides(&mut parsed.resources, &state_file);
 
-    // Select appropriate Provider based on configuration
-    let provider = get_provider_with_ctx(ctx, parsed, base_dir).await?;
-
     // Upstream state bindings are loaded up front so refs that target
-    // `upstream_state` blocks can be resolved during refresh (#1683).
+    // `upstream_state` blocks can be resolved during refresh (#1683) and
+    // so that provider configuration refs (`assume_role.role_arn =
+    // upstream.arn`) can be substituted before `create_provider` crosses
+    // the WASM boundary (carina#3182). Order matters: load upstream
+    // first, then resolve, then build the provider.
     let mut cycle_guard = super::plan::seed_cycle_guard(base_dir);
     let remote_bindings = super::plan::load_upstream_states(
         &parsed.upstream_states,
@@ -805,6 +806,18 @@ async fn run_apply_locked(
         super::plan::UpstreamMissingStatePolicy::Strict,
     )
     .await?;
+
+    // carina#3182: substitute upstream/binding refs inside
+    // `provider.attributes` before they reach `create_provider`.
+    carina_core::parser::resolve_provider_attributes_with_remote(
+        parsed,
+        &remote_bindings,
+        provider_context,
+    )
+    .map_err(|e| AppError::Config(format!("Provider attribute resolution error: {}", e)))?;
+
+    // Select appropriate Provider based on configuration
+    let provider = get_provider_with_ctx(ctx, parsed, base_dir).await?;
 
     // carina#3132: `sorted_resources` is `mut` because deferred-for
     // expansion now runs post-refresh (after phase-2, below) via the
