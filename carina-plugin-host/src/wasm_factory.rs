@@ -845,6 +845,10 @@ const WASM_ENV_ALLOWLIST: &[&str] = &[
     "AWS_CONTAINER_CREDENTIALS_FULL_URI",
     "HOME",
     "RUST_LOG",
+    // When set to "1", the WASM-side wasi:http bridge in carina-plugin-sdk
+    // emits a per-phase wall-clock breakdown of each request to stderr.
+    // Off by default; intended for diagnosing transport-level latency.
+    "CARINA_WASI_HTTP_TRACE",
 ];
 
 /// Build a WASI context that only exposes allowlisted environment variables.
@@ -1972,6 +1976,7 @@ mod tests {
         assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_CONTAINER_CREDENTIALS_FULL_URI"));
         assert!(WASM_ENV_ALLOWLIST.contains(&"HOME"));
         assert!(WASM_ENV_ALLOWLIST.contains(&"RUST_LOG"));
+        assert!(WASM_ENV_ALLOWLIST.contains(&"CARINA_WASI_HTTP_TRACE"));
     }
 
     #[test]
