@@ -2671,6 +2671,117 @@ fn finalize_provider_configs_rejects_non_map_default_tags() {
 }
 
 #[test]
+fn resolve_provider_attributes_with_remote_substitutes_upstream_refs() {
+    // carina#3182: a ResourceRef nested inside provider attributes
+    // (e.g. `assume_role = { role_arn = upstream.arn }`) must be
+    // substituted from `remote_bindings` before the attributes cross
+    // the WASM provider boundary.
+    use crate::parser::resolve_provider_attributes_with_remote;
+
+    let input = r#"
+        let mgmt = upstream_state { source = "../mgmt" }
+
+        provider aws {
+          source = "github.com/carina-rs/carina-provider-aws"
+          revision = "main"
+          region = "ap-northeast-1"
+          assume_role = {
+            role_arn = mgmt.role_arn
+            session_name = "downstream"
+          }
+        }
+    "#;
+
+    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+
+    // Pre-check: the ref survives parsing nested inside the assume_role map.
+    let pre = parsed.providers[0].attributes.get("assume_role").unwrap();
+    match pre {
+        Value::Concrete(ConcreteValue::Map(m)) => match m.get("role_arn").unwrap() {
+            Value::Deferred(DeferredValue::ResourceRef { path }) => {
+                assert_eq!(path.binding(), "mgmt");
+                assert_eq!(path.attribute(), "role_arn");
+            }
+            other => panic!("expected ResourceRef pre-resolve, got: {other:?}"),
+        },
+        other => panic!("expected Map for assume_role, got: {other:?}"),
+    }
+
+    // Build a `remote_bindings` shape mirroring what `load_upstream_states`
+    // produces at plan/apply time.
+    let mut mgmt_attrs: HashMap<String, Value> = HashMap::new();
+    mgmt_attrs.insert(
+        "role_arn".to_string(),
+        Value::Concrete(ConcreteValue::String(
+            "arn:aws:iam::123456789012:role/writer".to_string(),
+        )),
+    );
+    let mut remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
+    remote.insert("mgmt".to_string(), mgmt_attrs);
+
+    resolve_provider_attributes_with_remote(&mut parsed, &remote, &ProviderContext::default())
+        .expect("resolve must succeed");
+
+    let assume_role = parsed.providers[0].attributes.get("assume_role").unwrap();
+    let Value::Concrete(ConcreteValue::Map(m)) = assume_role else {
+        panic!("expected Map for assume_role post-resolve, got: {assume_role:?}");
+    };
+    assert_eq!(
+        m.get("role_arn"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "arn:aws:iam::123456789012:role/writer".to_string()
+        ))),
+        "role_arn must be substituted from remote_bindings; got: {m:?}",
+    );
+    assert_eq!(
+        m.get("session_name"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "downstream".to_string()
+        ))),
+        "literal sibling must be preserved",
+    );
+}
+
+#[test]
+fn resolve_provider_attributes_with_remote_leaves_unknown_refs_alone() {
+    // When `remote_bindings` does not name the binding referenced from
+    // provider attributes, the ref must be left in place (the caller —
+    // validate vs plan/apply — decides whether to error). The resolver
+    // itself must not panic or invent a value.
+    use crate::parser::resolve_provider_attributes_with_remote;
+
+    let input = r#"
+        let mgmt = upstream_state { source = "../mgmt" }
+
+        provider aws {
+          source = "github.com/carina-rs/carina-provider-aws"
+          revision = "main"
+          region = "ap-northeast-1"
+          assume_role = {
+            role_arn = mgmt.role_arn
+          }
+        }
+    "#;
+
+    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let empty: HashMap<String, HashMap<String, Value>> = HashMap::new();
+
+    resolve_provider_attributes_with_remote(&mut parsed, &empty, &ProviderContext::default())
+        .expect("resolve must not error on missing binding");
+
+    let assume_role = parsed.providers[0].attributes.get("assume_role").unwrap();
+    let Value::Concrete(ConcreteValue::Map(m)) = assume_role else {
+        panic!("expected Map for assume_role, got: {assume_role:?}");
+    };
+    match m.get("role_arn").unwrap() {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+            assert_eq!(path.binding(), "mgmt");
+        }
+        other => panic!("expected ResourceRef preserved, got: {other:?}"),
+    }
+}
+
+#[test]
 fn provider_config_carries_unresolved_attributes_field() {
     use crate::parser::ast::ProviderConfig;
     use indexmap::IndexMap;

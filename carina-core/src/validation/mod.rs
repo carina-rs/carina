@@ -685,6 +685,30 @@ pub fn validate_no_provider_in_module<E>(parsed: &crate::parser::File<E>) -> Res
     Ok(())
 }
 
+/// Returns `true` if `value` contains any deferred sub-value that the
+/// WASM provider boundary would reject (ResourceRef, BindingRef,
+/// Interpolation, FunctionCall, Unknown). Used by
+/// [`validate_provider_config`] to skip the plugin-side `validate_config`
+/// call for attributes whose refs cannot be substituted at validate
+/// time. `Secret` is transparent — its inner value is unwrapped because
+/// the secret wrapper survives WASM serialization but the inner value
+/// must still be checked. carina#3182.
+pub(crate) fn value_contains_unresolved_ref(value: &Value) -> bool {
+    match value {
+        Value::Deferred(DeferredValue::ResourceRef { .. })
+        | Value::Deferred(DeferredValue::BindingRef { .. })
+        | Value::Deferred(DeferredValue::Interpolation(_))
+        | Value::Deferred(DeferredValue::FunctionCall { .. })
+        | Value::Deferred(DeferredValue::Unknown(_)) => true,
+        Value::Deferred(DeferredValue::Secret(inner)) => value_contains_unresolved_ref(inner),
+        Value::Concrete(ConcreteValue::List(items)) => {
+            items.iter().any(value_contains_unresolved_ref)
+        }
+        Value::Concrete(ConcreteValue::Map(map)) => map.values().any(value_contains_unresolved_ref),
+        Value::Concrete(_) => false,
+    }
+}
+
 /// Validate provider configuration attributes.
 ///
 /// Runs host-side type-level validation using
@@ -693,6 +717,17 @@ pub fn validate_no_provider_in_module<E>(parsed: &crate::parser::File<E>) -> Res
 /// provider-specific semantic checks. Keeping format validation
 /// (namespace structure, enum membership) on the host side means fixes
 /// in `carina-core` take effect without rebuilding provider binaries.
+///
+/// Attributes containing unresolved references (e.g.
+/// `assume_role = { role_arn = upstream.arn }` at validate time, before
+/// plan/apply has fetched upstream state) are passed through host-side
+/// type validation — `AttributeType::validate` is deferred-aware and
+/// no-ops on `Value::Deferred` — but **excluded from the plugin-side
+/// `validate_config` call**, because the WASM serializer rejects
+/// deferred values. The same `validate_config` runs again at plan/apply
+/// time once the refs have been substituted by
+/// [`resolve_provider_attributes_with_remote`], so no plugin-side check
+/// is permanently lost. carina#3182.
 pub fn validate_provider_config<E>(
     parsed: &crate::parser::File<E>,
     factories: &[Box<dyn ProviderFactory>],
@@ -710,9 +745,17 @@ pub fn validate_provider_config<E>(
                     .map_err(|e| format!("provider {}: {}: {}", provider.name, attr_name, e))?;
             }
         }
-        // Provider-specific validation.
+        // Plugin-side validation. Drop attributes containing unresolved
+        // refs before crossing the WASM boundary; they will be checked
+        // again at plan/apply time post-resolution.
+        let serializable: IndexMap<String, Value> = provider
+            .attributes
+            .iter()
+            .filter(|(_, value)| !value_contains_unresolved_ref(value))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         factory
-            .validate_config(&provider.attributes)
+            .validate_config(&serializable)
             .map_err(|e| format!("provider {}: {}", provider.name, e))?;
     }
     Ok(())

@@ -467,6 +467,18 @@ pub async fn run_plan(
     )
     .await?;
 
+    // carina#3182: substitute `upstream.<attr>` and other binding refs
+    // inside `provider.attributes` (e.g. `assume_role.role_arn`) before
+    // the provider attributes cross the WASM boundary in
+    // `create_provider`. Parse leaves these refs in place; only here
+    // (post-`load_upstream_states`) do we have the upstream values.
+    carina_core::parser::resolve_provider_attributes_with_remote(
+        &mut parsed,
+        &remote_bindings,
+        provider_context,
+    )
+    .map_err(|e| AppError::Config(format!("Provider attribute resolution error: {}", e)))?;
+
     // carina#3132: deferred-for expansion runs inside
     // `create_plan_from_parsed_with_upstream` (post-refresh), which also
     // prints post-expansion warnings and returns the still-unresolved
