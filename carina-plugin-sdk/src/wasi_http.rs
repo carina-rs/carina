@@ -8,7 +8,8 @@
 //! This module is only compiled for `target_arch = "wasm32"`.
 
 use std::fmt;
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use aws_smithy_runtime_api::client::http::{
     HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings, SharedHttpClient,
@@ -25,6 +26,22 @@ use wasi::http::types::{
     Fields, IncomingBody, Method, OutgoingBody, OutgoingRequest, RequestOptions, Scheme,
 };
 use wasi::io::streams::StreamError;
+
+/// When `CARINA_WASI_HTTP_TRACE=1` is set in the host environment, emit a
+/// per-phase wall-clock breakdown of each request to stderr.
+///
+/// The env var is read once on first use and cached; flipping it
+/// mid-process has no effect. Off by default — the gate is a single atomic
+/// load per phase when disabled, so leaving the instrumentation in place
+/// costs essentially nothing.
+fn trace_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("CARINA_WASI_HTTP_TRACE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
 
 /// An HTTP client that uses wasi:http/outgoing-handler for making requests.
 ///
@@ -121,6 +138,19 @@ fn make_request(
     request: HttpRequest,
     options: Option<RequestOptions>,
 ) -> Result<Response<SdkBody>, ConnectorError> {
+    let trace = trace_enabled();
+    let req_start = if trace { Some(Instant::now()) } else { None };
+    let trace_method = if trace {
+        request.method().to_string()
+    } else {
+        String::new()
+    };
+    let trace_uri = if trace {
+        request.uri().to_string()
+    } else {
+        String::new()
+    };
+
     // Parse the URI
     let uri = request.uri().to_string();
     let parsed = uri
@@ -183,29 +213,37 @@ fn make_request(
         .set_path_with_query(Some(&path_and_query))
         .map_err(|()| ConnectorError::other("Failed to set path".into(), None))?;
 
+    let t_setup_done = req_start.map(|s| s.elapsed());
+
     // Write the request body
     let body_bytes = request.body().bytes().unwrap_or(&[]).to_vec();
+    let body_len = body_bytes.len();
     let outgoing_body = outgoing_req
         .body()
         .map_err(|()| ConnectorError::other("Failed to get outgoing body".into(), None))?;
     write_body(&outgoing_body, &body_bytes)?;
+    let t_write_body_done = req_start.map(|s| s.elapsed());
     OutgoingBody::finish(outgoing_body, None)
         .map_err(|e| ConnectorError::other(format!("Failed to finish body: {e:?}").into(), None))?;
+    let t_body_finish_done = req_start.map(|s| s.elapsed());
 
     // Send the request (with timeout options if provided)
     let future_response = outgoing_handler::handle(outgoing_req, options).map_err(|e| {
         ConnectorError::other(format!("outgoing-handler error: {e:?}").into(), None)
     })?;
+    let t_handle_done = req_start.map(|s| s.elapsed());
 
     // Wait for the response by polling
     let pollable = future_response.subscribe();
     pollable.block();
+    let t_pollable_block_done = req_start.map(|s| s.elapsed());
 
     let response = future_response
         .get()
         .ok_or_else(|| ConnectorError::other("Response not ready after block".into(), None))?
         .map_err(|()| ConnectorError::other("Response already taken".into(), None))?
         .map_err(|e| ConnectorError::other(format!("HTTP error: {e:?}").into(), None))?;
+    let t_get_response_done = req_start.map(|s| s.elapsed());
 
     // Read response status
     let status = response.status();
@@ -225,6 +263,33 @@ fn make_request(
         .map_err(|()| ConnectorError::other("Failed to consume response body".into(), None))?;
     let response_bytes = read_body(&incoming_body)?;
     let _trailers = IncomingBody::finish(incoming_body);
+    let t_read_body_done = req_start.map(|s| s.elapsed());
+
+    if trace {
+        // Emit a single-line breakdown so it can be greped from log files.
+        // Cumulative milliseconds since make_request entry, one column per phase.
+        // Phases that should be ~instant on the WASM side (everything except
+        // pollable.block) are the ones that flag a host-side stall when they
+        // grow.
+        let ms = |d: Option<Duration>| d.map(|x| x.as_millis()).unwrap_or(0);
+        eprintln!(
+            "carina-wasi-http-trace method={} uri={} status={} body_in={} body_out={} \
+             setup_ms={} write_body_ms={} body_finish_ms={} handle_ms={} \
+             pollable_block_ms={} get_response_ms={} read_body_ms={}",
+            trace_method,
+            trace_uri,
+            u16::from(status),
+            body_len,
+            response_bytes.len(),
+            ms(t_setup_done),
+            ms(t_write_body_done),
+            ms(t_body_finish_done),
+            ms(t_handle_done),
+            ms(t_pollable_block_done),
+            ms(t_get_response_done),
+            ms(t_read_body_done),
+        );
+    }
 
     // Build the AWS SDK Response
     let mut sdk_response = Response::new(
