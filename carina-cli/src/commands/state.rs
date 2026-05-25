@@ -23,7 +23,8 @@ use crate::commands::shared::state_writeback::apply_name_overrides;
 use crate::error::AppError;
 use crate::wiring::{
     WiringContext, build_factories_from_providers, get_provider_with_ctx,
-    reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
+    read_data_source_with_retry, reconcile_anonymous_identifiers_with_ctx,
+    reconcile_prefixed_names, resolve_data_source_refs_for_refresh,
 };
 
 /// Convert a lock acquisition error into an `AppError`.
@@ -729,6 +730,41 @@ pub(crate) async fn run_state_refresh_locked(
         current_states.insert(id.clone(), fresh_state);
     }
 
+    // carina#3271: re-read every `read aws.*` data source. Without
+    // this, `current_states` has no entry for any data source and
+    // the downstream `resolve_exports` (after #3266) cannot resolve
+    // `<data_source>.<attr>` references in `exports {}`, so
+    // `state.exports` keeps the pre-refresh literal for any export
+    // whose value depends on a data source.
+    //
+    // Mirrors the data-source phase of `run_apply_locked`
+    // (`resolve_data_source_refs_for_refresh` + `read_data_source_with_retry`):
+    // resolve input attribute `ResourceRef`s against the
+    // already-refreshed managed `current_states`, then read each
+    // data source through the provider.
+    if !parsed.data_sources.is_empty() {
+        let wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
+            .wait_bindings
+            .iter()
+            .map(carina_core::binding_index::WaitAliasSpec::from)
+            .collect();
+        let resolved_data_sources = resolve_data_source_refs_for_refresh(
+            &sorted_resources,
+            &parsed.virtual_resources,
+            &parsed.data_sources,
+            &current_states,
+            &HashMap::new(),
+            ctx.schemas(),
+            &wait_aliases,
+        )?;
+        for resource in &resolved_data_sources {
+            let fresh_state = read_data_source_with_retry(&provider, resource)
+                .await
+                .map_err(AppError::Provider)?;
+            current_states.insert(resource.id.clone(), fresh_state);
+        }
+    }
+
     // Restore unreturned attributes from state file (CloudControl doesn't always return them)
     let mut saved_attrs = state_file
         .as_ref()
@@ -805,14 +841,18 @@ pub(crate) async fn run_state_refresh_locked(
         // so `parsed.virtual_resources` still carry the authored
         // `ResourceRef` snapshots that `resolve_exports`'s post-apply
         // re-resolution needs (#3169 / #3177).
+        let post_apply_states =
+            crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
+                &current_states,
+                &state,
+            );
         state.exports = crate::commands::shared::state_writeback::resolve_exports(
             &parsed.export_params,
             &sorted_resources,
             &parsed.data_sources,
             &parsed.virtual_resources,
-            &state,
+            &post_apply_states,
             &wait_aliases,
-            &current_states,
         )?;
     }
 

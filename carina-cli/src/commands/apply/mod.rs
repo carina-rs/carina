@@ -34,8 +34,8 @@ use crate::commands::shared::progress::{
     RefreshProgress, emit_newline_on_interrupt, refresh_multi_progress,
 };
 use crate::commands::shared::state_writeback::{
-    ApplyStateSave, FinalizeApplyInput, apply_name_overrides, build_state_after_apply,
-    resolve_exports,
+    ApplyStateSave, FinalizeApplyInput, PostApplyStates, apply_name_overrides,
+    build_state_after_apply, resolve_exports,
 };
 use crate::commands::state::map_lock_error;
 use crate::cursor::CursorReveal;
@@ -301,14 +301,15 @@ pub(crate) async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), 
     // no source-side view of which exports the user intends — see the
     // `FinalizeApplyInput::export_params` doc-comment.
     if let Some(params) = input.export_params {
+        let post_apply_states =
+            PostApplyStates::from_current_and_state(input.current_states, &state);
         state.exports = resolve_exports(
             params,
             input.sorted_resources,
             input.data_sources,
             input.pre_resolve_virtuals,
-            &state,
+            &post_apply_states,
             input.wait_aliases,
-            input.current_states,
         )?;
     }
 
@@ -373,14 +374,14 @@ pub(crate) async fn persist_exports_only(
     current_states: &HashMap<ResourceId, carina_core::resource::State>,
 ) -> Result<(), AppError> {
     let mut state = state_file.unwrap_or_default();
+    let post_apply_states = PostApplyStates::from_current_and_state(current_states, &state);
     let exports = resolve_exports(
         export_params,
         sorted_resources,
         data_sources,
         pre_resolve_virtuals,
-        &state,
+        &post_apply_states,
         wait_aliases,
-        current_states,
     )?;
     state.exports = exports;
     if let Some(lk) = lock {

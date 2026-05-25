@@ -61,6 +61,79 @@ pub(crate) fn queue_state_refresh(
     }
 }
 
+/// Resource attribute map ready for export-resolution after an apply
+/// or state-refresh.
+///
+/// Pinning the merge rule in a type closes a class of bug that
+/// recurred between #3266 and #3271. Two facts about the inputs:
+///
+/// 1. `state.resources` carries only **managed** resources — data
+///    sources are read each run and discarded at writeback, so
+///    consulting `state.resources` alone leaves any
+///    `<data_source>.<attr>` reference in `exports {}` unresolved
+///    (carina#3266, carina#3271).
+/// 2. `current_states` holds the live execution view — every
+///    resource read this run, including data sources. For managed
+///    resources it may still carry the **pre-apply** snapshot
+///    (whatever the executor read at refresh time, before the apply
+///    mutation ran), so the post-apply attribute values in
+///    `state.resources` must win on key collision.
+///
+/// The single correct merge is therefore: seed from
+/// `current_states.clone()` (so data sources survive), then overlay
+/// entries derived from `state.resources` (so managed
+/// post-apply values win). Earlier ad-hoc call sites that built
+/// `current_states` HashMaps by hand re-introduced the bug each
+/// time they forgot one half of the merge; this newtype forces the
+/// merge to happen exactly once, in
+/// [`PostApplyStates::from_current_and_state`].
+#[derive(Debug, Clone)]
+pub(crate) struct PostApplyStates {
+    map: HashMap<ResourceId, carina_core::resource::State>,
+}
+
+impl PostApplyStates {
+    /// Build the post-apply view from the live execution `current_states`
+    /// (with data-source read results) and the `StateFile` whose
+    /// `state.resources` was just rewritten by the apply writeback.
+    ///
+    /// State-derived managed entries win on key collision (see the
+    /// type-level doc-comment for why).
+    pub(crate) fn from_current_and_state(
+        current_states: &HashMap<ResourceId, carina_core::resource::State>,
+        state: &StateFile,
+    ) -> Self {
+        let mut map = current_states.clone();
+        for rs in &state.resources {
+            let id = ResourceId::with_provider(
+                &rs.provider,
+                &rs.resource_type,
+                &rs.name,
+                rs.directives.provider_instance.clone(),
+            );
+            let attrs: HashMap<String, carina_core::resource::Value> = rs
+                .attributes
+                .iter()
+                .filter_map(|(k, v)| {
+                    carina_core::value::json_to_dsl_value(v).map(|val| (k.clone(), val))
+                })
+                .collect();
+            map.insert(
+                id.clone(),
+                carina_core::resource::State::existing(id, attrs),
+            );
+        }
+        Self { map }
+    }
+
+    /// Borrow the underlying map for callers that need to feed it
+    /// into a `PreApplyInputs.current_states` slot. Read-only — the
+    /// merge is finalized at construction time.
+    pub(crate) fn as_map(&self) -> &HashMap<ResourceId, carina_core::resource::State> {
+        &self.map
+    }
+}
+
 /// Input parameters for `finalize_apply`.
 ///
 /// Groups the execution result, resource data, and backend configuration
@@ -171,50 +244,17 @@ pub(crate) fn resolve_exports(
     sorted_resources: &[ManagedResource],
     data_sources: &[carina_core::resource::DataSource],
     pre_resolve_virtuals: &[carina_core::resource::VirtualResource],
-    state: &StateFile,
+    post_apply_states: &PostApplyStates,
     wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
-    current_states: &HashMap<ResourceId, carina_core::resource::State>,
 ) -> Result<HashMap<String, serde_json::Value>, AppError> {
     use carina_core::binding_index::ResolvedBindings;
     use carina_core::resolver::resolve_virtual_refs_post_apply;
-    use carina_core::resource::Value;
 
-    // Step 1: rebuild post-apply `current_states` from
-    // `state.resources` for managed resources, and layer in
-    // `current_states` for entries (notably data sources) that the
-    // writeback never persists.
-    //
-    // carina#3266: data sources are not written to `state.resources`,
-    // so an exports expression referencing `<data_source>.<attr>`
-    // would resolve against an empty data-source binding without the
-    // `current_states` layer. With it, `layer_data_source_bindings`
-    // (carina#3265) sees the provider-read attrs and the export
-    // resolves to the read result. State-derived managed entries
-    // win on key collision because they reflect the post-apply
-    // writeback, while `current_states` may still hold the
-    // pre-apply snapshot for any managed resource that was just
-    // applied.
-    let mut post_apply_states: HashMap<ResourceId, carina_core::resource::State> =
-        current_states.clone();
-    for rs in &state.resources {
-        let id = ResourceId::with_provider(
-            &rs.provider,
-            &rs.resource_type,
-            &rs.name,
-            rs.directives.provider_instance.clone(),
-        );
-        let attrs: HashMap<String, Value> = rs
-            .attributes
-            .iter()
-            .filter_map(|(k, v)| {
-                carina_core::value::json_to_dsl_value(v).map(|val| (k.clone(), val))
-            })
-            .collect();
-        post_apply_states.insert(
-            id.clone(),
-            carina_core::resource::State::existing(id, attrs),
-        );
-    }
+    // Step 1: the post-apply state view was assembled by
+    // [`PostApplyStates::from_current_and_state`] before this call.
+    // See that type's doc-comment for the merge rule that pins
+    // carina#3266 (data-source survives) and carina#3271 (state
+    // refresh path uses the same shape).
 
     // Virtuals: fresh clone of the **pre-resolve** snapshot. Their
     // attributes still carry `ResourceRef`s, so the post-apply
@@ -236,7 +276,7 @@ pub(crate) fn resolve_exports(
         managed: sorted_resources,
         virtuals: &[],
         data_sources,
-        current_states: &post_apply_states,
+        current_states: post_apply_states.as_map(),
         remote_bindings: &HashMap::new(),
         wait_aliases,
     });
@@ -634,6 +674,90 @@ pub(crate) fn build_orphan_resource(
         dependency_bindings: rs.dependency_bindings.clone(),
         module_source: None,
         quoted_string_attrs: std::collections::HashSet::new(),
+    }
+}
+
+#[cfg(test)]
+mod post_apply_states_tests {
+    use super::*;
+    use carina_core::resource::{ConcreteValue, ResourceId, State, Value};
+    use carina_state::StateFile;
+
+    /// Type-level contract pin for the carina#3266 + carina#3271 merge rule.
+    ///
+    /// `from_current_and_state` must:
+    /// 1. Keep entries that exist in `current_states` but **not** in
+    ///    `state.resources` — data sources land here (they are never
+    ///    persisted to `state.resources`).
+    /// 2. For entries present in **both** maps, pick the one
+    ///    derived from `state.resources` — that is the post-apply
+    ///    writeback value, while `current_states` may still hold
+    ///    the pre-apply snapshot.
+    #[test]
+    fn data_source_only_in_current_states_survives() {
+        let ds_id = ResourceId::with_provider("aws", "iam.Roles", "admin_access_roles", None);
+        let mut ds_attrs = HashMap::new();
+        ds_attrs.insert(
+            "arns".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("arn:aws:iam::1:role/x".to_string()),
+            )])),
+        );
+        let mut current_states = HashMap::new();
+        current_states.insert(
+            ds_id.clone(),
+            State::existing(ds_id.clone(), ds_attrs.clone()),
+        );
+
+        // state.resources has no entry for the data source — that is
+        // the production reality the bug springs from.
+        let state = StateFile::new();
+
+        let post = PostApplyStates::from_current_and_state(&current_states, &state);
+        let entry = post
+            .as_map()
+            .get(&ds_id)
+            .expect("data-source entry must survive merge");
+        assert_eq!(entry.attributes.get("arns"), ds_attrs.get("arns"));
+    }
+
+    #[test]
+    fn state_resources_entry_wins_over_current_states_on_collision() {
+        let id = ResourceId::with_provider("awscc", "s3.Bucket", "log", None);
+
+        // current_states carries the PRE-apply attribute value.
+        let mut pre_attrs = HashMap::new();
+        pre_attrs.insert(
+            "versioning".to_string(),
+            Value::Concrete(ConcreteValue::String("Suspended".to_string())),
+        );
+        let mut current_states = HashMap::new();
+        current_states.insert(id.clone(), State::existing(id.clone(), pre_attrs));
+
+        // state.resources carries the POST-apply value — this must win.
+        let json = serde_json::json!({
+            "version": 5,
+            "serial": 1,
+            "lineage": "test",
+            "carina_version": "0.4.0",
+            "resources": [
+                {
+                    "resource_type": "s3.Bucket",
+                    "name": "log",
+                    "identifier": "log-bucket",
+                    "provider": "awscc",
+                    "attributes": { "versioning": "Enabled" }
+                }
+            ]
+        });
+        let state: StateFile = serde_json::from_value(json).unwrap();
+
+        let post = PostApplyStates::from_current_and_state(&current_states, &state);
+        let entry = post.as_map().get(&id).expect("merged entry");
+        match entry.attributes.get("versioning") {
+            Some(Value::Concrete(ConcreteValue::String(s))) => assert_eq!(s, "Enabled"),
+            other => panic!("expected post-apply 'Enabled', got: {other:?}"),
+        }
     }
 }
 
