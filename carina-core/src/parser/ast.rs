@@ -8,8 +8,8 @@ use super::expressions::validate_expr::CompareOp;
 use super::util::snake_to_pascal;
 use crate::binding_index::IterableBindings;
 use crate::resource::{
-    Composition, ConcreteValue, DataSource, DeferredValue, Directives, Resource, ResourceId,
-    ResourceLike, UnknownReason, Value,
+    Composition, ConcreteValue, DataSource, DeferredValue, Directives, GraphNode, Resource,
+    ResourceId, ResourceLike, UnknownReason, Value,
 };
 use crate::version_constraint::VersionConstraint;
 use indexmap::IndexMap;
@@ -971,6 +971,25 @@ impl<E> File<E> {
             .map(ResourceRef::Resource)
             .chain(self.compositions.iter().map(ResourceRef::Composition))
             .chain(self.data_sources.iter().map(ResourceRef::DataSource))
+    }
+
+    /// Consume `self` and yield the top-level nodes as owned
+    /// [`GraphNode`]s.
+    ///
+    /// The owned counterpart to
+    /// [`iter_top_level_resources`](Self::iter_top_level_resources):
+    /// when a caller needs to take ownership of the three typed slices
+    /// and treat them uniformly (post-expansion plan-engine paths,
+    /// ownership transfer into intermediate representations), this
+    /// returns a single `Iterator<Item = GraphNode>` instead of three
+    /// parallel `Vec`s. Deferred for-expression templates are excluded
+    /// for the same reason as the borrowing iterator above.
+    pub fn into_graph_nodes(self) -> impl Iterator<Item = GraphNode> {
+        self.resources
+            .into_iter()
+            .map(GraphNode::from)
+            .chain(self.compositions.into_iter().map(GraphNode::from))
+            .chain(self.data_sources.into_iter().map(GraphNode::from))
     }
 
     /// Find a resource by resource type and name attribute value
