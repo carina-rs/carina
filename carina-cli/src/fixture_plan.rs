@@ -70,7 +70,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         // load. Direct `serde_json::from_str` would silently drop the
         // legacy field and leave `explicit` empty, breaking the
         // moved_prev_keys snapshot test.
-        Some(check_and_migrate(&json).unwrap())
+        Some(check_and_migrate(&json).unwrap().into_state())
     } else {
         None
     };
@@ -141,7 +141,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         let bindings = std::fs::read_to_string(&state_path)
             .ok()
             .and_then(|content| check_and_migrate(&content).ok())
-            .map(|sf| sf.build_remote_bindings())
+            .map(|migrated| migrated.state.build_remote_bindings())
             .unwrap_or_default();
         remote_bindings.insert(us.binding.clone(), bindings);
     }

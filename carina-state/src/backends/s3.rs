@@ -7,11 +7,13 @@ use aws_sdk_s3::operation::head_bucket::HeadBucketError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{PublicAccessBlockConfiguration, ServerSideEncryption};
 
+use std::sync::OnceLock;
+
 use carina_core::utils::convert_region_value;
 
 use crate::backend::{AwsError, BackendConfig, BackendError, BackendResult, StateBackend};
 use crate::lock::LockInfo;
-use crate::state::{self, StateFile};
+use crate::state::{self, MigrationInfo, StateFile, log_state_migration_once};
 
 const REGION_UNRESOLVED_MESSAGE: &str = "S3 backend has no region: set `region` in the backend block, or configure AWS_REGION / a profile region";
 
@@ -35,6 +37,10 @@ pub struct S3Backend {
     encrypt: bool,
     /// Whether to auto-create the bucket if it doesn't exist (default: true)
     auto_create: bool,
+    /// Tracks the first in-memory state-schema migration observed by
+    /// `read_state` on this backend instance (carina#3283). See the
+    /// equivalent field on `LocalBackend` for the rationale.
+    migration_logged: OnceLock<MigrationInfo>,
 }
 
 impl S3Backend {
@@ -100,6 +106,7 @@ impl S3Backend {
             region,
             encrypt,
             auto_create,
+            migration_logged: OnceLock::new(),
         }
     }
 
@@ -264,8 +271,15 @@ impl StateBackend for S3Backend {
                     .await
                     .map_err(|e| BackendError::Io(e.to_string()))?;
                 let bytes = body.into_bytes();
-                let state = state::check_and_migrate_bytes(&bytes)?;
-                Ok(Some(state))
+                let outcome = state::check_and_migrate_bytes(&bytes)?;
+                if let Some(info) = outcome.migration {
+                    log_state_migration_once(
+                        &self.migration_logged,
+                        info,
+                        &format!("s3://{}/{}", self.bucket, self.key.trim_start_matches('/')),
+                    );
+                }
+                Ok(Some(outcome.state))
             }
             Err(err) => {
                 if is_not_found_error(&err) {

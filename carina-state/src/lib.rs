@@ -57,4 +57,7 @@ pub use backends::{
     resolve_backend_anchored,
 };
 pub use lock::LockInfo;
-pub use state::{ResourceState, StateFile, check_and_migrate, check_and_migrate_bytes};
+pub use state::{
+    MigratedStateFile, MigrationInfo, ResourceState, StateFile, check_and_migrate,
+    check_and_migrate_bytes, log_state_migration_once,
+};

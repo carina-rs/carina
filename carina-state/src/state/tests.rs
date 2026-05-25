@@ -505,7 +505,9 @@ fn test_migrate_v6_empty_struct_to_unrecorded() {
             }
         ]
     }"#;
-    let state = check_and_migrate(v6).expect("migration should succeed");
+    let state = check_and_migrate(v6)
+        .expect("migration should succeed")
+        .into_state();
     assert_eq!(state.version, StateFile::CURRENT_VERSION);
     let rs = state
         .resources
@@ -550,7 +552,9 @@ fn test_migrate_v6_preserves_populated_explicit() {
             }
         ]
     }"#;
-    let state = check_and_migrate(v6).expect("migration should succeed");
+    let state = check_and_migrate(v6)
+        .expect("migration should succeed")
+        .into_state();
     let rs = state.resources.iter().find(|r| r.name == "vpc").unwrap();
     let ExplicitFields::Struct { children } = &rs.explicit else {
         panic!(
@@ -597,7 +601,9 @@ fn test_migrate_v6_does_not_rewrite_nested_empty_struct() {
             }
         ]
     }"#;
-    let state = check_and_migrate(v6).expect("migration should succeed");
+    let state = check_and_migrate(v6)
+        .expect("migration should succeed")
+        .into_state();
     let rs = state.resources.iter().find(|r| r.name == "vpc").unwrap();
     let ExplicitFields::Struct { children } = &rs.explicit else {
         panic!("expected top-level Struct, got {:?}", rs.explicit);
@@ -899,7 +905,7 @@ fn test_check_and_migrate_current_version() {
 
     let state = StateFile::new();
     let json = serde_json::to_string_pretty(&state).unwrap();
-    let result = check_and_migrate(&json).unwrap();
+    let result = check_and_migrate(&json).unwrap().into_state();
     assert_eq!(result.version, StateFile::CURRENT_VERSION);
     assert_eq!(result.lineage, state.lineage);
 }
@@ -942,7 +948,7 @@ fn test_check_and_migrate_older_version_migrates() {
         "resources": []
     }"#;
 
-    let result = check_and_migrate(json).unwrap();
+    let result = check_and_migrate(json).unwrap().into_state();
     assert_eq!(
         result.version,
         StateFile::CURRENT_VERSION,
@@ -971,7 +977,9 @@ fn test_check_and_migrate_bytes_works() {
 
     let state = StateFile::new();
     let json = serde_json::to_string_pretty(&state).unwrap();
-    let result = check_and_migrate_bytes(json.as_bytes()).unwrap();
+    let result = check_and_migrate_bytes(json.as_bytes())
+        .unwrap()
+        .into_state();
     assert_eq!(result.version, StateFile::CURRENT_VERSION);
 }
 
@@ -984,6 +992,48 @@ fn test_check_and_migrate_bytes_invalid_utf8() {
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(err.contains("UTF-8"), "error should mention UTF-8 issue");
+}
+
+// carina#3283: check_and_migrate is library-level and must not write to
+// stderr. The migration event is returned as a typed value so the caller
+// (a backend impl) can decide *when* and *how often* to log it. Without
+// this, every read_state call on the same physical state file emits a
+// fresh "Migrating state file..." line — for `carina plan` that means
+// the warning fires twice (T0 + T1 drift re-read) and even three times
+// when the run also crosses the refresh phase (#3283 repro).
+#[test]
+fn test_check_and_migrate_returns_migration_info_for_older_version() {
+    use super::check_and_migrate;
+
+    let json = r#"{
+        "version": 6,
+        "serial": 14,
+        "lineage": "test-lineage",
+        "carina_version": "0.0.1",
+        "resources": []
+    }"#;
+
+    let outcome = check_and_migrate(json).unwrap();
+    let migration = outcome
+        .migration
+        .expect("migration info should be present for v6 → v7");
+    assert_eq!(migration.from, 6);
+    assert_eq!(migration.to, StateFile::CURRENT_VERSION);
+    assert_eq!(outcome.state.version, StateFile::CURRENT_VERSION);
+}
+
+#[test]
+fn test_check_and_migrate_no_migration_info_for_current_version() {
+    use super::check_and_migrate;
+
+    let state = StateFile::new();
+    let json = serde_json::to_string_pretty(&state).unwrap();
+    let outcome = check_and_migrate(&json).unwrap();
+    assert!(
+        outcome.migration.is_none(),
+        "current-version reads must not report a migration"
+    );
+    assert_eq!(outcome.state.version, StateFile::CURRENT_VERSION);
 }
 
 #[test]
@@ -1465,7 +1515,7 @@ fn check_and_migrate_canonicalizes_legacy_map_key_addresses() {
         }}"#,
         ver = StateFile::CURRENT_VERSION,
     );
-    let state = check_and_migrate(&json).expect("load state");
+    let state = check_and_migrate(&json).expect("load state").into_state();
     let r = &state.resources[0];
     assert_eq!(r.name, "_accounts.registry_prod");
     assert_eq!(r.binding.as_deref(), Some("_accounts.registry_prod"));
@@ -1535,7 +1585,9 @@ fn v5_state_read_converts_desired_keys_to_explicit_leaves() {
         }]
     }"#;
 
-    let state = check_and_migrate(v5).expect("migration must succeed");
+    let state = check_and_migrate(v5)
+        .expect("migration must succeed")
+        .into_state();
     assert_eq!(state.version, StateFile::CURRENT_VERSION);
     assert_eq!(state.resources.len(), 1);
 
@@ -1574,7 +1626,7 @@ fn current_state_writes_and_reads_full_explicit_tree() {
     state.upsert_resource(rs);
 
     let json = serde_json::to_string(&state).expect("serialize");
-    let back = check_and_migrate(&json).expect("read");
+    let back = check_and_migrate(&json).expect("read").into_state();
     assert_eq!(back.version, StateFile::CURRENT_VERSION);
     assert_eq!(back.resources[0].explicit, state.resources[0].explicit);
 }
