@@ -19,8 +19,12 @@ explicit ideas:
 
 On top of that, encode three further invariants in the type system:
 
-- **`Signature` struct** for the shared `arguments`/`attributes`
-  surface that all three variants expose.
+- **`Signature` struct on `Composition` only** carrying the
+  `arguments` (resolved call-site inputs) and `attributes` (module
+  outputs) that uniquely make a composition function-shaped.
+  `Resource` / `DataSource` keep their existing `attributes` field
+  unchanged — they have no `arguments` concept, since the DSL's
+  `argument`/`attribute` keywords are module-only.
 - **`PersistentId` / `EphemeralId`** newtypes so "this id may not be
   looked up in state" is a compile-time fact, not a convention.
 - **`CompositionAttribute = Forwarded | Derived`** so the post-apply
@@ -41,10 +45,10 @@ On top of that, encode three further invariants in the type system:
   protocol's `Resource` type is independent of `carina-core`'s
   `Resource` — they have always been separate types connected by
   `convert::proto_to_core_*`, and this design does not change that.
-- Replacing `ResourceLike` immediately. The trait coexists with
-  `Signature` field-sharing during the migration and is removed in
-  the final PR of the series, once every accessor goes through
-  `signature.*` directly.
+- Replacing `ResourceLike` immediately. The trait stays through PRs
+  E–G and is removed in the final PR once `attributes` accessor call
+  sites have been migrated to direct field access (`r.attributes` for
+  resources / data sources, `c.signature.attributes` for compositions).
 
 ## Background
 
@@ -86,10 +90,22 @@ Three things the `#3181` series intentionally deferred:
    Callers must remember the threading order. Adding a fourth node
    class would touch every signature.
 
-2. **`Signature` duplication.** `ManagedResource`, `DataSource`, and
-   `VirtualResource` each carry their own `attributes` map plus
-   arguments. `ResourceLike` papers over the duplication at the
-   accessor level, but the underlying fields remain triplicated.
+2. **Composition's call boundary is implicit.** A `Composition` is
+   the only node that is genuinely function-shaped: it takes
+   resolved call-site arguments (`ModuleCall.arguments`) and exposes
+   module outputs (`AttributeParameter` resolved values, stored in
+   `Composition.attributes`). Today those two sides are not joined
+   on the composition itself — the arguments live on the
+   `ModuleCall`, which gets dropped at expansion time, leaving no
+   in-IR record of what was passed in. Reasoning about a composition
+   post-expansion requires consulting a separately-tracked call
+   site, which the type system does not enforce.
+
+   `Resource` and `DataSource` do not have this problem: their DSL
+   syntax (`<provider>.<type> "<name>" { key = value }`) uses a
+   single `attributes` namespace for user-written input, and there
+   is no `arguments` concept in DSL or runtime. The `attributes`
+   field on those structs is fine as-is.
 
 3. **`ResourceId` is single-flavour.** Both leaf nodes (which key
    into state) and virtual nodes (which never persist) use the same
@@ -148,21 +164,55 @@ This is the type-level version of today's `compile_fail` doctest on
 test, the differ's signature simply takes `&[LeafNode]` and the
 compiler enforces the boundary at every call site.
 
-### 3. Shared `Signature`
+### 3. `Signature` on `Composition` only
 
 ```rust
 pub struct Signature {
-    pub arguments:  BTreeMap<String, Value>,
-    pub attributes: IndexMap<String, AttributeType>,
+    /// Resolved call-site arguments. Populated from
+    /// `ModuleCall.arguments` at expansion time, so the call boundary
+    /// is recorded on the expanded node itself instead of being lost
+    /// when the `ModuleCall` is dropped.
+    pub arguments:  IndexMap<String, Value>,
+    /// Resolved module-output values. Today's `Composition.attributes`
+    /// content lives here, unchanged in semantics.
+    pub attributes: IndexMap<String, Value>,
+}
+
+pub struct Composition {
+    pub id: ResourceId,
+    pub signature: Signature,
+    pub binding: Option<String>,
+    pub module_name: String,
+    pub instance: String,
+    pub dependency_bindings: BTreeSet<String>,
+    pub quoted_string_attrs: HashSet<String>,
 }
 ```
 
-Each variant carries `signature: Signature` as a field. `ResourceLike`
-accessors that today return slices into per-struct fields can be
-re-pointed at `signature.arguments` / `signature.attributes` without
-breaking existing callers. The trait stays during migration; whether
-to retire it after all field accesses go through `signature` is a
-follow-up question, not a prerequisite.
+`Signature` is **not** shared with `Resource` or `DataSource`. Those
+structs keep their existing `attributes: IndexMap<String, Value>`
+field — the DSL gives them a single user-written input namespace with
+no `arguments`/`attributes` split, so a `Signature` would be a
+pretextual abstraction with one populated half.
+
+`ResourceLike::attributes()` continues to work for all three siblings
+by reading either the bare `attributes` field (resources, data
+sources) or `signature.attributes` (composition). The trait stays
+through the series and is removed in the final PR, once every
+accessor goes through field access directly.
+
+The value of `Signature` is twofold:
+
+1. **Boundary preservation.** Today's expander writes
+   `ModuleCall.arguments` into nothing post-expansion; the call
+   record is lost. With `Composition.signature.arguments` the
+   inputs that produced this composition are inspectable on the
+   expanded node, enabling later debug / display / diff features
+   without re-running the parser.
+2. **`CompositionAttribute` lift target.** PR G replaces
+   `signature.attributes`' value type from `Value` to
+   `CompositionAttribute`. Pinning the field path on `signature`
+   keeps that diff localized to one struct.
 
 ### 4. ID typestate
 
@@ -183,17 +233,22 @@ on-disk state is unchanged.
 
 ### 5. Composition attribute classification
 
+PR G changes the value type of `Signature.attributes` so that the
+expander can record *how* each module output was constructed, not
+just its current resolved value:
+
 ```rust
 pub enum CompositionAttribute {
+    /// Single-hop alias to another node's attribute.
     Forwarded(NodeId, AttrPath),
+    /// Multi-source expression, evaluated after post-apply state
+    /// is available.
     Derived(Expr),
 }
 
-pub struct Composition {
-    pub signature: Signature,
-    pub call_site: EphemeralId,
+pub struct Signature {
+    pub arguments:  IndexMap<String, Value>,
     pub attributes: IndexMap<String, CompositionAttribute>,
-    pub body: CompositionBody,
 }
 ```
 
@@ -204,7 +259,7 @@ pub struct Composition {
   resolver evaluates the expression after post-apply state is
   available.
 
-Today's `VirtualResource.attributes: IndexMap<String, Value>` collapses
+Today's `Composition.attributes: IndexMap<String, Value>` collapses
 both cases into one `Value`-shaped slot and re-classifies them at
 runtime. Splitting them at the type level removes the runtime
 classification and matches how the resolver actually consumes them.
@@ -243,15 +298,15 @@ contained.
 | **B** | Rename `VirtualResource` → `Composition` (struct + module + use sites). Mechanical sweep. |
 | **C** | Introduce `GraphNode` enum. Collapse three-slice signatures (`create_plan`, resolver entry points, parser output) to `&[GraphNode]`. Largest of the series. |
 | **D** | Introduce `LeafNode` subtype and re-shape `expand` to produce `Vec<LeafNode>`. Replace the `compile_fail` doctest with a real type-level guarantee at the differ entry. |
-| **E** | Introduce `Signature` struct and re-point `Resource` / `DataSource` / `Composition` field accesses through it. `ResourceLike` impls delegate to `signature`. |
+| **E** | Introduce `Signature` struct on **`Composition` only**, with `arguments` + `attributes` fields. Populate `arguments` from `ModuleCall.arguments` at expansion time; move `Composition.attributes` content into `signature.attributes`. `Resource` and `DataSource` are not touched. `ResourceLike::attributes()` reads `signature.attributes` for the `Composition` arm. |
 | **F** | Introduce `PersistentId` / `EphemeralId` newtypes; thread them through state and resolver boundaries. |
-| **G** | Introduce `CompositionAttribute = Forwarded \| Derived`; migrate `Composition.attributes` to the new shape; update resolver to dispatch on the variant. |
+| **G** | Introduce `CompositionAttribute = Forwarded \| Derived`; migrate `Signature.attributes`'s value type from `Value` to `CompositionAttribute`; update resolver to dispatch on the variant. |
 | **H** | Introduce `ExpansionTrace`; add display folding by composition; remove ad-hoc `module_name`/`instance` field reads where they were a proxy for trace lookup. |
 
 Suggested merge order: A → B → C → D → E → F → G → H. Each step
 leaves the tree green; F/G/H can be parallelised after E lands.
-PR H also retires `ResourceLike` once all field accesses go through
-`signature.*`.
+PR H also retires `ResourceLike` once all `attributes` accessor call
+sites have been migrated to direct field access.
 
 ## Acceptance
 
