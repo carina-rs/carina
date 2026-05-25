@@ -314,15 +314,13 @@ fn test_from_provider_state_without_existing() {
 }
 
 #[test]
-fn test_from_provider_state_repairs_empty_explicit_from_state_attrs() {
-    // carina#3280: a legacy state row persisted with `explicit.children`
-    // empty causes the differ to drop every attribute on projection and
-    // surfaces spurious `forces replacement` on every field. When
-    // `from_provider_state` is called with a `ManagedResource` whose own
-    // `attributes` is empty (the historical write-path bug that produced
-    // the corrupt state) AND the prior on-disk `existing.explicit` is
-    // already the corrupt `Struct { children: {} }` shape, rebuild
-    // `explicit` from the fresh state so the next write self-heals.
+fn test_from_provider_state_repairs_unrecorded_from_state_attrs() {
+    // carina#3280: when the prior on-disk row carries `Unrecorded` (the
+    // legacy-corruption marker, emitted by the v6→v7 migration for rows
+    // previously persisted as `Struct { children: {} }`) AND
+    // `resource.attributes` is empty AND the freshly-read
+    // `state.attributes` is populated, rebuild `explicit` from the
+    // fresh state so the next write replaces the corrupt row.
     use carina_core::explicit::ExplicitFields;
     use carina_core::resource::{ConcreteValue, ManagedResource, State as ProviderState, Value};
 
@@ -348,35 +346,34 @@ fn test_from_provider_state_repairs_empty_explicit_from_state_attrs() {
         dependency_bindings: BTreeSet::new(),
     };
 
-    // Simulate the corrupt on-disk row: an existing ResourceState whose
-    // `explicit` is already the empty Struct (the legacy corruption shape).
     let mut existing = ResourceState::new("sso.Assignment", "x", "awscc");
-    existing.explicit = ExplicitFields::Struct {
-        children: HashMap::new(),
-    };
+    existing.explicit = ExplicitFields::Unrecorded;
 
     let rs =
         ResourceState::from_provider_state(&resource, &provider_state, Some(&existing)).unwrap();
 
     let ExplicitFields::Struct { children } = &rs.explicit else {
-        panic!("expected Struct explicit, got {:?}", rs.explicit);
+        panic!(
+            "expected Struct explicit after repair, got {:?}",
+            rs.explicit
+        );
     };
     assert!(
         children.contains_key("principal_type"),
-        "explicit should be rebuilt from state.attributes when prior on-disk explicit was the corrupt empty-Struct shape"
+        "explicit should be rebuilt from state.attributes when prior on-disk explicit was `Unrecorded`"
     );
     assert!(children.contains_key("target_id"));
 }
 
 #[test]
-fn test_from_provider_state_does_not_repair_fresh_resource_with_empty_attrs() {
-    // carina#3280 follow-up to round-3/5 reviews: the repair must NOT fire
-    // on a green-field write or an empty-DSL-body resource. The discriminator
-    // is the prior on-disk row: only when `existing.explicit` is already the
-    // corrupt `Struct { children: {} }` is this a self-heal. With
-    // `existing: None` (first apply) the empty `resource.attributes` means
-    // the user authored nothing — propagate that authoring intent unchanged
-    // so subsequent diffs don't fabricate user-ownership of server defaults.
+fn test_from_provider_state_emits_unrecorded_for_fresh_empty_body_resource() {
+    // carina#3280: a green-field write of a resource with no DSL
+    // attributes (e.g. `aws.sts.CallerIdentity {}`, or `carina state
+    // import`) must emit `Unrecorded` — NOT `Struct { children: {} }`.
+    // Pre-fix `build_from_resource` produced the ambiguous empty
+    // Struct shape, which the differ used to interpret as "user
+    // authored an empty struct, drop every server-side attribute".
+    // The typed signal removes the ambiguity at the source.
     use carina_core::explicit::ExplicitFields;
     use carina_core::resource::{ConcreteValue, ManagedResource, State as ProviderState, Value};
 
@@ -396,12 +393,220 @@ fn test_from_provider_state_does_not_repair_fresh_resource_with_empty_attrs() {
 
     let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
 
-    let ExplicitFields::Struct { children } = &rs.explicit else {
-        panic!("expected Struct explicit, got {:?}", rs.explicit);
-    };
     assert!(
-        children.is_empty(),
-        "first-apply empty-body resource must NOT have its explicit fabricated from server attrs — got {children:?}"
+        matches!(rs.explicit, ExplicitFields::Unrecorded),
+        "first-apply empty-body resource must emit `Unrecorded`, got {:?}",
+        rs.explicit
+    );
+}
+
+#[test]
+fn test_from_provider_state_preserves_populated_struct_when_resource_attrs_empty() {
+    // carina#3280 idempotency: after the self-heal path runs once, the
+    // on-disk row carries a populated `Struct`. On the next apply (no
+    // DSL change), `resource.attributes` is still empty (the user's
+    // bodyless DSL hasn't changed), so `build_from_resource` produces
+    // `Struct { children: {} }` again. Without the preservation arm,
+    // the empty-Struct collapse would overwrite the populated record
+    // with `Unrecorded`, flip-flopping the row on every apply and
+    // churning state `serial`. Preserve the existing populated Struct.
+    use carina_core::explicit::ExplicitFields;
+    use carina_core::resource::{ConcreteValue, ManagedResource, State as ProviderState, Value};
+
+    let resource = ManagedResource::with_provider("aws", "sts.CallerIdentity", "caller", None);
+    let provider_state = ProviderState {
+        id: resource.id.clone(),
+        identifier: Some("id".to_string()),
+        attributes: [(
+            "account_id".to_string(),
+            Value::Concrete(ConcreteValue::String("123".to_string())),
+        )]
+        .into_iter()
+        .collect(),
+        exists: true,
+        dependency_bindings: BTreeSet::new(),
+    };
+
+    // Prior on-disk: populated Struct (e.g. from a previous self-heal).
+    let mut existing = ResourceState::new("sts.CallerIdentity", "caller", "aws");
+    let populated = ExplicitFields::Struct {
+        children: HashMap::from([("account_id".into(), ExplicitFields::Leaf)]),
+    };
+    existing.explicit = populated.clone();
+
+    let rs =
+        ResourceState::from_provider_state(&resource, &provider_state, Some(&existing)).unwrap();
+
+    assert_eq!(
+        rs.explicit, populated,
+        "populated Struct must be preserved on re-apply with no DSL change; \
+         got {:?}",
+        rs.explicit
+    );
+}
+
+#[test]
+fn test_from_provider_state_no_repair_when_state_attrs_also_empty() {
+    // carina#3280 case (b): existing is `Unrecorded` AND fresh
+    // `state.attributes` is empty (no provider data to promote). The
+    // repair cannot rebuild authoring from nothing — emit `Unrecorded`
+    // (stable fixed point), do not crash, do not invent attributes.
+    use carina_core::explicit::ExplicitFields;
+    use carina_core::resource::{ManagedResource, State as ProviderState};
+
+    let resource = ManagedResource::with_provider("awscc", "sso.Assignment", "x", None);
+    let provider_state = ProviderState {
+        id: resource.id.clone(),
+        identifier: Some("id".to_string()),
+        attributes: HashMap::new(),
+        exists: true,
+        dependency_bindings: BTreeSet::new(),
+    };
+
+    let mut existing = ResourceState::new("sso.Assignment", "x", "awscc");
+    existing.explicit = ExplicitFields::Unrecorded;
+
+    let rs =
+        ResourceState::from_provider_state(&resource, &provider_state, Some(&existing)).unwrap();
+
+    assert!(
+        matches!(rs.explicit, ExplicitFields::Unrecorded),
+        "Unrecorded + empty state.attributes must stay Unrecorded, got {:?}",
+        rs.explicit
+    );
+}
+
+#[test]
+fn test_migrate_v6_empty_struct_to_unrecorded() {
+    // carina#3280: state files at v6 carry the corrupt-row shape as
+    // `Struct { children: {} }`. The v6 → v7 migration rewrites
+    // every top-level empty Struct to `Unrecorded` so callers never
+    // encounter the ambiguous shape after read.
+    use carina_core::explicit::ExplicitFields;
+    let v6 = r#"{
+        "version": 6,
+        "serial": 1,
+        "lineage": "test-lineage",
+        "carina_version": "0.1.0",
+        "resources": [
+            {
+                "resource_type": "sso.Assignment",
+                "name": "x",
+                "provider": "awscc",
+                "identifier": "id",
+                "attributes": { "target_id": "123" },
+                "protected": false,
+                "directives": {},
+                "prefixes": {},
+                "name_overrides": {},
+                "binding": "x",
+                "dependency_bindings": [],
+                "explicit": { "kind": "struct", "children": {} }
+            }
+        ]
+    }"#;
+    let state = check_and_migrate(v6).expect("migration should succeed");
+    assert_eq!(state.version, StateFile::CURRENT_VERSION);
+    let rs = state
+        .resources
+        .iter()
+        .find(|r| r.name == "x")
+        .expect("test resource");
+    assert!(
+        matches!(rs.explicit, ExplicitFields::Unrecorded),
+        "v6 empty-Struct row must migrate to Unrecorded, got {:?}",
+        rs.explicit
+    );
+}
+
+#[test]
+fn test_migrate_v6_preserves_populated_explicit() {
+    // carina#3280 sibling: the v6 → v7 migration must leave populated
+    // `Struct` rows untouched. Only the top-level empty-Struct
+    // (corruption) shape is rewritten.
+    use carina_core::explicit::ExplicitFields;
+    let v6 = r#"{
+        "version": 6,
+        "serial": 1,
+        "lineage": "test-lineage",
+        "carina_version": "0.1.0",
+        "resources": [
+            {
+                "resource_type": "ec2.Vpc",
+                "name": "vpc",
+                "provider": "awscc",
+                "identifier": "vpc-1",
+                "attributes": { "cidr_block": "10.0.0.0/16" },
+                "protected": false,
+                "directives": {},
+                "prefixes": {},
+                "name_overrides": {},
+                "binding": "vpc",
+                "dependency_bindings": [],
+                "explicit": {
+                    "kind": "struct",
+                    "children": { "cidr_block": { "kind": "leaf" } }
+                }
+            }
+        ]
+    }"#;
+    let state = check_and_migrate(v6).expect("migration should succeed");
+    let rs = state.resources.iter().find(|r| r.name == "vpc").unwrap();
+    let ExplicitFields::Struct { children } = &rs.explicit else {
+        panic!(
+            "populated v6 Struct must survive migration, got {:?}",
+            rs.explicit
+        );
+    };
+    assert!(children.contains_key("cidr_block"));
+}
+
+#[test]
+fn test_migrate_v6_does_not_rewrite_nested_empty_struct() {
+    // carina#3280: the migration is top-level-only by design. A
+    // nested empty `Struct { children: {} }` (the legitimate
+    // "user wrote `tags = {}`" shape) must survive the migration
+    // unchanged — it is structurally meaningful at that position
+    // (recursive `project` correctly drops every field), unlike the
+    // top-level legacy-corruption case.
+    use carina_core::explicit::ExplicitFields;
+    let v6 = r#"{
+        "version": 6,
+        "serial": 1,
+        "lineage": "test-lineage",
+        "carina_version": "0.1.0",
+        "resources": [
+            {
+                "resource_type": "ec2.Vpc",
+                "name": "vpc",
+                "provider": "awscc",
+                "identifier": "vpc-1",
+                "attributes": {},
+                "protected": false,
+                "directives": {},
+                "prefixes": {},
+                "name_overrides": {},
+                "binding": "vpc",
+                "dependency_bindings": [],
+                "explicit": {
+                    "kind": "struct",
+                    "children": {
+                        "tags": { "kind": "struct", "children": {} }
+                    }
+                }
+            }
+        ]
+    }"#;
+    let state = check_and_migrate(v6).expect("migration should succeed");
+    let rs = state.resources.iter().find(|r| r.name == "vpc").unwrap();
+    let ExplicitFields::Struct { children } = &rs.explicit else {
+        panic!("expected top-level Struct, got {:?}", rs.explicit);
+    };
+    let tags = children.get("tags").expect("tags child");
+    assert!(
+        matches!(tags, ExplicitFields::Struct { children } if children.is_empty()),
+        "nested empty Struct must survive migration (legitimate `tags = {{}}` shape); got {:?}",
+        tags
     );
 }
 
@@ -665,9 +870,9 @@ fn test_build_orphan_dependencies() {
 }
 
 #[test]
-fn test_state_file_version_is_v6() {
+fn test_state_file_version_is_v7() {
     let state = StateFile::new();
-    assert_eq!(state.version, 6);
+    assert_eq!(state.version, 7);
 }
 
 #[test]
@@ -1346,9 +1551,9 @@ fn v5_state_read_converts_desired_keys_to_explicit_leaves() {
 }
 
 #[test]
-fn v6_state_writes_and_reads_full_explicit_tree() {
-    // A v6 state file with a nested `explicit` tree round-trips
-    // through serde without loss.
+fn current_state_writes_and_reads_full_explicit_tree() {
+    // A current-version state file with a nested `explicit` tree
+    // round-trips through serde without loss.
     let mut state = StateFile::new();
     let mut rs = ResourceState::new("s3.Bucket", "my-bucket", "aws");
     rs.explicit = ExplicitFields::Struct {
@@ -1370,7 +1575,7 @@ fn v6_state_writes_and_reads_full_explicit_tree() {
 
     let json = serde_json::to_string(&state).expect("serialize");
     let back = check_and_migrate(&json).expect("read");
-    assert_eq!(back.version, 6);
+    assert_eq!(back.version, StateFile::CURRENT_VERSION);
     assert_eq!(back.resources[0].explicit, state.resources[0].explicit);
 }
 

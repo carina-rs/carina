@@ -498,7 +498,11 @@ pub(super) fn find_changed_attributes(
     // Only flag attributes that were previously in the user's desired
     // state (top-level children of `prev_explicit`'s root `Struct`).
     // This prevents false removals for computed/provider-returned
-    // attributes the user never specified.
+    // attributes the user never specified. With `Unrecorded` (no
+    // authoring record) there is nothing to compare against, so
+    // attribute removal is not detected for those rows — the
+    // `from_provider_state` repair populates `Struct` on the next
+    // apply, after which removal detection works normally.
     if let Some(ExplicitFields::Struct { children }) = prev_explicit {
         for key in children.keys() {
             if key.starts_with('_') {

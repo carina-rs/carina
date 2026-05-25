@@ -41,7 +41,7 @@ impl StateFile {
     ///     state lift each top-level key to a `Leaf` child of the
     ///     root `Struct`; the next plan/apply rebuilds a full tree
     ///     from the resource's authored `Value`.
-    pub const CURRENT_VERSION: u32 = 6;
+    pub const CURRENT_VERSION: u32 = 7;
 
     /// Create a new empty state file
     pub fn new() -> Self {
@@ -452,6 +452,21 @@ pub fn check_and_migrate(content: &str) -> Result<StateFile, BackendError> {
             if v <= 5 {
                 migrate_v5_desired_keys_to_explicit(content, &mut state)?;
             }
+            // v6 → v7 (carina#3280): a top-level
+            // `ExplicitFields::Struct { children: {} }` row is the
+            // legacy-corruption shape produced by an older for-loop
+            // expansion path; it is structurally ambiguous with "user
+            // authored an empty struct at the top level" (which the
+            // current code never legitimately emits — `build_from_resource`
+            // produces this shape only when `resource.attributes` is
+            // empty, and the v7 writeback path emits `Unrecorded`
+            // instead). Rewriting every top-level empty Struct to
+            // `Unrecorded` on read makes the variant the single
+            // source of truth and lets every `match` arm be exhaustive
+            // again.
+            if v <= 6 {
+                migrate_v6_empty_struct_to_unrecorded(&mut state);
+            }
             state.version = StateFile::CURRENT_VERSION;
             state
         }
@@ -703,47 +718,82 @@ impl ResourceState {
         // Record the structural shape the user wrote in their .crn,
         // so the differ can project actual-state through it and skip
         // server-side defaults the user never authored (refs awscc#206).
-        rs.explicit = explicit::build_from_resource(resource);
-        // carina#3280: self-heal legacy state corruption. An older
-        // for-loop expansion path occasionally wrote state rows for
-        // children whose `ManagedResource.attributes` had been lost
-        // before reaching writeback, producing `ExplicitFields::Struct
-        // { children: {} }` on disk. The differ's projection then
-        // dropped every attribute and surfaced spurious
-        // `forces replacement` on every field. When the prior on-disk
-        // row already carries the corrupt empty-Struct shape AND the
-        // current write has nothing to author from `resource.attributes`,
-        // rebuild `explicit` from the fresh `state.attributes` so the
-        // next write replaces the corrupt row.
-        //
-        // The `existing.explicit == Struct { children: {} }` gate is
-        // load-bearing: it scopes the repair to "this row was already
-        // corrupt on disk" and prevents mis-attribution on legitimate
-        // empty-body resources (`aws.sts.CallerIdentity {}`) and on
-        // `carina state import` (which legitimately constructs a
-        // `ManagedResource` with no DSL attributes). Both produce the
-        // same `(resource.attributes.is_empty(), state.attributes
-        // non-empty)` shape; only the prior on-disk explicit
-        // distinguishes a legacy-corrupt row from a green-field write.
-        let existing_is_corrupt = matches!(
-            existing.map(|e| &e.explicit),
-            Some(ExplicitFields::Struct { children }) if children.is_empty()
-        );
-        if existing_is_corrupt
-            && let ExplicitFields::Struct { children } = &rs.explicit
-            && children.is_empty()
-            && !state.attributes.is_empty()
-        {
-            let rebuilt: HashMap<String, ExplicitFields> = state
-                .attributes
-                .iter()
-                .filter(|(k, _)| !k.starts_with('_'))
-                .map(|(k, v)| (k.clone(), explicit::build_from_value(v)))
-                .collect();
-            if !rebuilt.is_empty() {
-                rs.explicit = ExplicitFields::Struct { children: rebuilt };
+        // carina#3280: when `build_from_resource` would produce an
+        // empty top-level `Struct` (the user authored no attributes —
+        // bodyless resource like `aws.sts.CallerIdentity {}`, or the
+        // `carina state import` path that constructs a `ManagedResource`
+        // with no DSL attributes), emit `Unrecorded` instead. The
+        // empty-Struct-at-top-level shape used to double as the
+        // legacy-corruption marker, which forced callers to
+        // disambiguate by runtime convention; `Unrecorded` is the
+        // typed signal for "no authoring record".
+        let built = explicit::build_from_resource(resource);
+        rs.explicit = match built {
+            ExplicitFields::Struct { ref children } if children.is_empty() => {
+                // Three sub-cases when `resource.attributes` is empty:
+                //
+                // 1. Self-heal: prior on-disk row is `Unrecorded` (the
+                //    legacy-corruption marker, possibly from the v6→v7
+                //    migration). Promote freshly-read state attributes
+                //    back into an authoring record so the next plan
+                //    sees a populated `Struct` and the runtime
+                //    pass-through path no longer fires for this row.
+                //
+                // 2. Idempotent re-apply: prior on-disk row already
+                //    carries a populated `Struct` (e.g. the row was
+                //    self-healed in a previous apply, or the resource
+                //    legitimately has no DSL body but was applied
+                //    once before and recorded an authoring tree from
+                //    the provider's read). Preserve the populated
+                //    `Struct` — collapsing it to `Unrecorded` would
+                //    flip-flop the row on every apply.
+                //
+                // 3. Green-field write: prior row is `None` or
+                //    `Leaf`. There is genuinely no authoring record
+                //    yet. Emit `Unrecorded`.
+                match existing.map(|e| &e.explicit) {
+                    Some(ExplicitFields::Unrecorded) if !state.attributes.is_empty() => {
+                        let rebuilt: HashMap<String, ExplicitFields> = state
+                            .attributes
+                            .iter()
+                            .filter(|(k, _)| !k.starts_with('_'))
+                            .map(|(k, v)| (k.clone(), explicit::build_from_value(v)))
+                            .collect();
+                        if rebuilt.is_empty() {
+                            ExplicitFields::Unrecorded
+                        } else {
+                            ExplicitFields::Struct { children: rebuilt }
+                        }
+                    }
+                    Some(ExplicitFields::Struct { children }) if !children.is_empty() => {
+                        // Idempotent re-apply: keep the populated
+                        // authoring record. Cloning the children is
+                        // cheap (HashMap of small Leaf/Struct trees).
+                        ExplicitFields::Struct {
+                            children: children.clone(),
+                        }
+                    }
+                    Some(ExplicitFields::List { element }) => {
+                        // Top-level `List` is structurally improbable
+                        // (`build_from_resource` always produces a
+                        // root `Struct`), but if a prior write ever
+                        // landed one, preserve it for the same
+                        // idempotency reason.
+                        ExplicitFields::List {
+                            element: element.clone(),
+                        }
+                    }
+                    // None (no prior row), Leaf (default), or
+                    // Some(Struct { children: {} }) — the last is
+                    // unreachable post-migration but kept here so a
+                    // pre-migration in-memory `StateFile` (e.g.
+                    // constructed in tests) still emits the typed
+                    // signal rather than the ambiguous shape.
+                    _ => ExplicitFields::Unrecorded,
+                }
             }
-        }
+            other => other,
+        };
         // Store binding name for tree structure in orphan Delete effects
         rs.binding = resource.binding.clone();
         // Store dependency bindings for tree structure in orphan Delete effects.
@@ -812,6 +862,26 @@ fn migrate_v5_desired_keys_to_explicit(
         }
     }
     Ok(())
+}
+
+/// v6 → v7 (carina#3280): rewrite every top-level
+/// `ExplicitFields::Struct { children: {} }` row to
+/// `ExplicitFields::Unrecorded`. The empty-Struct shape on disk is
+/// always the legacy-corruption pattern (the older for-loop expansion
+/// path that lost child attributes before reaching writeback), never a
+/// legitimate "user authored an empty struct at top level" — the
+/// current `build_from_resource` produces this shape only when
+/// `resource.attributes` is empty, and the v7 writeback path emits
+/// `Unrecorded` for that case instead. Migrating eliminates the
+/// runtime ambiguity that callers used to disambiguate by convention.
+fn migrate_v6_empty_struct_to_unrecorded(state: &mut StateFile) {
+    for rs in state.resources.iter_mut() {
+        if let ExplicitFields::Struct { children } = &rs.explicit
+            && children.is_empty()
+        {
+            rs.explicit = ExplicitFields::Unrecorded;
+        }
+    }
 }
 
 #[cfg(test)]

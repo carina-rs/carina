@@ -1503,20 +1503,15 @@ fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline()
 }
 
 #[test]
-fn find_changed_attributes_empty_prev_explicit_struct_is_no_change_when_values_match() {
-    // carina#3280: a legacy state row persisted with
-    // `ExplicitFields::Struct { children: {} }` — e.g. a for-loop child
-    // written by an older expansion path before its attributes reached
-    // writeback — was treated by `project_attributes` as "the user
-    // authored nothing", which dropped every key from `projected_current`
-    // and made every per-attribute equality check return `false`. The
-    // differ then surfaced every attribute (including unrelated enum
-    // literals) as `forces replacement, known after apply`, even though
-    // the values were identical to state.
-    //
-    // Empty top-level children mean "we have no authoring record" — the
-    // projection must pass `current` through unchanged so equality can
-    // compare against `desired`.
+fn find_changed_attributes_unrecorded_prev_explicit_is_no_change_when_values_match() {
+    // carina#3280: a legacy state row whose authoring record was
+    // destroyed by an older for-loop expansion path is signalled by
+    // `ExplicitFields::Unrecorded` (emitted by the
+    // `from_provider_state` legacy-corruption repair). The projection
+    // must pass `current` through unchanged so the equality loop can
+    // compare against `desired` directly — otherwise every attribute
+    // gets flagged as changed and the plan surfaces a spurious
+    // `forces replacement` for each one.
     use crate::explicit::ExplicitFields;
     use std::collections::HashMap;
 
@@ -1531,24 +1526,23 @@ fn find_changed_attributes_empty_prev_explicit_struct_is_no_change_when_values_m
         ),
     ]);
     let current = desired.clone();
-    let prev_explicit = ExplicitFields::Struct {
-        children: HashMap::new(),
-    };
+    let prev_explicit = ExplicitFields::Unrecorded;
     let changed =
         find_changed_attributes(&desired, &current, None, Some(&prev_explicit), None, None);
     assert!(
         changed.is_empty(),
-        "carina#3280: empty `Struct {{ children: {{}} }}` is the \"no authoring record\" \
+        "carina#3280: `Unrecorded` is the \"no authoring record\" \
          degenerate case — desired == current must produce no changes, got {changed:?}"
     );
 }
 
 #[test]
-fn find_changed_attributes_empty_prev_explicit_struct_still_detects_real_drift() {
-    // carina#3280 sibling: confirm the "no authoring record" pass-through
-    // doesn't blind the differ to real drift. With `Struct { children: {} }`
-    // the projection no longer drops `current`, so a genuine value
-    // mismatch between `desired` and `current` must still surface.
+fn find_changed_attributes_unrecorded_prev_explicit_still_detects_real_drift() {
+    // carina#3280 sibling: confirm the `Unrecorded` pass-through
+    // doesn't blind the differ to real drift. With no authoring
+    // record the projection passes `current` through unchanged, so a
+    // genuine value mismatch between `desired` and `current` must
+    // still surface.
     use crate::explicit::ExplicitFields;
     use std::collections::HashMap;
 
@@ -1560,14 +1554,12 @@ fn find_changed_attributes_empty_prev_explicit_struct_still_detects_real_drift()
         "principal_type".to_string(),
         Value::Concrete(ConcreteValue::String("USER".to_string())),
     )]);
-    let prev_explicit = ExplicitFields::Struct {
-        children: HashMap::new(),
-    };
+    let prev_explicit = ExplicitFields::Unrecorded;
     let changed =
         find_changed_attributes(&desired, &current, None, Some(&prev_explicit), None, None);
     assert_eq!(
         changed,
         vec!["principal_type".to_string()],
-        "real drift under empty `Struct {{ children: {{}} }}` must still be reported"
+        "real drift under `Unrecorded` must still be reported"
     );
 }

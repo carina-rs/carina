@@ -1,5 +1,5 @@
 {
-  "version": 6,
+  "version": 7,
   "serial": 1,
   "lineage": "test-lineage-empty-explicit",
   "carina_version": "0.1.0",
@@ -25,8 +25,7 @@
       "binding": "vpc",
       "dependency_bindings": [],
       "explicit": {
-        "kind": "struct",
-        "children": {}
+        "kind": "unrecorded"
       }
     }
   ]
