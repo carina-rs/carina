@@ -24,6 +24,11 @@ use std::collections::HashMap;
 ///   server-only and are removed by projection.
 /// - `List`: the user wrote a list of structs here. `element` is the
 ///   union of authoring across all elements.
+/// - `Unrecorded`: no authoring record for this position. See the
+///   per-variant doc on `Unrecorded` and carina#3280 for the
+///   motivation — splitting it off from `Struct { children: {} }`
+///   removes the runtime convention previously needed to
+///   disambiguate "legacy-corrupt row" from "user wrote `{}`".
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ExplicitFields {
@@ -35,6 +40,17 @@ pub enum ExplicitFields {
     List {
         element: Box<ExplicitFields>,
     },
+    /// No authoring record for this position. Top-level callers
+    /// (`project_attributes`) treat this as "pass attrs through, the
+    /// authoring shape is whatever the user wrote in `.crn` right
+    /// now"; recursive `project` treats it the same as `Leaf` (keep
+    /// the entire value). Emitted by the `from_provider_state`
+    /// legacy-corruption repair (`carina-state/src/state/mod.rs`)
+    /// when the prior on-disk row carried an empty `Struct` whose
+    /// children were destroyed by an older write-path bug; deserialised
+    /// from `{ "kind": "unrecorded" }` in state files written after
+    /// carina#3280.
+    Unrecorded,
 }
 
 /// Build an `ExplicitFields::Struct` rooted at a resource's top-level
@@ -83,6 +99,15 @@ pub fn merge(a: ExplicitFields, b: ExplicitFields) -> ExplicitFields {
     match (a, b) {
         (Leaf, b) => b,
         (a, Leaf) => a,
+        // `Unrecorded` carries no shape information, so merging it
+        // with anything yields the other side. `build_from_value`
+        // never produces `Unrecorded` (only `from_provider_state`
+        // does), so reaching this arm in production is unlikely —
+        // the explicit handling exists to keep the `match` exhaustive
+        // and prevent a future caller from getting a silent fallback
+        // via the catch-all `(a, _) => a` arm below.
+        (Unrecorded, b) => b,
+        (a, Unrecorded) => a,
         (
             Struct {
                 children: mut a_children,
@@ -122,34 +147,44 @@ pub fn merge(a: ExplicitFields, b: ExplicitFields) -> ExplicitFields {
 /// the value is returned unchanged. This is a conservative choice —
 /// better to over-show a value once than to silently hide real data.
 pub fn project(value: Value, explicit: &ExplicitFields) -> Value {
-    match (value, explicit) {
+    match explicit {
         // user wrote whole leaf: keep entire current value
-        (v, ExplicitFields::Leaf) => v,
-        (Value::Concrete(ConcreteValue::Map(fields)), ExplicitFields::Struct { children }) => {
-            let projected: IndexMap<String, Value> = fields
-                .into_iter()
-                .filter_map(|(k, v)| children.get(&k).map(|sub| (k, project(v, sub))))
-                .collect();
-            Value::Concrete(ConcreteValue::Map(projected))
-        }
-        (Value::Concrete(ConcreteValue::List(items)), ExplicitFields::List { element }) => {
-            Value::Concrete(ConcreteValue::List(
+        ExplicitFields::Leaf => value,
+        // no authoring record at this position: same effect as `Leaf`
+        // — keep the entire current value (carina#3280).
+        ExplicitFields::Unrecorded => value,
+        ExplicitFields::Struct { children } => match value {
+            Value::Concrete(ConcreteValue::Map(fields)) => {
+                let projected: IndexMap<String, Value> = fields
+                    .into_iter()
+                    .filter_map(|(k, v)| children.get(&k).map(|sub| (k, project(v, sub))))
+                    .collect();
+                Value::Concrete(ConcreteValue::Map(projected))
+            }
+            // shape mismatch (state inconsistent or schema drift):
+            // keep value as-is to avoid hiding real data.
+            v => v,
+        },
+        ExplicitFields::List { element } => match value {
+            Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
                 items
                     .into_iter()
                     .map(|item| project(item, element))
                     .collect(),
-            ))
-        }
-        // shape mismatch (state inconsistent or schema drift): keep
-        // value as-is to avoid hiding real data
-        (v, _) => v,
+            )),
+            // shape mismatch: keep value as-is.
+            v => v,
+        },
     }
 }
 
 /// Apply `project` to every entry of a top-level attribute map. The
 /// outer `explicit` is expected to be `ExplicitFields::Struct` (the
-/// shape `build_from_resource` produces); other variants pass through
-/// conservatively.
+/// shape `build_from_resource` produces); `Unrecorded` (no authoring
+/// record — emitted by the carina#3280 legacy-corruption repair)
+/// passes attrs through unchanged. `Leaf` / `List` at the top level
+/// shouldn't occur for a resource's full attribute set and pass
+/// through conservatively.
 pub fn project_attributes(
     attrs: HashMap<String, Value>,
     explicit: &ExplicitFields,
@@ -159,9 +194,15 @@ pub fn project_attributes(
             .into_iter()
             .filter_map(|(k, v)| children.get(&k).map(|sub| (k, project(v, sub))))
             .collect(),
-        // Top-level being Leaf or List shouldn't occur for a
-        // resource's full attribute set; pass through conservatively.
-        _ => attrs,
+        // No authoring record at the top level (carina#3280): the
+        // legacy-corruption case where the differ must compare the
+        // real `current` against `desired` directly, without
+        // filtering. The `from_provider_state` repair rebuilds a
+        // populated `Struct` on the next write.
+        ExplicitFields::Unrecorded => attrs,
+        // Top-level Leaf / List shouldn't occur for a resource's full
+        // attribute set; pass through conservatively.
+        ExplicitFields::Leaf | ExplicitFields::List { .. } => attrs,
     }
 }
 
@@ -323,6 +364,36 @@ mod tests {
     }
 
     #[test]
+    fn project_unrecorded_keeps_whole_value() {
+        // carina#3280: `Unrecorded` at a recursive `project` position
+        // is treated like `Leaf` — the whole value is kept. Top-level
+        // `project_attributes` exercises the same semantic for the
+        // full attribute map; this direct unit test pins the recursive
+        // behaviour so a future refactor of `project` cannot regress
+        // it via the `Leaf | Unrecorded` arm consolidation.
+        let mut fields = IndexMap::new();
+        fields.insert("any".into(), Value::Concrete(ConcreteValue::Int(1)));
+        let value = Value::Concrete(ConcreteValue::Map(fields));
+        let result = project(value.clone(), &ExplicitFields::Unrecorded);
+        assert_eq!(result, value);
+    }
+
+    #[test]
+    fn unrecorded_round_trips_via_serde() {
+        // carina#3280: `Unrecorded` must serialize as
+        // `{"kind":"unrecorded"}` (kebab-case via
+        // `rename_all = "kebab-case"`, no inner fields) and round-trip
+        // back to the same variant. The fixture
+        // `empty_explicit_children_no_changes/carina.state.json`
+        // depends on this spelling.
+        let e = ExplicitFields::Unrecorded;
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(json, r#"{"kind":"unrecorded"}"#);
+        let back: ExplicitFields = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, back);
+    }
+
+    #[test]
     fn project_leaf_keeps_whole_value() {
         let mut fields = IndexMap::new();
         fields.insert("any".into(), Value::Concrete(ConcreteValue::Int(1)));
@@ -408,6 +479,41 @@ mod tests {
         let attrs = HashMap::from([("a".to_string(), Value::Concrete(ConcreteValue::Int(1)))]);
         let result = project_attributes(attrs.clone(), &ExplicitFields::Leaf);
         assert_eq!(result, attrs);
+    }
+
+    #[test]
+    fn project_attributes_passes_through_when_unrecorded() {
+        // carina#3280: a legacy state row with no authoring record (a
+        // for-loop child persisted before the expansion path populated
+        // attributes correctly). `Unrecorded` is the typed signal —
+        // pass the attrs through so downstream equality can compare
+        // them against `desired`. Distinct from `Struct { children: {} }`
+        // which means "user authored an empty struct here".
+        let attrs = HashMap::from([
+            ("a".to_string(), Value::Concrete(ConcreteValue::Int(1))),
+            (
+                "b".to_string(),
+                Value::Concrete(ConcreteValue::String("x".into())),
+            ),
+        ]);
+        let result = project_attributes(attrs.clone(), &ExplicitFields::Unrecorded);
+        assert_eq!(result, attrs);
+    }
+
+    #[test]
+    fn project_attributes_drops_top_level_unauthored_when_struct_children_empty() {
+        // Counterpart to `project_attributes_passes_through_when_unrecorded`:
+        // `Struct { children: {} }` is *not* the "no record" signal —
+        // it means "user authored an empty struct at this position" —
+        // and projection correctly drops every attribute. The two
+        // shapes are structurally distinct so callers no longer have
+        // to disambiguate at runtime (carina#3280).
+        let attrs = HashMap::from([("a".to_string(), Value::Concrete(ConcreteValue::Int(1)))]);
+        let explicit = ExplicitFields::Struct {
+            children: HashMap::new(),
+        };
+        let result = project_attributes(attrs, &explicit);
+        assert!(result.is_empty(), "empty Struct must drop all attrs");
     }
 
     #[test]

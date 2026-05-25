@@ -1501,3 +1501,65 @@ fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline()
          ignored and the contract is no longer pinned — got {result:?}"
     );
 }
+
+#[test]
+fn find_changed_attributes_unrecorded_prev_explicit_is_no_change_when_values_match() {
+    // carina#3280: a legacy state row whose authoring record was
+    // destroyed by an older for-loop expansion path is signalled by
+    // `ExplicitFields::Unrecorded` (emitted by the
+    // `from_provider_state` legacy-corruption repair). The projection
+    // must pass `current` through unchanged so the equality loop can
+    // compare against `desired` directly — otherwise every attribute
+    // gets flagged as changed and the plan surfaces a spurious
+    // `forces replacement` for each one.
+    use crate::explicit::ExplicitFields;
+    use std::collections::HashMap;
+
+    let desired: HashMap<String, Value> = HashMap::from([
+        (
+            "principal_type".to_string(),
+            Value::Concrete(ConcreteValue::String("GROUP".to_string())),
+        ),
+        (
+            "target_id".to_string(),
+            Value::Concrete(ConcreteValue::String("123".to_string())),
+        ),
+    ]);
+    let current = desired.clone();
+    let prev_explicit = ExplicitFields::Unrecorded;
+    let changed =
+        find_changed_attributes(&desired, &current, None, Some(&prev_explicit), None, None);
+    assert!(
+        changed.is_empty(),
+        "carina#3280: `Unrecorded` is the \"no authoring record\" \
+         degenerate case — desired == current must produce no changes, got {changed:?}"
+    );
+}
+
+#[test]
+fn find_changed_attributes_unrecorded_prev_explicit_still_detects_real_drift() {
+    // carina#3280 sibling: confirm the `Unrecorded` pass-through
+    // doesn't blind the differ to real drift. With no authoring
+    // record the projection passes `current` through unchanged, so a
+    // genuine value mismatch between `desired` and `current` must
+    // still surface.
+    use crate::explicit::ExplicitFields;
+    use std::collections::HashMap;
+
+    let desired: HashMap<String, Value> = HashMap::from([(
+        "principal_type".to_string(),
+        Value::Concrete(ConcreteValue::String("GROUP".to_string())),
+    )]);
+    let current: HashMap<String, Value> = HashMap::from([(
+        "principal_type".to_string(),
+        Value::Concrete(ConcreteValue::String("USER".to_string())),
+    )]);
+    let prev_explicit = ExplicitFields::Unrecorded;
+    let changed =
+        find_changed_attributes(&desired, &current, None, Some(&prev_explicit), None, None);
+    assert_eq!(
+        changed,
+        vec!["principal_type".to_string()],
+        "real drift under `Unrecorded` must still be reported"
+    );
+}

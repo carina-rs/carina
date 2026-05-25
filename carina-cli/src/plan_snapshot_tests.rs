@@ -324,6 +324,38 @@ fn snapshot_no_changes() {
     insta::assert_snapshot!(output);
 }
 
+/// carina#3280: a state row persisted with `explicit.children: {}` (the
+/// legacy for-loop-child corruption shape) must not surface every
+/// attribute as a spurious diff. Pre-fix `project_attributes` filtered
+/// every key out (empty children → empty projected_current), making
+/// every per-attribute equality check return `false` and rendering a
+/// `~ Change` (or `forces_replacement` Replace, depending on schema)
+/// row for each attribute. Post-fix the empty top-level `Struct` is
+/// treated as "no authoring record" — projection passes attrs through
+/// unchanged — and the desired-matches-state shape produces
+/// `No changes. Infrastructure is up-to-date.`
+#[test]
+fn snapshot_empty_explicit_children_no_changes() {
+    let fp = build_plan_from_fixture_name("empty_explicit_children_no_changes");
+    let output = strip_ansi(&format_plan(
+        &fp.plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&fp.schemas),
+        &fp.moved_origins,
+        &[],
+        &[],
+        Some(&fp.prev_explicit),
+    ));
+    assert!(
+        output.contains("No changes"),
+        "carina#3280: fixture with empty `explicit.children` and matching desired \
+         must render `No changes.`; pre-fix it surfaced every attribute as a \
+         spurious diff. Got:\n{output}"
+    );
+    insta::assert_snapshot!(output);
+}
+
 #[test]
 fn snapshot_mixed_operations() {
     let (plan, schemas, _moved) = build_plan_from_fixture("mixed_operations");

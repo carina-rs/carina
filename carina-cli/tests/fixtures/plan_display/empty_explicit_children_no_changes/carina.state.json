@@ -1,7 +1,7 @@
 {
   "version": 7,
   "serial": 1,
-  "lineage": "test-lineage-map-added-from-none",
+  "lineage": "test-lineage-empty-explicit",
   "carina_version": "0.1.0",
   "resources": [
     {
@@ -11,7 +11,12 @@
       "identifier": "vpc-0123456789abcdef0",
       "attributes": {
         "cidr_block": "10.0.0.0/16",
-        "vpc_id": "vpc-0123456789abcdef0"
+        "enable_dns_support": true,
+        "enable_dns_hostnames": true,
+        "vpc_id": "vpc-0123456789abcdef0",
+        "tags": {
+          "Name": "test-vpc"
+        }
       },
       "protected": false,
       "directives": {},
@@ -20,12 +25,7 @@
       "binding": "vpc",
       "dependency_bindings": [],
       "explicit": {
-        "kind": "struct",
-        "children": {
-          "cidr_block": {
-            "kind": "leaf"
-          }
-        }
+        "kind": "unrecorded"
       }
     }
   ]
