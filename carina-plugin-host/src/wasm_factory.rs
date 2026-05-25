@@ -377,8 +377,7 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
             let handle = wasmtime_wasi::runtime::spawn(async move {
                 let queue_ms = spawn_start.elapsed().as_millis();
                 let handler_start = std::time::Instant::now();
-                let result =
-                    wasmtime_wasi_http::p2::default_send_request_handler(request, config).await;
+                let result = traced_send_request_handler(request, config).await;
                 let handler_ms = handler_start.elapsed().as_millis();
                 eprintln!(
                     "carina-host-http-trace method={} uri={} queue_ms={} handler_ms={} status={}",
@@ -405,15 +404,167 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
 /// Companion to carina-plugin-sdk's `CARINA_WASI_HTTP_TRACE` switch.
 ///
 /// When set to "1", the host-side `WasiHttpHooks::send_request` spawns the
-/// outgoing request via a wrapper around `default_send_request_handler`
-/// and emits the wall-clock breakdown to stderr. Off by default; the
-/// gate is a single atomic load per request when disabled.
+/// outgoing request via `traced_send_request_handler` (a phase-instrumented
+/// copy of wasmtime-wasi-http's `default_send_request_handler`) and emits
+/// the wall-clock breakdown to stderr. Off by default; the gate is a
+/// single atomic load per request when disabled.
 fn trace_http_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
         std::env::var("CARINA_WASI_HTTP_TRACE")
             .map(|v| v == "1")
             .unwrap_or(false)
+    })
+}
+
+/// Phase-instrumented copy of `wasmtime_wasi_http::p2::default_send_request_handler`.
+///
+/// Carries the same TCP/TLS/HTTP path verbatim (so the trace measures what
+/// production actually does), but records `Instant::elapsed()` between each
+/// phase and emits a single stderr line at the end. Used only when
+/// [`trace_http_enabled`] returns true. The non-traced path keeps calling
+/// upstream's handler directly.
+///
+/// Phases (cumulative ms from entry):
+/// - `tcp_connect_ms` — DNS + TCP three-way handshake (`TcpStream::connect`)
+/// - `tls_handshake_ms` — rustls/tokio-rustls handshake (HTTPS only)
+/// - `http_handshake_ms` — hyper http/1.1 protocol handshake
+/// - `send_request_ms` — request headers/body sent, response head arrived
+///
+/// Errors are mapped to the upstream `ErrorCode` variants for parity with
+/// the non-traced path.
+async fn traced_send_request_handler(
+    mut request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+    config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
+) -> Result<
+    wasmtime_wasi_http::p2::types::IncomingResponse,
+    wasmtime_wasi_http::p2::bindings::http::types::ErrorCode,
+> {
+    use http_body_util::BodyExt;
+    use hyper_util::rt::TokioIo;
+    use tokio::net::TcpStream;
+    use tokio::time::timeout;
+    use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
+
+    let wasmtime_wasi_http::p2::types::OutgoingRequestConfig {
+        use_tls,
+        connect_timeout,
+        first_byte_timeout,
+        between_bytes_timeout,
+    } = config;
+
+    let phase_start = std::time::Instant::now();
+    let ms = |start: std::time::Instant| start.elapsed().as_millis();
+
+    let method = request.method().to_string();
+    let uri = request.uri().to_string();
+
+    let authority = if let Some(authority) = request.uri().authority() {
+        if authority.port().is_some() {
+            authority.to_string()
+        } else {
+            let port = if use_tls { 443 } else { 80 };
+            format!("{authority}:{port}")
+        }
+    } else {
+        return Err(ErrorCode::HttpRequestUriInvalid);
+    };
+
+    let tcp_stream = timeout(connect_timeout, TcpStream::connect(&authority))
+        .await
+        .map_err(|_| ErrorCode::ConnectionTimeout)?
+        .map_err(|_| ErrorCode::ConnectionRefused)?;
+    let tcp_connect_ms = ms(phase_start);
+
+    let (mut sender, worker, tls_handshake_ms, http_handshake_ms) = if use_tls {
+        use rustls::pki_types::ServerName;
+
+        let root_cert_store = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.into(),
+        };
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_cert_store)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls_config));
+        let host = authority.split(':').next().unwrap_or(&authority);
+        let domain = ServerName::try_from(host.to_owned()).map_err(|_| {
+            ErrorCode::DnsError(
+                wasmtime_wasi_http::p2::bindings::http::types::DnsErrorPayload {
+                    rcode: Some("invalid dns name".to_string()),
+                    info_code: Some(0),
+                },
+            )
+        })?;
+        let stream = connector
+            .connect(domain, tcp_stream)
+            .await
+            .map_err(|_| ErrorCode::TlsProtocolError)?;
+        let tls_handshake_ms = ms(phase_start);
+
+        let stream = TokioIo::new(stream);
+        let (sender, conn) = timeout(
+            connect_timeout,
+            hyper::client::conn::http1::handshake(stream),
+        )
+        .await
+        .map_err(|_| ErrorCode::ConnectionTimeout)?
+        .map_err(|_| ErrorCode::HttpProtocolError)?;
+        let http_handshake_ms = ms(phase_start);
+
+        let worker = wasmtime_wasi::runtime::spawn(async move {
+            let _ = conn.await;
+        });
+        (sender, worker, tls_handshake_ms, http_handshake_ms)
+    } else {
+        let stream = TokioIo::new(tcp_stream);
+        let (sender, conn) = timeout(
+            connect_timeout,
+            hyper::client::conn::http1::handshake(stream),
+        )
+        .await
+        .map_err(|_| ErrorCode::ConnectionTimeout)?
+        .map_err(|_| ErrorCode::HttpProtocolError)?;
+        let http_handshake_ms = ms(phase_start);
+
+        let worker = wasmtime_wasi::runtime::spawn(async move {
+            let _ = conn.await;
+        });
+        (sender, worker, tcp_connect_ms, http_handshake_ms)
+    };
+
+    // Strip scheme and authority from the request URI: HTTP/1.1 wants only
+    // the path on a non-proxy connection.
+    *request.uri_mut() = hyper::Uri::builder()
+        .path_and_query(
+            request
+                .uri()
+                .path_and_query()
+                .map(|p| p.as_str())
+                .unwrap_or("/"),
+        )
+        .build()
+        .expect("comes from valid request");
+
+    let resp = timeout(first_byte_timeout, sender.send_request(request))
+        .await
+        .map_err(|_| ErrorCode::ConnectionReadTimeout)?
+        .map_err(|_| ErrorCode::HttpProtocolError)?
+        .map(|body| {
+            body.map_err(|_| ErrorCode::HttpProtocolError)
+                .boxed_unsync()
+        });
+    let send_request_ms = ms(phase_start);
+
+    eprintln!(
+        "carina-host-http-trace-phases method={} uri={} \
+         tcp_connect_ms={} tls_handshake_ms={} http_handshake_ms={} send_request_ms={}",
+        method, uri, tcp_connect_ms, tls_handshake_ms, http_handshake_ms, send_request_ms,
+    );
+
+    Ok(wasmtime_wasi_http::p2::types::IncomingResponse {
+        resp,
+        worker: Some(worker),
+        between_bytes_timeout,
     })
 }
 
