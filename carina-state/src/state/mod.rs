@@ -704,6 +704,46 @@ impl ResourceState {
         // so the differ can project actual-state through it and skip
         // server-side defaults the user never authored (refs awscc#206).
         rs.explicit = explicit::build_from_resource(resource);
+        // carina#3280: self-heal legacy state corruption. An older
+        // for-loop expansion path occasionally wrote state rows for
+        // children whose `ManagedResource.attributes` had been lost
+        // before reaching writeback, producing `ExplicitFields::Struct
+        // { children: {} }` on disk. The differ's projection then
+        // dropped every attribute and surfaced spurious
+        // `forces replacement` on every field. When the prior on-disk
+        // row already carries the corrupt empty-Struct shape AND the
+        // current write has nothing to author from `resource.attributes`,
+        // rebuild `explicit` from the fresh `state.attributes` so the
+        // next write replaces the corrupt row.
+        //
+        // The `existing.explicit == Struct { children: {} }` gate is
+        // load-bearing: it scopes the repair to "this row was already
+        // corrupt on disk" and prevents mis-attribution on legitimate
+        // empty-body resources (`aws.sts.CallerIdentity {}`) and on
+        // `carina state import` (which legitimately constructs a
+        // `ManagedResource` with no DSL attributes). Both produce the
+        // same `(resource.attributes.is_empty(), state.attributes
+        // non-empty)` shape; only the prior on-disk explicit
+        // distinguishes a legacy-corrupt row from a green-field write.
+        let existing_is_corrupt = matches!(
+            existing.map(|e| &e.explicit),
+            Some(ExplicitFields::Struct { children }) if children.is_empty()
+        );
+        if existing_is_corrupt
+            && let ExplicitFields::Struct { children } = &rs.explicit
+            && children.is_empty()
+            && !state.attributes.is_empty()
+        {
+            let rebuilt: HashMap<String, ExplicitFields> = state
+                .attributes
+                .iter()
+                .filter(|(k, _)| !k.starts_with('_'))
+                .map(|(k, v)| (k.clone(), explicit::build_from_value(v)))
+                .collect();
+            if !rebuilt.is_empty() {
+                rs.explicit = ExplicitFields::Struct { children: rebuilt };
+            }
+        }
         // Store binding name for tree structure in orphan Delete effects
         rs.binding = resource.binding.clone();
         // Store dependency bindings for tree structure in orphan Delete effects.

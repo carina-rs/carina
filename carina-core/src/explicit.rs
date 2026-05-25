@@ -121,6 +121,12 @@ pub fn merge(a: ExplicitFields, b: ExplicitFields) -> ExplicitFields {
 /// shape (e.g. `Value::Concrete(ConcreteValue::String)` paired with `ExplicitFields::Struct`),
 /// the value is returned unchanged. This is a conservative choice —
 /// better to over-show a value once than to silently hide real data.
+///
+/// Note: an empty `Struct { children: {} }` at this *recursive* position
+/// is a legitimate "user wrote `{}`" (e.g. `tags = {}`) and correctly
+/// drops every field. `project_attributes` (top-level) treats the same
+/// shape differently — as "no authoring record" — see its docs and
+/// carina#3280.
 pub fn project(value: Value, explicit: &ExplicitFields) -> Value {
     match (value, explicit) {
         // user wrote whole leaf: keep entire current value
@@ -150,17 +156,29 @@ pub fn project(value: Value, explicit: &ExplicitFields) -> Value {
 /// outer `explicit` is expected to be `ExplicitFields::Struct` (the
 /// shape `build_from_resource` produces); other variants pass through
 /// conservatively.
+///
+/// `Struct { children: {} }` is treated as "no authoring record" and
+/// passes `attrs` through unchanged. This is the legacy-state case
+/// (carina#3280): a row persisted with empty children — most commonly
+/// a for-loop child whose attributes were lost on the way to writeback
+/// in an older expansion path — would otherwise drop every key on
+/// projection and make every per-attribute equality check return
+/// `false`, surfacing every attribute as a spurious diff. Treating
+/// empty children as "no record" lets the equality loop compare the
+/// real values; the `from_provider_state` repair path then rebuilds a
+/// populated `explicit` on the next apply.
 pub fn project_attributes(
     attrs: HashMap<String, Value>,
     explicit: &ExplicitFields,
 ) -> HashMap<String, Value> {
     match explicit {
-        ExplicitFields::Struct { children } => attrs
+        ExplicitFields::Struct { children } if !children.is_empty() => attrs
             .into_iter()
             .filter_map(|(k, v)| children.get(&k).map(|sub| (k, project(v, sub))))
             .collect(),
-        // Top-level being Leaf or List shouldn't occur for a
-        // resource's full attribute set; pass through conservatively.
+        // Empty `Struct` children = "no authoring record" (legacy state);
+        // top-level being `Leaf` / `List` shouldn't occur for a resource's
+        // full attribute set. Both pass through conservatively.
         _ => attrs,
     }
 }
@@ -407,6 +425,28 @@ mod tests {
     fn project_attributes_passes_through_when_explicit_is_leaf() {
         let attrs = HashMap::from([("a".to_string(), Value::Concrete(ConcreteValue::Int(1)))]);
         let result = project_attributes(attrs.clone(), &ExplicitFields::Leaf);
+        assert_eq!(result, attrs);
+    }
+
+    #[test]
+    fn project_attributes_passes_through_when_struct_children_empty() {
+        // carina#3280: a legacy state row with `Struct { children: {} }`
+        // (a for-loop child persisted before the expansion path populated
+        // attributes correctly) was being interpreted as "the user authored
+        // nothing", which dropped every attribute. Empty top-level children
+        // mean "we have no authoring record" — pass the attrs through so
+        // downstream equality can compare them against `desired`.
+        let attrs = HashMap::from([
+            ("a".to_string(), Value::Concrete(ConcreteValue::Int(1))),
+            (
+                "b".to_string(),
+                Value::Concrete(ConcreteValue::String("x".into())),
+            ),
+        ]);
+        let explicit = ExplicitFields::Struct {
+            children: HashMap::new(),
+        };
+        let result = project_attributes(attrs.clone(), &explicit);
         assert_eq!(result, attrs);
     }
 

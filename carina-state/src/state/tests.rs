@@ -314,6 +314,98 @@ fn test_from_provider_state_without_existing() {
 }
 
 #[test]
+fn test_from_provider_state_repairs_empty_explicit_from_state_attrs() {
+    // carina#3280: a legacy state row persisted with `explicit.children`
+    // empty causes the differ to drop every attribute on projection and
+    // surfaces spurious `forces replacement` on every field. When
+    // `from_provider_state` is called with a `ManagedResource` whose own
+    // `attributes` is empty (the historical write-path bug that produced
+    // the corrupt state) AND the prior on-disk `existing.explicit` is
+    // already the corrupt `Struct { children: {} }` shape, rebuild
+    // `explicit` from the fresh state so the next write self-heals.
+    use carina_core::explicit::ExplicitFields;
+    use carina_core::resource::{ConcreteValue, ManagedResource, State as ProviderState, Value};
+
+    let resource = ManagedResource::with_provider("awscc", "sso.Assignment", "x", None);
+    // resource.attributes intentionally left empty — this is the buggy
+    // input the old expansion path delivered to state writeback.
+    let provider_state = ProviderState {
+        id: resource.id.clone(),
+        identifier: Some("identifier".to_string()),
+        attributes: [
+            (
+                "principal_type".to_string(),
+                Value::Concrete(ConcreteValue::String("GROUP".to_string())),
+            ),
+            (
+                "target_id".to_string(),
+                Value::Concrete(ConcreteValue::String("123".to_string())),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        exists: true,
+        dependency_bindings: BTreeSet::new(),
+    };
+
+    // Simulate the corrupt on-disk row: an existing ResourceState whose
+    // `explicit` is already the empty Struct (the legacy corruption shape).
+    let mut existing = ResourceState::new("sso.Assignment", "x", "awscc");
+    existing.explicit = ExplicitFields::Struct {
+        children: HashMap::new(),
+    };
+
+    let rs =
+        ResourceState::from_provider_state(&resource, &provider_state, Some(&existing)).unwrap();
+
+    let ExplicitFields::Struct { children } = &rs.explicit else {
+        panic!("expected Struct explicit, got {:?}", rs.explicit);
+    };
+    assert!(
+        children.contains_key("principal_type"),
+        "explicit should be rebuilt from state.attributes when prior on-disk explicit was the corrupt empty-Struct shape"
+    );
+    assert!(children.contains_key("target_id"));
+}
+
+#[test]
+fn test_from_provider_state_does_not_repair_fresh_resource_with_empty_attrs() {
+    // carina#3280 follow-up to round-3/5 reviews: the repair must NOT fire
+    // on a green-field write or an empty-DSL-body resource. The discriminator
+    // is the prior on-disk row: only when `existing.explicit` is already the
+    // corrupt `Struct { children: {} }` is this a self-heal. With
+    // `existing: None` (first apply) the empty `resource.attributes` means
+    // the user authored nothing — propagate that authoring intent unchanged
+    // so subsequent diffs don't fabricate user-ownership of server defaults.
+    use carina_core::explicit::ExplicitFields;
+    use carina_core::resource::{ConcreteValue, ManagedResource, State as ProviderState, Value};
+
+    let resource = ManagedResource::with_provider("aws", "sts.CallerIdentity", "caller", None);
+    let provider_state = ProviderState {
+        id: resource.id.clone(),
+        identifier: Some("identifier".to_string()),
+        attributes: [(
+            "account_id".to_string(),
+            Value::Concrete(ConcreteValue::String("123456789012".to_string())),
+        )]
+        .into_iter()
+        .collect(),
+        exists: true,
+        dependency_bindings: BTreeSet::new(),
+    };
+
+    let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
+
+    let ExplicitFields::Struct { children } = &rs.explicit else {
+        panic!("expected Struct explicit, got {:?}", rs.explicit);
+    };
+    assert!(
+        children.is_empty(),
+        "first-apply empty-body resource must NOT have its explicit fabricated from server attrs — got {children:?}"
+    );
+}
+
+#[test]
 fn test_multi_provider_resources_do_not_collide() {
     use carina_core::resource::ManagedResource;
 

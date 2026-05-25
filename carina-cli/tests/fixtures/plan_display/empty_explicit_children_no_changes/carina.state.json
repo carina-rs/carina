@@ -1,0 +1,33 @@
+{
+  "version": 6,
+  "serial": 1,
+  "lineage": "test-lineage-empty-explicit",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "ec2.Vpc",
+      "name": "vpc",
+      "provider": "awscc",
+      "identifier": "vpc-0123456789abcdef0",
+      "attributes": {
+        "cidr_block": "10.0.0.0/16",
+        "enable_dns_support": true,
+        "enable_dns_hostnames": true,
+        "vpc_id": "vpc-0123456789abcdef0",
+        "tags": {
+          "Name": "test-vpc"
+        }
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "vpc",
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {}
+      }
+    }
+  ]
+}

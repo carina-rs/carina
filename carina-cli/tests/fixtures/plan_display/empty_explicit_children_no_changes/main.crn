@@ -1,0 +1,26 @@
+# carina#3280 fixture: a state row whose `explicit.children` is an empty
+# struct (the legacy-corruption shape produced by an older for-loop
+# expansion path). The desired side matches state exactly, so the plan
+# must report `No changes.` — not a spurious `must be replaced` with
+# every attribute flagged. The `let`-named binding is required so the
+# state row's `name` matches without the anonymous-hash step (the
+# fixture-runner skips hashing). The `exports` block uses the binding
+# so the unused-let check passes.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.Vpc {
+  cidr_block           = '10.0.0.0/16'
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = {
+    Name = 'test-vpc'
+  }
+}
+
+exports {
+  vpc_id = vpc.vpc_id
+}

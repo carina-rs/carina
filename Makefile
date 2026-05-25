@@ -4,6 +4,8 @@ plan-all-create:
 	$(PLAN_FIXTURE) all_create
 plan-no-changes:
 	$(PLAN_FIXTURE) no_changes
+plan-empty-explicit-children-no-changes:
+	$(PLAN_FIXTURE) empty_explicit_children_no_changes
 plan-mixed:
 	$(PLAN_FIXTURE) mixed_operations
 plan-delete:
@@ -234,7 +236,7 @@ plan-multi-instance-create:
 	$(PLAN_FIXTURE) multi_instance_create
 plan-multi-instance-module:
 	$(PLAN_FIXTURE) multi_instance_module
-.PHONY: plan-all-create plan-no-changes plan-no-changes-enum plan-mixed plan-delete plan-delete-list-of-maps plan-compact \
+.PHONY: plan-all-create plan-no-changes plan-empty-explicit-children-no-changes plan-no-changes-enum plan-mixed plan-delete plan-delete-list-of-maps plan-compact \
         plan-map-diff plan-list-diff-added-struct plan-list-diff-removed-struct \
         plan-list-diff-modified-with-unchanged \
         plan-list-diff-modified-with-unchanged-nested \
