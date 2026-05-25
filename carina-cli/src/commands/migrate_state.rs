@@ -253,8 +253,15 @@ mod tests {
         let mut s = StateFile::new();
         s.lineage = lineage.to_string();
         for i in 0..n_resources {
-            s.resources
-                .push(ResourceState::new("s3.Bucket", format!("r{i}"), "aws"));
+            // Identifier is mandatory for any row that should survive a
+            // round-trip through `check_and_migrate` (carina#3266): the
+            // read path prunes identifier=None rows as historical
+            // artifacts. Production-shaped `state.resources` rows always
+            // carry an identifier from the provider's apply result.
+            s.resources.push(
+                ResourceState::new("s3.Bucket", format!("r{i}"), "aws")
+                    .with_identifier(format!("bucket-{i}")),
+            );
         }
         s
     }
