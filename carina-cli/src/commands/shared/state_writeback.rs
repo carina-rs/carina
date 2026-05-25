@@ -73,6 +73,13 @@ pub(crate) struct FinalizeApplyInput<'a> {
     /// export-resolution binding view so `exports { x = some_read.attr }`
     /// resolves (carina#3181).
     pub data_sources: &'a [carina_core::resource::DataSource],
+    /// Live execution view of every resource read this run, including
+    /// data-source results. Forwarded to `resolve_exports` so a
+    /// `<data_source>.<attr>` export reference can resolve against
+    /// the provider-read attributes — `state.resources` never persists
+    /// data sources, so consulting it alone leaves those references
+    /// unresolved and `state.exports` stuck at the prior literal
+    /// (carina#3266).
     pub current_states: &'a HashMap<ResourceId, State>,
     pub plan: &'a Plan,
     pub backend: &'a dyn StateBackend,
@@ -143,8 +150,11 @@ pub(crate) struct FinalizeApplyInput<'a> {
 /// The fix splits `sorted_resources` by kind and re-resolves virtual
 /// attributes against the post-apply view before exports use them:
 ///
-/// 1. Build `post_apply_states` from `state.resources` (managed
-///    resources' applied attributes).
+/// 1. Build `post_apply_states` by starting from the live
+///    `current_states` (so data-source read results survive — see
+///    carina#3266) and overlaying entries derived from
+///    `state.resources` (managed resources' applied attributes win
+///    over any pre-apply snapshot left in `current_states`).
 /// 2. Split `sorted_resources` into a managed view (Managed +
 ///    DataSource collapsed onto `ManagedResource` by field projection)
 ///    and a virtual view ([`VirtualResource::try_from`]).
@@ -163,37 +173,48 @@ pub(crate) fn resolve_exports(
     pre_resolve_virtuals: &[carina_core::resource::VirtualResource],
     state: &StateFile,
     wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
+    current_states: &HashMap<ResourceId, carina_core::resource::State>,
 ) -> Result<HashMap<String, serde_json::Value>, AppError> {
     use carina_core::binding_index::ResolvedBindings;
     use carina_core::resolver::resolve_virtual_refs_post_apply;
     use carina_core::resource::Value;
 
     // Step 1: rebuild post-apply `current_states` from
-    // `state.resources` (the writeback already wrote the post-apply
-    // attribute values into the StateFile).
-    let post_apply_states = state
-        .resources
-        .iter()
-        .map(|rs| {
-            let id = ResourceId::with_provider(
-                &rs.provider,
-                &rs.resource_type,
-                &rs.name,
-                rs.directives.provider_instance.clone(),
-            );
-            let attrs: HashMap<String, Value> = rs
-                .attributes
-                .iter()
-                .filter_map(|(k, v)| {
-                    carina_core::value::json_to_dsl_value(v).map(|val| (k.clone(), val))
-                })
-                .collect();
-            (
-                id.clone(),
-                carina_core::resource::State::existing(id, attrs),
-            )
-        })
-        .collect::<HashMap<_, _>>();
+    // `state.resources` for managed resources, and layer in
+    // `current_states` for entries (notably data sources) that the
+    // writeback never persists.
+    //
+    // carina#3266: data sources are not written to `state.resources`,
+    // so an exports expression referencing `<data_source>.<attr>`
+    // would resolve against an empty data-source binding without the
+    // `current_states` layer. With it, `layer_data_source_bindings`
+    // (carina#3265) sees the provider-read attrs and the export
+    // resolves to the read result. State-derived managed entries
+    // win on key collision because they reflect the post-apply
+    // writeback, while `current_states` may still hold the
+    // pre-apply snapshot for any managed resource that was just
+    // applied.
+    let mut post_apply_states: HashMap<ResourceId, carina_core::resource::State> =
+        current_states.clone();
+    for rs in &state.resources {
+        let id = ResourceId::with_provider(
+            &rs.provider,
+            &rs.resource_type,
+            &rs.name,
+            rs.directives.provider_instance.clone(),
+        );
+        let attrs: HashMap<String, Value> = rs
+            .attributes
+            .iter()
+            .filter_map(|(k, v)| {
+                carina_core::value::json_to_dsl_value(v).map(|val| (k.clone(), val))
+            })
+            .collect();
+        post_apply_states.insert(
+            id.clone(),
+            carina_core::resource::State::existing(id, attrs),
+        );
+    }
 
     // Virtuals: fresh clone of the **pre-resolve** snapshot. Their
     // attributes still carry `ResourceRef`s, so the post-apply

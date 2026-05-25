@@ -812,6 +812,7 @@ pub(crate) async fn run_state_refresh_locked(
             &parsed.virtual_resources,
             &state,
             &wait_aliases,
+            &current_states,
         )?;
     }
 
