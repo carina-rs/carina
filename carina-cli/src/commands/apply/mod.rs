@@ -1048,25 +1048,38 @@ async fn run_apply_locked(
     // Create. The #1844 sort constraint (expanded resources must be in
     // the sorted/refreshed/diffed set) is honored by the re-sort
     // inside `expand_same_config_deferred_for`.
+    //
+    // carina#3278: the expand → child-refresh → hydrate(2nd) → lift
+    // quartet runs through `expand_refresh_and_lift_states` so the
+    // apply and refresh paths cannot diverge on these phases. The
+    // constructor is the only way to obtain an `ExpandedRefreshState`
+    // — leaving a phase out becomes a compile error.
     let moved_targets: HashSet<ResourceId> = moved_pairs.iter().map(|(_, to)| to.clone()).collect();
-    let crate::wiring::DeferredForExpansion {
+    let crate::wiring::ExpandedRefreshState {
         sorted_resources: resorted,
         residual_deferred_for,
-        new_child_ids,
-        refreshable_child_ids,
+        new_child_ids: _,
+        refreshable_child_ids: _,
         // `printed_warnings` drives the plan path's spinner-bar-region
         // close (#3150); the apply path's post-refresh bar handling is
         // tracked separately in #3151 and does not consume it here.
         printed_warnings: _,
-    } = crate::wiring::expand_same_config_deferred_for(
+    } = crate::wiring::expand_refresh_and_lift_states(crate::wiring::ExpandRefreshAndLiftInputs {
         parsed,
-        &sorted_resources,
-        &current_states,
-        &remote_bindings,
-        &wait_aliases,
-        &moved_targets,
-        &orphan_refreshed_ids,
-    )?;
+        provider: &provider,
+        sorted_resources: &sorted_resources,
+        current_states: &mut current_states,
+        remote_bindings: &remote_bindings,
+        wait_aliases: &wait_aliases,
+        moved_targets: &moved_targets,
+        already_refreshed: &orphan_refreshed_ids,
+        state_file: &state_file,
+        saved_dep_bindings: &HashMap::new(),
+        saved_attrs: &saved_attrs,
+        multi: &multi,
+        schemas: ctx.schemas(),
+    })
+    .await?;
     sorted_resources = resorted;
     // Expansion borrows `parsed` immutably (expands a clone), so
     // `parsed.deferred_for_expressions` is NOT drained of resolved
@@ -1077,39 +1090,10 @@ async fn run_apply_locked(
     // "deferred" entry. Mirrors the plan path's `ctx.residual_deferred_for`
     // (`commands/plan.rs`).
 
-    if !new_child_ids.is_empty() {
-        // Refresh only `refreshable_child_ids` (carina#3141): a child
-        // that is also a `moved` target keeps the migrated state from
-        // `materialize_moved_states`; re-reading it would clobber that
-        // state with `not_found`. `select` is the same (and only)
-        // constructor the plan path uses — there is no way to filter by
-        // the wider `new_child_ids` here, so a divergence is a compile
-        // error, not a silent parity bug.
-        let children = refreshable_child_ids.select(&sorted_resources);
-        crate::wiring::refresh_resource_set(
-            provider_ref,
-            &multi,
-            children,
-            &state_file,
-            &HashMap::new(),
-            &mut current_states,
-        )
-        .await?;
-        provider
-            .hydrate_read_state(&mut current_states, &saved_attrs)
-            .await;
-    }
-
-    // awscc#251: lift the provider-read `current_states` (not just
-    // `saved_attrs` above) — a refresh whose `provider.read()` returns
-    // plain-`String` IAM enum values must be lifted before the differ
-    // consumes it, same as the plan path. Both refresh phases have
-    // populated `current_states` by here.
-    carina_core::utils::lift_current_state_string_enums(
-        &mut current_states,
-        &sorted_resources,
-        ctx.schemas(),
-    );
+    // Data-source lifting stays inline: it operates on
+    // `parsed.data_sources` (not `sorted_resources`), so it is
+    // independent of the deferred-for expansion sequence the helper
+    // above pins.
     carina_core::utils::lift_current_state_string_enums_for_data_sources(
         &mut current_states,
         &data_sources,

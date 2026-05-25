@@ -1341,6 +1341,138 @@ pub fn expand_same_config_deferred_for<E: Clone>(
     })
 }
 
+/// Result of the deferred-for-expansion + materialised-child-read +
+/// StringEnum-lift trio that every refresh path runs on its
+/// `current_states`.
+///
+/// Closes the bug class behind carina#3266 / #3271 / #3272 at the type
+/// level — same closure pattern as
+/// [`PostApplyStates`](crate::commands::shared::state_writeback::PostApplyStates).
+/// Every call site that needs a post-expansion view of `sorted_resources`
+/// (apply `run_apply_locked`, refresh `run_state_refresh_locked`) MUST
+/// obtain it via [`expand_refresh_and_lift_states`], and the constructor
+/// performs all three phases or none:
+///
+/// 1. `expand_same_config_deferred_for` — synthesise for-loop children
+///    and re-sort the augmented set.
+/// 2. `refresh_resource_set` — read each materialised child through
+///    the provider (filtered through `refreshable_child_ids` so a
+///    `moved`-target or orphan-pre-read child is not re-read).
+/// 3. `lift_current_state_string_enums` on the **post-expansion**
+///    `sorted_resources`, so enum-typed attrs on the new children are
+///    not surfaced as phantom case diffs (carina#3272).
+///
+/// The constructor mutates `current_states` in place (read results are
+/// inserted, then lifted). Caller-side `provider.hydrate_read_state`
+/// stays at the call site — the apply path needs a second hydrate
+/// after this trio (saved_attrs for the new children), the refresh
+/// path runs hydrate once after the trio; encoding that difference
+/// in the constructor would re-introduce the divergence this newtype
+/// is meant to close.
+#[non_exhaustive]
+pub struct ExpandedRefreshState {
+    pub sorted_resources: Vec<ManagedResource>,
+    pub residual_deferred_for: Vec<carina_core::parser::DeferredForExpression>,
+    pub new_child_ids: HashSet<ResourceId>,
+    pub refreshable_child_ids: RefreshableChildIds,
+    pub printed_warnings: bool,
+}
+
+/// Inputs for [`expand_refresh_and_lift_states`].
+///
+/// Grouped into a struct because the underlying phases need many of
+/// the same inputs (provider, schemas, wait_aliases, …) and a flat
+/// arg list would already trip the 7-argument lint here.
+pub struct ExpandRefreshAndLiftInputs<'a, E: Clone, P: Provider + ProviderNormalizer> {
+    pub parsed: &'a carina_core::parser::File<E>,
+    pub provider: &'a P,
+    pub sorted_resources: &'a [ManagedResource],
+    pub current_states: &'a mut HashMap<ResourceId, State>,
+    pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
+    pub wait_aliases: &'a [WaitAliasSpec],
+    pub moved_targets: &'a HashSet<ResourceId>,
+    pub already_refreshed: &'a HashSet<ResourceId>,
+    pub state_file: &'a Option<StateFile>,
+    pub saved_dep_bindings: &'a HashMap<ResourceId, BTreeSet<String>>,
+    /// Saved attribute values to carry forward to materialised children
+    /// via `provider.hydrate_read_state` after their initial read. Pass
+    /// the same `SavedAttrs` the caller built once at the head of its
+    /// pipeline — `hydrate_read_state` is idempotent, so passing it
+    /// here and re-hydrating downstream of this function is safe.
+    pub saved_attrs: &'a carina_core::provider::SavedAttrs,
+    pub multi: &'a indicatif::MultiProgress,
+    pub schemas: &'a carina_core::schema::SchemaRegistry,
+}
+
+/// Run the expand → child-refresh → hydrate → lift quartet in
+/// lock-step.
+///
+/// See [`ExpandedRefreshState`] for why this is a single function.
+pub async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNormalizer>(
+    inputs: ExpandRefreshAndLiftInputs<'_, E, P>,
+) -> Result<ExpandedRefreshState, AppError> {
+    // Phase 1: expand for-loops.
+    let DeferredForExpansion {
+        sorted_resources,
+        residual_deferred_for,
+        new_child_ids,
+        refreshable_child_ids,
+        printed_warnings,
+    } = expand_same_config_deferred_for(
+        inputs.parsed,
+        inputs.sorted_resources,
+        inputs.current_states,
+        inputs.remote_bindings,
+        inputs.wait_aliases,
+        inputs.moved_targets,
+        inputs.already_refreshed,
+    )?;
+
+    // Phase 2: read materialised children that weren't already
+    // refreshed (moved-target / orphan-pre-read are excluded by
+    // `refreshable_child_ids`).
+    //
+    // Phase 2.5: carry forward saved_attrs to the newly-read children
+    // so create-only / API-unreturned fields survive. Mirrors the
+    // 2nd `hydrate_read_state` call apply ran by hand
+    // (apply/mod.rs ~1098); collapsing it into this constructor stops
+    // the next caller from forgetting it.
+    if !new_child_ids.is_empty() {
+        let children = refreshable_child_ids.select(&sorted_resources);
+        refresh_resource_set(
+            inputs.provider,
+            inputs.multi,
+            children,
+            inputs.state_file,
+            inputs.saved_dep_bindings,
+            inputs.current_states,
+        )
+        .await?;
+        inputs
+            .provider
+            .hydrate_read_state(inputs.current_states, inputs.saved_attrs)
+            .await;
+    }
+
+    // Phase 3: lift StringEnums on the post-expansion slice. Both
+    // pre-existing managed resources and the new for-loop children
+    // need this so enum-typed attrs aren't surfaced as phantom case
+    // diffs (carina#3272).
+    carina_core::utils::lift_current_state_string_enums(
+        inputs.current_states,
+        &sorted_resources,
+        inputs.schemas,
+    );
+
+    Ok(ExpandedRefreshState {
+        sorted_resources,
+        residual_deferred_for,
+        new_child_ids,
+        refreshable_child_ids,
+        printed_warnings,
+    })
+}
+
 /// Create a plan from parsed configuration (without upstream state bindings).
 ///
 /// This is a convenience wrapper around `create_plan_from_parsed_with_upstream`

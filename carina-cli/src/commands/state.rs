@@ -22,9 +22,9 @@ use super::validate_and_resolve_with_config;
 use crate::commands::shared::state_writeback::apply_name_overrides;
 use crate::error::AppError;
 use crate::wiring::{
-    WiringContext, build_factories_from_providers, expand_same_config_deferred_for,
-    get_provider_with_ctx, read_data_source_with_retry, reconcile_anonymous_identifiers_with_ctx,
-    reconcile_prefixed_names, refresh_resource_set, resolve_data_source_refs_for_refresh,
+    WiringContext, build_factories_from_providers, get_provider_with_ctx,
+    read_data_source_with_retry, reconcile_anonymous_identifiers_with_ctx,
+    reconcile_prefixed_names, resolve_data_source_refs_for_refresh,
 };
 
 /// Convert a lock acquisition error into an `AppError`.
@@ -715,60 +715,54 @@ pub(crate) async fn run_state_refresh_locked(
         .iter()
         .map(carina_core::binding_index::WaitAliasSpec::from)
         .collect();
-    let crate::wiring::DeferredForExpansion {
+    // carina#3278: route the expand → child-refresh → hydrate(2nd) →
+    // lift quartet through the shared constructor so this path and
+    // `run_apply_locked` cannot drift on the sequence again.
+    let saved_attrs_for_expansion = state_file
+        .as_ref()
+        .map(|sf| sf.build_saved_attrs())
+        .unwrap_or_default();
+    let saved_dep_bindings: HashMap<ResourceId, BTreeSet<String>> = state_file
+        .as_ref()
+        .map(|sf| {
+            sorted_resources
+                .iter()
+                .filter_map(|r| {
+                    let rs =
+                        sf.find_resource(&r.id.provider, &r.id.resource_type, r.id.name_str())?;
+                    if rs.dependency_bindings.is_empty() {
+                        None
+                    } else {
+                        Some((r.id.clone(), rs.dependency_bindings.clone()))
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let multi = indicatif::MultiProgress::new();
+    let crate::wiring::ExpandedRefreshState {
         sorted_resources: resorted,
-        new_child_ids,
-        refreshable_child_ids,
-        // residual / warnings: not consumed by the refresh path.
+        new_child_ids: _,
+        refreshable_child_ids: _,
         residual_deferred_for: _,
         printed_warnings: _,
-    } = expand_same_config_deferred_for(
+    } = crate::wiring::expand_refresh_and_lift_states(crate::wiring::ExpandRefreshAndLiftInputs {
         parsed,
-        &sorted_resources,
-        &current_states,
-        &HashMap::new(),
-        &wait_aliases_for_expansion,
-        &HashSet::new(),
-        &already_refreshed,
-    )?;
+        provider: &provider,
+        sorted_resources: &sorted_resources,
+        current_states: &mut current_states,
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &wait_aliases_for_expansion,
+        moved_targets: &HashSet::new(),
+        already_refreshed: &already_refreshed,
+        state_file: &state_file,
+        saved_dep_bindings: &saved_dep_bindings,
+        saved_attrs: &saved_attrs_for_expansion,
+        multi: &multi,
+        schemas: ctx.schemas(),
+    })
+    .await?;
     sorted_resources = resorted;
-
-    // Read state for any for-loop-materialised children that the
-    // initial managed loop didn't visit.
-    if !new_child_ids.is_empty() {
-        // Mirror the apply path's hand-rolled `saved_dep_bindings`
-        // build (apply/mod.rs ~874): `Provider::read` does not return
-        // `dependency_bindings`, so we have to pull them from the
-        // state file ourselves to restore them on the fresh state.
-        let saved_dep_bindings: HashMap<ResourceId, BTreeSet<String>> = state_file
-            .as_ref()
-            .map(|sf| {
-                sorted_resources
-                    .iter()
-                    .filter_map(|r| {
-                        let rs =
-                            sf.find_resource(&r.id.provider, &r.id.resource_type, r.id.name_str())?;
-                        if rs.dependency_bindings.is_empty() {
-                            None
-                        } else {
-                            Some((r.id.clone(), rs.dependency_bindings.clone()))
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let children = refreshable_child_ids.select(&sorted_resources);
-        let multi = indicatif::MultiProgress::new();
-        let _ = refresh_resource_set(
-            &provider,
-            &multi,
-            children,
-            &state_file,
-            &saved_dep_bindings,
-            &mut current_states,
-        )
-        .await?;
-    }
 
     // Also read states for orphaned resources (in state but removed from config)
     let desired_ids: HashSet<ResourceId> = sorted_resources.iter().map(|r| r.id.clone()).collect();
