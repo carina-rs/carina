@@ -1332,7 +1332,7 @@ mod tests {
     fn build_plan_from_state_empty() {
         let state = StateFile::new();
         let plan = build_plan_from_state(&state);
-        assert!(plan.is_empty());
+        assert!(plan.effects().is_empty());
     }
 
     #[test]

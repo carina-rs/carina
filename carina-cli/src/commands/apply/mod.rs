@@ -1619,7 +1619,14 @@ async fn run_apply_from_plan_locked(
         )));
     }
 
-    if plan.is_empty() {
+    if !plan.has_mutations() {
+        // Saved plans serialize every `Effect::Read` produced by the
+        // differ; gating on `is_empty()` would skip this branch for
+        // any data-source-bearing config, even when no managed
+        // resource needs work, and fall through into the
+        // resource-apply pipeline. Mirrors the source-driven apply
+        // path's gate (carina#3270 → run_apply_locked).
+        // carina#3275.
         println!("{}", "No changes needed.".green());
         return Ok(());
     }

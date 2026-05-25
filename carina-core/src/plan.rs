@@ -49,9 +49,14 @@ impl Plan {
         &self.effects
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.effects.is_empty()
-    }
+    // No `Plan::is_empty()`: it ambiguously straddled "no effects at
+    // all" (display semantics) and "nothing to apply" (routing
+    // semantics). Read/Wait effects are non-mutating but non-empty,
+    // and routing on `is_empty()` mis-routed export-only configs
+    // through the resource-apply pipeline (carina#3270, carina#3275).
+    // Call sites must say what they mean:
+    //   - display "no effects at all" → `plan.effects().is_empty()`
+    //   - routing "nothing to apply"   → `!plan.has_mutations()`
 
     /// Add a directive constraint violation error
     pub fn add_error(&mut self, error: PlanError) {
@@ -181,15 +186,15 @@ impl Plan {
 
     /// True iff the plan contains at least one mutating effect.
     ///
-    /// `is_empty()` returns false for a plan that holds only `Read` /
-    /// `Wait` effects, even though those do not change infrastructure.
-    /// Callers that route apply between the export-only fast path
-    /// (`persist_exports_only`) and the full resource-apply pipeline
-    /// MUST gate on this, not on `is_empty()`: a config whose only
-    /// difference from state is an export expression that reads a
-    /// data source produces a plan with `Read` effects but no
-    /// mutations, and `is_empty()` would mis-route it through the
-    /// resource-apply path (carina#3270).
+    /// This is the **only** correct routing predicate for "does this
+    /// plan need the resource-apply pipeline?". `Read`/`Wait` effects
+    /// do not mutate infrastructure, so a plan that holds only those
+    /// must take the export-only fast path (`persist_exports_only`)
+    /// or short-circuit with "no changes". A predicate built on
+    /// `effects().is_empty()` mis-routes any plan that carries a
+    /// data-source read — every config with `let x = read aws.*`
+    /// produces one (carina#3270 source-driven apply, carina#3275
+    /// saved-plan apply).
     pub fn has_mutations(&self) -> bool {
         self.effects.iter().any(|e| e.is_mutating())
     }
@@ -429,7 +434,7 @@ mod tests {
     #[test]
     fn empty_plan() {
         let plan = Plan::new();
-        assert!(plan.is_empty());
+        assert!(plan.effects().is_empty());
         assert_eq!(plan.mutation_count(), 0);
         assert!(!plan.has_mutations());
     }
@@ -448,8 +453,8 @@ mod tests {
         plan.add(Effect::Read {
             resource: DataSource::with_provider("aws", "iam.Roles", "admin_access_roles", None),
         });
-        // `is_empty()` is false — Read counts as a present effect.
-        assert!(!plan.is_empty());
+        // `effects().is_empty()` is false — Read counts as a present effect.
+        assert!(!plan.effects().is_empty());
         // But there is no mutation, so the export-only fast path
         // must take this plan.
         assert!(!plan.has_mutations());

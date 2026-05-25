@@ -205,7 +205,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
         &[],
     );
     assert!(
-        !plan_without.is_empty(),
+        !plan_without.effects().is_empty(),
         "Without normalize_state, differ should see a false diff"
     );
 
@@ -224,7 +224,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
         &[],
     );
     assert!(
-        plan_with.is_empty(),
+        plan_with.effects().is_empty(),
         "After normalize_state, no false diff should occur"
     );
 }
@@ -316,7 +316,7 @@ fn test_merge_default_tags_prevents_false_diff() {
         &[],
     );
     assert!(
-        !plan_without.is_empty(),
+        !plan_without.effects().is_empty(),
         "Without merge_default_tags, differ should see a false diff"
     );
 
@@ -346,7 +346,7 @@ fn test_merge_default_tags_prevents_false_diff() {
         &[],
     );
     assert!(
-        plan_with.is_empty(),
+        plan_with.effects().is_empty(),
         "After merge_default_tags, no false diff should occur"
     );
 }
