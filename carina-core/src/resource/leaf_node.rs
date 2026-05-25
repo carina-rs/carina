@@ -62,6 +62,16 @@ impl LeafNode {
         }
     }
 
+    /// The id of the underlying node wrapped as a [`PersistentId`](super::PersistentId).
+    ///
+    /// `LeafNode` is by construction a leaf — never a composition —
+    /// so its id is always `Persistent`. APIs that take
+    /// `&PersistentId` can be fed from a `LeafNode` without further
+    /// discrimination.
+    pub fn persistent_id(&self) -> super::PersistentId {
+        super::PersistentId::new(self.id().clone())
+    }
+
     /// Whether this leaf is a [`Resource`] (CRUD variant).
     pub fn is_resource(&self) -> bool {
         matches!(self, LeafNode::Resource(_))

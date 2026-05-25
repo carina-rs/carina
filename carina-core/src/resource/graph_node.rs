@@ -55,6 +55,23 @@ impl GraphNode {
         }
     }
 
+    /// The id of the underlying node, wrapped in the appropriate
+    /// [`NodeId`](super::NodeId) variant: `Persistent` for `Resource`
+    /// / `DataSource`, `Ephemeral` for `Composition`.
+    ///
+    /// Use this when a caller needs an id whose typestate reflects
+    /// "may be looked up in state" — and the caller does not already
+    /// know which variant it holds. State-load APIs should still take
+    /// `&PersistentId` directly so passing an `Ephemeral` is a compile
+    /// error rather than a runtime branch.
+    pub fn node_id(&self) -> super::NodeId {
+        match self {
+            GraphNode::Resource(r) => super::NodeId::Persistent(r.persistent_id()),
+            GraphNode::DataSource(d) => super::NodeId::Persistent(d.persistent_id()),
+            GraphNode::Composition(c) => super::NodeId::Ephemeral(c.ephemeral_id()),
+        }
+    }
+
     /// Whether this node is a [`Resource`] (CRUD variant).
     pub fn is_resource(&self) -> bool {
         matches!(self, GraphNode::Resource(_))

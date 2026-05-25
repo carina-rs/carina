@@ -67,6 +67,15 @@ impl DataSource {
         }
     }
 
+    /// The data source's id wrapped as a [`PersistentId`] — i.e., an
+    /// id that may legally enter state-load APIs.
+    ///
+    /// `DataSource` is a leaf node and persists in state (as a
+    /// snapshot), so its id is `PersistentId`-typed.
+    pub fn persistent_id(&self) -> super::PersistentId {
+        super::PersistentId::new(self.id.clone())
+    }
+
     /// Create a data source with a provider-qualified id.
     pub fn with_provider(
         provider: impl Into<String>,
