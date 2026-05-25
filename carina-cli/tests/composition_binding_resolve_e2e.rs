@@ -1,17 +1,17 @@
 //! End-to-end regression for carina#3246.
 //!
 //! A managed-resource attribute that references `<module_instance>.<attr>`
-//! (where `<module_instance>` is a `VirtualResource` produced by module
+//! (where `<module_instance>` is a `Composition` produced by module
 //! expansion) must resolve to the concrete managed-sibling literal that
 //! backs it. Pre-carina#3248, the plan-path resolver built bindings from
-//! the managed slice only, so the virtual-rooted ref survived as
+//! the managed slice only, so the composition-rooted ref survived as
 //! `ResourceRef` and the differ compared it against the literal already
 //! in state — producing a spurious "must be replaced" diff for what is
 //! the same value.
 //!
 //! Post-carina#3248, the resolver consumes a unified `ResolvedBindings`
-//! built via `pre_apply`, which lays virtuals into the binding map.
-//! The virtual-rooted ref chains through the virtual's attribute map
+//! built via `pre_apply`, which lays compositions into the binding map.
+//! The composition-rooted ref chains through the composition's attribute map
 //! to the managed sibling literal.
 //!
 //! Per CLAUDE.md "Directory-scoped, never single-file", the fixture
@@ -207,7 +207,7 @@ let bs = outer { }
 }
 
 /// Validate-path smoke: the fixture must validate cleanly. The
-/// virtual-rooted ref `bootstrap.role_name` is reachable from the
+/// composition-rooted ref `bootstrap.role_name` is reachable from the
 /// anonymous RolePolicy and must not surface as a binding or type
 /// error after expansion.
 #[test]
@@ -225,12 +225,12 @@ fn validate_passes_for_virtual_rooted_ref() {
 }
 
 /// Plan-path regression: a RolePolicy attribute referencing
-/// `<module_instance>.role_name` (a virtual-rooted ref) must resolve
+/// `<module_instance>.role_name` (a composition-rooted ref) must resolve
 /// to the concrete literal through the unified `ResolvedBindings`
 /// view that `pre_apply` constructs (carina#3246 / carina#3248).
 ///
 /// Pre-fix, the plan-path resolver built bindings from the managed
-/// slice only and the virtual-rooted ref survived as `ResourceRef`,
+/// slice only and the composition-rooted ref survived as `ResourceRef`,
 /// producing a spurious diff against state's matching literal.
 #[test]
 fn resolve_refs_for_plan_chains_through_virtual_in_multi_file_fixture() {
@@ -250,7 +250,7 @@ fn resolve_refs_for_plan_chains_through_virtual_in_multi_file_fixture() {
     // `load_configuration_with_config` does not run nested module
     // expansion; the CLI command pipeline calls it after validate.
     // Drive it explicitly here so the post-expansion shape (RolePolicy
-    // in `resources`, `_virtual.bs.bootstrap` in `virtual_resources`)
+    // in `resources`, `_virtual.bs.bootstrap` in `compositions`)
     // is in place for the assertion below.
     carina_core::module_resolver::resolve_modules_with_config(
         &mut parsed,
@@ -270,13 +270,13 @@ fn resolve_refs_for_plan_chains_through_virtual_in_multi_file_fixture() {
     );
     assert!(
         parsed
-            .virtual_resources
+            .compositions
             .iter()
             .any(|v| v.binding.as_deref() == Some("bs.bootstrap")),
-        "virtual `bs.bootstrap` must be present after expansion",
+        "composition `bs.bootstrap` must be present after expansion",
     );
 
-    // Pre-resolve: the RolePolicy carries the virtual-rooted ref.
+    // Pre-resolve: the RolePolicy carries the composition-rooted ref.
     let policy = parsed
         .resources
         .iter()
@@ -287,7 +287,7 @@ fn resolve_refs_for_plan_chains_through_virtual_in_multi_file_fixture() {
             assert_eq!(
                 path.binding(),
                 "bs.bootstrap",
-                "expected the virtual-rooted ref shape; got: {}",
+                "expected the composition-rooted ref shape; got: {}",
                 path.binding()
             );
         }
@@ -296,13 +296,13 @@ fn resolve_refs_for_plan_chains_through_virtual_in_multi_file_fixture() {
 
     // Build the unified pre-apply bindings view per the carina#3248
     // contract and run the plan-path resolver. The fix: `pre_apply`
-    // lays virtuals into the binding map so the virtual-rooted ref
+    // lays compositions into the binding map so the composition-rooted ref
     // chains through to the managed sibling literal.
     let mut resources = parsed.resources.clone();
     let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
         carina_core::binding_index::PreApplyInputs {
             managed: &resources,
-            virtuals: &parsed.virtual_resources,
+            compositions: &parsed.compositions,
             data_sources: &parsed.data_sources,
             current_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),

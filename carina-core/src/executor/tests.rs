@@ -424,7 +424,7 @@ async fn test_simple_create() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -474,7 +474,7 @@ async fn test_apply_renormalizes_after_resolution() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &CanonicalizingNormalizer,
@@ -529,7 +529,7 @@ async fn test_apply_reapplies_enum_alias_stage() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -589,7 +589,7 @@ async fn test_apply_reapplies_enum_alias_stage_update_path() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -641,7 +641,7 @@ async fn test_apply_reapplies_canonicalize_stage() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -699,7 +699,7 @@ async fn test_apply_renormalizes_update_path() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &CanonicalizingNormalizer,
@@ -762,7 +762,7 @@ async fn test_apply_renormalizes_nested_value_under_ref_bearing_resource() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &CanonicalizingNormalizer,
@@ -898,7 +898,7 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &normalizer,
@@ -960,7 +960,7 @@ async fn test_simple_delete() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -992,7 +992,7 @@ async fn test_failed_effect_propagates_to_dependent() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -1043,7 +1043,7 @@ async fn test_cbd_creates_before_deletes() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -1088,7 +1088,7 @@ async fn test_dbd_deletes_before_creates() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -1166,7 +1166,7 @@ async fn test_phased_cbd_creates_in_forward_order_deletes_in_reverse() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -1243,7 +1243,7 @@ async fn test_phased_noncbd_creates_after_deletes() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -1280,7 +1280,7 @@ async fn test_observer_events_emitted_correctly() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -1308,7 +1308,7 @@ async fn test_read_effect_is_no_op() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -1349,7 +1349,7 @@ async fn test_independent_effects_run_in_parallel() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -1400,7 +1400,7 @@ async fn test_parallel_failure_skips_dependents() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -1448,7 +1448,7 @@ async fn test_dependency_levels_sequential_chain() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -1675,7 +1675,7 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -1718,7 +1718,7 @@ async fn test_waiting_events_emitted_for_dependent_effects() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -1893,7 +1893,7 @@ async fn test_update_effect_binding_map_propagation() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -2012,7 +2012,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -2196,7 +2196,7 @@ async fn test_delete_waits_for_replace_cbd_of_dependent() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -2286,7 +2286,7 @@ async fn test_delete_waits_for_replace_cbd_even_when_delete_binding_is_none() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -2377,7 +2377,7 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -2523,7 +2523,7 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -2602,7 +2602,7 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -2719,7 +2719,7 @@ async fn test_chained_index_then_field_unresolved_at_apply_fails_with_clear_erro
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -2899,7 +2899,7 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -3104,7 +3104,7 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -3193,7 +3193,7 @@ async fn test_phased_move_with_interdependent_replace_does_not_panic() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
@@ -3314,7 +3314,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
     // current_states in one go.
     let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
         managed: &[role],
-        virtuals: &[],
+        compositions: &[],
         data_sources: &[ds],
         current_states: &current_states,
         remote_bindings: &HashMap::new(),
@@ -3324,7 +3324,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &HashMap::new(),
-        virtual_resources: &[],
+        compositions: &[],
         bindings,
         current_states,
         normalizer: &NoopNormalizer,

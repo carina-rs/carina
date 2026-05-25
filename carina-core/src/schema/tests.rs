@@ -15,7 +15,7 @@ fn attribute_schema_write_only_builder() {
 #[test]
 fn resource_schema_kind_default_managed() {
     let schema = ResourceSchema::new("test.resource");
-    assert_eq!(schema.kind, SchemaKind::Managed);
+    assert_eq!(schema.kind, SchemaKind::Resource);
     assert!(!schema.is_data_source());
 }
 
@@ -3958,7 +3958,7 @@ fn schema_registry_routes_lookup_by_typestate() {
     let m = registry
         .get_for(&managed_res)
         .expect("managed schema present");
-    assert_eq!(m.kind, SchemaKind::Managed);
+    assert_eq!(m.kind, SchemaKind::Resource);
 
     let d = registry
         .get_for_data_source(&data_res)
@@ -3971,7 +3971,7 @@ fn schema_registry_missing_returns_none() {
     let registry = SchemaRegistry::new();
     assert!(
         registry
-            .get("aws", "s3.Bucket", SchemaKind::Managed)
+            .get("aws", "s3.Bucket", SchemaKind::Resource)
             .is_none()
     );
     assert!(!registry.has_managed("aws", "s3.Bucket"));

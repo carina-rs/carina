@@ -1161,15 +1161,15 @@ fn resolve_exports_resolves_cross_file_dot_notation_strings() {
 }
 
 #[test]
-fn resolve_exports_resolves_module_call_attribute_via_virtual_resource() {
+fn resolve_exports_resolves_module_call_attribute_via_composition() {
     // #2479: writeback used to build bindings from `state.resources`
-    // only. A virtual resource (synthesised by module-call expansion to
+    // only. A composition resource (synthesised by module-call expansion to
     // expose `attributes { role_arn = role.arn }`) carries no provider
     // identity and never lands in `state.resources`, so an export
     // referencing `<module_call>.<attr>` failed with
     // `unresolved reference <call>.<attr>`.
     use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
-    use carina_core::resource::{AccessPath, DeferredValue, Value, VirtualResource};
+    use carina_core::resource::{AccessPath, Composition, DeferredValue, Value};
     use carina_state::StateFile;
 
     let state = {
@@ -1200,7 +1200,7 @@ fn resolve_exports_resolves_module_call_attribute_via_virtual_resource() {
 
     // Virtual resource as `expand_module_call` produces it: binding is
     // the module-call alias, and each attribute is a ResourceRef into
-    // an expanded sub-resource. carina#3181: virtuals are their own type.
+    // an expanded sub-resource. carina#3181: compositions are their own type.
     let mut virt_attrs = indexmap::IndexMap::new();
     virt_attrs.insert(
         "role_arn".to_string(),
@@ -1208,7 +1208,7 @@ fn resolve_exports_resolves_module_call_attribute_via_virtual_resource() {
             path: AccessPath::new("github_actions_carina.role", "arn"),
         }),
     );
-    let virtual_resource = VirtualResource {
+    let composition = Composition {
         id: carina_core::resource::ResourceId::new("_virtual", "github_actions_carina"),
         attributes: virt_attrs,
         binding: Some("github_actions_carina".to_string()),
@@ -1218,7 +1218,7 @@ fn resolve_exports_resolves_module_call_attribute_via_virtual_resource() {
         quoted_string_attrs: std::collections::HashSet::new(),
     };
     let sorted_resources = vec![role_resource];
-    let pre_resolve_virtuals = vec![virtual_resource];
+    let pre_resolve_compositions = vec![composition];
 
     let export_params = vec![ExportParameter {
         name: "role_arn".to_string(),
@@ -1237,7 +1237,7 @@ fn resolve_exports_resolves_module_call_attribute_via_virtual_resource() {
         &export_params,
         &sorted_resources,
         &[],
-        &pre_resolve_virtuals,
+        &pre_resolve_compositions,
         &post_apply_states,
         &[],
     )
@@ -1248,13 +1248,13 @@ fn resolve_exports_resolves_module_call_attribute_via_virtual_resource() {
         Some(&serde_json::Value::String(
             "arn:aws:iam::123456789012:role/github-actions-carina".to_string()
         )),
-        "module-call attribute export must resolve via virtual binding + provider state, got: {:?}",
+        "module-call attribute export must resolve via composition binding + provider state, got: {:?}",
         exports
     );
 }
 
 #[test]
-fn resolve_exports_resolves_chained_module_call_attribute_via_two_virtuals() {
+fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions() {
     // #2479 follow-up: a module-call binding whose attribute itself
     // points at *another* module-call binding's attribute (e.g.
     // `${outer_module.public_role_arn}` where the outer module's
@@ -1264,7 +1264,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_virtuals() {
     // role's `arn` from state. Pins the resolver's transitive walk so a
     // regression that broke after a single hop would surface.
     use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
-    use carina_core::resource::{AccessPath, DeferredValue, Value, VirtualResource};
+    use carina_core::resource::{AccessPath, Composition, DeferredValue, Value};
     use carina_state::StateFile;
 
     let state = {
@@ -1292,7 +1292,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_virtuals() {
     let mut role_resource = Resource::with_provider("awscc", "iam.Role", "outer.inner.role", None);
     role_resource.binding = Some("outer.inner.role".to_string());
 
-    // carina#3181: virtuals are a distinct typestate.
+    // carina#3181: compositions are a distinct typestate.
     let make_virtual = |id_name: &str, binding: &str, attr: &str, ref_b: &str, ref_a: &str| {
         let mut attributes = indexmap::IndexMap::new();
         attributes.insert(
@@ -1301,7 +1301,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_virtuals() {
                 path: AccessPath::new(ref_b, ref_a),
             }),
         );
-        VirtualResource {
+        Composition {
             id: carina_core::resource::ResourceId::new("_virtual", id_name),
             attributes,
             binding: Some(binding.to_string()),
@@ -1336,7 +1336,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_virtuals() {
         })),
     }];
 
-    let pre_resolve_virtuals = vec![inner_virtual, outer_virtual];
+    let pre_resolve_compositions = vec![inner_virtual, outer_virtual];
     let post_apply_states =
         crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
             &std::collections::HashMap::new(),
@@ -1346,7 +1346,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_virtuals() {
         &export_params,
         &sorted_resources,
         &[],
-        &pre_resolve_virtuals,
+        &pre_resolve_compositions,
         &post_apply_states,
         &[],
     )
@@ -1357,7 +1357,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_virtuals() {
         Some(&serde_json::Value::String(
             "arn:aws:iam::123456789012:role/chained".to_string()
         )),
-        "two-hop module-call chain must resolve through both virtuals, got: {:?}",
+        "two-hop module-call chain must resolve through both compositions, got: {:?}",
         exports
     );
 }
@@ -1370,18 +1370,18 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     // call to `resolve_refs_with_state_and_remote(&mut
     // resources_for_plan, &pre_apply_current_states, …)` collapses
     // every `ResourceRef` — including the ones inside a
-    // `VirtualResource`'s `attributes` — into the pre-apply
-    // concrete value (here: OLD_ARN). The virtual's `role_arn`
+    // `Composition`'s `attributes` — into the pre-apply
+    // concrete value (here: OLD_ARN). The composition's `role_arn`
     // attribute thus becomes a frozen string snapshot of the
     // pre-apply state. Later in `finalize_apply`, the resource
     // graph is sent into `resolve_exports`, which feeds the
-    // virtual's stale `role_arn` into `state.exports` — even
+    // composition's stale `role_arn` into `state.exports` — even
     // though the writeback wrote the new ARN into
     // `state.resources[role].arn`. So `state.exports.role_arn` and
     // `state.resources[role].arn` disagree, with exports holding
     // the old ARN.
     //
-    // **The fix** (#3177): `apply/mod.rs` snapshots every virtual
+    // **The fix** (#3177): `apply/mod.rs` snapshots every composition
     // *before* the head-of-pipeline `ResourceRef` collapse — that
     // snapshot still carries the authored `ref role.arn`. It
     // threads that pre-resolve snapshot into `finalize_apply` →
@@ -1389,12 +1389,12 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     // `sorted_resources`) to build a fresh post-apply
     // `ResolvedBindings` view via the typestate-split API
     // (`from_managed_with_state` + `resolve_virtual_refs_post_apply`
-    // + `layer_virtuals_post_apply`). Exports then resolve against the
+    // + `layer_compositions_post_apply`). Exports then resolve against the
     // post-apply view.
     //
     // **The test** mirrors that production pipeline: it (1)
-    // constructs the same managed + virtual graph, (2) takes a
-    // pre-resolve snapshot of the virtual, (3) runs the head-of-
+    // constructs the same managed + composition graph, (2) takes a
+    // pre-resolve snapshot of the composition, (3) runs the head-of-
     // pipeline resolver against a *pre-apply* `current_states`
     // (OLD_ARN), then (4) feeds the pre-resolve snapshot and the
     // resolved working slice into `resolve_exports` along with a
@@ -1402,14 +1402,14 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     // export ends up at NEW_ARN.
     //
     // Without the #3177 fix, `resolve_exports` would consult the
-    // mutated virtual's stale concrete attribute and return
+    // mutated composition's stale concrete attribute and return
     // OLD_ARN. With the fix in place, the pre-resolve snapshot
     // kicks in and re-resolves against the post-apply state.
     use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
     use carina_core::resolver::resolve_managed_refs_with_state_and_remote;
     use carina_core::resource::{
-        AccessPath, ConcreteValue, DeferredValue, ResourceId, State as ResourceState, Value,
-        VirtualResource,
+        AccessPath, Composition, ConcreteValue, DeferredValue, ResourceId, State as ResourceState,
+        Value,
     };
     use carina_state::StateFile;
     use std::collections::HashMap;
@@ -1442,7 +1442,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
 
     // Step (b): pre-apply `current_states` — what the head-of-
     // pipeline resolver sees. Holds the OLD ARN, so the pre-apply
-    // pass freezes virtual `role_arn` to OLD_ARN.
+    // pass freezes composition `role_arn` to OLD_ARN.
     let pre_apply_current_states: HashMap<ResourceId, ResourceState> = {
         let id = ResourceId::with_provider("awscc", "iam.Role", "carina_role", None);
         let mut attrs: HashMap<String, Value> = HashMap::new();
@@ -1456,9 +1456,9 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     };
 
     // Build the authored resource graph: a managed `role` (DSL
-    // does not inline `arn` — provider returns it) and a virtual
+    // does not inline `arn` — provider returns it) and a composition
     // module-call binding that references `role.arn`. carina#3181:
-    // virtuals are a distinct typestate, untouched by the managed
+    // compositions are a distinct typestate, untouched by the managed
     // head-of-pipeline resolver — they keep their authored
     // `ResourceRef`s, which is exactly the pre-resolve snapshot the
     // #3177 fix needs.
@@ -1472,7 +1472,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
             path: AccessPath::new("role", "arn"),
         }),
     );
-    let virtual_resource = VirtualResource {
+    let composition = Composition {
         id: ResourceId::new("_virtual", "carina_module"),
         attributes: virt_attrs,
         binding: Some("carina_module".to_string()),
@@ -1484,17 +1484,17 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
 
     let mut sorted_resources = vec![role_managed];
 
-    // Step (c): pre-resolve snapshot of the virtual — carries the
+    // Step (c): pre-resolve snapshot of the composition — carries the
     // authored `ref role.arn`.
-    let pre_resolve_virtuals: Vec<VirtualResource> = vec![virtual_resource];
+    let pre_resolve_compositions: Vec<Composition> = vec![composition];
 
     // Step (d): head-of-pipeline resolver — runs over the managed
-    // slice only. Virtuals are not part of it, so the pre-resolve
+    // slice only. compositions are not part of it, so the pre-resolve
     // snapshot above is preserved verbatim.
     let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
         carina_core::binding_index::PreApplyInputs {
             managed: &sorted_resources.clone(),
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[],
             current_states: &pre_apply_current_states,
             remote_bindings: &HashMap::new(),
@@ -1520,7 +1520,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
         &export_params,
         &sorted_resources,
         &[],
-        &pre_resolve_virtuals,
+        &pre_resolve_compositions,
         &post_apply_states,
         &[],
     )
@@ -1955,7 +1955,7 @@ mod apply_deferred_for_parity {
 
 #[cfg(test)]
 mod saved_plan_version_tests {
-    //! carina#3248: saved plans now persist `virtual_resources` and
+    //! carina#3248: saved plans now persist `compositions` and
     //! `data_sources` (version `4`). Older plans (version `3` and
     //! below) are rejected outright per the repo's
     //! no-backward-compat policy — re-running `carina plan` is the
@@ -1976,7 +1976,7 @@ mod saved_plan_version_tests {
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("plan.json");
         // A v3 plan: everything required by the pre-#3248 PlanFile
-        // shape, no `virtual_resources` field.
+        // shape, no `compositions` field.
         let v3 = serde_json::json!({
             "version": 3,
             "carina_version": "0.4.0",

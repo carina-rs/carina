@@ -394,8 +394,8 @@ pub fn parse_with_seeded_bindings(
     // carina#3181: managed resources and data sources are collected into
     // separate typed `Vec`s from the start — `resources` is managed-only,
     // `data_sources` holds the `read`-keyword resources. The parser never
-    // synthesizes virtual resources (that is the module expander's job),
-    // so `virtual_resources` is empty here.
+    // synthesizes composition resources (that is the module expander's job),
+    // so `compositions` is empty here.
 
     Ok(ParsedFile {
         providers,
@@ -403,7 +403,7 @@ pub fn parse_with_seeded_bindings(
         data_sources,
         // Virtual resources are synthesized by module-call expansion,
         // not the parser — left empty here, populated in `expander.rs`.
-        virtual_resources: Vec::new(),
+        compositions: Vec::new(),
         variables,
         uses,
         module_calls,
@@ -490,7 +490,7 @@ pub(crate) fn parse_expression_eval(
 /// This works for single-string inputs without `module_call` expansion.
 /// Directory-scoped flows (`parse_directory_with_overrides`,
 /// `load_configuration_with_config`) finalize **after**
-/// `module_resolver::resolve_modules_with_config` so that virtual
+/// `module_resolver::resolve_modules_with_config` so that composition
 /// resources from module expansion are visible to the resolver pass.
 pub fn parse_and_resolve(input: &str) -> Result<ParsedFile, ParseError> {
     let mut parsed = parse(input, &ProviderContext::default())?;

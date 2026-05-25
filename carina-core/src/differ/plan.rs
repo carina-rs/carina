@@ -32,7 +32,7 @@ fn find_changed_create_only(
     changed_attributes: &[String],
     registry: &SchemaRegistry,
 ) -> Vec<String> {
-    let Some(schema) = registry.get(provider, resource_type, SchemaKind::Managed) else {
+    let Some(schema) = registry.get(provider, resource_type, SchemaKind::Resource) else {
         return Vec::new();
     };
 
@@ -55,7 +55,7 @@ fn filter_non_removable_removals(
     changed_attributes: Vec<String>,
     registry: &SchemaRegistry,
 ) -> Vec<String> {
-    let Some(schema) = registry.get(provider, resource_type, SchemaKind::Managed) else {
+    let Some(schema) = registry.get(provider, resource_type, SchemaKind::Resource) else {
         // No schema available — keep all changes (conservative)
         return changed_attributes;
     };
@@ -146,19 +146,19 @@ fn generate_temporary_name(
 ///
 /// # Typestate invariants
 ///
-/// Virtuals are intentionally not an input. The compile-fail doctest
-/// below pins that — passing a [`VirtualResource`](crate::resource::VirtualResource)
-/// slice must fail to type-check, so the post-apply-only virtual class
+/// compositions are intentionally not an input. The compile-fail doctest
+/// below pins that — passing a [`Composition`](crate::resource::Composition)
+/// slice must fail to type-check, so the post-apply-only composition class
 /// (carina#3169) cannot accidentally reach pre-apply differ logic.
 ///
 /// ```compile_fail
 /// use std::collections::{BTreeSet, HashMap};
 /// use carina_core::differ::create_plan;
-/// use carina_core::resource::VirtualResource;
+/// use carina_core::resource::Composition;
 /// use carina_core::schema::SchemaRegistry;
-/// let virtuals: Vec<VirtualResource> = vec![];
+/// let compositions: Vec<Composition> = vec![];
 /// let _ = create_plan(
-///     &virtuals,
+///     &compositions,
 ///     &[],
 ///     &HashMap::new(),
 ///     &HashMap::new(),
@@ -210,7 +210,7 @@ pub fn create_plan(
         let schema = registry.get(
             &resource.id.provider,
             &resource.id.resource_type,
-            SchemaKind::Managed,
+            SchemaKind::Resource,
         );
         let d = diff(
             resource,
@@ -257,7 +257,7 @@ pub fn create_plan(
                     .get(
                         &resource.id.provider,
                         &resource.id.resource_type,
-                        SchemaKind::Managed,
+                        SchemaKind::Resource,
                     )
                     .is_some_and(|s| s.force_replace);
 
@@ -285,7 +285,7 @@ pub fn create_plan(
                             .get(
                                 &resource.id.provider,
                                 &resource.id.resource_type,
-                                SchemaKind::Managed,
+                                SchemaKind::Resource,
                             )
                             .and_then(|schema| generate_temporary_name(&to, &from, schema))
                     } else {
@@ -412,7 +412,7 @@ pub fn create_plan(
     // referencing the wait binding still fail loudly.
     for wb in wait_bindings {
         // Wait targets resolve over managed + data-source bindings.
-        // Virtuals are post-apply attribute containers and don't carry
+        // compositions are post-apply attribute containers and don't carry
         // `until`-pollable state, so excluding them (by construction
         // via the typed-slice split) matches the runtime invariant.
         let resolved = managed
@@ -502,7 +502,7 @@ pub fn create_plan(
         let schema = registry.get(
             &target_id.provider,
             &target_id.resource_type,
-            SchemaKind::Managed,
+            SchemaKind::Resource,
         );
         let schema_timeout = schema.and_then(|s| s.default_wait_timeout);
         let schema_interval = schema.and_then(|s| s.default_wait_interval);

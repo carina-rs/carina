@@ -300,7 +300,7 @@ where
 {
     let mut errors = Vec::new();
     // carina#3181: walk every top-level resource — managed, data source,
-    // virtual — so an empty interpolation in a `read` resource's
+    // composition — so an empty interpolation in a `read` resource's
     // attribute is still caught.
     for rref in parsed.iter_top_level_resources() {
         for (attr_name, value) in rref.attributes() {
@@ -437,7 +437,7 @@ pub fn apply_anonymous_to_named_renames(
                 .get(
                     provider,
                     resource_type,
-                    carina_core::schema::SchemaKind::Managed,
+                    carina_core::schema::SchemaKind::Resource,
                 )
                 .map(|s| s.create_only_attributes())
                 .unwrap_or_default();
@@ -494,7 +494,7 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
                 .get(
                     provider,
                     resource_type,
-                    carina_core::schema::SchemaKind::Managed,
+                    carina_core::schema::SchemaKind::Resource,
                 )
                 .map(|s| s.create_only_attributes())
                 .unwrap_or_default();
@@ -1266,7 +1266,7 @@ pub fn expand_same_config_deferred_for<E: Clone>(
 
     let iterable_bindings = ResolvedBindings::pre_apply(PreApplyInputs {
         managed: sorted_resources,
-        virtuals: &parsed.virtual_resources,
+        compositions: &parsed.compositions,
         data_sources: &parsed.data_sources,
         current_states,
         remote_bindings,
@@ -1568,7 +1568,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
 
         // Read states for all resources concurrently using identifier from state.
         // In identifier-based approach, if there's no identifier in state, the resource doesn't exist.
-        // Skip virtual resources (module attribute containers) — they have no infrastructure.
+        // Skip composition resources (module attribute containers) — they have no infrastructure.
         let provider_ref = &provider;
         // Pre-build a map of dependency_bindings from the state file so we can
         // restore them after refresh. Provider.read() returns fresh attributes but
@@ -1690,7 +1690,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
             .collect();
         let resolved_data_sources = resolve_data_source_refs_for_refresh(
             &sorted_resources,
-            &parsed.virtual_resources,
+            &parsed.compositions,
             &data_sources,
             &current_states,
             remote_bindings,
@@ -1890,8 +1890,8 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     );
     // Build the unified pre-apply bindings view once (carina#3248):
     // every kind of binding the configuration declares (managed,
-    // virtual, data source) is in the same view, so a managed
-    // attribute referencing `<module_instance>.<attr>` (a virtual)
+    // composition, data source) is in the same view, so a managed
+    // attribute referencing `<module_instance>.<attr>` (a composition)
     // chains through to the managed sibling literal instead of
     // surviving as an unresolved `ResourceRef` (carina#3246).
     let upstream_binding_names: std::collections::HashSet<&str> =
@@ -1899,7 +1899,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     let plan_bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
         carina_core::binding_index::PreApplyInputs {
             managed: &resources,
-            virtuals: &parsed.virtual_resources,
+            compositions: &parsed.compositions,
             data_sources: &data_sources,
             current_states: &current_states,
             remote_bindings,
@@ -2164,7 +2164,7 @@ fn resolve_import_target(
         .get(
             &to.provider,
             &to.resource_type,
-            carina_core::schema::SchemaKind::Managed,
+            carina_core::schema::SchemaKind::Resource,
         )
         .and_then(|s| s.name_attribute.as_deref());
 
@@ -2288,7 +2288,7 @@ pub(crate) async fn refresh_resource_set<'a>(
     let results: Vec<Result<(ResourceId, State), AppError>> =
         // carina#3181: `resources` is a managed-resource iterator —
         // data sources go through the data-source refresh path and
-        // virtuals carry no provider state.
+        // compositions carry no provider state.
         stream::iter(resources)
             .map(|resource| {
                 started_bar = true;
@@ -2387,7 +2387,7 @@ pub async fn read_data_source_with_retry(
 /// `binding` — data sources reference those.
 pub(crate) fn resolve_data_source_refs_for_refresh(
     managed: &[Resource],
-    virtuals: &[carina_core::resource::VirtualResource],
+    compositions: &[carina_core::resource::Composition],
     data_sources: &[carina_core::resource::DataSource],
     current_states: &HashMap<ResourceId, State>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
@@ -2395,12 +2395,12 @@ pub(crate) fn resolve_data_source_refs_for_refresh(
     wait_aliases: &[WaitAliasSpec],
 ) -> Result<Vec<carina_core::resource::DataSource>, AppError> {
     let mut resolved = data_sources.to_vec();
-    // carina#3248: unified pre-apply bindings include virtuals so a
+    // carina#3248: unified pre-apply bindings include compositions so a
     // data-source input referencing `<module_instance>.<attr>` chains
-    // through the virtual layer to the managed sibling literal.
+    // through the composition layer to the managed sibling literal.
     let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
         managed,
-        virtuals,
+        compositions,
         data_sources,
         current_states,
         remote_bindings,

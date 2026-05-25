@@ -9,8 +9,8 @@ use crate::parser::{
     ArgumentParameter, BindingName, DeferredForExpression, ModuleCall, ParsedFile, WaitBinding,
 };
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, Resource, ResourceId, ResourceName, Value,
-    VirtualResource,
+    Composition, ConcreteValue, DataSource, DeferredValue, Resource, ResourceId, ResourceName,
+    Value,
 };
 
 use super::error::ModuleError;
@@ -22,7 +22,7 @@ impl ModuleResolver<'_> {
     /// Expand a module call into resources.
     ///
     /// If the module defines `attributes` and the call has a `binding_name`,
-    /// a [`VirtualResource`] is created to expose the module's attribute
+    /// a [`Composition`] is created to expose the module's attribute
     /// values. Virtual resources are skipped by the differ.
     ///
     /// `enclosing_args` is the argument signature of the module the call
@@ -251,23 +251,23 @@ impl ModuleResolver<'_> {
             ));
         }
 
-        // Propagate the module's own virtual resources (synthesized by
+        // Propagate the module's own composition resources (synthesized by
         // nested module-call expansion), instance-prefixed.
-        let mut virtual_resources: Vec<VirtualResource> = Vec::new();
-        for virtual_resource in &module.virtual_resources {
-            virtual_resources.push(prefix_module_virtual_resource(
-                virtual_resource,
+        let mut compositions: Vec<Composition> = Vec::new();
+        for composition in &module.compositions {
+            compositions.push(prefix_module_composition(
+                composition,
                 instance_prefix,
                 &intra_module_bindings,
                 &argument_values,
             ));
         }
 
-        // Create a virtual resource if the module has attributes and the call has a binding
+        // Create a composition resource if the module has attributes and the call has a binding
         if !module.attribute_params.is_empty()
             && let Some(binding_name) = &call.binding_name
         {
-            let mut virtual_attrs: IndexMap<String, Value> = IndexMap::new();
+            let mut composition_attrs: IndexMap<String, Value> = IndexMap::new();
 
             // Copy attribute values from the module definition
             for attr_param in &module.attribute_params {
@@ -279,20 +279,20 @@ impl ModuleResolver<'_> {
                     // Same post-substitution canonicalize as the
                     // resource-attribute path above (#2815 / #2817).
                     substituted.canonicalize_in_place();
-                    virtual_attrs.insert(attr_param.name.clone(), substituted);
+                    composition_attrs.insert(attr_param.name.clone(), substituted);
                 }
             }
 
-            let virtual_resource = VirtualResource {
+            let composition = Composition {
                 id: ResourceId::new("_virtual", binding_name),
-                attributes: virtual_attrs,
+                attributes: composition_attrs,
                 binding: Some(binding_name.clone()),
                 dependency_bindings: BTreeSet::new(),
                 module_name: call.module_name.clone(),
                 instance: instance_prefix.to_string(),
                 quoted_string_attrs: HashSet::new(),
             };
-            virtual_resources.push(virtual_resource);
+            compositions.push(composition);
         }
 
         // Propagate the module's `wait` declarations, instance-prefixed
@@ -324,11 +324,11 @@ impl ModuleResolver<'_> {
             })
             .collect();
 
-        // carina#3181: managed resources, data sources, and virtual
+        // carina#3181: managed resources, data sources, and composition
         // resources are collected into separate typed `Vec`s above —
         // `resources` from `module.resources`, `data_sources`
-        // from `module.data_sources`, and `virtual_resources` from
-        // `module.virtual_resources` plus the `_virtual` attribute
+        // from `module.data_sources`, and `compositions` from
+        // `module.compositions` plus the `_virtual` attribute
         // resource built above.
 
         // The contribution is a full `ParsedFile` built with an
@@ -341,14 +341,14 @@ impl ModuleResolver<'_> {
             // Populated from the module, instance-prefixed:
             resources,
             data_sources,
-            virtual_resources,
+            compositions,
             wait_bindings: expanded_wait_bindings,
             deferred_for_expressions: expanded_deferred_for_expressions,
 
             // Consumed *inside* expansion, not propagated to the caller
             // (a module instance does not re-export these as raw
             // collections — they are inlined / surfaced via the
-            // virtual attribute resource above):
+            // composition attribute resource above):
             //   - `providers`: modules inherit the caller's providers.
             //   - `variables` / `user_functions`: module-local, already
             //     substituted into the expanded resources.
@@ -572,19 +572,19 @@ fn prefix_module_data_source(
     new_data_source
 }
 
-/// Instance-prefix one virtual resource crossing a module boundary — the
-/// [`VirtualResource`] analogue of [`prefix_module_resource`]. A
-/// `VirtualResource` carries no `module_source` (it has the flattened
+/// Instance-prefix one composition resource crossing a module boundary — the
+/// [`Composition`] analogue of [`prefix_module_resource`]. A
+/// `Composition` carries no `module_source` (it has the flattened
 /// `module_name` / `instance` fields, left unchanged as the synthetic
 /// node's own provenance) and no `prefixes` / `directives`, so only its
 /// `Bound` id name, `binding`, and attributes take the prefix treatment.
-fn prefix_module_virtual_resource(
-    virtual_resource: &VirtualResource,
+fn prefix_module_composition(
+    composition: &Composition,
     instance_prefix: &str,
     intra_module_bindings: &HashSet<String>,
     argument_values: &HashMap<String, Value>,
-) -> VirtualResource {
-    let mut new_virtual = virtual_resource.clone();
+) -> Composition {
+    let mut new_virtual = composition.clone();
 
     if let ResourceName::Bound(name) = &new_virtual.id.name {
         let new_name = apply_instance_prefix(instance_prefix, name);

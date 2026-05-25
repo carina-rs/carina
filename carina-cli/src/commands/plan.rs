@@ -55,12 +55,12 @@ pub struct PlanFile {
     /// by module expansion at plan time (carina#3248). Persisted so
     /// the saved-plan apply path builds the same `ResolvedBindings`
     /// view as the live-apply path: an attribute referencing
-    /// `<module_instance>.<attr>` chains through the virtual's
+    /// `<module_instance>.<attr>` chains through the composition's
     /// attribute map to the managed sibling literal that backs it.
     ///
     /// Pre-carina#3248 saved plans (version `3`) did not persist
-    /// virtuals and apply-from-plan passed `&[]` into the executor —
-    /// any virtual-rooted ref would survive resolution as a
+    /// compositions and apply-from-plan passed `&[]` into the executor —
+    /// any composition-rooted ref would survive resolution as a
     /// `ResourceRef` and fail-fast at the executor's
     /// `assert_fully_resolved` check, or produce a spurious diff if
     /// it reached the differ (carina#3246).
@@ -68,7 +68,7 @@ pub struct PlanFile {
     /// Empty when the configuration declares no module calls /
     /// `attributes { ... }` blocks.
     #[serde(default)]
-    pub virtual_resources: Vec<carina_core::resource::VirtualResource>,
+    pub compositions: Vec<carina_core::resource::Composition>,
     /// Data sources (`let x = read aws.iam.user { ... }`) emitted by
     /// module expansion at plan time (carina#3248). Persisted so the
     /// saved-plan apply path can re-create the same unified
@@ -160,7 +160,7 @@ fn build_plan_file<E>(
 ) -> Result<PlanFile, carina_core::value::SerializationError> {
     Ok(PlanFile {
         // carina#3248: bumped 3→4 — saved plans now persist
-        // `virtual_resources` so the saved-plan apply path can rebuild
+        // `compositions` so the saved-plan apply path can rebuild
         // the same `ResolvedBindings` view as the live-apply path.
         // Older plans (version `3` and below) are rejected with a
         // clear message pointing the user at re-running `plan`.
@@ -178,8 +178,8 @@ fn build_plan_file<E>(
             .iter()
             .map(redact_secrets_in_resource)
             .collect::<Result<Vec<_>, _>>()?,
-        virtual_resources: parsed
-            .virtual_resources
+        compositions: parsed
+            .compositions
             .iter()
             .map(carina_core::value::redact_secrets_in_virtual)
             .collect::<Result<Vec<_>, _>>()?,
@@ -623,7 +623,7 @@ pub async fn run_plan(
         let resolved_exports = resolve_export_values_for_display(
             &parsed.export_params,
             &ctx.sorted_resources,
-            &parsed.virtual_resources,
+            &parsed.compositions,
             &parsed.data_sources,
             &ctx.current_states,
             &export_wait_aliases,
@@ -687,18 +687,18 @@ pub async fn run_plan(
 pub(crate) fn resolve_export_values_for_display(
     export_params: &[carina_core::parser::InferredExportParam],
     resources: &[Resource],
-    virtuals: &[carina_core::resource::VirtualResource],
+    compositions: &[carina_core::resource::Composition],
     data_sources: &[carina_core::resource::DataSource],
     current_states: &HashMap<ResourceId, State>,
     wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
 ) -> Vec<carina_core::parser::InferredExportParam> {
     // carina#3248: build the unified pre-apply bindings view so an
     // export referencing `<module_instance>.<attr>` chains through the
-    // virtual to the managed sibling literal (carina#3246).
+    // composition to the managed sibling literal (carina#3246).
     let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
         carina_core::binding_index::PreApplyInputs {
             managed: resources,
-            virtuals,
+            compositions,
             data_sources,
             current_states,
             remote_bindings: &HashMap::new(),

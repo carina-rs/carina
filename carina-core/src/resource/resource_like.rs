@@ -4,7 +4,7 @@
 //! Lets read-only consumers — plan tree builders, formatters,
 //! diagnostics — stay generic over the three sibling types
 //! ([`Resource`](super::Resource),
-//! [`VirtualResource`](super::VirtualResource),
+//! [`Composition`](super::Composition),
 //! [`DataSource`](super::DataSource)). Write-side callers (resolver,
 //! effect-executor, writeback) continue to take a concrete type and
 //! benefit from the typed dispatch.
@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 
 use indexmap::IndexMap;
 
-use super::{DataSource, Resource, ResourceId, Value, VirtualResource};
+use super::{Composition, DataSource, Resource, ResourceId, Value};
 
 /// Read-only accessors shared by all resource representations.
 ///
@@ -66,7 +66,7 @@ impl ResourceLike for Resource {
     }
 }
 
-impl ResourceLike for VirtualResource {
+impl ResourceLike for Composition {
     fn id(&self) -> &ResourceId {
         &self.id
     }

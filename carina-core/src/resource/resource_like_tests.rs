@@ -1,5 +1,5 @@
 //! Tests for #3174: `ResourceLike` trait — shared read-only
-//! accessors implemented for `Resource`, `VirtualResource`, and
+//! accessors implemented for `Resource`, `Composition`, and
 //! `DataSource`.
 
 use std::collections::{BTreeSet, HashSet};
@@ -7,8 +7,8 @@ use std::collections::{BTreeSet, HashSet};
 use indexmap::IndexMap;
 
 use crate::resource::{
-    ConcreteValue, DataSource, Directives, ModuleSource, Resource, ResourceId, ResourceLike, Value,
-    VirtualResource,
+    Composition, ConcreteValue, DataSource, Directives, ModuleSource, Resource, ResourceId,
+    ResourceLike, Value,
 };
 
 fn sample_value(s: &str) -> Value {
@@ -27,10 +27,10 @@ fn make_managed() -> Resource {
         .with_module_source(ModuleSource::module("m", "inst"))
 }
 
-fn make_virtual() -> VirtualResource {
+fn make_virtual() -> Composition {
     let mut attributes = IndexMap::new();
     attributes.insert("k".to_string(), sample_value("v"));
-    VirtualResource {
+    Composition {
         id: ResourceId::new("aws.s3.Bucket", "b"),
         attributes,
         binding: Some("b".to_string()),
@@ -81,7 +81,7 @@ fn resource_implements_resource_like() {
 }
 
 #[test]
-fn virtual_resource_implements_resource_like() {
+fn composition_implements_resource_like() {
     let v = make_virtual();
     let expected_id = v.id.clone();
     assert_resource_like(&v, &expected_id, "k", Some("b"), &deps());
@@ -102,7 +102,7 @@ fn binding_none_covers_all_arms() {
 
     let mut v = make_virtual();
     v.binding = None;
-    assert_eq!(<VirtualResource as ResourceLike>::binding(&v), None);
+    assert_eq!(<Composition as ResourceLike>::binding(&v), None);
 
     let ds = DataSource::new("aws.s3.Bucket", "b");
     assert_eq!(<DataSource as ResourceLike>::binding(&ds), None);

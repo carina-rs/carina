@@ -135,14 +135,14 @@ pub(super) fn topological_sort_replaces(
 /// `Virtual` resources (the synthetic bindings module calls expose for their
 /// `attributes { }` block) have no Effect and would be invisible to a direct
 /// `binding -> effect index` lookup. To preserve the dependency edge from a
-/// caller through a module's attribute to the underlying resource, virtual
+/// caller through a module's attribute to the underlying resource, composition
 /// bindings are expanded transitively into the resource bindings their own
 /// attributes reference (#2543).
 pub(super) fn build_phase_dependency_map(
     effects: &[Effect],
     phase_indices: &[usize],
     unresolved_resources: &HashMap<ResourceId, Resource>,
-    virtual_resources: &[crate::resource::VirtualResource],
+    compositions: &[crate::resource::Composition],
 ) -> HashMap<usize, HashSet<usize>> {
     // Build binding -> effect index mapping for effects in this phase
     let phase_set: HashSet<usize> = phase_indices.iter().copied().collect();
@@ -153,7 +153,7 @@ pub(super) fn build_phase_dependency_map(
         }
     }
 
-    let resolver = DepResolver::new(&binding_to_idx, virtual_resources, Some(&phase_set));
+    let resolver = DepResolver::new(&binding_to_idx, compositions, Some(&phase_set));
 
     let mut deps_of: HashMap<usize, HashSet<usize>> = HashMap::new();
     for &idx in phase_indices {
@@ -171,19 +171,19 @@ pub(super) fn build_phase_dependency_map(
 }
 
 /// Resolve binding-name dependencies to the effect indices they reach,
-/// expanding any [`VirtualResource`] proxy bindings transparently
+/// expanding any [`Composition`] proxy bindings transparently
 /// through their own attribute references (#2543).
 ///
-/// carina#3181: virtual resources are a distinct typestate, supplied to
+/// carina#3181: composition resources are a distinct typestate, supplied to
 /// [`DepResolver::new`] as their own slice and indexed by `binding`
-/// name. A binding present in `virtuals_by_binding` *is* the "this is a
-/// virtual" condition — the `expand` walk follows such a binding through
-/// the virtual's own attribute references.
+/// name. A binding present in `compositions_by_binding` *is* the "this is a
+/// composition" condition — the `expand` walk follows such a binding through
+/// the composition's own attribute references.
 pub(super) struct DepResolver<'a> {
     binding_to_idx: &'a HashMap<String, usize>,
     /// Virtual resources owned by the resolver, keyed by their
     /// `binding` name.
-    virtuals_by_binding: HashMap<String, crate::resource::VirtualResource>,
+    compositions_by_binding: HashMap<String, crate::resource::Composition>,
     /// `Some` filters output indices to those in the phase; `None` retains
     /// every reachable index.
     phase_set: Option<&'a HashSet<usize>>,
@@ -192,21 +192,20 @@ pub(super) struct DepResolver<'a> {
 impl<'a> DepResolver<'a> {
     pub(super) fn new(
         binding_to_idx: &'a HashMap<String, usize>,
-        virtual_resources: &[crate::resource::VirtualResource],
+        compositions: &[crate::resource::Composition],
         phase_set: Option<&'a HashSet<usize>>,
     ) -> Self {
-        // carina#3181: virtual resources are a distinct typestate, so
+        // carina#3181: composition resources are a distinct typestate, so
         // they arrive as their own slice. Index them by `binding` name —
-        // a binding being present in `virtuals_by_binding` *is* the
-        // "this is a virtual" condition the `expand` walk checks.
-        let virtuals_by_binding: HashMap<String, crate::resource::VirtualResource> =
-            virtual_resources
-                .iter()
-                .filter_map(|v| v.binding.clone().map(|b| (b, v.clone())))
-                .collect();
+        // a binding being present in `compositions_by_binding` *is* the
+        // "this is a composition" condition the `expand` walk checks.
+        let compositions_by_binding: HashMap<String, crate::resource::Composition> = compositions
+            .iter()
+            .filter_map(|v| v.binding.clone().map(|b| (b, v.clone())))
+            .collect();
         Self {
             binding_to_idx,
-            virtuals_by_binding,
+            compositions_by_binding,
             phase_set,
         }
     }
@@ -245,7 +244,7 @@ impl<'a> DepResolver<'a> {
 
     /// Recursive dependency walk. The `'b` lifetime is bound to the
     /// `&self` borrow at the call site so the borrowed keys live
-    /// inside the resolver (`virtuals_by_binding` / `binding_to_idx`).
+    /// inside the resolver (`compositions_by_binding` / `binding_to_idx`).
     fn expand<'b>(
         &'b self,
         binding: &'b str,
@@ -261,22 +260,22 @@ impl<'a> DepResolver<'a> {
             }
             return;
         }
-        // No effect for this binding. If it names a `VirtualResource`
+        // No effect for this binding. If it names a `Composition`
         // (a module's attributes-block proxy), follow the
         // references in its own attributes to the underlying
         // resources the module exposes. The typed map answers
-        // "is this a virtual?" by presence — no `matches!` probe.
-        let Some(virt) = self.virtuals_by_binding.get(binding) else {
+        // "is this a composition?" by presence — no `matches!` probe.
+        let Some(virt) = self.compositions_by_binding.get(binding) else {
             return;
         };
-        // `get_virtual_resource_dependencies` returns owned `String`s,
+        // `get_composition_dependencies` returns owned `String`s,
         // but the visit set borrows from this resolver's keys to
         // avoid per-binding allocation. Re-borrow each inner
         // binding from the resolver's own keys so the borrow
         // lifetime matches `'b` (the `&self` borrow lifetime).
-        for inner in crate::deps::get_virtual_resource_dependencies(virt) {
+        for inner in crate::deps::get_composition_dependencies(virt) {
             let key: &'b str =
-                if let Some((k, _)) = self.virtuals_by_binding.get_key_value(inner.as_str()) {
+                if let Some((k, _)) = self.compositions_by_binding.get_key_value(inner.as_str()) {
                     k.as_str()
                 } else if let Some((k, _)) = self.binding_to_idx.get_key_value(inner.as_str()) {
                     k.as_str()
@@ -376,7 +375,7 @@ pub(super) async fn execute_effects_phased(
             effects,
             &phase1_indices,
             input.unresolved_resources,
-            input.virtual_resources,
+            input.compositions,
         );
         let mut completed_indices: HashSet<usize> = HashSet::new();
         let mut dispatched: HashSet<usize> = HashSet::new();
@@ -530,7 +529,7 @@ pub(super) async fn execute_effects_phased(
             effects,
             &cbd_indices,
             input.unresolved_resources,
-            input.virtual_resources,
+            input.compositions,
         );
         let mut completed_indices: HashSet<usize> = HashSet::new();
         let mut dispatched: HashSet<usize> = HashSet::new();
@@ -850,7 +849,7 @@ pub(super) async fn execute_effects_phased(
                 binding_to_idx.insert(binding, idx);
             }
         }
-        let resolver = DepResolver::new(&binding_to_idx, input.virtual_resources, Some(&phase_set));
+        let resolver = DepResolver::new(&binding_to_idx, input.compositions, Some(&phase_set));
         let mut deps_of: HashMap<usize, HashSet<usize>> = HashMap::new();
         for &idx in &delete_indices {
             let effect = &effects[idx];
@@ -1014,7 +1013,7 @@ pub(super) async fn execute_effects_phased(
             effects,
             &phase4_indices,
             input.unresolved_resources,
-            input.virtual_resources,
+            input.compositions,
         );
         let mut completed_indices: HashSet<usize> = HashSet::new();
         let mut dispatched: HashSet<usize> = HashSet::new();
@@ -1349,28 +1348,28 @@ pub(super) async fn execute_effects_phased(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::{ResourceId, Value, VirtualResource};
+    use crate::resource::{Composition, ResourceId, Value};
 
     /// Reproduces #2543: when a resource depends on `<module-instance>.<attr>`
     /// (where the module-instance binding is a `Virtual` resource exposing the
     /// module's `attributes { }`), the executor's phase dependency map drops
-    /// the dep silently — virtual resources have no Effect entry to look up.
-    /// The fix must follow the virtual binding through to the underlying
+    /// the dep silently — composition resources have no Effect entry to look up.
+    /// The fix must follow the composition binding through to the underlying
     /// resource(s) it references.
-    /// Build a [`VirtualResource`] with a single `ResourceRef` attribute.
+    /// Build a [`Composition`] with a single `ResourceRef` attribute.
     fn make_virtual(
         id_name: &str,
         binding: &str,
         attr: &str,
         ref_binding: &str,
         ref_attr: &str,
-    ) -> VirtualResource {
+    ) -> Composition {
         let mut attributes = indexmap::IndexMap::new();
         attributes.insert(
             attr.to_string(),
             Value::resource_ref(ref_binding, ref_attr, vec![]),
         );
-        VirtualResource {
+        Composition {
             id: ResourceId::with_provider("_virtual", "_virtual", id_name, None),
             attributes,
             binding: Some(binding.to_string()),
@@ -1386,7 +1385,7 @@ mod tests {
         let mut role = Resource::with_provider("awscc", "iam.Role", "bootstrap.role", None);
         role.binding = Some("bootstrap.role".to_string());
 
-        // carina#3181: the virtual exposes `role_name = role.role_name`,
+        // carina#3181: the composition exposes `role_name = role.role_name`,
         // which after intra-module rewriting refs `bootstrap.role`.
         let virt = make_virtual(
             "bootstrap",
@@ -1416,13 +1415,13 @@ mod tests {
 
         assert!(
             deps_of[&1].contains(&0),
-            "RolePolicy (idx 1) must depend on Role (idx 0) via the bootstrap virtual binding; got: {:?}",
+            "RolePolicy (idx 1) must depend on Role (idx 0) via the bootstrap composition binding; got: {:?}",
             deps_of[&1],
         );
     }
 
-    /// Module nesting: the outer caller references a virtual binding whose own
-    /// attribute references another virtual binding. The dep walk must drill
+    /// Module nesting: the outer caller references a composition binding whose own
+    /// attribute references another composition binding. The dep walk must drill
     /// through both layers to the underlying resource.
     #[test]
     fn build_phase_dependency_map_follows_nested_virtual_module_bindings() {
@@ -1460,7 +1459,7 @@ mod tests {
 
         assert!(
             deps_of[&1].contains(&0),
-            "caller must depend on Role through two virtual layers (outer → outer.inner → outer.inner.role); got: {:?}",
+            "caller must depend on Role through two composition layers (outer → outer.inner → outer.inner.role); got: {:?}",
             deps_of[&1],
         );
     }

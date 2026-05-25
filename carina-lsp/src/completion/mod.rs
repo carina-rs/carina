@@ -65,10 +65,10 @@ impl CompletionProvider {
     pub(super) fn lookup_schema(&self, key: &str) -> Option<&ResourceSchema> {
         let (provider, resource_type) = match key.split_once('.') {
             Some(parts) => parts,
-            None => return self.schemas.get("", key, SchemaKind::Managed),
+            None => return self.schemas.get("", key, SchemaKind::Resource),
         };
         self.schemas
-            .get(provider, resource_type, SchemaKind::Managed)
+            .get(provider, resource_type, SchemaKind::Resource)
             .or_else(|| {
                 self.schemas
                     .get(provider, resource_type, SchemaKind::DataSource)

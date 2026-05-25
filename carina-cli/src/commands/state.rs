@@ -816,7 +816,7 @@ pub(crate) async fn run_state_refresh_locked(
             .collect();
         let resolved_data_sources = resolve_data_source_refs_for_refresh(
             &sorted_resources,
-            &parsed.virtual_resources,
+            &parsed.compositions,
             &parsed.data_sources,
             &current_states,
             &HashMap::new(),
@@ -909,7 +909,7 @@ pub(crate) async fn run_state_refresh_locked(
             .map(carina_core::binding_index::WaitAliasSpec::from)
             .collect();
         // State refresh path: no head-of-pipeline resolver pass has run,
-        // so `parsed.virtual_resources` still carry the authored
+        // so `parsed.compositions` still carry the authored
         // `ResourceRef` snapshots that `resolve_exports`'s post-apply
         // re-resolution needs (#3169 / #3177).
         let post_apply_states =
@@ -921,7 +921,7 @@ pub(crate) async fn run_state_refresh_locked(
             &parsed.export_params,
             &sorted_resources,
             &parsed.data_sources,
-            &parsed.virtual_resources,
+            &parsed.compositions,
             &post_apply_states,
             &wait_aliases,
         )?;

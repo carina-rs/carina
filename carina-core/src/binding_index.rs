@@ -40,7 +40,7 @@
 //! ```
 
 use crate::parser::{BindingName, ResourceRef};
-use crate::resource::{Resource, ResourceId, State, Value, VirtualResource};
+use crate::resource::{Composition, Resource, ResourceId, State, Value};
 use crate::schema::{ResourceSchema, SchemaRegistry};
 use std::collections::HashMap;
 
@@ -83,7 +83,7 @@ impl<'a> BindingIndex<'a> {
         let mut entries = HashMap::new();
         let mut known_names = std::collections::HashSet::new();
         // Walk top-level resources only — managed resources, data
-        // sources, and virtuals (carina#3181: `iter_top_level_resources`
+        // sources, and compositions (carina#3181: `iter_top_level_resources`
         // chains the typed slices and excludes deferred for-body
         // templates). The parser auto-generates a synthetic `binding` for
         // anonymous for-body templates (used for resource address
@@ -100,15 +100,15 @@ impl<'a> BindingIndex<'a> {
             known_names.insert(binding_name.to_string());
             // Schema lookup routes by the typestate arm: managed
             // resources via `get_for`, data sources via
-            // `get_for_data_source`. A virtual resource has no schema,
+            // `get_for_data_source`. A composition resource has no schema,
             // so it stays in `known_names` but gets no `entries` row,
             // matching the prior "known binding, schema absent" surface.
             let schema = match rref {
-                ResourceRef::Managed(m) | ResourceRef::Deferred { resource: m, .. } => {
+                ResourceRef::Resource(m) | ResourceRef::Deferred { resource: m, .. } => {
                     registry.get_for(m)
                 }
                 ResourceRef::DataSource(d) => registry.get_for_data_source(d),
-                ResourceRef::Virtual(_) => None,
+                ResourceRef::Composition(_) => None,
             };
             let Some(schema) = schema else {
                 continue;
@@ -245,10 +245,10 @@ impl BindingNameSet {
         let mut by_name: HashMap<String, BindingNameKind> = HashMap::new();
 
         // carina#3181: walk the typed top-level slices — managed
-        // resources, data sources, and virtuals all register a
+        // resources, data sources, and compositions all register a
         // `Resource`-kind binding name (a data source declared as
         // `let x = read ...` is addressable by `ResourceRef`, and a
-        // virtual binding was a `Resource`-kind name before the
+        // composition binding was a `Resource`-kind name before the
         // typestate split too).
         for rref in parsed.iter_top_level_resources() {
             if let Some(name) = rref.binding() {
@@ -433,7 +433,7 @@ pub struct ResolvedBindings {
 /// Required inputs for [`ResolvedBindings::pre_apply`] (carina#3248).
 ///
 /// All fields are mandatory; no `Default`, no `Option`. This shape
-/// turns "forgot virtuals at a new call site" into a compile error —
+/// turns "forgot compositions at a new call site" into a compile error —
 /// a struct-literal with a missing field fails to compile, so the
 /// pre-apply path cannot be silently constructed without the kind
 /// of binding sources it needs (carina#3246).
@@ -443,7 +443,7 @@ pub struct ResolvedBindings {
 /// without forcing a clone at the API boundary.
 pub struct PreApplyInputs<'a> {
     pub managed: &'a [Resource],
-    pub virtuals: &'a [VirtualResource],
+    pub compositions: &'a [Composition],
     pub data_sources: &'a [crate::resource::DataSource],
     pub current_states: &'a HashMap<ResourceId, State>,
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
@@ -454,21 +454,21 @@ impl ResolvedBindings {
     /// Single typed pre-apply constructor (carina#3248).
     ///
     /// Builds the bindings view from every kind of binding that
-    /// reference resolution can name — managed resources, virtual
+    /// reference resolution can name — managed resources, composition
     /// resources (module-call attribute containers), and data
     /// sources — plus the same `current_states`, `remote_bindings`,
     /// and `wait_aliases` inputs the legacy entries took.
     ///
     /// The required-fields `PreApplyInputs` struct turns "forgot to
-    /// include virtuals at a new call site" into a compile error
+    /// include compositions at a new call site" into a compile error
     /// rather than a runtime symptom: any missing field on the
     /// struct-literal fails to compile, so a new pre-apply call site
-    /// cannot accidentally lose the virtual / data-source layer the
+    /// cannot accidentally lose the composition / data-source layer the
     /// way the previous managed-only constructor + opt-in
-    /// `add_virtual_resources` shape allowed (carina#3246).
+    /// `add_compositions` shape allowed (carina#3246).
     ///
     /// Layering order: managed first (merged with `current_states`,
-    /// DSL-wins-on-collision), then data sources, then virtuals,
+    /// DSL-wins-on-collision), then data sources, then compositions,
     /// then wait aliases. The post-apply layering in
     /// `state_writeback.rs` uses the same order, so a same-stack
     /// collision resolves identically on the pre-apply and post-apply
@@ -483,8 +483,8 @@ impl ResolvedBindings {
         );
         bindings.layer_data_source_bindings(inputs.data_sources, inputs.current_states);
         bindings
-            .layer_virtuals_post_apply(inputs.virtuals)
-            .expect("layer_virtuals_post_apply is currently infallible");
+            .layer_compositions_post_apply(inputs.compositions)
+            .expect("layer_compositions_post_apply is currently infallible");
         bindings.layer_wait_aliases(inputs.wait_aliases);
         bindings
     }
@@ -492,8 +492,8 @@ impl ResolvedBindings {
     /// Shared managed + remote-bindings layering used by both the
     /// pre-apply constructor and the legacy entries during the
     /// migration window. Wait-aliases are layered separately by the
-    /// caller after data sources / virtuals so a wait whose target is
-    /// a data source or virtual still snapshots the resolved attrs.
+    /// caller after data sources / compositions so a wait whose target is
+    /// a data source or composition still snapshots the resolved attrs.
     fn build_managed_core(
         managed: &[Resource],
         current_states: &HashMap<ResourceId, State>,
@@ -537,7 +537,7 @@ impl ResolvedBindings {
 
     /// Layer wait aliases on the view. Extracted from
     /// `pre_apply` so `pre_apply` can sequence the
-    /// layering (managed → data sources → virtuals → wait aliases)
+    /// layering (managed → data sources → compositions → wait aliases)
     /// without duplicating the alias logic.
     fn layer_wait_aliases(&mut self, wait_aliases: &[WaitAliasSpec]) {
         for spec in wait_aliases {
@@ -557,32 +557,32 @@ impl ResolvedBindings {
         }
     }
 
-    /// Typed post-apply layering (#3176): add virtual-resource
+    /// Typed post-apply layering (#3176): add composition
     /// bindings onto an existing view.
     ///
     /// **Scope:** post-apply increment layering (carina#3248). The
     /// canonical caller is `state_writeback.rs`, which re-resolves
-    /// virtuals against post-apply state via
+    /// compositions against post-apply state via
     /// `resolve_virtual_refs_post_apply` and then layers them on top
     /// of the pre-apply binding view for export resolution. Pre-apply
     /// call sites must use [`ResolvedBindings::pre_apply`] instead —
-    /// that constructor lays virtuals in once at the start and makes
-    /// "forgot virtuals" a compile error.
+    /// that constructor lays compositions in once at the start and makes
+    /// "forgot compositions" a compile error.
     ///
     /// **Ordering contract**: must be called *after* the managed-side
-    /// bindings have been constructed, so any virtual whose
+    /// bindings have been constructed, so any composition whose
     /// attributes contain a `ResourceRef` to a managed sibling
     /// resolves against the up-to-date managed view. The caller is
     /// responsible for that ordering; the function itself just
     /// appends.
     ///
     /// Unlike `pre_apply`, this entry does **not** merge
-    /// `current_states`: virtuals have no provider-side state to
-    /// merge. The virtual's own attribute map (as authored, after
+    /// `current_states`: compositions have no provider-side state to
+    /// merge. The composition's own attribute map (as authored, after
     /// `resolve_virtual_refs_post_apply` materialised any refs) is
     /// recorded verbatim.
     ///
-    /// Same-name collisions favour the virtual entry (it is inserted
+    /// Same-name collisions favour the composition entry (it is inserted
     /// last) — consistent with the design-doc rule that the
     /// post-apply view is layered *on top of* the pre-apply view.
     ///
@@ -593,11 +593,11 @@ impl ResolvedBindings {
     /// hard error on a same-name collision when the post-apply layer
     /// expects to merge rather than overwrite) be added without
     /// breaking the signature.
-    pub fn layer_virtuals_post_apply(
+    pub fn layer_compositions_post_apply(
         &mut self,
-        virtuals: &[VirtualResource],
+        compositions: &[Composition],
     ) -> Result<(), String> {
-        for v in virtuals.iter() {
+        for v in compositions.iter() {
             let Some(binding_name) = v.binding.as_ref() else {
                 continue;
             };
@@ -1013,7 +1013,7 @@ mod resolved_bindings_tests {
 
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &resources,
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[],
             current_states: &states,
             remote_bindings: &remote,
@@ -1068,7 +1068,7 @@ mod resolved_bindings_tests {
 
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &resources,
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[],
             current_states: &states,
             remote_bindings: &remote,
@@ -1108,7 +1108,7 @@ mod resolved_bindings_tests {
 
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &resources,
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[],
             current_states: &states,
             remote_bindings: &remote,
@@ -1143,7 +1143,7 @@ mod resolved_bindings_tests {
 
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &resources,
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[],
             current_states: &states,
             remote_bindings: &remote,
@@ -1180,7 +1180,7 @@ mod resolved_bindings_tests {
 
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &resources,
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[],
             current_states: &states,
             remote_bindings: &remote,
@@ -1234,7 +1234,7 @@ mod resolved_bindings_tests {
 
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &resources,
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[],
             current_states: &states,
             remote_bindings: &remote,
@@ -1349,7 +1349,7 @@ mod resolved_bindings_tests {
         let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
         let parent = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &resources,
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[],
             current_states: &states,
             remote_bindings: &remote,
@@ -1446,7 +1446,7 @@ mod resolved_bindings_tests {
         );
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &[cert],
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[],
             current_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
@@ -1477,7 +1477,7 @@ mod resolved_bindings_tests {
     fn wait_alias_absent_target_creates_no_entry() {
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &[],
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[],
             current_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
@@ -1503,7 +1503,7 @@ mod resolved_bindings_tests {
         remote.insert("up".to_string(), attrs);
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &[],
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[],
             current_states: &HashMap::new(),
             remote_bindings: &remote,
@@ -1530,7 +1530,7 @@ mod resolved_bindings_tests {
         );
         let mut resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &[cert],
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[],
             current_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
@@ -1572,7 +1572,7 @@ mod resolved_bindings_tests {
         );
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &[cert],
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[],
             current_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
@@ -1655,7 +1655,7 @@ mod resolved_bindings_tests {
 
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &[],
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[ds],
             current_states: &states,
             remote_bindings: &HashMap::new(),
@@ -1726,7 +1726,7 @@ mod resolved_bindings_tests {
 
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &[],
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[ds],
             current_states: &states,
             remote_bindings: &HashMap::new(),
@@ -1777,7 +1777,7 @@ mod resolved_bindings_tests {
 
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &[],
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[ds],
             current_states: &states,
             remote_bindings: &HashMap::new(),
@@ -1956,7 +1956,7 @@ let chosen = if true { "primary" } else { "fallback" }
         // `chosen`, so a `ResourceRef` to `chosen.foo` cannot resolve.
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
             managed: &parsed.resources,
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[],
             current_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),

@@ -157,14 +157,14 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         .map(carina_core::binding_index::WaitAliasSpec::from)
         .collect();
     // carina#3248: build unified pre-apply bindings (managed +
-    // virtual + data sources) so virtual-rooted refs in the fixture
-    // resolve through the virtual layer to the managed sibling.
+    // composition + data sources) so composition-rooted refs in the fixture
+    // resolve through the composition layer to the managed sibling.
     let upstream_binding_names: std::collections::HashSet<&str> =
         remote_bindings.keys().map(String::as_str).collect();
     let plan_bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
         carina_core::binding_index::PreApplyInputs {
             managed: &resources,
-            virtuals: &parsed.virtual_resources,
+            compositions: &parsed.compositions,
             data_sources: &data_sources,
             current_states: &current_states,
             remote_bindings: &remote_bindings,

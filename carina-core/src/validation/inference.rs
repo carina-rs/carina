@@ -94,7 +94,11 @@ impl std::fmt::Display for InferenceError {
                 write!(f, "no schema available for binding `{}`", binding)
             }
             InferenceError::CyclicVirtualBinding { cycle } => {
-                write!(f, "cyclic virtual binding chain: {}", cycle.join(" -> "))
+                write!(
+                    f,
+                    "cyclic composition binding chain: {}",
+                    cycle.join(" -> ")
+                )
             }
         }
     }
@@ -109,7 +113,7 @@ impl std::fmt::Display for InferenceError {
 /// while still passing through `upstream_state`-derived references.
 ///
 /// `Virtual` carries the attribute map of a module-call's
-/// virtual resource so an `exports` reference of the form
+/// composition resource so an `exports` reference of the form
 /// `<module_call>.<attr>` can transitively infer through the bound
 /// expression on the module's `attributes { ... }` block, instead of
 /// failing with `unknown binding` (#2493).
@@ -141,11 +145,11 @@ pub type InferenceBindings = HashMap<String, InferenceBinding>;
 pub fn bindings_from_parsed(parsed: &crate::parser::ParsedFile) -> InferenceBindings {
     // carina#3181: pass the typed top-level slices directly so
     // `bindings_from_parts` classifies managed resources, data sources,
-    // and (post-expansion) virtual rows from their own kinds.
+    // and (post-expansion) composition rows from their own kinds.
     let mut out = bindings_from_parts(
         &parsed.resources,
         &parsed.data_sources,
-        &parsed.virtual_resources,
+        &parsed.compositions,
         &parsed.upstream_states,
     );
     // Pre-expansion (load_configuration), `parsed.resources` does not
@@ -189,7 +193,7 @@ pub fn bindings_from_parsed(parsed: &crate::parser::ParsedFile) -> InferenceBind
 pub fn bindings_from_parts(
     resources: &[crate::resource::Resource],
     data_sources: &[crate::resource::DataSource],
-    virtual_resources: &[crate::resource::VirtualResource],
+    compositions: &[crate::resource::Composition],
     upstream_states: &[crate::parser::UpstreamState],
 ) -> InferenceBindings {
     let mut out = InferenceBindings::new();
@@ -229,14 +233,14 @@ pub fn bindings_from_parts(
             },
         );
     }
-    for virtual_resource in virtual_resources {
-        let Some(name) = &virtual_resource.binding else {
+    for composition in compositions {
+        let Some(name) = &composition.binding else {
             continue;
         };
         out.insert(
             name.clone(),
             InferenceBinding::Virtual {
-                attributes: virtual_resource.attributes.clone(),
+                attributes: composition.attributes.clone(),
             },
         );
     }
@@ -424,7 +428,7 @@ fn infer_resource_ref_with_visiting(
             });
         }
         Some(InferenceBinding::Virtual { attributes }) => {
-            // The module-call's virtual resource holds the module's
+            // The module-call's composition resource holds the module's
             // `attributes { ... }` projections directly. Recurse on the
             // bound expression so the type flows transitively through
             // the inner resource's schema. #2493.
@@ -552,7 +556,7 @@ fn lookup_schema<'a>(
     resource_type: &str,
 ) -> Option<&'a ResourceSchema> {
     schemas
-        .get(provider, resource_type, SchemaKind::Managed)
+        .get(provider, resource_type, SchemaKind::Resource)
         .or_else(|| schemas.get(provider, resource_type, SchemaKind::DataSource))
 }
 
@@ -1353,7 +1357,7 @@ mod tests {
         // resolve to the same `TypeExpr` as if the user had annotated
         // the export explicitly. The module's `attributes { role_arn =
         // role.arn }` block lets the type be inferred transitively
-        // through the module-call's virtual resource (post-expansion)
+        // through the module-call's composition resource (post-expansion)
         // and the inner role's schema attribute.
         //
         // Pre-#2493 the inference walked `parsed.resources` only, missed
@@ -1373,7 +1377,7 @@ mod tests {
         // Virtual resource that exposes the module's attributes.
         // `vpc_id` here stands in for the module-exposed attribute that
         // points at the inner role's schema attribute. carina#3181:
-        // virtuals are a distinct typestate in `virtual_resources`.
+        // compositions are a distinct typestate in `compositions`.
         let mut virt_attrs = indexmap::IndexMap::new();
         virt_attrs.insert(
             "role_id".to_string(),
@@ -1383,7 +1387,7 @@ mod tests {
                 vec![],
             ),
         );
-        let virt = crate::resource::VirtualResource {
+        let virt = crate::resource::Composition {
             id: crate::resource::ResourceId::new("_virtual", "github_actions_carina"),
             attributes: virt_attrs,
             binding: Some("github_actions_carina".to_string()),
@@ -1392,7 +1396,7 @@ mod tests {
             instance: "github_actions_carina".to_string(),
             quoted_string_attrs: std::collections::HashSet::new(),
         };
-        parsed.virtual_resources.push(virt); // allow: direct — fixture test inspection
+        parsed.compositions.push(virt); // allow: direct — fixture test inspection
         parsed.export_params.push(crate::parser::ParsedExportParam {
             name: "role_id".to_string(),
             type_expr: None,
@@ -1413,7 +1417,7 @@ mod tests {
         assert_eq!(
             inferred.export_params[0].type_expr,
             TypeExpr::Simple("vpc_id".to_string()),
-            "expected the inner attribute's type to flow through the virtual binding"
+            "expected the inner attribute's type to flow through the composition binding"
         );
     }
 
@@ -1421,7 +1425,7 @@ mod tests {
     fn apply_inference_treats_pre_expansion_module_call_binding_as_non_inferable() {
         // #2493 load-time path: at `load_configuration` the parser has
         // produced `parsed.module_calls` but module expansion hasn't
-        // run yet, so the virtual resource isn't in `parsed.resources`
+        // run yet, so the composition resource isn't in `parsed.resources`
         // and the bindings map can't see the module-call's projection.
         // The inferer must treat the binding as known-but-non-inferable
         // (mirroring `upstream_state`) so the export gets `Unknown`
@@ -1447,7 +1451,7 @@ mod tests {
         let (inferred, errors) = apply_inference(parsed, &SchemaRegistry::new());
         assert!(
             errors.is_empty(),
-            "module-call binding without a virtual resource yet must not error, got: {:?}",
+            "module-call binding without a composition yet must not error, got: {:?}",
             errors
         );
         assert_eq!(inferred.export_params[0].type_expr, TypeExpr::Unknown);
@@ -1471,7 +1475,7 @@ mod tests {
     }
 
     /// Convenience for the `Virtual`-binding cycle tests below.
-    fn virtual_binding(attrs: &[(&str, Value)]) -> InferenceBinding {
+    fn composition_binding(attrs: &[(&str, Value)]) -> InferenceBinding {
         let mut map = indexmap::IndexMap::new();
         for (k, v) in attrs {
             map.insert((*k).to_string(), v.clone());
@@ -1480,7 +1484,7 @@ mod tests {
     }
 
     #[test]
-    fn virtual_binding_two_node_cycle_reports_cycle_path() {
+    fn composition_binding_two_node_cycle_reports_cycle_path() {
         // #2497: a synthetic 2-binding `Virtual` cycle (`a.x -> b.y ->
         // a.x`) must be detected as a cycle and surface the chain in
         // the diagnostic, not loop until stack exhaustion. Parser and
@@ -1492,14 +1496,14 @@ mod tests {
         let mut bindings = InferenceBindings::new();
         bindings.insert(
             "a".to_string(),
-            virtual_binding(&[(
+            composition_binding(&[(
                 "x",
                 Value::resource_ref("b".to_string(), "y".to_string(), vec![]),
             )]),
         );
         bindings.insert(
             "b".to_string(),
-            virtual_binding(&[(
+            composition_binding(&[(
                 "y",
                 Value::resource_ref("a".to_string(), "x".to_string(), vec![]),
             )]),
@@ -1535,7 +1539,7 @@ mod tests {
         let mut bindings = InferenceBindings::new();
         bindings.insert(
             "a".to_string(),
-            virtual_binding(&[(
+            composition_binding(&[(
                 "x",
                 Value::resource_ref("a".to_string(), "x".to_string(), vec![]),
             )]),
@@ -1566,14 +1570,14 @@ mod tests {
         let mut bindings = InferenceBindings::new();
         bindings.insert(
             "a".to_string(),
-            virtual_binding(&[(
+            composition_binding(&[(
                 "x",
                 Value::Concrete(ConcreteValue::String("hi".to_string())),
             )]),
         );
         bindings.insert(
             "b".to_string(),
-            virtual_binding(&[(
+            composition_binding(&[(
                 "y",
                 Value::Concrete(ConcreteValue::String("there".to_string())),
             )]),

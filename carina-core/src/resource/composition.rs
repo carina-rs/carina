@@ -1,18 +1,18 @@
-//! `VirtualResource` — a synthetic IR node created by the module
+//! `Composition` — a synthetic IR node created by the module
 //! resolver to expose module `attributes` values.
 //!
 //! Part of the resource typestate split (#3169). Virtual resources
 //! are not sent to providers; they exist only in the IR. Their
 //! `attributes` may contain unresolved `ResourceRef` / `BindingRef`
 //! values whose resolution is **deferred to the post-apply path**.
-//! The typestate split encodes that invariant: a `VirtualResource`
+//! The typestate split encodes that invariant: a `Composition`
 //! is never accepted by the pre-apply resolver.
 //!
 //! Unlike [`Resource`](super::Resource), this struct
 //! does not carry `directives` (no `prevent_destroy` applies to a
 //! synthetic node) or `prefixes` (no auto-generated names on a
 //! non-provider resource). `module_source` is flattened to
-//! `module_name` + `instance` — those are always set for virtuals.
+//! `module_name` + `instance` — those are always set for compositions.
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{ResourceId, Value};
 
-/// A virtual resource created by module-call expansion.
+/// A composition resource created by module-call expansion.
 ///
 /// # Dropped fields (compile-time invariants)
 ///
@@ -32,8 +32,8 @@ use super::{ResourceId, Value};
 /// `prefixes` is dropped (no auto-generated names on a synthetic node):
 ///
 /// ```compile_fail
-/// use carina_core::resource::VirtualResource;
-/// fn _f(v: &VirtualResource) -> &std::collections::HashMap<String, String> {
+/// use carina_core::resource::Composition;
+/// fn _f(v: &Composition) -> &std::collections::HashMap<String, String> {
 ///     &v.prefixes
 /// }
 /// ```
@@ -41,8 +41,8 @@ use super::{ResourceId, Value};
 /// `directives` is dropped (no `prevent_destroy` applies to a synthetic node):
 ///
 /// ```compile_fail
-/// use carina_core::resource::VirtualResource;
-/// fn _f(v: &VirtualResource) -> &carina_core::resource::Directives {
+/// use carina_core::resource::Composition;
+/// fn _f(v: &Composition) -> &carina_core::resource::Directives {
 ///     &v.directives
 /// }
 /// ```
@@ -51,13 +51,13 @@ use super::{ResourceId, Value};
 /// `module_name` + `instance`:
 ///
 /// ```compile_fail
-/// use carina_core::resource::VirtualResource;
-/// fn _f(v: &VirtualResource) -> &Option<carina_core::resource::ModuleSource> {
+/// use carina_core::resource::Composition;
+/// fn _f(v: &Composition) -> &Option<carina_core::resource::ModuleSource> {
 ///     &v.module_source
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct VirtualResource {
+pub struct Composition {
     pub id: ResourceId,
     /// Attributes that may contain unresolved `ResourceRef` /
     /// `BindingRef` values. Resolution is deferred until post-apply.
@@ -65,11 +65,11 @@ pub struct VirtualResource {
     /// Binding name from `let` bindings in DSL.
     #[serde(default)]
     pub binding: Option<String>,
-    /// Binding names this virtual depends on.
+    /// Binding names this composition depends on.
     #[serde(default)]
     pub dependency_bindings: BTreeSet<String>,
     /// Module name from the originating module-call expansion
-    /// (e.g. "web_tier"). Always set for virtuals — see #2516.
+    /// (e.g. "web_tier"). Always set for compositions — see #2516.
     pub module_name: String,
     /// Module instance binding name (e.g. "web").
     pub instance: String,

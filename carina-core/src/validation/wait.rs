@@ -41,7 +41,7 @@ pub fn validate_wait_bindings<E>(
     // carina#3181: walk the typed top-level slices so a data-source
     // target (`let x = read ...`) is still found, and carry its
     // `SchemaKind` so the schema lookup below uses the matching kind.
-    // A virtual target stores `None` — it is still "found" but has no
+    // A composition target stores `None` — it is still "found" but has no
     // schema to check attributes against.
     let mut by_binding: std::collections::HashMap<String, (String, String, Option<SchemaKind>)> =
         std::collections::HashMap::new();
@@ -49,9 +49,11 @@ pub fn validate_wait_bindings<E>(
         if let Some(b) = rref.binding() {
             let id = rref.id();
             let schema_kind = match rref {
-                ResourceRef::Managed(_) | ResourceRef::Deferred { .. } => Some(SchemaKind::Managed),
+                ResourceRef::Resource(_) | ResourceRef::Deferred { .. } => {
+                    Some(SchemaKind::Resource)
+                }
                 ResourceRef::DataSource(_) => Some(SchemaKind::DataSource),
-                ResourceRef::Virtual(_) => None,
+                ResourceRef::Composition(_) => None,
             };
             by_binding.insert(
                 b.to_string(),
