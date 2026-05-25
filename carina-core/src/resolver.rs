@@ -210,9 +210,19 @@ pub fn resolve_virtual_refs_post_apply(
     bindings: &ResolvedBindings,
 ) -> Result<(), String> {
     for v in compositions.iter_mut() {
-        let mut resolved_attrs: IndexMap<String, Value> = IndexMap::new();
-        for (key, value) in &v.signature.attributes {
-            resolved_attrs.insert(key.clone(), resolve_ref_value(value, bindings)?);
+        let mut resolved_attrs: IndexMap<String, crate::resource::CompositionAttribute> =
+            IndexMap::new();
+        for (key, attr) in &v.signature.attributes {
+            // Reify the typed attribute back into a `Value`, resolve
+            // it the same way as before, then re-classify the
+            // resolved result. A `Forwarded` that resolves to a
+            // literal becomes a `Derived(Concrete(...))`; a one that
+            // resolves into another `ResourceRef` stays `Forwarded`.
+            let resolved = resolve_ref_value(&attr.to_value(), bindings)?;
+            resolved_attrs.insert(
+                key.clone(),
+                crate::resource::CompositionAttribute::from_value(resolved),
+            );
         }
         v.signature.attributes = resolved_attrs;
     }

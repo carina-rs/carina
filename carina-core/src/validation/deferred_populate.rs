@@ -97,7 +97,8 @@ pub fn validate_deferred_populate_refs<E>(
 
     let mut out: Vec<DeferredPopulateDiagnostic> = Vec::new();
     for rref in parsed.iter_all_resources() {
-        for (key, value) in rref.attributes() {
+        let attrs = rref.attributes();
+        for (key, value) in attrs.iter() {
             collect_unsynchronized_refs(
                 value,
                 key,

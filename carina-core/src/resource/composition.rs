@@ -20,7 +20,86 @@ use std::collections::{BTreeSet, HashSet};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use super::{ResourceId, Value};
+use super::{AccessPath, DeferredValue, ResourceId, Value};
+
+/// How a [`Composition`]'s attribute is produced from the rest of the
+/// IR.
+///
+/// Pre-#3294 every composition attribute was a single `Value`, and the
+/// resolver had to inspect the variant at runtime to decide whether it
+/// was a single-hop alias (`Value::Deferred(DeferredValue::ResourceRef
+/// { path })`) or a multi-source expression
+/// (`Value::Deferred(DeferredValue::Interpolation { ... })`,
+/// `FunctionCall`, etc.). Splitting that decision into a tagged enum
+/// removes the runtime classification and matches the way the
+/// post-apply resolver actually consumes them.
+///
+/// - **`Forwarded(path)`**: this attribute is the same value as the
+///   attribute reachable through `path` on another node. The resolver
+///   evaluates the path one hop at post-apply time; display can fold
+///   the alias under its target; dependency analysis adds one edge.
+/// - **`Derived(value)`**: this attribute is a multi-source expression
+///   (interpolation, function call, arithmetic, literal). The
+///   resolver evaluates the `Value` against post-apply state, which
+///   may itself contain nested refs.
+///
+/// `AccessPath` is used in `Forwarded` rather than `NodeId` because at
+/// expansion time the `NodeId` of the target may not yet be bound —
+/// the path carries a binding name + attribute path that the resolver
+/// already knows how to look up. A future PR can lift this to
+/// `Forwarded(NodeId, AttrPath)` once a name → `NodeId` index is
+/// available at expansion time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum CompositionAttribute {
+    /// Single-hop alias to another node's attribute, by path.
+    Forwarded(AccessPath),
+    /// Multi-source expression: a literal, interpolation, function
+    /// call, or any other `Value` shape that is not a bare
+    /// single-hop reference.
+    Derived(Value),
+}
+
+impl CompositionAttribute {
+    /// Classify a `Value` into the appropriate
+    /// [`CompositionAttribute`] variant.
+    ///
+    /// `Value::Deferred(DeferredValue::ResourceRef { path })` is a
+    /// single-hop alias and lifts into [`Forwarded`](Self::Forwarded).
+    /// Every other `Value` shape is multi-source (literal,
+    /// interpolation, function call, etc.) and lifts into
+    /// [`Derived`](Self::Derived).
+    pub fn from_value(value: Value) -> Self {
+        match value {
+            Value::Deferred(DeferredValue::ResourceRef { path }) => {
+                CompositionAttribute::Forwarded(path)
+            }
+            other => CompositionAttribute::Derived(other),
+        }
+    }
+
+    /// Reify back into a [`Value`] for callers that have not yet been
+    /// migrated to the new typed-variant dispatch.
+    ///
+    /// The post-apply resolver, plan display, and exporters consume
+    /// composition attributes as `Value`s today; this lets PR G ship
+    /// the type-level split without rewriting every consumer in one
+    /// commit. Each subsequent migration replaces a `.to_value()` site
+    /// with a direct match on `CompositionAttribute`.
+    pub fn to_value(&self) -> Value {
+        match self {
+            CompositionAttribute::Forwarded(path) => {
+                Value::Deferred(DeferredValue::ResourceRef { path: path.clone() })
+            }
+            CompositionAttribute::Derived(v) => v.clone(),
+        }
+    }
+}
+
+impl From<Value> for CompositionAttribute {
+    fn from(v: Value) -> Self {
+        Self::from_value(v)
+    }
+}
 
 /// The function-shaped I/O surface of a [`Composition`].
 ///
@@ -51,11 +130,13 @@ pub struct Signature {
     /// parameters, or when the call site passed no arguments.
     #[serde(default)]
     pub arguments: IndexMap<String, Value>,
-    /// Resolved module-output values. May contain unresolved
-    /// `ResourceRef` / `BindingRef` values; resolution is deferred to
-    /// the post-apply path.
+    /// Module-output values classified by how they are produced
+    /// (#3294): [`Forwarded`](CompositionAttribute::Forwarded) for
+    /// single-hop aliases, [`Derived`](CompositionAttribute::Derived)
+    /// for multi-source expressions. The resolver dispatches on the
+    /// variant at post-apply time.
     #[serde(default)]
-    pub attributes: IndexMap<String, Value>,
+    pub attributes: IndexMap<String, CompositionAttribute>,
 }
 
 /// A composition resource created by module-call expansion.
@@ -142,5 +223,87 @@ impl Composition {
     /// compile error.
     pub fn ephemeral_id(&self) -> super::EphemeralId {
         super::EphemeralId::new(self.id.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resource::ConcreteValue;
+
+    #[test]
+    fn from_value_resource_ref_classifies_as_forwarded() {
+        let path = AccessPath::new("role", "arn");
+        let v = Value::Deferred(DeferredValue::ResourceRef { path: path.clone() });
+        let attr = CompositionAttribute::from_value(v);
+        match attr {
+            CompositionAttribute::Forwarded(p) => assert_eq!(p, path),
+            CompositionAttribute::Derived(_) => panic!("ResourceRef must lift to Forwarded"),
+        }
+    }
+
+    #[test]
+    fn from_value_concrete_string_classifies_as_derived() {
+        let v = Value::Concrete(ConcreteValue::String("literal".to_string()));
+        let attr = CompositionAttribute::from_value(v.clone());
+        match attr {
+            CompositionAttribute::Derived(d) => assert_eq!(d, v),
+            CompositionAttribute::Forwarded(_) => panic!("literal must lift to Derived"),
+        }
+    }
+
+    #[test]
+    fn from_value_interpolation_classifies_as_derived() {
+        use crate::resource::InterpolationPart;
+        let v = Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Literal("prefix-".to_string()),
+            InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
+                path: AccessPath::new("svc", "id"),
+            })),
+        ]));
+        let attr = CompositionAttribute::from_value(v.clone());
+        match attr {
+            CompositionAttribute::Derived(d) => assert_eq!(d, v),
+            CompositionAttribute::Forwarded(_) => {
+                panic!("multi-source interpolation must lift to Derived")
+            }
+        }
+    }
+
+    #[test]
+    fn forwarded_to_value_is_resource_ref() {
+        let path = AccessPath::new("svc", "endpoint");
+        let attr = CompositionAttribute::Forwarded(path.clone());
+        let v = attr.to_value();
+        assert_eq!(
+            v,
+            Value::Deferred(DeferredValue::ResourceRef { path: path.clone() }),
+        );
+    }
+
+    #[test]
+    fn derived_to_value_returns_inner() {
+        let inner = Value::Concrete(ConcreteValue::String("kept".to_string()));
+        let attr = CompositionAttribute::Derived(inner.clone());
+        assert_eq!(attr.to_value(), inner);
+    }
+
+    /// Round-trip: a `Value` → `CompositionAttribute` → `Value` is
+    /// lossless for both `Forwarded`-lifted refs and `Derived`-wrapped
+    /// expressions. This is the invariant the resolver / display
+    /// layers rely on while migrating to per-variant dispatch.
+    #[test]
+    fn from_value_to_value_round_trip() {
+        let cases = vec![
+            Value::Deferred(DeferredValue::ResourceRef {
+                path: AccessPath::new("a", "b"),
+            }),
+            Value::Concrete(ConcreteValue::String("literal".to_string())),
+            Value::Concrete(ConcreteValue::Int(42)),
+        ];
+        for original in cases {
+            let lifted = CompositionAttribute::from_value(original.clone());
+            assert_eq!(lifted.to_value(), original);
+        }
     }
 }

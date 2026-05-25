@@ -464,7 +464,7 @@ impl DiagnosticEngine {
                     // Build block_name -> canonical_name map for this schema
                     let bn_map = schema.block_name_map();
 
-                    for (attr_name, attr_value) in resource_attributes {
+                    for (attr_name, attr_value) in resource_attributes.iter() {
                         if attr_name.starts_with('_') {
                             continue; // Skip internal attributes
                         }

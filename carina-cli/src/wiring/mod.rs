@@ -303,7 +303,8 @@ where
     // composition — so an empty interpolation in a `read` resource's
     // attribute is still caught.
     for rref in parsed.iter_top_level_resources() {
-        for (attr_name, value) in rref.attributes() {
+        let attrs = rref.attributes();
+        for (attr_name, value) in attrs.iter() {
             if value_contains_empty_interpolation(value) {
                 errors.push(AppError::Validation(format!(
                     "{}: attribute `{}`: empty interpolation `${{}}` — fill in the expression or remove it",

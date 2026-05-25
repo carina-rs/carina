@@ -666,8 +666,12 @@ fn test_expand_module_call_creates_composition() {
     // The security_group attribute should be a rewritten ResourceRef
     // pointing to the dot-path binding (web.sg)
     assert_eq!(
-        composition_res.signature.attributes.get("security_group"),
-        Some(&Value::resource_ref(
+        composition_res
+            .signature
+            .attributes
+            .get("security_group")
+            .map(|a| a.to_value()),
+        Some(Value::resource_ref(
             "web.sg".to_string(),
             "id".to_string(),
             vec![]
@@ -811,8 +815,12 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
 
     // The attribute half remains populated as before.
     assert_eq!(
-        composition.signature.attributes.get("endpoint"),
-        Some(&Value::Concrete(ConcreteValue::String(
+        composition
+            .signature
+            .attributes
+            .get("endpoint")
+            .map(|a| a.to_value()),
+        Some(Value::Concrete(ConcreteValue::String(
             "fixed-endpoint".to_string()
         ))),
     );
@@ -1532,8 +1540,12 @@ fn test_module_composition_dot_path_refs() {
 
     // The security_group attribute should reference dot-notation binding
     assert_eq!(
-        composition_res.signature.attributes.get("security_group"),
-        Some(&Value::resource_ref(
+        composition_res
+            .signature
+            .attributes
+            .get("security_group")
+            .map(|a| a.to_value()),
+        Some(Value::resource_ref(
             "web.sg".to_string(),
             "id".to_string(),
             vec![]

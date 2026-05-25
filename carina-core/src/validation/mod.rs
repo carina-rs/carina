@@ -155,7 +155,8 @@ pub fn validate_resource_ref_types<E>(
         };
         let resource_id = rref.id();
 
-        for (attr_name, attr_value) in rref.attributes() {
+        let attrs = rref.attributes();
+        for (attr_name, attr_value) in attrs.iter() {
             if attr_name.starts_with('_') {
                 continue;
             }
@@ -979,7 +980,8 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
     // `principals = [binding.attr]` would otherwise be missed.
     let mut referenced: HashSet<String> = HashSet::new();
     for rref in parsed.iter_all_resources() {
-        for (attr_name, value) in rref.attributes() {
+        let attrs = rref.attributes();
+        for (attr_name, value) in attrs.iter() {
             if attr_name.starts_with('_') {
                 continue;
             }

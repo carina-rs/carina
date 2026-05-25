@@ -43,8 +43,11 @@ pub fn get_resource_dependencies(resource: &Resource) -> HashSet<String> {
 /// same first-two-thirds of [`get_resource_dependencies`].
 pub fn get_composition_dependencies(virt: &crate::resource::Composition) -> HashSet<String> {
     let mut deps = HashSet::new();
-    for value in virt.signature.attributes.values() {
-        collect_dependencies(value, &mut deps);
+    for attr in virt.signature.attributes.values() {
+        // The Forwarded/Derived split (#3294) is a typed
+        // classification; dependency collection still walks the
+        // underlying `Value` shape, so reify and recurse.
+        collect_dependencies(&attr.to_value(), &mut deps);
     }
     for name in &virt.dependency_bindings {
         deps.insert(name.clone());
@@ -402,10 +405,15 @@ mod tests {
         // Build a composition whose attributes carry a ResourceRef and
         // whose `dependency_bindings` carries a separate entry.
         // Both must end up in the merged set.
-        let mut attributes = IndexMap::new();
+        let mut attributes: IndexMap<String, crate::resource::CompositionAttribute> =
+            IndexMap::new();
         attributes.insert(
             "role_arn".to_string(),
-            Value::resource_ref("role".to_string(), "arn", vec![]),
+            crate::resource::CompositionAttribute::from_value(Value::resource_ref(
+                "role".to_string(),
+                "arn",
+                vec![],
+            )),
         );
         let mut dep_bindings = BTreeSet::new();
         dep_bindings.insert("explicit_dep".to_string());

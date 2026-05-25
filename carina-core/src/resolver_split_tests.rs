@@ -51,9 +51,12 @@ fn make_managed(binding: &str, attrs: &[(&str, Value)]) -> Resource {
 }
 
 fn make_virtual(binding: &str, attrs: &[(&str, Value)]) -> Composition {
-    let mut attributes = IndexMap::new();
+    let mut attributes: IndexMap<String, crate::resource::CompositionAttribute> = IndexMap::new();
     for (k, v) in attrs {
-        attributes.insert((*k).into(), v.clone());
+        attributes.insert(
+            (*k).into(),
+            crate::resource::CompositionAttribute::from_value(v.clone()),
+        );
     }
     Composition {
         id: ResourceId::new("_virtual.module", binding),
@@ -176,7 +179,7 @@ fn resolve_virtual_refs_post_apply_uses_provided_bindings() {
         .attributes
         .get("forwarded")
         .expect("forwarded present");
-    assert_eq!(*forwarded, s("post_apply_value"));
+    assert_eq!(forwarded.to_value(), s("post_apply_value"));
 }
 
 #[test]
@@ -206,7 +209,7 @@ fn resolve_virtual_refs_post_apply_picks_post_apply_value_not_pre_apply() {
         .get("role_arn")
         .expect("role_arn present");
     assert_eq!(
-        *role_arn,
+        role_arn.to_value(),
         s("post_apply_arn"),
         "expected post-apply ARN, got {role_arn:?}",
     );
@@ -233,7 +236,7 @@ fn resolve_virtual_refs_post_apply_leaves_non_ref_values_intact() {
         .attributes
         .get("literal")
         .expect("literal present");
-    assert_eq!(*literal, s("kept"));
+    assert_eq!(literal.to_value(), s("kept"));
 }
 
 #[test]

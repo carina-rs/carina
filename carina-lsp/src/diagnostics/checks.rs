@@ -1761,7 +1761,8 @@ impl DiagnosticEngine {
         let mut diagnostics = Vec::new();
 
         for rref in parsed.iter_all_resources() {
-            for (attr_name, attr_value) in rref.attributes() {
+            let attrs = rref.attributes();
+            for (attr_name, attr_value) in attrs.iter() {
                 if attr_name.starts_with('_') {
                     continue;
                 }

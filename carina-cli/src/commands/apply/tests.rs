@@ -1201,12 +1201,15 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
     // Virtual resource as `expand_module_call` produces it: binding is
     // the module-call alias, and each attribute is a ResourceRef into
     // an expanded sub-resource. carina#3181: compositions are their own type.
-    let mut virt_attrs = indexmap::IndexMap::new();
+    let mut virt_attrs: indexmap::IndexMap<String, carina_core::resource::CompositionAttribute> =
+        indexmap::IndexMap::new();
     virt_attrs.insert(
         "role_arn".to_string(),
-        Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("github_actions_carina.role", "arn"),
-        }),
+        carina_core::resource::CompositionAttribute::from_value(Value::Deferred(
+            DeferredValue::ResourceRef {
+                path: AccessPath::new("github_actions_carina.role", "arn"),
+            },
+        )),
     );
     let composition = Composition {
         id: carina_core::resource::ResourceId::new("_virtual", "github_actions_carina"),
@@ -1297,12 +1300,17 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
 
     // carina#3181: compositions are a distinct typestate.
     let make_virtual = |id_name: &str, binding: &str, attr: &str, ref_b: &str, ref_a: &str| {
-        let mut attributes = indexmap::IndexMap::new();
+        let mut attributes: indexmap::IndexMap<
+            String,
+            carina_core::resource::CompositionAttribute,
+        > = indexmap::IndexMap::new();
         attributes.insert(
             attr.to_string(),
-            Value::Deferred(DeferredValue::ResourceRef {
-                path: AccessPath::new(ref_b, ref_a),
-            }),
+            carina_core::resource::CompositionAttribute::from_value(Value::Deferred(
+                DeferredValue::ResourceRef {
+                    path: AccessPath::new(ref_b, ref_a),
+                },
+            )),
         );
         Composition {
             id: carina_core::resource::ResourceId::new("_virtual", id_name),
@@ -1471,12 +1479,15 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     let mut role_managed = Resource::with_provider("awscc", "iam.Role", "carina_role", None);
     role_managed.binding = Some("role".to_string());
 
-    let mut virt_attrs = indexmap::IndexMap::new();
+    let mut virt_attrs: indexmap::IndexMap<String, carina_core::resource::CompositionAttribute> =
+        indexmap::IndexMap::new();
     virt_attrs.insert(
         "role_arn".to_string(),
-        Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("role", "arn"),
-        }),
+        carina_core::resource::CompositionAttribute::from_value(Value::Deferred(
+            DeferredValue::ResourceRef {
+                path: AccessPath::new("role", "arn"),
+            },
+        )),
     );
     let composition = Composition {
         id: ResourceId::new("_virtual", "carina_module"),

@@ -288,16 +288,13 @@ pub fn extract_compact_hint(
     resource: &dyn crate::resource::ResourceLike,
     parent_binding: Option<&str>,
 ) -> Option<String> {
-    let mut keys: Vec<_> = resource
-        .attributes()
-        .keys()
-        .filter(|k| !k.starts_with('_'))
-        .collect();
+    let attrs = resource.attributes();
+    let mut keys: Vec<&String> = attrs.keys().filter(|k| !k.starts_with('_')).collect();
     keys.sort();
 
     // Priority 1: First distinguishing string attribute (most identifying)
     for key in &keys {
-        if let Some(Value::Concrete(ConcreteValue::String(s))) = resource.attributes().get(*key)
+        if let Some(Value::Concrete(ConcreteValue::String(s))) = attrs.get(*key)
             && !s.is_empty()
         {
             let short_key = shorten_attr_name(key);
@@ -314,7 +311,7 @@ pub fn extract_compact_hint(
 
     // Priority 2: First non-parent ResourceRef attribute (direct or inside a List)
     for key in &keys {
-        match resource.attributes().get(*key) {
+        match attrs.get(*key) {
             Some(Value::Deferred(DeferredValue::ResourceRef { path })) => {
                 if parent_binding == Some(path.binding()) {
                     continue;
