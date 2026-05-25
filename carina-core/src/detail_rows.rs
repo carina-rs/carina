@@ -1302,6 +1302,19 @@ fn compute_list_of_maps_diff_parts(
                     && matches!(&new_map[k], Value::Concrete(ConcreteValue::Map(_)))
                 {
                     let nested = compute_map_diff_entries(old_val, &new_map[k], field_type, detail);
+                    // carina#3258: when every nested entry was
+                    // suppressed (display-equal phantom or
+                    // schema-aware leaf-skip), the parent header alone
+                    // — `~ { condition: }` — is itself a phantom row.
+                    // Fold the field into the hidden-unchanged count
+                    // instead of pushing an empty `NestedMapChanged`.
+                    // Mirrors the same guard at the sibling
+                    // `NestedMapDiff` site in
+                    // `compute_map_diff_entries` (#2910).
+                    if nested.is_empty() {
+                        unchanged_count += 1;
+                        continue;
+                    }
                     fields.push(ListOfMapsDiffField::NestedMapChanged {
                         key: k.to_string(),
                         entries: nested,
@@ -2901,6 +2914,87 @@ mod tests {
             )),
             "secret rotation must still produce a Changed row, got: {rows:?}"
         );
+    }
+
+    /// carina#3258 (regression caught from real-infra repro): when a
+    /// paired list-of-maps element has nested-map peer fields
+    /// (`condition`, `principal`) whose every child entry is itself a
+    /// display-equal phantom suppressed by the inner
+    /// `compute_map_diff_entries`, the *parent* must NOT push a
+    /// `NestedMapChanged { entries: [] }` row whose only visible
+    /// output is `~ key:` with an empty body. Fold such empty nested
+    /// fields into the per-element hidden-unchanged count.
+    #[test]
+    fn list_of_maps_modified_drops_empty_nested_map_field() {
+        // Inner map whose only "change" is a shape mismatch that
+        // collapses to display-equal under the phantom guard.
+        let mut old_condition = indexmap::IndexMap::new();
+        old_condition.insert(
+            "string_equals".to_string(),
+            Value::Concrete(ConcreteValue::StringList(vec!["x".to_string()])),
+        );
+        let mut new_condition = indexmap::IndexMap::new();
+        new_condition.insert(
+            "string_equals".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("x".to_string()),
+            )])),
+        );
+
+        // The whole statement mirrors the real OIDC repro: many
+        // shared fields (`sid`, `effect`, `action`) drive Phase 2
+        // similarity high enough to pair; the `condition` nested map
+        // is the all-phantom field that triggers the bug.
+        let mut old_stmt = indexmap::IndexMap::new();
+        old_stmt.insert(
+            "sid".to_string(),
+            Value::Concrete(ConcreteValue::String("shared".to_string())),
+        );
+        old_stmt.insert(
+            "effect".to_string(),
+            Value::Concrete(ConcreteValue::String("Allow".to_string())),
+        );
+        old_stmt.insert(
+            "condition".to_string(),
+            Value::Concrete(ConcreteValue::Map(old_condition)),
+        );
+
+        let mut new_stmt = indexmap::IndexMap::new();
+        new_stmt.insert(
+            "sid".to_string(),
+            Value::Concrete(ConcreteValue::String("shared".to_string())),
+        );
+        new_stmt.insert(
+            "effect".to_string(),
+            Value::Concrete(ConcreteValue::String("Allow".to_string())),
+        );
+        new_stmt.insert(
+            "condition".to_string(),
+            Value::Concrete(ConcreteValue::Map(new_condition)),
+        );
+
+        let old_value = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(old_stmt),
+        )]));
+        let new_value = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(new_stmt),
+        )]));
+
+        let (_unchanged, modified, _added, _removed) =
+            compute_list_of_maps_diff_parts(Some(&old_value), &new_value, None, DetailLevel::Full);
+
+        for m in &modified {
+            for field in m.fields.as_slice() {
+                if let ListOfMapsDiffField::NestedMapChanged { key, entries } = field {
+                    assert!(
+                        !entries.is_empty(),
+                        "nested-map field `{key}` rendered with empty entries; \
+                         an all-phantom nested map must fold into hidden_unchanged_count, \
+                         not push a `~ {key}:` header with no children"
+                    );
+                }
+            }
+        }
     }
 
     /// carina#3258 (negative — secret bypass at map-diff site):
