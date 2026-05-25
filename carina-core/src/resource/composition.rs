@@ -132,3 +132,15 @@ pub struct Composition {
     #[serde(default, skip)]
     pub quoted_string_attrs: HashSet<String>,
 }
+
+impl Composition {
+    /// The composition's id wrapped as an [`EphemeralId`](super::EphemeralId).
+    ///
+    /// `Composition` is plan-scoped and never persists in state, so its
+    /// id is `EphemeralId`-typed. By construction this id cannot enter
+    /// state-load APIs that take `&PersistentId` — that mismatch is a
+    /// compile error.
+    pub fn ephemeral_id(&self) -> super::EphemeralId {
+        super::EphemeralId::new(self.id.clone())
+    }
+}

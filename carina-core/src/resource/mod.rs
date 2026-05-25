@@ -1665,6 +1665,16 @@ impl Resource {
         }
     }
 
+    /// The resource's id wrapped as a [`PersistentId`] — i.e., an id
+    /// that may legally enter state-load APIs.
+    ///
+    /// `Resource` is a leaf node and persists in state, so its id is
+    /// `PersistentId`-typed. The wrapper is created by cloning the
+    /// inner `ResourceId`; for owned consumption use `PersistentId::new(r.id.clone())`.
+    pub fn persistent_id(&self) -> persistent_id::PersistentId {
+        persistent_id::PersistentId::new(self.id.clone())
+    }
+
     pub fn with_provider(
         provider: impl Into<String>,
         resource_type: impl Into<String>,
@@ -1794,10 +1804,12 @@ pub mod composition;
 pub mod data_source;
 pub mod graph_node;
 pub mod leaf_node;
+pub mod persistent_id;
 pub mod resource_like;
 
 pub use composition::{Composition, Signature};
 pub use data_source::DataSource;
 pub use graph_node::GraphNode;
 pub use leaf_node::{CompositionNotALeaf, LeafNode, expand_to_leaves};
+pub use persistent_id::{EphemeralId, NodeId, PersistentId};
 pub use resource_like::ResourceLike;
