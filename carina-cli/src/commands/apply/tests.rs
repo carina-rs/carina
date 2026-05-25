@@ -1137,14 +1137,18 @@ fn resolve_exports_resolves_cross_file_dot_notation_strings() {
     registry_prod.binding = Some("registry_prod".to_string());
     let sorted_resources = vec![registry_prod];
 
+    let post_apply_states =
+        crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
+            &std::collections::HashMap::new(),
+            &state,
+        );
     let exports = resolve_exports(
         &export_params,
         &sorted_resources,
         &[],
         &[],
-        &state,
+        &post_apply_states,
         &[],
-        &std::collections::HashMap::new(),
     )
     .unwrap();
 
@@ -1224,14 +1228,18 @@ fn resolve_exports_resolves_module_call_attribute_via_virtual_resource() {
         })),
     }];
 
+    let post_apply_states =
+        crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
+            &std::collections::HashMap::new(),
+            &state,
+        );
     let exports = resolve_exports(
         &export_params,
         &sorted_resources,
         &[],
         &pre_resolve_virtuals,
-        &state,
+        &post_apply_states,
         &[],
-        &std::collections::HashMap::new(),
     )
     .unwrap();
 
@@ -1330,14 +1338,18 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_virtuals() {
     }];
 
     let pre_resolve_virtuals = vec![inner_virtual, outer_virtual];
+    let post_apply_states =
+        crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
+            &std::collections::HashMap::new(),
+            &state,
+        );
     let exports = resolve_exports(
         &export_params,
         &sorted_resources,
         &[],
         &pre_resolve_virtuals,
-        &state,
+        &post_apply_states,
         &[],
-        &std::collections::HashMap::new(),
     )
     .unwrap();
 
@@ -1500,14 +1512,18 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
         })),
     }];
 
+    let post_apply_states =
+        crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
+            &std::collections::HashMap::new(),
+            &post_apply_state_file,
+        );
     let exports = resolve_exports(
         &export_params,
         &sorted_resources,
         &[],
         &pre_resolve_virtuals,
-        &post_apply_state_file,
+        &post_apply_states,
         &[],
-        &std::collections::HashMap::new(),
     )
     .unwrap();
 
@@ -1604,14 +1620,18 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
         })),
     }];
 
+    let post_apply_states =
+        crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
+            &current_states,
+            &post_apply_state_file,
+        );
     let exports = resolve_exports(
         &export_params,
         &[],
         &data_sources,
         &[],
-        &post_apply_state_file,
+        &post_apply_states,
         &[],
-        &current_states,
     )
     .unwrap();
 
