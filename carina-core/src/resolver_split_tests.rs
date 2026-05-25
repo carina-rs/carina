@@ -19,7 +19,8 @@ use crate::resolver::{
     resolve_managed_refs_with_state_and_remote, resolve_virtual_refs_post_apply,
 };
 use crate::resource::{
-    AccessPath, Composition, ConcreteValue, DeferredValue, Resource, ResourceId, State, Value,
+    AccessPath, Composition, ConcreteValue, DeferredValue, Resource, ResourceId, Signature, State,
+    Value,
 };
 
 fn s(s: &str) -> Value {
@@ -56,7 +57,10 @@ fn make_virtual(binding: &str, attrs: &[(&str, Value)]) -> Composition {
     }
     Composition {
         id: ResourceId::new("_virtual.module", binding),
-        attributes,
+        signature: Signature {
+            arguments: IndexMap::new(),
+            attributes,
+        },
         binding: Some(binding.into()),
         dependency_bindings: BTreeSet::new(),
         module_name: "m".into(),
@@ -168,6 +172,7 @@ fn resolve_virtual_refs_post_apply_uses_provided_bindings() {
     resolve_virtual_refs_post_apply(&mut compositions, &bindings).expect("resolve compositions");
 
     let forwarded = compositions[0]
+        .signature
         .attributes
         .get("forwarded")
         .expect("forwarded present");
@@ -196,6 +201,7 @@ fn resolve_virtual_refs_post_apply_picks_post_apply_value_not_pre_apply() {
         .expect("resolve compositions");
 
     let role_arn = compositions[0]
+        .signature
         .attributes
         .get("role_arn")
         .expect("role_arn present");
@@ -223,6 +229,7 @@ fn resolve_virtual_refs_post_apply_leaves_non_ref_values_intact() {
     resolve_virtual_refs_post_apply(&mut compositions, &bindings).expect("resolve compositions");
 
     let literal = compositions[0]
+        .signature
         .attributes
         .get("literal")
         .expect("literal present");

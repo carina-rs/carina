@@ -70,8 +70,16 @@ impl ResourceLike for Composition {
     fn id(&self) -> &ResourceId {
         &self.id
     }
+    /// Reads the I/O surface's `attributes` half.
+    ///
+    /// `Composition` is the only sibling that carries a [`Signature`]
+    /// (#3292). The `arguments` half is not exposed through
+    /// `ResourceLike` — the trait abstracts over the *output* surface
+    /// that `Resource` and `DataSource` also expose, while
+    /// `arguments` is composition-only and reached via
+    /// `c.signature.arguments` directly.
     fn attributes(&self) -> &IndexMap<String, Value> {
-        &self.attributes
+        &self.signature.attributes
     }
     fn binding(&self) -> Option<&str> {
         self.binding.as_deref()

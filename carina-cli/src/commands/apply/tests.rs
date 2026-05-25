@@ -1210,7 +1210,10 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
     );
     let composition = Composition {
         id: carina_core::resource::ResourceId::new("_virtual", "github_actions_carina"),
-        attributes: virt_attrs,
+        signature: carina_core::resource::Signature {
+            arguments: indexmap::IndexMap::new(),
+            attributes: virt_attrs,
+        },
         binding: Some("github_actions_carina".to_string()),
         dependency_bindings: std::collections::BTreeSet::new(),
         module_name: "github_module".to_string(),
@@ -1303,7 +1306,10 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
         );
         Composition {
             id: carina_core::resource::ResourceId::new("_virtual", id_name),
-            attributes,
+            signature: carina_core::resource::Signature {
+                arguments: indexmap::IndexMap::new(),
+                attributes,
+            },
             binding: Some(binding.to_string()),
             dependency_bindings: std::collections::BTreeSet::new(),
             module_name: "mod".to_string(),
@@ -1474,7 +1480,10 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     );
     let composition = Composition {
         id: ResourceId::new("_virtual", "carina_module"),
-        attributes: virt_attrs,
+        signature: carina_core::resource::Signature {
+            arguments: indexmap::IndexMap::new(),
+            attributes: virt_attrs,
+        },
         binding: Some("carina_module".to_string()),
         dependency_bindings: std::collections::BTreeSet::new(),
         module_name: "carina_module".to_string(),

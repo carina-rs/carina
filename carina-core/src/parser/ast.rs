@@ -115,7 +115,7 @@ impl<'a> ResourceRef<'a> {
     pub fn attributes(&self) -> &'a IndexMap<String, Value> {
         match self {
             ResourceRef::Resource(r) => &r.attributes,
-            ResourceRef::Composition(v) => &v.attributes,
+            ResourceRef::Composition(v) => &v.signature.attributes,
             ResourceRef::DataSource(d) => &d.attributes,
             ResourceRef::Deferred { resource, .. } => &resource.attributes,
         }

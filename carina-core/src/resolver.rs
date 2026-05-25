@@ -211,10 +211,10 @@ pub fn resolve_virtual_refs_post_apply(
 ) -> Result<(), String> {
     for v in compositions.iter_mut() {
         let mut resolved_attrs: IndexMap<String, Value> = IndexMap::new();
-        for (key, value) in &v.attributes {
+        for (key, value) in &v.signature.attributes {
             resolved_attrs.insert(key.clone(), resolve_ref_value(value, bindings)?);
         }
-        v.attributes = resolved_attrs;
+        v.signature.attributes = resolved_attrs;
     }
     Ok(())
 }

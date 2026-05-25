@@ -13,7 +13,7 @@ use std::collections::{BTreeSet, HashMap};
 use indexmap::IndexMap;
 
 use crate::binding_index::ResolvedBindings;
-use crate::resource::{Composition, ConcreteValue, Resource, ResourceId, State, Value};
+use crate::resource::{Composition, ConcreteValue, Resource, ResourceId, Signature, State, Value};
 
 fn s(s: &str) -> Value {
     Value::Concrete(ConcreteValue::String(s.into()))
@@ -43,7 +43,10 @@ fn make_virtual(binding: &str, attrs: &[(&str, Value)]) -> Composition {
     }
     Composition {
         id: ResourceId::new("_virtual.module", binding),
-        attributes,
+        signature: Signature {
+            arguments: IndexMap::new(),
+            attributes,
+        },
         binding: Some(binding.into()),
         dependency_bindings: BTreeSet::new(),
         module_name: "m".into(),
