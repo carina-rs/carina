@@ -283,9 +283,24 @@ impl ModuleResolver<'_> {
                 }
             }
 
+            // Preserve the resolved call-site arguments on the
+            // expanded composition itself (#3292). `argument_values`
+            // is a HashMap (look-up keyed); we record them on the
+            // composition in `module.arguments` declaration order so
+            // the trace is stable across runs.
+            let mut signature_arguments: IndexMap<String, Value> = IndexMap::new();
+            for arg in &module.arguments {
+                if let Some(value) = argument_values.get(&arg.name) {
+                    signature_arguments.insert(arg.name.clone(), value.clone());
+                }
+            }
+
             let composition = Composition {
                 id: ResourceId::new("_virtual", binding_name),
-                attributes: composition_attrs,
+                signature: crate::resource::Signature {
+                    arguments: signature_arguments,
+                    attributes: composition_attrs,
+                },
                 binding: Some(binding_name.clone()),
                 dependency_bindings: BTreeSet::new(),
                 module_name: call.module_name.clone(),
@@ -596,7 +611,7 @@ fn prefix_module_composition(
     }
 
     let mut substituted_attrs: IndexMap<String, Value> = IndexMap::new();
-    for (key, expr) in &new_virtual.attributes {
+    for (key, expr) in &new_virtual.signature.attributes {
         substituted_attrs.insert(
             key.clone(),
             prefix_attr_value(
@@ -607,7 +622,7 @@ fn prefix_module_composition(
             ),
         );
     }
-    new_virtual.attributes = substituted_attrs;
+    new_virtual.signature.attributes = substituted_attrs;
 
     new_virtual
 }

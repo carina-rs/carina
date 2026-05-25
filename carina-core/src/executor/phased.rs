@@ -1371,7 +1371,10 @@ mod tests {
         );
         Composition {
             id: ResourceId::with_provider("_virtual", "_virtual", id_name, None),
-            attributes,
+            signature: crate::resource::Signature {
+                arguments: indexmap::IndexMap::new(),
+                attributes,
+            },
             binding: Some(binding.to_string()),
             dependency_bindings: std::collections::BTreeSet::new(),
             module_name: "mod".to_string(),

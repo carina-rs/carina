@@ -606,7 +606,10 @@ mod tests {
         );
         let virt = Composition {
             id: ResourceId::with_provider("_virtual", "_virtual", "bootstrap", None),
-            attributes: virt_attrs,
+            signature: crate::resource::Signature {
+                arguments: indexmap::IndexMap::new(),
+                attributes: virt_attrs,
+            },
             binding: Some("bootstrap".to_string()),
             dependency_bindings: std::collections::BTreeSet::new(),
             module_name: "github-oidc".to_string(),

@@ -240,7 +240,7 @@ pub fn bindings_from_parts(
         out.insert(
             name.clone(),
             InferenceBinding::Virtual {
-                attributes: composition.attributes.clone(),
+                attributes: composition.signature.attributes.clone(),
             },
         );
     }
@@ -1389,7 +1389,10 @@ mod tests {
         );
         let virt = crate::resource::Composition {
             id: crate::resource::ResourceId::new("_virtual", "github_actions_carina"),
-            attributes: virt_attrs,
+            signature: crate::resource::Signature {
+                arguments: indexmap::IndexMap::new(),
+                attributes: virt_attrs,
+            },
             binding: Some("github_actions_carina".to_string()),
             dependency_bindings: std::collections::BTreeSet::new(),
             module_name: "github_module".to_string(),

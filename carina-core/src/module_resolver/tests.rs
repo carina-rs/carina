@@ -656,12 +656,17 @@ fn test_expand_module_call_creates_composition() {
     // Module info lives in the flattened module_name / instance fields.
     assert_eq!(composition_res.module_name, "web_tier");
     assert_eq!(composition_res.instance, "web");
-    assert!(!composition_res.attributes.contains_key("_module"));
-    assert!(!composition_res.attributes.contains_key("_module_instance"));
+    assert!(!composition_res.signature.attributes.contains_key("_module"));
+    assert!(
+        !composition_res
+            .signature
+            .attributes
+            .contains_key("_module_instance")
+    );
     // The security_group attribute should be a rewritten ResourceRef
     // pointing to the dot-path binding (web.sg)
     assert_eq!(
-        composition_res.attributes.get("security_group"),
+        composition_res.signature.attributes.get("security_group"),
         Some(&Value::resource_ref(
             "web.sg".to_string(),
             "id".to_string(),
@@ -702,6 +707,115 @@ fn test_expand_module_call_populates_compositions_slice() {
 
     // This module declares no data sources.
     assert!(expanded.data_sources.is_empty());
+}
+
+/// PR E (#3292) acceptance: a composition's `signature.arguments`
+/// preserves the resolved call-site arguments. The pre-#3292 expander
+/// dropped this information with the `ModuleCall`; with `Signature`
+/// on `Composition`, the call boundary is now inspectable on the
+/// expanded node itself.
+#[test]
+fn test_expand_module_call_preserves_arguments_on_composition_signature() {
+    use crate::parser::{ArgumentParameter, AttributeParameter, TypeExpr};
+
+    // A small module that declares two `argument` parameters and one
+    // `attribute` output, used to verify both halves of the signature.
+    let module = ParsedFile {
+        providers: vec![],
+        resources: vec![],
+        data_sources: vec![],
+        compositions: vec![],
+        variables: IndexMap::new(),
+        uses: vec![],
+        module_calls: vec![],
+        arguments: vec![
+            ArgumentParameter {
+                name: "region".to_string(),
+                type_expr: TypeExpr::String,
+                default: None,
+                description: None,
+                validations: vec![],
+            },
+            ArgumentParameter {
+                name: "instance_count".to_string(),
+                type_expr: TypeExpr::Int,
+                default: None,
+                description: None,
+                validations: vec![],
+            },
+        ],
+        attribute_params: vec![AttributeParameter {
+            name: "endpoint".to_string(),
+            type_expr: None,
+            value: Some(Value::Concrete(ConcreteValue::String(
+                "fixed-endpoint".to_string(),
+            ))),
+        }],
+        export_params: vec![],
+        backend: None,
+        state_blocks: vec![],
+        user_functions: HashMap::new(),
+        upstream_states: vec![],
+        wait_bindings: vec![],
+        requires: vec![],
+        structural_bindings: HashSet::new(),
+        warnings: vec![],
+        deferred_for_expressions: vec![],
+    };
+
+    let resolver = {
+        let mut r = ModuleResolver::new(".");
+        r.imported_modules.insert("svc".to_string(), module);
+        r
+    };
+
+    let mut call_arguments: HashMap<String, Value> = HashMap::new();
+    call_arguments.insert(
+        "region".to_string(),
+        Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
+    );
+    call_arguments.insert(
+        "instance_count".to_string(),
+        Value::Concrete(ConcreteValue::Int(3)),
+    );
+
+    let call = ModuleCall {
+        module_name: "svc".to_string(),
+        binding_name: Some("api".to_string()),
+        arguments: call_arguments,
+    };
+
+    let expanded = resolver.expand_module_call(&call, "api", None).unwrap();
+    assert_eq!(expanded.compositions.len(), 1);
+    let composition = &expanded.compositions[0];
+
+    // The composition's signature.arguments must contain BOTH values
+    // passed at the call site, keyed by argument name.
+    assert_eq!(
+        composition.signature.arguments.get("region"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "ap-northeast-1".to_string()
+        ))),
+        "region argument must be recorded on the composition signature",
+    );
+    assert_eq!(
+        composition.signature.arguments.get("instance_count"),
+        Some(&Value::Concrete(ConcreteValue::Int(3))),
+        "instance_count argument must be recorded on the composition signature",
+    );
+
+    // Arguments are recorded in module.arguments declaration order so
+    // the trace is stable across runs.
+    let keys: Vec<&String> = composition.signature.arguments.keys().collect();
+    assert_eq!(keys, vec!["region", "instance_count"]);
+
+    // The attribute half remains populated as before.
+    assert_eq!(
+        composition.signature.attributes.get("endpoint"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "fixed-endpoint".to_string()
+        ))),
+    );
 }
 
 #[test]
@@ -1418,7 +1532,7 @@ fn test_module_composition_dot_path_refs() {
 
     // The security_group attribute should reference dot-notation binding
     assert_eq!(
-        composition_res.attributes.get("security_group"),
+        composition_res.signature.attributes.get("security_group"),
         Some(&Value::resource_ref(
             "web.sg".to_string(),
             "id".to_string(),

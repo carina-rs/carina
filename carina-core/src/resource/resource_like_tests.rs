@@ -8,7 +8,7 @@ use indexmap::IndexMap;
 
 use crate::resource::{
     Composition, ConcreteValue, DataSource, Directives, ModuleSource, Resource, ResourceId,
-    ResourceLike, Value,
+    ResourceLike, Signature, Value,
 };
 
 fn sample_value(s: &str) -> Value {
@@ -32,7 +32,10 @@ fn make_virtual() -> Composition {
     attributes.insert("k".to_string(), sample_value("v"));
     Composition {
         id: ResourceId::new("aws.s3.Bucket", "b"),
-        attributes,
+        signature: Signature {
+            arguments: IndexMap::new(),
+            attributes,
+        },
         binding: Some("b".to_string()),
         dependency_bindings: deps(),
         module_name: "m".to_string(),

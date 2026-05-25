@@ -43,7 +43,7 @@ pub fn get_resource_dependencies(resource: &Resource) -> HashSet<String> {
 /// same first-two-thirds of [`get_resource_dependencies`].
 pub fn get_composition_dependencies(virt: &crate::resource::Composition) -> HashSet<String> {
     let mut deps = HashSet::new();
-    for value in virt.attributes.values() {
+    for value in virt.signature.attributes.values() {
         collect_dependencies(value, &mut deps);
     }
     for name in &virt.dependency_bindings {
@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn test_get_composition_dependencies_collects_attrs_and_deps() {
-        use crate::resource::Composition;
+        use crate::resource::{Composition, Signature};
         use indexmap::IndexMap;
         use std::collections::BTreeSet;
 
@@ -411,7 +411,10 @@ mod tests {
         dep_bindings.insert("explicit_dep".to_string());
         let virt = Composition {
             id: ResourceId::new("_virtual.module", "v"),
-            attributes,
+            signature: Signature {
+                arguments: IndexMap::new(),
+                attributes,
+            },
             binding: Some("v".to_string()),
             dependency_bindings: dep_bindings,
             module_name: "m".to_string(),

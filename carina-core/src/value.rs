@@ -771,14 +771,14 @@ pub fn redact_secrets_in_virtual(
     resource: &crate::resource::Composition,
 ) -> Result<crate::resource::Composition, SerializationError> {
     let attributes: Result<indexmap::IndexMap<String, Value>, _> = resource
+        .signature
         .attributes
         .iter()
         .map(|(k, e)| redact_secrets_in_value(e).map(|rv| (k.clone(), rv)))
         .collect();
-    Ok(crate::resource::Composition {
-        attributes: attributes?,
-        ..resource.clone()
-    })
+    let mut out = resource.clone();
+    out.signature.attributes = attributes?;
+    Ok(out)
 }
 
 /// Redact all secrets in a `State`, returning a new State with secrets replaced by hashes.
@@ -2364,7 +2364,7 @@ mod tests {
         // block (which lands as a `Value::Secret` in the composition's
         // attribute map) must be redacted before serialization, the
         // same way managed-resource attributes are redacted.
-        use crate::resource::{Composition, ResourceId};
+        use crate::resource::{Composition, ResourceId, Signature};
         use std::collections::{BTreeSet, HashSet};
         let mut attrs = indexmap::IndexMap::new();
         attrs.insert(
@@ -2379,7 +2379,10 @@ mod tests {
         );
         let virt = Composition {
             id: ResourceId::new("_virtual", "module_instance"),
-            attributes: attrs,
+            signature: Signature {
+                arguments: indexmap::IndexMap::new(),
+                attributes: attrs,
+            },
             binding: Some("module_instance".to_string()),
             dependency_bindings: BTreeSet::new(),
             module_name: "m".to_string(),
@@ -2391,13 +2394,13 @@ mod tests {
 
         // The non-secret attribute survives verbatim.
         assert_eq!(
-            redacted.attributes.get("non_secret"),
+            redacted.signature.attributes.get("non_secret"),
             Some(&Value::Concrete(ConcreteValue::String("kept".to_string()))),
         );
 
         // The secret attribute is replaced with the hash prefix, not the
         // plaintext.
-        match redacted.attributes.get("secret_field") {
+        match redacted.signature.attributes.get("secret_field") {
             Some(Value::Concrete(ConcreteValue::String(s))) => {
                 assert!(
                     s.starts_with(SECRET_PREFIX),

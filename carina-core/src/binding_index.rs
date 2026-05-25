@@ -604,7 +604,7 @@ impl ResolvedBindings {
             self.by_name.insert(
                 binding_name.clone(),
                 ResolvedBinding {
-                    attributes: crate::resource::attrs_to_hashmap(&v.attributes),
+                    attributes: crate::resource::attrs_to_hashmap(&v.signature.attributes),
                     source: BindingValueSource::Local,
                 },
             );

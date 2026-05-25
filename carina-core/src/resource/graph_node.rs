@@ -146,7 +146,10 @@ mod tests {
         use std::collections::{BTreeSet, HashSet};
         let c = Composition {
             id: ResourceId::new("_virtual", "m"),
-            attributes: IndexMap::new(),
+            signature: super::super::Signature {
+                arguments: IndexMap::new(),
+                attributes: IndexMap::new(),
+            },
             binding: None,
             dependency_bindings: BTreeSet::new(),
             module_name: "m".to_string(),
