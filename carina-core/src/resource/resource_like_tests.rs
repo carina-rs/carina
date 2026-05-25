@@ -28,8 +28,11 @@ fn make_managed() -> Resource {
 }
 
 fn make_virtual() -> Composition {
-    let mut attributes = IndexMap::new();
-    attributes.insert("k".to_string(), sample_value("v"));
+    let mut attributes: IndexMap<String, crate::resource::CompositionAttribute> = IndexMap::new();
+    attributes.insert(
+        "k".to_string(),
+        crate::resource::CompositionAttribute::from_value(sample_value("v")),
+    );
     Composition {
         id: ResourceId::new("aws.s3.Bucket", "b"),
         signature: Signature {
@@ -113,15 +116,15 @@ fn binding_none_covers_all_arms() {
 
 #[test]
 fn resource_like_supports_generic_dispatch() {
-    fn first_attribute_key<R: ResourceLike>(r: &R) -> Option<&String> {
-        r.attributes().keys().next()
+    fn first_attribute_key<R: ResourceLike>(r: &R) -> Option<String> {
+        r.attributes().keys().next().cloned()
     }
 
-    assert_eq!(first_attribute_key(&make_managed()), Some(&"k".to_string()));
-    assert_eq!(first_attribute_key(&make_virtual()), Some(&"k".to_string()));
+    assert_eq!(first_attribute_key(&make_managed()), Some("k".to_string()));
+    assert_eq!(first_attribute_key(&make_virtual()), Some("k".to_string()));
     assert_eq!(
         first_attribute_key(&make_data_source()),
-        Some(&"k".to_string()),
+        Some("k".to_string()),
     );
 }
 

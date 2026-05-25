@@ -267,9 +267,13 @@ impl ModuleResolver<'_> {
         if !module.attribute_params.is_empty()
             && let Some(binding_name) = &call.binding_name
         {
-            let mut composition_attrs: IndexMap<String, Value> = IndexMap::new();
+            let mut composition_attrs: IndexMap<String, crate::resource::CompositionAttribute> =
+                IndexMap::new();
 
-            // Copy attribute values from the module definition
+            // Copy attribute values from the module definition.
+            // Each value is classified into `Forwarded` (single-hop
+            // alias) vs `Derived` (multi-source expression) via
+            // `CompositionAttribute::from_value` (#3294).
             for attr_param in &module.attribute_params {
                 if let Some(value) = &attr_param.value {
                     // Rewrite intra-module refs and substitute arguments
@@ -279,7 +283,10 @@ impl ModuleResolver<'_> {
                     // Same post-substitution canonicalize as the
                     // resource-attribute path above (#2815 / #2817).
                     substituted.canonicalize_in_place();
-                    composition_attrs.insert(attr_param.name.clone(), substituted);
+                    composition_attrs.insert(
+                        attr_param.name.clone(),
+                        crate::resource::CompositionAttribute::from_value(substituted),
+                    );
                 }
             }
 
@@ -610,16 +617,21 @@ fn prefix_module_composition(
         new_virtual.binding = Some(apply_instance_prefix(instance_prefix, binding));
     }
 
-    let mut substituted_attrs: IndexMap<String, Value> = IndexMap::new();
-    for (key, expr) in &new_virtual.signature.attributes {
+    let mut substituted_attrs: IndexMap<String, crate::resource::CompositionAttribute> =
+        IndexMap::new();
+    for (key, attr) in &new_virtual.signature.attributes {
+        // Round-trip through `Value` so the existing `prefix_attr_value`
+        // helper (which knows about every nested `Value` shape) can
+        // run unmodified, then re-classify the result. A bare
+        // `Forwarded` may transform into another `Forwarded`
+        // (same shape, instance-prefixed binding) or stay `Derived`
+        // depending on what `prefix_attr_value` did.
+        let v = attr.to_value();
+        let prefixed =
+            prefix_attr_value(&v, instance_prefix, intra_module_bindings, argument_values);
         substituted_attrs.insert(
             key.clone(),
-            prefix_attr_value(
-                expr,
-                instance_prefix,
-                intra_module_bindings,
-                argument_values,
-            ),
+            crate::resource::CompositionAttribute::from_value(prefixed),
         );
     }
     new_virtual.signature.attributes = substituted_attrs;

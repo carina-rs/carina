@@ -111,13 +111,30 @@ impl<'a> ResourceRef<'a> {
         }
     }
 
-    /// Source-order preserving attribute map.
-    pub fn attributes(&self) -> &'a IndexMap<String, Value> {
+    /// Source-order preserving attribute map as `Value`s.
+    ///
+    /// Returned as a [`Cow`](std::borrow::Cow) because
+    /// [`Composition`] stores its attributes typed as
+    /// [`CompositionAttribute`](crate::resource::CompositionAttribute)
+    /// since #3294, and must materialize a `Value`-typed view on
+    /// demand. The other three variants ([`Resource`],
+    /// [`DataSource`], [`Deferred`](Self::Deferred)) return a borrowed
+    /// reference. Callers `.iter()` / `.contains_key()` / `.get()`
+    /// through the `Cow` directly via `Deref`.
+    pub fn attributes(&self) -> std::borrow::Cow<'a, IndexMap<String, Value>> {
         match self {
-            ResourceRef::Resource(r) => &r.attributes,
-            ResourceRef::Composition(v) => &v.signature.attributes,
-            ResourceRef::DataSource(d) => &d.attributes,
-            ResourceRef::Deferred { resource, .. } => &resource.attributes,
+            ResourceRef::Resource(r) => std::borrow::Cow::Borrowed(&r.attributes),
+            ResourceRef::Composition(v) => std::borrow::Cow::Owned(
+                v.signature
+                    .attributes
+                    .iter()
+                    .map(|(k, attr)| (k.clone(), attr.to_value()))
+                    .collect(),
+            ),
+            ResourceRef::DataSource(d) => std::borrow::Cow::Borrowed(&d.attributes),
+            ResourceRef::Deferred { resource, .. } => {
+                std::borrow::Cow::Borrowed(&resource.attributes)
+            }
         }
     }
 
@@ -166,7 +183,7 @@ impl<'a> ResourceRef<'a> {
     /// Attributes projected to a `HashMap<String, Value>` — the
     /// lookup-shaped view consumed by schema validation.
     pub fn resolved_attributes(&self) -> HashMap<String, Value> {
-        crate::resource::attrs_to_hashmap(self.attributes())
+        crate::resource::attrs_to_hashmap(&self.attributes())
     }
 }
 

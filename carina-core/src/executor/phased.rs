@@ -1367,7 +1367,11 @@ mod tests {
         let mut attributes = indexmap::IndexMap::new();
         attributes.insert(
             attr.to_string(),
-            Value::resource_ref(ref_binding, ref_attr, vec![]),
+            crate::resource::CompositionAttribute::from_value(Value::resource_ref(
+                ref_binding,
+                ref_attr,
+                vec![],
+            )),
         );
         Composition {
             id: ResourceId::with_provider("_virtual", "_virtual", id_name, None),

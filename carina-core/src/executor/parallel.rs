@@ -599,10 +599,15 @@ mod tests {
         role.binding = Some("bootstrap.role".to_string());
 
         // carina#3181: composition resources are a distinct typestate.
-        let mut virt_attrs = indexmap::IndexMap::new();
+        let mut virt_attrs: indexmap::IndexMap<String, crate::resource::CompositionAttribute> =
+            indexmap::IndexMap::new();
         virt_attrs.insert(
             "role_name".to_string(),
-            Value::resource_ref("bootstrap.role", "role_name", vec![]),
+            crate::resource::CompositionAttribute::from_value(Value::resource_ref(
+                "bootstrap.role",
+                "role_name",
+                vec![],
+            )),
         );
         let virt = Composition {
             id: ResourceId::with_provider("_virtual", "_virtual", "bootstrap", None),

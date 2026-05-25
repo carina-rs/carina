@@ -240,7 +240,12 @@ pub fn bindings_from_parts(
         out.insert(
             name.clone(),
             InferenceBinding::Virtual {
-                attributes: composition.signature.attributes.clone(),
+                attributes: composition
+                    .signature
+                    .attributes
+                    .iter()
+                    .map(|(k, attr)| (k.clone(), attr.to_value()))
+                    .collect(),
             },
         );
     }
@@ -1378,14 +1383,15 @@ mod tests {
         // `vpc_id` here stands in for the module-exposed attribute that
         // points at the inner role's schema attribute. carina#3181:
         // compositions are a distinct typestate in `compositions`.
-        let mut virt_attrs = indexmap::IndexMap::new();
+        let mut virt_attrs: indexmap::IndexMap<String, crate::resource::CompositionAttribute> =
+            indexmap::IndexMap::new();
         virt_attrs.insert(
             "role_id".to_string(),
-            Value::resource_ref(
+            crate::resource::CompositionAttribute::from_value(Value::resource_ref(
                 "github_actions_carina.role".to_string(),
                 "vpc_id".to_string(),
                 vec![],
-            ),
+            )),
         );
         let virt = crate::resource::Composition {
             id: crate::resource::ResourceId::new("_virtual", "github_actions_carina"),

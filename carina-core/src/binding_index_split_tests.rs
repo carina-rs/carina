@@ -37,9 +37,12 @@ fn make_managed(binding: &str, attrs: &[(&str, Value)]) -> Resource {
 }
 
 fn make_virtual(binding: &str, attrs: &[(&str, Value)]) -> Composition {
-    let mut attributes = IndexMap::new();
+    let mut attributes: IndexMap<String, crate::resource::CompositionAttribute> = IndexMap::new();
     for (k, v) in attrs {
-        attributes.insert((*k).into(), v.clone());
+        attributes.insert(
+            (*k).into(),
+            crate::resource::CompositionAttribute::from_value(v.clone()),
+        );
     }
     Composition {
         id: ResourceId::new("_virtual.module", binding),

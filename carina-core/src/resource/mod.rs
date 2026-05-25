@@ -1807,7 +1807,7 @@ pub mod leaf_node;
 pub mod persistent_id;
 pub mod resource_like;
 
-pub use composition::{Composition, Signature};
+pub use composition::{Composition, CompositionAttribute, Signature};
 pub use data_source::DataSource;
 pub use graph_node::GraphNode;
 pub use leaf_node::{CompositionNotALeaf, LeafNode, expand_to_leaves};

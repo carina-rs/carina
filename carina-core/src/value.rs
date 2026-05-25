@@ -770,12 +770,23 @@ pub fn redact_secrets_in_data_source(
 pub fn redact_secrets_in_virtual(
     resource: &crate::resource::Composition,
 ) -> Result<crate::resource::Composition, SerializationError> {
-    let attributes: Result<indexmap::IndexMap<String, Value>, _> = resource
-        .signature
-        .attributes
-        .iter()
-        .map(|(k, e)| redact_secrets_in_value(e).map(|rv| (k.clone(), rv)))
-        .collect();
+    // Reify each `CompositionAttribute` to a `Value`, redact secrets,
+    // then re-classify with `CompositionAttribute::from_value` so
+    // single-hop alias structure is preserved across the round-trip.
+    let attributes: Result<indexmap::IndexMap<String, crate::resource::CompositionAttribute>, _> =
+        resource
+            .signature
+            .attributes
+            .iter()
+            .map(|(k, attr)| {
+                redact_secrets_in_value(&attr.to_value()).map(|rv| {
+                    (
+                        k.clone(),
+                        crate::resource::CompositionAttribute::from_value(rv),
+                    )
+                })
+            })
+            .collect();
     let mut out = resource.clone();
     out.signature.attributes = attributes?;
     Ok(out)
@@ -2364,17 +2375,20 @@ mod tests {
         // block (which lands as a `Value::Secret` in the composition's
         // attribute map) must be redacted before serialization, the
         // same way managed-resource attributes are redacted.
+        use crate::resource::CompositionAttribute;
         use crate::resource::{Composition, ResourceId, Signature};
         use std::collections::{BTreeSet, HashSet};
-        let mut attrs = indexmap::IndexMap::new();
+        let mut attrs: indexmap::IndexMap<String, CompositionAttribute> = indexmap::IndexMap::new();
         attrs.insert(
             "non_secret".to_string(),
-            Value::Concrete(ConcreteValue::String("kept".to_string())),
+            CompositionAttribute::from_value(Value::Concrete(ConcreteValue::String(
+                "kept".to_string(),
+            ))),
         );
         attrs.insert(
             "secret_field".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("plaintext-must-not-leak".to_string()),
+            CompositionAttribute::from_value(Value::Deferred(DeferredValue::Secret(Box::new(
+                Value::Concrete(ConcreteValue::String("plaintext-must-not-leak".to_string())),
             )))),
         );
         let virt = Composition {
@@ -2394,13 +2408,23 @@ mod tests {
 
         // The non-secret attribute survives verbatim.
         assert_eq!(
-            redacted.signature.attributes.get("non_secret"),
-            Some(&Value::Concrete(ConcreteValue::String("kept".to_string()))),
+            redacted
+                .signature
+                .attributes
+                .get("non_secret")
+                .map(|a| a.to_value()),
+            Some(Value::Concrete(ConcreteValue::String("kept".to_string()))),
         );
 
         // The secret attribute is replaced with the hash prefix, not the
         // plaintext.
-        match redacted.signature.attributes.get("secret_field") {
+        match redacted
+            .signature
+            .attributes
+            .get("secret_field")
+            .map(|a| a.to_value())
+            .as_ref()
+        {
             Some(Value::Concrete(ConcreteValue::String(s))) => {
                 assert!(
                     s.starts_with(SECRET_PREFIX),

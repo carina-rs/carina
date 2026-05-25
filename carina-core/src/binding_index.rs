@@ -601,10 +601,16 @@ impl ResolvedBindings {
             let Some(binding_name) = v.binding.as_ref() else {
                 continue;
             };
+            let value_attrs: indexmap::IndexMap<String, crate::resource::Value> = v
+                .signature
+                .attributes
+                .iter()
+                .map(|(k, attr)| (k.clone(), attr.to_value()))
+                .collect();
             self.by_name.insert(
                 binding_name.clone(),
                 ResolvedBinding {
-                    attributes: crate::resource::attrs_to_hashmap(&v.signature.attributes),
+                    attributes: crate::resource::attrs_to_hashmap(&value_attrs),
                     source: BindingValueSource::Local,
                 },
             );
