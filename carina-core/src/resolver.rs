@@ -9,8 +9,8 @@ use indexmap::IndexMap;
 
 use crate::binding_index::ResolvedBindings;
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, InterpolationPart, ManagedResource, ResourceId,
-    State, Value, VirtualResource, contains_resource_ref, peel_secrets, rewrap_secrets,
+    ConcreteValue, DataSource, DeferredValue, InterpolationPart, Resource, ResourceId, State,
+    Value, VirtualResource, contains_resource_ref, peel_secrets, rewrap_secrets,
 };
 
 /// Resolve all ResourceRef values in resources using current state.
@@ -26,7 +26,7 @@ use crate::resource::{
 /// Each entry maps an upstream_state binding name to a map of resource binding names
 /// to their attributes. For example, `network -> { vpc -> { vpc_id -> "vpc-123" } }`.
 pub fn resolve_refs_with_state(
-    resources: &mut [ManagedResource],
+    resources: &mut [Resource],
     current_states: &HashMap<ResourceId, State>,
 ) -> Result<(), String> {
     let bindings =
@@ -55,7 +55,7 @@ pub fn resolve_refs_with_state(
 /// display can render it as `(known after upstream apply: <ref>)`
 /// instead of the raw dot-form.
 pub fn resolve_refs_with_state_and_remote(
-    resources: &mut [ManagedResource],
+    resources: &mut [Resource],
     bindings: &ResolvedBindings,
 ) -> Result<(), String> {
     resolve_refs_inner(resources, bindings, &std::collections::HashSet::new())
@@ -68,7 +68,7 @@ pub fn resolve_refs_with_state_and_remote(
 /// `Value::Unknown(UnknownReason::UpstreamRef { path })` for display.
 /// `apply` continues to call the strict variant. See #2366 / RFC #2371.
 pub fn resolve_refs_for_plan(
-    resources: &mut [ManagedResource],
+    resources: &mut [Resource],
     bindings: &ResolvedBindings,
     unresolved_upstream_bindings: &std::collections::HashSet<&str>,
 ) -> Result<(), String> {
@@ -76,7 +76,7 @@ pub fn resolve_refs_for_plan(
 }
 
 fn resolve_refs_inner(
-    resources: &mut [ManagedResource],
+    resources: &mut [Resource],
     bindings: &ResolvedBindings,
     unresolved_upstream_bindings: &std::collections::HashSet<&str>,
 ) -> Result<(), String> {
@@ -116,7 +116,7 @@ fn resolve_refs_inner(
 // ---------------------------------------------------------------------------
 
 /// Pre-apply path: resolve `ResourceRef` values across a slice of
-/// `ManagedResource`s.
+/// `Resource`s.
 ///
 /// carina#3248: virtuals and data sources are first-class binding
 /// sources on the pre-apply path. `bindings` must therefore include
@@ -129,7 +129,7 @@ fn resolve_refs_inner(
 /// to same-stack module attribute references — those resolve through
 /// the in-process virtual binding directly.
 pub fn resolve_managed_refs_with_state_and_remote(
-    managed: &mut [ManagedResource],
+    managed: &mut [Resource],
     bindings: &ResolvedBindings,
 ) -> Result<(), String> {
     resolve_refs_inner(managed, bindings, &std::collections::HashSet::new())
@@ -491,12 +491,8 @@ mod tests {
     use super::*;
     use crate::resource::ResourceId;
 
-    fn make_resource(
-        name: &str,
-        binding: Option<&str>,
-        attrs: Vec<(&str, Value)>,
-    ) -> ManagedResource {
-        let mut r = ManagedResource::new("test.resource", name);
+    fn make_resource(name: &str, binding: Option<&str>, attrs: Vec<(&str, Value)>) -> Resource {
+        let mut r = Resource::new("test.resource", name);
         r.attributes = attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
         r.binding = binding.map(|b| b.to_string());
         r
@@ -507,7 +503,7 @@ mod tests {
     /// view is identical to what production code constructs — there is
     /// no test-only back door into the type.
     fn bindings_from(entries: Vec<(&str, Vec<(&str, Value)>)>) -> ResolvedBindings {
-        let resources: Vec<ManagedResource> = entries
+        let resources: Vec<Resource> = entries
             .into_iter()
             .map(|(binding, attrs)| {
                 make_resource(&format!("{}-resource", binding), Some(binding), attrs)
@@ -528,7 +524,7 @@ mod tests {
     /// Builds the bindings view here, then delegates to the new
     /// signature.
     fn resolve_refs_with_state_and_remote_legacy(
-        resources: &mut [ManagedResource],
+        resources: &mut [Resource],
         current_states: &HashMap<ResourceId, State>,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         wait_aliases: &[crate::binding_index::WaitAliasSpec],
@@ -547,7 +543,7 @@ mod tests {
     /// Test-only adapter for the plan-path resolver (mirrors
     /// `resolve_refs_with_state_and_remote_legacy`).
     fn resolve_refs_for_plan_legacy(
-        resources: &mut [ManagedResource],
+        resources: &mut [Resource],
         current_states: &HashMap<ResourceId, State>,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         wait_aliases: &[crate::binding_index::WaitAliasSpec],

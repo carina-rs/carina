@@ -11,7 +11,7 @@ use indexmap::IndexMap;
 use crate::binding_index::BindingIndex;
 use crate::parser::{ModuleCall, ProviderContext, ResourceRef, TypeExpr, validate_custom_type};
 use crate::provider::ProviderFactory;
-use crate::resource::{ConcreteValue, DeferredValue, ManagedResource, Value};
+use crate::resource::{ConcreteValue, DeferredValue, Resource, Value};
 use crate::schema::{AttributeType, SchemaRegistry, suggest_similar_name};
 
 /// Render the trailing `" Did you mean 'X'?"` segment for an unknown
@@ -276,10 +276,10 @@ pub fn validate_resource_ref_types<E>(
 /// be rejected because `role_name` is `String`, not `IamRoleArn`.
 pub fn validate_attribute_param_ref_types(
     attribute_params: &[crate::parser::AttributeParameter],
-    resources: &[ManagedResource],
+    resources: &[Resource],
     registry: &SchemaRegistry,
 ) -> Result<(), String> {
-    let mut binding_map: HashMap<String, &ManagedResource> = HashMap::new();
+    let mut binding_map: HashMap<String, &Resource> = HashMap::new();
     for resource in resources {
         if let Some(ref binding_name) = resource.binding {
             binding_map.insert(binding_name.clone(), resource);
@@ -347,10 +347,10 @@ pub fn validate_attribute_param_ref_types(
 /// `vpc_id` is a string attribute but the export declares `bool`.
 pub fn validate_export_param_ref_types(
     export_params: &[crate::parser::InferredExportParam],
-    resources: &[ManagedResource],
+    resources: &[Resource],
     registry: &SchemaRegistry,
 ) -> Result<(), String> {
-    let mut binding_map: HashMap<String, &ManagedResource> = HashMap::new();
+    let mut binding_map: HashMap<String, &Resource> = HashMap::new();
     for resource in resources {
         if let Some(ref binding_name) = resource.binding {
             binding_map.insert(binding_name.clone(), resource);
@@ -392,7 +392,7 @@ fn collect_ref_type_errors(
     type_expr: &crate::parser::TypeExpr,
     value: &Value,
     param_name: &str,
-    binding_map: &HashMap<String, &ManagedResource>,
+    binding_map: &HashMap<String, &Resource>,
     registry: &SchemaRegistry,
     errors: &mut Vec<String>,
 ) {

@@ -9,7 +9,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use crate::deps::find_failed_dependency;
 use crate::effect::{Effect, WaitTarget};
 use crate::provider::Provider;
-use crate::resource::{ManagedResource, ResourceId, State, Value};
+use crate::resource::{Resource, ResourceId, State, Value};
 
 use super::basic::{
     BasicEffectCtx, ExecutionState, RenormalizePipeline, count_actionable_effects,
@@ -22,7 +22,7 @@ use super::{ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, 
 /// Build a dependency map: for each effect index, which other effect indices it depends on.
 pub(super) fn build_dependency_map(
     effects: &[Effect],
-    unresolved_resources: &HashMap<ResourceId, ManagedResource>,
+    unresolved_resources: &HashMap<ResourceId, Resource>,
     virtual_resources: &[crate::resource::VirtualResource],
 ) -> HashMap<usize, HashSet<usize>> {
     // Build binding -> effect index mapping
@@ -131,7 +131,7 @@ pub(super) fn build_dependency_map(
 #[cfg(test)]
 pub(super) fn build_dependency_levels(
     effects: &[Effect],
-    unresolved_resources: &HashMap<ResourceId, ManagedResource>,
+    unresolved_resources: &HashMap<ResourceId, Resource>,
     virtual_resources: &[crate::resource::VirtualResource],
 ) -> Vec<Vec<usize>> {
     let deps_of = build_dependency_map(effects, unresolved_resources, virtual_resources);
@@ -596,7 +596,7 @@ mod tests {
     /// underlying resources their attributes reference.
     #[test]
     fn build_dependency_map_follows_virtual_module_binding() {
-        let mut role = ManagedResource::with_provider("awscc", "iam.Role", "bootstrap.role", None);
+        let mut role = Resource::with_provider("awscc", "iam.Role", "bootstrap.role", None);
         role.binding = Some("bootstrap.role".to_string());
 
         // carina#3181: virtual resources are a distinct typestate.
@@ -615,7 +615,7 @@ mod tests {
             quoted_string_attrs: std::collections::HashSet::new(),
         };
 
-        let mut role_policy = ManagedResource::with_provider("awscc", "iam.RolePolicy", "rp", None);
+        let mut role_policy = Resource::with_provider("awscc", "iam.RolePolicy", "rp", None);
         role_policy.set_attr(
             "role_name",
             Value::resource_ref("bootstrap", "role_name", vec![]),
@@ -626,7 +626,7 @@ mod tests {
             Effect::Create(role_policy.clone()),
         ];
 
-        let mut unresolved: HashMap<ResourceId, ManagedResource> = HashMap::new();
+        let mut unresolved: HashMap<ResourceId, Resource> = HashMap::new();
         unresolved.insert(role.id.clone(), role.clone());
         unresolved.insert(role_policy.id.clone(), role_policy);
 

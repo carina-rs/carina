@@ -31,7 +31,7 @@ pub(crate) fn is_retryable_delete_error(e: &carina_core::provider::ProviderError
 /// Result of waiting for a resource deletion to complete.
 #[derive(Debug, PartialEq)]
 pub(crate) enum WaitResult {
-    /// ManagedResource confirmed deleted (`state.exists == false`).
+    /// Resource confirmed deleted (`state.exists == false`).
     Deleted,
     /// A `provider.read()` call returned an error.
     ReadError(String),

@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::resource::{DataSource, Directives, ManagedResource, ResourceId, ResourceLike, State};
+use crate::resource::{DataSource, Directives, Resource, ResourceId, ResourceLike, State};
 use crate::wait::predicate::WaitPredicate;
 
 /// Temporary name used during create-before-destroy replacement.
@@ -37,7 +37,7 @@ pub struct TemporaryName {
 pub struct CascadingUpdate {
     pub id: ResourceId,
     pub from: Box<State>,
-    pub to: ManagedResource,
+    pub to: Resource,
 }
 
 /// How an [`Effect::Wait`] obtains the cloud provider identifier its
@@ -85,13 +85,13 @@ pub enum Effect {
     Read { resource: DataSource },
 
     /// Create a new resource
-    Create(ManagedResource),
+    Create(Resource),
 
     /// Update an existing resource
     Update {
         id: ResourceId,
         from: Box<State>,
-        to: ManagedResource,
+        to: Resource,
         /// Attribute names that changed (including removed attributes)
         changed_attributes: Vec<String>,
     },
@@ -100,7 +100,7 @@ pub enum Effect {
     Replace {
         id: ResourceId,
         from: Box<State>,
-        to: ManagedResource,
+        to: Resource,
         #[serde(default)]
         directives: Directives,
         /// Which create-only attributes forced the replacement
@@ -233,13 +233,13 @@ pub enum Effect {
 pub enum BasicEffect<'a> {
     Create {
         effect: &'a Effect,
-        resource: &'a ManagedResource,
+        resource: &'a Resource,
     },
     Update {
         effect: &'a Effect,
         id: &'a ResourceId,
         from: &'a State,
-        to: &'a ManagedResource,
+        to: &'a Resource,
         changed_attributes: &'a [String],
     },
     Delete {
@@ -284,8 +284,8 @@ impl Effect {
     ///
     /// ```compile_fail
     /// use carina_core::effect::{BasicEffect, Effect};
-    /// use carina_core::resource::ManagedResource;
-    /// let effect = Effect::Create(ManagedResource::new("test", "x"));
+    /// use carina_core::resource::Resource;
+    /// let effect = Effect::Create(Resource::new("test", "x"));
     /// // Was: a missed filter could pass a non-basic `&Effect` straight
     /// // into `execute_basic_effect` and trip `unreachable!()` at apply
     /// // time (carina#3164). The conversion no longer exists.
@@ -377,7 +377,7 @@ impl Effect {
     /// effects have no resource.
     ///
     /// carina#3181: the underlying payloads are typestate structs —
-    /// `Create`/`Update`/`Replace` carry a [`ManagedResource`], `Read`
+    /// `Create`/`Update`/`Replace` carry a [`Resource`], `Read`
     /// carries a [`DataSource`]. Callers that need a concrete type match
     /// the variant directly; this helper covers the shared
     /// id/attributes/binding/dependency_bindings accessors.
@@ -428,7 +428,7 @@ impl Effect {
     /// `directives { depends_on = [...] }` declarations**, as a snapshot
     /// (cloned).
     ///
-    /// For variants carrying a `ManagedResource` (Create, Update, Replace,
+    /// For variants carrying a `Resource` (Create, Update, Replace,
     /// Read), the answer is derived live from
     /// `resource.directives.depends_on`. For Delete the answer comes
     /// from a stored `explicit_dependencies` set captured by the differ
@@ -472,7 +472,7 @@ mod tests {
 
     #[test]
     fn create_is_mutating() {
-        let resource = ManagedResource::new("s3.Bucket", "my-bucket");
+        let resource = Resource::new("s3.Bucket", "my-bucket");
         let effect = Effect::Create(resource);
         assert!(effect.is_mutating());
     }
@@ -488,7 +488,7 @@ mod tests {
 
     #[test]
     fn resource_returns_some_for_create() {
-        let resource = ManagedResource::new("s3.Bucket", "my-bucket");
+        let resource = Resource::new("s3.Bucket", "my-bucket");
         let effect = Effect::Create(resource.clone());
         assert_eq!(effect.resource_like().unwrap().id(), &resource.id);
     }
@@ -508,7 +508,7 @@ mod tests {
 
     #[test]
     fn binding_name_returns_binding() {
-        let resource = ManagedResource::new("test", "my_binding").with_binding("my_binding");
+        let resource = Resource::new("test", "my_binding").with_binding("my_binding");
         let effect = Effect::Create(resource);
         assert_eq!(effect.binding_name(), Some("my_binding".to_string()));
     }
@@ -516,7 +516,7 @@ mod tests {
     #[test]
     fn binding_name_returns_none_without_binding() {
         use crate::resource::{ConcreteValue, Value};
-        let resource = ManagedResource::new("test", "no_binding").with_attribute(
+        let resource = Resource::new("test", "no_binding").with_attribute(
             "name",
             Value::Concrete(ConcreteValue::String("test".to_string())),
         );
@@ -530,7 +530,7 @@ mod tests {
         use std::collections::HashMap;
 
         let effects = vec![
-            Effect::Create(ManagedResource::new("s3.Bucket", "my-bucket")),
+            Effect::Create(Resource::new("s3.Bucket", "my-bucket")),
             Effect::Read {
                 resource: DataSource::new("s3.Bucket", "existing"),
             },
@@ -543,7 +543,7 @@ mod tests {
                         Value::Concrete(ConcreteValue::String("Disabled".to_string())),
                     )]),
                 )),
-                to: ManagedResource::new("s3.Bucket", "my-bucket").with_attribute(
+                to: Resource::new("s3.Bucket", "my-bucket").with_attribute(
                     "versioning",
                     Value::Concrete(ConcreteValue::String("Enabled".to_string())),
                 ),
@@ -558,18 +558,18 @@ mod tests {
                         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
                     )]),
                 )),
-                to: ManagedResource::new("ec2.Vpc", "my-vpc").with_attribute(
+                to: Resource::new("ec2.Vpc", "my-vpc").with_attribute(
                     "cidr_block",
                     Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
                 ),
                 directives: Directives::default(),
                 changed_create_only: vec!["cidr_block".to_string()],
                 // carina#3181 PR D: cover `CascadingUpdate.to:
-                // ManagedResource` in the serde round-trip.
+                // Resource` in the serde round-trip.
                 cascading_updates: vec![CascadingUpdate {
                     id: ResourceId::new("ec2.Subnet", "my-subnet"),
                     from: Box::new(State::not_found(ResourceId::new("ec2.Subnet", "my-subnet"))),
-                    to: ManagedResource::new("ec2.Subnet", "my-subnet").with_attribute(
+                    to: Resource::new("ec2.Subnet", "my-subnet").with_attribute(
                         "vpc_id",
                         Value::Concrete(ConcreteValue::String("vpc.id".to_string())),
                     ),
@@ -597,7 +597,7 @@ mod tests {
     #[test]
     fn explicit_dependencies_derived_from_resource_directives() {
         use crate::resource::Directives;
-        let mut bucket = ManagedResource::new("s3.Bucket", "b");
+        let mut bucket = Resource::new("s3.Bucket", "b");
         bucket.directives = Directives {
             depends_on: vec!["role".to_string(), "kms".to_string()],
             ..Directives::default()
@@ -779,7 +779,7 @@ mod tests {
         let rid = ResourceId::new("test", "x");
 
         // Basic variants must narrow.
-        let create = Effect::Create(ManagedResource::new("test", "x"));
+        let create = Effect::Create(Resource::new("test", "x"));
         assert!(matches!(
             create.as_basic(),
             Some(BasicEffect::Create { .. })
@@ -788,7 +788,7 @@ mod tests {
         let update = Effect::Update {
             id: rid.clone(),
             from: Box::new(ResState::not_found(rid.clone())),
-            to: ManagedResource::new("test", "x"),
+            to: Resource::new("test", "x"),
             changed_attributes: vec![],
         };
         assert!(matches!(
@@ -819,7 +819,7 @@ mod tests {
         let replace = Effect::Replace {
             id: rid.clone(),
             from: Box::new(ResState::not_found(rid.clone())),
-            to: ManagedResource::new("test", "x"),
+            to: Resource::new("test", "x"),
             directives: Directives::default(),
             changed_create_only: vec![],
             cascading_updates: vec![],

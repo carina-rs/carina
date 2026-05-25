@@ -835,7 +835,7 @@ pub fn lift_saved_state_string_enums(
         crate::resource::ResourceId,
         std::collections::HashMap<String, Value>,
     >,
-    resources: &[crate::resource::ManagedResource],
+    resources: &[crate::resource::Resource],
     registry: &crate::schema::SchemaRegistry,
 ) {
     for resource in resources {
@@ -871,7 +871,7 @@ pub fn lift_current_state_string_enums(
         crate::resource::ResourceId,
         crate::resource::State,
     >,
-    resources: &[crate::resource::ManagedResource],
+    resources: &[crate::resource::Resource],
     registry: &crate::schema::SchemaRegistry,
 ) {
     for resource in resources {
@@ -2377,7 +2377,7 @@ mod tests {
     /// absent from the registry is skipped without panic.
     #[test]
     fn lift_saved_state_string_enums_resolves_schema_per_resource() {
-        use crate::resource::{ConcreteValue, ManagedResource, ResourceId, Value};
+        use crate::resource::{ConcreteValue, Resource, ResourceId, Value};
         use crate::schema::{
             AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
         };
@@ -2403,8 +2403,8 @@ mod tests {
                 .attribute(AttributeSchema::new("policy_document", policy_struct)),
         );
 
-        let known = ManagedResource::with_provider("awscc", "iam.RolePolicy", "rp", None);
-        let unknown = ManagedResource::with_provider("awscc", "iam.Unknown", "x", None);
+        let known = Resource::with_provider("awscc", "iam.RolePolicy", "rp", None);
+        let unknown = Resource::with_provider("awscc", "iam.Unknown", "x", None);
 
         let mut pd = indexmap::IndexMap::new();
         pd.insert(
@@ -2450,7 +2450,7 @@ mod tests {
     /// failed the strict validator.
     #[test]
     fn lift_current_state_string_enums_lifts_provider_read_state() {
-        use crate::resource::{ConcreteValue, ManagedResource, ResourceId, State, Value};
+        use crate::resource::{ConcreteValue, Resource, ResourceId, State, Value};
         use crate::schema::{
             AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
         };
@@ -2478,7 +2478,7 @@ mod tests {
             )),
         );
 
-        let role = ManagedResource::with_provider("awscc", "iam.Role", "bs.bootstrap.role", None);
+        let role = Resource::with_provider("awscc", "iam.Role", "bs.bootstrap.role", None);
 
         let mut pd = indexmap::IndexMap::new();
         pd.insert(

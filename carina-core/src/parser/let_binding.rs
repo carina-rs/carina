@@ -22,7 +22,7 @@ use super::parse_expression;
 use super::static_eval::is_static_value;
 use super::util::eval_type_name;
 use crate::eval_value::EvalValue;
-use crate::resource::{ConcreteValue, DataSource, DeferredValue, ManagedResource, Value};
+use crate::resource::{ConcreteValue, DataSource, DeferredValue, Resource, Value};
 
 /// Tuple returned by the let-binding parser. The RHS is `EvalValue`
 /// rather than `Value` so partial applications (closures) can survive
@@ -34,7 +34,7 @@ use crate::resource::{ConcreteValue, DataSource, DeferredValue, ManagedResource,
 /// [`ParsedFile`](super::ast::ParsedFile) (carina#3181).
 pub(crate) type LetBindingRhs = (
     EvalValue,
-    Vec<ManagedResource>,
+    Vec<Resource>,
     Vec<DataSource>,
     Vec<ModuleCall>,
     Option<UseStatement>,
@@ -53,7 +53,7 @@ pub(super) fn parse_let_binding_extended(
     (
         String,
         EvalValue,
-        Vec<ManagedResource>,
+        Vec<Resource>,
         Vec<DataSource>,
         Vec<ModuleCall>,
         Option<UseStatement>,

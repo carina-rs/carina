@@ -9,9 +9,7 @@ use indexmap::IndexMap;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::resource::{
-    ConcreteValue, DataSource, Directives, ManagedResource, ResourceId, State, Value,
-};
+use crate::resource::{ConcreteValue, DataSource, Directives, Resource, ResourceId, State, Value};
 use crate::schema::{SchemaRegistry, TypeIdentity};
 
 /// Contextual metadata attached to every [`ProviderError`] variant.
@@ -349,7 +347,7 @@ pub type ProviderResult<T> = Result<T, ProviderError>;
 #[derive(Debug, Clone)]
 pub struct CreateRequest {
     /// Full desired state for the new resource.
-    pub resource: ManagedResource,
+    pub resource: Resource,
 }
 
 /// Per-operation request record for [`Provider::read`].
@@ -366,7 +364,7 @@ pub struct ReadRequest;
 /// Mirrors `update-request` in `wit/types.wit`. `from` is the current
 /// provider-side state; `patch` carries only the user's intended
 /// changes. The patch is the sole source of truth for what the
-/// provider should write — there is no separate `to: ManagedResource`
+/// provider should write — there is no separate `to: Resource`
 /// because exposing the full desired resource invites providers to
 /// touch fields the user never specified (the root cause of
 /// `carina-rs/carina#2559`).
@@ -441,7 +439,7 @@ pub enum PatchOpKind {
 /// value from `to`.
 pub fn build_update_patch(
     changed_attributes: &[String],
-    to: &ManagedResource,
+    to: &Resource,
     from: &State,
 ) -> UpdatePatch {
     let ops = changed_attributes
@@ -623,7 +621,7 @@ pub trait ProviderNormalizer: Send + Sync {
     /// `Tier.advanced` into fully-qualified DSL format like
     /// `awscc.ec2_ipam.Tier.advanced` based on schema definitions.
     /// Providers without enum types return [`ready_noop`].
-    fn normalize_desired<'a>(&'a self, resources: &'a mut [ManagedResource]) -> BoxFuture<'a, ()>;
+    fn normalize_desired<'a>(&'a self, resources: &'a mut [Resource]) -> BoxFuture<'a, ()>;
 
     /// Normalize current state values before diffing.
     ///
@@ -667,7 +665,7 @@ pub trait ProviderNormalizer: Send + Sync {
     /// merge, or [`ready_noop`]'s deliberate no-op.
     fn merge_default_tags<'a>(
         &'a self,
-        resources: &'a mut [ManagedResource],
+        resources: &'a mut [Resource],
         default_tags: &'a IndexMap<String, Value>,
         registry: &'a SchemaRegistry,
     ) -> BoxFuture<'a, ()>;
@@ -677,7 +675,7 @@ pub trait ProviderNormalizer: Send + Sync {
 #[derive(Debug, Clone, Copy)]
 pub struct NoopNormalizer;
 impl ProviderNormalizer for NoopNormalizer {
-    fn normalize_desired<'a>(&'a self, _resources: &'a mut [ManagedResource]) -> BoxFuture<'a, ()> {
+    fn normalize_desired<'a>(&'a self, _resources: &'a mut [Resource]) -> BoxFuture<'a, ()> {
         ready_noop()
     }
 
@@ -698,7 +696,7 @@ impl ProviderNormalizer for NoopNormalizer {
 
     fn merge_default_tags<'a>(
         &'a self,
-        _resources: &'a mut [ManagedResource],
+        _resources: &'a mut [Resource],
         _default_tags: &'a IndexMap<String, Value>,
         _registry: &'a SchemaRegistry,
     ) -> BoxFuture<'a, ()> {
@@ -716,7 +714,7 @@ impl ProviderNormalizer for NoopNormalizer {
 /// metadata attribute.
 pub fn merge_default_tags_for_provider(
     provider_name: &str,
-    resources: &mut [ManagedResource],
+    resources: &mut [Resource],
     default_tags: &IndexMap<String, Value>,
     registry: &SchemaRegistry,
 ) {
@@ -905,7 +903,7 @@ impl Provider for ProviderRouter {
 }
 
 impl ProviderNormalizer for ProviderRouter {
-    fn normalize_desired<'a>(&'a self, resources: &'a mut [ManagedResource]) -> BoxFuture<'a, ()> {
+    fn normalize_desired<'a>(&'a self, resources: &'a mut [Resource]) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             // Sequential, never concurrent: normalizers are not
             // commutative, and `resources` is re-borrowed per iteration
@@ -941,7 +939,7 @@ impl ProviderNormalizer for ProviderRouter {
 
     fn merge_default_tags<'a>(
         &'a self,
-        resources: &'a mut [ManagedResource],
+        resources: &'a mut [Resource],
         default_tags: &'a IndexMap<String, Value>,
         registry: &'a SchemaRegistry,
     ) -> BoxFuture<'a, ()> {
@@ -1341,7 +1339,7 @@ mod tests {
         assert!(!state.exists);
     }
 
-    /// A provider that only accepts a data source when the full `ManagedResource`
+    /// A provider that only accepts a data source when the full `Resource`
     /// carrying its input attributes is delivered. Exercises the new
     /// `read_data_source` path introduced to enable resources like
     /// `identitystore.user` that look themselves up by user-provided inputs.
@@ -1360,7 +1358,7 @@ mod tests {
         ) -> BoxFuture<'_, ProviderResult<State>> {
             let id = id.clone();
             // Intentionally fails if the data source path doesn't deliver
-            // the full ManagedResource — the regular `read` route has no access
+            // the full Resource — the regular `read` route has no access
             // to input attributes.
             Box::pin(async move {
                 Err(ProviderError::internal("read cannot see inputs").for_resource(id))
@@ -1493,7 +1491,7 @@ mod tests {
     #[tokio::test]
     async fn mock_provider_create_returns_existing() {
         let provider = MockProvider;
-        let resource = ManagedResource::new("test", "example");
+        let resource = Resource::new("test", "example");
         let id = resource.id.clone();
         let state = provider
             .create(&id, CreateRequest { resource })
@@ -1518,7 +1516,7 @@ mod tests {
         let mut router = ProviderRouter::new();
         router.add_provider("mock".to_string(), Box::new(MockProvider));
 
-        let resource = ManagedResource::with_provider("mock", "test", "example", None);
+        let resource = Resource::with_provider("mock", "test", "example", None);
         let id = resource.id.clone();
         let state = router
             .create(&id, CreateRequest { resource })
@@ -1931,7 +1929,7 @@ mod tests {
         );
         let from = State::existing(id.clone(), from_attrs);
 
-        let mut to = ManagedResource::new("test", "example");
+        let mut to = Resource::new("test", "example");
         to.set_attr(
             "a".to_string(),
             Value::Concrete(ConcreteValue::String("new".into())),
@@ -2255,10 +2253,7 @@ mod tests {
         struct SchemaOnlyProvider;
 
         impl ProviderNormalizer for SchemaOnlyProvider {
-            fn normalize_desired<'a>(
-                &'a self,
-                resources: &'a mut [ManagedResource],
-            ) -> BoxFuture<'a, ()> {
+            fn normalize_desired<'a>(&'a self, resources: &'a mut [Resource]) -> BoxFuture<'a, ()> {
                 Box::pin(async move {
                     // Prefix all string attribute values with "normalized:"
                     for resource in resources.iter_mut() {
@@ -2299,7 +2294,7 @@ mod tests {
 
             fn merge_default_tags<'a>(
                 &'a self,
-                _resources: &'a mut [ManagedResource],
+                _resources: &'a mut [Resource],
                 _default_tags: &'a IndexMap<String, Value>,
                 _registry: &'a SchemaRegistry,
             ) -> BoxFuture<'a, ()> {
@@ -2309,7 +2304,7 @@ mod tests {
 
         // Test normalize_desired
         let ext = SchemaOnlyProvider;
-        let mut resources = vec![ManagedResource::new("test", "example").with_attribute(
+        let mut resources = vec![Resource::new("test", "example").with_attribute(
             "key",
             Value::Concrete(ConcreteValue::String("value".to_string())),
         )];
@@ -2400,10 +2395,7 @@ mod tests {
         // Separate schema ext struct for the router
         struct TestNormalizer;
         impl ProviderNormalizer for TestNormalizer {
-            fn normalize_desired<'a>(
-                &'a self,
-                resources: &'a mut [ManagedResource],
-            ) -> BoxFuture<'a, ()> {
+            fn normalize_desired<'a>(&'a self, resources: &'a mut [Resource]) -> BoxFuture<'a, ()> {
                 Box::pin(async move {
                     for resource in resources.iter_mut() {
                         if resource.id.provider == "normalizing" {
@@ -2434,7 +2426,7 @@ mod tests {
 
             fn merge_default_tags<'a>(
                 &'a self,
-                _resources: &'a mut [ManagedResource],
+                _resources: &'a mut [Resource],
                 _default_tags: &'a IndexMap<String, Value>,
                 _registry: &'a SchemaRegistry,
             ) -> BoxFuture<'a, ()> {
@@ -2447,7 +2439,7 @@ mod tests {
         router.add_normalizer(Box::new(TestNormalizer));
 
         let mut resources = vec![
-            ManagedResource::with_provider("normalizing", "test", "example", None).with_attribute(
+            Resource::with_provider("normalizing", "test", "example", None).with_attribute(
                 "key",
                 Value::Concrete(ConcreteValue::String("val".to_string())),
             ),

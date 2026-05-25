@@ -2,7 +2,7 @@
 //! managed.
 //!
 //! Part of the resource typestate split (#3169). A `DataSource`
-//! carries the same fields as a [`ManagedResource`](super::ManagedResource)
+//! carries the same fields as a [`Resource`](super::Resource)
 //! minus `prefixes` (auto-generated names do not apply to read-only
 //! lookups). `directives` is retained because `depends_on` and
 //! `provider_instance` are still meaningful when ordering reads
@@ -48,7 +48,7 @@ pub struct DataSource {
     pub module_source: Option<ModuleSource>,
     /// Parser-level: attributes whose value was written as a quoted
     /// string literal. Parse-time only; `#[serde(skip)]` keeps it out
-    /// of state — mirrors [`ManagedResource::quoted_string_attrs`](super::ManagedResource).
+    /// of state — mirrors [`Resource::quoted_string_attrs`](super::Resource).
     #[serde(default, skip)]
     pub quoted_string_attrs: HashSet<String>,
 }

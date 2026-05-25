@@ -706,34 +706,34 @@ pub fn redact_secrets_in_attributes(
         .collect()
 }
 
-/// Redact all secrets in a `ManagedResource`, returning a new ManagedResource with secrets replaced by hashes.
+/// Redact all secrets in a `Resource`, returning a new Resource with secrets replaced by hashes.
 pub fn redact_secrets_in_resource(
-    resource: &crate::resource::ManagedResource,
-) -> Result<crate::resource::ManagedResource, SerializationError> {
+    resource: &crate::resource::Resource,
+) -> Result<crate::resource::Resource, SerializationError> {
     let attributes: Result<_, _> = resource
         .attributes
         .iter()
         .map(|(k, e)| redact_secrets_in_value(e).map(|rv| (k.clone(), rv)))
         .collect();
-    Ok(crate::resource::ManagedResource {
+    Ok(crate::resource::Resource {
         attributes: attributes?,
         ..resource.clone()
     })
 }
 
-/// Redact all secrets in a [`ManagedResource`](crate::resource::ManagedResource).
+/// Redact all secrets in a [`Resource`](crate::resource::Resource).
 ///
 /// carina#3181 PR D: `Effect` payloads are typestate structs, so the
 /// redaction pass needs a typed entry point per arm.
 pub fn redact_secrets_in_managed(
-    resource: &crate::resource::ManagedResource,
-) -> Result<crate::resource::ManagedResource, SerializationError> {
+    resource: &crate::resource::Resource,
+) -> Result<crate::resource::Resource, SerializationError> {
     let attributes: Result<_, _> = resource
         .attributes
         .iter()
         .map(|(k, e)| redact_secrets_in_value(e).map(|rv| (k.clone(), rv)))
         .collect();
-    Ok(crate::resource::ManagedResource {
+    Ok(crate::resource::Resource {
         attributes: attributes?,
         ..resource.clone()
     })
@@ -1363,10 +1363,10 @@ fn canonicalize_to_string_list(value: Value) -> Value {
 /// validation surfaces the mismatch elsewhere.
 ///
 /// Call this once after `resolver::resolve_refs_*` and before the
-/// differ runs, so every `ManagedResource` flowing into the plan / state /
+/// differ runs, so every `Resource` flowing into the plan / state /
 /// provider boundary carries the canonical shape. See #2481, #2511.
 pub fn canonicalize_resources_with_schemas(
-    resources: &mut [crate::resource::ManagedResource],
+    resources: &mut [crate::resource::Resource],
     registry: &crate::schema::SchemaRegistry,
 ) {
     for resource in resources.iter_mut() {
@@ -1497,7 +1497,7 @@ pub fn resolve_value_alias(
 /// path (`executor::renormalize`) so the two cannot diverge on this
 /// stage again (carina#3063).
 pub fn resolve_enum_aliases_for_resources(
-    resources: &mut [crate::resource::ManagedResource],
+    resources: &mut [crate::resource::Resource],
     factories: &[Box<dyn crate::provider::ProviderFactory>],
 ) {
     for resource in resources.iter_mut() {
@@ -3508,14 +3508,14 @@ mod tests {
         reg
     }
 
-    fn make_resource(attrs: Vec<(&str, Value)>) -> crate::resource::ManagedResource {
-        use crate::resource::{ManagedResource, ResourceId, ResourceName};
+    fn make_resource(attrs: Vec<(&str, Value)>) -> crate::resource::Resource {
+        use crate::resource::{Resource, ResourceId, ResourceName};
         use std::collections::{BTreeSet, HashMap, HashSet};
         let mut attributes = IndexMap::new();
         for (k, v) in attrs {
             attributes.insert(k.to_string(), v);
         }
-        ManagedResource {
+        Resource {
             id: ResourceId {
                 provider: "aws".to_string(),
                 resource_type: "iam.policy".to_string(),

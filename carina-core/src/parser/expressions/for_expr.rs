@@ -13,9 +13,7 @@ use crate::parser::{
     evaluate_static_value, first_inner, next_pair, parse_expression, parse_module_call,
     parse_read_resource_expr, parse_resource_expr,
 };
-use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, ManagedResource, UnknownReason, Value,
-};
+use crate::resource::{ConcreteValue, DataSource, DeferredValue, Resource, UnknownReason, Value};
 
 /// Binding pattern for a for expression
 #[derive(Debug, Clone, PartialEq)]
@@ -81,7 +79,7 @@ fn is_bare_identifier(s: &str) -> bool {
 /// Result of parsing a for expression body: a managed resource, a data
 /// source, or a module call.
 pub(crate) enum ForBodyResult {
-    ManagedResource(Box<ManagedResource>),
+    Resource(Box<Resource>),
     DataSource(Box<DataSource>),
     ModuleCall(ModuleCall),
 }
@@ -130,7 +128,7 @@ pub(crate) fn parse_for_expr(
     pair: pest::iterators::Pair<Rule>,
     ctx: &mut ParseContext,
     binding_name: &str,
-) -> Result<(Vec<ManagedResource>, Vec<DataSource>, Vec<ModuleCall>), ParseError> {
+) -> Result<(Vec<Resource>, Vec<DataSource>, Vec<ModuleCall>), ParseError> {
     let for_line = pair.as_span().start_pos().line_col().0;
     let mut inner = pair.into_inner();
 
@@ -169,11 +167,11 @@ pub(crate) fn parse_for_expr(
     let mut module_calls = Vec::new();
 
     let collect = |result: ForBodyResult,
-                   resources: &mut Vec<ManagedResource>,
+                   resources: &mut Vec<Resource>,
                    data_sources: &mut Vec<DataSource>,
                    module_calls: &mut Vec<ModuleCall>| {
         match result {
-            ForBodyResult::ManagedResource(r) => resources.push(*r),
+            ForBodyResult::Resource(r) => resources.push(*r),
             ForBodyResult::DataSource(d) => data_sources.push(*d),
             ForBodyResult::ModuleCall(c) => module_calls.push(c),
         }
@@ -280,7 +278,7 @@ pub(crate) fn parse_for_expr(
             }
 
             let address = format!("{}[?]", binding_name);
-            if let Ok(ForBodyResult::ManagedResource(resource)) =
+            if let Ok(ForBodyResult::Resource(resource)) =
                 parse_for_body(body_pair, &template_ctx, &address)
             {
                 let attrs: Vec<(String, Value)> = resource
@@ -365,7 +363,7 @@ pub(crate) fn parse_for_expr(
                     }
                 }
                 let address = format!("{}[?]", binding_name);
-                if let Ok(ForBodyResult::ManagedResource(resource)) =
+                if let Ok(ForBodyResult::Resource(resource)) =
                     parse_for_body(body_pair, &template_ctx, &address)
                 {
                     let attrs: Vec<(String, Value)> = resource
@@ -528,7 +526,7 @@ pub(crate) fn parse_for_body(
             }
             Rule::resource_expr => {
                 let resource = parse_resource_expr(inner, &local_ctx, address)?;
-                return Ok(ForBodyResult::ManagedResource(Box::new(resource)));
+                return Ok(ForBodyResult::Resource(Box::new(resource)));
             }
             Rule::read_resource_expr => {
                 let data_source = parse_read_resource_expr(inner, &local_ctx, address)?;

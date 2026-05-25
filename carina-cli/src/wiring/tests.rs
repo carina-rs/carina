@@ -7,7 +7,7 @@ fn test_resolve_enum_aliases_ip_protocol_all() {
     // After normalize_desired, ip_protocol "all" becomes a namespaced DSL value.
     // resolve_enum_aliases should resolve the alias "all" -> "-1".
     let mut resource =
-        ManagedResource::with_provider("awscc", "ec2.security_group_egress", "test-rule", None);
+        Resource::with_provider("awscc", "ec2.security_group_egress", "test-rule", None);
     resource.set_attr(
         "ip_protocol".to_string(),
         Value::Concrete(ConcreteValue::String(
@@ -30,7 +30,7 @@ fn test_resolve_enum_aliases_no_alias() {
     // "tcp" has no alias mapping, so it should be converted from DSL enum
     // to its raw form by convert_enum_value but not further changed.
     let mut resource =
-        ManagedResource::with_provider("awscc", "ec2.security_group_egress", "test-rule", None);
+        Resource::with_provider("awscc", "ec2.security_group_egress", "test-rule", None);
     resource.set_attr(
         "ip_protocol".to_string(),
         Value::Concrete(ConcreteValue::String(
@@ -55,7 +55,7 @@ fn test_resolve_enum_aliases_no_alias() {
 fn test_resolve_enum_aliases_aws_provider() {
     // Same alias resolution should work for the aws provider
     let mut resource =
-        ManagedResource::with_provider("aws", "ec2.security_group_ingress", "test-rule", None);
+        Resource::with_provider("aws", "ec2.security_group_ingress", "test-rule", None);
     resource.set_attr(
         "ip_protocol".to_string(),
         Value::Concrete(ConcreteValue::String(
@@ -101,8 +101,7 @@ fn test_resolve_enum_aliases_in_states() {
 #[ignore = "requires provider binary for enum alias resolution"]
 fn test_resolve_enum_aliases_in_struct_field() {
     // Aliases within struct fields (maps inside lists) should also be resolved
-    let mut resource =
-        ManagedResource::with_provider("awscc", "ec2.SecurityGroup", "test-sg", None);
+    let mut resource = Resource::with_provider("awscc", "ec2.SecurityGroup", "test-sg", None);
     let mut egress_map = IndexMap::new();
     egress_map.insert(
         "ip_protocol".to_string(),
@@ -167,7 +166,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
     let ctx = WiringContext::new(vec![]);
 
     // Desired resource with normalized DSL enum value (after normalize_desired)
-    let mut resource = ManagedResource::with_provider("awscc", "ec2.Vpc", "test-vpc", None);
+    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "test-vpc", None);
     resource.set_attr(
         "instance_tenancy".to_string(),
         Value::Concrete(ConcreteValue::String(
@@ -256,7 +255,7 @@ fn test_merge_default_tags_prevents_false_diff() {
     schemas.insert("awscc", schema);
 
     // Desired resource without explicit tags
-    let resource = ManagedResource::with_provider("awscc", "s3.Bucket", "test-bucket", None);
+    let resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket", None);
 
     // State already has the default tags (from a previous apply)
     let id = resource.id.clone();
@@ -354,8 +353,7 @@ fn test_merge_default_tags_prevents_false_diff() {
 #[test]
 fn test_resolve_enum_aliases_non_enum_values_unchanged() {
     // Non-DSL-enum strings should not be affected
-    let mut resource =
-        ManagedResource::with_provider("awscc", "ec2.SecurityGroup", "test-sg", None);
+    let mut resource = Resource::with_provider("awscc", "ec2.SecurityGroup", "test-sg", None);
     resource.set_attr(
         "group_description".to_string(),
         Value::Concrete(ConcreteValue::String("My security group".to_string())),
@@ -386,7 +384,7 @@ fn test_resolve_enum_aliases_non_enum_values_unchanged() {
 fn import_fallback_matches_anonymous_resource_by_name_attribute() {
     use carina_core::effect::Effect;
     use carina_core::plan::Plan;
-    use carina_core::resource::{ConcreteValue, ManagedResource, ResourceId, Value};
+    use carina_core::resource::{ConcreteValue, Resource, ResourceId, Value};
     use carina_core::schema::ResourceSchema;
 
     // Schema with name_attribute = "bucket_name"
@@ -395,8 +393,7 @@ fn import_fallback_matches_anonymous_resource_by_name_attribute() {
     schemas.insert("awscc", bucket_schema);
 
     // Anonymous resource with hash name but bucket_name = "carina-rs-state"
-    let mut resource =
-        ManagedResource::with_provider("awscc", "s3.Bucket", "s3_bucket_1d43a664", None);
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "s3_bucket_1d43a664", None);
     resource.set_attr(
         "bucket_name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs-state".to_string())),
@@ -480,7 +477,7 @@ fn resolve_data_source_refs_replaces_resource_ref_with_concrete_value() {
     let identity_store_id = "d-9067c29a4b";
 
     // Managed resource with a binding — phase 1 would have refreshed it.
-    let mut sso = ManagedResource::with_provider("awscc", "sso.Instance", "carina-rs", None);
+    let mut sso = Resource::with_provider("awscc", "sso.Instance", "carina-rs", None);
     sso.binding = Some("sso".to_string());
 
     // Data source referencing `sso.identity_store_id`. carina#3181:
@@ -550,8 +547,8 @@ fn validate_resources_with_ctx_returns_each_error_as_app_error() {
     // Empty provider string sidesteps the "unknown provider, skip"
     // escape hatch (`known_providers` is empty), so each bad resource
     // produces its own "Unknown resource type" entry.
-    let r1 = ManagedResource::new("foo.nothing", "first");
-    let r2 = ManagedResource::new("bar.nothing", "second");
+    let r1 = Resource::new("foo.nothing", "first");
+    let r2 = Resource::new("bar.nothing", "second");
     let parsed = ParsedFile {
         resources: vec![r1, r2],
         ..ParsedFile::default()
@@ -571,7 +568,7 @@ fn validate_resources_with_ctx_returns_each_error_as_app_error() {
 #[test]
 fn dependency_chain_wrappers_return_vec_app_error() {
     let ctx = WiringContext::new(vec![]);
-    let mut resources: Vec<ManagedResource> = Vec::new();
+    let mut resources: Vec<Resource> = Vec::new();
     let providers: Vec<ProviderConfig> = Vec::new();
 
     let errors = resolve_names_with_ctx(&ctx, &mut resources);
@@ -617,7 +614,7 @@ fn strip_and_restore_unknown_attributes_round_trip() {
     use carina_core::resource::{AccessPath, ConcreteValue, DeferredValue, UnknownReason, Value};
     use indexmap::IndexMap;
 
-    let mut r = carina_core::resource::ManagedResource::new("test.t", "n");
+    let mut r = carina_core::resource::Resource::new("test.t", "n");
     let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
     r.attributes.insert(
         "group_description".into(),
@@ -735,7 +732,7 @@ fn restore_unknown_attributes_after_normalize_injection() {
     // the originals when the post-normalize map has different length.
     use carina_core::resource::{AccessPath, ConcreteValue, DeferredValue, UnknownReason, Value};
 
-    let mut r = carina_core::resource::ManagedResource::new("test.t", "n");
+    let mut r = carina_core::resource::Resource::new("test.t", "n");
     let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
     r.attributes.insert(
         "a".into(),
@@ -781,7 +778,7 @@ fn strip_and_restore_for_expression_unknowns_round_trip() {
     // `Value::Deferred(DeferredValue::Unknown)` of any reason.
     use carina_core::resource::{ConcreteValue, DeferredValue, UnknownReason, Value};
 
-    let mut r = carina_core::resource::ManagedResource::new("test.t", "n");
+    let mut r = carina_core::resource::Resource::new("test.t", "n");
     r.attributes.insert(
         "name".into(),
         Value::Concrete(ConcreteValue::String("static".into())),
@@ -865,7 +862,7 @@ fn strip_and_restore_resource_ref_round_trip() {
     };
     use indexmap::IndexMap;
 
-    let mut r = carina_core::resource::ManagedResource::new("test.t", "n");
+    let mut r = carina_core::resource::Resource::new("test.t", "n");
     let path = AccessPath::with_fields("admins", "group_id", vec![]);
     r.attributes.insert(
         "name".into(),
@@ -957,7 +954,7 @@ fn strip_unified_predicate_covers_unknown_and_ref() {
         AccessPath, ConcreteValue, DeferredValue, UnknownReason, Value, contains_resource_ref,
     };
 
-    let mut r = carina_core::resource::ManagedResource::new("test.t", "n");
+    let mut r = carina_core::resource::Resource::new("test.t", "n");
     let path = AccessPath::with_fields("admins", "group_id", vec![]);
     r.attributes.insert(
         "name".into(),
@@ -1003,7 +1000,7 @@ fn strip_unified_predicate_covers_unknown_and_ref() {
 // =====================================================================
 
 fn parsed_with_attr(attr_name: &str, attr_value: Value) -> ParsedFile {
-    let mut r = ManagedResource::new("foo.bar", "x");
+    let mut r = Resource::new("foo.bar", "x");
     r.attributes.insert(attr_name.to_string(), attr_value);
     ParsedFile {
         resources: vec![r],
@@ -1425,14 +1422,14 @@ mod expand_same_config_deferred_for_tests {
     /// order, and nothing outside the set.
     #[test]
     fn refreshable_child_ids_select_yields_exactly_the_set() {
-        // `ManagedResource::new` gives each resource a distinct, concrete
+        // `Resource::new` gives each resource a distinct, concrete
         // `ResourceId` directly — no parse/ID-reconcile step, so the
         // test pins `select`'s set-membership logic in isolation
         // (anonymous ids are still pending right after `parse`, which is
         // a different concern covered by the expand_* tests).
-        let r_a = ManagedResource::new("aws.ec2.Vpc", "a");
-        let r_b = ManagedResource::new("aws.ec2.Vpc", "b");
-        let r_c = ManagedResource::new("aws.ec2.Vpc", "c");
+        let r_a = Resource::new("aws.ec2.Vpc", "a");
+        let r_b = Resource::new("aws.ec2.Vpc", "b");
+        let r_c = Resource::new("aws.ec2.Vpc", "c");
         let resources = vec![r_a.clone(), r_b.clone(), r_c.clone()];
 
         // Refreshable set = {a, c}; b must be skipped.

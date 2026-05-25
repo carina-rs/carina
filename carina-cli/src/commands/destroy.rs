@@ -16,7 +16,7 @@ use carina_core::deps::{
 use carina_core::effect::Effect;
 use carina_core::plan::Plan;
 use carina_core::provider::Provider;
-use carina_core::resource::{ConcreteValue, ManagedResource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 use carina_state::{LockInfo, StateBackend, resolve_backend};
 
 use carina_core::parser::ProviderContext;
@@ -167,7 +167,7 @@ async fn run_destroy_locked(
 
     // Collect all resources (managed + orphans) before sorting.
     // We use the unsorted list for state reads, then sort once at the end.
-    let mut all_resources: Vec<ManagedResource> = parsed.resources.clone(); // allow: direct — plan-time reconciliation
+    let mut all_resources: Vec<Resource> = parsed.resources.clone(); // allow: direct — plan-time reconciliation
 
     if !refresh {
         eprintln!(
@@ -190,9 +190,9 @@ async fn run_destroy_locked(
         // from state. carina#3181: `all_resources` is sourced from
         // `parsed.resources`, which is managed-only — data sources and
         // virtual resources are not destroyed and never enter this list.
-        let managed_resources: Vec<&ManagedResource> = all_resources.iter().collect();
+        let resources: Vec<&Resource> = all_resources.iter().collect();
         let provider_ref = &provider;
-        let results: Vec<Result<(ResourceId, State), AppError>> = stream::iter(&managed_resources)
+        let results: Vec<Result<(ResourceId, State), AppError>> = stream::iter(&resources)
             .map(|resource| {
                 let progress = RefreshProgress::begin_multi(&multi, &resource.id);
                 let identifier = state_file
@@ -266,14 +266,14 @@ async fn run_destroy_locked(
     // Sort all resources (managed + orphans) for destroy ordering.
     // Uses depth-based pre-sorting to ensure stable ordering for independent
     // branches, then reverses for destroy order (dependents before dependencies).
-    let destroy_order: Vec<ManagedResource> =
+    let destroy_order: Vec<Resource> =
         sort_resources_for_destroy(&all_resources).map_err(AppError::Config)?;
 
     // Collect resources that exist and will be destroyed
     // Skip the state bucket if it matches the backend bucket
-    let mut protected_resources: Vec<&ManagedResource> = Vec::new();
-    let mut prevent_destroy_resources: Vec<&ManagedResource> = Vec::new();
-    let resources_to_destroy: Vec<&ManagedResource> = destroy_order
+    let mut protected_resources: Vec<&Resource> = Vec::new();
+    let mut prevent_destroy_resources: Vec<&Resource> = Vec::new();
+    let resources_to_destroy: Vec<&Resource> = destroy_order
         .iter()
         .filter(|r| {
             // carina#3181: `destroy_order` is managed-only — data
@@ -1153,7 +1153,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_deletion_succeeds_after_transient_exists() {
-        // ManagedResource exists on first poll, then disappears on second.
+        // Resource exists on first poll, then disappears on second.
         let id = ResourceId::new("s3.Bucket", "test");
         let existing_state = State::existing(id.clone(), HashMap::new());
         let provider =

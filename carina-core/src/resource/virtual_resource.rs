@@ -8,7 +8,7 @@
 //! The typestate split encodes that invariant: a `VirtualResource`
 //! is never accepted by the pre-apply resolver.
 //!
-//! Unlike [`ManagedResource`](super::ManagedResource), this struct
+//! Unlike [`Resource`](super::Resource), this struct
 //! does not carry `directives` (no `prevent_destroy` applies to a
 //! synthetic node) or `prefixes` (no auto-generated names on a
 //! non-provider resource). `module_source` is flattened to
@@ -75,7 +75,7 @@ pub struct VirtualResource {
     pub instance: String,
     /// Parser-level: attributes whose value was written as a quoted
     /// string literal. Parse-time only; `#[serde(skip)]` keeps it out
-    /// of state — mirrors [`ManagedResource::quoted_string_attrs`](super::ManagedResource).
+    /// of state — mirrors [`Resource::quoted_string_attrs`](super::Resource).
     #[serde(default, skip)]
     pub quoted_string_attrs: HashSet<String>,
 }

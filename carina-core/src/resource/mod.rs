@@ -1,4 +1,4 @@
-//! ManagedResource - Representing resources and their state
+//! Resource - Representing resources and their state
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -79,7 +79,7 @@ pub struct ResourceId {
     pub provider: String,
     /// Resource type (e.g., "s3.Bucket", "ec2.Instance")
     pub resource_type: String,
-    /// ManagedResource name (identifier specified in DSL).
+    /// Resource name (identifier specified in DSL).
     ///
     /// `Pending` means the resource is anonymous and the `name`
     /// attribute has not yet been promoted into the `ResourceId`.
@@ -1131,11 +1131,11 @@ impl Value {
     }
 }
 
-/// Project an `IndexMap<String, Value>` (the shape `ManagedResource.attributes`
+/// Project an `IndexMap<String, Value>` (the shape `Resource.attributes`
 /// uses since #2222) into a plain `HashMap<String, Value>` for callers
 /// that only need key-based lookup (state merging, ResourceRef
 /// resolution, provider trait inputs). Source-order is dropped on
-/// purpose at this boundary — keep it on `ManagedResource.attributes` itself
+/// purpose at this boundary — keep it on `Resource.attributes` itself
 /// when iteration order matters.
 ///
 /// Despite the historical name (the helper used to operate on the now-removed
@@ -1573,9 +1573,9 @@ pub struct Directives {
 /// Source of a resource (root or from a module)
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ModuleSource {
-    /// ManagedResource defined at the root level
+    /// Resource defined at the root level
     Root,
-    /// ManagedResource from a module instantiation
+    /// Resource from a module instantiation
     Module {
         /// Module name (e.g., "web_tier")
         name: String,
@@ -1601,7 +1601,7 @@ impl ModuleSource {
 
 /// A managed infrastructure resource declared in DSL.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ManagedResource {
+pub struct Resource {
     pub id: ResourceId,
     /// Source-order preserving map of attribute name → expression.
     ///
@@ -1636,7 +1636,7 @@ pub struct ManagedResource {
     /// Top-level attribute names whose value was written as a quoted
     /// string literal (`attr = "..."`) in the source `.crn`.
     ///
-    /// **Why on `ManagedResource`, not on `Value`:** the alternative is a
+    /// **Why on `Resource`, not on `Value`:** the alternative is a
     /// `Value::QuotedString` variant, but that ripples through every
     /// `match` arm in the codebase. Co-locating the bit with the
     /// owning resource is enough for the only consumer that needs it
@@ -1644,14 +1644,14 @@ pub struct ManagedResource {
     /// radius. Sharing a struct with the attributes also makes the
     /// lookup rename-proof: there is no separate identifier keying
     /// the metadata, so `compute_anonymous_identifiers` can rewrite
-    /// `ManagedResource.id.name` freely (#2229).
+    /// `Resource.id.name` freely (#2229).
     ///
     /// Parse-time only; `#[serde(skip)]` keeps it out of state.
     #[serde(default, skip)]
     pub quoted_string_attrs: HashSet<String>,
 }
 
-impl ManagedResource {
+impl Resource {
     pub fn new(resource_type: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             id: ResourceId::new(resource_type, name),
@@ -1748,7 +1748,7 @@ pub struct State {
     /// Binding names this resource depended on when it was last applied.
     /// Used by the executor to determine delete ordering during replace operations.
     ///
-    /// Set semantics (BTreeSet) — see ManagedResource::dependency_bindings (#2228).
+    /// Set semantics (BTreeSet) — see Resource::dependency_bindings (#2228).
     pub dependency_bindings: BTreeSet<String>,
 }
 

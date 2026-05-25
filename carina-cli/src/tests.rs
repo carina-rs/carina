@@ -11,7 +11,7 @@ use carina_core::parser::{ParsedFile, ProviderConfig};
 use carina_core::plan::Plan;
 use carina_core::provider::{BoxFuture, ProviderError, ProviderResult};
 use carina_core::resource::{
-    ConcreteValue, DataSource, DeferredValue, Directives, ManagedResource, ResourceId, State, Value,
+    ConcreteValue, DataSource, DeferredValue, Directives, Resource, ResourceId, State, Value,
 };
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
 use carina_state::{BackendError, LockInfo, ResourceState, StateBackend, StateFile};
@@ -106,7 +106,7 @@ impl Provider for TestProvider {
 
 #[tokio::test]
 async fn refresh_pending_states_updates_saved_state_from_provider_read() {
-    let resource = ManagedResource::with_provider("aws", "s3.Bucket", "bucket", None);
+    let resource = Resource::with_provider("aws", "s3.Bucket", "bucket", None);
     let id = resource.id.clone();
     let identifier = "bucket-123";
 
@@ -168,7 +168,7 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
 
 #[tokio::test]
 async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
-    let resource = ManagedResource::with_provider("aws", "s3.Bucket", "bucket", None);
+    let resource = Resource::with_provider("aws", "s3.Bucket", "bucket", None);
     let id = resource.id.clone();
     let identifier = "bucket-123";
 
@@ -215,7 +215,7 @@ async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
 
 #[tokio::test]
 async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refresh_fails() {
-    let resource = ManagedResource::with_provider("aws", "s3.Bucket", "bucket", None);
+    let resource = Resource::with_provider("aws", "s3.Bucket", "bucket", None);
     let id = resource.id.clone();
     let identifier = "bucket-123";
 
@@ -270,7 +270,7 @@ fn plan_file_serde_round_trip() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Create(
-        ManagedResource::with_provider("aws", "s3.Bucket", "my-bucket", None).with_attribute(
+        Resource::with_provider("aws", "s3.Bucket", "my-bucket", None).with_attribute(
             "bucket",
             Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
         ),
@@ -285,7 +285,7 @@ fn plan_file_serde_round_trip() {
     });
 
     let sorted_resources = vec![
-        ManagedResource::with_provider("aws", "s3.Bucket", "my-bucket", None).with_attribute(
+        Resource::with_provider("aws", "s3.Bucket", "my-bucket", None).with_attribute(
             "bucket",
             Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
         ),
@@ -366,7 +366,7 @@ fn plan_file_serde_round_trip() {
 #[test]
 #[ignore = "requires provider binary for schema-based prefix resolution"]
 fn test_resolve_attr_prefixes_extracts_prefix_and_generates_name() {
-    let mut resource = ManagedResource::with_provider("awscc", "s3.Bucket", "test-bucket", None);
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket", None);
     resource.set_attr(
         "bucket_name_prefix".to_string(),
         Value::Concrete(ConcreteValue::String("my-app-".to_string())),
@@ -396,7 +396,7 @@ fn test_resolve_attr_prefixes_extracts_prefix_and_generates_name() {
 #[test]
 fn test_resolve_attr_prefixes_leaves_non_matching_prefix_alone() {
     // If base attr doesn't exist in schema, leave _prefix as-is
-    let mut resource = ManagedResource::with_provider("awscc", "s3.Bucket", "test-bucket", None);
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket", None);
     resource.set_attr(
         "nonexistent_attr_prefix".to_string(),
         Value::Concrete(ConcreteValue::String("some-value".to_string())),
@@ -417,7 +417,7 @@ fn test_resolve_attr_prefixes_leaves_non_matching_prefix_alone() {
 #[test]
 #[ignore = "requires provider binary for schema-based prefix resolution"]
 fn test_resolve_attr_prefixes_errors_when_both_prefix_and_attr_specified() {
-    let mut resource = ManagedResource::with_provider("awscc", "s3.Bucket", "test-bucket", None);
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket", None);
     resource.set_attr(
         "bucket_name_prefix".to_string(),
         Value::Concrete(ConcreteValue::String("my-app-".to_string())),
@@ -441,7 +441,7 @@ fn test_resolve_attr_prefixes_errors_when_both_prefix_and_attr_specified() {
 #[test]
 #[ignore = "requires provider binary for schema-based prefix resolution"]
 fn test_resolve_attr_prefixes_errors_on_empty_prefix() {
-    let mut resource = ManagedResource::with_provider("awscc", "s3.Bucket", "test-bucket", None);
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket", None);
     resource.set_attr(
         "bucket_name_prefix".to_string(),
         Value::Concrete(ConcreteValue::String("".to_string())),
@@ -457,7 +457,7 @@ fn test_resolve_attr_prefixes_errors_on_empty_prefix() {
 #[ignore = "requires provider binary for schema-based name resolution"]
 fn test_resolve_names_handles_block_name_before_prefix() {
     // resolve_names should first resolve block names, then resolve attr prefixes
-    let mut resource = ManagedResource::with_provider("awscc", "ec2.ipam", "test-ipam", None);
+    let mut resource = Resource::with_provider("awscc", "ec2.ipam", "test-ipam", None);
     resource.set_attr(
         "operating_region".to_string(),
         Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
@@ -482,7 +482,7 @@ fn test_resolve_names_handles_block_name_before_prefix() {
 
 #[test]
 fn test_reconcile_prefixed_names_reuses_state_name_when_prefix_matches() {
-    let mut resource = ManagedResource::with_provider("awscc", "s3.Bucket", "test-bucket", None);
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket", None);
     resource
         .prefixes
         .insert("bucket_name".to_string(), "my-app-".to_string());
@@ -515,7 +515,7 @@ fn test_reconcile_prefixed_names_reuses_state_name_when_prefix_matches() {
 
 #[test]
 fn test_reconcile_prefixed_names_generates_new_name_when_prefix_changes() {
-    let mut resource = ManagedResource::with_provider("awscc", "s3.Bucket", "test-bucket", None);
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket", None);
     resource
         .prefixes
         .insert("bucket_name".to_string(), "new-prefix-".to_string());
@@ -548,7 +548,7 @@ fn test_reconcile_prefixed_names_generates_new_name_when_prefix_changes() {
 
 #[test]
 fn test_reconcile_prefixed_names_keeps_generated_name_when_no_state() {
-    let mut resource = ManagedResource::with_provider("awscc", "s3.Bucket", "test-bucket", None);
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket", None);
     resource
         .prefixes
         .insert("bucket_name".to_string(), "my-app-".to_string());
@@ -581,7 +581,7 @@ fn test_detailed_exitcode_no_changes() {
 fn test_detailed_exitcode_with_changes() {
     // A plan with mutating effects means changes -- has_changes should be true
     let mut plan = Plan::new();
-    plan.add(Effect::Create(ManagedResource::new("s3.Bucket", "test")));
+    plan.add(Effect::Create(Resource::new("s3.Bucket", "test")));
     let has_changes = plan.mutation_count() > 0;
     assert!(has_changes);
 }
@@ -620,13 +620,13 @@ fn make_awscc_provider(region_dsl: &str) -> ProviderConfig {
 #[ignore = "requires provider binary for identity_attributes"]
 fn test_anonymous_id_different_regions_produce_different_identifiers() {
     // Two anonymous ec2_vpc resources with same cidr_block but different provider regions
-    let mut r1 = ManagedResource::with_provider("awscc", "ec2.Vpc", "", None);
+    let mut r1 = Resource::with_provider("awscc", "ec2.Vpc", "", None);
     r1.set_attr(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
 
-    let mut r2 = ManagedResource::with_provider("awscc", "ec2.Vpc", "", None);
+    let mut r2 = Resource::with_provider("awscc", "ec2.Vpc", "", None);
     r2.set_attr(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
@@ -657,13 +657,13 @@ fn test_anonymous_id_different_regions_produce_different_identifiers() {
 #[ignore = "requires provider binary for identity_attributes"]
 fn test_anonymous_id_same_region_same_create_only_collides() {
     // Two anonymous ec2_vpc resources with same cidr_block and same provider region -> collision
-    let mut r1 = ManagedResource::with_provider("awscc", "ec2.Vpc", "", None);
+    let mut r1 = Resource::with_provider("awscc", "ec2.Vpc", "", None);
     r1.set_attr(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
 
-    let mut r2 = ManagedResource::with_provider("awscc", "ec2.Vpc", "", None);
+    let mut r2 = Resource::with_provider("awscc", "ec2.Vpc", "", None);
     r2.set_attr(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
@@ -680,13 +680,13 @@ fn test_anonymous_id_same_region_same_create_only_collides() {
 #[ignore = "requires provider binary for identity_attributes"]
 fn test_anonymous_id_different_create_only_same_region_no_collision() {
     // Two anonymous ec2_vpc resources with different cidr_block in same provider region -> no collision
-    let mut r1 = ManagedResource::with_provider("awscc", "ec2.Vpc", "", None);
+    let mut r1 = Resource::with_provider("awscc", "ec2.Vpc", "", None);
     r1.set_attr(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
 
-    let mut r2 = ManagedResource::with_provider("awscc", "ec2.Vpc", "", None);
+    let mut r2 = Resource::with_provider("awscc", "ec2.Vpc", "", None);
     r2.set_attr(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
@@ -704,7 +704,7 @@ fn test_anonymous_id_different_create_only_same_region_no_collision() {
 #[test]
 fn test_anonymous_id_named_resources_are_skipped() {
     // Named resources should not be processed by compute_anonymous_identifiers
-    let mut r1 = ManagedResource::with_provider("awscc", "ec2.Vpc", "my_vpc", None);
+    let mut r1 = Resource::with_provider("awscc", "ec2.Vpc", "my_vpc", None);
     r1.set_attr(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
@@ -724,7 +724,7 @@ fn test_find_state_bucket_resource_matching_type() {
         providers: vec![],
         backend: None,
         resources: vec![
-            ManagedResource::with_provider("aws", "s3.Bucket", "my-bucket", None).with_attribute(
+            Resource::with_provider("aws", "s3.Bucket", "my-bucket", None).with_attribute(
                 "bucket",
                 Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
             ),
@@ -772,7 +772,7 @@ fn test_find_state_bucket_resource_matching_type() {
 #[test]
 #[ignore = "requires provider binary for resource type validation"]
 fn validate_data_source_without_read_keyword_errors() {
-    let resource = ManagedResource::with_provider("aws", "sts.caller_identity", "identity", None);
+    let resource = Resource::with_provider("aws", "sts.caller_identity", "identity", None);
     // read_only defaults to false, simulating missing `read` keyword
     let result = validate_resources(&[resource]);
     assert!(result.is_err());
@@ -790,14 +790,14 @@ fn validate_data_source_without_read_keyword_errors() {
 }
 
 // carina#3181: the former `validate_data_source_with_read_keyword_passes`
-// test is obsolete — `validate_resources` takes `&[ManagedResource]`, so a
+// test is obsolete — `validate_resources` takes `&[Resource]`, so a
 // data source cannot be passed into the managed-resource validation path
 // at all (the typestate split enforces this).
 
 #[test]
 #[ignore = "requires provider binary for resource type validation"]
 fn validate_regular_resource_without_read_keyword_passes() {
-    let resource = ManagedResource::with_provider("aws", "s3.Bucket", "my-bucket", None)
+    let resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None)
         .with_attribute(
             "bucket",
             Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
@@ -815,7 +815,7 @@ fn validate_regular_resource_without_read_keyword_passes() {
 }
 
 // carina#3181: the former `destroy_plan_excludes_data_sources` test is
-// obsolete. The destroy path operates on `&[ManagedResource]`, and data
+// obsolete. The destroy path operates on `&[Resource]`, and data
 // sources are a distinct typestate (`DataSource`) — they can no longer
 // be mixed into the destroy candidate list, so "data sources are
 // excluded from destroy" is enforced by the type system rather than a
@@ -831,7 +831,7 @@ fn validate_regular_resource_without_read_keyword_passes() {
 fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
     // --- First run (apply) ---
     // 1. Parse: anonymous resource with bucket_name_prefix
-    let mut resource_run1 = ManagedResource::with_provider("awscc", "s3.Bucket", "", None);
+    let mut resource_run1 = Resource::with_provider("awscc", "s3.Bucket", "", None);
     resource_run1.set_attr(
         "bucket_name_prefix".to_string(),
         Value::Concrete(ConcreteValue::String("my-app-".to_string())),
@@ -885,7 +885,7 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
 
     // --- Second run (plan-verify) ---
     // 1. Parse again: same anonymous resource with bucket_name_prefix
-    let mut resource_run2 = ManagedResource::with_provider("awscc", "s3.Bucket", "", None);
+    let mut resource_run2 = Resource::with_provider("awscc", "s3.Bucket", "", None);
     resource_run2.set_attr(
         "bucket_name_prefix".to_string(),
         Value::Concrete(ConcreteValue::String("my-app-".to_string())),
@@ -935,7 +935,7 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
     let providers = vec![make_awscc_provider("awscc.Region.ap_northeast_1")];
 
     // --- First run ---
-    let mut resource_run1 = ManagedResource::with_provider("awscc", "iam.role", "", None);
+    let mut resource_run1 = Resource::with_provider("awscc", "iam.role", "", None);
     resource_run1.set_attr(
         "role_name_prefix".to_string(),
         Value::Concrete(ConcreteValue::String("carina-acc-test-".to_string())),
@@ -993,7 +993,7 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
     state_file.upsert_resource(resource_state);
 
     // --- Second run ---
-    let mut resource_run2 = ManagedResource::with_provider("awscc", "iam.role", "", None);
+    let mut resource_run2 = Resource::with_provider("awscc", "iam.role", "", None);
     resource_run2.set_attr(
         "role_name_prefix".to_string(),
         Value::Concrete(ConcreteValue::String("carina-acc-test-".to_string())),
@@ -1043,7 +1043,7 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
     let providers = vec![make_awscc_provider("awscc.Region.ap_northeast_1")];
 
     // --- First run ---
-    let mut resource_run1 = ManagedResource::with_provider("awscc", "ec2.flow_log", "", None);
+    let mut resource_run1 = Resource::with_provider("awscc", "ec2.flow_log", "", None);
     resource_run1.set_attr(
         "resource_id".to_string(),
         Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
@@ -1100,7 +1100,7 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
     state_file.upsert_resource(resource_state);
 
     // --- Second run ---
-    let mut resource_run2 = ManagedResource::with_provider("awscc", "ec2.flow_log", "", None);
+    let mut resource_run2 = Resource::with_provider("awscc", "ec2.flow_log", "", None);
     resource_run2.set_attr(
         "resource_id".to_string(),
         Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
@@ -1162,7 +1162,7 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
 
 #[tokio::test]
 async fn detect_drift_errors_when_resource_missing_from_planned_states() {
-    let resource = ManagedResource::with_provider("aws", "s3.Bucket", "my-bucket", None);
+    let resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None);
     let id = resource.id.clone();
 
     // Provider returns a non-existing state (identifier is None since no planned state)
@@ -1187,7 +1187,7 @@ async fn detect_drift_errors_when_resource_missing_from_planned_states() {
 
 #[tokio::test]
 async fn detect_drift_returns_none_when_no_drift() {
-    let resource = ManagedResource::with_provider("aws", "s3.Bucket", "my-bucket", None);
+    let resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None);
     let id = resource.id.clone();
     let identifier = "my-bucket";
 
@@ -1211,7 +1211,7 @@ async fn detect_drift_returns_none_when_no_drift() {
 
 #[tokio::test]
 async fn detect_drift_returns_messages_when_drift_detected() {
-    let resource = ManagedResource::with_provider("aws", "s3.Bucket", "my-bucket", None);
+    let resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None);
     let id = resource.id.clone();
     let identifier = "my-bucket";
 
@@ -1268,7 +1268,7 @@ fn orphaned_state_resource_produces_delete_effect() {
 
     // Config only has "keep-bucket" -- "removed-bucket" was deleted from .crn
     let desired = vec![
-        ManagedResource::with_provider("aws", "s3.Bucket", "keep-bucket", None).with_attribute(
+        Resource::with_provider("aws", "s3.Bucket", "keep-bucket", None).with_attribute(
             "bucket",
             Value::Concrete(ConcreteValue::String("keep-bucket".to_string())),
         ),
@@ -1598,7 +1598,7 @@ async fn finalize_apply_uses_write_state_locked() {
 /// (post-replacement) dependency IDs, not stale pre-replacement IDs.
 struct RecordingProvider {
     /// Tracks the `to` resource passed to each update call, keyed by resource ID string.
-    update_calls: std::sync::Mutex<Vec<(String, ManagedResource)>>,
+    update_calls: std::sync::Mutex<Vec<(String, Resource)>>,
 }
 
 impl RecordingProvider {
@@ -1608,7 +1608,7 @@ impl RecordingProvider {
         }
     }
 
-    fn get_update_calls(&self) -> Vec<(String, ManagedResource)> {
+    fn get_update_calls(&self) -> Vec<(String, Resource)> {
         self.update_calls.lock().unwrap().clone()
     }
 }
@@ -1656,7 +1656,7 @@ impl Provider for RecordingProvider {
         _identifier: &str,
         request: carina_core::provider::UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        // Reconstruct a ManagedResource view of the desired post-update state for
+        // Reconstruct a Resource view of the desired post-update state for
         // existing tests that introspect the recorded `to`.
         let mut attrs = request.from.attributes.clone();
         for op in &request.patch.ops {
@@ -1672,7 +1672,7 @@ impl Provider for RecordingProvider {
                 }
             }
         }
-        let mut to = ManagedResource::with_provider(
+        let mut to = Resource::with_provider(
             &id.provider,
             &id.resource_type,
             id.name_str(),
@@ -1764,7 +1764,7 @@ async fn rename_failure_in_create_before_destroy_counts_as_failure() {
     )
     .with_identifier("my-bucket");
 
-    let new_resource = ManagedResource::with_provider("awscc", "s3.Bucket", "my-bucket", None)
+    let new_resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None)
         .with_attribute(
             "bucket_name",
             Value::Concrete(ConcreteValue::String("my-bucket-tmp123".to_string())),
@@ -1834,14 +1834,14 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
     let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
     // --- Unresolved resources (before ref resolution) ---
-    let vpc_unresolved = ManagedResource::new("ec2.Vpc", "my-vpc")
+    let vpc_unresolved = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
 
-    let subnet_unresolved = ManagedResource::new("ec2.Subnet", "my-subnet")
+    let subnet_unresolved = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -1854,7 +1854,7 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
 
     // --- Resolved resources (after ref resolution with old state) ---
     // The subnet's vpc_id has been eagerly resolved to "vpc-OLD"
-    let subnet_resolved = ManagedResource::new("ec2.Subnet", "my-subnet")
+    let subnet_resolved = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -1954,7 +1954,7 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
     );
 
     // --- Unresolved resource map ---
-    let unresolved_resources: HashMap<ResourceId, ManagedResource> = HashMap::from([
+    let unresolved_resources: HashMap<ResourceId, Resource> = HashMap::from([
         (vpc_id.clone(), vpc_unresolved),
         (subnet_id.clone(), subnet_unresolved),
     ]);
@@ -2085,12 +2085,10 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
 
     // Config only has "keep-bucket" -- "orphan-bucket" was removed from .crn
     let mut parsed = carina_core::parser::InferredFile {
-        resources: vec![
-            ManagedResource::new("s3.Bucket", "keep-bucket").with_attribute(
-                "bucket",
-                Value::Concrete(ConcreteValue::String("keep-bucket".to_string())),
-            ),
-        ],
+        resources: vec![Resource::new("s3.Bucket", "keep-bucket").with_attribute(
+            "bucket",
+            Value::Concrete(ConcreteValue::String("keep-bucket".to_string())),
+        )],
         ..carina_core::parser::InferredFile::default()
     };
 
@@ -2243,7 +2241,7 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
     );
 
     // No desired resources — "removed-bucket" was removed from .crn
-    let desired: Vec<ManagedResource> = vec![];
+    let desired: Vec<Resource> = vec![];
     let desired_ids: HashSet<ResourceId> = desired.iter().map(|r| r.id.clone()).collect();
 
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
@@ -2315,7 +2313,7 @@ fn refresh_false_uses_cached_state_from_state_file() {
             .with_attribute("region", json!("ap-northeast-1")),
     );
 
-    let mut resource = ManagedResource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
     resource.set_attr(
         "bucket_name".to_string(),
         Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
@@ -2389,7 +2387,7 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
     );
 
     // No desired resources — the bucket was removed from .crn
-    let desired: Vec<ManagedResource> = vec![];
+    let desired: Vec<Resource> = vec![];
     let desired_ids: HashSet<ResourceId> = desired.iter().map(|r| r.id.clone()).collect();
 
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
@@ -2435,7 +2433,7 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
 fn refresh_false_without_state_file_treats_resources_as_new() {
     use carina_core::differ::create_plan;
 
-    let mut resource = ManagedResource::with_provider("awscc", "s3.Bucket", "new-bucket", None);
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "new-bucket", None);
     resource.set_attr(
         "bucket_name".to_string(),
         Value::Concrete(ConcreteValue::String("new-bucket".to_string())),
@@ -2480,7 +2478,7 @@ fn import_effect_preserves_resource_metadata_in_state() {
     // overwrite the ResourceState with a bare ResourceState::new(), stripping
     // directives, prefixes, desired_keys, binding, and dependency_bindings.
 
-    let mut resource = ManagedResource::with_provider("awscc", "ec2.Vpc", "my-vpc", None)
+    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None)
         .with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
@@ -2569,7 +2567,7 @@ fn build_state_after_apply_persists_write_only_attributes() {
     use carina_core::schema::{AttributeSchema, AttributeType};
 
     // Set up a resource with a write-only attribute (ipv4_netmask_length)
-    let mut resource = ManagedResource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
+    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
     resource.set_attr(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
@@ -2647,7 +2645,7 @@ fn build_state_after_apply_write_only_detects_value_change() {
     use carina_core::schema::{AttributeSchema, AttributeType};
 
     // Simulate: user changed ipv4_netmask_length from 16 to 24
-    let mut resource = ManagedResource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
+    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
     resource.set_attr(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/24".to_string())),
@@ -2727,13 +2725,12 @@ fn plan_file_serialization_redacts_secrets() {
         ConcreteValue::String("super-secret-pw".to_string()),
     ))));
 
-    let resource_with_secret =
-        ManagedResource::with_provider("awscc", "rds.db_instance", "my-db", None)
-            .with_attribute(
-                "name",
-                Value::Concrete(ConcreteValue::String("my-db".to_string())),
-            )
-            .with_attribute("master_password", secret_password.clone());
+    let resource_with_secret = Resource::with_provider("awscc", "rds.db_instance", "my-db", None)
+        .with_attribute(
+            "name",
+            Value::Concrete(ConcreteValue::String("my-db".to_string())),
+        )
+        .with_attribute("master_password", secret_password.clone());
 
     let mut plan = Plan::new();
     plan.add(Effect::Create(resource_with_secret.clone()));

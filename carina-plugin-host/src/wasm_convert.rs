@@ -10,8 +10,7 @@ use carina_core::provider::{
 };
 use carina_core::resource::{
     ConcreteValue, DataSource as CoreDataSource, DeferredValue, Directives,
-    ManagedResource as CoreResource, ResourceId as CoreResourceId, State as CoreState,
-    Value as CoreValue,
+    Resource as CoreResource, ResourceId as CoreResourceId, State as CoreState, Value as CoreValue,
 };
 use carina_core::schema::{
     AttributeSchema as CoreAttributeSchema, AttributeType as CoreAttributeType,

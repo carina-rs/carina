@@ -10,7 +10,7 @@ use ratatui::backend::TestBackend;
 
 use carina_core::effect::Effect;
 use carina_core::plan::Plan;
-use carina_core::resource::{ConcreteValue, Directives, ManagedResource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, Directives, Resource, ResourceId, State, Value};
 use carina_core::schema::SchemaRegistry;
 
 use crate::app::App;
@@ -46,7 +46,7 @@ fn render_tui_with_schemas(
 fn build_all_create_plan() -> Plan {
     let mut plan = Plan::new();
     plan.add(Effect::Create(
-        ManagedResource::new("ec2.Vpc", "my-vpc")
+        Resource::new("ec2.Vpc", "my-vpc")
             .with_binding("vpc")
             .with_attribute(
                 "cidr_block",
@@ -54,7 +54,7 @@ fn build_all_create_plan() -> Plan {
             ),
     ));
     plan.add(Effect::Create(
-        ManagedResource::new("ec2.RouteTable", "my-rt")
+        Resource::new("ec2.RouteTable", "my-rt")
             .with_binding("rt")
             .with_attribute(
                 "vpc_id",
@@ -62,7 +62,7 @@ fn build_all_create_plan() -> Plan {
             ),
     ));
     plan.add(Effect::Create(
-        ManagedResource::new("ec2.Subnet", "my-subnet")
+        Resource::new("ec2.Subnet", "my-subnet")
             .with_binding("subnet")
             .with_attribute(
                 "cidr_block",
@@ -96,7 +96,7 @@ fn build_mixed_operations_plan() -> Plan {
             .into_iter()
             .collect(),
         )),
-        to: ManagedResource::new("ec2.Vpc", "my-vpc")
+        to: Resource::new("ec2.Vpc", "my-vpc")
             .with_binding("vpc")
             .with_attribute(
                 "cidr_block",
@@ -109,7 +109,7 @@ fn build_mixed_operations_plan() -> Plan {
         changed_attributes: vec!["enable_dns_support".to_string()],
     });
     plan.add(Effect::Create(
-        ManagedResource::new("ec2.SecurityGroup", "my-sg")
+        Resource::new("ec2.SecurityGroup", "my-sg")
             .with_binding("sg")
             .with_attribute(
                 "group_description",
@@ -190,7 +190,7 @@ fn build_map_key_diff_plan() -> Plan {
             .into_iter()
             .collect(),
         )),
-        to: ManagedResource::new("ec2.Vpc", "my-vpc")
+        to: Resource::new("ec2.Vpc", "my-vpc")
             .with_binding("vpc")
             .with_attribute(
                 "cidr_block",
@@ -235,7 +235,7 @@ fn snapshot_map_key_diff() {
 fn snapshot_create_with_schema() {
     let mut plan = Plan::new();
     plan.add(Effect::Create(
-        ManagedResource::new("ec2.Vpc", "my-vpc")
+        Resource::new("ec2.Vpc", "my-vpc")
             .with_binding("vpc")
             .with_attribute(
                 "cidr_block",
@@ -361,7 +361,7 @@ fn build_moved_with_changes_plan() -> Plan {
             .into_iter()
             .collect(),
         )),
-        to: ManagedResource::new("ec2.Vpc", "new_vpc")
+        to: Resource::new("ec2.Vpc", "new_vpc")
             .with_binding("new_vpc")
             .with_attribute(
                 "cidr_block",
@@ -381,7 +381,7 @@ fn build_moved_with_changes_plan() -> Plan {
         changed_attributes: vec!["tags".to_string()],
     });
     plan.add(Effect::Create(
-        ManagedResource::new("ec2.Subnet", "my-subnet")
+        Resource::new("ec2.Subnet", "my-subnet")
             .with_attribute(
                 "cidr_block",
                 Value::Concrete(ConcreteValue::String("10.0.1.0/24".to_string())),

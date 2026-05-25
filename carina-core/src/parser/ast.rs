@@ -8,8 +8,8 @@ use super::expressions::validate_expr::CompareOp;
 use super::util::snake_to_pascal;
 use crate::binding_index::IterableBindings;
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, Directives, ManagedResource, ResourceId,
-    ResourceLike, UnknownReason, Value, VirtualResource,
+    ConcreteValue, DataSource, DeferredValue, Directives, Resource, ResourceId, ResourceLike,
+    UnknownReason, Value, VirtualResource,
 };
 use crate::version_constraint::VersionConstraint;
 use indexmap::IndexMap;
@@ -44,7 +44,7 @@ pub struct DeferredForExpression {
     /// correct variable(s).
     pub binding: ForBinding,
     /// Template resource for expansion (the for body parsed with placeholders).
-    pub template_resource: ManagedResource,
+    pub template_resource: Resource,
 }
 
 /// Origin of a resource yielded by [`ParsedFile::iter_all_resources`].
@@ -67,7 +67,7 @@ pub enum ResourceContext<'a> {
 /// arms borrow from `File`'s typed slices ([`File::resources`] managed
 /// rows, [`File::virtual_resources`], [`File::data_sources`]); the
 /// `Deferred` arm is a `for`-expression template body that still lives
-/// as a legacy [`ManagedResource`] in [`File::deferred_for_expressions`].
+/// as a legacy [`Resource`] in [`File::deferred_for_expressions`].
 ///
 /// Read-only consumers reach the shared accessors via
 /// [`ResourceRef::as_resource_like`] (or the `id` / `attributes` /
@@ -76,7 +76,7 @@ pub enum ResourceContext<'a> {
 #[derive(Debug, Clone, Copy)]
 pub enum ResourceRef<'a> {
     /// A top-level managed resource.
-    Managed(&'a ManagedResource),
+    Managed(&'a Resource),
     /// A top-level virtual resource (module-expansion synthetic node).
     Virtual(&'a VirtualResource),
     /// A top-level data source (`read`-keyword resource).
@@ -84,7 +84,7 @@ pub enum ResourceRef<'a> {
     /// The template body of a deferred `for` expression — always a
     /// managed resource (`for` bodies never carry `read` / virtual).
     Deferred {
-        resource: &'a ManagedResource,
+        resource: &'a Resource,
         deferred: &'a DeferredForExpression,
     },
 }
@@ -794,7 +794,7 @@ impl ExportParamLike for InferredExportParam {
 pub struct File<E> {
     pub providers: Vec<ProviderConfig>,
     /// Top-level managed infrastructure resources.
-    pub resources: Vec<ManagedResource>,
+    pub resources: Vec<Resource>,
     /// Read-only data-source resources (`read`-keyword resources).
     pub data_sources: Vec<DataSource>,
     /// Virtual resources synthesized by module-call expansion.
@@ -979,7 +979,7 @@ impl<E> File<E> {
         resource_type: &str,
         attr_name: &str,
         attr_value: &str,
-    ) -> Option<&ManagedResource> {
+    ) -> Option<&Resource> {
         self.resources.iter().find(|r| {
             r.id.resource_type == resource_type
                 && matches!(r.get_attr(attr_name), Some(Value::Concrete(ConcreteValue::String(n))) if n == attr_value)
@@ -1131,7 +1131,7 @@ impl<E> File<E> {
         }
 
         // carina#3181: a deferred for-expression's `template_resource` is
-        // a `ManagedResource`, so every expansion of it is managed — they
+        // a `Resource`, so every expansion of it is managed — they
         // go straight into the managed `resources` slice. (A `read` /
         // virtual for-body never reaches the deferred path.)
         self.resources.extend(expanded_resources);
@@ -1145,7 +1145,7 @@ impl<E> File<E> {
 /// with concrete scalars, surrounding `Interpolation` shapes can collapse
 /// to a `String` (#2227).
 fn substitute_attrs(
-    resource: &mut crate::resource::ManagedResource,
+    resource: &mut crate::resource::Resource,
     index: Option<i64>,
     key: Option<&str>,
     value: &Value,

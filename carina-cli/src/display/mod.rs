@@ -480,7 +480,7 @@ impl<'a> TreeRenderContext<'a> {
 
         let mut has_displayed_attrs = false;
 
-        // --- ManagedResource header line ---
+        // --- Resource header line ---
         match effect {
             Effect::Create(r) => {
                 if self.detail == DetailLevel::None {

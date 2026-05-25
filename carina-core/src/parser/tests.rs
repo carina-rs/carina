@@ -1,6 +1,6 @@
 use super::*;
 use crate::binding_index::IterableBindings;
-use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, ManagedResource, Value};
+use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Resource, Value};
 use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
 use std::collections::HashMap;
@@ -7505,7 +7505,7 @@ fn expand_deferred_for_map_binding_substitutes_key_and_value() {
     assert_eq!(parsed.resources.len(), 2); // allow: direct — fixture test inspection
 
     // Verify both key and value are substituted.
-    let mut by_name: HashMap<String, &ManagedResource> = HashMap::new();
+    let mut by_name: HashMap<String, &Resource> = HashMap::new();
     for r in &parsed.resources {
         if let Some(Value::Concrete(ConcreteValue::String(s))) = r.get_attr("target_name") {
             by_name.insert(s.clone(), r);
@@ -8285,7 +8285,7 @@ fn reference_to_upstream_state_binding_is_allowed() {
 /// Anonymous resources start with an empty name; the post-parse
 /// identifier pass rewrites that name. A side-table keyed by
 /// `ResourceId` would silently miss after the rename. Co-locating
-/// the bit on the `ManagedResource` (the same struct that carries the
+/// the bit on the `Resource` (the same struct that carries the
 /// attributes) makes it impossible to lose.
 #[test]
 fn quoted_literal_marker_survives_anonymous_resource_rename() {
@@ -8317,8 +8317,8 @@ fn quoted_literal_marker_survives_anonymous_resource_rename() {
 /// bare identifiers and namespaced identifiers at the parser level,
 /// so downstream enum diagnostics can report shape mismatches
 /// ("got a string literal") vs. variant mismatches ("invalid enum
-/// variant"). After #2229 the marker lives on the `ManagedResource` that
-/// owns the attributes (`ManagedResource.quoted_string_attrs`); the
+/// variant"). After #2229 the marker lives on the `Resource` that
+/// owns the attributes (`Resource.quoted_string_attrs`); the
 /// previous `string_literal_paths` side-table is gone.
 #[test]
 fn quoted_string_attrs_distinguish_quoted_from_bare_and_namespaced() {

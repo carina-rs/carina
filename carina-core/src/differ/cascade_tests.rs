@@ -11,14 +11,14 @@ fn cascade_dependent_updates_adds_update_for_dependent() {
     let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
     // Unresolved resources (before ref resolution)
-    let vpc = ManagedResource::new("ec2.Vpc", "my-vpc")
+    let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
 
-    let subnet = ManagedResource::new("ec2.Subnet", "my-subnet")
+    let subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -115,14 +115,14 @@ fn cascade_skips_resources_already_in_plan() {
     let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
     let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
-    let vpc = ManagedResource::new("ec2.Vpc", "my-vpc")
+    let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
 
-    let subnet = ManagedResource::new("ec2.Subnet", "my-subnet")
+    let subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -204,14 +204,14 @@ fn cascade_no_op_without_create_before_destroy() {
 
     let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
 
-    let vpc = ManagedResource::new("ec2.Vpc", "my-vpc")
+    let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
 
-    let subnet = ManagedResource::new("ec2.Subnet", "my-subnet")
+    let subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -263,21 +263,21 @@ fn cascade_transitive_dependencies() {
     let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
     let instance_id = ResourceId::new("ec2.Instance", "my-instance");
 
-    let vpc = ManagedResource::new("ec2.Vpc", "my-vpc")
+    let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
 
-    let subnet = ManagedResource::new("ec2.Subnet", "my-subnet")
+    let subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
             Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
         );
 
-    let instance = ManagedResource::new("ec2.Instance", "my-instance")
+    let instance = Resource::new("ec2.Instance", "my-instance")
         .with_binding("instance")
         .with_attribute(
             "subnet_id",
@@ -362,7 +362,7 @@ fn cascade_anonymous_resource_dependent() {
     let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
     let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
-    let vpc = ManagedResource::new("ec2.Vpc", "my-vpc")
+    let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
@@ -370,7 +370,7 @@ fn cascade_anonymous_resource_dependent() {
         );
 
     // Anonymous subnet (no _binding) with a ResourceRef to the VPC
-    let subnet = ManagedResource::new("ec2.Subnet", "my-subnet").with_attribute(
+    let subnet = Resource::new("ec2.Subnet", "my-subnet").with_attribute(
         "vpc_id",
         Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
     );
@@ -449,14 +449,14 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
     let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
     // Unresolved resources (before ref resolution)
-    let vpc = ManagedResource::new("ec2.Vpc", "my-vpc")
+    let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
 
-    let subnet = ManagedResource::new("ec2.Subnet", "my-subnet")
+    let subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -605,14 +605,14 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
     let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
     // Unresolved resources (before ref resolution)
-    let vpc = ManagedResource::new("ec2.Vpc", "my-vpc")
+    let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
 
-    let subnet = ManagedResource::new("ec2.Subnet", "my-subnet")
+    let subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -762,14 +762,14 @@ fn auto_detect_create_before_destroy_when_resource_has_dependents() {
     let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
     // Unresolved resources (before ref resolution)
-    let vpc = ManagedResource::new("ec2.Vpc", "my-vpc")
+    let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
 
-    let subnet = ManagedResource::new("ec2.Subnet", "my-subnet")
+    let subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -879,14 +879,14 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
     let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
     // Unresolved resources (before ref resolution)
-    let vpc = ManagedResource::new("ec2.Vpc", "my-vpc")
+    let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
 
-    let subnet = ManagedResource::new("ec2.Subnet", "my-subnet")
+    let subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -1015,14 +1015,14 @@ fn cascade_prevent_destroy_blocks_promotion_to_replace() {
     let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
     let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
-    let vpc = ManagedResource::new("ec2.Vpc", "my-vpc")
+    let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
 
-    let mut subnet = ManagedResource::new("ec2.Subnet", "my-subnet")
+    let mut subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -1134,14 +1134,14 @@ fn cascade_prevent_destroy_blocks_merge_upgrade_to_replace() {
     let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
     let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
 
-    let vpc = ManagedResource::new("ec2.Vpc", "my-vpc")
+    let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
 
-    let mut subnet = ManagedResource::new("ec2.Subnet", "my-subnet")
+    let mut subnet = Resource::new("ec2.Subnet", "my-subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",

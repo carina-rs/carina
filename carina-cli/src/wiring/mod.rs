@@ -24,7 +24,7 @@ use carina_core::provider::{
 };
 use carina_core::resolver::resolve_refs_for_plan;
 use carina_core::resource::{
-    ConcreteValue, DeferredValue, ManagedResource, ResourceId, State, Value, contains_resource_ref,
+    ConcreteValue, DeferredValue, Resource, ResourceId, State, Value, contains_resource_ref,
 };
 use carina_core::schema::{SchemaRegistry, resolve_block_names};
 use carina_core::validation;
@@ -37,7 +37,7 @@ use crate::error::AppError;
 /// Result of creating a plan, with context needed for saving
 pub struct PlanContext {
     pub plan: Plan,
-    pub sorted_resources: Vec<ManagedResource>,
+    pub sorted_resources: Vec<Resource>,
     pub current_states: HashMap<ResourceId, State>,
     /// Maps moved-to resource IDs to their original (moved-from) IDs.
     /// Used by display to show "(moved from: ...)" annotations on Update/Replace effects.
@@ -278,7 +278,7 @@ pub fn validate_resource_ref_types_with_ctx<E>(
 pub fn validate_attribute_param_ref_types_with_ctx(
     ctx: &WiringContext,
     attribute_params: &[carina_core::parser::AttributeParameter],
-    resources: &[ManagedResource],
+    resources: &[Resource],
 ) -> Vec<AppError> {
     lift_validation_result(validation::validate_attribute_param_ref_types(
         attribute_params,
@@ -365,10 +365,7 @@ fn value_contains_empty_interpolation(value: &Value) -> bool {
 }
 
 /// Resolve block name aliases and attribute prefixes in one step.
-pub fn resolve_names_with_ctx(
-    ctx: &WiringContext,
-    resources: &mut [ManagedResource],
-) -> Vec<AppError> {
+pub fn resolve_names_with_ctx(ctx: &WiringContext, resources: &mut [Resource]) -> Vec<AppError> {
     let mut errors = lift_validation_result(resolve_block_names(resources, ctx.schemas()));
     errors.extend(resolve_attr_prefixes_with_ctx(ctx, resources));
     errors
@@ -376,12 +373,12 @@ pub fn resolve_names_with_ctx(
 
 pub fn resolve_attr_prefixes_with_ctx(
     ctx: &WiringContext,
-    resources: &mut [ManagedResource],
+    resources: &mut [Resource],
 ) -> Vec<AppError> {
     lift_validation_result(identifier::resolve_attr_prefixes(resources, ctx.schemas()))
 }
 
-pub fn reconcile_prefixed_names(resources: &mut [ManagedResource], state_file: &Option<StateFile>) {
+pub fn reconcile_prefixed_names(resources: &mut [Resource], state_file: &Option<StateFile>) {
     let state_file = match state_file {
         Some(sf) => sf,
         None => return,
@@ -420,7 +417,7 @@ fn identity_attributes_for_provider(ctx: &WiringContext, name: &str) -> Vec<Stri
 /// new binding name so the differ sees the resource under its new identity.
 pub fn apply_anonymous_to_named_renames(
     ctx: &WiringContext,
-    resources: &[ManagedResource],
+    resources: &[Resource],
     providers: &[ProviderConfig],
     current_states: &mut HashMap<ResourceId, State>,
     prev_explicit: &mut HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
@@ -485,7 +482,7 @@ pub fn apply_anonymous_to_named_renames(
 
 pub fn reconcile_anonymous_identifiers_with_ctx(
     ctx: &WiringContext,
-    resources: &mut [ManagedResource],
+    resources: &mut [Resource],
     state_file: &mut StateFile,
 ) {
     let renames = identifier::reconcile_anonymous_identifiers(
@@ -552,7 +549,7 @@ pub fn apply_provider_prefix_renames(renames: &[(String, String)], state_file: &
 
 pub fn compute_anonymous_identifiers_with_ctx(
     ctx: &WiringContext,
-    resources: &mut [ManagedResource],
+    resources: &mut [Resource],
     providers: &[ProviderConfig],
 ) -> Vec<AppError> {
     match identifier::compute_anonymous_identifiers(resources, providers, ctx.schemas(), &|name| {
@@ -587,7 +584,7 @@ impl<'a> PlanPreprocessor<'a> {
     /// Call after `resolve_refs_with_state_and_remote()` and before `create_plan()`.
     pub async fn prepare(
         &self,
-        resources: &mut [ManagedResource],
+        resources: &mut [Resource],
         current_states: &mut HashMap<ResourceId, State>,
         provider_configs: &[ProviderConfig],
     ) {
@@ -651,7 +648,7 @@ struct StrippedAttribute {
 ///   `core_to_wit_value` `_` debug-format fallback would silently
 ///   stringify the ref (#2387).
 fn strip_attributes_matching(
-    resources: &mut [ManagedResource],
+    resources: &mut [Resource],
     predicate: &dyn Fn(&Value) -> bool,
 ) -> HashMap<ResourceId, Vec<StrippedAttribute>> {
     let mut out: HashMap<ResourceId, Vec<StrippedAttribute>> = HashMap::new();
@@ -698,7 +695,7 @@ fn strip_attributes_matching(
 /// provider-injected defaults) end up after the original entries,
 /// which matches behavior pre-#2377 for non-stripped attributes.
 fn restore_stripped_attributes(
-    resources: &mut [ManagedResource],
+    resources: &mut [Resource],
     mut stripped: HashMap<ResourceId, Vec<StrippedAttribute>>,
 ) {
     for resource in resources.iter_mut() {
@@ -743,7 +740,7 @@ fn current_states_contain_unknown(states: &HashMap<ResourceId, State>) -> bool {
 /// `normalize_desired()` to the resources. This resolves enum identifiers
 /// (e.g., bare enum identifiers -> namespaced enum strings) without requiring
 /// actual provider instances or network access.
-pub fn normalize_desired_with_ctx(ctx: &WiringContext, resources: &mut [ManagedResource]) {
+pub fn normalize_desired_with_ctx(ctx: &WiringContext, resources: &mut [Resource]) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("failed to build tokio runtime for normalize_desired");
@@ -790,7 +787,7 @@ pub fn normalize_state_with_ctx(
 ///
 /// This must be called on both desired resources and current states to ensure
 /// the differ sees consistent values and produces no false diffs.
-pub fn resolve_enum_aliases_with_ctx(ctx: &WiringContext, resources: &mut [ManagedResource]) {
+pub fn resolve_enum_aliases_with_ctx(ctx: &WiringContext, resources: &mut [Resource]) {
     // Single source of truth shared with the apply path
     // (`executor::renormalize`) so plan and apply cannot diverge on the
     // enum-alias stage again (carina#3063). The core helper mutates
@@ -1161,10 +1158,7 @@ impl RefreshableChildIds {
     /// through this method — there is no other constructor for the
     /// refresh set, which is what makes the plan/apply parity a
     /// type-level invariant rather than a reviewer's responsibility.
-    pub fn select<'a>(
-        &'a self,
-        resources: &'a [ManagedResource],
-    ) -> impl Iterator<Item = &'a ManagedResource> {
+    pub fn select<'a>(&'a self, resources: &'a [Resource]) -> impl Iterator<Item = &'a Resource> {
         resources.iter().filter(move |r| self.0.contains(&r.id))
     }
 
@@ -1189,7 +1183,7 @@ pub struct DeferredForExpansion {
     /// The augmented, re-sorted resource set: every original resource
     /// plus the materialized loop children, topologically ordered.
     /// Equal in length to the input when no loop resolved.
-    pub sorted_resources: Vec<ManagedResource>,
+    pub sorted_resources: Vec<Resource>,
     /// Loops still unresolved (iterable genuinely unknowable at plan
     /// time) — rendered as the carina#3128 validate/plan placeholder.
     pub residual_deferred_for: Vec<carina_core::parser::DeferredForExpression>,
@@ -1247,7 +1241,7 @@ pub struct DeferredForExpansion {
 /// so the plan and apply paths cannot diverge.
 pub fn expand_same_config_deferred_for<E: Clone>(
     parsed: &carina_core::parser::File<E>,
-    sorted_resources: &[ManagedResource],
+    sorted_resources: &[Resource],
     current_states: &HashMap<ResourceId, State>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     wait_aliases: &[WaitAliasSpec],
@@ -1371,7 +1365,7 @@ pub fn expand_same_config_deferred_for<E: Clone>(
 /// is meant to close.
 #[non_exhaustive]
 pub struct ExpandedRefreshState {
-    pub sorted_resources: Vec<ManagedResource>,
+    pub sorted_resources: Vec<Resource>,
     pub residual_deferred_for: Vec<carina_core::parser::DeferredForExpression>,
     pub new_child_ids: HashSet<ResourceId>,
     pub refreshable_child_ids: RefreshableChildIds,
@@ -1386,7 +1380,7 @@ pub struct ExpandedRefreshState {
 pub struct ExpandRefreshAndLiftInputs<'a, E: Clone, P: Provider + ProviderNormalizer> {
     pub parsed: &'a carina_core::parser::File<E>,
     pub provider: &'a P,
-    pub sorted_resources: &'a [ManagedResource],
+    pub sorted_resources: &'a [Resource],
     pub current_states: &'a mut HashMap<ResourceId, State>,
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
     pub wait_aliases: &'a [WaitAliasSpec],
@@ -2285,7 +2279,7 @@ pub async fn read_with_retry(
 pub(crate) async fn refresh_resource_set<'a>(
     provider: &dyn Provider,
     multi: &indicatif::MultiProgress,
-    resources: impl Iterator<Item = &'a ManagedResource>,
+    resources: impl Iterator<Item = &'a Resource>,
     state_file: &Option<StateFile>,
     saved_dep_bindings: &HashMap<ResourceId, BTreeSet<String>>,
     current_states: &mut HashMap<ResourceId, State>,
@@ -2392,7 +2386,7 @@ pub async fn read_data_source_with_retry(
 /// resolver builds its binding map from every managed resource with a
 /// `binding` — data sources reference those.
 pub(crate) fn resolve_data_source_refs_for_refresh(
-    managed: &[ManagedResource],
+    managed: &[Resource],
     virtuals: &[carina_core::resource::VirtualResource],
     data_sources: &[carina_core::resource::DataSource],
     current_states: &HashMap<ResourceId, State>,
@@ -2421,7 +2415,7 @@ pub(crate) fn resolve_data_source_refs_for_refresh(
 /// Convenience wrappers for tests. Each creates a fresh `WiringContext` internally,
 /// which is acceptable in test code where the overhead is negligible.
 #[cfg(test)]
-pub fn validate_resources(resources: &[ManagedResource]) -> Result<(), AppError> {
+pub fn validate_resources(resources: &[Resource]) -> Result<(), AppError> {
     use carina_core::parser::ParsedFile;
     let ctx = WiringContext::new(vec![]);
     let parsed = ParsedFile {
@@ -2436,20 +2430,20 @@ pub fn validate_resources(resources: &[ManagedResource]) -> Result<(), AppError>
 }
 
 #[cfg(test)]
-pub fn resolve_names(resources: &mut [ManagedResource]) -> Result<(), AppError> {
+pub fn resolve_names(resources: &mut [Resource]) -> Result<(), AppError> {
     let ctx = WiringContext::new(vec![]);
     errors_to_legacy_result(resolve_names_with_ctx(&ctx, resources))
 }
 
 #[cfg(test)]
-pub fn resolve_attr_prefixes(resources: &mut [ManagedResource]) -> Result<(), AppError> {
+pub fn resolve_attr_prefixes(resources: &mut [Resource]) -> Result<(), AppError> {
     let ctx = WiringContext::new(vec![]);
     errors_to_legacy_result(resolve_attr_prefixes_with_ctx(&ctx, resources))
 }
 
 #[cfg(test)]
 pub fn compute_anonymous_identifiers(
-    resources: &mut [ManagedResource],
+    resources: &mut [Resource],
     providers: &[ProviderConfig],
 ) -> Result<(), AppError> {
     let ctx = WiringContext::new(vec![]);
@@ -2481,7 +2475,7 @@ fn errors_to_legacy_result(errors: Vec<AppError>) -> Result<(), AppError> {
 }
 
 #[cfg(test)]
-pub fn resolve_enum_aliases(resources: &mut [ManagedResource]) {
+pub fn resolve_enum_aliases(resources: &mut [Resource]) {
     let ctx = WiringContext::new(vec![]);
     resolve_enum_aliases_with_ctx(&ctx, resources)
 }

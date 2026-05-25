@@ -12,7 +12,7 @@ use crate::provider::{
     build_update_patch,
 };
 use crate::resolver::resolve_ref_value;
-use crate::resource::{ConcreteValue, DeferredValue, ManagedResource, ResourceId, State, Value};
+use crate::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, State, Value};
 
 use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
 
@@ -123,10 +123,10 @@ pub(super) async fn refresh_pending_states(
 /// that populate asynchronously (ACM `domain_validation_options`,
 /// CloudFront `domain_name`, etc.).
 pub(super) async fn resolve_resource(
-    resource: &ManagedResource,
+    resource: &Resource,
     bindings: &ResolvedBindings,
     pipeline: &RenormalizePipeline<'_>,
-) -> Result<ManagedResource, String> {
+) -> Result<Resource, String> {
     let mut resolved = resource.clone();
     for (key, expr) in &resource.attributes {
         let resolved_value = unwrap_secret(resolve_ref_value(expr, bindings)?);
@@ -142,11 +142,11 @@ pub(super) async fn resolve_resource(
 /// See [`resolve_resource`] for the fail-fast contract on
 /// still-deferred values.
 pub(super) async fn resolve_resource_with_source(
-    target: &ManagedResource,
-    source: &ManagedResource,
+    target: &Resource,
+    source: &Resource,
     bindings: &ResolvedBindings,
     pipeline: &RenormalizePipeline<'_>,
-) -> Result<ManagedResource, String> {
+) -> Result<Resource, String> {
     let mut resolved = target.clone();
     for (key, expr) in &source.attributes {
         let resolved_value = unwrap_secret(resolve_ref_value(expr, bindings)?);
@@ -203,9 +203,9 @@ pub(super) struct RenormalizePipeline<'a> {
 /// fail-fast earlier on still-`Deferred` values — so this stays the tail
 /// expression without forcing `Ok(...)` at every call site.
 async fn renormalize(
-    resolved: ManagedResource,
+    resolved: Resource,
     pipeline: &RenormalizePipeline<'_>,
-) -> Result<ManagedResource, String> {
+) -> Result<Resource, String> {
     let mut one = [resolved];
     crate::value::canonicalize_resources_with_schemas(&mut one, pipeline.schemas);
     pipeline.normalizer.normalize_desired(&mut one).await;
@@ -335,7 +335,7 @@ pub(super) fn count_actionable_effects(effects: &[Effect]) -> usize {
 pub(super) struct BasicEffectCtx<'a> {
     pub(super) provider: &'a dyn Provider,
     pub(super) bindings: &'a ResolvedBindings,
-    pub(super) unresolved: &'a HashMap<ResourceId, ManagedResource>,
+    pub(super) unresolved: &'a HashMap<ResourceId, Resource>,
     pub(super) pipeline: &'a RenormalizePipeline<'a>,
     pub(super) completed: &'a AtomicUsize,
     pub(super) total: usize,

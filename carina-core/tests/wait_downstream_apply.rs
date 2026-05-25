@@ -10,7 +10,7 @@
 //!         viewer_certificate = { acm_certificate_arn =
 //!                                cert_issued.certificate_arn } }
 //!
-//! Pre-fix: `expand_module_call` returns only `Vec<ManagedResource>`, so the
+//! Pre-fix: `expand_module_call` returns only `Vec<Resource>`, so the
 //! module's `wait_bindings` are silently dropped and the module
 //! resources' references to the wait binding are never instance-
 //! prefixed. `create_plan` emits no `Effect::Wait`, the Distribution

@@ -7,15 +7,13 @@ use super::ast::{AttributeParameter, ExportParameter, ModuleCall, ParsedFile};
 use super::error::{ParseError, undefined_identifier_error};
 use super::static_eval::is_static_value;
 use crate::eval_value::EvalValue;
-use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, ManagedResource, ResourceLike, Value,
-};
+use crate::resource::{ConcreteValue, DataSource, DeferredValue, Resource, ResourceLike, Value};
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Mutable pre-apply traversal — the resolver mutates `attributes` and
 /// `dependency_bindings` of every resource whose references are resolved
-/// **before** apply: managed [`ManagedResource`]s and [`DataSource`]s.
+/// **before** apply: managed [`Resource`]s and [`DataSource`]s.
 ///
 /// `VirtualResource` is excluded on purpose — a virtual resource's
 /// attributes may carry refs whose resolution is deferred to the
@@ -26,7 +24,7 @@ trait PreApplyResourceMut: ResourceLike {
     fn dependency_bindings_mut(&mut self) -> &mut BTreeSet<String>;
 }
 
-impl PreApplyResourceMut for ManagedResource {
+impl PreApplyResourceMut for Resource {
     fn attributes_mut(&mut self) -> &mut IndexMap<String, Value> {
         &mut self.attributes
     }
@@ -71,7 +69,7 @@ fn iter_pre_apply_resources_mut(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn resolve_forward_references(
     resource_bindings: &HashSet<String>,
-    resources: &mut [ManagedResource],
+    resources: &mut [Resource],
     data_sources: &mut [DataSource],
     attribute_params: &mut [AttributeParameter],
     module_calls: &mut [ModuleCall],
@@ -395,7 +393,7 @@ pub fn check_identifier_scope(parsed: &ParsedFile) -> Vec<ParseError> {
 /// - `provider = <binding>` whose binding's kind does not match the
 ///   resource's kind (e.g. `aws.s3.Bucket { directives { provider =
 ///   <awscc-binding> } }`).
-/// - ManagedResource that omits `directives { provider = ... }` but whose
+/// - Resource that omits `directives { provider = ... }` but whose
 ///   kind has no default instance (the kind was registered via a
 ///   top-level `provider <kind> { source = ..., version = ... }`
 ///   block with no instance attributes, and every instance of that

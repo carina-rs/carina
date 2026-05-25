@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::effect::Effect;
-use crate::resource::{ConcreteValue, DeferredValue, ManagedResource, Value};
+use crate::resource::{ConcreteValue, DeferredValue, Resource, Value};
 
 /// Extract binding names that a resource depends on.
 ///
@@ -14,7 +14,7 @@ use crate::resource::{ConcreteValue, DeferredValue, ManagedResource, Value};
 ///
 /// Both sources are always merged because partial resolution can cause
 /// ResourceRef bindings to differ from the original direct dependencies.
-pub fn get_resource_dependencies(resource: &ManagedResource) -> HashSet<String> {
+pub fn get_resource_dependencies(resource: &Resource) -> HashSet<String> {
     let mut deps = HashSet::new();
     for value in resource.attributes.values() {
         collect_dependencies(value, &mut deps);
@@ -120,13 +120,13 @@ fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
 
 /// Like [`get_resource_dependencies`], but excludes `directives.depends_on`.
 ///
-/// The parser/resolver snapshots this into `ManagedResource.dependency_bindings`
+/// The parser/resolver snapshots this into `Resource.dependency_bindings`
 /// before reference resolution. Keeping the depends_on edges out of that
 /// snapshot is what lets the validation pass tell a redundant edge apart
 /// from a depends_on-only edge.
 ///
 /// Takes `&dyn ResourceLike` so the resolver can compute the snapshot for
-/// both managed [`ManagedResource`]s and [`DataSource`]s (carina#3181).
+/// both managed [`Resource`]s and [`DataSource`]s (carina#3181).
 pub fn get_resource_value_ref_dependencies(
     resource: &dyn crate::resource::ResourceLike,
 ) -> HashSet<String> {
@@ -148,9 +148,7 @@ pub fn get_resource_value_ref_dependencies(
 ///
 /// Returns an error if a circular dependency is detected, with a message
 /// showing the cycle path (e.g., "Circular dependency detected: a -> b -> c -> a").
-pub fn sort_resources_by_dependencies(
-    resources: &[ManagedResource],
-) -> Result<Vec<ManagedResource>, String> {
+pub fn sort_resources_by_dependencies(resources: &[Resource]) -> Result<Vec<Resource>, String> {
     topological_sort(resources, false)
 }
 
@@ -164,9 +162,7 @@ pub fn sort_resources_by_dependencies(
 /// The depth-based pre-sorting is only needed for destroy ordering. For apply
 /// (creation) ordering, the plain topological sort preserves the declaration
 /// order from the .crn file, which is the expected behavior (#1071).
-pub fn sort_resources_for_destroy(
-    resources: &[ManagedResource],
-) -> Result<Vec<ManagedResource>, String> {
+pub fn sort_resources_for_destroy(resources: &[Resource]) -> Result<Vec<Resource>, String> {
     let sorted = topological_sort(resources, true)?;
     Ok(sorted.into_iter().rev().collect())
 }
@@ -176,19 +172,16 @@ pub fn sort_resources_for_destroy(
 /// When `depth_presort` is true, resources are pre-sorted by dependency depth
 /// (ascending) before DFS traversal. This makes the sort input-order-independent,
 /// ensuring stable results for independent branches.
-fn topological_sort(
-    resources: &[ManagedResource],
-    depth_presort: bool,
-) -> Result<Vec<ManagedResource>, String> {
+fn topological_sort(resources: &[Resource], depth_presort: bool) -> Result<Vec<Resource>, String> {
     // Build binding name to resource mapping
-    let mut binding_to_resource: HashMap<String, &ManagedResource> = HashMap::new();
+    let mut binding_to_resource: HashMap<String, &Resource> = HashMap::new();
     for resource in resources {
         if let Some(ref binding_name) = resource.binding {
             binding_to_resource.insert(binding_name.clone(), resource);
         }
     }
 
-    let mut presorted: Vec<&ManagedResource> = resources.iter().collect();
+    let mut presorted: Vec<&Resource> = resources.iter().collect();
 
     if depth_presort {
         // Compute the dependency depth for each resource: the length of the longest
@@ -196,7 +189,7 @@ fn topological_sort(
         let mut depth_cache: HashMap<String, usize> = HashMap::new();
         fn compute_depth(
             binding: &str,
-            binding_to_resource: &HashMap<String, &ManagedResource>,
+            binding_to_resource: &HashMap<String, &Resource>,
             cache: &mut HashMap<String, usize>,
             visiting: &mut HashSet<String>,
         ) -> usize {
@@ -261,11 +254,11 @@ fn topological_sort(
     let mut visiting: Vec<String> = Vec::new();
 
     fn visit<'a>(
-        resource: &'a ManagedResource,
-        binding_to_resource: &HashMap<String, &'a ManagedResource>,
+        resource: &'a Resource,
+        binding_to_resource: &HashMap<String, &'a Resource>,
         visited: &mut HashSet<String>,
         visiting: &mut Vec<String>,
-        sorted: &mut Vec<ManagedResource>,
+        sorted: &mut Vec<Resource>,
     ) -> Result<(), String> {
         let binding_name = resource
             .binding
@@ -318,7 +311,7 @@ fn topological_sort(
 
 /// Build a reverse dependency map: for each binding, which bindings depend on it.
 /// If resource A depends on resource B, then `dependents_map["b"]` contains "a".
-pub fn build_dependents_map(resources: &[&ManagedResource]) -> HashMap<String, HashSet<String>> {
+pub fn build_dependents_map(resources: &[&Resource]) -> HashMap<String, HashSet<String>> {
     let mut dependents_map: HashMap<String, HashSet<String>> = HashMap::new();
     for resource in resources {
         let binding = resource
@@ -347,7 +340,7 @@ pub fn find_failed_dependency(
     // dependency set is assembled from the `ResourceLike` view (value
     // refs + `dependency_bindings`) plus the effect's explicit
     // `depends_on` edges — the same union `get_resource_dependencies`
-    // computes for a legacy `ManagedResource`.
+    // computes for a legacy `Resource`.
     let resource = effect.resource_like()?;
     let mut deps = get_resource_value_ref_dependencies(resource);
     deps.extend(effect.explicit_dependencies());
@@ -379,10 +372,10 @@ pub fn find_failed_dependent<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::{Directives, ManagedResource, ResourceId, Value};
+    use crate::resource::{Directives, Resource, ResourceId, Value};
 
-    fn make_resource(binding: &str, deps: &[&str]) -> ManagedResource {
-        let mut r = ManagedResource::new("test", binding);
+    fn make_resource(binding: &str, deps: &[&str]) -> Resource {
+        let mut r = Resource::new("test", binding);
         r.binding = Some(binding.to_string());
         for dep in deps {
             r.set_attr(
@@ -441,7 +434,7 @@ mod tests {
     }
 
     // Closure-in-attribute regression test deleted: `Value::Closure` no
-    // longer exists, so a closure can never reach `ManagedResource.attributes`.
+    // longer exists, so a closure can never reach `Resource.attributes`.
     // The original concern (refs inside captured args getting silently
     // dropped from dependency walks) is now type-impossible.
 
@@ -456,7 +449,7 @@ mod tests {
     /// "tgw" makes deps non-empty, the fallback is skipped, and "tgw_attach" is lost.
     #[test]
     fn test_dependency_bindings_merged_when_resourceref_partially_resolved() {
-        let mut resource = ManagedResource::new("ec2.route", "my-route");
+        let mut resource = Resource::new("ec2.route", "my-route");
         // After partial resolution: transit_gateway_id resolved to a ResourceRef
         // pointing at "tgw" (the transitive target), not "tgw_attach" (the direct dep)
         resource.set_attr(
@@ -508,7 +501,7 @@ mod tests {
         // A depends on B
         let a = make_resource("a", &["b"]);
         let b = make_resource("b", &[]);
-        let resources: Vec<&ManagedResource> = vec![&a, &b];
+        let resources: Vec<&Resource> = vec![&a, &b];
 
         let map = build_dependents_map(&resources);
 
@@ -670,7 +663,7 @@ mod tests {
         //
         // Test with multiple input orderings to ensure the result is correct
         // regardless of declaration order in the .crn file.
-        let orderings: Vec<Vec<ManagedResource>> = vec![
+        let orderings: Vec<Vec<Resource>> = vec![
             // Original .crn order
             vec![
                 vpc.clone(),
@@ -960,7 +953,7 @@ mod tests {
 
     #[test]
     fn directives_depends_on_is_unioned_into_resource_dependencies() {
-        let mut bucket = ManagedResource::new("s3.Bucket", "bucket");
+        let mut bucket = Resource::new("s3.Bucket", "bucket");
         bucket.directives.depends_on = vec!["role".to_string()];
 
         let deps = get_resource_dependencies(&bucket);
@@ -973,7 +966,7 @@ mod tests {
 
     #[test]
     fn directives_depends_on_unions_with_value_refs() {
-        let mut bucket = ManagedResource::new("s3.Bucket", "bucket");
+        let mut bucket = Resource::new("s3.Bucket", "bucket");
         bucket.set_attr(
             "encryption_key".to_string(),
             Value::resource_ref("key", "arn", vec![]),

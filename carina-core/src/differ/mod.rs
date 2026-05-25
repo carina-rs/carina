@@ -8,7 +8,7 @@ mod plan;
 
 use std::collections::HashMap;
 
-use crate::resource::{ManagedResource, ResourceId, State, Value};
+use crate::resource::{Resource, ResourceId, State, Value};
 use crate::schema::ResourceSchema;
 
 pub use plan::{cascade_dependent_updates, create_plan};
@@ -34,18 +34,18 @@ pub(crate) use comparison::type_aware_equal;
 /// Result of a diff operation
 #[derive(Debug, Clone, PartialEq)]
 pub enum Diff {
-    /// ManagedResource does not exist -> needs creation
-    Create(ManagedResource),
-    /// ManagedResource exists with differences -> needs update
+    /// Resource does not exist -> needs creation
+    Create(Resource),
+    /// Resource exists with differences -> needs update
     Update {
         id: ResourceId,
         from: Box<State>,
-        to: ManagedResource,
+        to: Resource,
         changed_attributes: Vec<String>,
     },
-    /// ManagedResource exists with no differences -> no action needed
+    /// Resource exists with no differences -> no action needed
     NoChange(ResourceId),
-    /// ManagedResource exists but not in desired state -> needs deletion
+    /// Resource exists but not in desired state -> needs deletion
     Delete(ResourceId),
 }
 
@@ -67,7 +67,7 @@ impl Diff {
 /// If `schema` is provided, type-aware comparison is used (e.g., Int/Float coercion,
 /// case-insensitive enum matching).
 pub fn diff(
-    desired: &ManagedResource,
+    desired: &Resource,
     current: &State,
     saved: Option<&HashMap<String, Value>>,
     prev_explicit: Option<&crate::explicit::ExplicitFields>,

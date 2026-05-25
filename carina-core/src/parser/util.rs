@@ -166,7 +166,7 @@ pub(crate) fn extract_string_from_pair(
 
 /// True if a parsed expression is exactly a plain (uninterpolated)
 /// quoted string literal — no operators, no interpolation, no
-/// list / map wrapping. Used to populate `ManagedResource.quoted_string_attrs`
+/// list / map wrapping. Used to populate `Resource.quoted_string_attrs`
 /// so enum-attribute diagnostics can distinguish a shape mismatch
 /// (`attr = "AWS_ACCOUNT"`) from a variant mismatch
 /// (`attr = AWS_ACCOUNT`); see #2094 / #2229.

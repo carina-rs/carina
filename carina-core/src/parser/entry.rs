@@ -27,7 +27,7 @@ use super::resolve::{
     resolve_resource_refs,
 };
 use crate::eval_value::EvalValue;
-use crate::resource::{DataSource, DeferredValue, ManagedResource, Value};
+use crate::resource::{DataSource, DeferredValue, Resource, Value};
 use indexmap::IndexMap;
 use pest::Parser;
 
@@ -53,7 +53,7 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
 /// Each name in `seeds` is registered in the per-file [`ParseContext`]
 /// the same way `register_argument_binding` does: a placeholder
 /// `Value::Deferred(DeferredValue::ResourceRef{ binding: <name>, attribute: "", … })` is
-/// installed in `ctx.variables`, and a placeholder `ManagedResource` is
+/// installed in `ctx.variables`, and a placeholder `Resource` is
 /// installed in `ctx.resource_bindings`. This means subsequent
 /// expressions resolve the name via the normal `ctx.get_variable` /
 /// `ctx.is_resource_binding` paths instead of degrading to the literal-
@@ -290,12 +290,11 @@ pub fn parse_with_seeded_bindings(
                                     if !is_discard {
                                         // Register the binding name so `name.attr`
                                         // resolves as a `ResourceRef`. Data sources
-                                        // are a distinct type from `ManagedResource`,
+                                        // are a distinct type from `Resource`,
                                         // so a placeholder managed binding stands in
                                         // for resolution purposes — same shape as the
                                         // `_module_binding` / `_wait` placeholders.
-                                        let placeholder =
-                                            ManagedResource::new("_data_source", &name);
+                                        let placeholder = Resource::new("_data_source", &name);
                                         ctx.set_resource_binding(name.clone(), placeholder);
                                     }
                                     data_sources.extend(expanded_data_sources);
@@ -310,14 +309,12 @@ pub fn parse_with_seeded_bindings(
                                     if !is_discard {
                                         // Register as a resource binding so that
                                         // `name.attr` resolves as ResourceRef
-                                        let placeholder =
-                                            ManagedResource::new("_module_binding", &name);
+                                        let placeholder = Resource::new("_module_binding", &name);
                                         ctx.set_resource_binding(name.clone(), placeholder);
                                     }
                                 }
                                 if is_upstream_state && !is_discard {
-                                    let placeholder =
-                                        ManagedResource::new("_upstream_state", &name);
+                                    let placeholder = Resource::new("_upstream_state", &name);
                                     ctx.set_resource_binding(name.clone(), placeholder);
                                     upstream_states.push(ctx.upstream_states[&name].clone());
                                 }
@@ -327,7 +324,7 @@ pub fn parse_with_seeded_bindings(
                                     // `<wait-binding>.<attr>` parses as `ResourceRef`.
                                     // Downstream resolution (Phase 4 of #2825) treats
                                     // it as passthrough of the target's snapshot.
-                                    let placeholder = ManagedResource::new("_wait", &name);
+                                    let placeholder = Resource::new("_wait", &name);
                                     ctx.set_resource_binding(name.clone(), placeholder);
                                     wait_bindings.push(ctx.wait_bindings[&name].clone());
                                 }
@@ -447,7 +444,7 @@ fn seed_bindings(ctx: &mut ParseContext<'_>, seeds: &[&str]) {
             binding: name.to_string(),
         });
         ctx.set_variable(name.to_string(), placeholder_ref);
-        let placeholder = ManagedResource::new("_seeded", name);
+        let placeholder = Resource::new("_seeded", name);
         ctx.set_resource_binding(name.to_string(), placeholder);
         ctx.seeded_bindings.insert(name.to_string());
     }

@@ -8,7 +8,7 @@ use crate::identifier::generate_random_suffix;
 use crate::parser::WaitBinding;
 use crate::plan::{Plan, PlanError};
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, Directives, ManagedResource, ResourceId, State, Value,
+    ConcreteValue, DataSource, DeferredValue, Directives, Resource, ResourceId, State, Value,
 };
 use crate::schema::{
     ResourceSchema, SchemaKind, SchemaRegistry, WAIT_DEFAULT_INTERVAL, WAIT_DEFAULT_TIMEOUT,
@@ -51,7 +51,7 @@ fn find_changed_create_only(
 fn filter_non_removable_removals(
     provider: &str,
     resource_type: &str,
-    to: &ManagedResource,
+    to: &Resource,
     changed_attributes: Vec<String>,
     registry: &SchemaRegistry,
 ) -> Vec<String> {
@@ -85,7 +85,7 @@ fn filter_non_removable_removals(
 /// the resource already uses name_prefix for that attribute, or
 /// the name_attribute value changed between `from` and `to`).
 fn generate_temporary_name(
-    resource: &ManagedResource,
+    resource: &Resource,
     from: &State,
     schema: &ResourceSchema,
 ) -> Option<TemporaryName> {
@@ -130,7 +130,7 @@ fn generate_temporary_name(
 ///
 /// The `directives_map` provides Carina-side directives for orphaned
 /// resources (resources in state but not in desired). For desired
-/// resources, the directives are read directly from the `ManagedResource`
+/// resources, the directives are read directly from the `Resource`
 /// struct.
 ///
 /// The `saved_attrs` map provides the last-known attribute values from the state file.
@@ -171,7 +171,7 @@ fn generate_temporary_name(
 /// ```
 #[allow(clippy::too_many_arguments)]
 pub fn create_plan(
-    managed: &[ManagedResource],
+    managed: &[Resource],
     data_sources: &[DataSource],
     current_states: &HashMap<ResourceId, State>,
     directives_map: &HashMap<ResourceId, Directives>,
@@ -370,7 +370,7 @@ pub fn create_plan(
             let dependencies = if let Some(dep_bindings) = orphan_dependencies.get(id) {
                 dep_bindings.iter().cloned().collect()
             } else {
-                let temp_resource = ManagedResource {
+                let temp_resource = Resource {
                     id: id.clone(),
                     // `state.attributes` is `HashMap` — no source order
                     // survives round-tripping through the provider. The
@@ -551,14 +551,14 @@ pub fn create_plan(
 /// `registry` provides attribute metadata to detect create-only attributes.
 pub fn cascade_dependent_updates(
     plan: &mut Plan,
-    unresolved_managed: &[ManagedResource],
+    unresolved_managed: &[Resource],
     current_states: &HashMap<ResourceId, State>,
     registry: &SchemaRegistry,
 ) {
     // Build binding/key -> unresolved resource mapping.
     // Uses the same key logic as the dependent lookup below so anonymous resources
     // (without _binding) are also found.
-    let mut binding_to_unresolved: HashMap<String, &ManagedResource> = HashMap::new();
+    let mut binding_to_unresolved: HashMap<String, &Resource> = HashMap::new();
     for resource in unresolved_managed {
         let key = resource
             .binding
