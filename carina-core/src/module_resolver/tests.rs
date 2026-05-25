@@ -20,7 +20,7 @@ fn create_test_module() -> ParsedFile {
     ParsedFile {
         providers: vec![],
         data_sources: vec![],
-        virtual_resources: vec![],
+        compositions: vec![],
         resources: vec![Resource {
             id: ResourceId::new("security_group", "sg"),
             attributes: {
@@ -137,7 +137,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
     ParsedFile {
         providers: vec![],
         data_sources: vec![],
-        virtual_resources: vec![],
+        compositions: vec![],
         resources: vec![Resource {
             id: ResourceId::with_provider("awscc", "iam.RolePolicy", "", None),
             attributes: {
@@ -279,7 +279,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
     ParsedFile {
         providers: vec![],
         data_sources: vec![],
-        virtual_resources: vec![],
+        compositions: vec![],
         resources: vec![Resource {
             id: ResourceId::with_provider("aws", "acm.Certificate", "cert", Some("us".to_string())),
             attributes: {
@@ -422,7 +422,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
     ParsedFile {
         providers: vec![],
         data_sources: vec![],
-        virtual_resources: vec![],
+        compositions: vec![],
         resources: vec![
             Resource {
                 id: ResourceId::new("ec2.Vpc", "main_vpc"),
@@ -582,7 +582,7 @@ fn create_module_with_attributes() -> ParsedFile {
     ParsedFile {
         providers: vec![],
         data_sources: vec![],
-        virtual_resources: vec![],
+        compositions: vec![],
         resources: vec![Resource {
             id: ResourceId::new("security_group", "sg"),
             attributes: {
@@ -631,7 +631,7 @@ fn create_module_with_attributes() -> ParsedFile {
 }
 
 #[test]
-fn test_expand_module_call_creates_virtual_resource() {
+fn test_expand_module_call_creates_composition() {
     let resolver = {
         let mut r = ModuleResolver::new(".");
         r.imported_modules
@@ -648,20 +648,20 @@ fn test_expand_module_call_creates_virtual_resource() {
     let expanded = resolver.expand_module_call(&call, "web", None).unwrap();
     // carina#3181 PR C: `resources` is managed-only — 1 real resource.
     assert_eq!(expanded.resources.len(), 1);
-    // The virtual resource lives in the typed `virtual_resources` slice.
-    assert_eq!(expanded.virtual_resources.len(), 1);
-    let virtual_res = &expanded.virtual_resources[0];
+    // The composition resource lives in the typed `compositions` slice.
+    assert_eq!(expanded.compositions.len(), 1);
+    let composition_res = &expanded.compositions[0];
 
-    assert_eq!(virtual_res.binding, Some("web".to_string()));
+    assert_eq!(composition_res.binding, Some("web".to_string()));
     // Module info lives in the flattened module_name / instance fields.
-    assert_eq!(virtual_res.module_name, "web_tier");
-    assert_eq!(virtual_res.instance, "web");
-    assert!(!virtual_res.attributes.contains_key("_module"));
-    assert!(!virtual_res.attributes.contains_key("_module_instance"));
+    assert_eq!(composition_res.module_name, "web_tier");
+    assert_eq!(composition_res.instance, "web");
+    assert!(!composition_res.attributes.contains_key("_module"));
+    assert!(!composition_res.attributes.contains_key("_module_instance"));
     // The security_group attribute should be a rewritten ResourceRef
     // pointing to the dot-path binding (web.sg)
     assert_eq!(
-        virtual_res.attributes.get("security_group"),
+        composition_res.attributes.get("security_group"),
         Some(&Value::resource_ref(
             "web.sg".to_string(),
             "id".to_string(),
@@ -672,10 +672,10 @@ fn test_expand_module_call_creates_virtual_resource() {
 
 /// carina#3181 PR C: module-call expansion partitions the expanded
 /// resources into the managed-only `resources` Vec and the typed
-/// `virtual_resources` / `data_sources` slices — each resource lands in
+/// `compositions` / `data_sources` slices — each resource lands in
 /// exactly one slice.
 #[test]
-fn test_expand_module_call_populates_virtual_resources_slice() {
+fn test_expand_module_call_populates_compositions_slice() {
     let resolver = {
         let mut r = ModuleResolver::new(".");
         r.imported_modules
@@ -691,17 +691,14 @@ fn test_expand_module_call_populates_virtual_resources_slice() {
 
     let expanded = resolver.expand_module_call(&call, "web", None).unwrap();
 
-    // `resources` is managed-only — the synthetic virtual is NOT here.
+    // `resources` is managed-only — the synthetic composition is NOT here.
     assert_eq!(expanded.resources.len(), 1);
 
-    // The virtual resource lives only in the typed slice.
-    assert_eq!(expanded.virtual_resources.len(), 1);
-    assert_eq!(
-        expanded.virtual_resources[0].binding,
-        Some("web".to_string())
-    );
-    assert_eq!(expanded.virtual_resources[0].module_name, "web_tier");
-    assert_eq!(expanded.virtual_resources[0].instance, "web");
+    // The composition resource lives only in the typed slice.
+    assert_eq!(expanded.compositions.len(), 1);
+    assert_eq!(expanded.compositions[0].binding, Some("web".to_string()));
+    assert_eq!(expanded.compositions[0].module_name, "web_tier");
+    assert_eq!(expanded.compositions[0].instance, "web");
 
     // This module declares no data sources.
     assert!(expanded.data_sources.is_empty());
@@ -726,8 +723,8 @@ fn test_expand_module_call_without_binding_no_virtual() {
     let expanded = resolver
         .expand_module_call(&call, "web_tier", None)
         .unwrap();
-    // No `binding_name` ⇒ no synthetic virtual resource is created.
-    assert!(expanded.virtual_resources.is_empty());
+    // No `binding_name` ⇒ no synthetic composition resource is created.
+    assert!(expanded.compositions.is_empty());
 }
 
 /// Regression fixtures for #2197. Writes a minimal `modules/thing` module
@@ -1397,7 +1394,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
 }
 
 #[test]
-fn test_module_virtual_resource_dot_path_refs() {
+fn test_module_composition_dot_path_refs() {
     let resolver = {
         let mut r = ModuleResolver::new(".");
         r.imported_modules
@@ -1413,15 +1410,15 @@ fn test_module_virtual_resource_dot_path_refs() {
 
     let expanded = resolver.expand_module_call(&call, "web", None).unwrap();
 
-    // carina#3181 PR C: the virtual resource lives in the typed slice.
-    let virtual_res = expanded
-        .virtual_resources
+    // carina#3181 PR C: the composition resource lives in the typed slice.
+    let composition_res = expanded
+        .compositions
         .first()
         .expect("Virtual resource should exist");
 
     // The security_group attribute should reference dot-notation binding
     assert_eq!(
-        virtual_res.attributes.get("security_group"),
+        composition_res.attributes.get("security_group"),
         Some(&Value::resource_ref(
             "web.sg".to_string(),
             "id".to_string(),
@@ -1537,7 +1534,7 @@ fn create_module_with_interpolation() -> ParsedFile {
     ParsedFile {
         providers: vec![],
         data_sources: vec![],
-        virtual_resources: vec![],
+        compositions: vec![],
         resources: vec![Resource {
             id: ResourceId::new("ec2.Vpc", "vpc"),
             attributes: {
@@ -1702,7 +1699,7 @@ fn test_nested_module_two_level() {
 #[test]
 fn test_nested_module_intra_ref_to_module_call_is_prefixed() {
     // carina#3243 regression: `outer_module` declares
-    //   let net = inner { ... }          (module call → virtual resource)
+    //   let net = inner { ... }          (module call → composition resource)
     //   let sg  = ... { vpc_id = net.vpc_id }
     // When the *outer* module is itself expanded (root.crn calls
     // `outer` with binding `web`), the `net.vpc_id` reference inside
@@ -1948,7 +1945,7 @@ fn create_module_with_port_validation() -> ParsedFile {
     ParsedFile {
         providers: vec![],
         data_sources: vec![],
-        virtual_resources: vec![],
+        compositions: vec![],
         resources: vec![],
         variables: IndexMap::new(),
         uses: vec![],
@@ -2133,7 +2130,7 @@ fn test_argument_validation_no_message_uses_default() {
     let module = ParsedFile {
         providers: vec![],
         data_sources: vec![],
-        virtual_resources: vec![],
+        compositions: vec![],
         resources: vec![],
         variables: IndexMap::new(),
         uses: vec![],
@@ -2198,7 +2195,7 @@ fn test_argument_validation_len_with_list() {
     let module = ParsedFile {
         providers: vec![],
         data_sources: vec![],
-        virtual_resources: vec![],
+        compositions: vec![],
         resources: vec![],
         variables: IndexMap::new(),
         uses: vec![],
@@ -2285,7 +2282,7 @@ fn test_require_block_passes() {
     let module = ParsedFile {
         providers: vec![],
         data_sources: vec![],
-        virtual_resources: vec![],
+        compositions: vec![],
         resources: vec![],
         variables: IndexMap::new(),
         uses: vec![],
@@ -2368,7 +2365,7 @@ fn test_require_block_fails_with_not_expr() {
     let module = ParsedFile {
         providers: vec![],
         data_sources: vec![],
-        virtual_resources: vec![],
+        compositions: vec![],
         resources: vec![],
         variables: IndexMap::new(),
         uses: vec![],
@@ -2450,7 +2447,7 @@ fn test_require_block_len_function() {
     let module = ParsedFile {
         providers: vec![],
         data_sources: vec![],
-        virtual_resources: vec![],
+        compositions: vec![],
         resources: vec![],
         variables: IndexMap::new(),
         uses: vec![],
@@ -2541,7 +2538,7 @@ fn test_require_block_multiple_constraints() {
     let module = ParsedFile {
         providers: vec![],
         data_sources: vec![],
-        virtual_resources: vec![],
+        compositions: vec![],
         resources: vec![],
         variables: IndexMap::new(),
         uses: vec![],
@@ -3847,7 +3844,7 @@ fn create_module_with_environment_union() -> ParsedFile {
     ParsedFile {
         providers: vec![],
         data_sources: vec![],
-        virtual_resources: vec![],
+        compositions: vec![],
         resources: vec![],
         variables: IndexMap::new(),
         uses: vec![],

@@ -340,7 +340,7 @@ fn plan_file_serde_round_trip() {
         plan,
         sorted_resources,
         current_states,
-        virtual_resources: vec![],
+        compositions: vec![],
         data_sources: vec![],
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
@@ -730,7 +730,7 @@ fn test_find_state_bucket_resource_matching_type() {
             ),
         ],
         data_sources: vec![],
-        virtual_resources: vec![],
+        compositions: vec![],
         variables: IndexMap::new(),
         uses: vec![],
         module_calls: vec![],
@@ -1442,7 +1442,7 @@ async fn lock_released_on_write_state_failure() {
         schemas: &SchemaRegistry::new(),
         export_params: Some(&[]),
         wait_aliases: &[],
-        pre_resolve_virtuals: &[],
+        pre_resolve_compositions: &[],
     })
     .await;
 
@@ -1578,7 +1578,7 @@ async fn finalize_apply_uses_write_state_locked() {
         schemas: &SchemaRegistry::new(),
         export_params: Some(&[]),
         wait_aliases: &[],
-        pre_resolve_virtuals: &[],
+        pre_resolve_compositions: &[],
     })
     .await;
 
@@ -2172,7 +2172,7 @@ async fn finalize_apply_without_lock_uses_write_state() {
         schemas: &SchemaRegistry::new(),
         export_params: Some(&[]),
         wait_aliases: &[],
-        pre_resolve_virtuals: &[],
+        pre_resolve_compositions: &[],
     })
     .await;
 
@@ -2758,7 +2758,7 @@ fn plan_file_serialization_redacts_secrets() {
         backend_config: None,
         plan: redact_secrets_in_plan(&plan).unwrap(),
         sorted_resources: vec![redact_secrets_in_resource(&resource_with_secret).unwrap()],
-        virtual_resources: vec![],
+        compositions: vec![],
         data_sources: vec![],
         current_states: vec![CurrentStateEntry {
             id: ResourceId::with_provider("awscc", "rds.db_instance", "my-db", None),
@@ -2973,7 +2973,7 @@ async fn finalize_apply_clears_state_exports_when_params_empty() {
         schemas: &SchemaRegistry::new(),
         export_params: Some(&[]),
         wait_aliases: &[],
-        pre_resolve_virtuals: &[],
+        pre_resolve_compositions: &[],
     })
     .await;
 
@@ -3031,7 +3031,7 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
         schemas: &SchemaRegistry::new(),
         export_params: None,
         wait_aliases: &[],
-        pre_resolve_virtuals: &[],
+        pre_resolve_compositions: &[],
     })
     .await;
 

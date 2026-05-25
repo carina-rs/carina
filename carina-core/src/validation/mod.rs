@@ -41,25 +41,25 @@ pub fn validate_resources<E>(
 
     // Classify per kind via the typed `ResourceRef` arms instead of
     // runtime `is_virtual()` / `is_data_source()` calls (carina#3180 /
-    // #3181). Virtuals are post-apply attribute containers and have no
+    // #3181). compositions are post-apply attribute containers and have no
     // schema to validate against, so they are silently filtered. Managed
     // and data sources route to the same schema-lookup body but render
     // different kind-mismatch diagnostics when the registry entry of the
     // *opposite* kind exists.
     enum ValidatableKind {
-        Managed,
+        Resource,
         DataSource,
     }
     for rref in parsed.iter_all_resources() {
         // A deferred for-expression template body is always managed —
-        // `for` bodies never carry `read` / virtual.
+        // `for` bodies never carry `read` / composition.
         let (kind, schema) = match rref {
-            ResourceRef::Virtual(_) => continue,
+            ResourceRef::Composition(_) => continue,
             ResourceRef::DataSource(d) => {
                 (ValidatableKind::DataSource, registry.get_for_data_source(d))
             }
-            ResourceRef::Managed(m) | ResourceRef::Deferred { resource: m, .. } => {
-                (ValidatableKind::Managed, registry.get_for(m))
+            ResourceRef::Resource(m) | ResourceRef::Deferred { resource: m, .. } => {
+                (ValidatableKind::Resource, registry.get_for(m))
             }
         };
         let id = rref.id();
@@ -103,7 +103,7 @@ pub fn validate_resources<E>(
                             kind_label, kind_label
                         ));
                     }
-                    ValidatableKind::Managed if has_data_source => {
+                    ValidatableKind::Resource if has_data_source => {
                         // No `read` against a data-source-only type
                         all_errors.push(format!(
                             "{} is a data source and must be used with the `read` keyword:\n  let <name> = read {} {{ }}",
@@ -144,9 +144,9 @@ pub fn validate_resource_ref_types<E>(
     for rref in parsed.iter_all_resources() {
         // A deferred for-expression template body is always managed.
         let schema = match rref {
-            ResourceRef::Virtual(_) => continue,
+            ResourceRef::Composition(_) => continue,
             ResourceRef::DataSource(d) => registry.get_for_data_source(d),
-            ResourceRef::Managed(m) | ResourceRef::Deferred { resource: m, .. } => {
+            ResourceRef::Resource(m) | ResourceRef::Deferred { resource: m, .. } => {
                 registry.get_for(m)
             }
         };
@@ -986,7 +986,7 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
             collect_resource_refs(value, &mut referenced);
             collect_dot_notation_refs(value, &mut referenced);
         }
-        // `VirtualResource` has no directives — `directives()` is `None`
+        // `Composition` has no directives — `directives()` is `None`
         // for that arm, so the depends_on walk is simply skipped.
         for dep in rref.directives().into_iter().flat_map(|d| &d.depends_on) {
             referenced.insert(dep.clone());

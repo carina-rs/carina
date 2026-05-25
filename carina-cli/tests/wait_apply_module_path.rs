@@ -279,10 +279,10 @@ fn apply_path_propagates_module_wait_binding() {
 
     // --- Diagnostic: the suspected real bug is that the Distribution's
     // `r.cert_issued.certificate_arn` resolves against AccessPath
-    // binding `r` (the virtual module proxy, which also exposes
+    // binding `r` (the composition module proxy, which also exposes
     // `certificate_arn` via the module's `attributes` block) instead
     // of `r.cert_issued` (the wait binding). Dump the actual
-    // AccessPath and whether a virtual `r` shadows it.
+    // AccessPath and whether a composition `r` shadows it.
     use carina_core::resource::{ConcreteValue, DeferredValue, Value};
     fn find_ref<'a>(v: &'a Value, acc: &mut Vec<&'a carina_core::resource::AccessPath>) {
         match v {
@@ -308,18 +308,18 @@ fn apply_path_propagates_module_wait_binding() {
             )
         })
         .collect();
-    let virtual_r = parsed
-        .virtual_resources
+    let composition_r = parsed
+        .compositions
         .iter()
         .any(|r| r.binding.as_deref() == Some("r"));
     // This assertion encodes the hypothesis. If it FAILS showing
     // binding="r", we've found the apply-path root cause: the nested
-    // ref binds to the virtual module proxy, not the wait binding.
+    // ref binds to the composition module proxy, not the wait binding.
     assert!(
         refs.iter().any(|p| p.binding() == "r.cert_issued"),
         "Distribution's distribution_config ref must bind to the wait \
-         binding `r.cert_issued`, NOT the virtual module proxy `r`. \
-         Found refs: {paths:?}. Virtual `r` present: {virtual_r}"
+         binding `r.cert_issued`, NOT the composition module proxy `r`. \
+         Found refs: {paths:?}. Composition `r` present: {composition_r}"
     );
 }
 
@@ -384,7 +384,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
         carina_core::binding_index::PreApplyInputs {
             managed: &resources_for_plan.clone(),
-            virtuals: &parsed.virtual_resources,
+            compositions: &parsed.compositions,
             data_sources: &[],
             current_states: &current_states,
             remote_bindings: &remote_bindings,
@@ -438,7 +438,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &unresolved_resources,
-        virtual_resources: &parsed.virtual_resources,
+        compositions: &parsed.compositions,
         bindings: ResolvedBindings::default(),
         current_states,
         normalizer: &NoopNormalizer,

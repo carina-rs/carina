@@ -35,15 +35,13 @@ pub fn get_resource_dependencies(resource: &Resource) -> HashSet<String> {
     deps
 }
 
-/// Dependency-binding collection for a [`VirtualResource`](crate::resource::VirtualResource).
+/// Dependency-binding collection for a [`Composition`](crate::resource::Composition).
 ///
-/// `VirtualResource` has no `directives` field — synthetic IR nodes
+/// `Composition` has no `directives` field — synthetic IR nodes
 /// never carry `depends_on`. The collection therefore reduces to
 /// "attributes' ResourceRefs ∪ `dependency_bindings`", which is the
 /// same first-two-thirds of [`get_resource_dependencies`].
-pub fn get_virtual_resource_dependencies(
-    virt: &crate::resource::VirtualResource,
-) -> HashSet<String> {
+pub fn get_composition_dependencies(virt: &crate::resource::Composition) -> HashSet<String> {
     let mut deps = HashSet::new();
     for value in virt.attributes.values() {
         collect_dependencies(value, &mut deps);
@@ -396,12 +394,12 @@ mod tests {
     }
 
     #[test]
-    fn test_get_virtual_resource_dependencies_collects_attrs_and_deps() {
-        use crate::resource::VirtualResource;
+    fn test_get_composition_dependencies_collects_attrs_and_deps() {
+        use crate::resource::Composition;
         use indexmap::IndexMap;
         use std::collections::BTreeSet;
 
-        // Build a virtual whose attributes carry a ResourceRef and
+        // Build a composition whose attributes carry a ResourceRef and
         // whose `dependency_bindings` carries a separate entry.
         // Both must end up in the merged set.
         let mut attributes = IndexMap::new();
@@ -411,7 +409,7 @@ mod tests {
         );
         let mut dep_bindings = BTreeSet::new();
         dep_bindings.insert("explicit_dep".to_string());
-        let virt = VirtualResource {
+        let virt = Composition {
             id: ResourceId::new("_virtual.module", "v"),
             attributes,
             binding: Some("v".to_string()),
@@ -421,7 +419,7 @@ mod tests {
             quoted_string_attrs: Default::default(),
         };
 
-        let deps = get_virtual_resource_dependencies(&virt);
+        let deps = get_composition_dependencies(&virt);
         assert!(
             deps.contains("role"),
             "expected attribute ResourceRef binding `role`, got {deps:?}",

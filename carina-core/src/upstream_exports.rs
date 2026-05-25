@@ -299,7 +299,7 @@ fn resource_attr_location(rref: ResourceRef<'_>, attr_name: &str) -> String {
     }
 }
 
-/// Walk every resource attribute in the project (managed, virtual, data
+/// Walk every resource attribute in the project (managed, composition, data
 /// source, and deferred-for templates), yielding
 /// `(ResourceRef, attr_name, &Value)` for each non-internal attribute
 /// (skips `_*` keys). Used by all upstream-ref checks; centralized so the
@@ -539,9 +539,9 @@ pub fn check_upstream_state_field_types<E>(
     for_each_resource_attr(parsed, |rref, attr_name, value| {
         // A deferred for-expression template body is always managed.
         let schema = match rref {
-            ResourceRef::Virtual(_) => return,
+            ResourceRef::Composition(_) => return,
             ResourceRef::DataSource(d) => registry.get_for_data_source(d),
-            ResourceRef::Managed(m) | ResourceRef::Deferred { resource: m, .. } => {
+            ResourceRef::Resource(m) | ResourceRef::Deferred { resource: m, .. } => {
                 registry.get_for(m)
             }
         };

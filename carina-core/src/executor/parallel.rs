@@ -23,7 +23,7 @@ use super::{ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, 
 pub(super) fn build_dependency_map(
     effects: &[Effect],
     unresolved_resources: &HashMap<ResourceId, Resource>,
-    virtual_resources: &[crate::resource::VirtualResource],
+    compositions: &[crate::resource::Composition],
 ) -> HashMap<usize, HashSet<usize>> {
     // Build binding -> effect index mapping
     let mut binding_to_idx: HashMap<String, usize> = HashMap::new();
@@ -44,7 +44,7 @@ pub(super) fn build_dependency_map(
         }
     }
 
-    let resolver = DepResolver::new(&binding_to_idx, virtual_resources, None);
+    let resolver = DepResolver::new(&binding_to_idx, compositions, None);
 
     let mut deps_of: HashMap<usize, HashSet<usize>> = HashMap::new();
     for (idx, effect) in effects.iter().enumerate() {
@@ -132,9 +132,9 @@ pub(super) fn build_dependency_map(
 pub(super) fn build_dependency_levels(
     effects: &[Effect],
     unresolved_resources: &HashMap<ResourceId, Resource>,
-    virtual_resources: &[crate::resource::VirtualResource],
+    compositions: &[crate::resource::Composition],
 ) -> Vec<Vec<usize>> {
-    let deps_of = build_dependency_map(effects, unresolved_resources, virtual_resources);
+    let deps_of = build_dependency_map(effects, unresolved_resources, compositions);
 
     // Assign levels: each effect's level is max(deps' levels) + 1, or 0 if no deps
     let mut levels: HashMap<usize, usize> = HashMap::new();
@@ -203,8 +203,7 @@ pub(super) async fn execute_effects_sequential(
     let total = count_actionable_effects(effects);
     let completed = AtomicUsize::new(0);
 
-    let deps_of =
-        build_dependency_map(effects, input.unresolved_resources, input.virtual_resources);
+    let deps_of = build_dependency_map(effects, input.unresolved_resources, input.compositions);
 
     // Build effect index -> binding name mapping for resolving dependency names
     let idx_to_binding: HashMap<usize, String> = effects
@@ -589,23 +588,23 @@ pub(super) async fn execute_effects_sequential(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::{Value, VirtualResource};
+    use crate::resource::{Composition, Value};
 
     /// Mirror of #2543's phased-executor test for the unphased dependency map:
-    /// virtual module-attribute proxies must be transparently followed to the
+    /// composition module-attribute proxies must be transparently followed to the
     /// underlying resources their attributes reference.
     #[test]
     fn build_dependency_map_follows_virtual_module_binding() {
         let mut role = Resource::with_provider("awscc", "iam.Role", "bootstrap.role", None);
         role.binding = Some("bootstrap.role".to_string());
 
-        // carina#3181: virtual resources are a distinct typestate.
+        // carina#3181: composition resources are a distinct typestate.
         let mut virt_attrs = indexmap::IndexMap::new();
         virt_attrs.insert(
             "role_name".to_string(),
             Value::resource_ref("bootstrap.role", "role_name", vec![]),
         );
-        let virt = VirtualResource {
+        let virt = Composition {
             id: ResourceId::with_provider("_virtual", "_virtual", "bootstrap", None),
             attributes: virt_attrs,
             binding: Some("bootstrap".to_string()),
@@ -634,7 +633,7 @@ mod tests {
 
         assert!(
             deps_of[&1].contains(&0),
-            "RolePolicy (idx 1) must depend on Role (idx 0) via the bootstrap virtual binding; got: {:?}",
+            "RolePolicy (idx 1) must depend on Role (idx 0) via the bootstrap composition binding; got: {:?}",
             deps_of[&1],
         );
     }

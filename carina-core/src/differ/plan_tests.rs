@@ -1175,8 +1175,8 @@ fn prevent_destroy_collects_multiple_errors() {
 
 // carina#3181: the former `virtual_resources_are_skipped_in_plan` test
 // is obsolete — `create_plan` now takes a `&[Resource]` /
-// `&[DataSource]` pair, so a `VirtualResource` cannot be passed into the
-// plan input at all. The "virtuals produce no effect" invariant is now
+// `&[DataSource]` pair, so a `Composition` cannot be passed into the
+// plan input at all. The "compositions produce no effect" invariant is now
 // enforced by the type system rather than a runtime skip.
 
 #[test]

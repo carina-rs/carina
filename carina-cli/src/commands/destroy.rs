@@ -189,7 +189,7 @@ async fn run_destroy_locked(
         // Read states for managed resources concurrently using identifier
         // from state. carina#3181: `all_resources` is sourced from
         // `parsed.resources`, which is managed-only — data sources and
-        // virtual resources are not destroyed and never enter this list.
+        // composition resources are not destroyed and never enter this list.
         let resources: Vec<&Resource> = all_resources.iter().collect();
         let provider_ref = &provider;
         let results: Vec<Result<(ResourceId, State), AppError>> = stream::iter(&resources)
@@ -277,7 +277,7 @@ async fn run_destroy_locked(
         .iter()
         .filter(|r| {
             // carina#3181: `destroy_order` is managed-only — data
-            // sources and virtuals never enter the destroy set.
+            // sources and compositions never enter the destroy set.
             if !current_states.get(&r.id).map(|s| s.exists).unwrap_or(false) {
                 return false;
             }

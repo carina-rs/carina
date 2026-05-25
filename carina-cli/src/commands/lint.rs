@@ -60,13 +60,13 @@ pub fn run_lint(path: &Path, provider_context: &ProviderContext) -> Result<(), A
     let mut all_list_struct_attrs: HashSet<String> = HashSet::new();
     let mut block_name_suggestions: HashMap<String, String> = HashMap::new();
     // carina#3181: walk every top-level resource — managed and data
-    // source schemas can both carry List<Struct> attributes. Virtuals
+    // source schemas can both carry List<Struct> attributes. compositions
     // have no schema, so `get_for` returns `None` for them.
     for rref in parsed.iter_top_level_resources() {
         let schema = match rref {
-            carina_core::parser::ResourceRef::Managed(m) => schemas.get_for(m),
+            carina_core::parser::ResourceRef::Resource(m) => schemas.get_for(m),
             carina_core::parser::ResourceRef::DataSource(d) => schemas.get_for_data_source(d),
-            carina_core::parser::ResourceRef::Virtual(_) => None,
+            carina_core::parser::ResourceRef::Composition(_) => None,
             carina_core::parser::ResourceRef::Deferred { resource, .. } => {
                 schemas.get_for(resource)
             }

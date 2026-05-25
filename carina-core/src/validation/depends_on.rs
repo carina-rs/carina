@@ -74,7 +74,7 @@ impl DependsOnDiagnostic {
 
 /// The `directives.depends_on` list of a resource, or an empty slice.
 ///
-/// `VirtualResource` carries no directives — [`ResourceRef::directives`]
+/// `Composition` carries no directives — [`ResourceRef::directives`]
 /// is `None` for that arm, treated here as an empty `depends_on` list.
 fn depends_on_of<'a>(rref: ResourceRef<'a>) -> &'a [String] {
     rref.directives()
@@ -212,7 +212,7 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
     // carina#3181: only managed resources can participate in a cycle —
     // data sources are rejected as `depends_on` targets above (so they
     // can be sources but never the depended-on end of an edge), and
-    // virtual resources are post-apply synthetic nodes with no
+    // composition resources are post-apply synthetic nodes with no
     // directives. A cycle therefore lives entirely within the managed
     // slice.
     if let Err(msg) = sort_resources_by_dependencies(&parsed.resources) {

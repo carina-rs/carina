@@ -1790,10 +1790,10 @@ mod tests;
 #[cfg(test)]
 mod resource_like_tests;
 
+pub mod composition;
 pub mod data_source;
 pub mod resource_like;
-pub mod virtual_resource;
 
+pub use composition::Composition;
 pub use data_source::DataSource;
 pub use resource_like::ResourceLike;
-pub use virtual_resource::VirtualResource;

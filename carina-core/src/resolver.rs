@@ -9,8 +9,8 @@ use indexmap::IndexMap;
 
 use crate::binding_index::ResolvedBindings;
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, InterpolationPart, Resource, ResourceId, State,
-    Value, VirtualResource, contains_resource_ref, peel_secrets, rewrap_secrets,
+    Composition, ConcreteValue, DataSource, DeferredValue, InterpolationPart, Resource, ResourceId,
+    State, Value, contains_resource_ref, peel_secrets, rewrap_secrets,
 };
 
 /// Resolve all ResourceRef values in resources using current state.
@@ -32,7 +32,7 @@ pub fn resolve_refs_with_state(
     let bindings =
         crate::binding_index::ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
             managed: resources,
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[],
             current_states,
             remote_bindings: &HashMap::new(),
@@ -118,16 +118,16 @@ fn resolve_refs_inner(
 /// Pre-apply path: resolve `ResourceRef` values across a slice of
 /// `Resource`s.
 ///
-/// carina#3248: virtuals and data sources are first-class binding
+/// carina#3248: compositions and data sources are first-class binding
 /// sources on the pre-apply path. `bindings` must therefore include
 /// all kinds the configuration declares, via
 /// [`ResolvedBindings::pre_apply`]. A managed attribute referencing
-/// `<module_instance>.<attr>` (a virtual binding) chains through the
-/// virtual's attribute map to the managed sibling literal that backs
+/// `<module_instance>.<attr>` (a composition binding) chains through the
+/// composition's attribute map to the managed sibling literal that backs
 /// it. The earlier "wait / upstream-state passthrough" guidance for
 /// this shape (referring to cross-stack consumption) does not apply
 /// to same-stack module attribute references — those resolve through
-/// the in-process virtual binding directly.
+/// the in-process composition binding directly.
 pub fn resolve_managed_refs_with_state_and_remote(
     managed: &mut [Resource],
     bindings: &ResolvedBindings,
@@ -139,7 +139,7 @@ pub fn resolve_managed_refs_with_state_and_remote(
 /// a pre-built `ResolvedBindings` view (carina#3248).
 ///
 /// Data sources are read-only; their input attributes (`read aws.iam.user
-/// { user_name = some_let.name }`) reference managed resources, virtuals,
+/// { user_name = some_let.name }`) reference managed resources, compositions,
 /// or other data sources, so the binding map the caller passes must
 /// include all kinds via [`ResolvedBindings::pre_apply`]. Each data
 /// source's `dependency_bindings` is recorded before resolution
@@ -192,7 +192,7 @@ fn resolve_data_source_refs_inner(
 }
 
 /// Post-apply path: resolve `ResourceRef` values across a slice of
-/// `VirtualResource`s using a `ResolvedBindings` view that the caller
+/// `Composition`s using a `ResolvedBindings` view that the caller
 /// has already built against the post-apply state.
 ///
 /// Calling this against pre-apply state would re-introduce the
@@ -202,14 +202,14 @@ fn resolve_data_source_refs_inner(
 /// bindings view, not the raw state inputs) to make accidental
 /// pre-apply use harder to write.
 ///
-/// `dependency_bindings` is left untouched: virtual→managed edges are
+/// `dependency_bindings` is left untouched: composition→resource edges are
 /// already recorded during the pre-apply pass, and the post-apply
 /// resolution only needs to materialise the attribute values.
 pub fn resolve_virtual_refs_post_apply(
-    virtuals: &mut [VirtualResource],
+    compositions: &mut [Composition],
     bindings: &ResolvedBindings,
 ) -> Result<(), String> {
-    for v in virtuals.iter_mut() {
+    for v in compositions.iter_mut() {
         let mut resolved_attrs: IndexMap<String, Value> = IndexMap::new();
         for (key, value) in &v.attributes {
             resolved_attrs.insert(key.clone(), resolve_ref_value(value, bindings)?);
@@ -511,7 +511,7 @@ mod tests {
             .collect();
         ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
             managed: &resources,
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[],
             current_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
@@ -531,7 +531,7 @@ mod tests {
     ) -> Result<(), String> {
         let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
             managed: resources,
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[],
             current_states,
             remote_bindings,
@@ -550,7 +550,7 @@ mod tests {
     ) -> Result<(), String> {
         let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
             managed: resources,
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[],
             current_states,
             remote_bindings,
@@ -2236,7 +2236,7 @@ mod tests {
         );
         let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
             managed: &[cert],
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[],
             current_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
@@ -2265,7 +2265,7 @@ mod tests {
     fn resolve_ref_value_wait_binding_absent_target_left_intact() {
         let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
             managed: &[],
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[],
             current_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),

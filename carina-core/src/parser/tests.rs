@@ -73,7 +73,7 @@ fn iter_all_resources_yields_direct_then_deferred() {
     assert_eq!(items.len(), 2, "expected one direct + one deferred");
 
     // The direct managed resource comes first.
-    assert!(matches!(items[0], ResourceRef::Managed(_)));
+    assert!(matches!(items[0], ResourceRef::Resource(_)));
     assert!(matches!(items[0].context(), ResourceContext::Direct));
     assert_eq!(
         items[0].attributes().get("name"),
@@ -110,7 +110,7 @@ fn iter_all_resources_classifies_managed_and_data_source_arms() {
 
     let managed: Vec<_> = items
         .iter()
-        .filter(|r| matches!(r, ResourceRef::Managed(_)))
+        .filter(|r| matches!(r, ResourceRef::Resource(_)))
         .collect();
     let data_sources: Vec<_> = items
         .iter()
@@ -6635,9 +6635,9 @@ fn parse_partitions_managed_and_data_source_slices() {
         "sts.caller_identity"
     );
 
-    // The parser never synthesizes virtual resources — that is the
+    // The parser never synthesizes composition resources — that is the
     // module expander's job.
-    assert!(result.virtual_resources.is_empty());
+    assert!(result.compositions.is_empty());
 }
 
 #[test]

@@ -65,12 +65,12 @@ pub async fn execute_effects(
     bindings: &mut ResolvedBindings,
     current_states: &mut HashMap<ResourceId, State>,
     unresolved_resources: &HashMap<ResourceId, Resource>,
-    virtual_resources: &[carina_core::resource::VirtualResource],
+    compositions: &[carina_core::resource::Composition],
 ) -> ApplyResult {
     let input = ExecutionInput {
         plan,
         unresolved_resources,
-        virtual_resources,
+        compositions,
         bindings: std::mem::take(bindings),
         current_states: std::mem::take(current_states),
         normalizer,
@@ -307,7 +307,7 @@ pub(crate) async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), 
             params,
             input.sorted_resources,
             input.data_sources,
-            input.pre_resolve_virtuals,
+            input.pre_resolve_compositions,
             &post_apply_states,
             input.wait_aliases,
         )?;
@@ -368,7 +368,7 @@ pub(crate) async fn persist_exports_only(
     state_file: Option<StateFile>,
     sorted_resources: &[Resource],
     data_sources: &[carina_core::resource::DataSource],
-    pre_resolve_virtuals: &[carina_core::resource::VirtualResource],
+    pre_resolve_compositions: &[carina_core::resource::Composition],
     export_params: &[carina_core::parser::InferredExportParam],
     wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
     current_states: &HashMap<ResourceId, carina_core::resource::State>,
@@ -379,7 +379,7 @@ pub(crate) async fn persist_exports_only(
         export_params,
         sorted_resources,
         data_sources,
-        pre_resolve_virtuals,
+        pre_resolve_compositions,
         &post_apply_states,
         wait_aliases,
     )?;
@@ -864,7 +864,7 @@ async fn run_apply_locked(
 
     // Read states for all resources using identifier from state
     // In identifier-based approach, if there's no identifier in state, the resource doesn't exist
-    // Skip virtual resources (module attribute containers) — they have no infrastructure.
+    // Skip composition resources (module attribute containers) — they have no infrastructure.
     RefreshProgress::start_header();
     let multi = refresh_multi_progress();
     let provider_ref = &provider;
@@ -1008,7 +1008,7 @@ async fn run_apply_locked(
     // and refresh them via `read_data_source` (#1683, #1685).
     let resolved_data_sources = resolve_data_source_refs_for_refresh(
         &sorted_resources,
-        &parsed.virtual_resources,
+        &parsed.compositions,
         &data_sources,
         &current_states,
         &remote_bindings,
@@ -1100,28 +1100,28 @@ async fn run_apply_locked(
         ctx.schemas(),
     );
 
-    // Snapshot each virtual resource's *pre-resolve* attributes
+    // Snapshot each composition resource's *pre-resolve* attributes
     // (still carrying `ResourceRef`s) before the head-of-pipeline
     // resolver call below replaces them with pre-apply concrete
     // values. `finalize_apply`'s export resolution needs this
-    // snapshot to re-resolve virtuals against the post-apply state —
-    // see #3169 / #3177. Without it, every virtual ref is frozen at
+    // snapshot to re-resolve compositions against the post-apply state —
+    // see #3169 / #3177. Without it, every composition ref is frozen at
     // the pre-apply value and `state.exports` captures stale data
     // after any Replace on a referenced managed resource.
-    // carina#3181: virtual resources live in `parsed.virtual_resources`
+    // carina#3181: composition resources live in `parsed.compositions`
     // as their own typed slice.
-    let pre_resolve_virtuals: Vec<carina_core::resource::VirtualResource> =
-        parsed.virtual_resources.clone();
+    let pre_resolve_compositions: Vec<carina_core::resource::Composition> =
+        parsed.compositions.clone();
 
     // Build the unified pre-apply bindings view (carina#3248): every
-    // kind of binding the configuration declares (managed, virtual,
+    // kind of binding the configuration declares (managed, composition,
     // data source) is in the same view, so a managed attribute
     // referencing `<module_instance>.<attr>` chains through the
-    // virtual's attribute map to the managed sibling literal
+    // composition's attribute map to the managed sibling literal
     // (carina#3246).
     let mut bindings = ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
         managed: &sorted_resources,
-        virtuals: &pre_resolve_virtuals,
+        compositions: &pre_resolve_compositions,
         data_sources: &data_sources,
         current_states: &current_states,
         remote_bindings: &remote_bindings,
@@ -1212,7 +1212,7 @@ async fn run_apply_locked(
         let resolved_exports = crate::commands::plan::resolve_export_values_for_display(
             &parsed.export_params,
             &sorted_resources,
-            &parsed.virtual_resources,
+            &parsed.compositions,
             &parsed.data_sources,
             &current_states,
             &wait_aliases,
@@ -1257,20 +1257,20 @@ async fn run_apply_locked(
             )
             .cyan()
         );
-        // No-op apply path: virtuals were never resolved (no head-of-
-        // pipeline pass ran). carina#3181: virtuals live in
-        // `parsed.virtual_resources` and still carry the authored
+        // No-op apply path: compositions were never resolved (no head-of-
+        // pipeline pass ran). carina#3181: compositions live in
+        // `parsed.compositions` and still carry the authored
         // `ResourceRef` snapshots — the shape `resolve_exports` expects
         // from the post-apply path.
-        let pre_resolve_virtuals_noop: Vec<carina_core::resource::VirtualResource> =
-            parsed.virtual_resources.clone();
+        let pre_resolve_compositions_noop: Vec<carina_core::resource::Composition> =
+            parsed.compositions.clone();
         persist_exports_only(
             backend,
             lock,
             state_file,
             &sorted_resources,
             &data_sources,
-            &pre_resolve_virtuals_noop,
+            &pre_resolve_compositions_noop,
             &parsed.export_params,
             &wait_aliases,
             &current_states,
@@ -1302,7 +1302,7 @@ async fn run_apply_locked(
     let resolved_exports = crate::commands::plan::resolve_export_values_for_display(
         &parsed.export_params,
         &sorted_resources,
-        &parsed.virtual_resources,
+        &parsed.compositions,
         &parsed.data_sources,
         &current_states,
         &wait_aliases,
@@ -1354,7 +1354,7 @@ async fn run_apply_locked(
         &mut bindings,
         &mut current_states,
         &unresolved_resources,
-        &parsed.virtual_resources,
+        &parsed.compositions,
     )
     .await;
 
@@ -1381,7 +1381,7 @@ async fn run_apply_locked(
         schemas,
         export_params: Some(&parsed.export_params),
         wait_aliases: &wait_aliases,
-        pre_resolve_virtuals: &pre_resolve_virtuals,
+        pre_resolve_compositions: &pre_resolve_compositions,
     })
     .await?;
 
@@ -1421,10 +1421,10 @@ pub async fn run_apply_from_plan(
         serde_json::from_str(&content).map_err(|e| format!("Failed to parse plan file: {}", e))?;
 
     // Validate version compatibility. Plan-file version 4
-    // (carina#3248) persists `virtual_resources` so the saved-plan
+    // (carina#3248) persists `compositions` so the saved-plan
     // apply path can rebuild the same `ResolvedBindings` view as the
     // live-apply path (carina#3246). Older plans (version 3 and
-    // below) lack the `virtual_resources` field and cannot be applied
+    // below) lack the `compositions` field and cannot be applied
     // by the post-#3248 binding-construction path, so they are
     // rejected outright per the repo's no-backward-compat policy.
     if plan_file.version != 4 {
@@ -1673,18 +1673,18 @@ async fn run_apply_from_plan_locked(
         })
         .collect();
     // carina#3248: saved plans (version 4) persist both
-    // `virtual_resources` and `data_sources`, so the saved-plan apply
+    // `compositions` and `data_sources`, so the saved-plan apply
     // path builds the same unified pre-apply bindings view as the
-    // live-apply path. The view includes virtuals so a managed
+    // live-apply path. The view includes compositions so a managed
     // attribute referencing `<module_instance>.<attr>` chains through
     // to the managed sibling literal (carina#3246), and includes data
     // sources so a managed attribute referencing `<read_binding>.<attr>`
     // resolves through the data source's attribute map.
-    let plan_virtuals: &[carina_core::resource::VirtualResource] = &plan_file.virtual_resources;
+    let plan_compositions: &[carina_core::resource::Composition] = &plan_file.compositions;
     let plan_data_sources: &[carina_core::resource::DataSource] = &plan_file.data_sources;
     let mut bindings = ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
         managed: sorted_resources,
-        virtuals: plan_virtuals,
+        compositions: plan_compositions,
         data_sources: plan_data_sources,
         current_states: &current_states,
         remote_bindings: &upstream_snapshot,
@@ -1712,7 +1712,7 @@ async fn run_apply_from_plan_locked(
         &mut bindings,
         &mut current_states,
         &unresolved_resources,
-        plan_virtuals,
+        plan_compositions,
     )
     .await;
 
@@ -1747,8 +1747,8 @@ async fn run_apply_from_plan_locked(
         wait_aliases: &wait_aliases,
         // Same rationale as `export_params: None`: no export
         // resolution runs from the `apply --plan` path, so no
-        // pre-resolve virtual snapshot is needed.
-        pre_resolve_virtuals: &[],
+        // pre-resolve composition snapshot is needed.
+        pre_resolve_compositions: &[],
     })
     .await?;
 

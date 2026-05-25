@@ -346,14 +346,14 @@ impl DiagnosticEngine {
                 let resource_attributes = rref.attributes();
                 let resource_quoted_string_attrs = rref.quoted_string_attrs();
                 let resource_schema = || match rref {
-                    carina_core::parser::ResourceRef::Managed(m)
+                    carina_core::parser::ResourceRef::Resource(m)
                     | carina_core::parser::ResourceRef::Deferred { resource: m, .. } => {
                         self.schemas.get_for(m)
                     }
                     carina_core::parser::ResourceRef::DataSource(d) => {
                         self.schemas.get_for_data_source(d)
                     }
-                    carina_core::parser::ResourceRef::Virtual(_) => None,
+                    carina_core::parser::ResourceRef::Composition(_) => None,
                 };
                 let provider = &resource_id.provider;
                 let full_resource_type = format!("{}.{}", provider, resource_id.resource_type);

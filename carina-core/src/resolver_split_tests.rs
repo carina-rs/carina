@@ -2,7 +2,7 @@
 //!
 //! - `resolve_managed_refs_with_state_and_remote(&mut [Resource], ...)`
 //!   — pre-apply path, accepts only `Resource` slices.
-//! - `resolve_virtual_refs_post_apply(&mut [VirtualResource], &ResolvedBindings)`
+//! - `resolve_virtual_refs_post_apply(&mut [Composition], &ResolvedBindings)`
 //!   — post-apply path, takes a pre-built bindings view.
 //!
 //! Both are new entry points layered over the existing
@@ -19,7 +19,7 @@ use crate::resolver::{
     resolve_managed_refs_with_state_and_remote, resolve_virtual_refs_post_apply,
 };
 use crate::resource::{
-    AccessPath, ConcreteValue, DeferredValue, Resource, ResourceId, State, Value, VirtualResource,
+    AccessPath, Composition, ConcreteValue, DeferredValue, Resource, ResourceId, State, Value,
 };
 
 fn s(s: &str) -> Value {
@@ -49,12 +49,12 @@ fn make_managed(binding: &str, attrs: &[(&str, Value)]) -> Resource {
     }
 }
 
-fn make_virtual(binding: &str, attrs: &[(&str, Value)]) -> VirtualResource {
+fn make_virtual(binding: &str, attrs: &[(&str, Value)]) -> Composition {
     let mut attributes = IndexMap::new();
     for (k, v) in attrs {
         attributes.insert((*k).into(), v.clone());
     }
-    VirtualResource {
+    Composition {
         id: ResourceId::new("_virtual.module", binding),
         attributes,
         binding: Some(binding.into()),
@@ -75,7 +75,7 @@ fn resolve_managed_refs_resolves_resource_ref_against_managed_sibling() {
     {
         let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
             managed: &managed,
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[],
             current_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
@@ -99,7 +99,7 @@ fn resolve_managed_refs_records_dependency_bindings() {
     {
         let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
             managed: &managed,
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[],
             current_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
@@ -135,7 +135,7 @@ fn resolve_managed_refs_falls_through_state_attributes() {
     {
         let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
             managed: &managed,
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[],
             current_states: &current_states,
             remote_bindings: &HashMap::new(),
@@ -152,22 +152,22 @@ fn resolve_managed_refs_falls_through_state_attributes() {
 #[test]
 fn resolve_virtual_refs_post_apply_uses_provided_bindings() {
     // Bindings built externally (#3177's job at apply time). Verify
-    // that the post-apply entry resolves `VirtualResource` refs
+    // that the post-apply entry resolves `Composition` refs
     // against the supplied view.
     let referenced = make_managed("a", &[("value", s("post_apply_value"))]);
     let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
         managed: std::slice::from_ref(&referenced),
-        virtuals: &[],
+        compositions: &[],
         data_sources: &[],
         current_states: &HashMap::new(),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
 
-    let mut virtuals = vec![make_virtual("v", &[("forwarded", ref_to("a", "value"))])];
-    resolve_virtual_refs_post_apply(&mut virtuals, &bindings).expect("resolve virtuals");
+    let mut compositions = vec![make_virtual("v", &[("forwarded", ref_to("a", "value"))])];
+    resolve_virtual_refs_post_apply(&mut compositions, &bindings).expect("resolve compositions");
 
-    let forwarded = virtuals[0]
+    let forwarded = compositions[0]
         .attributes
         .get("forwarded")
         .expect("forwarded present");
@@ -176,7 +176,7 @@ fn resolve_virtual_refs_post_apply_uses_provided_bindings() {
 
 #[test]
 fn resolve_virtual_refs_post_apply_picks_post_apply_value_not_pre_apply() {
-    // #3169 root cause: a virtual that references a managed Role
+    // #3169 root cause: a composition that references a managed Role
     // gets the *pre-apply* ARN if resolution runs against the
     // pre-apply state, and the *post-apply* ARN if it runs against
     // the post-apply state. Verify the post-apply entry selects the
@@ -184,17 +184,18 @@ fn resolve_virtual_refs_post_apply_picks_post_apply_value_not_pre_apply() {
     let role = make_managed("role", &[("arn", s("post_apply_arn"))]);
     let post_apply_bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
         managed: std::slice::from_ref(&role),
-        virtuals: &[],
+        compositions: &[],
         data_sources: &[],
         current_states: &HashMap::new(),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
 
-    let mut virtuals = vec![make_virtual("rd", &[("role_arn", ref_to("role", "arn"))])];
-    resolve_virtual_refs_post_apply(&mut virtuals, &post_apply_bindings).expect("resolve virtuals");
+    let mut compositions = vec![make_virtual("rd", &[("role_arn", ref_to("role", "arn"))])];
+    resolve_virtual_refs_post_apply(&mut compositions, &post_apply_bindings)
+        .expect("resolve compositions");
 
-    let role_arn = virtuals[0]
+    let role_arn = compositions[0]
         .attributes
         .get("role_arn")
         .expect("role_arn present");
@@ -207,21 +208,21 @@ fn resolve_virtual_refs_post_apply_picks_post_apply_value_not_pre_apply() {
 
 #[test]
 fn resolve_virtual_refs_post_apply_leaves_non_ref_values_intact() {
-    // A literal attribute on a `VirtualResource` should be preserved
+    // A literal attribute on a `Composition` should be preserved
     // verbatim by the post-apply pass.
     let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
         managed: &[],
-        virtuals: &[],
+        compositions: &[],
         data_sources: &[],
         current_states: &HashMap::new(),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
-    let mut virtuals = vec![make_virtual("v", &[("literal", s("kept"))])];
+    let mut compositions = vec![make_virtual("v", &[("literal", s("kept"))])];
 
-    resolve_virtual_refs_post_apply(&mut virtuals, &bindings).expect("resolve virtuals");
+    resolve_virtual_refs_post_apply(&mut compositions, &bindings).expect("resolve compositions");
 
-    let literal = virtuals[0]
+    let literal = compositions[0]
         .attributes
         .get("literal")
         .expect("literal present");
@@ -234,7 +235,7 @@ fn resolve_managed_refs_with_empty_slice_is_ok() {
     {
         let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
             managed: &managed,
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[],
             current_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
@@ -250,16 +251,16 @@ fn resolve_managed_refs_with_empty_slice_is_ok() {
 fn resolve_virtual_refs_post_apply_with_empty_slice_is_ok() {
     let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
         managed: &[],
-        virtuals: &[],
+        compositions: &[],
         data_sources: &[],
         current_states: &HashMap::new(),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
-    let mut virtuals: Vec<VirtualResource> = Vec::new();
-    resolve_virtual_refs_post_apply(&mut virtuals, &bindings)
-        .expect("empty virtual slice resolves cleanly");
-    assert!(virtuals.is_empty());
+    let mut compositions: Vec<Composition> = Vec::new();
+    resolve_virtual_refs_post_apply(&mut compositions, &bindings)
+        .expect("empty composition slice resolves cleanly");
+    assert!(compositions.is_empty());
 }
 
 #[test]
@@ -274,7 +275,7 @@ fn resolve_managed_refs_legacy_shim_produces_identical_result() {
     {
         let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
             managed: &managed,
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[],
             current_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),
@@ -288,7 +289,7 @@ fn resolve_managed_refs_legacy_shim_produces_identical_result() {
     {
         let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
             managed: &legacy,
-            virtuals: &[],
+            compositions: &[],
             data_sources: &[],
             current_states: &HashMap::new(),
             remote_bindings: &HashMap::new(),

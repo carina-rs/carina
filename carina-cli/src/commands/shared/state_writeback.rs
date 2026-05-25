@@ -173,7 +173,7 @@ pub(crate) struct FinalizeApplyInput<'a> {
     /// (paired with `export_params: None`, so no export resolution
     /// runs there anyway).
     pub wait_aliases: &'a [carina_core::binding_index::WaitAliasSpec],
-    /// Pre-resolve snapshot of every `VirtualResource` in the
+    /// Pre-resolve snapshot of every `Composition` in the
     /// configuration: each one carries its **authored**
     /// `ResourceRef` attribute values (e.g. `role_arn = role.arn`),
     /// not the pre-apply-resolved concrete values.
@@ -181,24 +181,24 @@ pub(crate) struct FinalizeApplyInput<'a> {
     /// `apply` mutates a working copy of `sorted_resources`
     /// in-place via `resolve_refs_with_state_and_remote` at the head
     /// of the pipeline, which collapses every `ResourceRef` —
-    /// including the ones inside virtual `attributes` — into
+    /// including the ones inside composition `attributes` — into
     /// pre-apply concrete values. By the time `finalize_apply`
     /// runs, the resolved copy holds the *pre-apply* values, and a
     /// post-apply re-resolve has nothing to chase.
     ///
     /// This field carries the unresolved snapshot taken **before**
     /// that head-of-pipeline pass, so the export-resolution path
-    /// (#3169 / #3177) can re-resolve virtuals against the
+    /// (#3169 / #3177) can re-resolve compositions against the
     /// post-apply state. Empty for the `apply --plan` path, where
     /// `export_params` is also `None` and no export resolution
     /// runs.
-    pub pre_resolve_virtuals: &'a [carina_core::resource::VirtualResource],
+    pub pre_resolve_compositions: &'a [carina_core::resource::Composition],
 }
 
 /// Resolve export expressions using bindings built from applied state.
 ///
 /// `sorted_resources` carries the in-memory resource graph including any
-/// virtual resources synthesised by module-call expansion
+/// composition resources synthesised by module-call expansion
 /// (`expand_module_call`). Virtual resources are not persisted to
 /// `state.resources` because they have no provider-side identity, so a
 /// writeback that consults `state.resources` alone misses module-call
@@ -206,18 +206,18 @@ pub(crate) struct FinalizeApplyInput<'a> {
 /// fails with `unresolved reference my_module_call.attr` even though
 /// `carina plan` rendered the value cleanly. Issue #2479.
 ///
-/// # Post-apply virtual re-resolution (#3169)
+/// # Post-apply composition re-resolution (#3169)
 ///
 /// Before #3177 this function fed `sorted_resources` directly into
-/// `from_resources_with_state`. That captured each virtual's
-/// **pre-apply** attribute snapshot — for a virtual whose
+/// `from_resources_with_state`. That captured each composition's
+/// **pre-apply** attribute snapshot — for a composition whose
 /// `attributes.role_arn = role.arn` and a managed `role` that was
 /// `Replace`d during apply, the pre-apply `role.arn` was the
 /// *old* ARN. The writeback path then wrote that stale ARN into
 /// `state.exports`, even though `state.resources[role].attributes.arn`
 /// already held the new ARN. Issue #3169.
 ///
-/// The fix splits `sorted_resources` by kind and re-resolves virtual
+/// The fix splits `sorted_resources` by kind and re-resolves composition
 /// attributes against the post-apply view before exports use them:
 ///
 /// 1. Build `post_apply_states` by starting from the live
@@ -227,20 +227,20 @@ pub(crate) struct FinalizeApplyInput<'a> {
 ///    over any pre-apply snapshot left in `current_states`).
 /// 2. Split `sorted_resources` into a managed view (Managed +
 ///    DataSource collapsed onto `Resource` by field projection)
-///    and a virtual view ([`VirtualResource::try_from`]).
+///    and a composition view ([`Composition::try_from`]).
 /// 3. Build the bindings view from the managed slice via
 ///    [`ResolvedBindings::from_managed_with_state`] (#3176).
-/// 4. Re-resolve each virtual's `ResourceRef`s against that view via
-///    [`resolve_virtual_refs_post_apply`] (#3175), so a virtual that
+/// 4. Re-resolve each composition's `ResourceRef`s against that view via
+///    [`resolve_virtual_refs_post_apply`] (#3175), so a composition that
 ///    references a Replaced managed gets the *post*-replace value.
-/// 5. Layer the re-resolved virtuals onto the bindings view via
-///    `layer_virtuals_post_apply` (#3176).
+/// 5. Layer the re-resolved compositions onto the bindings view via
+///    `layer_compositions_post_apply` (#3176).
 /// 6. Resolve export expressions against the combined view.
 pub(crate) fn resolve_exports(
     export_params: &[carina_core::parser::InferredExportParam],
     sorted_resources: &[Resource],
     data_sources: &[carina_core::resource::DataSource],
-    pre_resolve_virtuals: &[carina_core::resource::VirtualResource],
+    pre_resolve_compositions: &[carina_core::resource::Composition],
     post_apply_states: &PostApplyStates,
     wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
 ) -> Result<HashMap<String, serde_json::Value>, AppError> {
@@ -253,41 +253,42 @@ pub(crate) fn resolve_exports(
     // carina#3266 (data-source survives) and carina#3271 (state
     // refresh path uses the same shape).
 
-    // Virtuals: fresh clone of the **pre-resolve** snapshot. Their
+    // compositions: fresh clone of the **pre-resolve** snapshot. Their
     // attributes still carry `ResourceRef`s, so the post-apply
     // resolver below can pick up the post-apply state values for
     // any managed sibling that was Replaced during apply
     // (#3169 / #3177).
-    let mut virtuals: Vec<carina_core::resource::VirtualResource> = pre_resolve_virtuals.to_vec();
+    let mut compositions: Vec<carina_core::resource::Composition> =
+        pre_resolve_compositions.to_vec();
 
     // Step 3: build the bindings view from the managed slice plus
-    // post-apply states, **with data sources but no virtuals yet**.
-    // The virtuals' attribute maps still hold pre-apply
+    // post-apply states, **with data sources but no compositions yet**.
+    // The compositions' attribute maps still hold pre-apply
     // `ResourceRef`s and need to be re-resolved against the
     // post-apply state in Step 4; only after that re-resolution can
     // they be layered into the bindings view. We use `pre_apply`
-    // with `virtuals: &[]` here, then call
-    // `layer_virtuals_post_apply` once the re-resolution is done.
+    // with `compositions: &[]` here, then call
+    // `layer_compositions_post_apply` once the re-resolution is done.
     // (carina#3181, carina#3248)
     let mut bindings = ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
         managed: sorted_resources,
-        virtuals: &[],
+        compositions: &[],
         data_sources,
         current_states: post_apply_states.as_map(),
         remote_bindings: &HashMap::new(),
         wait_aliases,
     });
 
-    // Step 4: re-resolve each virtual's attributes against the
-    // post-apply bindings view. After this, a virtual's
+    // Step 4: re-resolve each composition's attributes against the
+    // post-apply bindings view. After this, a composition's
     // `role_arn = role.arn` no longer holds the pre-apply
     // `ResourceRef`; it holds the post-apply concrete value.
-    resolve_virtual_refs_post_apply(&mut virtuals, &bindings)?;
+    resolve_virtual_refs_post_apply(&mut compositions, &bindings)?;
 
-    // Step 5: layer the re-resolved virtuals onto the bindings view.
+    // Step 5: layer the re-resolved compositions onto the bindings view.
     // Now `exports { foo = some_module.role_arn }` resolves against
     // a binding whose `role_arn` is the post-apply value.
-    bindings.layer_virtuals_post_apply(&virtuals)?;
+    bindings.layer_compositions_post_apply(&compositions)?;
 
     // Step 6: resolve the export expressions against the combined
     // view.

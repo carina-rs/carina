@@ -33,12 +33,12 @@ pub struct ExecutionInput<'a> {
     pub plan: &'a crate::plan::Plan,
     pub unresolved_resources: &'a HashMap<ResourceId, crate::resource::Resource>,
     /// Virtual resources (module attribute containers). carina#3181:
-    /// virtuals are a distinct typestate from managed resources, so the
+    /// compositions are a distinct typestate from managed resources, so the
     /// executor's dependency walk receives them as their own slice. A
     /// managed resource that depends on `<module-instance>.<attr>` —
-    /// where the module-instance binding is a virtual — has that edge
-    /// followed through the virtual's own attribute refs (#2543).
-    pub virtual_resources: &'a [crate::resource::VirtualResource],
+    /// where the module-instance binding is a composition — has that edge
+    /// followed through the composition's own attribute refs (#2543).
+    pub compositions: &'a [crate::resource::Composition],
     pub bindings: ResolvedBindings,
     pub current_states: HashMap<ResourceId, State>,
     /// The same provider normalizer that ran at plan time

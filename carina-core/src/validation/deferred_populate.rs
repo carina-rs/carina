@@ -225,7 +225,7 @@ fn check_ref(
         // avoids spurious double diagnostics.
         return;
     };
-    let Some(schema) = schemas.get(provider, resource_type, SchemaKind::Managed) else {
+    let Some(schema) = schemas.get(provider, resource_type, SchemaKind::Resource) else {
         return;
     };
     let Some(attr_schema) = schema.attributes.get(path.attribute()) else {

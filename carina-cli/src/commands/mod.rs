@@ -299,7 +299,7 @@ pub fn validate_and_resolve_errors_with_factories(
         return errors;
     }
 
-    // Module expansion produces virtual resources for module-call
+    // Module expansion produces composition resources for module-call
     // bindings (`carina-core/src/module_resolver/expander.rs`). Resolve
     // deferred provider attributes that reference those bindings
     // (`default_tags = mod.tags`), then finalize so the resolved values

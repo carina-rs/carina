@@ -8,8 +8,8 @@ use super::expressions::validate_expr::CompareOp;
 use super::util::snake_to_pascal;
 use crate::binding_index::IterableBindings;
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, Directives, Resource, ResourceId, ResourceLike,
-    UnknownReason, Value, VirtualResource,
+    Composition, ConcreteValue, DataSource, DeferredValue, Directives, Resource, ResourceId,
+    ResourceLike, UnknownReason, Value,
 };
 use crate::version_constraint::VersionConstraint;
 use indexmap::IndexMap;
@@ -65,7 +65,7 @@ pub enum ResourceContext<'a> {
 ///
 /// Part of the carina#3181 resource typestate split. The three typed
 /// arms borrow from `File`'s typed slices ([`File::resources`] managed
-/// rows, [`File::virtual_resources`], [`File::data_sources`]); the
+/// rows, [`File::compositions`], [`File::data_sources`]); the
 /// `Deferred` arm is a `for`-expression template body that still lives
 /// as a legacy [`Resource`] in [`File::deferred_for_expressions`].
 ///
@@ -75,14 +75,14 @@ pub enum ResourceContext<'a> {
 /// enum arm directly.
 #[derive(Debug, Clone, Copy)]
 pub enum ResourceRef<'a> {
-    /// A top-level managed resource.
-    Managed(&'a Resource),
-    /// A top-level virtual resource (module-expansion synthetic node).
-    Virtual(&'a VirtualResource),
+    /// A top-level resource.
+    Resource(&'a Resource),
+    /// A top-level composition (module-expansion synthetic node).
+    Composition(&'a Composition),
     /// A top-level data source (`read`-keyword resource).
     DataSource(&'a DataSource),
     /// The template body of a deferred `for` expression — always a
-    /// managed resource (`for` bodies never carry `read` / virtual).
+    /// resource (`for` bodies never carry `read` / composition).
     Deferred {
         resource: &'a Resource,
         deferred: &'a DeferredForExpression,
@@ -94,8 +94,8 @@ impl<'a> ResourceRef<'a> {
     /// `binding` / `dependency_bindings` for every arm.
     pub fn as_resource_like(&self) -> &dyn ResourceLike {
         match self {
-            ResourceRef::Managed(r) => *r,
-            ResourceRef::Virtual(v) => *v,
+            ResourceRef::Resource(r) => *r,
+            ResourceRef::Composition(v) => *v,
             ResourceRef::DataSource(d) => *d,
             ResourceRef::Deferred { resource, .. } => *resource,
         }
@@ -104,8 +104,8 @@ impl<'a> ResourceRef<'a> {
     /// Stable identifier of this resource.
     pub fn id(&self) -> &'a ResourceId {
         match self {
-            ResourceRef::Managed(r) => &r.id,
-            ResourceRef::Virtual(v) => &v.id,
+            ResourceRef::Resource(r) => &r.id,
+            ResourceRef::Composition(v) => &v.id,
             ResourceRef::DataSource(d) => &d.id,
             ResourceRef::Deferred { resource, .. } => &resource.id,
         }
@@ -114,8 +114,8 @@ impl<'a> ResourceRef<'a> {
     /// Source-order preserving attribute map.
     pub fn attributes(&self) -> &'a IndexMap<String, Value> {
         match self {
-            ResourceRef::Managed(r) => &r.attributes,
-            ResourceRef::Virtual(v) => &v.attributes,
+            ResourceRef::Resource(r) => &r.attributes,
+            ResourceRef::Composition(v) => &v.attributes,
             ResourceRef::DataSource(d) => &d.attributes,
             ResourceRef::Deferred { resource, .. } => &resource.attributes,
         }
@@ -124,20 +124,20 @@ impl<'a> ResourceRef<'a> {
     /// `let` binding name if any.
     pub fn binding(&self) -> Option<&'a str> {
         match self {
-            ResourceRef::Managed(r) => r.binding.as_deref(),
-            ResourceRef::Virtual(v) => v.binding.as_deref(),
+            ResourceRef::Resource(r) => r.binding.as_deref(),
+            ResourceRef::Composition(v) => v.binding.as_deref(),
             ResourceRef::DataSource(d) => d.binding.as_deref(),
             ResourceRef::Deferred { resource, .. } => resource.binding.as_deref(),
         }
     }
 
-    /// `directives` meta-argument block. [`VirtualResource`] drops the
+    /// `directives` meta-argument block. [`Composition`] drops the
     /// field (no `prevent_destroy` on a synthetic node) — returns `None`
     /// for the `Virtual` arm.
     pub fn directives(&self) -> Option<&'a Directives> {
         match self {
-            ResourceRef::Managed(r) => Some(&r.directives),
-            ResourceRef::Virtual(_) => None,
+            ResourceRef::Resource(r) => Some(&r.directives),
+            ResourceRef::Composition(_) => None,
             ResourceRef::DataSource(d) => Some(&d.directives),
             ResourceRef::Deferred { resource, .. } => Some(&resource.directives),
         }
@@ -146,8 +146,8 @@ impl<'a> ResourceRef<'a> {
     /// Parser-level set of attributes written as quoted string literals.
     pub fn quoted_string_attrs(&self) -> &'a HashSet<String> {
         match self {
-            ResourceRef::Managed(r) => &r.quoted_string_attrs,
-            ResourceRef::Virtual(v) => &v.quoted_string_attrs,
+            ResourceRef::Resource(r) => &r.quoted_string_attrs,
+            ResourceRef::Composition(v) => &v.quoted_string_attrs,
             ResourceRef::DataSource(d) => &d.quoted_string_attrs,
             ResourceRef::Deferred { resource, .. } => &resource.quoted_string_attrs,
         }
@@ -798,7 +798,7 @@ pub struct File<E> {
     /// Read-only data-source resources (`read`-keyword resources).
     pub data_sources: Vec<DataSource>,
     /// Virtual resources synthesized by module-call expansion.
-    pub virtual_resources: Vec<VirtualResource>,
+    pub compositions: Vec<Composition>,
     pub variables: IndexMap<String, Value>,
     /// Module `use` statements
     pub uses: Vec<UseStatement>,
@@ -845,7 +845,7 @@ impl<E> Default for File<E> {
             providers: Vec::new(),
             resources: Vec::new(),
             data_sources: Vec::new(),
-            virtual_resources: Vec::new(),
+            compositions: Vec::new(),
             variables: IndexMap::new(),
             uses: Vec::new(),
             module_calls: Vec::new(),
@@ -884,7 +884,7 @@ impl<E> File<E> {
             providers,
             resources,
             data_sources,
-            virtual_resources,
+            compositions,
             variables,
             uses,
             module_calls,
@@ -906,7 +906,7 @@ impl<E> File<E> {
             providers,
             resources,
             data_sources,
-            virtual_resources,
+            compositions,
             variables,
             uses,
             module_calls,
@@ -926,7 +926,7 @@ impl<E> File<E> {
     }
 
     /// Iterate every resource reachable from the parsed file — the
-    /// top-level managed resources, virtual resources, data sources, and
+    /// top-level managed resources, composition resources, data sources, and
     /// the `template_resource` of each deferred for-expression — each
     /// wrapped in a typed [`ResourceRef`].
     ///
@@ -939,13 +939,13 @@ impl<E> File<E> {
     /// **carina#3181 PR C:** `self.resources` is now managed-only — the
     /// parser, module expander, and deferred-for expansion write each
     /// resource into exactly one of `resources` / `data_sources` /
-    /// `virtual_resources`. The iterator chains the three typed slices
+    /// `compositions`. The iterator chains the three typed slices
     /// plus the deferred for-expression templates.
     pub fn iter_all_resources(&self) -> impl Iterator<Item = ResourceRef<'_>> {
         self.resources
             .iter()
-            .map(ResourceRef::Managed)
-            .chain(self.virtual_resources.iter().map(ResourceRef::Virtual))
+            .map(ResourceRef::Resource)
+            .chain(self.compositions.iter().map(ResourceRef::Composition))
             .chain(self.data_sources.iter().map(ResourceRef::DataSource))
             .chain(
                 self.deferred_for_expressions
@@ -957,7 +957,7 @@ impl<E> File<E> {
             )
     }
 
-    /// Iterate the top-level resources — managed, virtual, and data
+    /// Iterate the top-level resources — managed, composition, and data
     /// source — as typed [`ResourceRef`]s, **excluding** deferred
     /// for-expression templates.
     ///
@@ -968,8 +968,8 @@ impl<E> File<E> {
     pub fn iter_top_level_resources(&self) -> impl Iterator<Item = ResourceRef<'_>> {
         self.resources
             .iter()
-            .map(ResourceRef::Managed)
-            .chain(self.virtual_resources.iter().map(ResourceRef::Virtual))
+            .map(ResourceRef::Resource)
+            .chain(self.compositions.iter().map(ResourceRef::Composition))
             .chain(self.data_sources.iter().map(ResourceRef::DataSource))
     }
 
@@ -1133,7 +1133,7 @@ impl<E> File<E> {
         // carina#3181: a deferred for-expression's `template_resource` is
         // a `Resource`, so every expansion of it is managed — they
         // go straight into the managed `resources` slice. (A `read` /
-        // virtual for-body never reaches the deferred path.)
+        // composition for-body never reaches the deferred path.)
         self.resources.extend(expanded_resources);
         self.warnings.extend(new_warnings);
     }

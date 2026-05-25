@@ -1170,7 +1170,7 @@ impl DiagnosticEngine {
             .unwrap_or(("", resource_type.as_str()));
         let schema = self
             .schemas
-            .get(provider, rt, carina_core::schema::SchemaKind::Managed)
+            .get(provider, rt, carina_core::schema::SchemaKind::Resource)
             .or_else(|| {
                 self.schemas
                     .get(provider, rt, carina_core::schema::SchemaKind::DataSource)

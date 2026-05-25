@@ -2472,7 +2472,7 @@ pub struct OperationConfig {
 /// See `notes/specs/2026-05-02-resource-vs-data-source-design.md` (Decision 1-1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaKind {
-    Managed,
+    Resource,
     DataSource,
 }
 
@@ -2534,7 +2534,7 @@ impl ResourceSchema {
             attributes: HashMap::new(),
             description: None,
             validator: None,
-            kind: SchemaKind::Managed,
+            kind: SchemaKind::Resource,
             name_attribute: None,
             force_replace: false,
             operation_config: None,
@@ -3459,7 +3459,7 @@ impl SchemaRegistry {
     pub fn insert(&mut self, provider: impl Into<String>, schema: ResourceSchema) {
         let key = (provider.into(), schema.resource_type.clone());
         match schema.kind {
-            SchemaKind::Managed => {
+            SchemaKind::Resource => {
                 self.managed.insert(key, schema);
             }
             SchemaKind::DataSource => {
@@ -3477,7 +3477,7 @@ impl SchemaRegistry {
     ) -> Option<&ResourceSchema> {
         let key = (provider.to_string(), resource_type.to_string());
         match kind {
-            SchemaKind::Managed => self.managed.get(&key),
+            SchemaKind::Resource => self.managed.get(&key),
             SchemaKind::DataSource => self.data_sources.get(&key),
         }
     }
@@ -3487,7 +3487,7 @@ impl SchemaRegistry {
         self.get(
             &resource.id.provider,
             &resource.id.resource_type,
-            SchemaKind::Managed,
+            SchemaKind::Resource,
         )
     }
 
@@ -3504,7 +3504,7 @@ impl SchemaRegistry {
     }
 
     pub fn has_managed(&self, provider: &str, resource_type: &str) -> bool {
-        self.get(provider, resource_type, SchemaKind::Managed)
+        self.get(provider, resource_type, SchemaKind::Resource)
             .is_some()
     }
 
@@ -3518,7 +3518,7 @@ impl SchemaRegistry {
     pub fn iter(&self) -> impl Iterator<Item = (&str, &str, SchemaKind, &ResourceSchema)> + '_ {
         self.managed
             .iter()
-            .map(|((p, t), s)| (p.as_str(), t.as_str(), SchemaKind::Managed, s))
+            .map(|((p, t), s)| (p.as_str(), t.as_str(), SchemaKind::Resource, s))
             .chain(
                 self.data_sources
                     .iter()

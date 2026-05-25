@@ -216,7 +216,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
             carina_core::binding_index::PreApplyInputs {
                 managed: &resources_for_plan.clone(),
-                virtuals: &[],
+                compositions: &[],
                 data_sources: &[],
                 current_states: &current_states,
                 remote_bindings: &remote_bindings,
@@ -261,7 +261,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &unresolved_resources,
-        virtual_resources: &[],
+        compositions: &[],
         bindings: carina_core::binding_index::ResolvedBindings::default(),
         current_states,
         normalizer: &NoopNormalizer,
@@ -352,7 +352,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
             carina_core::binding_index::PreApplyInputs {
                 managed: &resources_for_plan.clone(),
-                virtuals: &[],
+                compositions: &[],
                 data_sources: &[],
                 current_states: &current_states,
                 remote_bindings: &remote_bindings,
@@ -396,7 +396,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &unresolved_resources,
-        virtual_resources: &[],
+        compositions: &[],
         bindings: carina_core::binding_index::ResolvedBindings::default(),
         current_states,
         normalizer: &NoopNormalizer,
@@ -471,7 +471,7 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
         let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
             carina_core::binding_index::PreApplyInputs {
                 managed: &resources_for_plan.clone(),
-                virtuals: &[],
+                compositions: &[],
                 data_sources: &[],
                 current_states: &current_states,
                 remote_bindings: &remote_bindings,

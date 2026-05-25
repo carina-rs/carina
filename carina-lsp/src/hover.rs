@@ -630,7 +630,7 @@ impl HoverProvider {
                 .get(
                     provider,
                     resource_type,
-                    carina_core::schema::SchemaKind::Managed,
+                    carina_core::schema::SchemaKind::Resource,
                 )
                 .or_else(|| {
                     self.schemas.get(
@@ -868,12 +868,12 @@ mod tests {
     #[test]
     fn test_resource_hover_converts_markdown_links() {
         // Full description with a markdown link (no truncation)
-        let desc = "Specifies a virtual private cloud (VPC). To add an IPv6 CIDR block to the VPC, see [AWS::EC2::VPCCidrBlock](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-vpccidrblock.html).";
+        let desc = "Specifies a composition private cloud (VPC). To add an IPv6 CIDR block to the VPC, see [AWS::EC2::VPCCidrBlock](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-vpccidrblock.html).";
 
         let provider = create_hover_provider_with_description("ec2.Vpc", desc);
         let schema = provider
             .schemas
-            .get("", "ec2.Vpc", carina_core::schema::SchemaKind::Managed)
+            .get("", "ec2.Vpc", carina_core::schema::SchemaKind::Resource)
             .unwrap();
         let hover = provider.schema_hover("ec2.Vpc", schema).unwrap();
 

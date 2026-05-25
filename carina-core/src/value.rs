@@ -755,12 +755,12 @@ pub fn redact_secrets_in_data_source(
 }
 
 /// Redact all secrets in a
-/// [`VirtualResource`](crate::resource::VirtualResource) (carina#3248).
+/// [`Composition`](crate::resource::Composition) (carina#3248).
 ///
-/// Virtuals are now persisted in saved plan files (`PlanFile`
+/// compositions are now persisted in saved plan files (`PlanFile`
 /// version `4`) so the saved-plan apply path can rebuild the same
 /// `ResolvedBindings` view as the live-apply path (carina#3246). A
-/// virtual's attribute map can hold values copied through from an
+/// composition's attribute map can hold values copied through from an
 /// inner module's `attributes { ... }` block — including literal
 /// secrets — so it must pass through the same per-kind redaction as
 /// managed resources / data sources / state before serialization.
@@ -768,14 +768,14 @@ pub fn redact_secrets_in_data_source(
 /// resources) is preserved so the user-authored attribute order
 /// survives redaction.
 pub fn redact_secrets_in_virtual(
-    resource: &crate::resource::VirtualResource,
-) -> Result<crate::resource::VirtualResource, SerializationError> {
+    resource: &crate::resource::Composition,
+) -> Result<crate::resource::Composition, SerializationError> {
     let attributes: Result<indexmap::IndexMap<String, Value>, _> = resource
         .attributes
         .iter()
         .map(|(k, e)| redact_secrets_in_value(e).map(|rv| (k.clone(), rv)))
         .collect();
-    Ok(crate::resource::VirtualResource {
+    Ok(crate::resource::Composition {
         attributes: attributes?,
         ..resource.clone()
     })
@@ -1431,7 +1431,7 @@ pub fn canonicalize_states_with_schemas(
             registry.get(
                 &state.id.provider,
                 &state.id.resource_type,
-                crate::schema::SchemaKind::Managed,
+                crate::schema::SchemaKind::Resource,
             )
         };
         let Some(schema) = kind else {
@@ -2359,12 +2359,12 @@ mod tests {
 
     #[test]
     fn test_redact_secrets_in_virtual_redacts_attribute_secrets() {
-        // carina#3248: virtuals are now persisted in saved plans, so
+        // carina#3248: compositions are now persisted in saved plans, so
         // a literal secret authored inside a module's `attributes { ... }`
-        // block (which lands as a `Value::Secret` in the virtual's
+        // block (which lands as a `Value::Secret` in the composition's
         // attribute map) must be redacted before serialization, the
         // same way managed-resource attributes are redacted.
-        use crate::resource::{ResourceId, VirtualResource};
+        use crate::resource::{Composition, ResourceId};
         use std::collections::{BTreeSet, HashSet};
         let mut attrs = indexmap::IndexMap::new();
         attrs.insert(
@@ -2377,7 +2377,7 @@ mod tests {
                 ConcreteValue::String("plaintext-must-not-leak".to_string()),
             )))),
         );
-        let virt = VirtualResource {
+        let virt = Composition {
             id: ResourceId::new("_virtual", "module_instance"),
             attributes: attrs,
             binding: Some("module_instance".to_string()),
@@ -2413,7 +2413,7 @@ mod tests {
             other => panic!("expected redacted secret, got: {:?}", other),
         }
 
-        // The rest of the VirtualResource (id, binding, etc.) is
+        // The rest of the Composition (id, binding, etc.) is
         // preserved verbatim.
         assert_eq!(redacted.binding.as_deref(), Some("module_instance"));
         assert_eq!(redacted.id.resource_type, "_virtual");

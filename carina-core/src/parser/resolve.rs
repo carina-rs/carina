@@ -15,10 +15,10 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 /// `dependency_bindings` of every resource whose references are resolved
 /// **before** apply: managed [`Resource`]s and [`DataSource`]s.
 ///
-/// `VirtualResource` is excluded on purpose — a virtual resource's
+/// `Composition` is excluded on purpose — a composition resource's
 /// attributes may carry refs whose resolution is deferred to the
 /// post-apply path, so the pre-apply resolver must never rewrite them
-/// (carina#3181; see the `virtual_resource.rs` module doc).
+/// (carina#3181; see the `composition.rs` module doc).
 trait PreApplyResourceMut: ResourceLike {
     fn attributes_mut(&mut self) -> &mut IndexMap<String, Value>;
     fn dependency_bindings_mut(&mut self) -> &mut BTreeSet<String>;
@@ -208,7 +208,7 @@ pub fn resolve_resource_refs_with_config(
     }
 
     // Build a map of binding_name -> attributes for quick lookup. Walk
-    // every top-level resource (managed, data source, virtual) so a
+    // every top-level resource (managed, data source, composition) so a
     // `ResourceRef` to any binding resolves. `binding_map` only needs
     // key-based lookup, not source order, so the inner map stays a plain
     // `HashMap`.
@@ -262,7 +262,7 @@ pub fn resolve_resource_refs_with_config(
     // the user's source order through resolution (#2222).
     //
     // carina#3181: managed resources and data sources both go through
-    // pre-apply ref resolution; `VirtualResource` is excluded — its refs
+    // pre-apply ref resolution; `Composition` is excluded — its refs
     // are resolved on the post-apply path.
     for resource in iter_pre_apply_resources_mut(parsed) {
         let mut resolved_attrs: IndexMap<String, Value> = IndexMap::new();
@@ -294,7 +294,7 @@ pub fn resolve_resource_refs_with_config(
     // During per-file parsing, "binding.attribute" strings from sibling files
     // remain as Value::Concrete(ConcreteValue::String). Convert them to ResourceRef now that the full
     // binding map is available.
-    // carina#3181: include data sources and virtuals — a sibling-file
+    // carina#3181: include data sources and compositions — a sibling-file
     // export can forward-reference any top-level binding. Only the
     // binding-name set is needed (forward-ref resolution is keyed on
     // the name).
@@ -312,7 +312,7 @@ pub fn resolve_resource_refs_with_config(
     // `resolve_provider_unresolved_attributes` (generic over export-
     // parameter shape so it works on both `ParsedFile` and `InferredFile`),
     // and is called by consumers after `module_resolver::resolve_modules_with_config`
-    // produces virtual resources. See #2717.
+    // produces composition resources. See #2717.
 
     Ok(())
 }
@@ -334,7 +334,7 @@ pub fn resolve_resource_refs_with_config(
 pub fn collect_known_bindings_merged(parsed: &ParsedFile) -> std::collections::HashSet<&str> {
     let mut known: std::collections::HashSet<&str> = std::collections::HashSet::new();
     // carina#3181: walk the typed top-level slices — managed resources,
-    // data sources, and virtuals all contribute a binding name in scope.
+    // data sources, and compositions all contribute a binding name in scope.
     known.extend(
         parsed
             .iter_top_level_resources()
@@ -408,8 +408,8 @@ pub fn check_identifier_scope(parsed: &ParsedFile) -> Vec<ParseError> {
 pub fn check_provider_instance_routing(parsed: &ParsedFile) -> Vec<ParseError> {
     let mut errors = Vec::new();
     // carina#3181: walk the typed top-level slices. `directives()` is
-    // `None` for the virtual arm (no `directives` on a synthetic node),
-    // which routes to the `None` match arm — and a virtual's `id` has an
+    // `None` for the composition arm (no `directives` on a synthetic node),
+    // which routes to the `None` match arm — and a composition's `id` has an
     // empty provider, so it is skipped there, matching prior behaviour.
     for rref in parsed.iter_top_level_resources() {
         let id = rref.id();
@@ -495,7 +495,7 @@ fn accumulate_undefined_reference_errors(
         });
     };
 
-    // carina#3181: walk the typed top-level slices (managed, virtual,
+    // carina#3181: walk the typed top-level slices (managed, composition,
     // data source) — `parsed.resources` is managed-only now. Deferred
     // for-expression templates are handled by
     // `accumulate_deferred_iterable_errors`, so they are excluded here.
@@ -720,7 +720,7 @@ fn resolve_function_calls_only(
 /// `parsed.upstream_states`.
 ///
 /// Call this **after** `module_resolver::resolve_modules_with_config`
-/// has produced virtual resources for module-call bindings, so that
+/// has produced composition resources for module-call bindings, so that
 /// `default_tags = mod.tags` can see the module's exported attribute
 /// values. Then call [`finalize_provider_configs`] to drain the
 /// (now-literal) values into the typed `default_tags` field.
@@ -734,9 +734,9 @@ pub fn resolve_provider_unresolved_attributes<E>(
 ) -> Result<(), ParseError> {
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
     // carina#3181: walk every top-level resource — managed, data source,
-    // and virtual. This runs after module expansion, so virtual resources
+    // and composition. This runs after module expansion, so composition resources
     // exist and a provider attr like `default_tags = mod.tags` resolves
-    // through the module-call virtual.
+    // through the module-call composition.
     for rref in parsed.iter_top_level_resources() {
         if let Some(binding_name) = rref.binding() {
             binding_map.insert(binding_name.to_string(), rref.resolved_attributes());

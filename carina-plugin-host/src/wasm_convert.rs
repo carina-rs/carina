@@ -624,7 +624,7 @@ fn proto_schema_to_core(s: &proto::ResourceSchema) -> CoreResourceSchema {
         description: s.description.clone(),
         validator: build_validator_from_types(&s.validators),
         kind: match s.kind {
-            proto::SchemaKind::Managed => carina_core::schema::SchemaKind::Managed,
+            proto::SchemaKind::Managed => carina_core::schema::SchemaKind::Resource,
             proto::SchemaKind::DataSource => carina_core::schema::SchemaKind::DataSource,
         },
         name_attribute: s.name_attribute.clone(),
