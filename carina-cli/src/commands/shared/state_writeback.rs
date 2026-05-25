@@ -98,11 +98,25 @@ impl PostApplyStates {
     /// `state.resources` was just rewritten by the apply writeback.
     ///
     /// State-derived managed entries win on key collision (see the
-    /// type-level doc-comment for why).
+    /// type-level doc-comment for why) — except for entries whose id
+    /// matches a known data source: those are NOT overlaid, so a
+    /// stale `state.resources` row (historical artifact from a
+    /// pre-#3181 carina version that persisted data sources) does
+    /// not clobber the fresh `current_states` read from phase 2
+    /// (carina#3266 re-open).
+    ///
+    /// Threading `data_sources` is mandatory: a caller with no data
+    /// sources passes `&[]` and gets the original "state.resources
+    /// wins" behavior. A caller that has data sources but forgets
+    /// to pass them re-introduces carina#3266 — making the parameter
+    /// required keeps that mistake impossible at the call site.
     pub(crate) fn from_current_and_state(
         current_states: &HashMap<ResourceId, carina_core::resource::State>,
         state: &StateFile,
+        data_sources: &[carina_core::resource::DataSource],
     ) -> Self {
+        let data_source_ids: std::collections::HashSet<ResourceId> =
+            data_sources.iter().map(|d| d.id.clone()).collect();
         let mut map = current_states.clone();
         for rs in &state.resources {
             let id = ResourceId::with_provider(
@@ -111,6 +125,12 @@ impl PostApplyStates {
                 &rs.name,
                 rs.directives.provider_instance.clone(),
             );
+            // carina#3266 (re-opened): a stale data-source row in
+            // `state.resources` must not overwrite the fresh
+            // `current_states[ds.id]` entry phase-2 just produced.
+            if data_source_ids.contains(&id) {
+                continue;
+            }
             let attrs: HashMap<String, carina_core::resource::Value> = rs
                 .attributes
                 .iter()
@@ -713,12 +733,86 @@ mod post_apply_states_tests {
         // the production reality the bug springs from.
         let state = StateFile::new();
 
-        let post = PostApplyStates::from_current_and_state(&current_states, &state);
+        let post = PostApplyStates::from_current_and_state(&current_states, &state, &[]);
         let entry = post
             .as_map()
             .get(&ds_id)
             .expect("data-source entry must survive merge");
         assert_eq!(entry.attributes.get("arns"), ds_attrs.get("arns"));
+    }
+
+    /// carina#3266 (re-opened): when `state.resources` carries a STALE
+    /// data-source row (a historical artifact — an older carina release
+    /// persisted them, or a pre-#3181 `state refresh` did), the
+    /// post-apply merge must NOT overlay it on top of the
+    /// `current_states[ds.id]` fresh read. Without this guard, every
+    /// apply rewrites `state.exports` from the stale on-disk attrs and
+    /// the data-source-derived export never converges to the live
+    /// provider value.
+    #[test]
+    fn data_source_current_states_wins_over_stale_state_resources_3266() {
+        use carina_core::resource::DataSource;
+
+        let ds_id = ResourceId::with_provider("aws", "iam.Roles", "admin_access_roles", None);
+
+        // current_states: phase-2 fresh read returned the NEW value.
+        let new_arn = "arn:aws:iam::1:role/sso/NEW";
+        let mut fresh_attrs = HashMap::new();
+        fresh_attrs.insert(
+            "arns".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String(new_arn.to_string()),
+            )])),
+        );
+        let mut current_states = HashMap::new();
+        current_states.insert(ds_id.clone(), State::existing(ds_id.clone(), fresh_attrs));
+
+        // state.resources carries the STALE value (historical artifact:
+        // a pre-#3181 carina version persisted the data source here).
+        let stale_arn = "arn:aws:iam::1:role/sso/OLD";
+        let state_json = serde_json::json!({
+            "version": 7,
+            "serial": 1,
+            "lineage": "test",
+            "carina_version": "0.4.0",
+            "resources": [
+                {
+                    "resource_type": "iam.Roles",
+                    "name": "admin_access_roles",
+                    "identifier": null,
+                    "provider": "aws",
+                    "attributes": { "arns": [stale_arn] }
+                }
+            ]
+        });
+        let state: StateFile = serde_json::from_value(state_json).unwrap();
+
+        // Declare the data source so the merge knows to exclude its id
+        // from the state.resources overlay.
+        let mut ds = DataSource::with_provider("aws", "iam.Roles", "admin_access_roles", None);
+        ds.binding = Some("admin_access_roles".to_string());
+        let data_sources = vec![ds];
+
+        let post = PostApplyStates::from_current_and_state(&current_states, &state, &data_sources);
+        let entry = post
+            .as_map()
+            .get(&ds_id)
+            .expect("data-source entry must be present after merge");
+        match entry.attributes.get("arns") {
+            Some(Value::Concrete(ConcreteValue::List(items))) => {
+                let s = match items.first() {
+                    Some(Value::Concrete(ConcreteValue::String(s))) => s.as_str(),
+                    other => panic!("unexpected list element: {other:?}"),
+                };
+                assert_eq!(
+                    s, new_arn,
+                    "data-source attrs must be the FRESH `current_states` value, \
+                     not the stale state.resources row carried over from a prior \
+                     carina version. Got: {s}"
+                );
+            }
+            other => panic!("expected list of arns, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -752,7 +846,7 @@ mod post_apply_states_tests {
         });
         let state: StateFile = serde_json::from_value(json).unwrap();
 
-        let post = PostApplyStates::from_current_and_state(&current_states, &state);
+        let post = PostApplyStates::from_current_and_state(&current_states, &state, &[]);
         let entry = post.as_map().get(&id).expect("merged entry");
         match entry.attributes.get("versioning") {
             Some(Value::Concrete(ConcreteValue::String(s))) => assert_eq!(s, "Enabled"),

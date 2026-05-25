@@ -301,8 +301,11 @@ pub(crate) async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), 
     // no source-side view of which exports the user intends — see the
     // `FinalizeApplyInput::export_params` doc-comment.
     if let Some(params) = input.export_params {
-        let post_apply_states =
-            PostApplyStates::from_current_and_state(input.current_states, &state);
+        let post_apply_states = PostApplyStates::from_current_and_state(
+            input.current_states,
+            &state,
+            input.data_sources,
+        );
         state.exports = resolve_exports(
             params,
             input.sorted_resources,
@@ -374,7 +377,8 @@ pub(crate) async fn persist_exports_only(
     current_states: &HashMap<ResourceId, carina_core::resource::State>,
 ) -> Result<(), AppError> {
     let mut state = state_file.unwrap_or_default();
-    let post_apply_states = PostApplyStates::from_current_and_state(current_states, &state);
+    let post_apply_states =
+        PostApplyStates::from_current_and_state(current_states, &state, data_sources);
     let exports = resolve_exports(
         export_params,
         sorted_resources,

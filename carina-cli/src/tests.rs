@@ -2926,6 +2926,111 @@ async fn persist_exports_only_writes_state_with_new_exports() {
     );
 }
 
+/// carina#3266 (re-opened) — integration-level pin.
+///
+/// The production repro: the on-disk state file carries a stale
+/// `state.resources` row for a data source (historical artifact from
+/// a pre-#3181 carina version that persisted data sources). The
+/// post-apply binding view must take the FRESH `current_states`
+/// read, not the stale `state.resources` row, so a
+/// `<data_source>.<attr>` export updates on disk.
+///
+/// Without the `PostApplyStates::from_current_and_state(..., data_sources)`
+/// filter, `persist_exports_only` reads the stale row, layers it into
+/// bindings via `layer_data_source_bindings`, resolves the export
+/// against the stale value, and rewrites `state.exports` with the
+/// pre-apply literal — every apply prints "Exports updated" but the
+/// on-disk value never converges. Plan keeps showing the same diff.
+#[tokio::test]
+async fn persist_exports_only_ignores_stale_data_source_row_in_state_resources_3266() {
+    use carina_core::parser::{InferredExportParam, TypeExpr};
+    use carina_core::resource::{
+        AccessPath, ConcreteValue, DataSource, DeferredValue, ResourceId, State as ResourceState,
+        Value,
+    };
+
+    let captured = Arc::new(Mutex::new(None));
+    let backend = CapturingBackend {
+        captured: captured.clone(),
+    };
+    let lock = LockInfo::new("apply");
+
+    let old_arn = "arn:aws:iam::1:role/sso/OLD";
+    let new_arn = "arn:aws:iam::1:role/sso/NEW";
+
+    // Pre-apply state: BOTH the stale exports literal AND a stale
+    // `state.resources` row for the data source (the historical
+    // artifact from a pre-#3181 carina version).
+    let state_json = serde_json::json!({
+        "version": 7,
+        "serial": 14,
+        "lineage": "33333333-3333-3333-3333-333333333333",
+        "carina_version": "0.0.0-test",
+        "resources": [
+            {
+                "resource_type": "iam.Roles",
+                "name": "admin_access_roles",
+                "identifier": null,
+                "provider": "aws",
+                "attributes": { "arns": [old_arn] }
+            }
+        ],
+        "exports": { "admin_access_role_arns": [old_arn] }
+    });
+    let state_in: StateFile = serde_json::from_value(state_json).unwrap();
+
+    // Data source declared in source.
+    let ds_id = ResourceId::with_provider("aws", "iam.Roles", "admin_access_roles", None);
+    let mut ds = DataSource::with_provider("aws", "iam.Roles", "admin_access_roles", None);
+    ds.binding = Some("admin_access_roles".to_string());
+    let data_sources = vec![ds];
+
+    // Phase-2 fresh read: NEW value lives in `current_states[ds.id]`.
+    let mut current_states: HashMap<ResourceId, ResourceState> = HashMap::new();
+    let mut attrs: HashMap<String, Value> = HashMap::new();
+    attrs.insert(
+        "arns".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String(new_arn.to_string()),
+        )])),
+    );
+    current_states.insert(ds_id.clone(), ResourceState::existing(ds_id, attrs));
+
+    let export_params = vec![InferredExportParam {
+        name: "admin_access_role_arns".to_string(),
+        type_expr: TypeExpr::Unknown,
+        value: Some(Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new("admin_access_roles", "arns"),
+        })),
+    }];
+
+    let result = crate::commands::apply::persist_exports_only(
+        &backend,
+        Some(&lock),
+        Some(state_in),
+        &[],
+        &data_sources,
+        &[],
+        &export_params,
+        &[],
+        &current_states,
+    )
+    .await;
+
+    assert!(result.is_ok(), "persist_exports_only failed: {:?}", result);
+
+    let written = captured.lock().unwrap();
+    let state = written.as_ref().expect("state should be written");
+    assert_eq!(
+        state.exports.get("admin_access_role_arns"),
+        Some(&serde_json::json!([new_arn])),
+        "state.exports must hold the NEW data-source value, not the \
+         stale row carried over from state.resources. \
+         Got state.exports: {:?}",
+        state.exports,
+    );
+}
+
 /// Regression test for #2932: when the user removes the entire
 /// `exports {}` block (so `parsed.export_params` is empty) but the
 /// plan has resource changes, `finalize_apply` must still drop

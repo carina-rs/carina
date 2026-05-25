@@ -919,6 +919,7 @@ pub(crate) async fn run_state_refresh_locked(
             crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
                 &current_states,
                 &state,
+                &parsed.data_sources,
             );
         state.exports = crate::commands::shared::state_writeback::resolve_exports(
             &parsed.export_params,
