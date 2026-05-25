@@ -2868,6 +2868,7 @@ async fn persist_exports_only_clears_state_exports_when_params_empty() {
         &[],
         &[],
         &[],
+        &std::collections::HashMap::new(),
     )
     .await;
 
@@ -2910,6 +2911,7 @@ async fn persist_exports_only_writes_state_with_new_exports() {
         &[],
         &export_params,
         &[],
+        &std::collections::HashMap::new(),
     )
     .await;
 

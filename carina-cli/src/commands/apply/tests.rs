@@ -1137,8 +1137,16 @@ fn resolve_exports_resolves_cross_file_dot_notation_strings() {
     registry_prod.binding = Some("registry_prod".to_string());
     let sorted_resources = vec![registry_prod];
 
-    let exports =
-        resolve_exports(&export_params, &sorted_resources, &[], &[], &state, &[]).unwrap();
+    let exports = resolve_exports(
+        &export_params,
+        &sorted_resources,
+        &[],
+        &[],
+        &state,
+        &[],
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
 
     assert_eq!(
         exports.get("account_id"),
@@ -1223,6 +1231,7 @@ fn resolve_exports_resolves_module_call_attribute_via_virtual_resource() {
         &pre_resolve_virtuals,
         &state,
         &[],
+        &std::collections::HashMap::new(),
     )
     .unwrap();
 
@@ -1328,6 +1337,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_virtuals() {
         &pre_resolve_virtuals,
         &state,
         &[],
+        &std::collections::HashMap::new(),
     )
     .unwrap();
 
@@ -1497,6 +1507,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
         &pre_resolve_virtuals,
         &post_apply_state_file,
         &[],
+        &std::collections::HashMap::new(),
     )
     .unwrap();
 
@@ -1506,6 +1517,109 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
         "exports.role_arn must be the POST-apply ARN ({post_apply_arn}) — \
          the value carried by state.resources, NOT a pre-apply snapshot. \
          Got: {exports:?}",
+    );
+}
+
+#[test]
+fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
+    // carina#3266 root-cause regression test.
+    //
+    // The bug: `resolve_exports` builds `post_apply_states` from
+    // `state.resources` only. Managed resources are persisted there,
+    // but data sources are not — they are queried each run and the
+    // result lives in `current_states` during execution and is
+    // discarded at writeback. So when an export references a
+    // data-source attribute (e.g. `exports { x = ds.arns }`), the
+    // post-apply binding view layered onto `pre_apply` finds no
+    // attributes for the data source (#3265's `layer_data_source_bindings`
+    // merge fires only when `current_states[ds.id]` carries the read
+    // result), the ResourceRef resolves to nothing, and the resolver
+    // silently keeps the prior literal in `state.exports`.
+    //
+    // The fix: thread `current_states` from `finalize_apply` into
+    // `resolve_exports` so the read results stay visible across the
+    // exports-resolution boundary. `layer_data_source_bindings` then
+    // merges the read attrs and `ds.arns` resolves to the read value.
+    //
+    // Without the fix, `resolve_exports` returns an empty map (no
+    // entry for the export) instead of the NEW arn — exports stays
+    // at the pre-apply literal in production.
+    use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
+    use carina_core::resource::{
+        AccessPath, ConcreteValue, DataSource, DeferredValue, ResourceId, State as ResourceState,
+        Value,
+    };
+    use carina_state::StateFile;
+    use std::collections::HashMap;
+
+    let new_arn = "arn:aws:iam::412038850359:role/aws-reserved/sso.amazonaws.com/ap-northeast-1/AWSReservedSSO_AdministratorAccess_ed2ecac126d82b94";
+
+    // Post-apply state file: no managed resource entries needed; the
+    // export's only input is a data source, which is never persisted
+    // to `state.resources`.
+    let post_apply_state_file = {
+        let json = serde_json::json!({
+            "version": 5,
+            "serial": 2,
+            "lineage": "test",
+            "carina_version": "0.4.0",
+            "resources": []
+        });
+        serde_json::from_value::<StateFile>(json).unwrap()
+    };
+
+    // The authored data source: `let admin_access_roles = read aws.iam.Roles { ... }`.
+    let ds_id = ResourceId::with_provider("aws", "iam.Roles", "admin_access_roles", None);
+    let mut ds = DataSource::with_provider("aws", "iam.Roles", "admin_access_roles", None);
+    ds.binding = Some("admin_access_roles".to_string());
+    ds.attributes.insert(
+        "path_prefix".to_string(),
+        Value::Concrete(ConcreteValue::String(
+            "/aws-reserved/sso.amazonaws.com/".to_string(),
+        )),
+    );
+    let data_sources = vec![ds];
+
+    // The provider-read result that `read_data_source_with_retry`
+    // writes into `current_states[ds.id]` during apply execution.
+    let current_states: HashMap<ResourceId, ResourceState> = {
+        let mut attrs: HashMap<String, Value> = HashMap::new();
+        attrs.insert(
+            "arns".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String(new_arn.to_string()),
+            )])),
+        );
+        let mut m = HashMap::new();
+        m.insert(ds_id.clone(), ResourceState::existing(ds_id, attrs));
+        m
+    };
+
+    // The export: `exports { admin_access_role_arns = admin_access_roles.arns }`.
+    let export_params = vec![ExportParameter {
+        name: "admin_access_role_arns".to_string(),
+        type_expr: TypeExpr::Unknown,
+        value: Some(Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new("admin_access_roles", "arns"),
+        })),
+    }];
+
+    let exports = resolve_exports(
+        &export_params,
+        &[],
+        &data_sources,
+        &[],
+        &post_apply_state_file,
+        &[],
+        &current_states,
+    )
+    .unwrap();
+
+    let expected_json = serde_json::json!([new_arn]);
+    assert_eq!(
+        exports.get("admin_access_role_arns"),
+        Some(&expected_json),
+        "data-source-derived export must resolve via current_states read result, got: {exports:?}",
     );
 }
 

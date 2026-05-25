@@ -308,6 +308,7 @@ pub(crate) async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), 
             input.pre_resolve_virtuals,
             &state,
             input.wait_aliases,
+            input.current_states,
         )?;
     }
 
@@ -366,6 +367,7 @@ pub(crate) async fn persist_exports_only(
     pre_resolve_virtuals: &[carina_core::resource::VirtualResource],
     export_params: &[carina_core::parser::InferredExportParam],
     wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
+    current_states: &HashMap<ResourceId, carina_core::resource::State>,
 ) -> Result<(), AppError> {
     let mut state = state_file.unwrap_or_default();
     let exports = resolve_exports(
@@ -375,6 +377,7 @@ pub(crate) async fn persist_exports_only(
         pre_resolve_virtuals,
         &state,
         wait_aliases,
+        current_states,
     )?;
     state.exports = exports;
     if let Some(lk) = lock {
@@ -1275,6 +1278,7 @@ async fn run_apply_locked(
             &pre_resolve_virtuals_noop,
             &parsed.export_params,
             &wait_aliases,
+            &current_states,
         )
         .await?;
         return Ok(());
