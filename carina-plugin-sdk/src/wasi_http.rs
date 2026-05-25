@@ -151,6 +151,27 @@ fn make_request(
         String::new()
     };
 
+    if trace {
+        // Dump request headers as we received them from the AWS SDK, before
+        // any wasi:http translation. Used to confirm whether DELETE requests
+        // carry `content-length: 0` / `transfer-encoding: chunked` /
+        // `expect: 100-continue` (the body-framing hypotheses being narrowed
+        // for the ~20 s S3 latency).
+        let body_in = request.body().bytes().map(|b| b.len()).unwrap_or(0);
+        let header_pairs: Vec<String> = request
+            .headers()
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect();
+        eprintln!(
+            "carina-wasi-http-trace-headers method={} uri={} body_in={} headers=[{}]",
+            trace_method,
+            trace_uri,
+            body_in,
+            header_pairs.join("; "),
+        );
+    }
+
     // Parse the URI
     let uri = request.uri().to_string();
     let parsed = uri
