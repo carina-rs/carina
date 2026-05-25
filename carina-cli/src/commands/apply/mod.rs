@@ -352,11 +352,14 @@ pub async fn save_state_unlocked(
     backend.write_state(state).await.map_err(AppError::Backend)
 }
 
-/// Persist export changes when the resource plan is empty.
+/// Persist export changes when the plan has no mutating effects.
 ///
-/// Used when `plan.is_empty()` short-circuits apply: resources don't need
-/// any work, but exports may have changed. Rebuild the exports from the
-/// current state + desired `export_params` and write the state.
+/// Used when `!plan.has_mutations()` short-circuits apply: no
+/// managed-resource Create/Update/Delete is needed (the plan is
+/// either empty or carries only `Read`/`Wait` effects), but
+/// exports may have changed. Rebuild the exports from the current
+/// state + desired `export_params` and write the state
+/// (carina#3270).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn persist_exports_only(
     backend: &dyn StateBackend,
@@ -1211,9 +1214,16 @@ async fn run_apply_locked(
         )));
     }
 
-    if plan.is_empty() {
-        // Even when no resources need changes, exports may have changed.
-        // Persist them before returning so state stays in sync with config.
+    if !plan.has_mutations() {
+        // No mutating effects — the plan only holds `Read` (data-source
+        // reads) or `Wait` effects, or is entirely empty. Either way no
+        // resource apply pipeline needs to run; route through the
+        // export-only fast path. Without this, a plan whose only
+        // difference from state is an export expression that reads a
+        // data source (a `Read` effect lands in the plan, but no
+        // mutation does) silently falls through into the
+        // resource-apply pipeline and the `Persisting N export
+        // change(s) to state.` banner never prints (carina#3270).
         let resolved_exports = crate::commands::plan::resolve_export_values_for_display(
             &parsed.export_params,
             &sorted_resources,
