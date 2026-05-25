@@ -7,17 +7,16 @@
 //! parsing, error classification) with no network I/O and no external
 //! process.
 //!
-//! Scope note (#3203): `winterbaume-s3` 0.2 parses the S3 conditional
-//! write headers (`If-None-Match` / `If-Match`) but does not enforce
-//! them — there is no `PreconditionFailed` path — so the lock-contention
-//! and conditional-write-conflict paths cannot be covered here. See the
-//! issue and #3205 for the follow-up. These tests cover what the mock
-//! honors faithfully: state write/read, bucket auto-create, and
-//! single-holder lock acquire/release.
+//! Conditional-write coverage (#3205): `winterbaume-s3` 0.2.1 enforces
+//! `If-None-Match` / `If-Match` and returns `412 PreconditionFailed`
+//! on a conflict, so the lock-contention and expired-lock takeover
+//! paths are exercised here (in addition to state write/read,
+//! bucket auto-create, and single-holder lock acquire/release).
 
 use aws_sdk_s3::Client;
+use aws_sdk_s3::primitives::ByteStream;
 use carina_state::backends::S3Backend;
-use carina_state::{StateBackend, StateFile};
+use carina_state::{BackendError, LockInfo, StateBackend, StateFile};
 use winterbaume_core::MockAws;
 use winterbaume_s3::S3Service;
 
@@ -37,14 +36,33 @@ async fn mock_s3_client() -> Client {
 /// disabled because the mock does not need server-side encryption and
 /// leaving it on only adds a header the mock ignores.
 async fn mock_backend() -> S3Backend {
-    S3Backend::from_client(
-        mock_s3_client().await,
+    mock_backend_with_client().await.0
+}
+
+/// Build an `S3Backend` and return both the backend and a second
+/// `aws_sdk_s3::Client` wired to the same in-process mock. The shared
+/// client lets a test seed S3 objects directly (e.g. an expired lock
+/// file) that the backend will then observe.
+async fn mock_backend_with_client() -> (S3Backend, Client) {
+    let mock = MockAws::builder().with_service(S3Service::new()).build();
+    let sdk_config = mock.sdk_config(TEST_REGION).await;
+    let backend = S3Backend::from_client(
+        Client::new(&sdk_config),
         TEST_BUCKET.to_string(),
         TEST_KEY.to_string(),
         TEST_REGION.to_string(),
         false, // encrypt
         true,  // auto_create
-    )
+    );
+    let raw_client = Client::new(&sdk_config);
+    (backend, raw_client)
+}
+
+/// S3 key the backend uses for its lock file. Mirrors `S3Backend::lock_key`
+/// (which is `pub(crate)`): tests need the same key to plant or replace
+/// the lock object out-of-band.
+fn lock_key() -> String {
+    format!("{TEST_KEY}.lock")
 }
 
 #[tokio::test]
@@ -172,11 +190,9 @@ async fn read_state_returns_none_when_object_absent() {
 #[tokio::test]
 async fn acquire_then_release_lock_round_trips() {
     // Covers the single-holder lock mechanics: write the lock object,
-    // read it back to verify ownership on release, then delete it. It
-    // does *not* cover contention — `winterbaume-s3` 0.2 does not enforce
-    // the `If-None-Match` conditional header, so a second `acquire_lock`
-    // would succeed instead of conflicting. The contention path is
-    // tracked separately (#3203 Notes / follow-up #3205).
+    // read it back to verify ownership on release, then delete it. The
+    // conditional-write contention path is exercised separately in
+    // `acquire_lock_conflicts_with_held_lock` (#3205).
     let backend = mock_backend().await;
     backend.init().await.unwrap();
 
@@ -242,6 +258,153 @@ async fn write_state_locked_rejects_write_when_lock_not_held() {
     assert!(
         matches!(err, carina_state::BackendError::LockNotHeld(_)),
         "expected LockNotHeld when the lock object is absent, got: {err:?}",
+    );
+}
+
+#[tokio::test]
+async fn acquire_lock_conflicts_with_held_lock() {
+    // #3205: a second `acquire_lock` while a non-expired lock is held
+    // must return `BackendError::Locked`. The path under test is
+    // `write_lock_if_absent` -> `If-None-Match: *` -> 412 ->
+    // `is_conditional_write_conflict` -> `read_lock_with_etag` ->
+    // `!is_expired` -> `Locked`. Without winterbaume enforcing the
+    // conditional header the second PUT would silently overwrite and
+    // this test would fail.
+    let backend = mock_backend().await;
+    backend.init().await.unwrap();
+
+    let first = backend.acquire_lock("apply").await.unwrap();
+
+    let err = backend
+        .acquire_lock("plan")
+        .await
+        .expect_err("a second acquire while a fresh lock is held must conflict");
+    match err {
+        BackendError::Locked {
+            lock_id, operation, ..
+        } => {
+            assert_eq!(
+                lock_id, first.id,
+                "Locked error must report the holder's id"
+            );
+            assert_eq!(
+                operation, "apply",
+                "Locked error must report the holder's operation",
+            );
+        }
+        other => panic!("expected BackendError::Locked, got: {other:?}"),
+    }
+
+    backend.release_lock(&first).await.unwrap();
+}
+
+#[tokio::test]
+async fn acquire_lock_takes_over_expired_lock() {
+    // #3205: when the holder of the existing lock has expired,
+    // `acquire_lock` must replace it via `replace_lock_if_match`
+    // (`If-Match: <etag>` -> 200) and return the new lock. This
+    // exercises the second branch of the acquire loop, which only
+    // works when the mock enforces `If-Match`.
+    let (backend, client) = mock_backend_with_client().await;
+    backend.init().await.unwrap();
+
+    // Plant an expired lock under the same key the backend uses.
+    let expired = LockInfo::with_timeout("apply", -60);
+    assert!(
+        expired.is_expired(),
+        "precondition: planted lock is expired"
+    );
+    let body = serde_json::to_vec(&expired).unwrap();
+    client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key(lock_key())
+        .body(ByteStream::from(body))
+        .content_type("application/json")
+        .send()
+        .await
+        .expect("planting the expired lock must succeed");
+
+    // acquire_lock sees the expired lock and replaces it with a fresh one.
+    let taken_over = backend.acquire_lock("plan").await.unwrap();
+    assert_ne!(
+        taken_over.id, expired.id,
+        "takeover must mint a new lock id, not reuse the expired holder's",
+    );
+    assert_eq!(taken_over.operation, "plan");
+    assert!(
+        !taken_over.is_expired(),
+        "the taken-over lock must have a fresh, non-expired TTL",
+    );
+
+    backend.release_lock(&taken_over).await.unwrap();
+}
+
+#[tokio::test]
+async fn renew_lock_rejects_when_lock_was_replaced() {
+    // #3205: `renew_lock` must refuse to refresh when the lock object
+    // was replaced out from under the holder. The rejection path under
+    // test is the id-mismatch check in `renew_lock`; the
+    // `If-Match`-conditional `replace_lock_if_match` further guards
+    // against TOCTOU between the read and the write.
+    let (backend, client) = mock_backend_with_client().await;
+    backend.init().await.unwrap();
+
+    let original = backend.acquire_lock("apply").await.unwrap();
+
+    // Replace the lock object out-of-band with a different lock id.
+    let usurper = LockInfo::new("plan");
+    assert_ne!(usurper.id, original.id);
+    let body = serde_json::to_vec(&usurper).unwrap();
+    client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key(lock_key())
+        .body(ByteStream::from(body))
+        .content_type("application/json")
+        .send()
+        .await
+        .expect("planting the usurping lock must succeed");
+
+    let err = backend
+        .renew_lock(&original)
+        .await
+        .expect_err("renew_lock must fail when the lock was replaced concurrently");
+    assert!(
+        matches!(err, BackendError::LockNotHeld(_)),
+        "expected LockNotHeld after a concurrent replacement, got: {err:?}",
+    );
+}
+
+#[tokio::test]
+async fn head_bucket_resolves_to_typed_not_found_on_missing_bucket() {
+    // winterbaume#3 fix: `HeadBucket` on a missing bucket must return a
+    // body-less 404 so `aws-sdk-rust` resolves the response into the
+    // typed `HeadBucketError::NotFound` variant. If the mock ever
+    // regresses to returning an `<Error>` XML body, the SDK falls back
+    // to `Unhandled` and this test fails — flagging that the body-less
+    // contract has broken before `bucket_exists`'s 404-status fallback
+    // hides it.
+    use aws_sdk_s3::error::SdkError;
+    use aws_sdk_s3::operation::head_bucket::HeadBucketError;
+
+    let (_backend, client) = mock_backend_with_client().await;
+
+    let err = client
+        .head_bucket()
+        .bucket(TEST_BUCKET)
+        .send()
+        .await
+        .expect_err("HeadBucket on an absent bucket must fail");
+    let service_err = match &err {
+        SdkError::ServiceError(svc) => svc.err(),
+        other => panic!("expected SdkError::ServiceError, got: {other:?}"),
+    };
+    assert!(
+        matches!(service_err, HeadBucketError::NotFound(_)),
+        "HeadBucket must resolve to the typed NotFound variant; got {service_err:?}. \
+         An Unhandled variant here means winterbaume regressed and is returning a \
+         response body on a 4xx HEAD response (see moriyoshi/winterbaume#3).",
     );
 }
 

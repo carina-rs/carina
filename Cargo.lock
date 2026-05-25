@@ -5690,9 +5690,9 @@ dependencies = [
 
 [[package]]
 name = "winterbaume-kms"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad02ac483c8a27015ef8857d6d859adbeee4c57a7c45a6e2043a1411978d71bf"
+checksum = "054d190c98fa7df63b2fee481f2db74a00feaf54e724d1aa28a438088b55f92b"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -5714,9 +5714,9 @@ dependencies = [
 
 [[package]]
 name = "winterbaume-s3"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48730964f4f607ae4739f90d75ab295dac32d06f2ed95892e5ad902748c0be59"
+checksum = "8a970d46d8ed2309cda242f31fa147c51bc230a235969a8bbf9e6cab145d7f10"
 dependencies = [
  "bytes",
  "chrono",

@@ -12,15 +12,12 @@
 //! real base64 → `KMS:Decrypt` → UTF-8 path with no real AWS and no
 //! external process (#3227).
 //!
-//! Scope note: `decrypt_one`'s `Some(key)` branch (the optional
-//! `KeyId` argument) is not covered here. Real AWS validates `KeyId`
-//! against the ciphertext header and returns `IncorrectKeyException`
-//! on mismatch (per the `KMS:Decrypt` API docs), but `winterbaume-kms`
-//! 0.2 ignores the request-side `KeyId` and resolves the key from the
-//! ciphertext header alone — so a key-mismatch test would silently
-//! succeed and a key-match test would also succeed if the branch were
-//! reduced to a no-op. Neither shape is evidence. Tracked in
-//! winterbaume issue moriyoshi/winterbaume#5.
+//! KeyId coverage: `decrypt_one`'s `Some(key)` branch (the optional
+//! `KeyId` argument) is exercised in
+//! `decryptor_rejects_wrong_key_id_with_incorrect_key_exception` —
+//! `winterbaume-kms` 0.2.1 validates the request-side `KeyId` against
+//! the ciphertext header and surfaces `IncorrectKeyException`, matching
+//! the documented AWS behaviour.
 
 use aws_sdk_kms::Client;
 use aws_sdk_kms::primitives::Blob;
@@ -78,6 +75,66 @@ async fn decryptor_round_trips_base64_ciphertext_through_kms() {
         plaintext.as_bytes(),
         TEST_PLAINTEXT,
         "decryptor must return the original plaintext bytes",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn decryptor_round_trips_with_matching_key_id() {
+    // `Some(key)` branch, matching ciphertext key: real KMS accepts the
+    // request and `decrypt_one` returns the plaintext. Without this case
+    // a no-op `Some` branch (e.g. one that silently ignored the argument)
+    // would not be caught by the `None` happy-path test.
+    let client = mock_kms_client().await;
+    let key = client.create_key().send().await.expect("create_key");
+    let key_id = key.key_metadata().unwrap().key_id().to_string();
+
+    let enc = client
+        .encrypt()
+        .key_id(&key_id)
+        .plaintext(Blob::new(TEST_PLAINTEXT.to_vec()))
+        .send()
+        .await
+        .expect("encrypt");
+    let ciphertext_b64 =
+        base64::engine::general_purpose::STANDARD.encode(enc.ciphertext_blob().unwrap().as_ref());
+
+    let decryptor = build_kms_decryptor(client);
+
+    let plaintext = decryptor(&ciphertext_b64, Some(&key_id))
+        .expect("decryptor must succeed when KeyId matches the ciphertext");
+    assert_eq!(plaintext.as_bytes(), TEST_PLAINTEXT);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn decryptor_rejects_wrong_key_id_with_incorrect_key_exception() {
+    // `Some(key)` branch, mismatched ciphertext key: real KMS returns
+    // `IncorrectKeyException` per the `KMS:Decrypt` API docs. winterbaume
+    // 0.2.1 enforces the same. The decryptor must propagate this as a
+    // `decrypt(): KMS decrypt failed:` error rather than silently
+    // returning the wrong-key plaintext.
+    let client = mock_kms_client().await;
+    let key_a = client.create_key().send().await.expect("create_key a");
+    let key_a_id = key_a.key_metadata().unwrap().key_id().to_string();
+    let key_b = client.create_key().send().await.expect("create_key b");
+    let key_b_id = key_b.key_metadata().unwrap().key_id().to_string();
+
+    let enc = client
+        .encrypt()
+        .key_id(&key_a_id)
+        .plaintext(Blob::new(TEST_PLAINTEXT.to_vec()))
+        .send()
+        .await
+        .expect("encrypt under key_a");
+    let ciphertext_b64 =
+        base64::engine::general_purpose::STANDARD.encode(enc.ciphertext_blob().unwrap().as_ref());
+
+    let decryptor = build_kms_decryptor(client);
+
+    let err = decryptor(&ciphertext_b64, Some(&key_b_id))
+        .expect_err("decrypt with a KeyId that does not match the ciphertext must fail");
+    assert!(
+        err.starts_with("decrypt(): KMS decrypt failed:"),
+        "wrong-KeyId failure must be surfaced via the KMS error label, got: {err}",
     );
 }
 
