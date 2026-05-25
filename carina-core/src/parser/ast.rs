@@ -8,8 +8,8 @@ use super::expressions::validate_expr::CompareOp;
 use super::util::snake_to_pascal;
 use crate::binding_index::IterableBindings;
 use crate::resource::{
-    Composition, ConcreteValue, DataSource, DeferredValue, Directives, GraphNode, Resource,
-    ResourceId, ResourceLike, UnknownReason, Value,
+    Composition, ConcreteValue, DataSource, DeferredValue, Directives, GraphNode, LeafNode,
+    Resource, ResourceId, ResourceLike, UnknownReason, Value,
 };
 use crate::version_constraint::VersionConstraint;
 use indexmap::IndexMap;
@@ -990,6 +990,28 @@ impl<E> File<E> {
             .map(GraphNode::from)
             .chain(self.compositions.into_iter().map(GraphNode::from))
             .chain(self.data_sources.into_iter().map(GraphNode::from))
+    }
+
+    /// Consume `self` and yield the leaf nodes as owned
+    /// [`LeafNode`]s — i.e. resources and data sources only.
+    ///
+    /// `LeafNode` is the subset of [`GraphNode`] that has no
+    /// `Composition` variant by construction, so a downstream caller
+    /// that takes `Vec<LeafNode>` (the post-expansion view) cannot
+    /// be handed a composition through the type system. This is the
+    /// type-level counterpart to
+    /// [`into_graph_nodes`](Self::into_graph_nodes), and is the
+    /// boundary the differ / executor pipeline crosses at the end of
+    /// composition expansion.
+    ///
+    /// Compositions are dropped from the output; the originating
+    /// `Composition` → leaf lineage will be carried separately by the
+    /// `ExpansionTrace` once #3295 introduces it.
+    pub fn into_leaf_nodes(self) -> impl Iterator<Item = LeafNode> {
+        self.resources
+            .into_iter()
+            .map(LeafNode::from)
+            .chain(self.data_sources.into_iter().map(LeafNode::from))
     }
 
     /// Find a resource by resource type and name attribute value
