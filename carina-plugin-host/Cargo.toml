@@ -19,6 +19,14 @@ wasmtime-wasi = "43"
 wasmtime-wasi-http = "43"
 hyper = "1"
 tokio = { version = "1", features = ["rt"] }
+# Used by the local phase-instrumented copy of `default_send_request_handler`.
+# Versions track wasmtime-wasi-http 43.x so we share the rustls/hyper stack
+# instead of forking the TLS/HTTP wire path.
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+rustls = "0.22"
+tokio-rustls = "0.25"
+webpki-roots = "0.26"
 dirs = "6"
 sha2 = "0.10"
 indexmap = "2"

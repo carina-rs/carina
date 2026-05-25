@@ -932,18 +932,23 @@ dependencies = [
  "carina-core",
  "carina-provider-protocol",
  "dirs",
+ "http-body-util",
  "hyper 1.8.1",
+ "hyper-util",
  "indexmap",
  "log",
+ "rustls 0.22.4",
  "semver",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "tokio",
+ "tokio-rustls 0.25.0",
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-http",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
