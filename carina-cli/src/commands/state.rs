@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -22,9 +22,9 @@ use super::validate_and_resolve_with_config;
 use crate::commands::shared::state_writeback::apply_name_overrides;
 use crate::error::AppError;
 use crate::wiring::{
-    WiringContext, build_factories_from_providers, get_provider_with_ctx,
-    read_data_source_with_retry, reconcile_anonymous_identifiers_with_ctx,
-    reconcile_prefixed_names, resolve_data_source_refs_for_refresh,
+    WiringContext, build_factories_from_providers, expand_same_config_deferred_for,
+    get_provider_with_ctx, read_data_source_with_retry, reconcile_anonymous_identifiers_with_ctx,
+    reconcile_prefixed_names, refresh_resource_set, resolve_data_source_refs_for_refresh,
 };
 
 /// Convert a lock acquisition error into an `AppError`.
@@ -664,7 +664,7 @@ pub(crate) async fn run_state_refresh_locked(
     }
     apply_name_overrides(&mut parsed.resources, &state_file);
 
-    let sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
+    let mut sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
 
     // Select provider
     let provider = get_provider_with_ctx(&ctx, parsed, base_dir).await?;
@@ -674,6 +674,7 @@ pub(crate) async fn run_state_refresh_locked(
 
     // Read states for all resources using identifier from state
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
+    let mut already_refreshed: HashSet<ResourceId> = HashSet::new();
     for resource in &sorted_resources {
         let identifier = state_file
             .as_ref()
@@ -693,6 +694,80 @@ pub(crate) async fn run_state_refresh_locked(
             .await
             .map_err(AppError::Provider)?;
         current_states.insert(resource.id.clone(), fresh_state);
+        already_refreshed.insert(resource.id.clone());
+    }
+
+    // carina#3272: expand `for _, _ in <iter> { ... }` loops the same
+    // way `run_apply_locked` does, so the materialised children land
+    // in `sorted_resources` (and therefore in the orphan-classification
+    // `desired_ids` set below + the `lift_current_state_string_enums`
+    // input slice). Without this, every for-loop-produced resource is
+    // mis-classified as `(orphan)` on refresh and its enum-typed attrs
+    // skip the StringEnum lift, surfacing snake_case ↔ SCREAMING_CASE
+    // as a phantom `~` diff.
+    //
+    // Refresh has no `moved` block (that is a plan/apply concept), so
+    // `moved_targets` is empty. `already_refreshed` carries the ids the
+    // managed read loop above already populated, so the post-expansion
+    // refresh below doesn't redundantly re-read them.
+    let wait_aliases_for_expansion: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
+        .wait_bindings
+        .iter()
+        .map(carina_core::binding_index::WaitAliasSpec::from)
+        .collect();
+    let crate::wiring::DeferredForExpansion {
+        sorted_resources: resorted,
+        new_child_ids,
+        refreshable_child_ids,
+        // residual / warnings: not consumed by the refresh path.
+        residual_deferred_for: _,
+        printed_warnings: _,
+    } = expand_same_config_deferred_for(
+        parsed,
+        &sorted_resources,
+        &current_states,
+        &HashMap::new(),
+        &wait_aliases_for_expansion,
+        &HashSet::new(),
+        &already_refreshed,
+    )?;
+    sorted_resources = resorted;
+
+    // Read state for any for-loop-materialised children that the
+    // initial managed loop didn't visit.
+    if !new_child_ids.is_empty() {
+        // Mirror the apply path's hand-rolled `saved_dep_bindings`
+        // build (apply/mod.rs ~874): `Provider::read` does not return
+        // `dependency_bindings`, so we have to pull them from the
+        // state file ourselves to restore them on the fresh state.
+        let saved_dep_bindings: HashMap<ResourceId, BTreeSet<String>> = state_file
+            .as_ref()
+            .map(|sf| {
+                sorted_resources
+                    .iter()
+                    .filter_map(|r| {
+                        let rs =
+                            sf.find_resource(&r.id.provider, &r.id.resource_type, r.id.name_str())?;
+                        if rs.dependency_bindings.is_empty() {
+                            None
+                        } else {
+                            Some((r.id.clone(), rs.dependency_bindings.clone()))
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let children = refreshable_child_ids.select(&sorted_resources);
+        let multi = indicatif::MultiProgress::new();
+        let _ = refresh_resource_set(
+            &provider,
+            &multi,
+            children,
+            &state_file,
+            &saved_dep_bindings,
+            &mut current_states,
+        )
+        .await?;
     }
 
     // Also read states for orphaned resources (in state but removed from config)
@@ -772,9 +847,13 @@ pub(crate) async fn run_state_refresh_locked(
         .unwrap_or_default();
     // awscc#251: lift pre-StringEnum-migration state before
     // `hydrate_read_state` carries it forward into read state.
+    // carina#3272: use the post-expansion `sorted_resources` (not
+    // `parsed.resources`) so for-loop-materialised children's saved
+    // state is lifted too — otherwise their enum-typed attrs stay
+    // as plain `String` and the differ surfaces a phantom case diff.
     carina_core::utils::lift_saved_state_string_enums(
         &mut saved_attrs,
-        &parsed.resources,
+        &sorted_resources,
         ctx.schemas(),
     );
     provider
@@ -784,9 +863,10 @@ pub(crate) async fn run_state_refresh_locked(
     // `saved_attrs`) — the values read at the refresh loop above arrive
     // as plain `String` for IAM enum fields and must be lifted before
     // they are written back / compared.
+    // carina#3272: same `sorted_resources` reason as above.
     carina_core::utils::lift_current_state_string_enums(
         &mut current_states,
-        &parsed.resources,
+        &sorted_resources,
         ctx.schemas(),
     );
 
