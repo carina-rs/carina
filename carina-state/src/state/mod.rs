@@ -403,20 +403,94 @@ struct VersionCheck {
     version: u32,
 }
 
+/// Reports an in-memory schema upgrade applied to a state file by
+/// [`check_and_migrate`]. The function itself never writes to stderr —
+/// the caller (a backend impl) decides whether and how often to log,
+/// which lets `carina plan` emit the migration warning exactly once
+/// per run even when state is read multiple times (T0 snapshot +
+/// post-plan drift re-read, see carina#3283).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MigrationInfo {
+    /// On-disk version that was read.
+    pub from: u32,
+    /// Version the state was migrated to (always `StateFile::CURRENT_VERSION`).
+    pub to: u32,
+}
+
+/// Successful outcome of [`check_and_migrate`].
+///
+/// Always carries the parsed (and possibly schema-upgraded) state.
+/// `migration` is `Some` iff the on-disk version was older than
+/// [`StateFile::CURRENT_VERSION`] and an in-memory upgrade was applied;
+/// `None` for state files that were already current.
+///
+/// Intentionally not `Clone`: a [`StateFile`] can hold every resource
+/// in the deployment, so accidentally cloning the wrapper would clone
+/// the full state. The wrapper is consumed at the backend boundary
+/// (`read_state` → caller takes `.state` or `.into_state()`).
+#[derive(Debug)]
+pub struct MigratedStateFile {
+    pub state: StateFile,
+    pub migration: Option<MigrationInfo>,
+}
+
+impl MigratedStateFile {
+    /// Discard the migration info and return just the state. Convenience
+    /// for call sites (e.g. unit tests, fixture loaders) that only need
+    /// the parsed `StateFile` and never log the migration.
+    pub fn into_state(self) -> StateFile {
+        self.state
+    }
+}
+
+/// Emit the state-schema migration warning to stderr at most once for
+/// the given `OnceLock`-protected slot. Backends call this from
+/// `read_state` so a single `carina plan` run — which reads state
+/// twice (T0 snapshot plus post-plan drift re-read, carina#3283) —
+/// surfaces the warning exactly once per backend instance.
+///
+/// `display_target` should identify the underlying state file (e.g. a
+/// local path or `s3://bucket/key`) so an operator running with
+/// `upstream_state` chains or multiple backends in one process can
+/// tell which file the warning refers to.
+///
+/// Dedupe is per-backend-instance, not per `(from, to)` pair: once
+/// any migration has been logged through this slot, no subsequent
+/// `read_state` on the same backend logs again, even if a later read
+/// observed a different `from` version. This matches the only
+/// realistic case (each backend points at one physical state file)
+/// and keeps the API trivially correct.
+pub fn log_state_migration_once(
+    slot: &std::sync::OnceLock<MigrationInfo>,
+    info: MigrationInfo,
+    display_target: &str,
+) {
+    if slot.set(info).is_ok() {
+        eprintln!(
+            "Warning: state file {} is v{} on disk; in-memory migration \
+             to v{} applied for this run. Disk state will be rewritten \
+             on the next `carina apply` or `carina state refresh` in \
+             that directory.",
+            display_target, info.from, info.to
+        );
+    }
+}
+
 /// Deserialize a state file from a JSON string, checking the version and
 /// migrating from older formats if necessary.
 ///
-/// - Current version: deserialized directly.
+/// - Current version: deserialized directly; returned with `migration = None`.
 /// - Future version (newer than supported): returns a clear error asking the
 ///   user to upgrade Carina.
 /// - Older version: attempts deserialization with serde defaults and bumps
-///   the version to current. When a future version introduces breaking changes,
-///   explicit migration functions should be added here.
+///   the version to current. The from/to versions are returned as
+///   [`MigrationInfo`] so the caller can log the event (carina#3283).
 /// - Invalid JSON: returns a parse error.
-pub fn check_and_migrate(content: &str) -> Result<StateFile, BackendError> {
+pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendError> {
     let check: VersionCheck = serde_json::from_str(content)
         .map_err(|e| BackendError::InvalidState(format!("Failed to parse state version: {}", e)))?;
 
+    let mut migration: Option<MigrationInfo> = None;
     let mut state: StateFile = match check.version {
         v if v == StateFile::CURRENT_VERSION => serde_json::from_str(content).map_err(|e| {
             BackendError::InvalidState(format!("Failed to parse state file: {}", e))
@@ -429,13 +503,10 @@ pub fn check_and_migrate(content: &str) -> Result<StateFile, BackendError> {
             )));
         }
         v => {
-            // Older version — for now, try to deserialize with serde defaults.
-            // In the future, add explicit migration functions here.
-            eprintln!(
-                "Warning: Migrating state file from v{} to v{}",
-                v,
-                StateFile::CURRENT_VERSION
-            );
+            migration = Some(MigrationInfo {
+                from: v,
+                to: StateFile::CURRENT_VERSION,
+            });
             let mut state: StateFile = serde_json::from_str(content).map_err(|e| {
                 BackendError::InvalidState(format!(
                     "Failed to migrate state file from v{}: {}",
@@ -475,7 +546,7 @@ pub fn check_and_migrate(content: &str) -> Result<StateFile, BackendError> {
     // rewritten to the canonical form on read so existing state files
     // resolve cleanly against new emissions. See #1903.
     state.canonicalize_addresses();
-    Ok(state)
+    Ok(MigratedStateFile { state, migration })
 }
 
 /// Deserialize a state file from a byte slice, checking the version and
@@ -483,7 +554,7 @@ pub fn check_and_migrate(content: &str) -> Result<StateFile, BackendError> {
 ///
 /// This is the byte-slice equivalent of [`check_and_migrate`] for backends
 /// that read raw bytes (e.g., S3).
-pub fn check_and_migrate_bytes(bytes: &[u8]) -> Result<StateFile, BackendError> {
+pub fn check_and_migrate_bytes(bytes: &[u8]) -> Result<MigratedStateFile, BackendError> {
     let content = std::str::from_utf8(bytes)
         .map_err(|e| BackendError::InvalidState(format!("State file is not valid UTF-8: {}", e)))?;
     check_and_migrate(content)

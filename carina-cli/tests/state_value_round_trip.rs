@@ -65,7 +65,7 @@ fn fixture_attributes_round_trip_through_value_codec() {
         let raw = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let state = match check_and_migrate(&raw) {
-            Ok(s) => s,
+            Ok(s) => s.into_state(),
             Err(e) => {
                 failures.push(format!("{}: deserialize StateFile: {e}", path.display()));
                 continue;

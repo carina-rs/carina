@@ -7,12 +7,13 @@ use async_trait::async_trait;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::time::sleep as async_sleep;
 
 use crate::backend::{BackendConfig, BackendError, BackendResult, StateBackend};
 use crate::lock::LockInfo;
-use crate::state::{self, StateFile};
+use crate::state::{self, MigrationInfo, StateFile, log_state_migration_once};
 
 /// Local file backend for development and simple use cases
 pub struct LocalBackend {
@@ -20,6 +21,13 @@ pub struct LocalBackend {
     state_path: PathBuf,
     /// Path to the lock file
     lock_path: PathBuf,
+    /// Tracks the first in-memory state-schema migration observed by
+    /// `read_state` on this backend instance, so the warning is emitted
+    /// exactly once per backend (carina#3283). `carina plan` reads state
+    /// twice per run (T0 snapshot + post-plan drift re-read) and an
+    /// unguarded `eprintln!` inside `check_and_migrate` would surface
+    /// the warning twice for a single physical file.
+    migration_logged: OnceLock<MigrationInfo>,
 }
 
 const RECOVERY_CLAIM_TIMEOUT_SECS: i64 = 30;
@@ -50,6 +58,7 @@ impl LocalBackend {
         Self {
             state_path,
             lock_path,
+            migration_logged: OnceLock::new(),
         }
     }
 
@@ -236,9 +245,15 @@ impl StateBackend for LocalBackend {
             }
         };
 
-        let state = state::check_and_migrate(&content)?;
-
-        Ok(Some(state))
+        let outcome = state::check_and_migrate(&content)?;
+        if let Some(info) = outcome.migration {
+            log_state_migration_once(
+                &self.migration_logged,
+                info,
+                &self.state_path.display().to_string(),
+            );
+        }
+        Ok(Some(outcome.state))
     }
 
     async fn write_state(&self, state: &StateFile) -> BackendResult<()> {
