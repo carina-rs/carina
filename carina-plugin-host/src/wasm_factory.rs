@@ -369,10 +369,52 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
         config.connect_timeout = config.connect_timeout.min(cap);
         config.first_byte_timeout = config.first_byte_timeout.min(cap);
         config.between_bytes_timeout = config.between_bytes_timeout.min(cap);
+
+        if trace_http_enabled() {
+            let method = request.method().to_string();
+            let uri = request.uri().to_string();
+            let spawn_start = std::time::Instant::now();
+            let handle = wasmtime_wasi::runtime::spawn(async move {
+                let queue_ms = spawn_start.elapsed().as_millis();
+                let handler_start = std::time::Instant::now();
+                let result =
+                    wasmtime_wasi_http::p2::default_send_request_handler(request, config).await;
+                let handler_ms = handler_start.elapsed().as_millis();
+                eprintln!(
+                    "carina-host-http-trace method={} uri={} queue_ms={} handler_ms={} status={}",
+                    method,
+                    uri,
+                    queue_ms,
+                    handler_ms,
+                    match &result {
+                        Ok(resp) => format!("{}", resp.resp.status().as_u16()),
+                        Err(e) => format!("err:{:?}", e),
+                    },
+                );
+                Ok(result)
+            });
+            return Ok(wasmtime_wasi_http::p2::types::HostFutureIncomingResponse::pending(handle));
+        }
+
         Ok(wasmtime_wasi_http::p2::default_send_request(
             request, config,
         ))
     }
+}
+
+/// Companion to carina-plugin-sdk's `CARINA_WASI_HTTP_TRACE` switch.
+///
+/// When set to "1", the host-side `WasiHttpHooks::send_request` spawns the
+/// outgoing request via a wrapper around `default_send_request_handler`
+/// and emits the wall-clock breakdown to stderr. Off by default; the
+/// gate is a single atomic load per request when disabled.
+fn trace_http_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("CARINA_WASI_HTTP_TRACE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
 }
 
 // -- Host state for WASI --
