@@ -179,6 +179,21 @@ impl Plan {
         self.effects.iter().filter(|e| e.is_mutating()).count()
     }
 
+    /// True iff the plan contains at least one mutating effect.
+    ///
+    /// `is_empty()` returns false for a plan that holds only `Read` /
+    /// `Wait` effects, even though those do not change infrastructure.
+    /// Callers that route apply between the export-only fast path
+    /// (`persist_exports_only`) and the full resource-apply pipeline
+    /// MUST gate on this, not on `is_empty()`: a config whose only
+    /// difference from state is an export expression that reads a
+    /// data source produces a plan with `Read` effects but no
+    /// mutations, and `is_empty()` would mis-route it through the
+    /// resource-apply path (carina#3270).
+    pub fn has_mutations(&self) -> bool {
+        self.effects.iter().any(|e| e.is_mutating())
+    }
+
     /// Generate a summary of the Plan for display
     pub fn summary(&self) -> PlanSummary {
         let mut summary = PlanSummary::default();
@@ -416,6 +431,40 @@ mod tests {
         let plan = Plan::new();
         assert!(plan.is_empty());
         assert_eq!(plan.mutation_count(), 0);
+        assert!(!plan.has_mutations());
+    }
+
+    /// carina#3270: a plan that holds only `Read` effects (data-source
+    /// reads, with no managed-resource mutation) must report
+    /// `has_mutations() == false`. The export-only apply path
+    /// (`persist_exports_only`) gates on this; the old `is_empty()`
+    /// check returned false for the same plan and mis-routed the
+    /// run through the full resource-apply pipeline.
+    #[test]
+    fn read_only_plan_has_no_mutations() {
+        use crate::resource::DataSource;
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Read {
+            resource: DataSource::with_provider("aws", "iam.Roles", "admin_access_roles", None),
+        });
+        // `is_empty()` is false — Read counts as a present effect.
+        assert!(!plan.is_empty());
+        // But there is no mutation, so the export-only fast path
+        // must take this plan.
+        assert!(!plan.has_mutations());
+        assert_eq!(plan.mutation_count(), 0);
+    }
+
+    #[test]
+    fn plan_with_create_has_mutations() {
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(ManagedResource::new(
+            "acm.Certificate",
+            "cert",
+        )));
+        assert!(plan.has_mutations());
+        assert_eq!(plan.mutation_count(), 1);
     }
 
     #[test]
