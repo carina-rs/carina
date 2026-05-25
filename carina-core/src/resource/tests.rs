@@ -714,7 +714,7 @@ fn canonical_hash_consistency() {
 
 #[test]
 fn resource_typed_binding_field() {
-    let resource = ManagedResource::new("s3.Bucket", "my-bucket").with_binding("my_bucket");
+    let resource = Resource::new("s3.Bucket", "my-bucket").with_binding("my_bucket");
     assert_eq!(resource.binding, Some("my_bucket".to_string()));
     // binding should NOT be in attributes
     assert!(!resource.attributes.contains_key("_binding"));
@@ -722,7 +722,7 @@ fn resource_typed_binding_field() {
 
 #[test]
 fn resource_typed_dependency_bindings_field() {
-    let resource = ManagedResource::new("ec2.Subnet", "my-subnet")
+    let resource = Resource::new("ec2.Subnet", "my-subnet")
         .with_dependency_bindings(["vpc".to_string()].into_iter().collect());
     assert!(resource.dependency_bindings.contains("vpc"));
     assert_eq!(resource.dependency_bindings.len(), 1);
@@ -734,7 +734,7 @@ fn resource_typed_dependency_bindings_field() {
 /// entry (#2228).
 #[test]
 fn resource_dependency_bindings_dedup_on_duplicate_insert() {
-    let mut resource = ManagedResource::new("ec2.Subnet", "my-subnet");
+    let mut resource = Resource::new("ec2.Subnet", "my-subnet");
     resource.dependency_bindings.insert("vpc".to_string());
     resource.dependency_bindings.insert("vpc".to_string());
     assert_eq!(resource.dependency_bindings.len(), 1);
@@ -745,7 +745,7 @@ fn resource_dependency_bindings_dedup_on_duplicate_insert() {
 /// order (#2228).
 #[test]
 fn resource_dependency_bindings_iteration_is_sorted() {
-    let mut resource = ManagedResource::new("ec2.Route", "my-route");
+    let mut resource = Resource::new("ec2.Route", "my-route");
     resource.dependency_bindings.insert("rt".to_string());
     resource
         .dependency_bindings
@@ -767,14 +767,14 @@ fn state_dependency_bindings_dedup_on_duplicate_insert() {
 
 #[test]
 fn resource_default_metadata_fields() {
-    let resource = ManagedResource::new("s3.Bucket", "my-bucket");
+    let resource = Resource::new("s3.Bucket", "my-bucket");
     assert_eq!(resource.binding, None);
     assert!(resource.dependency_bindings.is_empty());
 }
 
 #[test]
 fn resource_attributes_use_value_type() {
-    let resource = ManagedResource::new("s3.Bucket", "test")
+    let resource = Resource::new("s3.Bucket", "test")
         .with_attribute(
             "name",
             Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
@@ -816,12 +816,11 @@ fn attrs_to_hashmap_clones_values() {
 fn resource_module_source_typed_field() {
     // Real resources that belong to modules should use the typed module_source field
     // instead of storing _module/_module_instance as hidden attributes
-    let resource = ManagedResource::new("ec2.SecurityGroup", "web_sg").with_module_source(
-        ModuleSource::Module {
+    let resource =
+        Resource::new("ec2.SecurityGroup", "web_sg").with_module_source(ModuleSource::Module {
             name: "web_tier".to_string(),
             instance: "web".to_string(),
-        },
-    );
+        });
 
     // Module source info should be in the typed field
     assert_eq!(

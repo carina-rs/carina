@@ -1,13 +1,13 @@
 //! Tests for #3175: typed resolver entry points.
 //!
-//! - `resolve_managed_refs_with_state_and_remote(&mut [ManagedResource], ...)`
-//!   — pre-apply path, accepts only `ManagedResource` slices.
+//! - `resolve_managed_refs_with_state_and_remote(&mut [Resource], ...)`
+//!   — pre-apply path, accepts only `Resource` slices.
 //! - `resolve_virtual_refs_post_apply(&mut [VirtualResource], &ResolvedBindings)`
 //!   — post-apply path, takes a pre-built bindings view.
 //!
 //! Both are new entry points layered over the existing
 //! `resolve_refs_inner` logic; the legacy
-//! `resolve_refs_with_state_and_remote(&mut [ManagedResource], …)` shim is
+//! `resolve_refs_with_state_and_remote(&mut [Resource], …)` shim is
 //! unchanged.
 
 use std::collections::{BTreeSet, HashMap};
@@ -19,8 +19,7 @@ use crate::resolver::{
     resolve_managed_refs_with_state_and_remote, resolve_virtual_refs_post_apply,
 };
 use crate::resource::{
-    AccessPath, ConcreteValue, DeferredValue, ManagedResource, ResourceId, State, Value,
-    VirtualResource,
+    AccessPath, ConcreteValue, DeferredValue, Resource, ResourceId, State, Value, VirtualResource,
 };
 
 fn s(s: &str) -> Value {
@@ -33,12 +32,12 @@ fn ref_to(binding: &str, attr: &str) -> Value {
     })
 }
 
-fn make_managed(binding: &str, attrs: &[(&str, Value)]) -> ManagedResource {
+fn make_managed(binding: &str, attrs: &[(&str, Value)]) -> Resource {
     let mut attributes = IndexMap::new();
     for (k, v) in attrs {
         attributes.insert((*k).into(), v.clone());
     }
-    ManagedResource {
+    Resource {
         id: ResourceId::new("aws.s3.Bucket", binding),
         attributes,
         directives: Default::default(),
@@ -231,7 +230,7 @@ fn resolve_virtual_refs_post_apply_leaves_non_ref_values_intact() {
 
 #[test]
 fn resolve_managed_refs_with_empty_slice_is_ok() {
-    let mut managed: Vec<ManagedResource> = Vec::new();
+    let mut managed: Vec<Resource> = Vec::new();
     {
         let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
             managed: &managed,
@@ -266,7 +265,7 @@ fn resolve_virtual_refs_post_apply_with_empty_slice_is_ok() {
 #[test]
 fn resolve_managed_refs_legacy_shim_produces_identical_result() {
     // Equivalence guard: feeding the same managed-only inputs through
-    // the new typed entry and the legacy `&mut [ManagedResource]` shim must
+    // the new typed entry and the legacy `&mut [Resource]` shim must
     // produce identical attributes.
     let a_new = make_managed("a", &[("value", s("hi"))]);
     let b_new = make_managed("b", &[("dep", ref_to("a", "value"))]);
@@ -285,7 +284,7 @@ fn resolve_managed_refs_legacy_shim_produces_identical_result() {
     }
     .expect("resolve managed");
 
-    let mut legacy: Vec<ManagedResource> = vec![a_new.clone(), b_new.clone()];
+    let mut legacy: Vec<Resource> = vec![a_new.clone(), b_new.clone()];
     {
         let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
             managed: &legacy,

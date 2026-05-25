@@ -297,10 +297,10 @@ mod tests {
     use super::*;
     use carina_core::effect::Effect;
     use carina_core::executor::ProgressInfo;
-    use carina_core::resource::ManagedResource;
+    use carina_core::resource::Resource;
 
     fn dummy_create_effect() -> Effect {
-        Effect::Create(ManagedResource::new("aws.s3.Bucket", "demo"))
+        Effect::Create(Resource::new("aws.s3.Bucket", "demo"))
     }
 
     #[test]

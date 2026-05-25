@@ -31,7 +31,7 @@ use phased::{execute_effects_phased, has_interdependent_replaces};
 /// Input data required to execute a plan.
 pub struct ExecutionInput<'a> {
     pub plan: &'a crate::plan::Plan,
-    pub unresolved_resources: &'a HashMap<ResourceId, crate::resource::ManagedResource>,
+    pub unresolved_resources: &'a HashMap<ResourceId, crate::resource::Resource>,
     /// Virtual resources (module attribute containers). carina#3181:
     /// virtuals are a distinct typestate from managed resources, so the
     /// executor's dependency walk receives them as their own slice. A

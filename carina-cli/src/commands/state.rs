@@ -11,7 +11,7 @@ use carina_core::effect::Effect;
 use carina_core::parser::ProviderContext;
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
-use carina_core::resource::{ConcreteValue, ManagedResource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 use carina_core::value::{format_value, json_to_dsl_value};
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, LockInfo, ResourceState, StateBackend,
@@ -301,10 +301,7 @@ fn format_state_lookup(
     };
 
     let rs = find_resource_by_query(state, resource_name).ok_or_else(|| {
-        AppError::Config(format!(
-            "ManagedResource '{}' not found in state.",
-            resource_name
-        ))
+        AppError::Config(format!("Resource '{}' not found in state.", resource_name))
     })?;
 
     match attribute {
@@ -955,14 +952,14 @@ pub(crate) async fn run_state_refresh_locked(
 ///
 /// When `resource` is `Some`, directives, prefixes, and desired keys
 /// are preserved from it. When `None` (orphan resources), a minimal
-/// `ManagedResource` is constructed from the id.
+/// `Resource` is constructed from the id.
 ///
 /// `label_suffix` is appended to the resource header (e.g., `" (orphan)"`).
 fn diff_display_update_resource(
     id: &ResourceId,
     fresh_state: &State,
     state: &mut carina_state::StateFile,
-    resource: Option<&ManagedResource>,
+    resource: Option<&Resource>,
     label_suffix: &str,
     updated_count: &mut u32,
     unchanged_count: &mut u32,
@@ -1056,7 +1053,7 @@ fn diff_display_update_resource(
         let res = match resource {
             Some(r) => r,
             None => {
-                owned_resource = ManagedResource::with_provider(
+                owned_resource = Resource::with_provider(
                     &id.provider,
                     &id.resource_type,
                     id.name_str(),
@@ -1222,7 +1219,7 @@ mod tests {
         let err = format_state_lookup(&state, "nonexistent", false).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("ManagedResource 'nonexistent' not found"),
+            msg.contains("Resource 'nonexistent' not found"),
             "unexpected error: {}",
             msg
         );

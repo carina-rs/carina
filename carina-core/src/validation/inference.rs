@@ -115,7 +115,7 @@ impl std::fmt::Display for InferenceError {
 /// failing with `unknown binding` (#2493).
 #[derive(Debug, Clone)]
 pub enum InferenceBinding {
-    ManagedResource {
+    Resource {
         provider: String,
         resource_type: String,
     },
@@ -187,7 +187,7 @@ pub fn bindings_from_parsed(parsed: &crate::parser::ParsedFile) -> InferenceBind
 /// semantics; the duplicate-binding check elsewhere is the gate that
 /// reports it to the user.
 pub fn bindings_from_parts(
-    resources: &[crate::resource::ManagedResource],
+    resources: &[crate::resource::Resource],
     data_sources: &[crate::resource::DataSource],
     virtual_resources: &[crate::resource::VirtualResource],
     upstream_states: &[crate::parser::UpstreamState],
@@ -197,7 +197,7 @@ pub fn bindings_from_parts(
         out.insert(us.binding.clone(), InferenceBinding::UpstreamState);
     }
     // carina#3181: managed resources and data sources both carry a
-    // provider identity, so each maps to `InferenceBinding::ManagedResource`
+    // provider identity, so each maps to `InferenceBinding::Resource`
     // (a `read`-bound `${data_source.attr}` still resolves its type via
     // a schema lookup). Virtual resources synthesised by module-call
     // expansion (`expand_module_call`) carry no provider identity — their
@@ -211,7 +211,7 @@ pub fn bindings_from_parts(
         };
         out.insert(
             name.clone(),
-            InferenceBinding::ManagedResource {
+            InferenceBinding::Resource {
                 provider: resource.id.provider.clone(),
                 resource_type: resource.id.resource_type.clone(),
             },
@@ -223,7 +223,7 @@ pub fn bindings_from_parts(
         };
         out.insert(
             name.clone(),
-            InferenceBinding::ManagedResource {
+            InferenceBinding::Resource {
                 provider: data_source.id.provider.clone(),
                 resource_type: data_source.id.resource_type.clone(),
             },
@@ -414,7 +414,7 @@ fn infer_resource_ref_with_visiting(
     visiting: &mut indexmap::IndexSet<String>,
 ) -> Result<TypeExpr, InferenceError> {
     let target = match bindings.get(binding) {
-        Some(InferenceBinding::ManagedResource {
+        Some(InferenceBinding::Resource {
             provider,
             resource_type,
         }) => (provider.as_str(), resource_type.as_str()),
@@ -779,7 +779,7 @@ mod tests {
         let mut b = InferenceBindings::new();
         b.insert(
             name.to_string(),
-            InferenceBinding::ManagedResource {
+            InferenceBinding::Resource {
                 provider: "awscc".to_string(),
                 resource_type: "ec2.Vpc".to_string(),
             },
@@ -1164,9 +1164,8 @@ mod tests {
         // resource wins, so `x.attr` infers precisely instead of
         // degrading to `NonInferableBinding`.
         use crate::parser::UpstreamState;
-        use crate::resource::ManagedResource;
-        let resource =
-            ManagedResource::with_provider("awscc", "ec2.Vpc", "main", None).with_binding("x");
+        use crate::resource::Resource;
+        let resource = Resource::with_provider("awscc", "ec2.Vpc", "main", None).with_binding("x");
         let upstream = UpstreamState {
             binding: "x".to_string(),
             source: std::path::PathBuf::from("../other"),
@@ -1174,7 +1173,7 @@ mod tests {
         let bindings = bindings_from_parts(&[resource], &[], &[], &[upstream]);
         assert!(matches!(
             bindings.get("x"),
-            Some(InferenceBinding::ManagedResource { .. })
+            Some(InferenceBinding::Resource { .. })
         ));
     }
 
@@ -1225,7 +1224,7 @@ mod tests {
         let mut bindings = InferenceBindings::new();
         bindings.insert(
             "policy".to_string(),
-            InferenceBinding::ManagedResource {
+            InferenceBinding::Resource {
                 provider: "awscc".to_string(),
                 resource_type: "iam.Policy".to_string(),
             },
@@ -1284,7 +1283,7 @@ mod tests {
     #[test]
     fn apply_inference_fills_inferable_export_with_inferred_type() {
         let mut parsed = crate::parser::ParsedFile::default();
-        let res = crate::resource::ManagedResource::with_provider("awscc", "ec2.Vpc", "main", None)
+        let res = crate::resource::Resource::with_provider("awscc", "ec2.Vpc", "main", None)
             .with_binding("main");
         parsed.resources.push(res); // allow: direct — fixture test inspection
         parsed.export_params.push(crate::parser::ParsedExportParam {
@@ -1363,7 +1362,7 @@ mod tests {
         // "unknown binding" diagnostic.
         let mut parsed = crate::parser::ParsedFile::default();
         // Concrete role resource with prefixed binding (post-expansion shape).
-        let role = crate::resource::ManagedResource::with_provider(
+        let role = crate::resource::Resource::with_provider(
             "awscc",
             "ec2.Vpc",
             "github_actions_carina.role",

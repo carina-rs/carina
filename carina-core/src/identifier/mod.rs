@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::parser::ProviderConfig;
-use crate::resource::{ConcreteValue, DeferredValue, ManagedResource, ResourceId, Value};
+use crate::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, Value};
 use crate::schema::SchemaRegistry;
 use crate::validation::is_string_compatible_type;
 
@@ -27,7 +27,7 @@ pub fn generate_random_suffix() -> String {
 ///
 /// Errors if both `<attr>_prefix` and `<attr>` are specified, or if prefix is empty.
 pub fn resolve_attr_prefixes(
-    resources: &mut [ManagedResource],
+    resources: &mut [Resource],
     registry: &SchemaRegistry,
 ) -> Result<(), String> {
     let mut all_errors = Vec::new();
@@ -112,7 +112,7 @@ pub struct PrefixStateInfo {
 /// reuses the existing name from state instead of the temporarily generated one.
 /// If the prefix has changed or there's no state match, keeps the new generated name.
 pub fn reconcile_prefixed_names(
-    resources: &mut [ManagedResource],
+    resources: &mut [Resource],
     find_state: &dyn Fn(&str, &str, &str) -> Option<PrefixStateInfo>,
 ) {
     for resource in resources.iter_mut() {
@@ -352,7 +352,7 @@ pub(crate) fn extract_hash_from_identifier(identifier: &str) -> Option<u64> {
 /// so the two always agree on what a resource's anonymous ID would be.
 fn simhash_from_identity_and_resource(
     identity_values: &BTreeMap<String, String>,
-    resource: &ManagedResource,
+    resource: &Resource,
 ) -> u64 {
     let mut simhash_values = identity_values.clone();
     for (key, value) in &resource.attributes {
@@ -368,7 +368,7 @@ fn simhash_from_identity_and_resource(
 /// single resource. Used by `detect_anonymous_to_named_renames` to recover the
 /// anonymous ID of a resource that has since been wrapped in a `let` binding.
 fn compute_resource_simhash(
-    resource: &ManagedResource,
+    resource: &Resource,
     providers: &[ProviderConfig],
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
 ) -> u64 {
@@ -393,7 +393,7 @@ fn compute_resource_simhash(
 /// `identity_attributes_fn` takes a provider name and returns the list of identity attribute names
 /// for that provider (e.g., `["region"]`).
 pub fn compute_anonymous_identifiers(
-    resources: &mut [ManagedResource],
+    resources: &mut [Resource],
     providers: &[ProviderConfig],
     registry: &SchemaRegistry,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
@@ -573,7 +573,7 @@ pub struct AnonymousIdStateInfo {
 /// resource keeps its freshly-computed new-format name and the wiring layer
 /// re-keys the state entry instead of destroy+recreate.
 pub fn reconcile_anonymous_identifiers(
-    resources: &mut [ManagedResource],
+    resources: &mut [Resource],
     registry: &SchemaRegistry,
     find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
 ) -> Vec<(String, String)> {
@@ -716,7 +716,7 @@ pub fn reconcile_anonymous_identifiers(
 /// An "orphaned" state entry is one whose name is not used by any current DSL
 /// resource (so it would otherwise appear as a Delete in the plan).
 pub fn detect_anonymous_to_named_renames(
-    resources: &[ManagedResource],
+    resources: &[Resource],
     registry: &SchemaRegistry,
     find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
     providers: &[ProviderConfig],

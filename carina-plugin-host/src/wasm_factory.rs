@@ -24,7 +24,7 @@ use carina_core::provider::{
     BoxFuture, CreateRequest, DeleteRequest, Provider, ProviderError, ProviderFactory,
     ProviderNormalizer, ProviderResult, ReadRequest, SavedAttrs, UpdateRequest,
 };
-use carina_core::resource::{DataSource, ManagedResource, ResourceId, State, Value};
+use carina_core::resource::{DataSource, Resource, ResourceId, State, Value};
 use carina_core::schema::{CompletionValue, ResourceSchema, TypeIdentity};
 use carina_core::value::SerializationError;
 
@@ -1952,7 +1952,7 @@ unsafe impl Sync for WasmProviderNormalizer {}
 impl ProviderNormalizer for WasmProviderNormalizer {
     fn normalize_desired<'a>(
         &'a self,
-        resources: &'a mut [ManagedResource],
+        resources: &'a mut [Resource],
     ) -> carina_core::provider::BoxFuture<'a, ()> {
         Box::pin(async move {
             let wit_resources: Vec<_> = expect_unresolvable_absent(
@@ -2093,7 +2093,7 @@ impl ProviderNormalizer for WasmProviderNormalizer {
 
     fn merge_default_tags<'a>(
         &'a self,
-        resources: &'a mut [ManagedResource],
+        resources: &'a mut [Resource],
         default_tags: &'a IndexMap<String, Value>,
         _registry: &'a carina_core::schema::SchemaRegistry,
     ) -> carina_core::provider::BoxFuture<'a, ()> {

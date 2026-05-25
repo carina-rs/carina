@@ -1,5 +1,5 @@
 //! Tests for #3174: `ResourceLike` trait — shared read-only
-//! accessors implemented for `ManagedResource`, `VirtualResource`, and
+//! accessors implemented for `Resource`, `VirtualResource`, and
 //! `DataSource`.
 
 use std::collections::{BTreeSet, HashSet};
@@ -7,8 +7,8 @@ use std::collections::{BTreeSet, HashSet};
 use indexmap::IndexMap;
 
 use crate::resource::{
-    ConcreteValue, DataSource, Directives, ManagedResource, ModuleSource, ResourceId, ResourceLike,
-    Value, VirtualResource,
+    ConcreteValue, DataSource, Directives, ModuleSource, Resource, ResourceId, ResourceLike, Value,
+    VirtualResource,
 };
 
 fn sample_value(s: &str) -> Value {
@@ -19,8 +19,8 @@ fn deps() -> BTreeSet<String> {
     ["dep_binding".into()].into_iter().collect()
 }
 
-fn make_managed() -> ManagedResource {
-    ManagedResource::new("aws.s3.Bucket", "b")
+fn make_managed() -> Resource {
+    Resource::new("aws.s3.Bucket", "b")
         .with_attribute("k", sample_value("v"))
         .with_binding("b")
         .with_dependency_bindings(deps())
@@ -74,7 +74,7 @@ fn assert_resource_like<R: ResourceLike>(
 }
 
 #[test]
-fn managed_resource_implements_resource_like() {
+fn resource_implements_resource_like() {
     let managed = make_managed();
     let expected_id = managed.id.clone();
     assert_resource_like(&managed, &expected_id, "k", Some("b"), &deps());
@@ -96,9 +96,9 @@ fn data_source_implements_resource_like() {
 
 #[test]
 fn binding_none_covers_all_arms() {
-    // ManagedResource::new() leaves binding = None by default.
-    let managed = ManagedResource::new("aws.s3.Bucket", "b");
-    assert_eq!(<ManagedResource as ResourceLike>::binding(&managed), None);
+    // Resource::new() leaves binding = None by default.
+    let managed = Resource::new("aws.s3.Bucket", "b");
+    assert_eq!(<Resource as ResourceLike>::binding(&managed), None);
 
     let mut v = make_virtual();
     v.binding = None;

@@ -99,7 +99,7 @@ fn build_list_item(row: &crate::module_info_app::InfoRow, is_selected: bool) -> 
             }
             s
         }
-        SectionKind::ManagedResource => {
+        SectionKind::Resource => {
             vec![
                 Span::raw(indent),
                 Span::styled(row.label.clone(), Style::default().fg(Color::White)),

@@ -9,7 +9,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use crate::deps::{find_failed_dependency, get_resource_dependencies};
 use crate::effect::Effect;
 use crate::provider::{CreateRequest, DeleteRequest, Provider, UpdateRequest};
-use crate::resource::{ConcreteValue, ManagedResource, ResourceId, State, Value};
+use crate::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 
 use super::basic::{
     BasicEffectCtx, BasicEffectResult, ExecutionState, RenormalizePipeline,
@@ -141,7 +141,7 @@ pub(super) fn topological_sort_replaces(
 pub(super) fn build_phase_dependency_map(
     effects: &[Effect],
     phase_indices: &[usize],
-    unresolved_resources: &HashMap<ResourceId, ManagedResource>,
+    unresolved_resources: &HashMap<ResourceId, Resource>,
     virtual_resources: &[crate::resource::VirtualResource],
 ) -> HashMap<usize, HashSet<usize>> {
     // Build binding -> effect index mapping for effects in this phase
@@ -213,11 +213,7 @@ impl<'a> DepResolver<'a> {
 
     /// Walk a resource's dependencies (via `get_resource_dependencies`) and
     /// merge the reached effect indices into `out`.
-    pub(super) fn collect_from_resource(
-        &self,
-        resource: &ManagedResource,
-        out: &mut HashSet<usize>,
-    ) {
+    pub(super) fn collect_from_resource(&self, resource: &Resource, out: &mut HashSet<usize>) {
         let dep_bindings = get_resource_dependencies(resource);
         let mut visited: HashSet<&str> = HashSet::new();
         for binding in &dep_bindings {
@@ -1387,7 +1383,7 @@ mod tests {
 
     #[test]
     fn build_phase_dependency_map_follows_virtual_module_binding() {
-        let mut role = ManagedResource::with_provider("awscc", "iam.Role", "bootstrap.role", None);
+        let mut role = Resource::with_provider("awscc", "iam.Role", "bootstrap.role", None);
         role.binding = Some("bootstrap.role".to_string());
 
         // carina#3181: the virtual exposes `role_name = role.role_name`,
@@ -1400,7 +1396,7 @@ mod tests {
             "role_name",
         );
 
-        let mut role_policy = ManagedResource::with_provider("awscc", "iam.RolePolicy", "rp", None);
+        let mut role_policy = Resource::with_provider("awscc", "iam.RolePolicy", "rp", None);
         role_policy.set_attr(
             "role_name",
             Value::resource_ref("bootstrap", "role_name", vec![]),
@@ -1412,7 +1408,7 @@ mod tests {
         ];
         let phase_indices: Vec<usize> = vec![0, 1];
 
-        let mut unresolved: HashMap<ResourceId, ManagedResource> = HashMap::new();
+        let mut unresolved: HashMap<ResourceId, Resource> = HashMap::new();
         unresolved.insert(role.id.clone(), role.clone());
         unresolved.insert(role_policy.id.clone(), role_policy.clone());
 
@@ -1430,8 +1426,7 @@ mod tests {
     /// through both layers to the underlying resource.
     #[test]
     fn build_phase_dependency_map_follows_nested_virtual_module_bindings() {
-        let mut role =
-            ManagedResource::with_provider("awscc", "iam.Role", "outer.inner.role", None);
+        let mut role = Resource::with_provider("awscc", "iam.Role", "outer.inner.role", None);
         role.binding = Some("outer.inner.role".to_string());
 
         let inner_virt = make_virtual(
@@ -1443,7 +1438,7 @@ mod tests {
         );
         let outer_virt = make_virtual("outer", "outer", "role_name", "outer.inner", "role_name");
 
-        let mut caller = ManagedResource::with_provider("awscc", "iam.RolePolicy", "rp", None);
+        let mut caller = Resource::with_provider("awscc", "iam.RolePolicy", "rp", None);
         caller.set_attr(
             "role_name",
             Value::resource_ref("outer", "role_name", vec![]),
@@ -1452,7 +1447,7 @@ mod tests {
         let effects = vec![Effect::Create(role.clone()), Effect::Create(caller.clone())];
         let phase_indices: Vec<usize> = vec![0, 1];
 
-        let mut unresolved: HashMap<ResourceId, ManagedResource> = HashMap::new();
+        let mut unresolved: HashMap<ResourceId, Resource> = HashMap::new();
         unresolved.insert(role.id.clone(), role);
         unresolved.insert(caller.id.clone(), caller);
 
@@ -1477,9 +1472,9 @@ mod tests {
     fn topological_sort_replaces_respects_depends_on() {
         use crate::resource::{Directives, State};
 
-        let mut role = ManagedResource::with_provider("test", "iam.Role", "role", None);
+        let mut role = Resource::with_provider("test", "iam.Role", "role", None);
         role.binding = Some("role".to_string());
-        let mut bucket = ManagedResource::with_provider("test", "s3.Bucket", "bucket", None);
+        let mut bucket = Resource::with_provider("test", "s3.Bucket", "bucket", None);
         bucket.binding = Some("bucket".to_string());
         bucket.directives = Directives {
             depends_on: vec!["role".to_string()],

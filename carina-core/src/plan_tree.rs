@@ -373,13 +373,12 @@ pub fn shorten_service_name<'a>(attr_name: &str, value: &'a str) -> Cow<'a, str>
 mod tests {
     use super::*;
     use crate::plan::Plan;
-    use crate::resource::ManagedResource;
+    use crate::resource::Resource;
 
     #[test]
     fn explicit_only_depends_on_edge_is_in_dependency_graph() {
-        let role = ManagedResource::new("iam.Role", "role").with_binding("role".to_string());
-        let mut bucket =
-            ManagedResource::new("s3.Bucket", "bucket").with_binding("bucket".to_string());
+        let role = Resource::new("iam.Role", "role").with_binding("role".to_string());
+        let mut bucket = Resource::new("s3.Bucket", "bucket").with_binding("bucket".to_string());
         bucket.directives.depends_on = vec!["role".to_string()];
 
         let mut plan = Plan::new();

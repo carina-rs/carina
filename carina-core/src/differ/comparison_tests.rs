@@ -133,7 +133,7 @@ fn type_aware_diff_no_change_with_schema() {
         AttributeSchema::new("port", AttributeType::Float),
     );
 
-    let desired = ManagedResource::new("test.resource", "test")
+    let desired = Resource::new("test.resource", "test")
         .with_attribute("port", Value::Concrete(ConcreteValue::Int(443)));
 
     let mut current_attrs = HashMap::new();
@@ -1079,7 +1079,7 @@ fn carina3080_principal_scalar_vs_singleton_is_no_change_via_pipeline() {
             "cloudfront.amazonaws.com".to_string(),
         )),
     );
-    let mut resources = vec![ManagedResource::new("iam.policy", "p1").with_attribute(
+    let mut resources = vec![Resource::new("iam.policy", "p1").with_attribute(
         "principal",
         Value::Concrete(ConcreteValue::Map(desired_inner)),
     )];
@@ -1261,7 +1261,7 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
         Value::Concrete(ConcreteValue::Map(desired_dcb)),
     );
     let mut resources = vec![
-        ManagedResource::new("cloudfront.Distribution", "d1").with_attribute(
+        Resource::new("cloudfront.Distribution", "d1").with_attribute(
             "distribution_config",
             Value::Concrete(ConcreteValue::Map(desired_dc)),
         ),
@@ -1468,7 +1468,7 @@ fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline()
     };
 
     let mut resources = vec![
-        ManagedResource::new("cloudfront.Distribution", "d1")
+        Resource::new("cloudfront.Distribution", "d1")
             .with_attribute("distribution_config", dcb("get", "head")),
     ];
     resources[0].id.provider = "awscc".to_string();

@@ -15,7 +15,7 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
     // Schema is registered with provider-prefixed key
     schemas.insert("awscc", schema);
 
-    let mut resource = ManagedResource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
+    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
     resource.set_attr(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
@@ -93,8 +93,8 @@ fn build_state_after_apply_preserves_block_name_attribute() {
         );
     schemas.insert("awscc", schema);
 
-    // ManagedResource with resolved block name (policy -> policies)
-    let mut resource = ManagedResource::with_provider("awscc", "iam.role", "test-role", None);
+    // Resource with resolved block name (policy -> policies)
+    let mut resource = Resource::with_provider("awscc", "iam.role", "test-role", None);
     resource.set_attr(
         "role_name".to_string(),
         Value::Concrete(ConcreteValue::String("test-role".to_string())),
@@ -233,7 +233,7 @@ fn block_name_attribute_no_diff_when_hydrated() {
         );
 
     // Desired resource (after resolve_block_names: "policy" -> "policies")
-    let mut resource = ManagedResource::with_provider("awscc", "iam.role", "test-role", None);
+    let mut resource = Resource::with_provider("awscc", "iam.role", "test-role", None);
     resource.set_attr(
         "role_name".to_string(),
         Value::Concrete(ConcreteValue::String("test-role".to_string())),
@@ -342,8 +342,8 @@ fn block_name_attribute_state_roundtrip() {
         .attribute(AttributeSchema::new("description", AttributeType::String));
     schemas.insert("awscc", schema);
 
-    // ManagedResource with resolved block name
-    let mut resource = ManagedResource::with_provider("awscc", "ec2.ipam", "test-ipam", None);
+    // Resource with resolved block name
+    let mut resource = Resource::with_provider("awscc", "ec2.ipam", "test-ipam", None);
     resource.set_attr(
         "operating_regions".to_string(),
         Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
@@ -488,9 +488,9 @@ fn move_plus_replace_keeps_post_replace_identifier_and_attributes() {
         "rd.awscc_iam_role_policy_0cd2c914",
         None,
     );
-    let mut resource = ManagedResource {
+    let mut resource = Resource {
         id: new_id.clone(),
-        ..ManagedResource::with_provider(
+        ..Resource::with_provider(
             new_id.provider.clone(),
             new_id.resource_type.clone(),
             new_id.name.as_str(),
@@ -661,7 +661,7 @@ fn move_plus_update_keeps_post_update_attributes() {
     schemas.insert("awscc", schema);
 
     let new_id = ResourceId::with_provider("awscc", "ec2.Tag", "tag_new", None);
-    let mut resource = ManagedResource::with_provider("awscc", "ec2.Tag", "tag_new", None);
+    let mut resource = Resource::with_provider("awscc", "ec2.Tag", "tag_new", None);
     resource.set_attr(
         "key".to_string(),
         Value::Concrete(ConcreteValue::String("env".to_string())),
@@ -751,7 +751,7 @@ fn move_alone_carries_attributes_via_current_states() {
     );
 
     let new_id = ResourceId::with_provider("awscc", "s3.Bucket", "bucket_new", None);
-    let mut resource = ManagedResource::with_provider("awscc", "s3.Bucket", "bucket_new", None);
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "bucket_new", None);
     resource.set_attr(
         "bucket_name".to_string(),
         Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
@@ -866,7 +866,7 @@ fn failed_refresh_preserves_existing_row() {
     );
 
     let id = ResourceId::with_provider("awscc", "s3.Bucket", "stuck", None);
-    let resource = ManagedResource::with_provider("awscc", "s3.Bucket", "stuck", None);
+    let resource = Resource::with_provider("awscc", "s3.Bucket", "stuck", None);
     let sorted_resources = vec![resource];
 
     let mut failed_refreshes = HashSet::new();
@@ -918,7 +918,7 @@ fn move_from_overlapping_desired_resource_errors() {
     );
 
     let id = ResourceId::with_provider("awscc", "s3.Bucket", "collision", None);
-    let mut resource = ManagedResource::with_provider("awscc", "s3.Bucket", "collision", None);
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "collision", None);
     resource.set_attr(
         "bucket_name".to_string(),
         Value::Concrete(ConcreteValue::String("x".to_string())),
@@ -975,7 +975,7 @@ fn remove_overlapping_desired_resource_errors() {
     );
 
     let id = ResourceId::with_provider("awscc", "s3.Bucket", "collision", None);
-    let mut resource = ManagedResource::with_provider("awscc", "s3.Bucket", "collision", None);
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "collision", None);
     resource.set_attr(
         "bucket_name".to_string(),
         Value::Concrete(ConcreteValue::String("x".to_string())),
@@ -1026,7 +1026,7 @@ fn self_move_overlapping_desired_resource_errors() {
     );
 
     let id = ResourceId::with_provider("awscc", "s3.Bucket", "self", None);
-    let mut resource = ManagedResource::with_provider("awscc", "s3.Bucket", "self", None);
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "self", None);
     resource.set_attr(
         "bucket_name".to_string(),
         Value::Concrete(ConcreteValue::String("x".to_string())),
@@ -1133,7 +1133,7 @@ fn resolve_exports_resolves_cross_file_dot_notation_strings() {
     // with a binding; provider-returned attributes flow in via
     // `current_states` derived from `state.resources`.
     let mut registry_prod =
-        ManagedResource::with_provider("awscc", "organizations.account", "registry-prod", None);
+        Resource::with_provider("awscc", "organizations.account", "registry-prod", None);
     registry_prod.binding = Some("registry_prod".to_string());
     let sorted_resources = vec![registry_prod];
 
@@ -1195,7 +1195,7 @@ fn resolve_exports_resolves_module_call_attribute_via_virtual_resource() {
     };
 
     let mut role_resource =
-        ManagedResource::with_provider("awscc", "iam.Role", "github_actions_carina.role", None);
+        Resource::with_provider("awscc", "iam.Role", "github_actions_carina.role", None);
     role_resource.binding = Some("github_actions_carina.role".to_string());
 
     // Virtual resource as `expand_module_call` produces it: binding is
@@ -1289,8 +1289,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_virtuals() {
         serde_json::from_value::<StateFile>(json).unwrap()
     };
 
-    let mut role_resource =
-        ManagedResource::with_provider("awscc", "iam.Role", "outer.inner.role", None);
+    let mut role_resource = Resource::with_provider("awscc", "iam.Role", "outer.inner.role", None);
     role_resource.binding = Some("outer.inner.role".to_string());
 
     // carina#3181: virtuals are a distinct typestate.
@@ -1463,7 +1462,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     // head-of-pipeline resolver — they keep their authored
     // `ResourceRef`s, which is exactly the pre-resolve snapshot the
     // #3177 fix needs.
-    let mut role_managed = ManagedResource::with_provider("awscc", "iam.Role", "carina_role", None);
+    let mut role_managed = Resource::with_provider("awscc", "iam.Role", "carina_role", None);
     role_managed.binding = Some("role".to_string());
 
     let mut virt_attrs = indexmap::IndexMap::new();

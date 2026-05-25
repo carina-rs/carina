@@ -4,9 +4,7 @@ use crate::provider::{
     BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer, ProviderError, ProviderResult,
     ReadRequest, UpdateRequest,
 };
-use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, Directives, ManagedResource, Value,
-};
+use crate::resource::{ConcreteValue, DataSource, DeferredValue, Directives, Resource, Value};
 use parallel::{build_dependency_levels, build_dependency_map};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -25,7 +23,7 @@ struct MockProvider {
     /// Resources passed in to `create()` in call order — lets a test
     /// assert that the executor handed the provider a fully-resolved
     /// resource (no remaining `Value::Deferred(ResourceRef)` etc.).
-    create_resources: Arc<Mutex<Vec<ManagedResource>>>,
+    create_resources: Arc<Mutex<Vec<Resource>>>,
     /// `UpdateRequest`s passed in to `update()` in call order — lets a
     /// test assert the patch carries re-normalized attribute values.
     update_requests: Arc<Mutex<Vec<UpdateRequest>>>,
@@ -64,7 +62,7 @@ impl MockProvider {
         self.call_log.lock().unwrap().clone()
     }
 
-    fn captured_create_resources(&self) -> Vec<ManagedResource> {
+    fn captured_create_resources(&self) -> Vec<Resource> {
         self.create_resources.lock().unwrap().clone()
     }
 
@@ -259,7 +257,7 @@ fn canonicalize_value(v: &Value) -> Option<Value> {
 impl crate::provider::ProviderNormalizer for CanonicalizingNormalizer {
     fn normalize_desired<'a>(
         &'a self,
-        resources: &'a mut [ManagedResource],
+        resources: &'a mut [Resource],
     ) -> crate::provider::BoxFuture<'a, ()> {
         Box::pin(async move {
             for r in resources.iter_mut() {
@@ -292,7 +290,7 @@ impl crate::provider::ProviderNormalizer for CanonicalizingNormalizer {
 
     fn merge_default_tags<'a>(
         &'a self,
-        _resources: &'a mut [ManagedResource],
+        _resources: &'a mut [Resource],
         _default_tags: &'a indexmap::IndexMap<String, Value>,
         _registry: &'a crate::schema::SchemaRegistry,
     ) -> crate::provider::BoxFuture<'a, ()> {
@@ -378,8 +376,8 @@ impl ProviderFactory for AliasFactory {
 // Helper functions
 // -----------------------------------------------------------------------
 
-fn make_resource(binding: &str, deps: &[&str]) -> ManagedResource {
-    let mut r = ManagedResource::new("test", binding);
+fn make_resource(binding: &str, deps: &[&str]) -> Resource {
+    let mut r = Resource::new("test", binding);
     r.binding = Some(binding.to_string());
     for dep in deps {
         r.set_attr(
@@ -512,7 +510,7 @@ async fn test_apply_reapplies_enum_alias_stage() {
     let provider = MockProvider::new();
     // `id.provider = "test"` so the per-resource factory lookup finds
     // `AliasFactory` (whose `name()` is `"test"`).
-    let mut resource = ManagedResource::with_provider("test", "sg", "a", None);
+    let mut resource = Resource::with_provider("test", "sg", "a", None);
     resource.binding = Some("a".to_string());
     // Post-normalize_desired shape: namespaced DSL enum identifier.
     resource.set_attr(
@@ -561,7 +559,7 @@ async fn test_apply_reapplies_enum_alias_stage() {
 #[tokio::test]
 async fn test_apply_reapplies_enum_alias_stage_update_path() {
     let provider = MockProvider::new();
-    let mut to_resource = ManagedResource::with_provider("test", "sg", "a", None);
+    let mut to_resource = Resource::with_provider("test", "sg", "a", None);
     to_resource.binding = Some("a".to_string());
     to_resource.set_attr(
         "ip_protocol",
@@ -628,7 +626,7 @@ async fn test_apply_reapplies_enum_alias_stage_update_path() {
 #[tokio::test]
 async fn test_apply_reapplies_canonicalize_stage() {
     let provider = MockProvider::new();
-    let mut resource = ManagedResource::with_provider("test", "sg", "a", None);
+    let mut resource = Resource::with_provider("test", "sg", "a", None);
     resource.binding = Some("a".to_string());
     resource.set_attr(
         "subject",
@@ -839,7 +837,7 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
     impl crate::provider::ProviderNormalizer for LockHoldingNormalizer {
         fn normalize_desired<'a>(
             &'a self,
-            resources: &'a mut [ManagedResource],
+            resources: &'a mut [Resource],
         ) -> crate::provider::BoxFuture<'a, ()> {
             Box::pin(async move {
                 let mut guard = self.store.lock().await;
@@ -872,7 +870,7 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
 
         fn merge_default_tags<'a>(
             &'a self,
-            _resources: &'a mut [ManagedResource],
+            _resources: &'a mut [Resource],
             _default_tags: &'a indexmap::IndexMap<String, Value>,
             _registry: &'a crate::schema::SchemaRegistry,
         ) -> crate::provider::BoxFuture<'a, ()> {
@@ -1022,7 +1020,7 @@ async fn test_cbd_creates_before_deletes() {
     let provider = MockProvider::new();
     let rid = ResourceId::new("test", "a");
     let from = State::existing(rid.clone(), HashMap::new()).with_identifier("old-id");
-    let to = ManagedResource::new("test", "a");
+    let to = Resource::new("test", "a");
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
@@ -1070,7 +1068,7 @@ async fn test_dbd_deletes_before_creates() {
     let provider = MockProvider::new();
     let rid = ResourceId::new("test", "a");
     let from = State::existing(rid.clone(), HashMap::new()).with_identifier("old-id");
-    let to = ManagedResource::new("test", "a");
+    let to = Resource::new("test", "a");
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
@@ -1121,12 +1119,12 @@ async fn test_phased_cbd_creates_in_forward_order_deletes_in_reverse() {
     let subnet_id = ResourceId::new("test", "subnet");
 
     let vpc_from = State::existing(vpc_id.clone(), HashMap::new()).with_identifier("vpc-old");
-    let mut vpc_to = ManagedResource::new("test", "vpc");
+    let mut vpc_to = Resource::new("test", "vpc");
     vpc_to.binding = Some("vpc".to_string());
 
     let subnet_from =
         State::existing(subnet_id.clone(), HashMap::new()).with_identifier("subnet-old");
-    let mut subnet_to = ManagedResource::new("test", "subnet");
+    let mut subnet_to = Resource::new("test", "subnet");
     subnet_to.binding = Some("subnet".to_string());
     subnet_to.dependency_bindings = std::collections::BTreeSet::from(["vpc".to_string()]);
 
@@ -1202,12 +1200,12 @@ async fn test_phased_noncbd_creates_after_deletes() {
     let subnet_id = ResourceId::new("test", "subnet");
 
     let vpc_from = State::existing(vpc_id.clone(), HashMap::new()).with_identifier("vpc-old");
-    let mut vpc_to = ManagedResource::new("test", "vpc");
+    let mut vpc_to = Resource::new("test", "vpc");
     vpc_to.binding = Some("vpc".to_string());
 
     let subnet_from =
         State::existing(subnet_id.clone(), HashMap::new()).with_identifier("subnet-old");
-    let mut subnet_to = ManagedResource::new("test", "subnet");
+    let mut subnet_to = Resource::new("test", "subnet");
     subnet_to.binding = Some("subnet".to_string());
     subnet_to.dependency_bindings = std::collections::BTreeSet::from(["vpc".to_string()]);
 
@@ -1510,7 +1508,7 @@ fn test_build_dependency_levels_transitive_ref_preserves_direct_dep() {
     // but _dependency_bindings records the original direct dependencies.
 
     // tgw_attach depends on tgw, vpc, subnet
-    let mut tgw_attach = ManagedResource::new("ec2.transit_gateway_attachment", "tgw_attach");
+    let mut tgw_attach = Resource::new("ec2.transit_gateway_attachment", "tgw_attach");
     tgw_attach.binding = Some("tgw_attach".to_string());
     tgw_attach.dependency_bindings = std::collections::BTreeSet::from([
         "tgw".to_string(),
@@ -1520,7 +1518,7 @@ fn test_build_dependency_levels_transitive_ref_preserves_direct_dep() {
 
     // route depends on rt and tgw_attach (but after partial resolution,
     // transit_gateway_id points to ResourceRef { binding: "tgw" })
-    let mut route = ManagedResource::new("ec2.route", "my-route");
+    let mut route = Resource::new("ec2.route", "my-route");
     route.set_attr(
         "transit_gateway_id".to_string(),
         Value::resource_ref("tgw".to_string(), "id".to_string(), vec![]),
@@ -1529,17 +1527,17 @@ fn test_build_dependency_levels_transitive_ref_preserves_direct_dep() {
         std::collections::BTreeSet::from(["rt".to_string(), "tgw_attach".to_string()]);
 
     // Other resources
-    let mut vpc = ManagedResource::new("ec2.Vpc", "vpc");
+    let mut vpc = Resource::new("ec2.Vpc", "vpc");
     vpc.binding = Some("vpc".to_string());
 
-    let mut tgw = ManagedResource::new("ec2.transit_gateway", "tgw");
+    let mut tgw = Resource::new("ec2.transit_gateway", "tgw");
     tgw.binding = Some("tgw".to_string());
 
-    let mut subnet = ManagedResource::new("ec2.Subnet", "subnet");
+    let mut subnet = Resource::new("ec2.Subnet", "subnet");
     subnet.binding = Some("subnet".to_string());
     subnet.dependency_bindings = std::collections::BTreeSet::from(["vpc".to_string()]);
 
-    let mut rt = ManagedResource::new("ec2.RouteTable", "rt");
+    let mut rt = Resource::new("ec2.RouteTable", "rt");
     rt.binding = Some("rt".to_string());
     rt.dependency_bindings = std::collections::BTreeSet::from(["vpc".to_string()]);
 
@@ -1960,7 +1958,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
     let provider = RecordingMockProvider::new();
 
     // VPC resource with binding "vpc"
-    let mut vpc = ManagedResource::new("test", "my-vpc");
+    let mut vpc = Resource::new("test", "my-vpc");
     vpc.binding = Some("vpc".to_string());
     vpc.set_attr(
         "cidr_block",
@@ -1969,7 +1967,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
     let vpc_id = vpc.id.clone();
 
     // Subnet resource that references vpc.vpc_id
-    let mut subnet = ManagedResource::new("test", "my-subnet");
+    let mut subnet = Resource::new("test", "my-subnet");
     subnet.set_attr(
         "vpc_id",
         Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
@@ -2148,7 +2146,7 @@ async fn test_delete_waits_for_replace_cbd_of_dependent() {
         .with_identifier("attach-old")
         .with_dependency_bindings(std::collections::BTreeSet::from(["tgw_a".to_string()]));
     // to: depends on tgw_b (different TGW — dependency changed)
-    let mut attachment_to = ManagedResource::new("test", "attachment");
+    let mut attachment_to = Resource::new("test", "attachment");
     attachment_to.binding = Some("attachment".to_string());
     attachment_to.dependency_bindings = std::collections::BTreeSet::from(["tgw_b".to_string()]);
 
@@ -2160,7 +2158,7 @@ async fn test_delete_waits_for_replace_cbd_of_dependent() {
     let mut plan = Plan::new();
 
     // tgw_b: Create (new resource)
-    let mut tgw_b = ManagedResource::new("test", "tgw_b");
+    let mut tgw_b = Resource::new("test", "tgw_b");
     tgw_b.binding = Some("tgw_b".to_string());
     plan.add(Effect::Create(tgw_b));
 
@@ -2242,7 +2240,7 @@ async fn test_delete_waits_for_replace_cbd_even_when_delete_binding_is_none() {
     let attachment_from = State::existing(attachment_id.clone(), HashMap::new())
         .with_identifier("attach-old")
         .with_dependency_bindings(std::collections::BTreeSet::from(["tgw_a".to_string()]));
-    let mut attachment_to = ManagedResource::new("test", "attachment");
+    let mut attachment_to = Resource::new("test", "attachment");
     attachment_to.binding = Some("attachment".to_string());
     attachment_to.dependency_bindings = std::collections::BTreeSet::from(["tgw_b".to_string()]);
 
@@ -2254,7 +2252,7 @@ async fn test_delete_waits_for_replace_cbd_even_when_delete_binding_is_none() {
     let mut plan = Plan::new();
 
     // tgw_b: Create
-    let mut tgw_b = ManagedResource::new("test", "tgw_b");
+    let mut tgw_b = Resource::new("test", "tgw_b");
     tgw_b.binding = Some("tgw_b".to_string());
     plan.add(Effect::Create(tgw_b));
 
@@ -2437,7 +2435,7 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
     // `dist` references the wait binding from *inside a nested Map*,
     // mirroring `viewer_certificate = { acm_certificate_arn =
     // cert_issued.certificate_arn }`.
-    let mut dist = ManagedResource::new("test", "dist");
+    let mut dist = Resource::new("test", "dist");
     dist.binding = Some("dist".to_string());
     let mut viewer_certificate = indexmap::IndexMap::new();
     viewer_certificate.insert(
@@ -2657,7 +2655,7 @@ async fn test_chained_index_then_field_unresolved_at_apply_fails_with_clear_erro
     // attribute would be populated only by the create's read-back
     // state. Mirror the real ACM Certificate's user-facing shape.
     let cert = {
-        let mut r = ManagedResource::new("test", "cert");
+        let mut r = Resource::new("test", "cert");
         r.binding = Some("cert".to_string());
         r.set_attr(
             "domain_name",
@@ -2671,7 +2669,7 @@ async fn test_chained_index_then_field_unresolved_at_apply_fails_with_clear_erro
     // attributes from the issue:
     //   resource_records = [cert.domain_validation_options[0].resource_record_value]
     let record = {
-        let mut r = ManagedResource::new("test", "record");
+        let mut r = Resource::new("test", "record");
         r.binding = Some("record".to_string());
         r.dependency_bindings = ["cert".to_string()].into_iter().collect();
         let value_path = AccessPath::with_segments(
@@ -2800,7 +2798,7 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
     // as `carina-provider-aws::services::acm::certificate.rs::read_acm_certificate`
     // inserts it.
     let cert = {
-        let mut r = ManagedResource::new("test", "cert");
+        let mut r = Resource::new("test", "cert");
         r.binding = Some("cert".to_string());
         r.set_attr(
             "domain_name",
@@ -2814,7 +2812,7 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
     // chained-access path. Uses the post-aws#295 *nested* shape:
     // `resource_record` is a struct with `name`/`type`/`value`.
     let record = {
-        let mut r = ManagedResource::new("test", "record");
+        let mut r = Resource::new("test", "record");
         r.binding = Some("record".to_string());
         r.dependency_bindings = ["cert".to_string()].into_iter().collect();
         let chained_dvo = |leaf: &str| {
@@ -3069,7 +3067,7 @@ impl Provider for IdentifierAwareProvider {
 async fn wait_resolves_target_identifier_from_just_created_state() {
     use crate::wait::predicate::{AttrPath, WaitPredicate};
 
-    let mut cert = ManagedResource::new("test", "cert");
+    let mut cert = Resource::new("test", "cert");
     cert.binding = Some("cert".to_string());
     let cert_id = cert.id.clone();
 
@@ -3153,12 +3151,12 @@ async fn test_phased_move_with_interdependent_replace_does_not_panic() {
     let policy_new_id = ResourceId::new("test", "policy_new");
 
     let role_from = State::existing(role_id.clone(), HashMap::new()).with_identifier("role-old");
-    let mut role_to = ManagedResource::new("test", "role");
+    let mut role_to = Resource::new("test", "role");
     role_to.binding = Some("role".to_string());
 
     let policy_from =
         State::existing(policy_new_id.clone(), HashMap::new()).with_identifier("policy-old");
-    let mut policy_to = ManagedResource::new("test", "policy_new");
+    let mut policy_to = Resource::new("test", "policy_new");
     policy_to.dependency_bindings = std::collections::BTreeSet::from(["role".to_string()]);
 
     let mut plan = Plan::new();
@@ -3238,7 +3236,7 @@ async fn test_phased_move_with_interdependent_replace_does_not_panic() {
 /// `assume_role_policy_document.statement[].principal.aws = admin_access_roles.arns`
 /// on `carina-rs/infra@main`.
 #[tokio::test]
-async fn test_data_source_read_state_resolves_for_downstream_managed_resource() {
+async fn test_data_source_read_state_resolves_for_downstream_resource() {
     use crate::binding_index::{PreApplyInputs, ResolvedBindings};
     use crate::resource::{AccessPath, ResourceId};
 
@@ -3286,7 +3284,7 @@ async fn test_data_source_read_state_resolves_for_downstream_managed_resource() 
     // struct, but the resolve path is the same per-attribute one.)
     let role_id = ResourceId::with_provider("awscc", "iam.Role", "rd.role", None);
     let role = {
-        let mut r = ManagedResource::with_provider("awscc", "iam.Role", "rd.role", None);
+        let mut r = Resource::with_provider("awscc", "iam.Role", "rd.role", None);
         r.id = role_id.clone();
         r.binding = Some("role".to_string());
         // No `dependency_bindings` — the executor's dependency-graph

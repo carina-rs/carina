@@ -7,7 +7,7 @@
 //!
 //! See `notes/specs/2026-05-10-explicit-fields-design.md`.
 
-use crate::resource::{ConcreteValue, ManagedResource, Value};
+use crate::resource::{ConcreteValue, Resource, Value};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -56,7 +56,7 @@ pub enum ExplicitFields {
 /// Build an `ExplicitFields::Struct` rooted at a resource's top-level
 /// attributes. Underscore-prefixed keys (internal attributes) are
 /// excluded.
-pub fn build_from_resource(resource: &ManagedResource) -> ExplicitFields {
+pub fn build_from_resource(resource: &Resource) -> ExplicitFields {
     ExplicitFields::Struct {
         children: resource
             .attributes
@@ -301,7 +301,7 @@ mod tests {
 
     #[test]
     fn build_from_resource_skips_underscore_attrs() {
-        let mut r = ManagedResource::with_provider("aws", "s3.Bucket", "x", None);
+        let mut r = Resource::with_provider("aws", "s3.Bucket", "x", None);
         r.set_attr(
             "name".to_string(),
             Value::Concrete(ConcreteValue::String("hi".into())),

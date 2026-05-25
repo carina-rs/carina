@@ -8,16 +8,16 @@
 //!   declaration kinds the parser tracks (resource, argument, module
 //!   call, upstream state, import alias, user function, variable,
 //!   structural binding from let-of-if/for/read).
-//! - [`BindingIndex`] — "what schema and which `ManagedResource` does this
+//! - [`BindingIndex`] — "what schema and which `Resource` does this
 //!   binding point at?" Schema-aware view. Used by validation and the
-//!   LSP. Each entry has both a `ManagedResource` and a `ResourceSchema`.
+//!   LSP. Each entry has both a `Resource` and a `ResourceSchema`.
 //! - [`ResolvedBindings`] — "what attribute values does this binding
 //!   actually carry?" Value-aware view. Used by the resolver and
-//!   executor. Includes upstream-state bindings that have no `ManagedResource`
+//!   executor. Includes upstream-state bindings that have no `Resource`
 //!   or `ResourceSchema`.
 //!
 //! The three are separate types rather than fields on one because their
-//! invariants differ — `BindingIndex` requires both `ManagedResource` and
+//! invariants differ — `BindingIndex` requires both `Resource` and
 //! `ResourceSchema`, `ResolvedBindings` requires only attribute values
 //! (no schema), `BindingNameSet` requires only the name and an origin
 //! tag. Callers that need more than one view hold them side by side.
@@ -40,7 +40,7 @@
 //! ```
 
 use crate::parser::{BindingName, ResourceRef};
-use crate::resource::{ManagedResource, ResourceId, State, Value, VirtualResource};
+use crate::resource::{Resource, ResourceId, State, Value, VirtualResource};
 use crate::schema::{ResourceSchema, SchemaRegistry};
 use std::collections::HashMap;
 
@@ -175,7 +175,7 @@ impl<'a> BindingIndex<'a> {
 #[non_exhaustive]
 pub enum BindingNameKind {
     /// `let <name> = ...` resource binding.
-    ManagedResource,
+    Resource,
     /// `argument <name> { ... }` module argument.
     Argument,
     /// `module <name> "..." { ... }` call site.
@@ -236,7 +236,7 @@ impl BindingNameSet {
     /// inserted in **most-specific-first** order and the first
     /// `insert` wins (later sources call `entry().or_insert`).
     ///
-    /// The order — `ManagedResource` → `ModuleCall` → `UpstreamState` →
+    /// The order — `Resource` → `ModuleCall` → `UpstreamState` →
     /// `Argument` → `Use` → `UserFunction` → `Structural` → `Variable`
     /// — keeps `Variable` last because `parsed.variables` is the
     /// catch-all "any `let`-RHS placeholder lives here" map, while the
@@ -246,15 +246,15 @@ impl BindingNameSet {
 
         // carina#3181: walk the typed top-level slices — managed
         // resources, data sources, and virtuals all register a
-        // `ManagedResource`-kind binding name (a data source declared as
+        // `Resource`-kind binding name (a data source declared as
         // `let x = read ...` is addressable by `ResourceRef`, and a
-        // virtual binding was a `ManagedResource`-kind name before the
+        // virtual binding was a `Resource`-kind name before the
         // typestate split too).
         for rref in parsed.iter_top_level_resources() {
             if let Some(name) = rref.binding() {
                 by_name
                     .entry(name.to_string())
-                    .or_insert(BindingNameKind::ManagedResource);
+                    .or_insert(BindingNameKind::Resource);
             }
         }
         // Wait bindings register right after resources: a wait binding
@@ -421,7 +421,7 @@ pub struct ResolvedBinding {
 /// why this is a separate type.
 ///
 /// Owned, not borrowed: building the merged map requires combining
-/// `ManagedResource.attributes` with `State.attributes`, and there is no single
+/// `Resource.attributes` with `State.attributes`, and there is no single
 /// upstream `HashMap<String, HashMap<String, Value>>` already on hand to
 /// borrow from. Owning the merged map avoids a self-referential
 /// structure.
@@ -442,7 +442,7 @@ pub struct ResolvedBindings {
 /// stores owned copies internally, so the caller retains ownership
 /// without forcing a clone at the API boundary.
 pub struct PreApplyInputs<'a> {
-    pub managed: &'a [ManagedResource],
+    pub managed: &'a [Resource],
     pub virtuals: &'a [VirtualResource],
     pub data_sources: &'a [crate::resource::DataSource],
     pub current_states: &'a HashMap<ResourceId, State>,
@@ -495,7 +495,7 @@ impl ResolvedBindings {
     /// caller after data sources / virtuals so a wait whose target is
     /// a data source or virtual still snapshots the resolved attrs.
     fn build_managed_core(
-        managed: &[ManagedResource],
+        managed: &[Resource],
         current_states: &HashMap<ResourceId, State>,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
     ) -> Self {
@@ -988,15 +988,11 @@ let vpc = aws.ec2.Vpc {
 #[cfg(test)]
 mod resolved_bindings_tests {
     use super::*;
-    use crate::resource::{ConcreteValue, DataSource, ManagedResource, ResourceId, State, Value};
+    use crate::resource::{ConcreteValue, DataSource, Resource, ResourceId, State, Value};
     use std::collections::BTreeSet;
 
-    fn make_resource(
-        name: &str,
-        binding: Option<&str>,
-        attrs: Vec<(&str, Value)>,
-    ) -> ManagedResource {
-        let mut r = ManagedResource::new("test.resource", name);
+    fn make_resource(name: &str, binding: Option<&str>, attrs: Vec<(&str, Value)>) -> Resource {
+        let mut r = Resource::new("test.resource", name);
         r.attributes = attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
         r.binding = binding.map(|b| b.to_string());
         r
@@ -1098,9 +1094,9 @@ mod resolved_bindings_tests {
 
     #[test]
     fn upstream_state_binding_is_first_class() {
-        // Upstream-state bindings have no `ManagedResource` and no `ResourceSchema`,
+        // Upstream-state bindings have no `Resource` and no `ResourceSchema`,
         // which is the case `BindingIndex` cannot represent.
-        let resources: Vec<ManagedResource> = Vec::new();
+        let resources: Vec<Resource> = Vec::new();
         let states: HashMap<ResourceId, State> = HashMap::new();
         let mut remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
         let mut network_attrs = HashMap::new();
@@ -1820,7 +1816,7 @@ let vpc = aws.ec2.Vpc {
         let names = BindingNameSet::from_parsed(&parsed);
 
         assert!(names.contains("vpc"));
-        assert_eq!(names.kind("vpc"), Some(&BindingNameKind::ManagedResource));
+        assert_eq!(names.kind("vpc"), Some(&BindingNameKind::Resource));
     }
 
     #[test]
@@ -2004,6 +2000,6 @@ let cert_issued = wait cert {
             "wait binding must carry its typed target edge"
         );
         // The target itself is still a plain resource binding.
-        assert_eq!(names.kind("cert"), Some(&BindingNameKind::ManagedResource));
+        assert_eq!(names.kind("cert"), Some(&BindingNameKind::Resource));
     }
 }

@@ -13,18 +13,18 @@ use std::collections::{BTreeSet, HashMap};
 use indexmap::IndexMap;
 
 use crate::binding_index::ResolvedBindings;
-use crate::resource::{ConcreteValue, ManagedResource, ResourceId, State, Value, VirtualResource};
+use crate::resource::{ConcreteValue, Resource, ResourceId, State, Value, VirtualResource};
 
 fn s(s: &str) -> Value {
     Value::Concrete(ConcreteValue::String(s.into()))
 }
 
-fn make_managed(binding: &str, attrs: &[(&str, Value)]) -> ManagedResource {
+fn make_managed(binding: &str, attrs: &[(&str, Value)]) -> Resource {
     let mut attributes = IndexMap::new();
     for (k, v) in attrs {
         attributes.insert((*k).into(), v.clone());
     }
-    ManagedResource {
+    Resource {
         id: ResourceId::new("aws.s3.Bucket", binding),
         attributes,
         directives: Default::default(),

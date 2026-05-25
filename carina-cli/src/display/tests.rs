@@ -2,10 +2,10 @@ use super::*;
 
 use carina_core::effect::{CascadingUpdate, Effect};
 use carina_core::plan::Plan;
-use carina_core::resource::{ConcreteValue, Directives, ManagedResource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, Directives, Resource, ResourceId, State, Value};
 
-fn make_resource(resource_type: &str, name: &str, binding: &str, deps: &[&str]) -> ManagedResource {
-    let mut r = ManagedResource::new(resource_type, name);
+fn make_resource(resource_type: &str, name: &str, binding: &str, deps: &[&str]) -> Resource {
+    let mut r = Resource::new(resource_type, name);
     r.binding = Some(binding.to_string());
     for dep in deps {
         r.set_attr(
@@ -22,7 +22,7 @@ fn make_resource(resource_type: &str, name: &str, binding: &str, deps: &[&str]) 
 /// `.unwrap()` could theoretically panic if `dep_idx` were invalid.
 #[test]
 fn test_print_plan_with_external_dependency_does_not_panic() {
-    // ManagedResource "b" depends on "a", but "a" is NOT in the plan.
+    // Resource "b" depends on "a", but "a" is NOT in the plan.
     // This simulates an external/unresolved dependency.
     let b = make_resource("test.resource", "b", "b", &["a"]);
     let mut plan = Plan::new();
@@ -380,7 +380,7 @@ fn test_dependency_free_resource_nested_under_shallowest_referencing_resource() 
 /// Test that extract_compact_hint returns only the first non-parent ResourceRef hint.
 #[test]
 fn test_extract_compact_hint_resource_ref() {
-    let mut r = ManagedResource::new("ec2.subnet_route_table_association", "hash123");
+    let mut r = Resource::new("ec2.subnet_route_table_association", "hash123");
     r.set_attr(
         "route_table_id".to_string(),
         Value::resource_ref("public_rt".to_string(), "id".to_string(), vec![]),
@@ -398,7 +398,7 @@ fn test_extract_compact_hint_resource_ref() {
 /// Test that extract_compact_hint skips ResourceRef that matches parent binding.
 #[test]
 fn test_extract_compact_hint_skips_parent_ref() {
-    let mut r = ManagedResource::new("ec2.subnet_route_table_association", "hash123");
+    let mut r = Resource::new("ec2.subnet_route_table_association", "hash123");
     r.set_attr(
         "route_table_id".to_string(),
         Value::resource_ref("database_rt".to_string(), "id".to_string(), vec![]),
@@ -416,7 +416,7 @@ fn test_extract_compact_hint_skips_parent_ref() {
 /// Test that extract_compact_hint falls back to string values when no ResourceRef.
 #[test]
 fn test_extract_compact_hint_string_fallback() {
-    let mut r = ManagedResource::new("ec2.route", "hash456");
+    let mut r = Resource::new("ec2.route", "hash456");
     r.set_attr(
         "destination_cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("0.0.0.0/0".to_string())),
@@ -429,7 +429,7 @@ fn test_extract_compact_hint_string_fallback() {
 /// Test that extract_compact_hint returns None when no useful attributes.
 #[test]
 fn test_extract_compact_hint_none() {
-    let r = ManagedResource::new("ec2.route", "hash789");
+    let r = Resource::new("ec2.route", "hash789");
     let hint = extract_compact_hint(&r, None);
     assert_eq!(hint, None);
 }
@@ -437,7 +437,7 @@ fn test_extract_compact_hint_none() {
 /// Test that extract_compact_hint prefers string over ResourceRef.
 #[test]
 fn test_extract_compact_hint_prefers_string_over_resource_ref() {
-    let mut r = ManagedResource::new("ec2.route", "hash_mixed");
+    let mut r = Resource::new("ec2.route", "hash_mixed");
     r.set_attr(
         "destination".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/8".to_string())),
@@ -455,7 +455,7 @@ fn test_extract_compact_hint_prefers_string_over_resource_ref() {
 /// Test that extract_compact_hint shortens service_name values.
 #[test]
 fn test_extract_compact_hint_service_name_shortening() {
-    let mut r = ManagedResource::new("ec2.vpc_endpoint", "hash_svc");
+    let mut r = Resource::new("ec2.vpc_endpoint", "hash_svc");
     r.set_attr(
         "service_name".to_string(),
         Value::Concrete(ConcreteValue::String(
@@ -467,7 +467,7 @@ fn test_extract_compact_hint_service_name_shortening() {
     assert_eq!(hint, Some("service: ecr.dkr".to_string()));
 
     // Single service component
-    let mut r2 = ManagedResource::new("ec2.vpc_endpoint", "hash_svc2");
+    let mut r2 = Resource::new("ec2.vpc_endpoint", "hash_svc2");
     r2.set_attr(
         "service_name".to_string(),
         Value::Concrete(ConcreteValue::String(
@@ -482,7 +482,7 @@ fn test_extract_compact_hint_service_name_shortening() {
 /// Test that extract_compact_hint falls back to string when all ResourceRefs match parent.
 #[test]
 fn test_extract_compact_hint_all_refs_match_parent() {
-    let mut r = ManagedResource::new("ec2.security_group_ingress", "hash_sg");
+    let mut r = Resource::new("ec2.security_group_ingress", "hash_sg");
     r.set_attr(
         "group_id".to_string(),
         Value::resource_ref("endpoint_sg".to_string(), "id".to_string(), vec![]),
@@ -500,7 +500,7 @@ fn test_extract_compact_hint_all_refs_match_parent() {
 /// Test that extract_compact_hint prefers string over ResourceRef for vpc_endpoint.
 #[test]
 fn test_extract_compact_hint_prefers_string_for_vpc_endpoint() {
-    let mut r = ManagedResource::new("ec2.vpc_endpoint", "hash_ep");
+    let mut r = Resource::new("ec2.vpc_endpoint", "hash_ep");
     r.set_attr(
         "service_name".to_string(),
         Value::Concrete(ConcreteValue::String(
@@ -528,11 +528,11 @@ fn test_extract_compact_hint_prefers_string_for_vpc_endpoint() {
 /// Test that has_binding correctly detects bound vs anonymous resources.
 #[test]
 fn test_has_binding() {
-    let mut bound = ManagedResource::new("ec2.Vpc", "vpc");
+    let mut bound = Resource::new("ec2.Vpc", "vpc");
     bound.binding = Some("vpc".to_string());
     assert!(has_binding(&bound));
 
-    let anonymous = ManagedResource::new("ec2.Vpc", "hash123");
+    let anonymous = Resource::new("ec2.Vpc", "hash123");
     assert!(!has_binding(&anonymous));
 }
 
@@ -540,7 +540,7 @@ fn test_has_binding() {
 /// parenthesized hints for anonymous resources.
 #[test]
 fn test_format_compact_name_bound_resource() {
-    let mut r = ManagedResource::new("ec2.Vpc", "vpc");
+    let mut r = Resource::new("ec2.Vpc", "vpc");
     r.binding = Some("vpc".to_string());
     // For bound resources, should show name as plain identifier (no quotes)
     let result = format_compact_name(&r, "vpc", None);
@@ -553,7 +553,7 @@ fn test_format_compact_name_bound_resource() {
 
 #[test]
 fn test_format_compact_name_anonymous_with_hint() {
-    let mut r = ManagedResource::new("ec2.subnet_route_table_association", "hash123");
+    let mut r = Resource::new("ec2.subnet_route_table_association", "hash123");
     r.set_attr(
         "subnet_id".to_string(),
         Value::resource_ref("database_subnet_1a".to_string(), "id".to_string(), vec![]),
@@ -598,7 +598,7 @@ fn test_print_plan_compact_does_not_panic() {
 /// keys are not printed (attributes are hidden in compact mode).
 #[test]
 fn test_print_plan_compact_with_anonymous_resources() {
-    let mut anon = ManagedResource::new("ec2.route", "hash_anon");
+    let mut anon = Resource::new("ec2.route", "hash_anon");
     anon.set_attr(
         "destination_cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("0.0.0.0/0".to_string())),
@@ -628,7 +628,7 @@ fn test_print_plan_compact_with_anonymous_resources() {
 /// e.g., security_group_ids = [endpoint_sg.group_id] should produce "security_group: endpoint_sg"
 #[test]
 fn test_extract_compact_hint_list_containing_resource_ref() {
-    let mut r = ManagedResource::new("ec2.vpc_endpoint", "hash_list_ref");
+    let mut r = Resource::new("ec2.vpc_endpoint", "hash_list_ref");
     r.set_attr(
         "security_group_ids".to_string(),
         Value::Concrete(ConcreteValue::List(vec![Value::resource_ref(
@@ -649,7 +649,7 @@ fn test_extract_compact_hint_list_containing_resource_ref() {
 /// Test that extract_compact_hint skips List<ResourceRef> when ref matches parent.
 #[test]
 fn test_extract_compact_hint_list_ref_skips_parent() {
-    let mut r = ManagedResource::new("ec2.vpc_endpoint", "hash_list_parent");
+    let mut r = Resource::new("ec2.vpc_endpoint", "hash_list_parent");
     r.set_attr(
         "security_group_ids".to_string(),
         Value::Concrete(ConcreteValue::List(vec![Value::resource_ref(
@@ -680,7 +680,7 @@ fn test_shorten_attr_name_ids_suffix() {
 /// Test that extract_compact_hint resolves DSL enum identifiers.
 #[test]
 fn test_extract_compact_hint_resolves_dsl_enum() {
-    let mut r = ManagedResource::new("ec2.Subnet", "hash_enum");
+    let mut r = Resource::new("ec2.Subnet", "hash_enum");
     r.set_attr(
         "availability_zone".to_string(),
         Value::Concrete(ConcreteValue::String(
@@ -701,7 +701,7 @@ fn test_extract_compact_hint_resolves_dsl_enum() {
 /// Test that extract_compact_hint skips _-prefixed attributes.
 #[test]
 fn test_extract_compact_hint_skips_internal_attributes() {
-    let mut r = ManagedResource::new("ec2.Vpc", "hash_internal");
+    let mut r = Resource::new("ec2.Vpc", "hash_internal");
     r.binding = Some("vpc".to_string());
     r.set_attr(
         "_hash".to_string(),
@@ -724,7 +724,7 @@ fn test_cascading_update_shows_attribute_diffs() {
             Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
         )]),
     );
-    let vpc_to = ManagedResource::new("ec2.Vpc", "vpc")
+    let vpc_to = Resource::new("ec2.Vpc", "vpc")
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
@@ -744,7 +744,7 @@ fn test_cascading_update_shows_attribute_diffs() {
             ),
         ]),
     );
-    let subnet_to = ManagedResource::new("ec2.Subnet", "subnet")
+    let subnet_to = Resource::new("ec2.Subnet", "subnet")
         .with_attribute(
             "vpc_id",
             Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
@@ -807,7 +807,7 @@ fn test_format_cascading_update_attr_diff() {
                 ),
             ]),
         )),
-        to: ManagedResource::new("ec2.Subnet", "subnet")
+        to: Resource::new("ec2.Subnet", "subnet")
             .with_attribute(
                 "vpc_id",
                 Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
@@ -987,7 +987,7 @@ fn test_format_cascading_update_diff_excludes_non_ref_attributes() {
                 ),
             ]),
         )),
-        to: ManagedResource::new("ec2.Subnet", "subnet")
+        to: Resource::new("ec2.Subnet", "subnet")
             .with_attribute(
                 "vpc_id",
                 Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
@@ -1045,7 +1045,7 @@ fn test_format_cascading_update_diff_includes_list_with_ref() {
                 )])),
             )]),
         )),
-        to: ManagedResource::new("ec2.Instance", "instance").with_attribute(
+        to: Resource::new("ec2.Instance", "instance").with_attribute(
             "security_group_ids",
             Value::Concrete(ConcreteValue::List(vec![Value::resource_ref(
                 "sg".to_string(),
@@ -1204,7 +1204,7 @@ fn test_resolved_ref_loses_dependency_for_tree_nesting() {
     // SG: Create effect with RESOLVED ref (string instead of ResourceRef).
     // This is what happens after resolve_refs_with_state() runs:
     // vpc_id = vpc.vpc_id becomes vpc_id = "vpc-0123456789abcdef0"
-    let mut sg = ManagedResource::new("ec2.SecurityGroup", "sg");
+    let mut sg = Resource::new("ec2.SecurityGroup", "sg");
     sg.binding = Some("sg".to_string());
     // This is the resolved value — a plain string, NOT a ResourceRef
     sg.set_attr(
@@ -1289,7 +1289,7 @@ fn format_effect_delete_falls_back_to_id_name() {
 /// so the type/address boundary is visible in plan/apply output.
 #[test]
 fn format_effect_create_separates_type_and_name_with_space() {
-    let mut r = ManagedResource::new("s3.Bucket", "state_bucket");
+    let mut r = Resource::new("s3.Bucket", "state_bucket");
     r.id = ResourceId::with_provider("aws", "s3.Bucket", "state_bucket", None);
     let effect = Effect::Create(r);
     assert_eq!(format_effect(&effect), "Create aws.s3.Bucket state_bucket");
@@ -1298,7 +1298,7 @@ fn format_effect_create_separates_type_and_name_with_space() {
 #[test]
 fn format_effect_update_separates_type_and_name_with_space() {
     let id = ResourceId::with_provider("awscc", "iam.Role", "bs.bootstrap.role", None);
-    let mut to = ManagedResource::new("iam.Role", "bs.bootstrap.role");
+    let mut to = Resource::new("iam.Role", "bs.bootstrap.role");
     to.id = id.clone();
     let effect = Effect::Update {
         id,
@@ -1320,7 +1320,7 @@ fn format_effect_update_separates_type_and_name_with_space() {
 #[test]
 fn format_effect_replace_separates_type_and_name_with_space() {
     let id = ResourceId::with_provider("awscc", "ec2.Vpc", "vpc", None);
-    let mut to = ManagedResource::new("ec2.Vpc", "vpc");
+    let mut to = Resource::new("ec2.Vpc", "vpc");
     to.id = id.clone();
     let effect = Effect::Replace {
         id,

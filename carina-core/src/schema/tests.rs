@@ -2006,7 +2006,7 @@ fn block_name_map_empty_when_no_block_names() {
 #[test]
 fn resolve_block_names_renames_key() {
     let mut resources = vec![{
-        let mut r = ManagedResource::new("ec2.ipam", "my-ipam");
+        let mut r = Resource::new("ec2.ipam", "my-ipam");
         // Block syntax produces Value::Concrete(ConcreteValue::List)
         r.set_attr(
             "operating_region".to_string(),
@@ -2042,7 +2042,7 @@ fn resolve_block_names_renames_key() {
 #[test]
 fn resolve_block_names_noop_when_no_match() {
     let mut resources = vec![{
-        let mut r = ManagedResource::new("ec2.ipam", "my-ipam");
+        let mut r = Resource::new("ec2.ipam", "my-ipam");
         r.set_attr(
             "name".to_string(),
             Value::Concrete(ConcreteValue::String("test".to_string())),
@@ -2065,7 +2065,7 @@ fn resolve_block_names_noop_when_no_match() {
 #[test]
 fn resolve_block_names_errors_on_mixed_syntax() {
     let mut resources = vec![{
-        let mut r = ManagedResource::new("ec2.ipam", "my-ipam");
+        let mut r = Resource::new("ec2.ipam", "my-ipam");
         // Block syntax produces Value::Concrete(ConcreteValue::List)
         r.set_attr(
             "operating_region".to_string(),
@@ -2116,7 +2116,7 @@ fn resolve_block_names_errors_on_mixed_syntax() {
 #[test]
 fn resolve_block_names_skips_unknown_schema() {
     let mut resources = vec![{
-        let mut r = ManagedResource::new("unknown.type", "test");
+        let mut r = Resource::new("unknown.type", "test");
         r.set_attr(
             "operating_region".to_string(),
             Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
@@ -2166,7 +2166,7 @@ fn resolve_block_names_nested_struct() {
     );
 
     let mut resources = vec![{
-        let mut r = ManagedResource::new("s3.Bucket", "my-bucket");
+        let mut r = Resource::new("s3.Bucket", "my-bucket");
         r.set_attr(
             "lifecycle_configuration".to_string(),
             Value::Concrete(ConcreteValue::Map(inner_map)),
@@ -2234,7 +2234,7 @@ fn resolve_block_names_singular_field_not_renamed_when_assigned() {
     );
 
     let mut resources = vec![{
-        let mut r = ManagedResource::new("s3.Bucket", "my-bucket");
+        let mut r = Resource::new("s3.Bucket", "my-bucket");
         r.set_attr(
             "lifecycle_configuration".to_string(),
             Value::Concrete(ConcreteValue::Map(inner_map)),
@@ -2308,7 +2308,7 @@ fn resolve_block_names_block_syntax_renamed_when_singular_field_exists() {
     );
 
     let mut resources = vec![{
-        let mut r = ManagedResource::new("s3.Bucket", "my-bucket");
+        let mut r = Resource::new("s3.Bucket", "my-bucket");
         r.set_attr(
             "lifecycle_configuration".to_string(),
             Value::Concrete(ConcreteValue::Map(inner_map)),
@@ -2367,7 +2367,7 @@ fn resolve_block_names_same_block_and_canonical_name() {
     // without triggering a false "cannot use both" error.
     // This regression was introduced in PR #913 and fixed in PR #917.
     let mut resources = vec![{
-        let mut r = ManagedResource::new("ec2.SecurityGroup", "my-sg");
+        let mut r = Resource::new("ec2.SecurityGroup", "my-sg");
         // Block syntax produces Value::Concrete(ConcreteValue::List)
         r.set_attr(
             "ingress".to_string(),
@@ -2419,7 +2419,7 @@ fn resolve_block_names_same_block_and_canonical_name_multiple_items() {
     // The key already exists (it IS the canonical key), so the `continue`
     // path handles it. This test verifies all items are preserved.
     let mut resources = vec![{
-        let mut r = ManagedResource::new("ec2.SecurityGroup", "my-sg");
+        let mut r = Resource::new("ec2.SecurityGroup", "my-sg");
         r.set_attr(
             "ingress".to_string(),
             Value::Concrete(ConcreteValue::List(vec![
@@ -2493,7 +2493,7 @@ fn resolve_block_names_nested_same_block_and_canonical_name() {
     );
 
     let mut resources = vec![{
-        let mut r = ManagedResource::new("test.resource", "my-resource");
+        let mut r = Resource::new("test.resource", "my-resource");
         r.set_attr(
             "config".to_string(),
             Value::Concrete(ConcreteValue::Map(inner_map)),
@@ -3946,13 +3946,13 @@ fn schema_registry_routes_lookup_by_typestate() {
     // carina#3181: schema lookup routes by the resource typestate —
     // `get_for` for managed resources, `get_for_data_source` for data
     // sources.
-    use crate::resource::{DataSource, ManagedResource};
+    use crate::resource::{DataSource, Resource};
 
     let mut registry = SchemaRegistry::new();
     registry.insert("aws", ResourceSchema::new("s3.Bucket"));
     registry.insert("aws", ResourceSchema::new("s3.Bucket").as_data_source());
 
-    let managed_res = ManagedResource::with_provider("aws", "s3.Bucket", "new", None);
+    let managed_res = Resource::with_provider("aws", "s3.Bucket", "new", None);
     let data_res = DataSource::with_provider("aws", "s3.Bucket", "existing", None);
 
     let m = registry

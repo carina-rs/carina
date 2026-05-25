@@ -15,7 +15,7 @@ use carina_core::executor::{ExecutionInput, ExecutionResult};
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ReadRequest};
 use carina_core::resolver::resolve_refs_with_state_and_remote;
-use carina_core::resource::{ConcreteValue, ManagedResource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 use carina_core::value::format_value;
 use carina_state::{LockInfo, StateBackend, StateFile, resolve_backend};
 
@@ -64,7 +64,7 @@ pub async fn execute_effects(
     schemas: &carina_core::schema::SchemaRegistry,
     bindings: &mut ResolvedBindings,
     current_states: &mut HashMap<ResourceId, State>,
-    unresolved_resources: &HashMap<ResourceId, ManagedResource>,
+    unresolved_resources: &HashMap<ResourceId, Resource>,
     virtual_resources: &[carina_core::resource::VirtualResource],
 ) -> ApplyResult {
     let input = ExecutionInput {
@@ -366,7 +366,7 @@ pub(crate) async fn persist_exports_only(
     backend: &dyn StateBackend,
     lock: Option<&LockInfo>,
     state_file: Option<StateFile>,
-    sorted_resources: &[ManagedResource],
+    sorted_resources: &[Resource],
     data_sources: &[carina_core::resource::DataSource],
     pre_resolve_virtuals: &[carina_core::resource::VirtualResource],
     export_params: &[carina_core::parser::InferredExportParam],
@@ -399,7 +399,7 @@ pub(crate) async fn persist_exports_only(
 /// Returns `Ok(None)` if no drift is detected, or `Ok(Some(messages))` with drift details.
 /// Returns `Err` if a resource is missing from planned_states or if a provider read fails.
 pub async fn detect_drift(
-    sorted_resources: &[ManagedResource],
+    sorted_resources: &[Resource],
     planned_states: &HashMap<ResourceId, State>,
     provider: &dyn Provider,
 ) -> Result<Option<Vec<String>>, AppError> {
@@ -484,7 +484,7 @@ pub async fn detect_drift(
             }
         } else {
             return Err(AppError::Config(format!(
-                "ManagedResource {} is present in plan but missing from planned states. \
+                "Resource {} is present in plan but missing from planned states. \
                  The plan file may be corrupted. Please re-run 'carina plan'.",
                 resource.id
             )));
@@ -1336,7 +1336,7 @@ async fn run_apply_locked(
     println!();
 
     // Build unresolved resource map for re-resolution at apply time
-    let unresolved_resources: HashMap<ResourceId, ManagedResource> = sorted_resources
+    let unresolved_resources: HashMap<ResourceId, Resource> = sorted_resources
         .iter()
         .map(|r| (r.id.clone(), r.clone()))
         .collect();
@@ -1695,7 +1695,7 @@ async fn run_apply_from_plan_locked(
     println!();
 
     // Build unresolved resource map for re-resolution at apply time
-    let unresolved_resources: HashMap<ResourceId, ManagedResource> = sorted_resources
+    let unresolved_resources: HashMap<ResourceId, Resource> = sorted_resources
         .iter()
         .map(|r| (r.id.clone(), r.clone()))
         .collect();

@@ -379,7 +379,7 @@ pub fn build_detail_rows(
     }
 
     // carina#3181: `Effect` payloads are typestate structs — the
-    // managed variants carry `ManagedResource`, `Read` carries a
+    // managed variants carry `Resource`, `Read` carries a
     // `DataSource`. Schema lookup routes through the matching
     // `get_for` / `get_for_data_source` registry method.
     match effect {
@@ -572,7 +572,7 @@ fn build_expanded_tags_row(
 
 fn build_update_rows(
     from: &crate::resource::State,
-    to: &crate::resource::ManagedResource,
+    to: &crate::resource::Resource,
     changed_attributes: &[String],
     schema: Option<&ResourceSchema>,
     detail: DetailLevel,
@@ -731,7 +731,7 @@ fn build_update_rows(
 #[allow(clippy::too_many_arguments)]
 fn build_replace_rows(
     from: &crate::resource::State,
-    to: &crate::resource::ManagedResource,
+    to: &crate::resource::Resource,
     changed_create_only: &[String],
     cascading_updates: &[crate::effect::CascadingUpdate],
     temporary_name: &Option<crate::effect::TemporaryName>,
@@ -1513,7 +1513,7 @@ fn value_references_binding(value: &Value, binding: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::{ManagedResource, ResourceId, State};
+    use crate::resource::{Resource, ResourceId, State};
     use std::collections::HashSet;
 
     #[test]
@@ -1539,7 +1539,7 @@ mod tests {
 
     #[test]
     fn test_names_only_returns_empty() {
-        let resource = ManagedResource::new("s3.Bucket", "my-bucket");
+        let resource = Resource::new("s3.Bucket", "my-bucket");
         let effect = Effect::Create(resource);
         let rows = build_detail_rows(&effect, None, DetailLevel::NamesOnly, None, None);
         assert!(rows.is_empty());
@@ -1547,7 +1547,7 @@ mod tests {
 
     #[test]
     fn test_create_basic_attributes() {
-        let resource = ManagedResource::new("s3.Bucket", "my-bucket")
+        let resource = Resource::new("s3.Bucket", "my-bucket")
             .with_attribute(
                 "bucket",
                 Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
@@ -1574,7 +1574,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = ManagedResource::new("s3.Bucket", "my-bucket").with_attribute(
+        let to = Resource::new("s3.Bucket", "my-bucket").with_attribute(
             "versioning",
             Value::Concrete(ConcreteValue::String("Enabled".to_string())),
         );
@@ -1611,7 +1611,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = ManagedResource::new("s3.Bucket", "my-bucket")
+        let to = Resource::new("s3.Bucket", "my-bucket")
             .with_attribute(
                 "name",
                 Value::Concrete(ConcreteValue::String("test".to_string())),
@@ -1665,7 +1665,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = ManagedResource::new("s3.Bucket", "my-bucket")
+        let to = Resource::new("s3.Bucket", "my-bucket")
             .with_attribute(
                 "authored",
                 Value::Concrete(ConcreteValue::String("a".to_string())),
@@ -1765,7 +1765,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = ManagedResource::new("s3.Bucket", "my-bucket").with_attribute(
+        let to = Resource::new("s3.Bucket", "my-bucket").with_attribute(
             "name",
             Value::Concrete(ConcreteValue::String("test".to_string())),
         );
@@ -1791,7 +1791,7 @@ mod tests {
             "Environment".to_string(),
             Value::Concrete(ConcreteValue::String("prod".to_string())),
         );
-        let resource = ManagedResource::new("s3.Bucket", "my-bucket")
+        let resource = Resource::new("s3.Bucket", "my-bucket")
             .with_attribute("tags", Value::Concrete(ConcreteValue::Map(tags)));
         let effect = Effect::Create(resource);
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
@@ -1854,7 +1854,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::Map(statement2.clone())),
             ])),
         );
-        let resource = ManagedResource::new("iam.RolePolicy", "test").with_attribute(
+        let resource = Resource::new("iam.RolePolicy", "test").with_attribute(
             "policy_document",
             Value::Concrete(ConcreteValue::Map(policy)),
         );
@@ -1999,7 +1999,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = ManagedResource::new("ec2.Vpc", "my-vpc").with_attribute(
+        let to = Resource::new("ec2.Vpc", "my-vpc").with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
@@ -2068,7 +2068,7 @@ mod tests {
             "effect".to_string(),
             Value::Concrete(ConcreteValue::String("Allow".to_string())),
         );
-        let resource = ManagedResource::new("iam.RolePolicy", "test").with_attribute(
+        let resource = Resource::new("iam.RolePolicy", "test").with_attribute(
             "statement",
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                 ConcreteValue::Map(entry),
@@ -2096,7 +2096,7 @@ mod tests {
 
     #[test]
     fn create_row_scalar_attribute_unchanged() {
-        let resource = ManagedResource::new("iam.Role", "test").with_attribute(
+        let resource = Resource::new("iam.Role", "test").with_attribute(
             "role_name",
             Value::Concrete(ConcreteValue::String("foo".to_string())),
         );
@@ -2115,7 +2115,7 @@ mod tests {
     fn create_row_list_of_strings_emits_pretty_attribute() {
         // list-of-string must route through PrettyAttribute so
         // format_value_pretty's 80-col threshold can apply.
-        let resource = ManagedResource::new("iam.Role", "test").with_attribute(
+        let resource = Resource::new("iam.Role", "test").with_attribute(
             "managed_policy_arns",
             Value::Concrete(ConcreteValue::List(vec![
                 Value::Concrete(ConcreteValue::String(
@@ -2150,7 +2150,7 @@ mod tests {
         // Pins down `tags = []` behavior — a regression that re-introduces
         // an `!items.is_empty()` guard would silently bypass the routing
         // for empty lists, breaking the formatting-path uniformity.
-        let resource = ManagedResource::new("iam.Role", "test")
+        let resource = Resource::new("iam.Role", "test")
             .with_attribute("tags", Value::Concrete(ConcreteValue::List(vec![])));
         let effect = Effect::Create(resource);
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
@@ -2256,7 +2256,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = ManagedResource::new("iam.Role", "r").with_attribute(
+        let to = Resource::new("iam.Role", "r").with_attribute(
             "policy",
             iam_policy_value(
                 ConcreteValue::String("Allow".to_string()),
@@ -2300,7 +2300,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = ManagedResource::new("iam.Role", "r")
+        let to = Resource::new("iam.Role", "r")
             .with_attribute(
                 "policy",
                 iam_policy_value(
@@ -2349,7 +2349,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = ManagedResource::new("iam.Role", "r").with_attribute(
+        let to = Resource::new("iam.Role", "r").with_attribute(
             "policy",
             iam_policy_value(
                 ConcreteValue::String("Allow".to_string()),
@@ -2389,7 +2389,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = ManagedResource::new("iam.Role", "r").with_attribute(
+        let to = Resource::new("iam.Role", "r").with_attribute(
             "policy",
             iam_policy_value(
                 ConcreteValue::String("Allow".to_string()),
@@ -2458,7 +2458,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = ManagedResource::new("x.Thing", "t")
+        let to = Resource::new("x.Thing", "t")
             .with_attribute("modes", mk(ConcreteValue::String("On".to_string())));
         let effect = Effect::Update {
             id: ResourceId::new("x.Thing", "t"),
@@ -2493,7 +2493,7 @@ mod tests {
         );
         // Desired flips effect to the API-canonical `Deny` — a real
         // change, not a spelling alias of `allow`.
-        let to = ManagedResource::new("iam.Role", "r").with_attribute(
+        let to = Resource::new("iam.Role", "r").with_attribute(
             "policy",
             iam_policy_value(
                 ConcreteValue::String("Deny".to_string()),
@@ -2545,7 +2545,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = ManagedResource::new("iam.Role", "r")
+        let to = Resource::new("iam.Role", "r")
             .with_attribute(
                 "policy",
                 iam_policy_value(
@@ -2650,8 +2650,8 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        let to = ManagedResource::new("x.Thing", "t")
-            .with_attribute("modes", enum_list(&["Allow", "Deny"]));
+        let to =
+            Resource::new("x.Thing", "t").with_attribute("modes", enum_list(&["Allow", "Deny"]));
         let effect = Effect::Update {
             id: ResourceId::new("x.Thing", "t"),
             from: Box::new(from),
@@ -2851,7 +2851,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = ManagedResource::new("x.Thing", "t").with_attribute(
+        let to = Resource::new("x.Thing", "t").with_attribute(
             "tags",
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                 ConcreteValue::String("only-one".to_string()),
@@ -2894,7 +2894,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let to = ManagedResource::new("x.Thing", "t").with_attribute(
+        let to = Resource::new("x.Thing", "t").with_attribute(
             "password",
             Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
                 ConcreteValue::String("new-secret".to_string()),
@@ -3105,8 +3105,8 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        let to = ManagedResource::new("x.Thing", "t")
-            .with_attribute("modes", enum_list(&["Allow", "Deny"]));
+        let to =
+            Resource::new("x.Thing", "t").with_attribute("modes", enum_list(&["Allow", "Deny"]));
         let effect = Effect::Update {
             id: ResourceId::new("x.Thing", "t"),
             from: Box::new(from),

@@ -226,12 +226,12 @@ fn run_tui<A>(
 mod tests {
     use super::*;
     use carina_core::effect::Effect;
-    use carina_core::resource::ManagedResource;
+    use carina_core::resource::Resource;
 
     fn make_app() -> App {
         let mut plan = Plan::new();
-        plan.add(Effect::Create(ManagedResource::new("s3.Bucket", "a")));
-        plan.add(Effect::Create(ManagedResource::new("s3.Bucket", "b")));
+        plan.add(Effect::Create(Resource::new("s3.Bucket", "a")));
+        plan.add(Effect::Create(Resource::new("s3.Bucket", "b")));
         App::new(&plan, &SchemaRegistry::new())
     }
 
@@ -275,13 +275,13 @@ mod tests {
     fn make_search_app() -> App {
         let mut plan = Plan::new();
         plan.add(Effect::Create(
-            ManagedResource::new("s3.Bucket", "my-bucket").with_binding("bucket"),
+            Resource::new("s3.Bucket", "my-bucket").with_binding("bucket"),
         ));
         plan.add(Effect::Create(
-            ManagedResource::new("ec2.Vpc", "my-vpc").with_binding("vpc"),
+            Resource::new("ec2.Vpc", "my-vpc").with_binding("vpc"),
         ));
         plan.add(Effect::Create(
-            ManagedResource::new("ec2.Subnet", "my-subnet")
+            Resource::new("ec2.Subnet", "my-subnet")
                 .with_binding("subnet")
                 .with_attribute(
                     "vpc_id",
@@ -483,15 +483,14 @@ mod tests {
     fn make_provider_prefixed_app() -> App {
         let mut plan = Plan::new();
         plan.add(Effect::Create(
-            ManagedResource::with_provider("awscc", "ec2.Vpc", "my-vpc", None).with_binding("vpc"),
+            Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None).with_binding("vpc"),
         ));
         plan.add(Effect::Create(
-            ManagedResource::with_provider("awscc", "ec2.Subnet", "my-subnet", None)
+            Resource::with_provider("awscc", "ec2.Subnet", "my-subnet", None)
                 .with_binding("subnet"),
         ));
         plan.add(Effect::Create(
-            ManagedResource::with_provider("awscc", "s3.Bucket", "my-bucket", None)
-                .with_binding("bucket"),
+            Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None).with_binding("bucket"),
         ));
         App::new(&plan, &SchemaRegistry::new())
     }

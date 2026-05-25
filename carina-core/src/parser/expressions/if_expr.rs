@@ -15,12 +15,12 @@ use crate::parser::{
     is_static_value, next_pair, parse_expression, parse_module_call, parse_read_resource_expr,
     parse_resource_expr,
 };
-use crate::resource::{ConcreteValue, DataSource, ManagedResource, Value};
+use crate::resource::{ConcreteValue, DataSource, Resource, Value};
 
 /// Result of parsing an if expression body: a managed resource, a data
 /// source, a module call, or a value.
 pub(crate) enum IfBodyResult {
-    ManagedResource(Box<ManagedResource>),
+    Resource(Box<Resource>),
     DataSource(Box<DataSource>),
     ModuleCall(ModuleCall),
     Value(Value),
@@ -100,7 +100,7 @@ pub(crate) fn parse_if_body_to_rhs(
 ) -> Result<LetBindingRhs, ParseError> {
     let result = parse_if_body(pair, ctx, binding_name)?;
     match result {
-        IfBodyResult::ManagedResource(r) => {
+        IfBodyResult::Resource(r) => {
             let ref_value =
                 Value::Concrete(ConcreteValue::String(format!("${{{}}}", binding_name)));
             Ok((
@@ -156,7 +156,7 @@ pub(crate) fn parse_if_body(
             }
             Rule::resource_expr => {
                 let resource = parse_resource_expr(inner, &local_ctx, binding_name)?;
-                return Ok(IfBodyResult::ManagedResource(Box::new(resource)));
+                return Ok(IfBodyResult::Resource(Box::new(resource)));
             }
             Rule::read_resource_expr => {
                 let data_source = parse_read_resource_expr(inner, &local_ctx, binding_name)?;
