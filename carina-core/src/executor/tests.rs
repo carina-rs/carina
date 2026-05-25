@@ -3215,3 +3215,152 @@ async fn test_phased_move_with_interdependent_replace_does_not_panic() {
         "two Replace effects should be counted as successes; Move is state-only and handled by the CLI"
     );
 }
+
+// -----------------------------------------------------------------------
+// carina#3252: a managed-resource attribute that references a
+// `read aws.*` data source must resolve from the data source's
+// pre-refreshed `current_states` row at apply time. Pre-fix, the
+// pre-apply binding view never merged the data source's `State.attributes`
+// into its binding, so the executor's `assert_fully_resolved` rejected
+// the unresolved `ResourceRef` with the misleading "add a `wait` block"
+// message that does not apply to data sources.
+// -----------------------------------------------------------------------
+
+/// End-to-end binding-view → executor wiring: a downstream managed
+/// resource references `admin_access_roles.arns` (a `read aws.iam.Roles`
+/// data source). The data source's read result lives in
+/// `current_states[data_source.id]`. `ResolvedBindings::pre_apply` (the
+/// only constructor real apply uses) must surface that read state on the
+/// data source's binding so the executor's resolve step finds a concrete
+/// value to hand to the provider.
+///
+/// Mirrors the production `carina apply` repro in carina#3252:
+/// `assume_role_policy_document.statement[].principal.aws = admin_access_roles.arns`
+/// on `carina-rs/infra@main`.
+#[tokio::test]
+async fn test_data_source_read_state_resolves_for_downstream_managed_resource() {
+    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::resource::{AccessPath, ResourceId};
+
+    // `RecordingMockProvider` captures the resolved attribute map the
+    // executor handed to `create()`, so the test can assert what the
+    // provider actually saw.
+    let provider = RecordingMockProvider::new();
+
+    // Data source: `let admin_access_roles = read aws.iam.Roles { ... }`.
+    // The DSL attributes hold input filters only; the produced `arns`
+    // list lives in `current_states[ds.id]`. `with_provider` matches
+    // the id shape real apply uses.
+    let ds_id = ResourceId::with_provider("aws", "iam.Roles", "admin_access_roles", None);
+    let mut ds = DataSource::with_provider("aws", "iam.Roles", "admin_access_roles", None);
+    ds.id = ds_id.clone();
+    ds.binding = Some("admin_access_roles".to_string());
+    ds.attributes.insert(
+        "path_prefix".to_string(),
+        Value::Concrete(ConcreteValue::String(
+            "/aws-reserved/sso.amazonaws.com/".to_string(),
+        )),
+    );
+
+    let arn_value = "arn:aws:iam::111111111111:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_AdministratorAccess_abcdef0123456789";
+    let mut current_states: HashMap<ResourceId, State> = HashMap::new();
+    current_states.insert(
+        ds_id.clone(),
+        State::existing(
+            ds_id.clone(),
+            vec![(
+                "arns".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::String(arn_value.to_string()),
+                )])),
+            )]
+            .into_iter()
+            .collect(),
+        ),
+    );
+
+    // Downstream managed: `awscc.iam.Role rd.role`. Its
+    // `assume_role_policy_document_arns` attr is a `ResourceRef` to
+    // `admin_access_roles.arns`. (Modelled as a top-level attribute
+    // for test concision; the production case nests it inside a
+    // struct, but the resolve path is the same per-attribute one.)
+    let role_id = ResourceId::with_provider("awscc", "iam.Role", "rd.role", None);
+    let role = {
+        let mut r = ManagedResource::with_provider("awscc", "iam.Role", "rd.role", None);
+        r.id = role_id.clone();
+        r.binding = Some("role".to_string());
+        // No `dependency_bindings` — the executor's dependency-graph
+        // path only registers managed-resource bindings into
+        // `binding_to_idx` (data sources never become effects), so the
+        // field isn't load-bearing here. The dependency is implicit:
+        // the data source's read result lives in `current_states`
+        // before the executor runs.
+        r.set_attr(
+            "assume_role_policy_document_arns",
+            Value::Deferred(DeferredValue::ResourceRef {
+                path: AccessPath::new("admin_access_roles", "arns"),
+            }),
+        );
+        r
+    };
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(role.clone()));
+
+    let role_state =
+        State::existing(role_id.clone(), HashMap::new()).with_identifier("rd.role-iam-id");
+    provider.push_create(Ok(role_state));
+
+    // Build bindings the way the real apply path does (carina#3248):
+    // one typed constructor that lays managed + data sources +
+    // current_states in one go.
+    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+        managed: &[role],
+        virtuals: &[],
+        data_sources: &[ds],
+        current_states: &current_states,
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        virtual_resources: &[],
+        bindings,
+        current_states,
+        normalizer: &NoopNormalizer,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+    };
+
+    let observer = MockObserver::new();
+    let result = execute_plan(&provider, input, &observer).await;
+
+    assert_eq!(
+        result.failure_count,
+        0,
+        "data-source ref must resolve; pre-fix this errored with \
+         'has not been published yet' (carina#3252). events: {:?}",
+        observer.events(),
+    );
+    assert_eq!(result.success_count, 1);
+
+    // The executor must have handed the provider a concrete
+    // List<String> resolved from the data source's read state — not the
+    // original `Value::Deferred(ResourceRef)`.
+    let calls = provider.create_calls();
+    assert_eq!(calls.len(), 1);
+    let (_, role_attrs) = &calls[0];
+    let resolved = role_attrs
+        .get("assume_role_policy_document_arns")
+        .expect("downstream attr must be present in the create call");
+    assert_eq!(
+        resolved,
+        &Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String(arn_value.to_string())
+        )])),
+        "the ResourceRef must resolve to the data source's read-state \
+         `arns`; got {resolved:?}",
+    );
+}
