@@ -481,7 +481,7 @@ impl ResolvedBindings {
             inputs.current_states,
             inputs.remote_bindings,
         );
-        bindings.layer_data_sources_post_apply(inputs.data_sources);
+        bindings.layer_data_source_bindings(inputs.data_sources, inputs.current_states);
         bindings
             .layer_virtuals_post_apply(inputs.virtuals)
             .expect("layer_virtuals_post_apply is currently infallible");
@@ -618,22 +618,72 @@ impl ResolvedBindings {
     /// must see the data source's resolved attribute map. Data sources
     /// are a distinct typestate from managed resources, so they are
     /// layered in explicitly rather than collapsed into the managed
-    /// slice. The resolved attribute map is recorded verbatim — data
-    /// sources have no provider-side state to merge here.
+    /// slice.
     ///
-    /// **Scope:** post-apply increment layering (carina#3248). Same
-    /// as [`Self::layer_virtuals_post_apply`] — pre-apply call sites
-    /// must use [`ResolvedBindings::pre_apply`] instead so the
-    /// data-source layer is established at construction time.
-    pub fn layer_data_sources_post_apply(&mut self, data_sources: &[crate::resource::DataSource]) {
+    /// # State merging (carina#3252)
+    ///
+    /// Each data-source binding carries two layers, in this order:
+    ///
+    /// 1. `DataSource.attributes` — the parsed DSL attributes (input
+    ///    filters like `path_prefix` / `name_regex`, plus the parser's
+    ///    `_type` marker).
+    /// 2. `current_states[ds.id].attributes` — the **read result** the
+    ///    provider returned: `arns`, `user_id`, `account_id`, etc.
+    ///    Populated by `read_data_source_with_retry` (apply path) or
+    ///    `resolve_data_source_refs_for_refresh` (plan path). Without
+    ///    this layer the read attributes are missing from the binding
+    ///    entirely; a downstream `ResourceRef` like
+    ///    `admin_access_roles.arns` resolves to nothing and the
+    ///    executor's `assert_fully_resolved` rejects it with the
+    ///    misleading "add a `wait` block" message that does not apply
+    ///    to data sources.
+    ///
+    /// Layer 2 wins on key collision — same direction as
+    /// `record_applied` (post-apply, provider value is truth), but
+    /// gated on `state.exists` the way [`Self::build_managed_core`]
+    /// gates its own state merge (a tombstoned row must not
+    /// contribute attributes). `record_applied` itself has no such
+    /// gate because its caller only fires it on a successful apply
+    /// result. The merge direction deliberately diverges from
+    /// [`Self::build_managed_core`] (which is DSL-wins because the
+    /// managed-resource DSL attributes *are* the user-authored desired
+    /// state): a data source has no desired-state authoring, only a
+    /// filter input and a provider-returned result, so the provider's
+    /// value is the source of truth. The two layers don't typically
+    /// share keys anyway (inputs are filters, outputs are produced
+    /// values).
+    ///
+    /// The shared structural pattern with [`Self::build_managed_core`]
+    /// is that *both* merge their `current_states` row into the
+    /// binding — the carina#3252 gap was a data-source binding that
+    /// dropped state entirely. The merge-direction divergence above is
+    /// intentional.
+    ///
+    /// **Scope:** the only documented caller is
+    /// [`ResolvedBindings::pre_apply`]. The function is `pub(crate)`
+    /// so a new call site cannot recreate the carina#3252 gap by
+    /// forgetting to pass `current_states`.
+    pub(crate) fn layer_data_source_bindings(
+        &mut self,
+        data_sources: &[crate::resource::DataSource],
+        current_states: &HashMap<ResourceId, State>,
+    ) {
         for d in data_sources.iter() {
             let Some(binding_name) = d.binding.as_ref() else {
                 continue;
             };
+            let mut merged = crate::resource::attrs_to_hashmap(&d.attributes);
+            if let Some(state) = current_states.get(&d.id)
+                && state.exists
+            {
+                for (k, v) in &state.attributes {
+                    merged.insert(k.clone(), v.clone());
+                }
+            }
             self.by_name.insert(
                 binding_name.clone(),
                 ResolvedBinding {
-                    attributes: crate::resource::attrs_to_hashmap(&d.attributes),
+                    attributes: merged,
                     source: BindingValueSource::Local,
                 },
             );
@@ -938,7 +988,7 @@ let vpc = aws.ec2.Vpc {
 #[cfg(test)]
 mod resolved_bindings_tests {
     use super::*;
-    use crate::resource::{ConcreteValue, ManagedResource, ResourceId, State, Value};
+    use crate::resource::{ConcreteValue, DataSource, ManagedResource, ResourceId, State, Value};
     use std::collections::BTreeSet;
 
     fn make_resource(
@@ -1547,6 +1597,204 @@ mod resolved_bindings_tests {
             Some(Value::Concrete(ConcreteValue::String(
                 "arn:shared".to_string()
             )))
+        );
+    }
+
+    /// carina#3252: a `read aws.X` data-source binding must expose the
+    /// attributes that `read_data_source_with_retry` wrote into
+    /// `current_states[ds.id]`, not just the DSL-side input filters.
+    ///
+    /// Pre-fix: `layer_data_sources_post_apply` recorded only
+    /// `DataSource.attributes` (the `path_prefix` / `name_regex` filters),
+    /// so a downstream managed resource referencing
+    /// `admin_access_roles.arns` saw nothing in the binding map and the
+    /// executor's `assert_fully_resolved` rejected the unresolved
+    /// `ResourceRef` with the misleading "add a `wait` block" message.
+    ///
+    /// The fix mirrors `build_managed_core`: pre-apply layering for a
+    /// data-source binding must merge the read-result `State.attributes`
+    /// (the actual output: `arns`, `user_id`, ...) on top of the DSL
+    /// input map. Read-result wins on key collision — the input map is
+    /// just the filter set the provider was *given*; the state map is
+    /// what the provider *returned*.
+    #[test]
+    fn data_source_binding_merges_state_attributes() {
+        let ds_id = ResourceId::new("aws.iam.Roles", "admin_access_roles");
+        let mut ds = DataSource::new("aws.iam.Roles", "admin_access_roles");
+        ds.id = ds_id.clone();
+        ds.binding = Some("admin_access_roles".to_string());
+        ds.attributes.insert(
+            "path_prefix".to_string(),
+            Value::Concrete(ConcreteValue::String(
+                "/aws-reserved/sso.amazonaws.com/".to_string(),
+            )),
+        );
+        ds.attributes.insert(
+            "name_regex".to_string(),
+            Value::Concrete(ConcreteValue::String(
+                "^AWSReservedSSO_AdministratorAccess_[0-9a-f]{16}$".to_string(),
+            )),
+        );
+
+        let mut states: HashMap<ResourceId, State> = HashMap::new();
+        states.insert(
+            ds_id.clone(),
+            State {
+                id: ds_id,
+                identifier: None,
+                exists: true,
+                attributes: vec![(
+                    "arns".to_string(),
+                    Value::Concrete(ConcreteValue::List(vec![
+                        Value::Concrete(ConcreteValue::String(
+                            "arn:aws:iam::111111111111:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_AdministratorAccess_abcdef0123456789".to_string(),
+                        )),
+                    ])),
+                )]
+                .into_iter()
+                .collect(),
+                dependency_bindings: BTreeSet::new(),
+            },
+        );
+
+        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+            managed: &[],
+            virtuals: &[],
+            data_sources: &[ds],
+            current_states: &states,
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        });
+
+        let attrs = resolved
+            .get("admin_access_roles")
+            .expect("data-source binding present");
+        // The DSL-input filter survives — useful for plan-display refs
+        // that name the input field.
+        assert!(
+            attrs.get("path_prefix").is_some(),
+            "DSL input filter must remain visible in the binding",
+        );
+        // The read result must be visible so downstream resource refs
+        // (e.g. `role.assume_role_policy_document = admin_access_roles.arns`)
+        // resolve to a concrete `List<String>` at apply time.
+        let arns = attrs
+            .get("arns")
+            .expect("read-state attribute `arns` must be visible on the binding");
+        match arns {
+            Value::Concrete(ConcreteValue::List(items)) => {
+                assert_eq!(items.len(), 1, "one role arn returned");
+            }
+            other => panic!("expected concrete List, got {:?}", other),
+        }
+        assert_eq!(
+            resolved.source("admin_access_roles"),
+            Some(&BindingValueSource::Local)
+        );
+    }
+
+    /// carina#3252 follow-up: when the data-source DSL input map and the
+    /// read state share a key, the read state must win — it is the value
+    /// the provider returned. Mirrors `record_applied`'s "state wins"
+    /// rule for managed resources. The two maps don't normally collide
+    /// (inputs are filters, outputs are produced values), but a provider
+    /// is allowed to echo an input back into its state and the binding
+    /// view must surface the post-read value, not the pre-read filter.
+    #[test]
+    fn data_source_binding_state_wins_on_key_collision() {
+        let ds_id = ResourceId::new("aws.example.Echo", "echo");
+        let mut ds = DataSource::new("aws.example.Echo", "echo");
+        ds.id = ds_id.clone();
+        ds.binding = Some("echo".to_string());
+        ds.attributes.insert(
+            "filter".to_string(),
+            Value::Concrete(ConcreteValue::String("dsl-input".to_string())),
+        );
+
+        let mut states: HashMap<ResourceId, State> = HashMap::new();
+        states.insert(
+            ds_id.clone(),
+            State {
+                id: ds_id,
+                identifier: None,
+                exists: true,
+                attributes: vec![(
+                    "filter".to_string(),
+                    Value::Concrete(ConcreteValue::String("provider-result".to_string())),
+                )]
+                .into_iter()
+                .collect(),
+                dependency_bindings: BTreeSet::new(),
+            },
+        );
+
+        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+            managed: &[],
+            virtuals: &[],
+            data_sources: &[ds],
+            current_states: &states,
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        });
+        let attrs = resolved.get("echo").expect("echo binding present");
+        assert_eq!(
+            attrs.get("filter"),
+            Some(&Value::Concrete(ConcreteValue::String(
+                "provider-result".to_string()
+            ))),
+            "read-state attribute must override DSL input on collision",
+        );
+    }
+
+    /// carina#3252: cover the no-DSL-input shape (e.g.
+    /// `read aws.sts.CallerIdentity {}` — failure path (b)/(c) in the
+    /// issue comment). The DSL attribute map is empty; the binding's
+    /// entire visible content comes from `current_states[ds.id]`. A
+    /// regression that re-broke `current_states` merging would still
+    /// pass [`data_source_binding_merges_state_attributes`] because that
+    /// test also asserts the DSL filter survives — this test does not,
+    /// so it pins the state-only variant.
+    #[test]
+    fn data_source_binding_with_no_dsl_inputs_exposes_state_only() {
+        let ds_id = ResourceId::with_provider("aws", "sts.CallerIdentity", "caller", None);
+        let mut ds = DataSource::with_provider("aws", "sts.CallerIdentity", "caller", None);
+        ds.id = ds_id.clone();
+        ds.binding = Some("caller".to_string());
+        assert!(
+            ds.attributes.is_empty(),
+            "this test covers the no-DSL-input shape",
+        );
+
+        let mut states: HashMap<ResourceId, State> = HashMap::new();
+        states.insert(
+            ds_id.clone(),
+            State::existing(
+                ds_id,
+                vec![(
+                    "account_id".to_string(),
+                    Value::Concrete(ConcreteValue::String("111111111111".to_string())),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+        );
+
+        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+            managed: &[],
+            virtuals: &[],
+            data_sources: &[ds],
+            current_states: &states,
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        });
+        let attrs = resolved.get("caller").expect("caller binding present");
+        assert_eq!(
+            attrs.get("account_id"),
+            Some(&Value::Concrete(ConcreteValue::String(
+                "111111111111".to_string()
+            ))),
+            "with no DSL inputs, the binding's content is entirely the \
+             read state's attributes",
         );
     }
 }

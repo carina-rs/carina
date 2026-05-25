@@ -528,6 +528,23 @@ pub trait Provider: Send + Sync {
     /// Each provider must implement this explicitly. For zero-input data
     /// sources (e.g. `aws.sts.caller_identity`), the implementation can
     /// simply delegate to a state-only read against `resource.id`.
+    ///
+    /// # `State.exists` contract
+    ///
+    /// A successful read MUST return a `State` with `exists: true`,
+    /// even when the query yielded no rows — the data source itself
+    /// "exists" (the lookup succeeded); the result set being empty is
+    /// just an empty-list attribute on the returned state. Reserve
+    /// `exists: false` for *failure to resolve the data source itself*
+    /// (the query returned no resource at all, e.g. an
+    /// `identity_store_id` whose store does not exist).
+    ///
+    /// This matters for the binding view (`ResolvedBindings::pre_apply`
+    /// / `layer_data_source_bindings`): the merge that surfaces the
+    /// read result to downstream `ResourceRef`s is gated on
+    /// `state.exists`, so `exists: false` causes the binding to drop
+    /// the read state entirely and downstream `ResourceRef`s fail with
+    /// the "has not been published yet" diagnostic (carina#3252).
     fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>>;
 
     /// Create the resource described by `request.resource` and return
