@@ -1036,6 +1036,56 @@ fn test_check_and_migrate_no_migration_info_for_current_version() {
     assert_eq!(outcome.state.version, StateFile::CURRENT_VERSION);
 }
 
+// carina#3266: `state.resources` is managed-only by invariant since
+// #3181, but pre-#3181 carina releases (and an older `carina state
+// refresh` path) persisted `read aws.*` data-source rows here. They
+// share one distinguishing shape — `identifier: null` — because a
+// data source has no provider-side identity to record. They must be
+// pruned at the single read seam so every downstream consumer (apply,
+// destroy, state refresh, plan) sees an invariant-respecting state.
+// In production, the bug surfaced as `state.exports` for a
+// data-source-derived value never converging — the post-apply binding
+// overlay was lifting the stale `arns` value out of the artifact row
+// and writing it straight back. See the issue body for the full
+// repro on `aws/management/identity-center/`.
+#[test]
+fn check_and_migrate_drops_artifact_rows_with_null_identifier_3266() {
+    use super::check_and_migrate;
+
+    let json = r#"{
+        "version": 7,
+        "serial": 14,
+        "lineage": "test-lineage",
+        "carina_version": "0.4.0",
+        "resources": [
+            {
+                "resource_type": "iam.Roles",
+                "name": "admin_access_roles",
+                "provider": "aws",
+                "identifier": null,
+                "attributes": { "arns": ["arn:aws:iam::1:role/OLD"] },
+                "binding": "admin_access_roles"
+            },
+            {
+                "resource_type": "s3.Bucket",
+                "name": "log",
+                "provider": "awscc",
+                "identifier": "log-bucket",
+                "attributes": { "name": "log-bucket" }
+            }
+        ]
+    }"#;
+
+    let state = check_and_migrate(json).expect("read").into_state();
+    let kept_names: Vec<&str> = state.resources.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(
+        kept_names,
+        vec!["log"],
+        "identifier=None artifact rows must be pruned at read time; \
+         only managed resources with identifiers survive. Got: {kept_names:?}",
+    );
+}
+
 #[test]
 fn test_merge_write_only_attributes() {
     use carina_core::resource::{ConcreteValue, ManagedResource, State as ProviderState, Value};
@@ -1564,6 +1614,10 @@ fn v5_state_read_converts_desired_keys_to_explicit_leaves() {
     // Reading it under v6 must (a) bump the version to 6 and
     // (b) lift each top-level key to a `Leaf` child of the root
     // `ExplicitFields::Struct`.
+    // carina#3266: production v5 rows carry an identifier (the
+    // provider returns one on every successful apply). The read
+    // path now prunes identifier=None rows as historical artifacts,
+    // so this fixture has to mirror real shape.
     let v5 = r#"{
         "version": 5,
         "serial": 0,
@@ -1573,7 +1627,7 @@ fn v5_state_read_converts_desired_keys_to_explicit_leaves() {
             "resource_type": "s3.Bucket",
             "name": "my-bucket",
             "provider": "aws",
-            "identifier": null,
+            "identifier": "my-bucket",
             "attributes": {"region": "ap-northeast-1"},
             "protected": false,
             "directives": {},
@@ -1607,7 +1661,10 @@ fn current_state_writes_and_reads_full_explicit_tree() {
     // A current-version state file with a nested `explicit` tree
     // round-trips through serde without loss.
     let mut state = StateFile::new();
-    let mut rs = ResourceState::new("s3.Bucket", "my-bucket", "aws");
+    // carina#3266: `check_and_migrate` prunes identifier=None rows
+    // (historical-artifact shape from pre-#3181 data-source writeback).
+    // Production rows always carry an identifier from `from_provider_state`.
+    let mut rs = ResourceState::new("s3.Bucket", "my-bucket", "aws").with_identifier("my-bucket");
     rs.explicit = ExplicitFields::Struct {
         children: HashMap::from([(
             "lifecycle_configuration".into(),

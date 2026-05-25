@@ -546,6 +546,26 @@ pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendErro
     // rewritten to the canonical form on read so existing state files
     // resolve cleanly against new emissions. See #1903.
     state.canonicalize_addresses();
+    // carina#3266: `state.resources` is managed-only by invariant
+    // (since #3181). Pre-#3181 versions of `carina state refresh` /
+    // older apply paths persisted `read aws.*` data-source rows here;
+    // those rows carry `identifier: null` (a data source has no
+    // provider-side identity), survive every subsequent read, and
+    // then silently overwrite the fresh phase-2 data-source read
+    // when post-apply binding views overlay `state.resources` on top
+    // of `current_states`. Consumer paths (apply, destroy, state
+    // refresh, plan) each used the overlay and so each saw the stale
+    // value — including export resolution, which then wrote the
+    // pre-apply literal back to `state.exports` on every apply.
+    //
+    // Dropping these rows at the single read seam restores the
+    // managed-only invariant for every downstream consumer in one
+    // place; no per-site filter or post-write cleanup is required.
+    // A managed resource that has never returned an identifier from
+    // the provider never reaches state writeback (it lands as
+    // `add_cleanup` instead), so identifier=None in `state.resources`
+    // is exclusively a historical-artifact shape.
+    state.resources.retain(|rs| rs.identifier.is_some());
     Ok(MigratedStateFile { state, migration })
 }
 

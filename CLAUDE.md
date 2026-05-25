@@ -2,6 +2,17 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Root-cause fixes only — no bandaids, no per-symptom carve-outs
+
+**The most important rule of this project.** When fixing a bug, fix the root cause, not the symptom. If the same broken invariant produces symptoms in multiple code paths (`apply`, `destroy`, `state refresh`, `plan`, etc.), the correct fix is the *one* upstream change that restores the invariant, not a filter / guard / carve-out at every consumer site.
+
+- **Never propose "minimal fix in this PR, follow-up issue for the rest"** when "the rest" is the same class of bug at sibling call sites. That is a bandaid presented as scope discipline. The correct framing is: this is one bug, fix the root.
+- **Never invoke "1 PR = 1 topic" to justify a per-site patch.** "1 topic" means one *root cause*, not "one of several symptoms of the same root cause." Fixing the root *is* the topic. Concretely: if the bug is "data sources should not live in `state.resources`", the fix is "prune them at state read", not "filter them at every consumer of the overlay." If the bug is "`Effect` arms diverge on field X", the fix is at the enum / type level, not at every match site.
+- **Self-check before opening a PR:** if the diff filters / guards / skips for the buggy condition instead of removing the condition itself, the fix is symptom-level. Step back and find the upstream seam.
+- **5-round review passing is NOT evidence the fix is root-cause.** A bandaid can pass every gate. Ask "if a new caller appears tomorrow, does it need to remember this filter too?" — if yes, the root is still broken.
+- **When in doubt, pick the broader fix.** Past failure mode in this repo: shrinking scope and offering a follow-up has been pushed back on every single time. The user has explicitly said: do not present "fix here + follow-up for sibling" — fix the root once.
+- **Type Safety First applies here too:** prefer the fix that makes the broken state unrepresentable. Newtypes, tagged unions, typestate — over runtime filters at every consumer.
+
 ## Type Safety First
 
 - When fixing bugs, prefer type-level solutions (newtypes, tagged unions, typestate) over runtime validation/filters.
