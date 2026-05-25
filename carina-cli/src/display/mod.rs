@@ -263,7 +263,8 @@ pub fn format_plan(
 ) -> String {
     let mut out = String::new();
 
-    if plan.is_empty() && deferred_for_expressions.is_empty() && export_changes.is_empty() {
+    if plan.effects().is_empty() && deferred_for_expressions.is_empty() && export_changes.is_empty()
+    {
         writeln!(
             out,
             "{}",
@@ -389,7 +390,7 @@ pub fn format_destroy_plan(
 ) -> String {
     let mut out = String::new();
 
-    if plan.is_empty() {
+    if plan.effects().is_empty() {
         return out;
     }
 
