@@ -61,6 +61,7 @@ fn snapshot_depends_on() {
         &[],
         &[],
         None,
+        None,
     ));
     insta::assert_snapshot!(output);
 }
@@ -86,6 +87,7 @@ fn snapshot_wait_cert() {
         &[],
         &[],
         None,
+        None,
     ));
     insta::assert_snapshot!(output);
 }
@@ -101,6 +103,7 @@ fn snapshot_all_create() {
         &HashMap::new(),
         &[],
         &[],
+        None,
         None,
     ));
     insta::assert_snapshot!(output);
@@ -126,6 +129,7 @@ fn snapshot_multi_instance_create() {
         &HashMap::new(),
         &[],
         &[],
+        None,
         None,
     ));
     insta::assert_snapshot!(output);
@@ -218,6 +222,7 @@ fn snapshot_module_anonymous_resource() {
         &[],
         &[],
         None,
+        None,
     ));
     insta::assert_snapshot!(output);
 }
@@ -234,6 +239,7 @@ fn snapshot_policy_pretty() {
         &[],
         &[],
         None,
+        None,
     ));
     insta::assert_snapshot!(output);
 }
@@ -249,6 +255,7 @@ fn snapshot_policy_pretty_nested() {
         &HashMap::new(),
         &[],
         &[],
+        None,
         None,
     ));
     insta::assert_snapshot!(output);
@@ -272,6 +279,7 @@ fn snapshot_policy_pretty_dynamic_key_list() {
         &[],
         &[],
         None,
+        None,
     ));
     insta::assert_snapshot!(output);
 }
@@ -287,6 +295,7 @@ fn snapshot_pretty_long_string_list() {
         &HashMap::new(),
         &[],
         &[],
+        None,
         None,
     ));
     insta::assert_snapshot!(output);
@@ -304,6 +313,7 @@ fn snapshot_pretty_short_string_list() {
         &[],
         &[],
         None,
+        None,
     ));
     insta::assert_snapshot!(output);
 }
@@ -319,6 +329,7 @@ fn snapshot_no_changes() {
         &HashMap::new(),
         &[],
         &[],
+        None,
         None,
     ));
     insta::assert_snapshot!(output);
@@ -346,6 +357,7 @@ fn snapshot_empty_explicit_children_no_changes() {
         &[],
         &[],
         Some(&fp.prev_explicit),
+        None,
     ));
     assert!(
         output.contains("No changes"),
@@ -367,6 +379,7 @@ fn snapshot_mixed_operations() {
         &HashMap::new(),
         &[],
         &[],
+        None,
         None,
     ));
     insta::assert_snapshot!(output);
@@ -398,6 +411,7 @@ fn snapshot_delete_orphan() {
         &HashMap::new(),
         &[],
         &[],
+        None,
         None,
     ));
     insta::assert_snapshot!(output);
@@ -435,6 +449,7 @@ fn snapshot_delete_orphan_list_of_maps() {
         &[],
         &[],
         None,
+        None,
     ));
     insta::assert_snapshot!(output);
 }
@@ -451,6 +466,7 @@ fn snapshot_compact() {
         &[],
         &[],
         None,
+        None,
     ));
     insta::assert_snapshot!(output);
 }
@@ -466,6 +482,7 @@ fn snapshot_map_key_diff() {
         &HashMap::new(),
         &[],
         &[],
+        None,
         None,
     ));
     insta::assert_snapshot!(output);
@@ -485,6 +502,7 @@ fn snapshot_map_added_from_none() {
         &HashMap::new(),
         &[],
         &[],
+        None,
         None,
     ));
     insta::assert_snapshot!(output);
@@ -507,6 +525,7 @@ fn snapshot_map_attribute_removed() {
         &[],
         &[],
         None,
+        None,
     ));
     insta::assert_snapshot!(output);
 }
@@ -523,6 +542,7 @@ fn snapshot_enum_display() {
         &[],
         &[],
         None,
+        None,
     ));
     insta::assert_snapshot!(output);
 }
@@ -538,6 +558,7 @@ fn snapshot_no_changes_enum() {
         &HashMap::new(),
         &[],
         &[],
+        None,
         None,
     ));
     insta::assert_snapshot!(output);
@@ -591,6 +612,7 @@ fn snapshot_default_values() {
         &[],
         &[],
         None,
+        None,
     ));
     insta::assert_snapshot!(output);
 }
@@ -606,6 +628,7 @@ fn snapshot_read_only_attrs() {
         &HashMap::new(),
         &[],
         &[],
+        None,
         None,
     ));
     insta::assert_snapshot!(output);
@@ -623,6 +646,7 @@ fn snapshot_explicit() {
         &[],
         &[],
         None,
+        None,
     ));
     insta::assert_snapshot!(output);
 }
@@ -639,6 +663,7 @@ fn snapshot_default_tags() {
         &[],
         &[],
         None,
+        None,
     ));
     insta::assert_snapshot!(output);
 }
@@ -654,6 +679,7 @@ fn snapshot_state_blocks() {
         &HashMap::new(),
         &[],
         &[],
+        None,
         None,
     ));
     insta::assert_snapshot!(output);
@@ -686,6 +712,7 @@ fn snapshot_secret_values() {
         &[],
         &[],
         None,
+        None,
     ));
     insta::assert_snapshot!(output);
 }
@@ -701,6 +728,7 @@ fn snapshot_moved_with_changes() {
         &moved_origins,
         &[],
         &[],
+        None,
         None,
     ));
     insta::assert_snapshot!(output);
@@ -731,6 +759,7 @@ fn snapshot_moved_prev_keys() {
         &moved_origins,
         &[],
         &[],
+        None,
         None,
     ));
     insta::assert_snapshot!(output);
@@ -768,6 +797,7 @@ fn snapshot_moved_pure() {
         &[],
         &[],
         None,
+        None,
     ));
     insta::assert_snapshot!(output);
 }
@@ -791,6 +821,7 @@ fn snapshot_moved_with_changes_compact() {
         &moved_origins,
         &[],
         &[],
+        None,
         None,
     ));
     insta::assert_snapshot!(output);
@@ -920,6 +951,7 @@ fn plan_snapshot_upstream_state() {
         &[],
         &[],
         None,
+        None,
     );
     insta::assert_snapshot!(strip_ansi(&output));
 }
@@ -939,6 +971,7 @@ fn plan_snapshot_upstream_state_unresolved() {
         &moved_origins,
         &[],
         &[],
+        None,
         None,
     );
     let stripped = strip_ansi(&output);
@@ -967,6 +1000,7 @@ fn plan_snapshot_upstream_state_empty_exports() {
         &[],
         &[],
         None,
+        None,
     );
     let stripped = strip_ansi(&output);
     assert!(
@@ -992,6 +1026,7 @@ fn plan_snapshot_upstream_state_map_subscript() {
         &moved_origins,
         &[],
         &[],
+        None,
         None,
     );
     let stripped = strip_ansi(&output);
@@ -1039,6 +1074,7 @@ fn plan_snapshot_upstream_state_map_dot_notation() {
         &moved_origins,
         &[],
         &[],
+        None,
         None,
     );
     let stripped = strip_ansi(&output);
@@ -1097,6 +1133,7 @@ fn plan_snapshot_exports() {
         &export_changes,
         &[],
         None,
+        None,
     );
     insta::assert_snapshot!(strip_ansi(&output));
 }
@@ -1132,6 +1169,7 @@ fn plan_snapshot_exports_multifile() {
         &fp.moved_origins,
         &export_changes,
         &[],
+        None,
         None,
     );
     insta::assert_snapshot!(strip_ansi(&output));
@@ -1170,6 +1208,7 @@ fn plan_snapshot_export_changes_mixed() {
         &export_changes,
         &[],
         None,
+        None,
     );
     insta::assert_snapshot!(strip_ansi(&output));
 }
@@ -1185,6 +1224,7 @@ fn snapshot_nested_map_diff() {
         &HashMap::new(),
         &[],
         &[],
+        None,
         None,
     ));
     insta::assert_snapshot!(output);
@@ -1206,6 +1246,7 @@ fn snapshot_list_diff_added_struct() {
         &HashMap::new(),
         &[],
         &[],
+        None,
         None,
     ));
     assert!(
@@ -1234,6 +1275,7 @@ fn snapshot_list_diff_modified_with_unchanged() {
         &HashMap::new(),
         &[],
         &[],
+        None,
         None,
     ));
     assert!(
@@ -1265,6 +1307,7 @@ fn snapshot_list_diff_string_list_grew() {
         &[],
         &[],
         None,
+        None,
     ));
     assert!(
         !output.lines().any(|l| l.len() > 200),
@@ -1291,6 +1334,7 @@ fn snapshot_map_field_string_list_grew() {
         &HashMap::new(),
         &[],
         &[],
+        None,
         None,
     ));
     assert!(
@@ -1320,6 +1364,7 @@ fn snapshot_list_diff_modified_with_unchanged_nested() {
         &HashMap::new(),
         &[],
         &[],
+        None,
         None,
     ));
     assert!(
@@ -1352,6 +1397,7 @@ fn snapshot_list_diff_paired_all_unchanged_dropped() {
         &[],
         &[],
         None,
+        None,
     ));
     insta::assert_snapshot!(output);
 }
@@ -1374,6 +1420,7 @@ fn snapshot_nested_list_of_maps_all_dropped() {
         &[],
         &[],
         None,
+        None,
     ));
     insta::assert_snapshot!(output);
 }
@@ -1390,6 +1437,7 @@ fn snapshot_list_diff_removed_struct() {
         &HashMap::new(),
         &[],
         &[],
+        None,
         None,
     ));
     assert!(
@@ -1417,6 +1465,7 @@ fn snapshot_deferred_for() {
         &[],
         &fp.deferred_for_expressions,
         Some(&fp.prev_explicit),
+        None,
     ));
     insta::assert_snapshot!(output);
 }
@@ -1436,6 +1485,7 @@ fn snapshot_provider_prefix() {
         &HashMap::new(),
         &[],
         &[],
+        None,
         None,
     ));
     insta::assert_snapshot!(output);
@@ -1460,6 +1510,7 @@ fn snapshot_server_default_struct_leaf() {
         &[],
         &[],
         Some(&fp.prev_explicit),
+        None,
     ));
     insta::assert_snapshot!(output);
 
@@ -1468,6 +1519,70 @@ fn snapshot_server_default_struct_leaf() {
     assert!(
         !output.contains("Name"),
         "rendered plan must not surface the unauthored 'Name' leaf, got:\n{}",
+        output
+    );
+}
+
+/// #3307 acceptance: when an `ExpansionTrace` records two leaf resources
+/// under a composition call site, the rendered plan groups them under a
+/// `Composition "<binding>"` header. The third leaf, declared at the
+/// DSL root with no trace entry, stays at the top level.
+#[test]
+fn snapshot_composition_folding() {
+    use carina_core::effect::Effect;
+    use carina_core::plan::Plan;
+    use carina_core::resource::{EphemeralId, ExpansionTrace, PersistentId, Resource, ResourceId};
+    use carina_core::schema::SchemaRegistry;
+
+    let mut plan = Plan::new();
+
+    // Two leaves under the composition `cluster`.
+    let inner = Resource::new("aws.eks.Cluster", "cluster/inner");
+    let inner_role = Resource::new("aws.iam.Role", "cluster/inner-role");
+    // One leaf at the DSL root.
+    let logs = Resource::new("aws.s3.Bucket", "logs");
+
+    let inner_id = inner.id.clone();
+    let inner_role_id = inner_role.id.clone();
+
+    plan.add(Effect::Create(inner));
+    plan.add(Effect::Create(inner_role));
+    plan.add(Effect::Create(logs));
+
+    let mut trace = ExpansionTrace::new();
+    let cluster_site = EphemeralId::new(ResourceId::new("_virtual", "cluster"));
+    trace.record(PersistentId::new(inner_id), vec![cluster_site.clone()]);
+    trace.record(PersistentId::new(inner_role_id), vec![cluster_site]);
+
+    let schemas = SchemaRegistry::new();
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::None,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+        Some(&trace),
+    ));
+    insta::assert_snapshot!(output);
+
+    // Acceptance: the composition header must appear, with both leaves
+    // following it in the output.
+    assert!(
+        output.contains("Composition \"cluster\""),
+        "expected `Composition \"cluster\"` header in:\n{}",
+        output
+    );
+    assert!(
+        output.contains("cluster/inner"),
+        "expected inner leaf row in:\n{}",
+        output
+    );
+    assert!(
+        output.contains("logs"),
+        "expected ungrouped `logs` leaf row in:\n{}",
         output
     );
 }

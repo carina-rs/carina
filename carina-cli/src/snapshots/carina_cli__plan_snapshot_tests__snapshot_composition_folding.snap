@@ -1,0 +1,13 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+assertion_line: 1571
+expression: output
+---
+Execution Plan:
+
+  + aws.s3.Bucket logs
++ Composition "cluster"
+  + aws.eks.Cluster cluster/inner
+  + aws.iam.Role cluster/inner-role
+
+Plan: 3 to add, 0 to change, 0 to destroy.

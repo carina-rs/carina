@@ -60,6 +60,10 @@ pub struct PlanContext {
     /// `parsed.deferred_for_expressions` the caller used to pass to
     /// `print_plan` — expansion no longer mutates `parsed`.
     pub residual_deferred_for: Vec<carina_core::parser::DeferredForExpression>,
+    /// Plan-scoped lineage of leaves back to the composition call sites
+    /// that produced them (#3306, #3307). Forwarded to the display
+    /// layer so the rendered tree folds leaves under composition rows.
+    pub expansion_trace: carina_core::resource::ExpansionTrace,
 }
 
 /// Cached provider factories and schemas, constructed once per CLI invocation.
@@ -1986,6 +1990,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         upstream_snapshot: remote_bindings.clone(),
         prev_explicit,
         residual_deferred_for,
+        expansion_trace: parsed.expansion_trace.clone(),
     })
 }
 

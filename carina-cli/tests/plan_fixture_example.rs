@@ -29,6 +29,7 @@ fn render_plan(fixture: &str, detail: DetailLevel) -> String {
         &[],
         &fp.deferred_for_expressions,
         Some(&fp.prev_explicit),
+        None,
     )
 }
 

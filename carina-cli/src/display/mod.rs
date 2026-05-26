@@ -225,6 +225,7 @@ pub fn print_plan(
     export_changes: &[crate::commands::plan::ExportChange],
     deferred_for_expressions: &[carina_core::parser::DeferredForExpression],
     prev_explicit: Option<&HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
+    expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
 ) {
     print!(
         "{}",
@@ -237,6 +238,7 @@ pub fn print_plan(
             export_changes,
             deferred_for_expressions,
             prev_explicit,
+            expansion_trace,
         )
     );
 }
@@ -260,6 +262,7 @@ pub fn format_plan(
     export_changes: &[crate::commands::plan::ExportChange],
     deferred_for_expressions: &[carina_core::parser::DeferredForExpression],
     prev_explicit: Option<&HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
+    expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
 ) -> String {
     let mut out = String::new();
 
@@ -289,6 +292,7 @@ pub fn format_plan(
         schemas,
         moved_origins,
         prev_explicit,
+        expansion_trace,
     ));
 
     // Show deferred for-expressions
@@ -404,6 +408,7 @@ pub fn format_destroy_plan(
         None,
         &HashMap::new(),
         None,
+        None, // ExpansionTrace doesn't apply to destroy plans (no compositions in state)
     ));
 
     out
@@ -803,6 +808,7 @@ impl<'a> TreeRenderContext<'a> {
 ///
 /// `delete_attributes` optionally provides current state attributes for Delete
 /// effects, allowing the display to show what will be deleted.
+#[allow(clippy::too_many_arguments)]
 fn format_plan_tree<'a>(
     plan: &Plan,
     detail: DetailLevel,
@@ -810,6 +816,7 @@ fn format_plan_tree<'a>(
     schemas: Option<&'a SchemaRegistry>,
     moved_origins: &'a HashMap<ResourceId, ResourceId>,
     prev_explicit: Option<&'a HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
+    expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
 ) -> String {
     // Build dependency graph from effects
     let graph = build_dependency_graph(plan);
@@ -840,9 +847,38 @@ fn format_plan_tree<'a>(
         update_or_replace_targets,
     };
 
-    // Print from roots
-    for (i, root_idx) in roots.iter().enumerate() {
-        ctx.format_effect_tree(*root_idx, 0, i == roots.len() - 1, "", None);
+    // #3307: when an ExpansionTrace is supplied AND it actually
+    // records lineage for the plan's leaves, group root rows by their
+    // outermost composition call site. Within each composition group,
+    // a `Composition "<binding>"` header is printed first, followed by
+    // the leaf rows. Roots with no lineage entry render at the
+    // top level as before.
+    let composition_groups = group_roots_by_outermost_composition(plan, &roots, expansion_trace);
+
+    if composition_groups.has_any_grouping() {
+        // First: render ungrouped roots (declared at the DSL root).
+        for (i, root_idx) in composition_groups.ungrouped.iter().enumerate() {
+            let last = i == composition_groups.ungrouped.len() - 1
+                && composition_groups.grouped.is_empty();
+            ctx.format_effect_tree(*root_idx, 0, last, "", None);
+        }
+        // Then: each composition group with its header. Each leaf
+        // renders as a top-level row (indent 0, no prefix) — the
+        // composition header marks the group, and the per-line `Composition`
+        // header visually separates groups.
+        for group in &composition_groups.grouped {
+            writeln!(ctx.out, "{}", format_composition_header(&group.binding)).unwrap();
+            for (li, leaf_idx) in group.leaves.iter().enumerate() {
+                let leaf_last = li == group.leaves.len() - 1;
+                ctx.format_effect_tree(*leaf_idx, 0, leaf_last, "  ", None);
+            }
+        }
+    } else {
+        // No trace, or trace empty for this plan's leaves — use the
+        // pre-#3307 flat layout so existing snapshots remain valid.
+        for (i, root_idx) in roots.iter().enumerate() {
+            ctx.format_effect_tree(*root_idx, 0, i == roots.len() - 1, "", None);
+        }
     }
 
     // Print any remaining effects that weren't reachable from roots
@@ -855,6 +891,88 @@ fn format_plan_tree<'a>(
     }
 
     ctx.out
+}
+
+/// Header row for a composition group in the folded plan layout.
+fn format_composition_header(binding: &str) -> String {
+    use colored::Colorize;
+    format!("{} Composition \"{}\"", "+".cyan(), binding.cyan().bold())
+}
+
+/// Bucket of root effects, partitioned into the ones nested inside a
+/// composition (grouped under their outermost call site) and the ones
+/// declared at the DSL root (ungrouped).
+struct CompositionGroups {
+    ungrouped: Vec<usize>,
+    grouped: Vec<CompositionGroup>,
+}
+
+impl CompositionGroups {
+    fn has_any_grouping(&self) -> bool {
+        !self.grouped.is_empty()
+    }
+}
+
+struct CompositionGroup {
+    /// Display label — the call site's binding (instance prefix), e.g. `cluster`.
+    binding: String,
+    /// Root indices in `plan.effects()` that belong to this group.
+    leaves: Vec<usize>,
+}
+
+/// Partition `roots` into composition-grouped vs ungrouped buckets
+/// using the `ExpansionTrace`. A root whose effect's resource has an
+/// outermost composition in the trace lands in the grouped bucket
+/// under that call site; everything else stays ungrouped.
+fn group_roots_by_outermost_composition(
+    plan: &Plan,
+    roots: &[usize],
+    expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
+) -> CompositionGroups {
+    let trace = match expansion_trace {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            return CompositionGroups {
+                ungrouped: roots.to_vec(),
+                grouped: Vec::new(),
+            };
+        }
+    };
+
+    // Map: outermost call-site name → group leaves (preserves first
+    // appearance order).
+    let mut order: Vec<String> = Vec::new();
+    let mut by_call_site: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut ungrouped: Vec<usize> = Vec::new();
+
+    for &root_idx in roots {
+        let effect = &plan.effects()[root_idx];
+        let outer = effect
+            .as_resource_ref()
+            .map(|rref| carina_core::resource::PersistentId::new(rref.id().clone()))
+            .and_then(|pid| trace.call_sites_of(&pid).first().cloned());
+
+        match outer {
+            Some(eid) => {
+                let key = eid.inner().name.as_str().to_string();
+                if !by_call_site.contains_key(&key) {
+                    order.push(key.clone());
+                }
+                by_call_site.entry(key).or_default().push(root_idx);
+            }
+            None => ungrouped.push(root_idx),
+        }
+    }
+
+    let grouped: Vec<CompositionGroup> = order
+        .into_iter()
+        .map(|binding| {
+            let leaves = by_call_site.remove(&binding).unwrap_or_default();
+            CompositionGroup { binding, leaves }
+        })
+        .collect();
+
+    CompositionGroups { grouped, ungrouped }
 }
 
 /// Split a string by `, ` at the top level, respecting nested brackets, braces, and quotes.
