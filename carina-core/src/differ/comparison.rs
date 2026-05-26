@@ -200,6 +200,82 @@ pub(crate) fn type_aware_equal(
                 canonical(va).eq_ignore_ascii_case(&canonical(vb))
             }
 
+            // CustomEnum: a namespaced enum carrying a `to_dsl` callback,
+            // not an `Aliases` table (StringEnum's shape). The differ sees
+            // both shapes in the wild: the provider-read side stores the
+            // AWS-canonical value (e.g. `String("ap-northeast-1a")` for
+            // `aws.AvailabilityZone`), while the DSL side flows through
+            // `resolve_enum_value_recursive` and arrives as the
+            // fully-qualified namespaced spelling
+            // (`String("aws.AvailabilityZone.ap_northeast_1a")` /
+            // `EnumIdentifier(...)` of the same). Without this arm the
+            // post-apply plan reports a phantom `forces replacement`
+            // diff on every `CustomEnum`-typed attribute — see
+            // carina-rs/carina#3312 and the closed carina-rs/carina-provider-aws#363.
+            (
+                a,
+                b,
+                AttributeType::CustomEnum {
+                    identity: _,
+                    to_dsl,
+                    ..
+                },
+            ) if matches!(
+                a,
+                Value::Concrete(ConcreteValue::String(_) | ConcreteValue::EnumIdentifier(_))
+            ) && matches!(
+                b,
+                Value::Concrete(ConcreteValue::String(_) | ConcreteValue::EnumIdentifier(_))
+            ) =>
+            {
+                let text = |v: &Value| -> Option<String> {
+                    match v {
+                        Value::Concrete(ConcreteValue::String(s))
+                        | Value::Concrete(ConcreteValue::EnumIdentifier(s)) => Some(s.clone()),
+                        _ => None,
+                    }
+                };
+                let (Some(sa), Some(sb)) = (text(a), text(b)) else {
+                    return a.semantically_equal(b);
+                };
+                if sa == sb {
+                    return true;
+                }
+                // Normalize both sides to the trailing enum-value spelling,
+                // then map through `to_dsl` if available. Each side may
+                // arrive in any of these shapes:
+                //
+                //   - AWS-canonical:     `ap-northeast-1a`
+                //   - Dotted namespace:  `aws.AvailabilityZone.ap_northeast_1a`
+                //   - With `kind` tail:  `aws.AvailabilityZone.ZoneName.ap_northeast_1a`
+                //     (the WIT-bridged identity, where the original
+                //     `("aws.AvailabilityZone", "ZoneName")` axis split
+                //     does not round-trip and `kind` carries the full
+                //     dotted form — see carina#3312)
+                //   - Or any of the above with `EnumIdentifier` shape
+                //
+                // Stripping is greedy: take the segment after the last `.`,
+                // since the trailing enum value never contains a `.` in
+                // any AWS namespace (`ap_northeast_1a`, `dedicated`, etc.).
+                // The `to_dsl` mapping then aligns hyphenated AWS spellings
+                // with underscored DSL spellings (`ap-northeast-1a` ↔
+                // `ap_northeast_1a`); when `to_dsl` is `None` (the WIT
+                // bridge currently drops the function pointer), text
+                // equality after stripping is still sufficient for the
+                // identical-segment case.
+                let canonical = |s: &str| -> String {
+                    let trailing = match s.rsplit_once('.') {
+                        Some((_, tail)) => tail,
+                        None => s,
+                    };
+                    match to_dsl {
+                        Some(f) => f(trailing),
+                        None => trailing.to_string(),
+                    }
+                };
+                canonical(&sa) == canonical(&sb)
+            }
+
             // Custom types with base type: delegate to base
             (_, _, AttributeType::Custom { base, .. }) => {
                 type_aware_equal(a, b, Some(base), secret_ctx)
