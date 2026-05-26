@@ -192,10 +192,15 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         .find(|r| r.id.resource_type == "cloudfront.Distribution")
         .expect("expanded Distribution must be present");
     assert!(
-        carina_core::deps::get_resource_value_ref_dependencies(dist).contains("r.cert_issued"),
+        carina_core::deps::get_resource_value_ref_dependencies(
+            carina_core::parser::ResourceRef::Resource(dist)
+        )
+        .contains("r.cert_issued"),
         "Distribution must depend on the prefixed wait binding \
          `r.cert_issued`; deps were {:?}",
-        carina_core::deps::get_resource_value_ref_dependencies(dist)
+        carina_core::deps::get_resource_value_ref_dependencies(
+            carina_core::parser::ResourceRef::Resource(dist)
+        )
     );
 
     // ---- Apply pipeline (mirrors `carina apply`): the Distribution
@@ -330,10 +335,15 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         .find(|r| r.id.resource_type == "cloudfront.Distribution")
         .expect("expanded Distribution must be present");
     assert!(
-        carina_core::deps::get_resource_value_ref_dependencies(dist).contains("o.c.cert_issued"),
+        carina_core::deps::get_resource_value_ref_dependencies(
+            carina_core::parser::ResourceRef::Resource(dist)
+        )
+        .contains("o.c.cert_issued"),
         "Distribution must depend on the doubly-prefixed wait binding \
          `o.c.cert_issued`; deps were {:?}",
-        carina_core::deps::get_resource_value_ref_dependencies(dist)
+        carina_core::deps::get_resource_value_ref_dependencies(
+            carina_core::parser::ResourceRef::Resource(dist)
+        )
     );
 
     // End-to-end apply: the Distribution must wait, not fail/skip.

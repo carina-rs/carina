@@ -123,7 +123,7 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
             collect_resource_refs(value, &mut value_ref_deps);
             collect_dot_notation_refs(value, &mut value_ref_deps);
         }
-        for name in resource.as_resource_like().dependency_bindings() {
+        for name in resource.dependency_bindings() {
             value_ref_deps.insert(name.clone());
         }
 

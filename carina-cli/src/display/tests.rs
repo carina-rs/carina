@@ -390,7 +390,7 @@ fn test_extract_compact_hint_resource_ref() {
         Value::resource_ref("public_subnet_1a".to_string(), "id".to_string(), vec![]),
     );
 
-    let hint = extract_compact_hint(&r, None);
+    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
     // Should return only the first ResourceRef alphabetically, with _id suffix stripped
     assert_eq!(hint, Some("route_table: public_rt".to_string()));
 }
@@ -409,7 +409,10 @@ fn test_extract_compact_hint_skips_parent_ref() {
     );
 
     // When parent is database_rt, should skip route_table_id and show only subnet_id
-    let hint = extract_compact_hint(&r, Some("database_rt"));
+    let hint = extract_compact_hint(
+        carina_core::parser::ResourceRef::Resource(&r),
+        Some("database_rt"),
+    );
     assert_eq!(hint, Some("subnet: database_subnet_1a".to_string()));
 }
 
@@ -422,7 +425,7 @@ fn test_extract_compact_hint_string_fallback() {
         Value::Concrete(ConcreteValue::String("0.0.0.0/0".to_string())),
     );
 
-    let hint = extract_compact_hint(&r, None);
+    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
     assert_eq!(hint, Some("destination_cidr_block: 0.0.0.0/0".to_string()));
 }
 
@@ -430,7 +433,7 @@ fn test_extract_compact_hint_string_fallback() {
 #[test]
 fn test_extract_compact_hint_none() {
     let r = Resource::new("ec2.route", "hash789");
-    let hint = extract_compact_hint(&r, None);
+    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
     assert_eq!(hint, None);
 }
 
@@ -447,7 +450,7 @@ fn test_extract_compact_hint_prefers_string_over_resource_ref() {
         Value::resource_ref("igw".to_string(), "id".to_string(), vec![]),
     );
 
-    let hint = extract_compact_hint(&r, None);
+    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
     // String takes priority over ResourceRef
     assert_eq!(hint, Some("destination: 10.0.0.0/8".to_string()));
 }
@@ -463,7 +466,7 @@ fn test_extract_compact_hint_service_name_shortening() {
         )),
     );
 
-    let hint = extract_compact_hint(&r, None);
+    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
     assert_eq!(hint, Some("service: ecr.dkr".to_string()));
 
     // Single service component
@@ -475,7 +478,7 @@ fn test_extract_compact_hint_service_name_shortening() {
         )),
     );
 
-    let hint2 = extract_compact_hint(&r2, None);
+    let hint2 = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r2), None);
     assert_eq!(hint2, Some("service: s3".to_string()));
 }
 
@@ -493,7 +496,10 @@ fn test_extract_compact_hint_all_refs_match_parent() {
     );
 
     // When parent is endpoint_sg, should skip group_id and use description
-    let hint = extract_compact_hint(&r, Some("endpoint_sg"));
+    let hint = extract_compact_hint(
+        carina_core::parser::ResourceRef::Resource(&r),
+        Some("endpoint_sg"),
+    );
     assert_eq!(hint, Some("description: Allow HTTPS from VPC".to_string()));
 }
 
@@ -521,7 +527,7 @@ fn test_extract_compact_hint_prefers_string_for_vpc_endpoint() {
     );
 
     // String attribute (service_name) takes priority over ResourceRef
-    let hint = extract_compact_hint(&r, Some("vpc"));
+    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), Some("vpc"));
     assert_eq!(hint, Some("service: ecr.dkr".to_string()));
 }
 
@@ -530,10 +536,14 @@ fn test_extract_compact_hint_prefers_string_for_vpc_endpoint() {
 fn test_has_binding() {
     let mut bound = Resource::new("ec2.Vpc", "vpc");
     bound.binding = Some("vpc".to_string());
-    assert!(has_binding(&bound));
+    assert!(has_binding(carina_core::parser::ResourceRef::Resource(
+        &bound
+    )));
 
     let anonymous = Resource::new("ec2.Vpc", "hash123");
-    assert!(!has_binding(&anonymous));
+    assert!(!has_binding(carina_core::parser::ResourceRef::Resource(
+        &anonymous
+    )));
 }
 
 /// Test that format_compact_name shows plain identifiers for bound resources and
@@ -543,7 +553,7 @@ fn test_format_compact_name_bound_resource() {
     let mut r = Resource::new("ec2.Vpc", "vpc");
     r.binding = Some("vpc".to_string());
     // For bound resources, should show name as plain identifier (no quotes)
-    let result = format_compact_name(&r, "vpc", None);
+    let result = format_compact_name(carina_core::parser::ResourceRef::Resource(&r), "vpc", None);
     assert!(
         !result.contains('"'),
         "Bound resource name should not be quoted"
@@ -558,7 +568,11 @@ fn test_format_compact_name_anonymous_with_hint() {
         "subnet_id".to_string(),
         Value::resource_ref("database_subnet_1a".to_string(), "id".to_string(), vec![]),
     );
-    let result = format_compact_name(&r, "hash123", None);
+    let result = format_compact_name(
+        carina_core::parser::ResourceRef::Resource(&r),
+        "hash123",
+        None,
+    );
     assert!(
         result.contains('(') && result.contains(')'),
         "Anonymous resource should show hint in parentheses, got: {}",
@@ -638,7 +652,7 @@ fn test_extract_compact_hint_list_containing_resource_ref() {
         )])),
     );
 
-    let hint = extract_compact_hint(&r, None);
+    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
     assert_eq!(
         hint,
         Some("security_group: endpoint_sg".to_string()),
@@ -659,7 +673,10 @@ fn test_extract_compact_hint_list_ref_skips_parent() {
         )])),
     );
 
-    let hint = extract_compact_hint(&r, Some("endpoint_sg"));
+    let hint = extract_compact_hint(
+        carina_core::parser::ResourceRef::Resource(&r),
+        Some("endpoint_sg"),
+    );
     assert_eq!(
         hint, None,
         "Should skip List<ResourceRef> when ref matches parent"
@@ -688,7 +705,7 @@ fn test_extract_compact_hint_resolves_dsl_enum() {
         )),
     );
 
-    let hint = extract_compact_hint(&r, None);
+    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
     // Displays DSL form (underscored) until provider alias tables include
     // to_dsl reverse mappings (see issue #1675).
     assert_eq!(
@@ -708,7 +725,7 @@ fn test_extract_compact_hint_skips_internal_attributes() {
         Value::Concrete(ConcreteValue::String("abc123".to_string())),
     );
 
-    let hint = extract_compact_hint(&r, None);
+    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
     assert_eq!(hint, None, "Internal attributes should be skipped");
 }
 

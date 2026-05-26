@@ -9,7 +9,7 @@ use super::util::snake_to_pascal;
 use crate::binding_index::IterableBindings;
 use crate::resource::{
     Composition, ConcreteValue, DataSource, DeferredValue, Directives, GraphNode, LeafNode,
-    Resource, ResourceId, ResourceLike, UnknownReason, Value,
+    Resource, ResourceId, UnknownReason, Value,
 };
 use crate::version_constraint::VersionConstraint;
 use indexmap::IndexMap;
@@ -90,17 +90,6 @@ pub enum ResourceRef<'a> {
 }
 
 impl<'a> ResourceRef<'a> {
-    /// View as the shared read-only trait — covers `id` / `attributes` /
-    /// `binding` / `dependency_bindings` for every arm.
-    pub fn as_resource_like(&self) -> &dyn ResourceLike {
-        match self {
-            ResourceRef::Resource(r) => *r,
-            ResourceRef::Composition(v) => *v,
-            ResourceRef::DataSource(d) => *d,
-            ResourceRef::Deferred { resource, .. } => *resource,
-        }
-    }
-
     /// Stable identifier of this resource.
     pub fn id(&self) -> &'a ResourceId {
         match self {
@@ -145,6 +134,21 @@ impl<'a> ResourceRef<'a> {
             ResourceRef::Composition(v) => v.binding.as_deref(),
             ResourceRef::DataSource(d) => d.binding.as_deref(),
             ResourceRef::Deferred { resource, .. } => resource.binding.as_deref(),
+        }
+    }
+
+    /// Binding names this resource depends on (via `ResourceRef` /
+    /// `BindingRef` values in its attribute tree).
+    ///
+    /// Mirrors the field formerly exposed by
+    /// `ResourceLike::dependency_bindings`; #3308 lifts this accessor
+    /// onto `ResourceRef` so the trait can retire.
+    pub fn dependency_bindings(&self) -> &'a std::collections::BTreeSet<String> {
+        match self {
+            ResourceRef::Resource(r) => &r.dependency_bindings,
+            ResourceRef::Composition(v) => &v.dependency_bindings,
+            ResourceRef::DataSource(d) => &d.dependency_bindings,
+            ResourceRef::Deferred { resource, .. } => &resource.dependency_bindings,
         }
     }
 

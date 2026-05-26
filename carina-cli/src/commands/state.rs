@@ -1394,7 +1394,7 @@ mod tests {
         let state = load_fixture_state();
         let plan = build_plan_from_state(&state);
 
-        let vpc_resource = plan.effects()[0].resource_like().unwrap();
+        let vpc_resource = plan.effects()[0].as_resource_ref().unwrap();
         assert!(vpc_resource.attributes().contains_key("cidr_block"));
         assert!(vpc_resource.attributes().contains_key("vpc_id"));
     }
@@ -1412,7 +1412,7 @@ mod tests {
         let plan = build_plan_from_state(&state);
 
         // subnet depends on vpc
-        let subnet_resource = plan.effects()[1].resource_like().unwrap();
+        let subnet_resource = plan.effects()[1].as_resource_ref().unwrap();
         assert_eq!(
             subnet_resource.dependency_bindings(),
             &std::collections::BTreeSet::from(["vpc".to_string()])

@@ -32,17 +32,19 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
     let mut effect_types: HashMap<usize, String> = HashMap::new();
 
     for (idx, effect) in plan.effects().iter().enumerate() {
-        let (resource, deps): (Option<&dyn crate::resource::ResourceLike>, HashSet<String>) =
+        let (resource, deps): (Option<crate::parser::ResourceRef<'_>>, HashSet<String>) =
             match effect {
-                // carina#3181 PR D: `Create`/`Update`/`Replace`/`Read`
+                // carina#3181 PR D / #3308: `Create`/`Update`/`Replace`/`Read`
                 // all carry a typestate struct — reach them through the
-                // shared `ResourceLike` view, and assemble the dependency
+                // shared `ResourceRef` view, and assemble the dependency
                 // set from value refs + the effect's explicit depends_on.
                 Effect::Create(_)
                 | Effect::Update { .. }
                 | Effect::Replace { .. }
                 | Effect::Read { .. } => {
-                    let rl = effect.resource_like().expect("variant carries a resource");
+                    let rl = effect
+                        .as_resource_ref()
+                        .expect("variant carries a resource");
                     let mut deps = get_resource_value_ref_dependencies(rl);
                     deps.extend(effect.explicit_dependencies());
                     (Some(rl), deps)
@@ -285,7 +287,7 @@ pub fn build_single_parent_tree(
 /// `parent_binding` is the binding name of the parent resource in the tree, used to
 /// skip ResourceRef attributes that redundantly reference the parent.
 pub fn extract_compact_hint(
-    resource: &dyn crate::resource::ResourceLike,
+    resource: crate::parser::ResourceRef<'_>,
     parent_binding: Option<&str>,
 ) -> Option<String> {
     let attrs = resource.attributes();

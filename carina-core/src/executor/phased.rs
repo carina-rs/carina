@@ -159,7 +159,7 @@ pub(super) fn build_phase_dependency_map(
     for &idx in phase_indices {
         let mut dep_indices = HashSet::new();
         let effect = &effects[idx];
-        if effect.resource_like().is_some() {
+        if effect.as_resource_ref().is_some() {
             resolver.collect_from_effect(effect, &mut dep_indices);
             if let Some(unresolved) = unresolved_resources.get(effect.resource_id()) {
                 resolver.collect_from_resource(unresolved, &mut dep_indices);
@@ -231,7 +231,7 @@ impl<'a> DepResolver<'a> {
     /// State-only / `Wait` effects have no resource and contribute
     /// nothing.
     pub(super) fn collect_from_effect(&self, effect: &Effect, out: &mut HashSet<usize>) {
-        let Some(resource) = effect.resource_like() else {
+        let Some(resource) = effect.as_resource_ref() else {
             return;
         };
         let mut dep_bindings = crate::deps::get_resource_value_ref_dependencies(resource);
@@ -854,7 +854,7 @@ pub(super) async fn execute_effects_phased(
         for &idx in &delete_indices {
             let effect = &effects[idx];
             let mut dep_indices = HashSet::new();
-            if effect.resource_like().is_some() {
+            if effect.as_resource_ref().is_some() {
                 resolver.collect_from_effect(effect, &mut dep_indices);
                 if let Some(unresolved) = input.unresolved_resources.get(effect.resource_id()) {
                     resolver.collect_from_resource(unresolved, &mut dep_indices);

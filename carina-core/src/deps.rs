@@ -83,7 +83,7 @@ pub fn get_data_source_dependencies(data_source: &crate::resource::DataSource) -
 /// resource depends on the named binding. The two parse to different
 /// `Value` variants since #2847 (`ResourceRef` vs. `BindingRef`), so
 /// the walker visits both forms here.
-fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
+pub(crate) fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
     fn walk(value: &Value, deps: &mut HashSet<String>) {
         match value {
             Value::Deferred(DeferredValue::ResourceRef { path }) => {
@@ -126,13 +126,16 @@ fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
 /// snapshot is what lets the validation pass tell a redundant edge apart
 /// from a depends_on-only edge.
 ///
-/// Takes `&dyn ResourceLike` so the resolver can compute the snapshot for
-/// both managed [`Resource`]s and [`DataSource`]s (carina#3181).
+/// Takes a [`ResourceRef`](crate::parser::ResourceRef) so the resolver
+/// can compute the snapshot for any node kind ([`Resource`],
+/// [`DataSource`], [`Composition`](crate::resource::Composition))
+/// uniformly (carina#3181 / #3308).
 pub fn get_resource_value_ref_dependencies(
-    resource: &dyn crate::resource::ResourceLike,
+    resource: crate::parser::ResourceRef<'_>,
 ) -> HashSet<String> {
     let mut deps = HashSet::new();
-    for value in resource.attributes().values() {
+    let attrs = resource.attributes();
+    for value in attrs.values() {
         collect_dependencies(value, &mut deps);
     }
     for name in resource.dependency_bindings() {
@@ -342,7 +345,7 @@ pub fn find_failed_dependency(
     // refs + `dependency_bindings`) plus the effect's explicit
     // `depends_on` edges — the same union `get_resource_dependencies`
     // computes for a legacy `Resource`.
-    let resource = effect.resource_like()?;
+    let resource = effect.as_resource_ref()?;
     let mut deps = get_resource_value_ref_dependencies(resource);
     deps.extend(effect.explicit_dependencies());
     deps.into_iter().find(|dep| failed_bindings.contains(dep))

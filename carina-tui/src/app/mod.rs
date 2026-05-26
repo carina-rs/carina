@@ -630,7 +630,7 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
     for (idx, effect) in plan.effects().iter().enumerate() {
         // carina#3181 PR D: `Effect` payloads are typestate structs;
         // reach them through the shared `ResourceLike` view.
-        let resource = effect.resource_like();
+        let resource = effect.as_resource_ref();
 
         if let Some(r) = resource {
             let display_type = r.id().display_type();
@@ -649,7 +649,7 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
                         return binding.clone();
                     }
                     p_effect
-                        .resource_like()
+                        .as_resource_ref()
                         .and_then(|pr| pr.binding().map(str::to_string))
                 });
                 if let Some(hint) = extract_compact_hint(r, parent_binding.as_deref()) {

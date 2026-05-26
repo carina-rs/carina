@@ -42,7 +42,7 @@ pub fn refresh_plan_separator(refreshed: bool) -> &'static str {
 }
 
 /// Check if a resource has a `let` binding (i.e., is not anonymous).
-fn has_binding(resource: &dyn carina_core::resource::ResourceLike) -> bool {
+fn has_binding(resource: carina_core::parser::ResourceRef<'_>) -> bool {
     resource.binding().is_some()
 }
 
@@ -53,7 +53,7 @@ fn has_binding(resource: &dyn carina_core::resource::ResourceLike) -> bool {
 /// `parent_binding` is the binding name of the parent in the tree, used to skip
 /// redundant ResourceRef hints.
 fn format_compact_name(
-    resource: &dyn carina_core::resource::ResourceLike,
+    resource: carina_core::parser::ResourceRef<'_>,
     name: &str,
     parent_binding: Option<&str>,
 ) -> String {
@@ -484,7 +484,11 @@ impl<'a> TreeRenderContext<'a> {
         match effect {
             Effect::Create(r) => {
                 if self.detail == DetailLevel::None {
-                    let name_part = format_compact_name(r, r.id.name_str(), parent_binding);
+                    let name_part = format_compact_name(
+                        carina_core::parser::ResourceRef::Resource(r),
+                        r.id.name_str(),
+                        parent_binding,
+                    );
                     writeln!(
                         self.out,
                         "{}{}{} {} {}",
@@ -514,7 +518,11 @@ impl<'a> TreeRenderContext<'a> {
                     .get(id)
                     .map(|from| format!(" (moved from: {})", from.name_str()));
                 if self.detail == DetailLevel::None {
-                    let name_part = format_compact_name(to, id.name_str(), parent_binding);
+                    let name_part = format_compact_name(
+                        carina_core::parser::ResourceRef::Resource(to),
+                        id.name_str(),
+                        parent_binding,
+                    );
                     writeln!(
                         self.out,
                         "{}{}{} {} {}{}",
@@ -553,7 +561,11 @@ impl<'a> TreeRenderContext<'a> {
                     .get(id)
                     .map(|from| format!(" (moved from: {})", from.name_str()));
                 if self.detail == DetailLevel::None {
-                    let name_part = format_compact_name(to, id.name_str(), parent_binding);
+                    let name_part = format_compact_name(
+                        carina_core::parser::ResourceRef::Resource(to),
+                        id.name_str(),
+                        parent_binding,
+                    );
                     writeln!(
                         self.out,
                         "{}{}{} {} {} {}{}",
@@ -596,8 +608,11 @@ impl<'a> TreeRenderContext<'a> {
             }
             Effect::Read { resource } => {
                 if self.detail == DetailLevel::None {
-                    let name_part =
-                        format_compact_name(resource, resource.id.name_str(), parent_binding);
+                    let name_part = format_compact_name(
+                        carina_core::parser::ResourceRef::DataSource(resource),
+                        resource.id.name_str(),
+                        parent_binding,
+                    );
                     writeln!(
                         self.out,
                         "{}{}{} {} {} {}",
@@ -722,7 +737,7 @@ impl<'a> TreeRenderContext<'a> {
                 binding.clone()
             } else {
                 effect
-                    .resource_like()
+                    .as_resource_ref()
                     .and_then(|r| r.binding().map(str::to_string))
             }
         };

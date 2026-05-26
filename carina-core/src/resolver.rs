@@ -84,7 +84,9 @@ fn resolve_refs_inner(
     // This metadata is used by plan tree building to recover parent-child
     // relationships (see build_plan_tree in display.rs and app.rs).
     for resource in resources.iter_mut() {
-        let deps = crate::deps::get_resource_value_ref_dependencies(resource);
+        let deps = crate::deps::get_resource_value_ref_dependencies(
+            crate::parser::ResourceRef::Resource(resource),
+        );
         if !deps.is_empty() {
             resource.dependency_bindings = deps.into_iter().collect();
         }
@@ -169,7 +171,9 @@ fn resolve_data_source_refs_inner(
     unresolved_upstream_bindings: &std::collections::HashSet<&str>,
 ) -> Result<(), String> {
     for data_source in data_sources.iter_mut() {
-        let deps = crate::deps::get_resource_value_ref_dependencies(data_source);
+        let deps = crate::deps::get_resource_value_ref_dependencies(
+            crate::parser::ResourceRef::DataSource(data_source),
+        );
         if !deps.is_empty() {
             data_source.dependency_bindings = deps.into_iter().collect();
         }
