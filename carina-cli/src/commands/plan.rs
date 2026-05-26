@@ -396,8 +396,16 @@ pub async fn run_plan(
         let bucket_exists = backend.bucket_exists().await.map_err(AppError::Backend)?;
 
         if bucket_exists {
-            // Try to load state from backend
-            state_file = backend.read_state().await.map_err(AppError::Backend)?;
+            // Try to load state from backend. `plan` is read-only and
+            // already warns when an in-memory migration was applied,
+            // so it drops the migration token via `into_state()` —
+            // carina#3315 routes persistence through the lock-held
+            // `apply` / `destroy` / `state refresh` paths.
+            state_file = backend
+                .read_state()
+                .await
+                .map_err(AppError::Backend)?
+                .map(|loaded| loaded.into_state());
         } else {
             // Check if there's a matching s3_bucket resource defined
             let bucket_name = config
@@ -443,9 +451,15 @@ pub async fn run_plan(
         }
         backend
     } else {
-        // Use local backend by default
+        // Use local backend by default. Plan is read-only; drop any
+        // pending-migration token (carina#3315 — lock-held callers
+        // persist instead).
         let backend = create_local_backend();
-        state_file = backend.read_state().await.map_err(AppError::Backend)?;
+        state_file = backend
+            .read_state()
+            .await
+            .map_err(AppError::Backend)?
+            .map(|loaded| loaded.into_state());
         backend
     };
 
@@ -554,6 +568,7 @@ pub async fn run_plan(
         drift_detection_test_barrier().await;
         match plan_backend.read_state().await {
             Ok(state_t1) => {
+                let state_t1 = state_t1.map(|loaded| loaded.into_state());
                 if let Some(drift) = detect_state_drift(Some(snapshot_t0), state_t1.as_ref()) {
                     eprintln!("{}", drift.warning().yellow());
                 }
@@ -922,7 +937,14 @@ pub(crate) async fn load_upstream_states(
         cycle_guard.remove(&source_abs);
         let backend = backend_result?;
 
-        let state_file = backend.read_state().await.map_err(AppError::Backend)?;
+        // Upstream-state reads are read-only; drop any pending-migration
+        // token (carina#3315 — only the owning directory's lock-held
+        // apply / destroy / refresh persists).
+        let state_file = backend
+            .read_state()
+            .await
+            .map_err(AppError::Backend)?
+            .map(|loaded| loaded.into_state());
         let bindings = match (state_file, policy) {
             (Some(sf), _) => sf.build_remote_bindings(),
             (None, UpstreamMissingStatePolicy::Strict) => {

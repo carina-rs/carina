@@ -13,7 +13,7 @@ use tokio::time::sleep as async_sleep;
 
 use crate::backend::{BackendConfig, BackendError, BackendResult, StateBackend};
 use crate::lock::LockInfo;
-use crate::state::{self, MigrationInfo, StateFile, log_state_migration_once};
+use crate::state::{self, LoadedState, MigrationInfo, StateFile, log_state_migration_once};
 
 /// Local file backend for development and simple use cases
 pub struct LocalBackend {
@@ -233,7 +233,7 @@ impl Default for LocalBackend {
 
 #[async_trait]
 impl StateBackend for LocalBackend {
-    async fn read_state(&self) -> BackendResult<Option<StateFile>> {
+    async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
         let content = match tokio::fs::read_to_string(&self.state_path).await {
             Ok(content) => content,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -252,8 +252,13 @@ impl StateBackend for LocalBackend {
                 info,
                 &self.state_path.display().to_string(),
             );
+            Ok(Some(LoadedState::Migrated {
+                state: outcome.state,
+                info,
+            }))
+        } else {
+            Ok(Some(LoadedState::Pristine(outcome.state)))
         }
-        Ok(Some(outcome.state))
     }
 
     async fn write_state(&self, state: &StateFile) -> BackendResult<()> {
@@ -581,7 +586,7 @@ mod tests {
         // Read back
         let read_state = backend.read_state().await.unwrap();
         assert!(read_state.is_some());
-        let read_state = read_state.unwrap();
+        let read_state = read_state.unwrap().into_state();
         assert_eq!(read_state.serial, 1);
     }
 
@@ -857,7 +862,7 @@ mod tests {
             .await
             .unwrap();
 
-        let read_state = backend.read_state().await.unwrap().unwrap();
+        let read_state = backend.read_state().await.unwrap().unwrap().into_state();
         assert_eq!(read_state.serial, 1);
 
         backend.release_lock(&lock).await.unwrap();

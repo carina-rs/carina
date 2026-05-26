@@ -13,7 +13,7 @@ use carina_core::utils::convert_region_value;
 
 use crate::backend::{AwsError, BackendConfig, BackendError, BackendResult, StateBackend};
 use crate::lock::LockInfo;
-use crate::state::{self, MigrationInfo, StateFile, log_state_migration_once};
+use crate::state::{self, LoadedState, MigrationInfo, StateFile, log_state_migration_once};
 
 const REGION_UNRESOLVED_MESSAGE: &str = "S3 backend has no region: set `region` in the backend block, or configure AWS_REGION / a profile region";
 
@@ -254,7 +254,7 @@ impl S3Backend {
 
 #[async_trait]
 impl StateBackend for S3Backend {
-    async fn read_state(&self) -> BackendResult<Option<StateFile>> {
+    async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
         let result = self
             .client
             .get_object()
@@ -272,14 +272,20 @@ impl StateBackend for S3Backend {
                     .map_err(|e| BackendError::Io(e.to_string()))?;
                 let bytes = body.into_bytes();
                 let outcome = state::check_and_migrate_bytes(&bytes)?;
-                if let Some(info) = outcome.migration {
+                let loaded = if let Some(info) = outcome.migration {
                     log_state_migration_once(
                         &self.migration_logged,
                         info,
                         &format!("s3://{}/{}", self.bucket, self.key.trim_start_matches('/')),
                     );
-                }
-                Ok(Some(outcome.state))
+                    LoadedState::Migrated {
+                        state: outcome.state,
+                        info,
+                    }
+                } else {
+                    LoadedState::Pristine(outcome.state)
+                };
+                Ok(Some(loaded))
             }
             Err(err) => {
                 if is_not_found_error(&err) {

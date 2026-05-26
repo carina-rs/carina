@@ -443,6 +443,59 @@ impl MigratedStateFile {
     }
 }
 
+/// A state file just read from a backend, tagged with whether
+/// `check_and_migrate` had to lift the on-disk schema in memory.
+/// Returned from [`crate::backend::StateBackend::read_state`].
+///
+/// The two-variant shape (rather than `StateFile + Option<MigrationInfo>`)
+/// forces every consumer to `match` on the pristine vs. migrated case
+/// at the boundary. Lock-held call sites (`apply`, `destroy`,
+/// `state refresh`) bind the `Migrated { state, info }` arm and
+/// persist the upgraded shape before any short-circuit return, so the
+/// carina#3283 warning ("Disk state will be rewritten on the next
+/// `carina apply` or `carina state refresh`") matches reality —
+/// carina#3315. Read-only call sites (`plan`, exports, `state
+/// list/show/lookup`, etc.) bind both arms identically and discard
+/// `info` explicitly — the discard is visible in the source rather
+/// than hidden inside an `Option::None`.
+///
+/// Intentionally not `Clone`: a [`StateFile`] can hold every resource
+/// in the deployment, so accidentally cloning the wrapper would clone
+/// the full state. Consume the wrapper at the call site via
+/// [`Self::into_state`] (read-only paths) or by destructuring the
+/// enum directly (lock-held paths that need the `MigrationInfo`).
+#[derive(Debug)]
+#[must_use = "a loaded state must be either persisted (lock-held paths) or \
+              explicitly consumed via .into_state() (read-only paths); \
+              see LoadedState docs for the carina#3315 invariant"]
+pub enum LoadedState {
+    /// The on-disk state already matched [`StateFile::CURRENT_VERSION`];
+    /// no in-memory migration was applied.
+    Pristine(StateFile),
+    /// `check_and_migrate` lifted the on-disk state to
+    /// [`StateFile::CURRENT_VERSION`] in memory. Lock-held callers
+    /// must persist `state` so the disk reflects the new schema.
+    Migrated {
+        state: StateFile,
+        info: MigrationInfo,
+    },
+}
+
+impl LoadedState {
+    /// Consume the wrapper, returning the state and dropping any
+    /// pending-migration indicator. Use this for read-only paths
+    /// (`plan`, exports, `state list/show/lookup`) where the on-disk
+    /// version is reported via a separate warning and not persisted.
+    /// Lock-held paths destructure the enum directly so the
+    /// `MigrationInfo` is a named binding rather than a hidden drop.
+    pub fn into_state(self) -> StateFile {
+        match self {
+            Self::Pristine(s) => s,
+            Self::Migrated { state, .. } => state,
+        }
+    }
+}
+
 /// Emit the state-schema migration warning to stderr at most once for
 /// the given `OnceLock`-protected slot. Backends call this from
 /// `read_state` so a single `carina plan` run — which reads state
