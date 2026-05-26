@@ -345,6 +345,7 @@ pub(crate) fn merge_parsed_file<E>(target: &mut File<E>, source: File<E>) {
         structural_bindings,
         warnings,
         deferred_for_expressions,
+        expansion_trace,
     } = source;
 
     target.providers.extend(providers);
@@ -367,6 +368,13 @@ pub(crate) fn merge_parsed_file<E>(target: &mut File<E>, source: File<E>) {
     target
         .deferred_for_expressions
         .extend(deferred_for_expressions);
+    // `expansion_trace`: merge every (leaf, chain) entry. Different
+    // sources never produce the same leaf id (the expander prefixes
+    // leaf ids with the call-site instance), so the merge is just a
+    // disjoint-set union; the iteration order does not matter.
+    for (leaf, call_sites) in expansion_trace.leaf_to_call_sites {
+        target.expansion_trace.record(leaf, call_sites);
+    }
     // `backend` is config, not accumulated content: last file wins.
     if let Some(backend) = backend {
         target.backend = Some(backend);

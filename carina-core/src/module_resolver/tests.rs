@@ -78,6 +78,7 @@ fn create_test_module() -> ParsedFile {
         structural_bindings: HashSet::new(),
         warnings: vec![],
         deferred_for_expressions: vec![],
+        expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
 
@@ -170,6 +171,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
         structural_bindings: HashSet::new(),
         warnings: vec![],
         deferred_for_expressions: vec![],
+        expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
 
@@ -315,6 +317,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
         structural_bindings: HashSet::new(),
         warnings: vec![],
         deferred_for_expressions: vec![],
+        expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
 
@@ -482,6 +485,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
         structural_bindings: HashSet::new(),
         warnings: vec![],
         deferred_for_expressions: vec![],
+        expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
 
@@ -627,6 +631,7 @@ fn create_module_with_attributes() -> ParsedFile {
         structural_bindings: HashSet::new(),
         warnings: vec![],
         deferred_for_expressions: vec![],
+        expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
 
@@ -713,6 +718,85 @@ fn test_expand_module_call_populates_compositions_slice() {
     assert!(expanded.data_sources.is_empty());
 }
 
+/// #3306 acceptance: a single-level module call records each leaf
+/// resource it produces in the `ExpansionTrace`, with the call-site
+/// `EphemeralId` as the only chain element.
+#[test]
+fn test_expand_module_call_populates_expansion_trace_single_level() {
+    let resolver = {
+        let mut r = ModuleResolver::new(".");
+        r.imported_modules
+            .insert("web_tier".to_string(), create_module_with_attributes());
+        r
+    };
+
+    let call = ModuleCall {
+        module_name: "web_tier".to_string(),
+        binding_name: Some("web".to_string()),
+        arguments: HashMap::new(),
+    };
+
+    let expanded = resolver.expand_module_call(&call, "web", None).unwrap();
+
+    // One leaf produced (the security_group resource).
+    assert_eq!(expanded.resources.len(), 1);
+    let leaf = &expanded.resources[0];
+
+    // The trace records the leaf against a one-element chain.
+    let chain = expanded
+        .expansion_trace
+        .call_sites_of(&leaf.persistent_id());
+    assert_eq!(
+        chain.len(),
+        1,
+        "single-level expansion must yield a one-element chain, got {chain:?}",
+    );
+
+    // The chain element points at this call site's instance prefix
+    // (`_virtual.<instance_prefix>`).
+    let expected_call_site =
+        crate::resource::EphemeralId::new(crate::resource::ResourceId::new("_virtual", "web"));
+    assert_eq!(chain[0], expected_call_site);
+}
+
+/// #3306 acceptance: when an outer expansion absorbs leaves from a
+/// previously-expanded inner module, the trace prepends the outer
+/// call site to the inner chain — outermost-first overall.
+#[test]
+fn test_build_expansion_trace_prepends_outer_call_site_to_inner_chain() {
+    use crate::resource::{EphemeralId, ExpansionTrace, PersistentId, ResourceId};
+
+    // Simulate an inner module that already finished its own
+    // expansion: one leaf nested one level deep (inner_call_site).
+    let mut inner_trace = ExpansionTrace::new();
+    let inner_leaf = PersistentId::new(ResourceId::new("aws.s3.Bucket", "outer.inner.logs"));
+    let inner_call_site = EphemeralId::new(ResourceId::new("_virtual", "outer.inner"));
+    inner_trace.record(inner_leaf.clone(), vec![inner_call_site.clone()]);
+
+    // Build the outer trace: no direct leaves at this level, only
+    // inherited ones. The outer call-site is `outer`.
+    let outer_trace =
+        crate::module_resolver::expander::build_expansion_trace("outer", &inner_trace, &[], &[]);
+
+    // The inner leaf is still recorded, but its chain now leads with
+    // the outer call site.
+    let chain = outer_trace.call_sites_of(&inner_leaf);
+    assert_eq!(
+        chain.len(),
+        2,
+        "two-level expansion must produce a two-element chain, got {chain:?}",
+    );
+    let expected_outer = EphemeralId::new(ResourceId::new("_virtual", "outer"));
+    assert_eq!(
+        chain[0], expected_outer,
+        "outermost element must be the outer call site",
+    );
+    assert_eq!(
+        chain[1], inner_call_site,
+        "inner element must follow the outer one",
+    );
+}
+
 /// PR E (#3292) acceptance: a composition's `signature.arguments`
 /// preserves the resolved call-site arguments. The pre-#3292 expander
 /// dropped this information with the `ModuleCall`; with `Signature`
@@ -765,6 +849,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
         structural_bindings: HashSet::new(),
         warnings: vec![],
         deferred_for_expressions: vec![],
+        expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
     let resolver = {
@@ -1725,6 +1810,7 @@ fn create_module_with_interpolation() -> ParsedFile {
         structural_bindings: HashSet::new(),
         warnings: vec![],
         deferred_for_expressions: vec![],
+        expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
 
@@ -2108,6 +2194,7 @@ fn create_module_with_port_validation() -> ParsedFile {
         structural_bindings: HashSet::new(),
         warnings: vec![],
         deferred_for_expressions: vec![],
+        expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
 
@@ -2286,6 +2373,7 @@ fn test_argument_validation_no_message_uses_default() {
         structural_bindings: HashSet::new(),
         warnings: vec![],
         deferred_for_expressions: vec![],
+        expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
     let resolver = {
@@ -2354,6 +2442,7 @@ fn test_argument_validation_len_with_list() {
         structural_bindings: HashSet::new(),
         warnings: vec![],
         deferred_for_expressions: vec![],
+        expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
     let resolver = {
@@ -2455,6 +2544,7 @@ fn test_require_block_passes() {
         structural_bindings: HashSet::new(),
         warnings: vec![],
         deferred_for_expressions: vec![],
+        expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
     let resolver = {
@@ -2532,6 +2622,7 @@ fn test_require_block_fails_with_not_expr() {
         structural_bindings: HashSet::new(),
         warnings: vec![],
         deferred_for_expressions: vec![],
+        expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
     let resolver = {
@@ -2607,6 +2698,7 @@ fn test_require_block_len_function() {
         structural_bindings: HashSet::new(),
         warnings: vec![],
         deferred_for_expressions: vec![],
+        expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
     let resolver = {
@@ -2704,6 +2796,7 @@ fn test_require_block_multiple_constraints() {
         structural_bindings: HashSet::new(),
         warnings: vec![],
         deferred_for_expressions: vec![],
+        expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
     let resolver = {
@@ -3996,6 +4089,7 @@ fn create_module_with_environment_union() -> ParsedFile {
         structural_bindings: HashSet::new(),
         warnings: vec![],
         deferred_for_expressions: vec![],
+        expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
 

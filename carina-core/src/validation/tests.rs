@@ -24,6 +24,7 @@ fn empty_parsed() -> ParsedFile {
         structural_bindings: HashSet::new(),
         warnings: Vec::new(),
         deferred_for_expressions: Vec::new(),
+        expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
 

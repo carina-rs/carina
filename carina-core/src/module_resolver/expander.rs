@@ -353,6 +353,16 @@ impl ModuleResolver<'_> {
         // `module.compositions` plus the `_virtual` attribute
         // resource built above.
 
+        // #3306: build the expansion trace from this call's leaves +
+        // nested-expansion traces inherited from `module`, *before*
+        // the struct literal moves `resources` / `data_sources`.
+        let expansion_trace = build_expansion_trace(
+            instance_prefix,
+            &module.expansion_trace,
+            &resources,
+            &data_sources,
+        );
+
         // The contribution is a full `ParsedFile` built with an
         // **exhaustive struct literal** (no `..Default::default()`):
         // adding a `File<E>` field breaks this until someone decides
@@ -398,8 +408,54 @@ impl ModuleResolver<'_> {
             requires: Vec::new(),
             structural_bindings: HashSet::new(),
             warnings: Vec::new(),
+
+            // ExpansionTrace (#3306): pre-built above against the
+            // call's leaves before the struct literal moved them.
+            expansion_trace,
         })
     }
+}
+
+/// Build an [`ExpansionTrace`](crate::resource::ExpansionTrace) for one
+/// `expand_module_call` invocation.
+///
+/// Records the call site (derived from `instance_prefix`) against
+/// every leaf produced at this level, and prepends the same call site
+/// to every chain inherited from the module's own
+/// `expansion_trace` (so nested expansions surface a full outermost-
+/// first chain in the merged plan).
+pub(crate) fn build_expansion_trace(
+    instance_prefix: &str,
+    inner_trace: &crate::resource::ExpansionTrace,
+    leaf_resources: &[Resource],
+    leaf_data_sources: &[DataSource],
+) -> crate::resource::ExpansionTrace {
+    let this_call_site = crate::resource::EphemeralId::new(crate::resource::ResourceId::new(
+        "_virtual",
+        instance_prefix,
+    ));
+
+    let mut out = crate::resource::ExpansionTrace::new();
+
+    // Direct leaves at this expansion level: chain is `[this_call_site]`.
+    for r in leaf_resources {
+        out.record(r.persistent_id(), vec![this_call_site.clone()]);
+    }
+    for d in leaf_data_sources {
+        out.record(d.persistent_id(), vec![this_call_site.clone()]);
+    }
+
+    // Leaves from nested expansions inside `module` already have an
+    // inner chain; prepend the current call site to mark this level as
+    // their outer-most container.
+    for (leaf, inner_chain) in inner_trace.iter() {
+        let mut chain = Vec::with_capacity(inner_chain.len() + 1);
+        chain.push(this_call_site.clone());
+        chain.extend(inner_chain.iter().cloned());
+        out.record(leaf.clone(), chain);
+    }
+
+    out
 }
 
 /// Join a module-call `instance_prefix` to an intra-module binding name
