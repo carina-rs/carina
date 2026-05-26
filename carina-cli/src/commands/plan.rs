@@ -646,6 +646,7 @@ pub async fn run_plan(
             &export_changes,
             &ctx.residual_deferred_for,
             Some(&ctx.prev_explicit),
+            Some(&ctx.expansion_trace),
         );
     }
 

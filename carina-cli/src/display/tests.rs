@@ -38,6 +38,7 @@ fn test_print_plan_with_external_dependency_does_not_panic() {
         &[],
         &[],
         None,
+        None,
     );
 }
 
@@ -60,6 +61,7 @@ fn test_print_plan_with_internal_dependency_does_not_panic() {
         &HashMap::new(),
         &[],
         &[],
+        None,
         None,
     );
 }
@@ -605,6 +607,7 @@ fn test_print_plan_compact_does_not_panic() {
         &[],
         &[],
         None,
+        None,
     );
 }
 
@@ -634,6 +637,7 @@ fn test_print_plan_compact_with_anonymous_resources() {
         &HashMap::new(),
         &[],
         &[],
+        None,
         None,
     );
 }
@@ -801,6 +805,7 @@ fn test_cascading_update_shows_attribute_diffs() {
         &HashMap::new(),
         &[],
         &[],
+        None,
         None,
     );
 }

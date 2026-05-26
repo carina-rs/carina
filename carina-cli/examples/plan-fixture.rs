@@ -112,6 +112,7 @@ fn main() -> ExitCode {
             &[],
             &fp.deferred_for_expressions,
             Some(&fp.prev_explicit),
+            None,
         );
     }
 

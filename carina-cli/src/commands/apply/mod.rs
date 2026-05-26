@@ -1239,6 +1239,7 @@ async fn run_apply_locked(
             &export_changes,
             &residual_deferred_for,
             None,
+            None,
         );
 
         let stdin = tokio::io::BufReader::new(tokio::io::stdin());
@@ -1322,6 +1323,7 @@ async fn run_apply_locked(
         &export_changes,
         &residual_deferred_for,
         Some(&prev_explicit),
+        None,
     );
 
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
@@ -1638,6 +1640,7 @@ async fn run_apply_from_plan_locked(
         &HashMap::new(),
         &[],
         &[],
+        None,
         None,
     );
 
