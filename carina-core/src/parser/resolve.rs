@@ -7,7 +7,7 @@ use super::ast::{AttributeParameter, ExportParameter, ModuleCall, ParsedFile};
 use super::error::{ParseError, undefined_identifier_error};
 use super::static_eval::is_static_value;
 use crate::eval_value::EvalValue;
-use crate::resource::{ConcreteValue, DataSource, DeferredValue, Resource, ResourceLike, Value};
+use crate::resource::{ConcreteValue, DataSource, DeferredValue, Resource, Value};
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -19,12 +19,24 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 /// attributes may carry refs whose resolution is deferred to the
 /// post-apply path, so the pre-apply resolver must never rewrite them
 /// (carina#3181; see the `composition.rs` module doc).
-trait PreApplyResourceMut: ResourceLike {
+/// Pre-apply mutable accessors. Self-contained since #3308 retired
+/// the `ResourceLike` trait — this trait keeps the read+write surface
+/// the pre-apply resolver needs while staying scoped to the two
+/// types that actually go through it ([`Resource`] and [`DataSource`]).
+trait PreApplyResourceMut {
+    fn attributes(&self) -> &IndexMap<String, Value>;
+    fn dependency_bindings(&self) -> &BTreeSet<String>;
     fn attributes_mut(&mut self) -> &mut IndexMap<String, Value>;
     fn dependency_bindings_mut(&mut self) -> &mut BTreeSet<String>;
 }
 
 impl PreApplyResourceMut for Resource {
+    fn attributes(&self) -> &IndexMap<String, Value> {
+        &self.attributes
+    }
+    fn dependency_bindings(&self) -> &BTreeSet<String> {
+        &self.dependency_bindings
+    }
     fn attributes_mut(&mut self) -> &mut IndexMap<String, Value> {
         &mut self.attributes
     }
@@ -34,6 +46,12 @@ impl PreApplyResourceMut for Resource {
 }
 
 impl PreApplyResourceMut for DataSource {
+    fn attributes(&self) -> &IndexMap<String, Value> {
+        &self.attributes
+    }
+    fn dependency_bindings(&self) -> &BTreeSet<String> {
+        &self.dependency_bindings
+    }
     fn attributes_mut(&mut self) -> &mut IndexMap<String, Value> {
         &mut self.attributes
     }
@@ -201,7 +219,17 @@ pub fn resolve_resource_refs_with_config(
     // source's attributes can carry refs too, and `parsed.resources` is
     // now managed-only.
     for resource in iter_pre_apply_resources_mut(parsed) {
-        let deps = crate::deps::get_resource_value_ref_dependencies(&*resource);
+        // #3308: compute the value-ref dependency snapshot inline from
+        // the trait's read accessors. The previous shared helper took
+        // `&dyn ResourceLike`; with that trait gone, the equivalent is
+        // a one-line attribute walk + dependency_bindings copy.
+        let mut deps: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for value in resource.attributes().values() {
+            crate::deps::collect_dependencies(value, &mut deps);
+        }
+        for name in resource.dependency_bindings() {
+            deps.insert(name.clone());
+        }
         if !deps.is_empty() {
             *resource.dependency_bindings_mut() = deps.into_iter().collect();
         }

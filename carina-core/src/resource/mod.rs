@@ -1797,16 +1797,12 @@ impl State {
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
-mod resource_like_tests;
-
 pub mod composition;
 pub mod data_source;
 pub mod expansion_trace;
 pub mod graph_node;
 pub mod leaf_node;
 pub mod persistent_id;
-pub mod resource_like;
 
 pub use composition::{Composition, CompositionAttribute, Signature};
 pub use data_source::DataSource;
@@ -1814,4 +1810,3 @@ pub use expansion_trace::ExpansionTrace;
 pub use graph_node::GraphNode;
 pub use leaf_node::{CompositionNotALeaf, LeafNode, expand_to_leaves};
 pub use persistent_id::{EphemeralId, NodeId, PersistentId};
-pub use resource_like::ResourceLike;

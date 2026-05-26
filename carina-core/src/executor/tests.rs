@@ -2459,9 +2459,11 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
     // (resolver.rs:70 -> get_resource_value_ref_dependencies), instead
     // of hand-setting the set. This is the load-bearing difference from
     // the existing flat-ref test.
-    dist.dependency_bindings = crate::deps::get_resource_value_ref_dependencies(&dist)
-        .into_iter()
-        .collect();
+    dist.dependency_bindings = crate::deps::get_resource_value_ref_dependencies(
+        crate::parser::ResourceRef::Resource(&dist),
+    )
+    .into_iter()
+    .collect();
     let dist_id = dist.id.clone();
 
     // Sanity: the resolver helper must have recovered the wait binding

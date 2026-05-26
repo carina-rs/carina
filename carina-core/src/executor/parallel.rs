@@ -49,7 +49,7 @@ pub(super) fn build_dependency_map(
     let mut deps_of: HashMap<usize, HashSet<usize>> = HashMap::new();
     for (idx, effect) in effects.iter().enumerate() {
         let mut dep_indices = HashSet::new();
-        if effect.resource_like().is_some() {
+        if effect.as_resource_ref().is_some() {
             resolver.collect_from_effect(effect, &mut dep_indices);
             if let Some(unresolved) = unresolved_resources.get(effect.resource_id()) {
                 resolver.collect_from_resource(unresolved, &mut dep_indices);

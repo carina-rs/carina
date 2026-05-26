@@ -270,7 +270,9 @@ fn apply_path_propagates_module_wait_binding() {
         .iter()
         .find(|r| r.id.resource_type == "cloudfront.Distribution")
         .expect("expanded Distribution must be present");
-    let deps = carina_core::deps::get_resource_value_ref_dependencies(dist);
+    let deps = carina_core::deps::get_resource_value_ref_dependencies(
+        carina_core::parser::ResourceRef::Resource(dist),
+    );
     assert!(
         deps.contains("r.cert_issued"),
         "expanded Distribution must depend on the prefixed wait \

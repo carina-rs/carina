@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::resource::{DataSource, Directives, Resource, ResourceId, ResourceLike, State};
+use crate::resource::{DataSource, Directives, Resource, ResourceId, State};
 use crate::wait::predicate::WaitPredicate;
 
 /// Temporary name used during create-before-destroy replacement.
@@ -372,21 +372,22 @@ impl Effect {
         }
     }
 
-    /// Returns a read-only [`ResourceLike`] view of the resource for this
-    /// effect, if it has one. Delete, Import, Remove, Move, and Wait
-    /// effects have no resource.
+    /// Returns a read-only [`ResourceRef`](crate::parser::ResourceRef)
+    /// view of the resource for this effect, if it has one. Delete,
+    /// Import, Remove, Move, and Wait effects have no resource.
     ///
-    /// carina#3181: the underlying payloads are typestate structs —
-    /// `Create`/`Update`/`Replace` carry a [`Resource`], `Read`
-    /// carries a [`DataSource`]. Callers that need a concrete type match
-    /// the variant directly; this helper covers the shared
-    /// id/attributes/binding/dependency_bindings accessors.
-    pub fn resource_like(&self) -> Option<&dyn ResourceLike> {
+    /// carina#3181 / #3308: the underlying payloads are typestate
+    /// structs — `Create`/`Update`/`Replace` carry a [`Resource`],
+    /// `Read` carries a [`DataSource`]. Callers that need a concrete
+    /// type match the variant directly; this helper covers the
+    /// shared id/attributes/binding/dependency_bindings accessors
+    /// through the borrowing `ResourceRef` enum.
+    pub fn as_resource_ref(&self) -> Option<crate::parser::ResourceRef<'_>> {
         match self {
-            Effect::Create(resource) => Some(resource),
-            Effect::Update { to, .. } => Some(to),
-            Effect::Replace { to, .. } => Some(to),
-            Effect::Read { resource } => Some(resource),
+            Effect::Create(resource) => Some(crate::parser::ResourceRef::Resource(resource)),
+            Effect::Update { to, .. } => Some(crate::parser::ResourceRef::Resource(to)),
+            Effect::Replace { to, .. } => Some(crate::parser::ResourceRef::Resource(to)),
+            Effect::Read { resource } => Some(crate::parser::ResourceRef::DataSource(resource)),
             Effect::Delete { .. }
             | Effect::Import { .. }
             | Effect::Remove { .. }
@@ -420,7 +421,7 @@ impl Effect {
         if let Effect::Wait { binding, .. } = self {
             return Some(binding.clone());
         }
-        self.resource_like()
+        self.as_resource_ref()
             .and_then(|r| r.binding().map(str::to_string))
     }
 
@@ -490,7 +491,7 @@ mod tests {
     fn resource_returns_some_for_create() {
         let resource = Resource::new("s3.Bucket", "my-bucket");
         let effect = Effect::Create(resource.clone());
-        assert_eq!(effect.resource_like().unwrap().id(), &resource.id);
+        assert_eq!(effect.as_resource_ref().unwrap().id(), &resource.id);
     }
 
     #[test]
@@ -503,7 +504,7 @@ mod tests {
             dependencies: HashSet::new(),
             explicit_dependencies: std::collections::HashSet::new(),
         };
-        assert!(effect.resource_like().is_none());
+        assert!(effect.as_resource_ref().is_none());
     }
 
     #[test]
