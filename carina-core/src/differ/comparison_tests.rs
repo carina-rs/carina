@@ -292,6 +292,105 @@ fn type_aware_string_enum_namespaced_vs_raw() {
     );
 }
 
+/// Regression for carina#3312: `CustomEnum` attributes with a `to_dsl`
+/// callback (e.g. `aws.AvailabilityZone`, where `to_dsl = |s|
+/// s.replace('-', '_')`) must compare equal across the `String("ap-northeast-1a")`
+/// vs `String("aws.AvailabilityZone.ap_northeast_1a")` / `EnumIdentifier(...)`
+/// pairs that arise naturally between provider-read state (AWS canonical)
+/// and DSL-side desired (fully-qualified identifier). Without this arm
+/// the differ reports a phantom replacement on every post-apply plan.
+#[test]
+fn type_aware_custom_enum_canonical_vs_namespaced_identifier() {
+    let az_type = AttributeType::CustomEnum {
+        identity: TypeIdentity::new(Some("aws"), ["AvailabilityZone"], "ZoneName"),
+        base: Box::new(AttributeType::String),
+        validate: noop_validator(),
+        to_dsl: Some(|s: &str| s.replace('-', "_")),
+    };
+
+    // Provider-read AWS canonical form vs DSL fully-qualified identifier.
+    // State side stores `String("ap-northeast-1a")`; the DSL parser turns
+    // `aws.AvailabilityZone.ap_northeast_1a` into an `EnumIdentifier` and
+    // `resolve_enum_value_recursive` rewrites it to a `String` carrying
+    // the same dotted form. Both shapes need to compare equal.
+    assert!(
+        type_aware_equal(
+            &Value::Concrete(ConcreteValue::String("ap-northeast-1a".to_string())),
+            &Value::Concrete(ConcreteValue::String(
+                "aws.AvailabilityZone.ap_northeast_1a".to_string()
+            )),
+            Some(&az_type),
+            None,
+        ),
+        "AWS-canonical hyphenated form must equal the fully-qualified DSL identifier"
+    );
+    assert!(
+        type_aware_equal(
+            &Value::Concrete(ConcreteValue::String(
+                "aws.AvailabilityZone.ap_northeast_1a".to_string()
+            )),
+            &Value::Concrete(ConcreteValue::String("ap-northeast-1a".to_string())),
+            Some(&az_type),
+            None,
+        ),
+        "Equality must be symmetric"
+    );
+
+    // Same dotted DSL form on both sides — identical strings, trivially equal.
+    assert!(
+        type_aware_equal(
+            &Value::Concrete(ConcreteValue::String(
+                "aws.AvailabilityZone.ap_northeast_1a".to_string()
+            )),
+            &Value::Concrete(ConcreteValue::String(
+                "aws.AvailabilityZone.ap_northeast_1a".to_string()
+            )),
+            Some(&az_type),
+            None,
+        ),
+        "Identical fully-qualified forms must be equal"
+    );
+
+    // Bare canonical form on both sides — identical strings, trivially equal.
+    assert!(
+        type_aware_equal(
+            &Value::Concrete(ConcreteValue::String("ap-northeast-1a".to_string())),
+            &Value::Concrete(ConcreteValue::String("ap-northeast-1a".to_string())),
+            Some(&az_type),
+            None,
+        ),
+        "Identical AWS-canonical forms must be equal"
+    );
+
+    // Cross-shape: state String vs DSL EnumIdentifier (the parser
+    // produces this for the `aws.AvailabilityZone.ap_northeast_1a` literal
+    // before resolve_enum_value_recursive rewrites it).
+    assert!(
+        type_aware_equal(
+            &Value::Concrete(ConcreteValue::String("ap-northeast-1a".to_string())),
+            &Value::Concrete(ConcreteValue::EnumIdentifier(
+                "aws.AvailabilityZone.ap_northeast_1a".to_string()
+            )),
+            Some(&az_type),
+            None,
+        ),
+        "AWS-canonical String must equal the matching EnumIdentifier shape"
+    );
+
+    // Different values must still produce a real diff (don't over-fold).
+    assert!(
+        !type_aware_equal(
+            &Value::Concrete(ConcreteValue::String("ap-northeast-1a".to_string())),
+            &Value::Concrete(ConcreteValue::String(
+                "aws.AvailabilityZone.ap_northeast_1c".to_string()
+            )),
+            Some(&az_type),
+            None,
+        ),
+        "Different enum values must not be folded as equal"
+    );
+}
+
 #[test]
 fn type_aware_struct_ignores_default_string_enum_empty() {
     use crate::schema::StructField;
