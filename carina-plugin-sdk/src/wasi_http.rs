@@ -27,6 +27,8 @@ use wasi::http::types::{
 };
 use wasi::io::streams::StreamError;
 
+use crate::wasi_http_body::{RequestBody, inject_content_length_header};
+
 /// When `CARINA_WASI_HTTP_TRACE=1` is set in the host environment, emit a
 /// per-phase wall-clock breakdown of each request to stderr.
 ///
@@ -178,12 +180,21 @@ fn make_request(
         .parse::<http::Uri>()
         .map_err(|e| ConnectorError::other(e.into(), None))?;
 
-    // Build headers
-    let headers_list: Vec<(String, Vec<u8>)> = request
+    // Classify the SDK body into Empty / Sized so the wire framing is
+    // explicit. Without this, AWS SDK-emitted body-less DELETEs lose
+    // their length signal at the wasi:http boundary, the host falls
+    // back to `Transfer-Encoding: chunked`, and S3 sits for ~20s
+    // (carina-rs/carina#3254) waiting for chunked-body bytes that
+    // hyper never produces.
+    let body = RequestBody::from_sdk_body(request.body().bytes().unwrap_or(&[]));
+
+    // Build headers, injecting `content-length` if the SDK omitted it.
+    let mut headers_list: Vec<(String, Vec<u8>)> = request
         .headers()
         .iter()
         .map(|(k, v)| (k.to_string(), v.as_bytes().to_vec()))
         .collect();
+    inject_content_length_header(&mut headers_list, &body);
     let fields = Fields::from_list(&headers_list).map_err(|e| {
         ConnectorError::other(format!("Failed to create headers: {e:?}").into(), None)
     })?;
@@ -236,13 +247,15 @@ fn make_request(
 
     let t_setup_done = req_start.map(|s| s.elapsed());
 
-    // Write the request body
-    let body_bytes = request.body().bytes().unwrap_or(&[]).to_vec();
-    let body_len = body_bytes.len();
+    // Write the request body. `body` was classified above so the
+    // wasi:http `OutgoingBody` only ever sees a known-sized payload
+    // (Empty → no stream write; Sized → exactly `body.content_length()`
+    // bytes, matching the `content-length` header we injected).
+    let body_len = body.content_length();
     let outgoing_body = outgoing_req
         .body()
         .map_err(|()| ConnectorError::other("Failed to get outgoing body".into(), None))?;
-    write_body(&outgoing_body, &body_bytes)?;
+    write_body(&outgoing_body, body.as_bytes())?;
     let t_write_body_done = req_start.map(|s| s.elapsed());
     OutgoingBody::finish(outgoing_body, None)
         .map_err(|e| ConnectorError::other(format!("Failed to finish body: {e:?}").into(), None))?;
