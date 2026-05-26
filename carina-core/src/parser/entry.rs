@@ -419,6 +419,10 @@ pub fn parse_with_seeded_bindings(
         structural_bindings: ctx.structural_bindings,
         warnings: ctx.warnings,
         deferred_for_expressions: ctx.deferred_for_expressions,
+        // The parser never synthesizes composition resources, so it
+        // never records lineage — the trace starts empty here and is
+        // populated by `module_resolver::expander` (#3306).
+        expansion_trace: crate::resource::ExpansionTrace::new(),
     })
 }
 

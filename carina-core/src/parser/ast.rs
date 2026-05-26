@@ -847,6 +847,18 @@ pub struct File<E> {
     pub warnings: Vec<ParseWarning>,
     /// For-expressions whose iterables are unresolved; displayed as deferred in plan.
     pub deferred_for_expressions: Vec<DeferredForExpression>,
+    /// Plan-scoped lineage of leaf nodes back to the composition call
+    /// sites that produced them (#3306).
+    ///
+    /// Populated by `ModuleResolver::expand_module_call`: every leaf
+    /// resource added to the expanded `File` records its originating
+    /// call-site chain (outermost first). Leaves declared at the DSL
+    /// root are absent from the map.
+    ///
+    /// Not serialized to state — the trace is plan-scoped and rebuilt
+    /// from DSL on every parse. (`File` itself does not derive Serde,
+    /// so no annotation is required.)
+    pub expansion_trace: crate::resource::ExpansionTrace,
 }
 
 /// Parse-phase file: exports retain their `Option<TypeExpr>` shape.
@@ -878,6 +890,7 @@ impl<E> Default for File<E> {
             structural_bindings: HashSet::new(),
             warnings: Vec::new(),
             deferred_for_expressions: Vec::new(),
+            expansion_trace: crate::resource::ExpansionTrace::new(),
         }
     }
 }
@@ -917,6 +930,7 @@ impl<E> File<E> {
             structural_bindings,
             warnings,
             deferred_for_expressions,
+            expansion_trace,
         } = self;
 
         File {
@@ -939,6 +953,7 @@ impl<E> File<E> {
             structural_bindings,
             warnings,
             deferred_for_expressions,
+            expansion_trace,
         }
     }
 
