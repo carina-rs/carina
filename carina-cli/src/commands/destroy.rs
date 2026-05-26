@@ -145,8 +145,12 @@ async fn run_destroy_locked(
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
     let ctx = WiringContext::new(factories);
 
-    // Read current state from backend
-    let mut state_file = backend.read_state().await.map_err(AppError::Backend)?;
+    // Read current state from backend. carina#3315: persist any v6→v7
+    // schema migration under the destroy lock before any short-circuit
+    // (e.g. "No resources to destroy.") returns — see
+    // `apply::load_state_persist_if_migrated`.
+    let mut state_file =
+        crate::commands::apply::load_state_persist_if_migrated(backend, lock).await?;
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
     if let Some(sf) = state_file.as_ref() {

@@ -14,7 +14,7 @@ use carina_core::resource::{
     ConcreteValue, DataSource, DeferredValue, Directives, Resource, ResourceId, State, Value,
 };
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
-use carina_state::{BackendError, LockInfo, ResourceState, StateBackend, StateFile};
+use carina_state::{BackendError, LoadedState, LockInfo, ResourceState, StateBackend, StateFile};
 
 use crate::commands::apply::{
     ApplyResult, detect_drift, execute_effects, finalize_apply, refresh_pending_states,
@@ -1358,8 +1358,8 @@ struct MockBackend {
 
 #[async_trait::async_trait]
 impl StateBackend for MockBackend {
-    async fn read_state(&self) -> carina_state::BackendResult<Option<StateFile>> {
-        Ok(Some(StateFile::new()))
+    async fn read_state(&self) -> carina_state::BackendResult<Option<LoadedState>> {
+        Ok(Some(LoadedState::Pristine(StateFile::new())))
     }
     async fn write_state(&self, _state: &StateFile) -> carina_state::BackendResult<()> {
         if self.write_state_fails {
@@ -1480,8 +1480,8 @@ impl LockTrackingBackend {
 
 #[async_trait::async_trait]
 impl StateBackend for LockTrackingBackend {
-    async fn read_state(&self) -> carina_state::BackendResult<Option<StateFile>> {
-        Ok(Some(StateFile::new()))
+    async fn read_state(&self) -> carina_state::BackendResult<Option<LoadedState>> {
+        Ok(Some(LoadedState::Pristine(StateFile::new())))
     }
     async fn write_state(&self, _state: &StateFile) -> carina_state::BackendResult<()> {
         self.write_state_called.store(true, Ordering::SeqCst);
@@ -2019,8 +2019,8 @@ impl RefreshTestBackend {
 
 #[async_trait::async_trait]
 impl StateBackend for RefreshTestBackend {
-    async fn read_state(&self) -> carina_state::BackendResult<Option<StateFile>> {
-        Ok(self.initial_state.clone())
+    async fn read_state(&self) -> carina_state::BackendResult<Option<LoadedState>> {
+        Ok(self.initial_state.clone().map(LoadedState::Pristine))
     }
     async fn write_state(&self, state: &StateFile) -> carina_state::BackendResult<()> {
         *self.written_state.lock().unwrap() = Some(state.clone());
@@ -2797,8 +2797,8 @@ struct CapturingBackend {
 
 #[async_trait::async_trait]
 impl StateBackend for CapturingBackend {
-    async fn read_state(&self) -> carina_state::BackendResult<Option<StateFile>> {
-        Ok(Some(StateFile::new()))
+    async fn read_state(&self) -> carina_state::BackendResult<Option<LoadedState>> {
+        Ok(Some(LoadedState::Pristine(StateFile::new())))
     }
     async fn write_state(&self, state: &StateFile) -> carina_state::BackendResult<()> {
         *self.captured.lock().unwrap() = Some(state.clone());

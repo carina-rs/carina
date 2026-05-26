@@ -76,10 +76,18 @@ async fn perform_state_migration(
     target: &dyn StateBackend,
     force: bool,
 ) -> Result<StateFile, AppError> {
+    // `carina init --migrate-state` copies the source state into the
+    // target backend verbatim. The pending-migration token is
+    // discarded here: `target.write_state(&state)` will re-emit the
+    // state at `StateFile::CURRENT_VERSION` on disk regardless, and
+    // the `--migrate-state` command is itself the backend-relocation
+    // path (carina#3315 — schema-migration persistence is handled by
+    // apply/destroy/state-refresh in the source-or-target directory).
     let state = source
         .read_state()
         .await
         .map_err(AppError::Backend)?
+        .map(|loaded| loaded.into_state())
         .ok_or_else(|| {
             AppError::Config(
                 "The locked backend holds no state. There is nothing to migrate; \
@@ -91,7 +99,11 @@ async fn perform_state_migration(
 
     // Target guard: refuse to clobber a populated, differently-lineaged
     // target unless the operator explicitly opted in with --force.
-    if let Some(existing) = target.read_state().await.map_err(AppError::Backend)?
+    if let Some(existing) = target
+        .read_state()
+        .await
+        .map_err(AppError::Backend)?
+        .map(|loaded| loaded.into_state())
         && (existing.lineage != state.lineage || !existing.resources.is_empty())
         && !force
     {
@@ -117,6 +129,7 @@ async fn perform_state_migration(
         .read_state()
         .await
         .map_err(AppError::Backend)?
+        .map(|loaded| loaded.into_state())
         .ok_or_else(|| {
             AppError::Config(
                 "Failed to read state back from the configured backend after \
@@ -279,7 +292,7 @@ mod tests {
         let state = perform_state_migration(&src, &dst, false).await.unwrap();
         assert_eq!(state.resources.len(), 3);
 
-        let migrated = dst.read_state().await.unwrap().unwrap();
+        let migrated = dst.read_state().await.unwrap().unwrap().into_state();
         assert_eq!(migrated.lineage, "lin-1");
         assert_eq!(migrated.resources.len(), 3);
     }
@@ -300,7 +313,7 @@ mod tests {
             "got: {err:?}"
         );
         // Target must be untouched on refusal.
-        let dst_state = dst.read_state().await.unwrap().unwrap();
+        let dst_state = dst.read_state().await.unwrap().unwrap().into_state();
         assert_eq!(dst_state.lineage, "lin-dst");
     }
 
@@ -313,7 +326,7 @@ mod tests {
         dst.write_state(&state_with("lin-dst", 2)).await.unwrap();
 
         perform_state_migration(&src, &dst, true).await.unwrap();
-        let dst_state = dst.read_state().await.unwrap().unwrap();
+        let dst_state = dst.read_state().await.unwrap().unwrap().into_state();
         assert_eq!(dst_state.lineage, "lin-src");
         assert_eq!(dst_state.resources.len(), 1);
     }
@@ -391,7 +404,8 @@ mod tests {
             .read_state()
             .await
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .into_state();
         assert_eq!(migrated.resources.len(), 2);
 
         // Lock now reflects the configured backend ⇒ a second run is a no-op.

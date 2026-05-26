@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::lock::LockInfo;
-use crate::state::StateFile;
+use crate::state::{LoadedState, StateFile};
 
 /// Errors that can occur when interacting with a state backend
 #[derive(Debug, Error)]
@@ -366,10 +366,18 @@ pub type BackendResult<T> = Result<T, BackendError>;
 /// as well as managing locks for concurrent access control.
 #[async_trait]
 pub trait StateBackend: Send + Sync {
-    /// Read the current state from the backend
+    /// Read the current state from the backend.
     ///
-    /// Returns `None` if no state exists (first-time use)
-    async fn read_state(&self) -> BackendResult<Option<StateFile>>;
+    /// Returns `None` if no state exists (first-time use). When the
+    /// on-disk schema is older than [`StateFile::CURRENT_VERSION`],
+    /// `check_and_migrate` lifts it in memory and the result is
+    /// returned as the [`LoadedState::Migrated`] variant carrying the
+    /// migration info; otherwise [`LoadedState::Pristine`].
+    /// Lock-held callers (`apply`, `destroy`, `state refresh`)
+    /// destructure the `Migrated` arm and persist `state` so the
+    /// carina#3283 warning text matches reality — otherwise the
+    /// warning re-emits forever (carina#3315).
+    async fn read_state(&self) -> BackendResult<Option<LoadedState>>;
 
     /// Write the state to the backend
     ///

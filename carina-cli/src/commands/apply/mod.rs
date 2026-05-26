@@ -353,6 +353,42 @@ pub async fn save_state_unlocked(
     backend.write_state(state).await.map_err(AppError::Backend)
 }
 
+/// Read state from the backend and, if `check_and_migrate` lifted the
+/// on-disk schema in memory, persist the upgraded shape immediately
+/// under the current lock.
+///
+/// This is the lock-held entry-point used by `apply`, `destroy`, and
+/// `state refresh`. Without it, the no-op short-circuits inside those
+/// commands (e.g. "No changes needed." when no resource diff exists)
+/// would skip the writer entirely and leave the on-disk version
+/// stuck at the older schema — which is the bug reported in
+/// carina#3315 and which makes carina#3283's "Disk state will be
+/// rewritten on the next `carina apply` or `carina state refresh`"
+/// warning text a lie.
+///
+/// Persistence happens exactly once per state file's schema lifetime:
+/// after the first successful run under this helper the on-disk
+/// version matches `StateFile::CURRENT_VERSION`, so subsequent
+/// `read_state` calls produce a pristine `LoadedState` and this
+/// helper is a no-op write-wise.
+pub async fn load_state_persist_if_migrated(
+    backend: &dyn StateBackend,
+    lock: Option<&LockInfo>,
+) -> Result<Option<StateFile>, AppError> {
+    match backend.read_state().await.map_err(AppError::Backend)? {
+        None => Ok(None),
+        Some(carina_state::LoadedState::Pristine(state)) => Ok(Some(state)),
+        Some(carina_state::LoadedState::Migrated { mut state, .. }) => {
+            if let Some(lk) = lock {
+                save_state_locked(backend, lk, &mut state).await?;
+            } else {
+                save_state_unlocked(backend, &mut state).await?;
+            }
+            Ok(Some(state))
+        }
+    }
+}
+
 /// Persist export changes when the plan has no mutating effects.
 ///
 /// Used when `!plan.has_mutations()` short-circuits apply: no
@@ -778,8 +814,12 @@ async fn run_apply_locked(
     base_dir: &std::path::Path,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    // Read current state from backend
-    let mut state_file = backend.read_state().await.map_err(AppError::Backend)?;
+    // Read current state from backend. carina#3315: if `check_and_migrate`
+    // lifted an older on-disk schema in memory, persist the upgrade
+    // under the current lock before any short-circuit path can return
+    // — otherwise the carina#3283 warning text ("Disk state will be
+    // rewritten on the next `carina apply`...") becomes a lie.
+    let mut state_file = load_state_persist_if_migrated(backend, lock).await?;
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
     if let Some(sf) = state_file.as_ref() {
@@ -1519,8 +1559,19 @@ async fn run_apply_from_plan_locked(
     lock: Option<&LockInfo>,
     base_dir: &std::path::Path,
 ) -> Result<(), AppError> {
-    // Read current state and validate lineage
-    let state_file = backend.read_state().await.map_err(AppError::Backend)?;
+    // Read current state and validate lineage. carina#3315: a
+    // pending in-memory schema migration must be persisted under
+    // the apply lock so the carina#3283 warning text matches
+    // reality — but we run that *after* the saved-plan
+    // lineage/serial check below, so the operator sees the original
+    // on-disk serial (the one the saved plan was diffed against)
+    // rather than a +1 bump caused by our own migration persist.
+    let (mut state_file, pending_migration) =
+        match backend.read_state().await.map_err(AppError::Backend)? {
+            None => (None, None),
+            Some(carina_state::LoadedState::Pristine(state)) => (Some(state), None),
+            Some(carina_state::LoadedState::Migrated { state, info }) => (Some(state), Some(info)),
+        };
 
     if let Some(ref state) = state_file {
         // Validate state lineage
@@ -1546,6 +1597,20 @@ async fn run_apply_from_plan_locked(
                 )
                 .yellow()
             );
+        }
+    }
+
+    // Now that the saved-plan integrity checks have run against the
+    // pristine on-disk view, persist any pending schema migration so
+    // the next short-circuit (`!plan.has_mutations()`) cannot leave
+    // the disk at the older version (carina#3315).
+    if pending_migration.is_some()
+        && let Some(state) = state_file.as_mut()
+    {
+        if let Some(lk) = lock {
+            save_state_locked(backend, lk, state).await?;
+        } else {
+            save_state_unlocked(backend, state).await?;
         }
     }
 

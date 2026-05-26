@@ -87,7 +87,8 @@ async fn init_auto_creates_bucket_and_seeds_empty_state() {
         .read_state()
         .await
         .unwrap()
-        .expect("init should seed a state file");
+        .expect("init should seed a state file")
+        .into_state();
     assert_eq!(
         state.version,
         StateFile::CURRENT_VERSION,
@@ -128,7 +129,8 @@ async fn write_then_read_state_round_trips() {
         .read_state()
         .await
         .unwrap()
-        .expect("state written above should be readable");
+        .expect("state written above should be readable")
+        .into_state();
     // `StateFile` has no `PartialEq`; compare the fields that prove the
     // bytes round-tripped through S3 unchanged. `lineage` is preserved
     // (not regenerated) so it pins identity across the write/read.
@@ -227,7 +229,7 @@ async fn write_state_locked_succeeds_for_held_lock() {
     state.increment_serial();
     backend.write_state_locked(&state, &lock).await.unwrap();
 
-    let read_back = backend.read_state().await.unwrap().unwrap();
+    let read_back = backend.read_state().await.unwrap().unwrap().into_state();
     assert_eq!(
         read_back.lineage, state.lineage,
         "locked write must persist the state we passed in",

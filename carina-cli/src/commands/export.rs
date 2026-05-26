@@ -37,10 +37,14 @@ pub async fn run_export(
         .await
         .map_err(AppError::Backend)?;
 
+    // `carina export` is read-only; drop the pending-migration token
+    // — lock-held callers (apply/destroy/state refresh) persist
+    // schema migrations (carina#3315).
     let state_file = backend
         .read_state()
         .await
         .map_err(AppError::Backend)?
+        .map(|loaded| loaded.into_state())
         .ok_or_else(|| {
             AppError::Config("No state file found. Run 'carina apply' first.".to_string())
         })?;
