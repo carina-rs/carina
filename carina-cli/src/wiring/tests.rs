@@ -429,6 +429,207 @@ fn import_fallback_matches_anonymous_resource_by_name_attribute() {
     }
 }
 
+/// Sibling of the Import/Removed routing fix:
+/// `moved { from = X 'a', to = X 'b' }` faces the same address-
+/// equality bug when the state-resident `a` carries
+/// `provider_instance = Some("X")`. Without the root fix
+/// `current_states.remove(from)` misses (since the key in the map has
+/// the routed id), the moved state is never transferred, and the
+/// orphan Delete for `a` is never suppressed — the operator sees both
+/// `<- moved` and `- delete` for the same address.
+///
+/// Coverage shape: state has `a` under routed id; `materialize_moved_states`
+/// must (a) actually move the entry under `b`'s routed id, and (b)
+/// return a `(from, to)` pair whose ids carry the routing so the
+/// downstream `suppress_delete` set in `add_state_block_effects`
+/// keys correctly.
+#[test]
+fn moved_block_resolves_routed_instance_on_from_and_to() {
+    use carina_core::resource::{ResourceId, State};
+    use carina_state::state::{ResourceState, StateFile};
+
+    // State has the source resource under a routed id.
+    let mut state_file = StateFile::new();
+    let mut rs = ResourceState::new("route53.RecordSet", "old_record", "aws");
+    rs.directives.provider_instance = Some("management".to_string());
+    state_file.resources.push(rs);
+
+    // Pre-populate `current_states` with the routed `from` id (mirrors
+    // what `build_state_for_resource` would produce).
+    let routed_from = ResourceId::with_provider(
+        "aws",
+        "route53.RecordSet",
+        "old_record",
+        Some("management".to_string()),
+    );
+    let mut current_states = HashMap::new();
+    current_states.insert(routed_from.clone(), State::not_found(routed_from.clone()));
+
+    let mut prev_explicit = HashMap::new();
+    let mut saved_attrs = HashMap::new();
+
+    // `moved` block addresses are parsed without routing.
+    let state_blocks = vec![StateBlock::Moved {
+        from: ResourceId::with_provider("aws", "route53.RecordSet", "old_record", None),
+        to: ResourceId::with_provider("aws", "route53.RecordSet", "new_record", None),
+    }];
+
+    let moved_pairs = materialize_moved_states(
+        &mut current_states,
+        &mut prev_explicit,
+        &mut saved_attrs,
+        &state_blocks,
+        &Some(state_file),
+    );
+
+    // The pair must inherit `from`'s routing so the downstream
+    // `suppress_delete` lookup matches the orphan Delete's id.
+    assert_eq!(moved_pairs.len(), 1);
+    let (from, _to) = &moved_pairs[0];
+    assert_eq!(
+        from.provider_instance.as_deref(),
+        Some("management"),
+        "moved.from must inherit routing from the matched state row, got {from:?}",
+    );
+
+    // And `current_states` must no longer carry the old key — the
+    // state was actually transferred (not silently left under the
+    // routed id while a None-routing key was inserted).
+    assert!(
+        !current_states.contains_key(&routed_from),
+        "old routed key must be removed after move",
+    );
+}
+
+/// Sibling of `import_suppresses_create_when_target_resource_is_routed_to_named_instance`:
+/// `removed { from = X 'addr' }` faces the same address-equality
+/// mismatch when the state-resident resource has
+/// `provider_instance = Some("X")` (originally created via
+/// `directives { provider = X }`) but the user-typed `from` parses as
+/// `provider_instance = None`. Without the root fix the orphan Delete
+/// stays in the plan and the operator sees both `<- removed` and
+/// `- delete` for the same address (carina#3324 root cause class).
+#[test]
+fn removed_block_suppresses_delete_when_state_resource_is_routed_to_named_instance() {
+    use carina_core::effect::Effect;
+    use carina_core::plan::Plan;
+    use carina_core::resource::ResourceId;
+    use carina_state::state::{ResourceState, StateFile};
+
+    let schemas = SchemaRegistry::new();
+
+    // State has a resource that was originally created via
+    // `directives { provider = management }` — `provider_instance =
+    // Some("management")`.
+    let mut state_file = StateFile::new();
+    let mut rs = ResourceState::new("route53.RecordSet", "r.delegation_ns", "aws");
+    rs.directives.provider_instance = Some("management".to_string());
+    state_file.resources.push(rs);
+
+    // The orphan Delete effect carries the same routed instance.
+    let mut plan = Plan::new();
+    plan.add(Effect::Delete {
+        id: ResourceId::with_provider(
+            "aws",
+            "route53.RecordSet",
+            "r.delegation_ns",
+            Some("management".to_string()),
+        ),
+        identifier: String::new(),
+        directives: carina_core::resource::Directives::default(),
+        binding: None,
+        dependencies: std::collections::HashSet::new(),
+        explicit_dependencies: std::collections::HashSet::new(),
+    });
+
+    // `removed` block was written without routing — `from` has
+    // `provider_instance = None`.
+    let state_blocks = vec![StateBlock::Removed {
+        from: ResourceId::with_provider("aws", "route53.RecordSet", "r.delegation_ns", None),
+    }];
+
+    add_state_block_effects(&mut plan, &state_blocks, &Some(state_file), &[], &schemas);
+
+    let effects = plan.effects();
+    assert_eq!(
+        effects.len(),
+        1,
+        "expected only the Remove effect (orphan Delete must be suppressed \
+         when the same address is being removed), got {effects:?}",
+    );
+    match &effects[0] {
+        Effect::Remove { id } => {
+            assert_eq!(
+                id.provider_instance.as_deref(),
+                Some("management"),
+                "the remove effect must inherit the routed instance from the \
+                 state row so apply-time routing sends the state-removal call \
+                 to the correct provider instance",
+            );
+        }
+        other => panic!("expected Remove effect, got {other:?}"),
+    }
+}
+
+/// carina#3324 regression: an import block targeting a let-bound
+/// resource whose `directives { provider = <name> }` routes it to a
+/// named provider instance must still suppress the resource's Create
+/// effect. Before the fix, the import target was carrying the user-
+/// typed `provider_instance = None` while the Create's resource had
+/// the directive-routed `provider_instance = Some("management")`, so
+/// the `suppress_create` set never matched and the same address
+/// appeared as both `<- import` and `+ add` in the plan.
+#[test]
+fn import_suppresses_create_when_target_resource_is_routed_to_named_instance() {
+    use carina_core::effect::Effect;
+    use carina_core::plan::Plan;
+    use carina_core::resource::{Resource, ResourceId};
+
+    let schemas = SchemaRegistry::new();
+
+    // Let-bound resource with `directives { provider = management }`:
+    // the parser stamps `provider_instance = Some("management")` on
+    // its ResourceId.
+    let resource = Resource::with_provider(
+        "aws",
+        "route53.RecordSet",
+        "r.delegation_ns",
+        Some("management".to_string()),
+    );
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(resource));
+
+    // The import block was written without a routing hint
+    // (`to = aws.route53.RecordSet 'r.delegation_ns'`), so the parsed
+    // `to` carries `provider_instance = None`. Same address otherwise.
+    let state_blocks = vec![StateBlock::Import {
+        to: ResourceId::with_provider("aws", "route53.RecordSet", "r.delegation_ns", None),
+        id: "|hosted-zone-id|registry-dev.carina-rs.dev|NS".to_string(),
+    }];
+
+    add_state_block_effects(&mut plan, &state_blocks, &None, &[], &schemas);
+
+    let effects = plan.effects();
+    assert_eq!(
+        effects.len(),
+        1,
+        "expected only the Import effect (Create must be suppressed when \
+         the same address is being imported), got {effects:?}",
+    );
+    match &effects[0] {
+        Effect::Import { id, .. } => {
+            assert_eq!(
+                id.provider_instance.as_deref(),
+                Some("management"),
+                "the import effect must inherit the routed instance from the \
+                 matched resource so apply-time routing sends the import call \
+                 to the correct provider instance",
+            );
+        }
+        other => panic!("expected Import effect, got {other:?}"),
+    }
+}
+
 #[test]
 fn import_fallback_skips_when_already_in_state_by_name_attribute() {
     use carina_core::plan::Plan;

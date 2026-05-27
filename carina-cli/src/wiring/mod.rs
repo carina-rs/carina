@@ -2016,36 +2016,89 @@ pub fn materialize_moved_states(
 
     for block in state_blocks {
         if let StateBlock::Moved { from, to } = block {
-            let old_in_state = state_file.as_ref().is_some_and(|sf| {
+            // carina#3324: `from`/`to` are parsed from
+            // `moved { from = X 'a', to = X 'b' }`, which has no
+            // syntax for `provider_instance`. The state-resident
+            // `from` may carry routing from its original
+            // `directives { provider = ... }`, and the desired-state
+            // `to` may similarly carry routing from the new let-bound
+            // resource's directives. Resolve both to their full ids
+            // so map lookups (which include `provider_instance` in
+            // `Hash`/`Eq`) hit the right keys and the emitted
+            // `(from, to)` pair matches every downstream consumer's
+            // address shape.
+            let resolved_from = state_file.as_ref().and_then(|sf| {
                 sf.find_resource(&from.provider, &from.resource_type, from.name_str())
-                    .is_some()
+                    .map(|rs| {
+                        ResourceId::with_provider(
+                            &rs.provider,
+                            &rs.resource_type,
+                            &rs.name,
+                            rs.directives.provider_instance.clone(),
+                        )
+                    })
             });
-            if old_in_state {
-                // Transfer state from the old name to the new name so the
-                // differ compares desired(to) against actual(from).
-                if let Some(mut state) = current_states.remove(from) {
-                    state.id = to.clone();
-                    current_states.insert(to.clone(), state);
-                }
+            let Some(resolved_from) = resolved_from else {
+                continue;
+            };
+            // For `to`, look up the destination key by
+            // `(provider, resource_type, name)` across the desired
+            // state maps. `current_states` / `prev_explicit` /
+            // `saved_attrs` may already have an entry under the
+            // routed id; without resolving, `insert(to.clone(), ...)`
+            // would create a second entry under the None-routing id
+            // and the routed id would be left as an orphan.
+            //
+            // Consult all three maps (not just `current_states`) so
+            // the resolution is independent of map-population
+            // ordering — a routed entry in any of the three is the
+            // right routing for the destination.
+            let resolved_to = find_desired_id(to, current_states)
+                .or_else(|| find_desired_id(to, prev_explicit))
+                .or_else(|| find_desired_id(to, saved_attrs))
+                .unwrap_or_else(|| to.clone());
 
-                // Transfer prev_explicit so the differ detects attribute
-                // removals under the new resource name.
-                if let Some(keys) = prev_explicit.remove(from) {
-                    prev_explicit.insert(to.clone(), keys);
-                }
-
-                // Transfer saved_attrs so create_plan can look up saved
-                // attributes under the new resource name.
-                if let Some(attrs) = saved_attrs.remove(from) {
-                    saved_attrs.insert(to.clone(), attrs);
-                }
-
-                moved_pairs.push((from.clone(), to.clone()));
+            // Transfer state from the old name to the new name so the
+            // differ compares desired(to) against actual(from).
+            if let Some(mut state) = current_states.remove(&resolved_from) {
+                state.id = resolved_to.clone();
+                current_states.insert(resolved_to.clone(), state);
             }
+
+            // Transfer prev_explicit so the differ detects attribute
+            // removals under the new resource name.
+            if let Some(keys) = prev_explicit.remove(&resolved_from) {
+                prev_explicit.insert(resolved_to.clone(), keys);
+            }
+
+            // Transfer saved_attrs so create_plan can look up saved
+            // attributes under the new resource name.
+            if let Some(attrs) = saved_attrs.remove(&resolved_from) {
+                saved_attrs.insert(resolved_to.clone(), attrs);
+            }
+
+            moved_pairs.push((resolved_from, resolved_to));
         }
     }
 
     moved_pairs
+}
+
+/// Look up `to`'s full id (with any routed `provider_instance`) in
+/// `desired` by matching on `(provider, resource_type, name)` —
+/// `provider_instance` is intentionally not part of the match key,
+/// since `moved { to = X 'name' }` has no syntax for routing. Returns
+/// `None` when no matching key exists, so callers can chain across
+/// multiple maps with `.or_else(...)` (carina#3324).
+fn find_desired_id<V>(to: &ResourceId, desired: &HashMap<ResourceId, V>) -> Option<ResourceId> {
+    desired
+        .keys()
+        .find(|k| {
+            k.provider == to.provider
+                && k.resource_type == to.resource_type
+                && k.name_str() == to.name_str()
+        })
+        .cloned()
 }
 
 /// Add state block effects (import/removed/moved) to the plan.
@@ -2105,14 +2158,29 @@ pub fn add_state_block_effects(
                 }
             }
             StateBlock::Removed { from } => {
-                // Skip if resource is not in state
-                let in_state = state_file.as_ref().is_some_and(|sf| {
+                // `from` is parsed from `removed { from = X 'addr' }`,
+                // which has no syntax for `provider_instance`. The
+                // resource in state may still carry a routed instance
+                // from its original `directives { provider = ... }`.
+                // Resolve to the full state id (inheriting the
+                // routing) so the emitted Remove effect and the
+                // `suppress_delete` HashSet key match the orphan
+                // Delete effect's id exactly — same root fix as the
+                // Import arm above (carina#3324).
+                let resolved_from = state_file.as_ref().and_then(|sf| {
                     sf.find_resource(&from.provider, &from.resource_type, from.name_str())
-                        .is_some()
+                        .map(|rs| {
+                            ResourceId::with_provider(
+                                &rs.provider,
+                                &rs.resource_type,
+                                &rs.name,
+                                rs.directives.provider_instance.clone(),
+                            )
+                        })
                 });
-                if in_state {
-                    suppress_delete.insert(from.clone());
-                    new_effects.push(Effect::Remove { id: from.clone() });
+                if let Some(id) = resolved_from {
+                    suppress_delete.insert(id.clone());
+                    new_effects.push(Effect::Remove { id });
                 }
             }
             StateBlock::Moved { .. } => {
@@ -2153,13 +2221,32 @@ pub fn add_state_block_effects(
 
 /// Resolve an import block's `to` address to a matching resource in the plan or state.
 ///
-/// Tries exact match first (by provider, resource_type, name). If no exact match
-/// exists, falls back to matching `to.name` against the `name_attribute` values of:
-/// 1. Anonymous resources in the plan's Create effects (pre-apply case)
-/// 2. Resources in the state file (already-imported case)
+/// Match keys on `(provider, resource_type, name)`. **`provider_instance`
+/// is intentionally not part of the address** — `to = X 'addr'` in DSL
+/// has no syntax for specifying a routed instance, so the parsed `to`
+/// always has `provider_instance = None`. The let-bound resource it
+/// targets may carry `directives { provider = <name> }`, which the
+/// parser stamps as `provider_instance = Some(<name>)`. Treating the
+/// instance as part of the address would falsely make these addresses
+/// non-equal and silently emit both an Import and a Create for the
+/// same infrastructure (carina#3324).
 ///
-/// This lets users write `to = awscc.s3.Bucket 'carina-rs-state'` without needing
-/// the auto-generated hash name, matching against `bucket_name = 'carina-rs-state'`.
+/// The function returns the matched resource's full id (inheriting
+/// its `provider_instance`), so:
+/// - The Import effect carries the routing the operator's directives
+///   selected — apply-time routing sends the import to the right
+///   provider instance.
+/// - The `suppress_create` set in [`add_state_block_effects`] keys on
+///   exactly the same id as the Create's resource, so the Create is
+///   suppressed.
+///
+/// Match precedence:
+/// 1. Exact `(provider, resource_type, name)` against a Create effect.
+/// 2. `name_attribute` fallback against a Create effect's anonymous
+///    resource (so `to = X 'carina-rs-state'` matches against
+///    `bucket_name = 'carina-rs-state'` on a `s3_bucket_1d43a664`).
+/// 3. `name_attribute` fallback against the state file
+///    (already-imported case).
 fn resolve_import_target(
     to: &ResourceId,
     plan: &Plan,
@@ -2174,14 +2261,24 @@ fn resolve_import_target(
         )
         .and_then(|s| s.name_attribute.as_deref());
 
+    // Address-equality test that ignores `provider_instance` — the
+    // import-block surface form has no routing slot, so two ids with
+    // the same `(provider, resource_type, name)` are the same address
+    // regardless of routing.
+    let same_address = |id: &ResourceId| {
+        id.provider == to.provider
+            && id.resource_type == to.resource_type
+            && id.name_str() == to.name_str()
+    };
+
     // Single pass: prefer exact id match, otherwise remember the first name_attribute match.
     let mut fallback_id: Option<ResourceId> = None;
     for effect in plan.effects() {
         let Effect::Create(resource) = effect else {
             continue;
         };
-        if resource.id == *to {
-            return to.clone();
+        if same_address(&resource.id) {
+            return resource.id.clone();
         }
         if fallback_id.is_some() {
             continue;
