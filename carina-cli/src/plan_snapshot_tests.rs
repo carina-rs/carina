@@ -1523,15 +1523,20 @@ fn snapshot_server_default_struct_leaf() {
     );
 }
 
-/// #3307 acceptance: when an `ExpansionTrace` records two leaf resources
-/// under a composition call site, the rendered plan groups them under a
-/// `Composition "<binding>"` header. The third leaf, declared at the
-/// DSL root with no trace entry, stays at the top level.
+/// carina#3307 + carina#3322 acceptance: when an `ExpansionTrace`
+/// records two leaf resources under a composition call site, the
+/// rendered plan groups them under a
+/// `module "<binding>" (<source_path>)` header. The third leaf,
+/// declared at the DSL root with no trace entry, stays at the top
+/// level. The header label was rebadged from the internal
+/// `Composition "<binding>"` term in carina#3322.
 #[test]
 fn snapshot_composition_folding() {
     use carina_core::effect::Effect;
     use carina_core::plan::Plan;
-    use carina_core::resource::{EphemeralId, ExpansionTrace, PersistentId, Resource, ResourceId};
+    use carina_core::resource::{
+        CallSite, EphemeralId, ExpansionTrace, PersistentId, Resource, ResourceId,
+    };
     use carina_core::schema::SchemaRegistry;
 
     let mut plan = Plan::new();
@@ -1550,7 +1555,13 @@ fn snapshot_composition_folding() {
     plan.add(Effect::Create(logs));
 
     let mut trace = ExpansionTrace::new();
-    let cluster_site = EphemeralId::new(ResourceId::new("_virtual", "cluster"));
+    // carina#3322: the call site carries the `use { source = "..." }`
+    // path so the rendered header reads
+    // `module "cluster" (./modules/cluster)`.
+    let cluster_site = CallSite::new(
+        EphemeralId::new(ResourceId::new("_virtual", "cluster")),
+        "./modules/cluster",
+    );
     trace.record(PersistentId::new(inner_id), vec![cluster_site.clone()]);
     trace.record(PersistentId::new(inner_role_id), vec![cluster_site]);
 
@@ -1568,11 +1579,17 @@ fn snapshot_composition_folding() {
     ));
     insta::assert_snapshot!(output);
 
-    // Acceptance: the composition header must appear, with both leaves
-    // following it in the output.
+    // Acceptance: the rebadged module header must appear, with the
+    // DSL-visible source path in parens, and the two leaves following
+    // it in the output (carina#3322).
     assert!(
-        output.contains("Composition \"cluster\""),
-        "expected `Composition \"cluster\"` header in:\n{}",
+        output.contains("module \"cluster\" (./modules/cluster)"),
+        "expected `module \"cluster\" (./modules/cluster)` header in:\n{}",
+        output
+    );
+    assert!(
+        !output.contains("Composition"),
+        "must not leak internal `Composition` term in:\n{}",
         output
     );
     assert!(
@@ -1584,5 +1601,46 @@ fn snapshot_composition_folding() {
         output.contains("logs"),
         "expected ungrouped `logs` leaf row in:\n{}",
         output
+    );
+}
+
+/// carina#3322 end-to-end: loading a real multi-file fixture
+/// (`module_anonymous_resource` — main.crn + an `oidc-module/`
+/// subdirectory referenced as `use { source = './oidc-module' }`)
+/// must render the composition group with `module "<binding>"
+/// (./oidc-module)`. This exercises the full pipeline:
+/// `process_imports` records `module_paths`, `expand_module_call`
+/// stamps each `CallSite`, the renderer reads `source_path`. Without
+/// this test the rebadge could regress silently for any input the
+/// hand-built `snapshot_composition_folding` doesn't cover.
+///
+/// Also obeys the CLAUDE.md "directory-scoped, never single-file"
+/// policy: the fixture is a real two-directory module shape, not a
+/// bare string.
+#[test]
+fn snapshot_module_header_renders_use_source_path_for_real_fixture() {
+    let fp = build_plan_from_fixture_name("module_anonymous_resource");
+    let output = strip_ansi(&format_plan(
+        &fp.plan,
+        DetailLevel::None,
+        &HashMap::new(),
+        Some(&fp.schemas),
+        &fp.moved_origins,
+        &[],
+        &[],
+        None,
+        Some(&fp.expansion_trace),
+    ));
+
+    assert!(
+        output.contains(r#"module "bootstrap" (./oidc-module)"#),
+        "expected `module \"bootstrap\" (./oidc-module)` header from real \
+         fixture in:\n{}",
+        output,
+    );
+    assert!(
+        !output.contains("Composition"),
+        "internal `Composition` term must not surface to operators in:\n{}",
+        output,
     );
 }

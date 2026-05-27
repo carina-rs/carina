@@ -39,6 +39,11 @@ pub struct FixturePlan {
     /// default fields the user never wrote do not surface in plan
     /// output (refs awscc#206).
     pub prev_explicit: HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
+    /// Plan-scoped lineage of leaf nodes back to their composition
+    /// call sites — surfaced here so fixture-based snapshot tests
+    /// can render the composition-group header the same way the
+    /// real `carina plan` command does (carina#3322).
+    pub expansion_trace: carina_core::resource::ExpansionTrace,
 }
 
 /// Build a plan from a fixture directory name (e.g. "all_create"). Resolves
@@ -291,6 +296,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         deferred_for_expressions: parsed.deferred_for_expressions,
         export_params: parsed.export_params,
         prev_explicit,
+        expansion_trace: parsed.expansion_trace,
     }
 }
 

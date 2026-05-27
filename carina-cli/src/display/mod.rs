@@ -850,9 +850,12 @@ fn format_plan_tree<'a>(
     // #3307: when an ExpansionTrace is supplied AND it actually
     // records lineage for the plan's leaves, group root rows by their
     // outermost composition call site. Within each composition group,
-    // a `Composition "<binding>"` header is printed first, followed by
-    // the leaf rows. Roots with no lineage entry render at the
-    // top level as before.
+    // a `module "<binding>" (<source_path>)` header is printed first,
+    // followed by the leaf rows. Roots with no lineage entry render
+    // at the top level as before. (carina#3307 introduced the
+    // grouping; carina#3322 renamed the user-facing label from
+    // `Composition "<binding>"` to the DSL-visible
+    // `module "<binding>" (<source_path>)` shape.)
     let composition_groups = group_roots_by_outermost_composition(plan, &roots, expansion_trace);
 
     if composition_groups.has_any_grouping() {
@@ -867,7 +870,12 @@ fn format_plan_tree<'a>(
         // composition header marks the group, and the per-line `Composition`
         // header visually separates groups.
         for group in &composition_groups.grouped {
-            writeln!(ctx.out, "{}", format_composition_header(&group.binding)).unwrap();
+            writeln!(
+                ctx.out,
+                "{}",
+                format_composition_header(&group.binding, group.source_path.as_deref())
+            )
+            .unwrap();
             for (li, leaf_idx) in group.leaves.iter().enumerate() {
                 let leaf_last = li == group.leaves.len() - 1;
                 ctx.format_effect_tree(*leaf_idx, 0, leaf_last, "  ", None);
@@ -894,9 +902,25 @@ fn format_plan_tree<'a>(
 }
 
 /// Header row for a composition group in the folded plan layout.
-fn format_composition_header(binding: &str) -> String {
+///
+/// Renders `+ module "<binding>" (<source_path>)`, dropping the
+/// parenthesized suffix when the call site has no recorded
+/// `source_path` (hand-built traces, test fixtures). The keyword
+/// `module` matches the DSL `module_call` construct the operator
+/// wrote (`let r = infra { ... }`), so it is something they can
+/// trace back to their own `.crn` — unlike the previous internal
+/// `Composition` label (carina#3322).
+fn format_composition_header(binding: &str, source_path: Option<&str>) -> String {
     use colored::Colorize;
-    format!("{} Composition \"{}\"", "+".cyan(), binding.cyan().bold())
+    match source_path {
+        None => format!("{} module \"{}\"", "+".cyan(), binding.cyan().bold()),
+        Some(path) => format!(
+            "{} module \"{}\" {}",
+            "+".cyan(),
+            binding.cyan().bold(),
+            format!("({})", path).dimmed(),
+        ),
+    }
 }
 
 /// Bucket of root effects, partitioned into the ones nested inside a
@@ -916,6 +940,11 @@ impl CompositionGroups {
 struct CompositionGroup {
     /// Display label — the call site's binding (instance prefix), e.g. `cluster`.
     binding: String,
+    /// `use { source = "..." }` path the module was loaded from.
+    /// `None` when the trace was built without a recorded path (test
+    /// fixtures, hand-built traces); the renderer drops the
+    /// parenthesized suffix then.
+    source_path: Option<String>,
     /// Root indices in `plan.effects()` that belong to this group.
     leaves: Vec<usize>,
 }
@@ -940,9 +969,11 @@ fn group_roots_by_outermost_composition(
     };
 
     // Map: outermost call-site name → group leaves (preserves first
-    // appearance order).
+    // appearance order). `source_path` is recorded on first sight; the
+    // expander stamps every leaf of the same call site with the same
+    // path, so later sightings can be ignored.
     let mut order: Vec<String> = Vec::new();
-    let mut by_call_site: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut by_call_site: HashMap<String, (Option<String>, Vec<usize>)> = HashMap::new();
     let mut ungrouped: Vec<usize> = Vec::new();
 
     for &root_idx in roots {
@@ -953,12 +984,16 @@ fn group_roots_by_outermost_composition(
             .and_then(|pid| trace.call_sites_of(&pid).first().cloned());
 
         match outer {
-            Some(eid) => {
-                let key = eid.inner().name.as_str().to_string();
+            Some(site) => {
+                let key = site.binding().to_string();
                 if !by_call_site.contains_key(&key) {
                     order.push(key.clone());
                 }
-                by_call_site.entry(key).or_default().push(root_idx);
+                by_call_site
+                    .entry(key)
+                    .or_insert_with(|| (site.source_path.clone(), Vec::new()))
+                    .1
+                    .push(root_idx);
             }
             None => ungrouped.push(root_idx),
         }
@@ -967,8 +1002,12 @@ fn group_roots_by_outermost_composition(
     let grouped: Vec<CompositionGroup> = order
         .into_iter()
         .map(|binding| {
-            let leaves = by_call_site.remove(&binding).unwrap_or_default();
-            CompositionGroup { binding, leaves }
+            let (source_path, leaves) = by_call_site.remove(&binding).unwrap_or_default();
+            CompositionGroup {
+                binding,
+                source_path,
+                leaves,
+            }
         })
         .collect();
 

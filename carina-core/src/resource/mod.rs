@@ -1806,7 +1806,7 @@ pub mod persistent_id;
 
 pub use composition::{Composition, CompositionAttribute, Signature};
 pub use data_source::DataSource;
-pub use expansion_trace::ExpansionTrace;
+pub use expansion_trace::{CallSite, ExpansionTrace};
 pub use graph_node::GraphNode;
 pub use leaf_node::{CompositionNotALeaf, LeafNode, expand_to_leaves};
 pub use persistent_id::{EphemeralId, NodeId, PersistentId};

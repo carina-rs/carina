@@ -1677,3 +1677,25 @@ fn test_refresh_plan_separator_emits_blank_line_after_refresh() {
 fn test_refresh_plan_separator_no_blank_line_without_refresh() {
     assert_eq!(refresh_plan_separator(false), "");
 }
+
+/// carina#3322: the composition group header reads
+/// `+ module "<binding>" (<source_path>)`. The keyword is `module`,
+/// not the internal `Composition`; the binding name is the user's
+/// `let` LHS, and the parenthesized suffix surfaces the DSL `use`
+/// path so the operator can trace the group back to a real `.crn`
+/// file.
+#[test]
+fn test_composition_header_renders_module_with_source_path() {
+    let header = strip_ansi(&format_composition_header("r", Some("./modules/infra")));
+    assert_eq!(header, r#"+ module "r" (./modules/infra)"#);
+}
+
+/// Fallback shape when no `use` path was recorded for the call site
+/// (test fixtures, hand-built traces). The parenthesized suffix is
+/// dropped so the header still reads as a clean `+ module "<binding>"`
+/// line — never as a literal "None" or an empty `()`.
+#[test]
+fn test_composition_header_drops_parens_for_none_source_path() {
+    let header = strip_ansi(&format_composition_header("r", None));
+    assert_eq!(header, r#"+ module "r""#);
+}

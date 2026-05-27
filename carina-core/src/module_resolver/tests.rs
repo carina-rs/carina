@@ -756,7 +756,76 @@ fn test_expand_module_call_populates_expansion_trace_single_level() {
     // (`_virtual.<instance_prefix>`).
     let expected_call_site =
         crate::resource::EphemeralId::new(crate::resource::ResourceId::new("_virtual", "web"));
-    assert_eq!(chain[0], expected_call_site);
+    assert_eq!(chain[0].id, expected_call_site);
+}
+
+/// carina#3322 acceptance: when `process_imports` recorded a
+/// `use { source = "..." }` path for the module alias, the call site
+/// stamped onto each leaf in the `ExpansionTrace` must carry that
+/// path verbatim. The plan renderer reads it to label a composition
+/// group with `module "<binding>" (<source_path>)` — without this,
+/// the group label silently falls back to the path-less form.
+#[test]
+fn test_expand_module_call_records_use_source_path_on_call_site() {
+    let resolver = {
+        let mut r = ModuleResolver::new(".");
+        r.imported_modules
+            .insert("web_tier".to_string(), create_module_with_attributes());
+        // Simulates what `process_imports` records for
+        // `use { source = "./modules/web_tier", alias = "web_tier" }`.
+        r.module_paths
+            .insert("web_tier".to_string(), "./modules/web_tier".to_string());
+        r
+    };
+
+    let call = ModuleCall {
+        module_name: "web_tier".to_string(),
+        binding_name: Some("web".to_string()),
+        arguments: HashMap::new(),
+    };
+
+    let expanded = resolver.expand_module_call(&call, "web", None).unwrap();
+    let leaf = &expanded.resources[0];
+    let chain = expanded
+        .expansion_trace
+        .call_sites_of(&leaf.persistent_id());
+
+    assert_eq!(
+        chain[0].source_path.as_deref(),
+        Some("./modules/web_tier"),
+        "the call site must carry the DSL `use` source path so the \
+         renderer can emit `module \"<binding>\" (./modules/web_tier)`",
+    );
+}
+
+/// Absence-of-path fallback: when no `module_paths` entry exists for
+/// the alias (e.g. hand-built test resolvers, or a module synthesized
+/// without going through `process_imports`), the call site falls back
+/// to `source_path = None`. The renderer treats that as
+/// "drop the parenthesized suffix" — never a panic, never the literal
+/// string "None".
+#[test]
+fn test_expand_module_call_call_site_source_path_none_when_unmapped() {
+    let resolver = {
+        let mut r = ModuleResolver::new(".");
+        r.imported_modules
+            .insert("web_tier".to_string(), create_module_with_attributes());
+        // Deliberately no `module_paths` entry.
+        r
+    };
+
+    let call = ModuleCall {
+        module_name: "web_tier".to_string(),
+        binding_name: Some("web".to_string()),
+        arguments: HashMap::new(),
+    };
+
+    let expanded = resolver.expand_module_call(&call, "web", None).unwrap();
+    let leaf = &expanded.resources[0];
+    let chain = expanded
+        .expansion_trace
+        .call_sites_of(&leaf.persistent_id());
+    assert_eq!(chain[0].source_path, None);
 }
 
 /// #3306 acceptance: when an outer expansion absorbs leaves from a
@@ -764,19 +833,27 @@ fn test_expand_module_call_populates_expansion_trace_single_level() {
 /// call site to the inner chain — outermost-first overall.
 #[test]
 fn test_build_expansion_trace_prepends_outer_call_site_to_inner_chain() {
-    use crate::resource::{EphemeralId, ExpansionTrace, PersistentId, ResourceId};
+    use crate::resource::{CallSite, EphemeralId, ExpansionTrace, PersistentId, ResourceId};
 
     // Simulate an inner module that already finished its own
     // expansion: one leaf nested one level deep (inner_call_site).
     let mut inner_trace = ExpansionTrace::new();
     let inner_leaf = PersistentId::new(ResourceId::new("aws.s3.Bucket", "outer.inner.logs"));
-    let inner_call_site = EphemeralId::new(ResourceId::new("_virtual", "outer.inner"));
+    let inner_call_site = CallSite::new(
+        EphemeralId::new(ResourceId::new("_virtual", "outer.inner")),
+        "./modules/inner",
+    );
     inner_trace.record(inner_leaf.clone(), vec![inner_call_site.clone()]);
 
     // Build the outer trace: no direct leaves at this level, only
     // inherited ones. The outer call-site is `outer`.
-    let outer_trace =
-        crate::module_resolver::expander::build_expansion_trace("outer", &inner_trace, &[], &[]);
+    let outer_trace = crate::module_resolver::expander::build_expansion_trace(
+        "outer",
+        Some("./modules/outer"),
+        &inner_trace,
+        &[],
+        &[],
+    );
 
     // The inner leaf is still recorded, but its chain now leads with
     // the outer call site.
@@ -788,8 +865,13 @@ fn test_build_expansion_trace_prepends_outer_call_site_to_inner_chain() {
     );
     let expected_outer = EphemeralId::new(ResourceId::new("_virtual", "outer"));
     assert_eq!(
-        chain[0], expected_outer,
+        chain[0].id, expected_outer,
         "outermost element must be the outer call site",
+    );
+    assert_eq!(
+        chain[0].source_path.as_deref(),
+        Some("./modules/outer"),
+        "outer call site must carry the outer module's source path",
     );
     assert_eq!(
         chain[1], inner_call_site,
