@@ -912,7 +912,8 @@ pub async fn get_provider_with_ctx<E>(
     // instance (`let <name> = provider <kind> { ... }`), reusing the
     // factory the default instance already brought in.
     for provider_config in parsed.providers.iter().filter(|p| p.is_default) {
-        instantiate_provider_into_router(ctx, &mut router, provider_config, base_dir, None).await?;
+        instantiate_provider_into_router(ctx, &mut router, provider_config, base_dir, None, None)
+            .await?;
     }
 
     for provider_config in parsed.providers.iter().filter(|p| !p.is_default) {
@@ -920,12 +921,14 @@ pub async fn get_provider_with_ctx<E>(
             .binding
             .clone()
             .expect("named instance must carry its binding name (parser invariant)");
+        let inherited_source = kind_default_source(&parsed.providers, &provider_config.name);
         instantiate_provider_into_router(
             ctx,
             &mut router,
             provider_config,
             base_dir,
             Some(binding),
+            inherited_source,
         )
         .await?;
     }
@@ -941,6 +944,54 @@ pub async fn get_provider_with_ctx<E>(
     Ok(router)
 }
 
+/// Look up the `source` declared on the kind's default instance for a
+/// given kind name. Named instances inherit `source` from the kind's
+/// default — the parser rejects `source` on `let <name> = provider
+/// <kind>` — so this is the only way to get the source URL while
+/// processing a named instance's wiring.
+fn kind_default_source<'a>(configs: &'a [ProviderConfig], kind: &str) -> Option<&'a str> {
+    configs
+        .iter()
+        .find(|p| p.is_default && p.name == kind)
+        .and_then(|p| p.source.as_deref())
+}
+
+/// Format the "Using <provider>" announcement emitted by both the
+/// default-instance and named-instance wiring paths (carina#3067).
+///
+/// One helper, one shape — the rule is that there is no other place
+/// in the codebase that builds this line. Both code paths
+/// (`try_add_source_provider` for the kind's default, the
+/// `find_factory` branch of `instantiate_provider_into_router` for
+/// named instances) call this function, so a future "third caller"
+/// physically cannot emit a divergent shape without touching this
+/// function.
+///
+/// - `kind` is the kind name (`aws`, `awscc`) — what the user writes
+///   in `provider <kind> {}` and routes to via `directives.provider`.
+///   Use `ProviderFactory::name()`, not `display_name()`.
+/// - `binding = None` is the kind's default instance and is rendered
+///   as `instance=default`. Explicit, not omitted: the omission is
+///   exactly what made the old shape ambiguous.
+/// - `source = None` is omitted from the rendered line. In practice
+///   both call paths feed a `Some(...)`: the source-loading path has
+///   it directly, and the find_factory path threads in the kind
+///   default's source. `None` is only reachable if a kind default
+///   never declared a `source`, which currently only happens in
+///   mock/test wiring that doesn't pass through this helper.
+fn format_provider_using_line(
+    kind: &str,
+    region: &str,
+    binding: Option<&str>,
+    source: Option<&str>,
+) -> String {
+    let instance = binding.unwrap_or("default");
+    match source {
+        Some(src) => format!("Using {kind} (region: {region}, instance={instance}, source: {src})"),
+        None => format!("Using {kind} (region: {region}, instance={instance})"),
+    }
+}
+
 /// Register a single provider instance into `router`. `binding = None`
 /// is the kind's default instance; `binding = Some(name)` is a named
 /// instance and routes resources tagged `directives { provider = name }`.
@@ -954,6 +1005,7 @@ async fn instantiate_provider_into_router(
     provider_config: &ProviderConfig,
     base_dir: &Path,
     binding: Option<String>,
+    inherited_source: Option<&str>,
 ) -> Result<(), AppError> {
     // Named instances inherit `source`/`version`/`revision` from the
     // kind's default — these fields are rejected by the parser when set
@@ -968,17 +1020,18 @@ async fn instantiate_provider_into_router(
 
     if let Some(factory) = provider_mod::find_factory(ctx.factories(), &provider_config.name) {
         let region = factory.extract_region(&provider_config.attributes);
-        let instance_label = match &binding {
-            Some(name) => format!(" instance={}", name),
-            None => String::new(),
-        };
+        // Reaching this branch implies `provider_config.source` is None:
+        // the early-return above handles `binding.is_none() && source.is_some()`,
+        // and the parser rejects `source` on named instances. So the only
+        // candidate for the log line is the kind default's source, threaded
+        // in by the caller as `inherited_source`.
         println!(
             "{}",
-            format!(
-                "Using {} (region: {}{})",
-                factory.display_name(),
-                region,
-                instance_label
+            format_provider_using_line(
+                factory.name(),
+                &region,
+                binding.as_deref(),
+                inherited_source,
             )
             .cyan()
         );
@@ -1023,7 +1076,7 @@ async fn try_add_source_provider(
             let region = factory.extract_region(&config.attributes);
             println!(
                 "{}",
-                format!("Using {} (region: {}, source: {})", name, region, source).cyan()
+                format_provider_using_line(&name, &region, None, Some(source)).cyan()
             );
             router.add_provider(name, provider);
             router.add_normalizer(factory.create_normalizer(None, &config.attributes).await);
@@ -1118,15 +1171,23 @@ pub async fn create_providers_from_configs(
     // first (they may load the WASM plugin), then named instances reuse
     // the factory that was just loaded.
     for config in configs.iter().filter(|p| p.is_default) {
-        instantiate_provider_into_router(&ctx, &mut router, config, base_dir, None).await?;
+        instantiate_provider_into_router(&ctx, &mut router, config, base_dir, None, None).await?;
     }
     for config in configs.iter().filter(|p| !p.is_default) {
         let binding = config
             .binding
             .clone()
             .expect("named instance must carry its binding name (parser invariant)");
-        instantiate_provider_into_router(&ctx, &mut router, config, base_dir, Some(binding))
-            .await?;
+        let inherited_source = kind_default_source(configs, &config.name);
+        instantiate_provider_into_router(
+            &ctx,
+            &mut router,
+            config,
+            base_dir,
+            Some(binding),
+            inherited_source,
+        )
+        .await?;
     }
 
     if router.is_empty() {

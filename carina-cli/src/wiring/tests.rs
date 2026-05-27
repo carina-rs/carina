@@ -2341,3 +2341,175 @@ mod expand_same_config_deferred_for_tests {
         );
     }
 }
+
+/// Tests for the unified "Using <provider>" announcement format
+/// (carina#3067). The default-instance and named-instance code paths
+/// must emit the same shape so that CI logs are unambiguous about
+/// which kind / instance / region was wired up.
+#[cfg(test)]
+mod using_line_format_tests {
+    use super::super::format_provider_using_line;
+
+    #[test]
+    fn default_instance_with_source() {
+        // Default instance (no binding). Source is always known on this
+        // path because the default instance is the only one that
+        // load-sources a factory.
+        assert_eq!(
+            format_provider_using_line(
+                "awscc",
+                "ap-northeast-1",
+                None,
+                Some("github.com/carina-rs/carina-provider-awscc"),
+            ),
+            "Using awscc (region: ap-northeast-1, instance=default, \
+             source: github.com/carina-rs/carina-provider-awscc)",
+        );
+    }
+
+    #[test]
+    fn named_instance_with_source() {
+        // Named instance. Source belongs to the kind, not the instance,
+        // and is still included so that one log line is enough to
+        // identify what got wired up.
+        assert_eq!(
+            format_provider_using_line(
+                "aws",
+                "us-east-1",
+                Some("us"),
+                Some("github.com/carina-rs/carina-provider-aws"),
+            ),
+            "Using aws (region: us-east-1, instance=us, \
+             source: github.com/carina-rs/carina-provider-aws)",
+        );
+    }
+
+    #[test]
+    fn instance_label_uses_default_marker_when_unbound() {
+        // The kind's default instance must be labeled "instance=default"
+        // explicitly, not omitted — the omission is what made the old
+        // default-line and named-line shapes diverge.
+        let line = format_provider_using_line("aws", "ap-northeast-1", None, None);
+        assert!(
+            line.contains("instance=default"),
+            "default instance must surface as 'instance=default'; got: {line}",
+        );
+    }
+
+    #[test]
+    fn kind_label_is_kind_name_not_display_name() {
+        // The label must be the kind name ("aws") — what the user
+        // writes in `provider <kind> {}` and routes to via
+        // `directives.provider` — not the factory's display_name
+        // ("AWS provider"). The old named-instance path used
+        // display_name, which made the two log lines disagree on
+        // what to call the same construct.
+        let line = format_provider_using_line("aws", "us-east-1", Some("us"), None);
+        assert!(
+            line.starts_with("Using aws "),
+            "kind label must be the kind name, not a display name; got: {line}",
+        );
+    }
+}
+
+#[cfg(test)]
+mod kind_default_source_tests {
+    use super::super::kind_default_source;
+    use carina_core::parser::ProviderConfig;
+    use indexmap::IndexMap;
+
+    fn config(name: &str, is_default: bool, source: Option<&str>) -> ProviderConfig {
+        ProviderConfig {
+            name: name.to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            source: source.map(str::to_string),
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: if is_default {
+                None
+            } else {
+                Some("named".to_string())
+            },
+            is_default,
+        }
+    }
+
+    #[test]
+    fn returns_source_of_matching_kind_default() {
+        let configs = vec![
+            config(
+                "aws",
+                true,
+                Some("github.com/carina-rs/carina-provider-aws"),
+            ),
+            config("aws", false, None),
+        ];
+        assert_eq!(
+            kind_default_source(&configs, "aws"),
+            Some("github.com/carina-rs/carina-provider-aws"),
+        );
+    }
+
+    #[test]
+    fn ignores_named_instances_with_same_kind() {
+        // Named instance comes first in the slice. The function must
+        // still pick the default, not the named — otherwise it would
+        // return the named instance's (always-None) source.
+        let configs = vec![
+            config("aws", false, None),
+            config(
+                "aws",
+                true,
+                Some("github.com/carina-rs/carina-provider-aws"),
+            ),
+        ];
+        assert_eq!(
+            kind_default_source(&configs, "aws"),
+            Some("github.com/carina-rs/carina-provider-aws"),
+        );
+    }
+
+    #[test]
+    fn different_kinds_do_not_cross_leak() {
+        // Two kinds, each with their own default + source. Asking for
+        // one kind must never return the other's source.
+        let configs = vec![
+            config(
+                "aws",
+                true,
+                Some("github.com/carina-rs/carina-provider-aws"),
+            ),
+            config(
+                "awscc",
+                true,
+                Some("github.com/carina-rs/carina-provider-awscc"),
+            ),
+        ];
+        assert_eq!(
+            kind_default_source(&configs, "aws"),
+            Some("github.com/carina-rs/carina-provider-aws"),
+        );
+        assert_eq!(
+            kind_default_source(&configs, "awscc"),
+            Some("github.com/carina-rs/carina-provider-awscc"),
+        );
+    }
+
+    #[test]
+    fn returns_none_when_kind_default_has_no_source() {
+        let configs = vec![config("mock", true, None)];
+        assert_eq!(kind_default_source(&configs, "mock"), None);
+    }
+
+    #[test]
+    fn returns_none_when_kind_is_absent() {
+        let configs = vec![config(
+            "aws",
+            true,
+            Some("github.com/carina-rs/carina-provider-aws"),
+        )];
+        assert_eq!(kind_default_source(&configs, "awscc"), None);
+    }
+}
