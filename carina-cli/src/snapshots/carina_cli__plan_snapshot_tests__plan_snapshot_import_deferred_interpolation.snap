@@ -1,0 +1,10 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: stripped
+---
+Execution Plan:
+
+  <- aws.route53.RecordSet r.delegation_ns (import: (known after upstream apply: management_route53.apex_zone_id)|registry-dev.carina-rs.dev|NS)
+      id: (known after upstream apply: management_route53.apex_zone_id)|registry-dev.carina-rs.dev|NS
+
+Plan: 1 to import, 0 to add, 0 to change, 0 to destroy.

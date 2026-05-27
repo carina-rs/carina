@@ -1219,13 +1219,26 @@ async fn run_apply_locked(
     // Uses unresolved resources (sorted_resources) so dependents retain ResourceRef values.
     cascade_dependent_updates(&mut plan, &sorted_resources, &current_states, schemas);
 
-    // Add state block effects (import/removed/moved) to the plan
+    // Add state block effects (import/removed/moved) to the plan.
+    // carina#3329: resolve `import { id = "${…}|…" }` interpolations
+    // against the same binding view the resource-attribute resolver
+    // uses. The empty `unresolved_upstream_bindings` set here just
+    // skips the plan-time "stamp upstream refs as
+    // `(known after upstream apply: …)`" pass — apply does not need
+    // that display marker. The hard-fail on a still-deferred
+    // identifier is enforced one layer down in
+    // `execute_import_effects` via [`carina_core::effect::resolve_import_identifier`],
+    // which rejects any non-Concrete `Value` before it can reach the
+    // provider's `read()`.
+    let no_unresolved_upstreams: std::collections::HashSet<&str> = std::collections::HashSet::new();
     crate::wiring::add_state_block_effects(
         &mut plan,
         &parsed.state_blocks,
         &state_file,
         &moved_pairs,
         schemas,
+        &bindings,
+        &no_unresolved_upstreams,
     );
 
     // Check for prevent_destroy violations
@@ -1462,16 +1475,24 @@ pub async fn run_apply_from_plan(
     let plan_file: PlanFile =
         serde_json::from_str(&content).map_err(|e| format!("Failed to parse plan file: {}", e))?;
 
-    // Validate version compatibility. Plan-file version 4
-    // (carina#3248) persists `compositions` so the saved-plan
-    // apply path can rebuild the same `ResolvedBindings` view as the
-    // live-apply path (carina#3246). Older plans (version 3 and
-    // below) lack the `compositions` field and cannot be applied
-    // by the post-#3248 binding-construction path, so they are
+    // Validate version compatibility. Plan-file version 5
+    // (carina#3329) changed `Effect::Import.identifier`'s on-disk shape
+    // from a plain string to a tagged `Value`, so a deferred upstream-
+    // state reference inside the import id can survive plan→apply as
+    // a `Value::Deferred(Interpolation)` rather than being silently
+    // substituted to empty. Pre-#3329 plans (version 4) serialise
+    // `identifier` as a raw string and would otherwise hit an opaque
+    // serde error at deserialisation; the explicit version check
+    // produces a clean "re-run plan" message instead.
+    //
+    // Plan-file version 4 (carina#3248) persists `compositions` so the
+    // saved-plan apply path can rebuild the same `ResolvedBindings`
+    // view as the live-apply path (carina#3246). Older plans cannot be
+    // applied by the post-#3248 binding-construction path and are
     // rejected outright per the repo's no-backward-compat policy.
-    if plan_file.version != 4 {
+    if plan_file.version != 5 {
         return Err(AppError::Config(format!(
-            "Unsupported plan file version: {} (expected 4). \
+            "Unsupported plan file version: {} (expected 5). \
              Re-run 'carina plan' to produce a plan in the current format.",
             plan_file.version
         )));

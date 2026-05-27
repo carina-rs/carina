@@ -404,10 +404,20 @@ fn import_fallback_matches_anonymous_resource_by_name_attribute() {
     // Import block with the logical name (not the hash)
     let state_blocks = vec![StateBlock::Import {
         to: StateBlockAddress::new("awscc", "s3.Bucket", "carina-rs-state"),
-        id: "carina-rs-state".to_string(),
+        id: Value::Concrete(ConcreteValue::String("carina-rs-state".to_string())),
     }];
 
-    add_state_block_effects(&mut plan, &state_blocks, &None, &[], &schemas);
+    let bindings = carina_core::binding_index::ResolvedBindings::default();
+    let no_upstreams: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    add_state_block_effects(
+        &mut plan,
+        &state_blocks,
+        &None,
+        &[],
+        &schemas,
+        &bindings,
+        &no_upstreams,
+    );
 
     // Expect only an Import effect (no Create) targeting the anonymous hash name
     let effects = plan.effects();
@@ -423,7 +433,10 @@ fn import_fallback_matches_anonymous_resource_by_name_attribute() {
                 "s3_bucket_1d43a664",
                 "Import should target the anonymous hash name"
             );
-            assert_eq!(identifier, "carina-rs-state");
+            assert_eq!(
+                identifier,
+                &Value::Concrete(ConcreteValue::String("carina-rs-state".to_string())),
+            );
         }
         other => panic!("Expected Import effect, got {other:?}"),
     }
@@ -549,7 +562,17 @@ fn removed_block_suppresses_delete_when_state_resource_is_routed_to_named_instan
         from: StateBlockAddress::new("aws", "route53.RecordSet", "r.delegation_ns"),
     }];
 
-    add_state_block_effects(&mut plan, &state_blocks, &Some(state_file), &[], &schemas);
+    let bindings = carina_core::binding_index::ResolvedBindings::default();
+    let no_upstreams: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    add_state_block_effects(
+        &mut plan,
+        &state_blocks,
+        &Some(state_file),
+        &[],
+        &schemas,
+        &bindings,
+        &no_upstreams,
+    );
 
     let effects = plan.effects();
     assert_eq!(
@@ -605,10 +628,22 @@ fn import_suppresses_create_when_target_resource_is_routed_to_named_instance() {
     // is responsible for lifting routing from the matched Create.
     let state_blocks = vec![StateBlock::Import {
         to: StateBlockAddress::new("aws", "route53.RecordSet", "r.delegation_ns"),
-        id: "|hosted-zone-id|registry-dev.carina-rs.dev|NS".to_string(),
+        id: Value::Concrete(ConcreteValue::String(
+            "|hosted-zone-id|registry-dev.carina-rs.dev|NS".to_string(),
+        )),
     }];
 
-    add_state_block_effects(&mut plan, &state_blocks, &None, &[], &schemas);
+    let bindings = carina_core::binding_index::ResolvedBindings::default();
+    let no_upstreams: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    add_state_block_effects(
+        &mut plan,
+        &state_blocks,
+        &None,
+        &[],
+        &schemas,
+        &bindings,
+        &no_upstreams,
+    );
 
     let effects = plan.effects();
     assert_eq!(
@@ -653,10 +688,20 @@ fn import_fallback_skips_when_already_in_state_by_name_attribute() {
     let mut plan = Plan::new();
     let state_blocks = vec![StateBlock::Import {
         to: StateBlockAddress::new("awscc", "s3.Bucket", "carina-rs-state"),
-        id: "carina-rs-state".to_string(),
+        id: Value::Concrete(ConcreteValue::String("carina-rs-state".to_string())),
     }];
 
-    add_state_block_effects(&mut plan, &state_blocks, &Some(state_file), &[], &schemas);
+    let bindings = carina_core::binding_index::ResolvedBindings::default();
+    let no_upstreams: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    add_state_block_effects(
+        &mut plan,
+        &state_blocks,
+        &Some(state_file),
+        &[],
+        &schemas,
+        &bindings,
+        &no_upstreams,
+    );
 
     // Already in state (via fallback match) — no Import effect should be emitted
     assert_eq!(

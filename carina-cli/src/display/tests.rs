@@ -1363,7 +1363,9 @@ fn format_effect_replace_separates_type_and_name_with_space() {
 fn format_effect_import_separates_type_and_name_with_space() {
     let effect = Effect::Import {
         id: ResourceId::with_provider("aws", "s3.Bucket", "logs", None),
-        identifier: "my-logs-bucket".to_string(),
+        identifier: carina_core::resource::Value::Concrete(
+            carina_core::resource::ConcreteValue::String("my-logs-bucket".to_string()),
+        ),
     };
     assert_eq!(
         format_effect(&effect),

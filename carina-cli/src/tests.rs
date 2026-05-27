@@ -302,7 +302,7 @@ fn plan_file_serde_round_trip() {
     }];
 
     let plan_file = PlanFile {
-        version: 4,
+        version: 5,
         carina_version: "0.1.0".to_string(),
         timestamp: "2025-01-01T00:00:00Z".to_string(),
         source_path: "example.crn".to_string(),
@@ -350,7 +350,7 @@ fn plan_file_serde_round_trip() {
     let json = serde_json::to_string_pretty(&plan_file).unwrap();
     let deserialized: PlanFile = serde_json::from_str(&json).unwrap();
 
-    assert_eq!(deserialized.version, 4);
+    assert_eq!(deserialized.version, 5);
     assert_eq!(deserialized.carina_version, "0.1.0");
     assert_eq!(deserialized.source_path, "example.crn");
     assert_eq!(deserialized.state_lineage, Some("test-lineage".to_string()));
@@ -2510,7 +2510,7 @@ fn import_effect_preserves_resource_metadata_in_state() {
     let mut plan = Plan::new();
     plan.add(Effect::Import {
         id: id.clone(),
-        identifier: identifier.to_string(),
+        identifier: Value::Concrete(ConcreteValue::String(identifier.to_string())),
     });
 
     let saved = build_state_after_apply(ApplyStateSave {
@@ -2749,7 +2749,7 @@ fn plan_file_serialization_redacts_secrets() {
 
     // Redact before building PlanFile (same as production code does)
     let plan_file = PlanFile {
-        version: 4,
+        version: 5,
         carina_version: "0.1.0".to_string(),
         timestamp: "2025-01-01T00:00:00Z".to_string(),
         source_path: "example.crn".to_string(),

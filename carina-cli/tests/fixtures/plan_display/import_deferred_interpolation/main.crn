@@ -1,0 +1,23 @@
+# Regression fixture for carina#3329.
+#
+# An `import { id = "${X.attr}|literal|literal" }` whose `${X.attr}` is
+# a deferred upstream-state reference (the upstream's state file has not
+# published the export yet) must render its interpolation through the
+# plan-display path that emits `(known after upstream apply: …)` for
+# every other deferred ref site. Before #3329 the parser dropped the
+# `${…}` segment entirely and the plan showed `id: |literal|literal` —
+# a partially-substituted string presented as if it were the real cloud
+# identifier.
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+let management_route53 = upstream_state {
+  source = "./network"
+}
+
+import {
+  to = aws.route53.RecordSet "r.delegation_ns"
+  id = "${management_route53.apex_zone_id}|registry-dev.carina-rs.dev|NS"
+}

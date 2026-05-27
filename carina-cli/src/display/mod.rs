@@ -644,6 +644,13 @@ impl<'a> TreeRenderContext<'a> {
                 }
             }
             Effect::Import { id, identifier } => {
+                // carina#3329: render the identifier through
+                // `format_import_identifier` so a concrete cloud
+                // identifier prints bare (`vpc-0abc…`) while a
+                // deferred-upstream interpolation keeps its
+                // `(known after upstream apply: …)` marker rather than
+                // being silently substituted to empty.
+                let identifier_str = carina_core::effect::format_import_identifier(identifier);
                 writeln!(
                     self.out,
                     "{}{}{} {} {} {}",
@@ -652,7 +659,7 @@ impl<'a> TreeRenderContext<'a> {
                     colored_symbol,
                     id.display_type().cyan().bold(),
                     id.name_str().cyan().bold(),
-                    format!("(import: {})", identifier).dimmed()
+                    format!("(import: {})", identifier_str).dimmed()
                 )
                 .unwrap();
             }
@@ -1859,7 +1866,11 @@ pub fn format_effect(effect: &Effect) -> String {
             format!("Read {}", resource.id.human())
         }
         Effect::Import { id, identifier } => {
-            format!("Import {} (id: {})", id.human(), identifier)
+            format!(
+                "Import {} (id: {})",
+                id.human(),
+                carina_core::effect::format_import_identifier(identifier)
+            )
         }
         Effect::Remove { id } => {
             format!("Remove {} from state", id.human())

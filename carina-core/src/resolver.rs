@@ -303,6 +303,36 @@ fn stamp_unresolved_upstream(
     }
 }
 
+/// Plan-only single-value counterpart of [`resolve_refs_for_plan`].
+///
+/// Resolves `ResourceRef` segments against `bindings` and then stamps
+/// any surviving ref whose root binding is in
+/// `unresolved_upstream_bindings` as
+/// `Value::Deferred(DeferredValue::Unknown(UpstreamRef { path }))` so
+/// plan display renders it as `(known after upstream apply: …)`.
+///
+/// Used by `carina_cli::wiring::add_state_block_effects` for the `id`
+/// value of an `import { … }` block: a `"${X.attr}|…"`
+/// interpolation that references a deferred upstream-state value must
+/// either fold to a concrete cloud identifier (when `X.attr` is in
+/// scope) or carry the deferred marker through plan display (carina#3329).
+/// Errors are converted into the input value untouched — same shape as
+/// the resource-attribute path, where a non-evaluable interpolation
+/// stays a `Value::Deferred(DeferredValue::Interpolation)` rather than
+/// aborting the plan.
+pub fn resolve_value_for_plan(
+    value: &Value,
+    bindings: &ResolvedBindings,
+    unresolved_upstream_bindings: &std::collections::HashSet<&str>,
+) -> Value {
+    let resolved = resolve_ref_value(value, bindings).unwrap_or_else(|_| value.clone());
+    if unresolved_upstream_bindings.is_empty() {
+        resolved
+    } else {
+        stamp_unresolved_upstream(resolved, unresolved_upstream_bindings)
+    }
+}
+
 /// Recursively resolve a single Value, replacing ResourceRef with the referenced value.
 ///
 /// If the referenced binding or attribute is not found, the value is returned as-is.

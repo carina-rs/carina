@@ -664,6 +664,65 @@ pub fn merge_secrets_into_provider_json(
 /// secret plaintext is ever written. The hash uses Argon2id with the fallback
 /// salt (not context-aware). This is suitable for plan file serialization where
 /// the goal is redaction, not state comparison.
+/// Secret-only redactor used inside deferred wrappers (`Interpolation`,
+/// `FunctionCall`) where a `Value::Deferred(Unknown(UpstreamRef))` is a
+/// load-bearing plan-time placeholder, not an error.
+///
+/// Hashes every `Secret(_)` leaf — matching `redact_secrets_in_value`
+/// for that case — but, unlike the top-level redactor, passes
+/// `Unknown` and other deferred shapes through verbatim. This is the
+/// Unknown-tolerant counterpart introduced by carina#3329 so that
+/// `plan --out` on an `import { id = "${upstream.attr}|tail" }`
+/// (where the upstream is not yet applied) does not fail with
+/// `UnknownNotAllowed`. The apply-side enforcement still happens:
+/// `resolve_import_identifier` rejects any non-concrete identifier
+/// before the provider is called.
+fn redact_secrets_only(value: &Value) -> Result<Value, SerializationError> {
+    match value {
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            let inner_json = value_to_json(inner)?;
+            let json_str = serde_json::to_string(&inner_json)
+                .expect("serde_json::Value -> String is infallible");
+            let hash_hex = argon2id_hash(json_str.as_bytes(), None);
+            Ok(Value::Concrete(ConcreteValue::String(format!(
+                "{SECRET_PREFIX}{hash_hex}"
+            ))))
+        }
+        Value::Concrete(ConcreteValue::Map(map)) => {
+            let redacted: Result<IndexMap<String, Value>, _> = map
+                .iter()
+                .map(|(k, v)| redact_secrets_only(v).map(|rv| (k.clone(), rv)))
+                .collect();
+            Ok(Value::Concrete(ConcreteValue::Map(redacted?)))
+        }
+        Value::Concrete(ConcreteValue::List(items)) => {
+            let redacted: Result<Vec<_>, _> = items.iter().map(redact_secrets_only).collect();
+            Ok(Value::Concrete(ConcreteValue::List(redacted?)))
+        }
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+            let redacted: Result<Vec<InterpolationPart>, _> = parts
+                .iter()
+                .map(|p| match p {
+                    InterpolationPart::Literal(s) => Ok(InterpolationPart::Literal(s.clone())),
+                    InterpolationPart::Expr(v) => {
+                        redact_secrets_only(v).map(InterpolationPart::Expr)
+                    }
+                })
+                .collect();
+            Ok(Value::Deferred(DeferredValue::Interpolation(redacted?)))
+        }
+        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
+            let redacted: Result<Vec<Value>, _> = args.iter().map(redact_secrets_only).collect();
+            Ok(Value::Deferred(DeferredValue::FunctionCall {
+                name: name.clone(),
+                args: redacted?,
+            }))
+        }
+        // `Unknown` and every other deferred / concrete shape pass through.
+        other => Ok(other.clone()),
+    }
+}
+
 pub fn redact_secrets_in_value(value: &Value) -> Result<Value, SerializationError> {
     match value {
         Value::Deferred(DeferredValue::Secret(inner)) => {
@@ -685,6 +744,39 @@ pub fn redact_secrets_in_value(value: &Value) -> Result<Value, SerializationErro
         Value::Concrete(ConcreteValue::List(items)) => {
             let redacted: Result<Vec<_>, _> = items.iter().map(redact_secrets_in_value).collect();
             Ok(Value::Concrete(ConcreteValue::List(redacted?)))
+        }
+        // carina#3329: an `Interpolation` can carry a secret under an
+        // `Expr` part (e.g. `id = "${secret_let.value}|tail"`). Walk
+        // the parts via the secret-only redactor — a generic
+        // `redact_secrets_in_value` recurse would reject the deferred
+        // `Unknown(UpstreamRef)` produced by plan-time stamping (RFC
+        // #2371 stage-4 invariant), even though the supported scenario
+        // here is exactly "deferred upstream ref inside import id".
+        // The dedicated `redact_secrets_only` walker only hashes
+        // `Secret` leaves and passes every other shape through
+        // unchanged, so `Unknown` survives saved-plan write to the
+        // apply side where the version-5 contract is enforced.
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+            let redacted: Result<Vec<InterpolationPart>, _> = parts
+                .iter()
+                .map(|p| match p {
+                    InterpolationPart::Literal(s) => Ok(InterpolationPart::Literal(s.clone())),
+                    InterpolationPart::Expr(v) => {
+                        redact_secrets_only(v).map(InterpolationPart::Expr)
+                    }
+                })
+                .collect();
+            Ok(Value::Deferred(DeferredValue::Interpolation(redacted?)))
+        }
+        // Sibling shape: a deferred function-call carries `Value` args
+        // that could equally hide a `Secret`. Same Unknown-tolerant
+        // recursion via `redact_secrets_only`.
+        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
+            let redacted: Result<Vec<Value>, _> = args.iter().map(redact_secrets_only).collect();
+            Ok(Value::Deferred(DeferredValue::FunctionCall {
+                name: name.clone(),
+                args: redacted?,
+            }))
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             Err(SerializationError::UnknownNotAllowed {
@@ -871,7 +963,14 @@ pub fn redact_secrets_in_effect(
         },
         Effect::Import { id, identifier } => Effect::Import {
             id: id.clone(),
-            identifier: identifier.clone(),
+            // carina#3329: `identifier` is a `Value` (not the legacy
+            // `String`), so a `"${secret_let.value}|tail"` interpolation
+            // can carry a `DeferredValue::Secret(...)` segment under an
+            // `Expr` part. Route through `redact_secrets_in_value` so
+            // the saved-plan / persisted form replaces the secret with
+            // its hash; without this, the plain `clone()` would persist
+            // the in-memory plaintext.
+            identifier: redact_secrets_in_value(identifier)?,
         },
         Effect::Remove { id } => Effect::Remove { id: id.clone() },
         Effect::Move { from, to } => Effect::Move {
@@ -3926,5 +4025,106 @@ mod tests {
             big.contains('\n'),
             "oversize list must render vertically, got: {big:?}"
         );
+    }
+
+    /// Carina#3329 (round-4): `plan --out` on the supported scenario
+    /// — `import { id = "${upstream.attr}|tail" }` where `upstream.attr`
+    /// is still deferred at plan time — must succeed and persist the
+    /// deferred `Unknown` placeholder through `redact_secrets_in_plan`.
+    /// A previous iteration of the fix routed through
+    /// `redact_secrets_in_value` directly and tripped its strict
+    /// "Unknown is not serializable" guard (RFC #2371 stage 4),
+    /// causing `plan --out` to fail on the exact scenario the PR
+    /// targets. The dedicated `redact_secrets_only` walker keeps the
+    /// Secret-redaction behavior while passing `Unknown` through.
+    #[test]
+    fn redact_secrets_in_effect_passes_unknown_through_import_identifier() {
+        use crate::effect::Effect;
+        use crate::resource::{
+            AccessPath, DeferredValue, InterpolationPart, ResourceId, UnknownReason, Value,
+        };
+        let path =
+            AccessPath::with_fields("management_route53", "apex_zone_id", Vec::<String>::new());
+        let identifier = Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
+                UnknownReason::UpstreamRef { path },
+            ))),
+            InterpolationPart::Literal("|registry-dev.carina-rs.dev|NS".to_string()),
+        ]));
+        let effect = Effect::Import {
+            id: ResourceId::new("aws.route53.RecordSet", "r.delegation_ns"),
+            identifier,
+        };
+        let redacted = redact_secrets_in_effect(&effect)
+            .expect("redaction must not error on a deferred Unknown inside an import identifier");
+        match redacted {
+            Effect::Import { identifier, .. } => {
+                // Round-trip preserves the Unknown placeholder verbatim
+                // for the saved-plan apply path to encounter.
+                assert!(
+                    matches!(identifier, Value::Deferred(DeferredValue::Interpolation(_))),
+                    "identifier shape must survive redaction, got: {identifier:?}",
+                );
+            }
+            other => panic!("expected Effect::Import, got {other:?}"),
+        }
+    }
+
+    /// Carina#3329: a secret value reaching `Effect::Import.identifier`
+    /// — possible when the import id is `"${secret_let.value}|tail"` —
+    /// must be redacted in the saved-plan / persisted form just like
+    /// every other secret-bearing leaf. The pre-#3329 clone() bypassed
+    /// the redactor entirely because the field was a plain `String`;
+    /// now that it carries a `Value`, the redactor walks the
+    /// interpolation parts and replaces the secret with its hash.
+    #[test]
+    fn redact_secrets_in_effect_walks_import_identifier_interpolation() {
+        use crate::effect::Effect;
+        use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, ResourceId, Value};
+        let secret_inner = Value::Concrete(ConcreteValue::String("super-secret".to_string()));
+        let identifier = Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Expr(Value::Deferred(DeferredValue::Secret(Box::new(
+                secret_inner,
+            )))),
+            InterpolationPart::Literal("|tail".to_string()),
+        ]));
+        let effect = Effect::Import {
+            id: ResourceId::new("aws.s3.Bucket", "b"),
+            identifier,
+        };
+        let redacted = redact_secrets_in_effect(&effect).expect("redaction succeeds");
+        match redacted {
+            Effect::Import { identifier, .. } => {
+                // The secret must no longer be reachable as plaintext.
+                let rendered = format_value_with_key(&identifier, None);
+                assert!(
+                    !rendered.contains("super-secret"),
+                    "redacted import identifier must not contain plaintext secret, got: {rendered}",
+                );
+                // The redactor emits a `_carina_secret_` hash prefix
+                // for the secret's leaf; that prefix must be present
+                // somewhere in the redacted Value tree.
+                fn walk(v: &Value) -> bool {
+                    use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
+                    match v {
+                        Value::Concrete(ConcreteValue::String(s)) => {
+                            s.starts_with(crate::value::SECRET_PREFIX)
+                        }
+                        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+                            parts.iter().any(|p| match p {
+                                InterpolationPart::Expr(inner) => walk(inner),
+                                InterpolationPart::Literal(_) => false,
+                            })
+                        }
+                        _ => false,
+                    }
+                }
+                assert!(
+                    walk(&identifier),
+                    "redacted identifier must carry the secret-prefix marker, got: {identifier:?}",
+                );
+            }
+            other => panic!("expected Effect::Import, got {other:?}"),
+        }
     }
 }

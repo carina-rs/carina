@@ -1,0 +1,7 @@
+backend local { path = "carina.state.json" }
+
+# Upstream declares the binding but has not been applied yet — `exports`
+# is empty, so `management_route53.apex_zone_id` is a deferred upstream
+# ref at plan time.
+exports {
+}

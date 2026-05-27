@@ -415,7 +415,11 @@ fn format_effect_brief(effect: &Effect) -> String {
         }
         Effect::Delete { id, .. } => format!("- {}", id),
         Effect::Read { resource } => format!("<= {} (data source)", resource.id),
-        Effect::Import { id, identifier } => format!("<- {} (import: {})", id, identifier),
+        Effect::Import { id, identifier } => format!(
+            "<- {} (import: {})",
+            id,
+            crate::effect::format_import_identifier(identifier)
+        ),
         Effect::Remove { id } => format!("x {}", id),
         Effect::Move { from, to } => format!("-> {} (from: {})", to, from),
         Effect::Wait {
