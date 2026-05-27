@@ -250,25 +250,39 @@ fn make_request(
 
     let t_setup_done = req_start.map(|s| s.elapsed());
 
-    // Write the request body. `body` was classified above so the
-    // wasi:http `OutgoingBody` only ever sees a known-sized payload
-    // (Empty → no stream write; Sized → exactly `body.content_length()`
-    // bytes, matching the `content-length` header we injected).
+    // Acquire the `OutgoingBody` resource **before** handing the
+    // request to `outgoing_handler::handle`. `outgoing_request.body()`
+    // constructs the host-side mpsc channel that backs the body, and
+    // the `OutgoingBody` resource is allowed to outlive the request
+    // (see `wasmtime_wasi_http::p2::types_impl`: "we could be still
+    // writing to the stream after `outgoing-handler.handle` is
+    // called").
     let body_len = body.content_length();
     let outgoing_body = outgoing_req
         .body()
         .map_err(|()| ConnectorError::other("Failed to get outgoing body".into(), None))?;
+
+    // Hand the request off to the host *first* so the hyper task that
+    // consumes the body channel is spawned before we start writing.
+    // If we wrote the body first, the host channel (default capacity
+    // `outgoing_body_buffer_chunks + 1 = 2`) would fill up with no
+    // reader on the other side, and the trailing `write_ready().await`
+    // inside `wasmtime-wasi-io`'s `blocking_write_and_flush` default
+    // impl would block forever — the carina-rs/carina#3320 20-minute
+    // host I/O hang.
+    let future_response = outgoing_handler::handle(outgoing_req, options).map_err(|e| {
+        ConnectorError::other(format!("outgoing-handler error: {e:?}").into(), None)
+    })?;
+    let t_handle_done = req_start.map(|s| s.elapsed());
+
+    // Now ship the body. The hyper consumer is live, so each
+    // `blocking_write_and_flush` chunk drains as it goes and the
+    // channel stays well below its capacity bound.
     write_body(&outgoing_body, body.as_bytes())?;
     let t_write_body_done = req_start.map(|s| s.elapsed());
     OutgoingBody::finish(outgoing_body, None)
         .map_err(|e| ConnectorError::other(format!("Failed to finish body: {e:?}").into(), None))?;
     let t_body_finish_done = req_start.map(|s| s.elapsed());
-
-    // Send the request (with timeout options if provided)
-    let future_response = outgoing_handler::handle(outgoing_req, options).map_err(|e| {
-        ConnectorError::other(format!("outgoing-handler error: {e:?}").into(), None)
-    })?;
-    let t_handle_done = req_start.map(|s| s.elapsed());
 
     // Wait for the response by polling
     let pollable = future_response.subscribe();
@@ -309,9 +323,15 @@ fn make_request(
         // pollable.block) are the ones that flag a host-side stall when they
         // grow.
         let ms = |d: Option<Duration>| d.map(|x| x.as_millis()).unwrap_or(0);
+        // Columns are emitted in execution order so a reader can scan
+        // left-to-right and see where the wall-clock went. The order
+        // is: setup → handle (hand request off so the hyper consumer
+        // is live before we write — see carina-rs/carina#3320) →
+        // write_body → body_finish → pollable_block → get_response →
+        // read_body.
         eprintln!(
             "carina-wasi-http-trace method={} uri={} status={} body_in={} body_out={} \
-             setup_ms={} write_body_ms={} body_finish_ms={} handle_ms={} \
+             setup_ms={} handle_ms={} write_body_ms={} body_finish_ms={} \
              pollable_block_ms={} get_response_ms={} read_body_ms={}",
             trace_method,
             trace_uri,
@@ -319,9 +339,9 @@ fn make_request(
             body_len,
             response_bytes.len(),
             ms(t_setup_done),
+            ms(t_handle_done),
             ms(t_write_body_done),
             ms(t_body_finish_done),
-            ms(t_handle_done),
             ms(t_pollable_block_done),
             ms(t_get_response_done),
             ms(t_read_body_done),
