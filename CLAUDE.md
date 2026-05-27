@@ -19,6 +19,64 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Type safety is part of the same 'topic' as the bug fix - do not defer it to a separate PR.
 - For enums/variants that carry different data, use tagged unions rather than optional fields with runtime checks.
 
+## Long-term view alongside root-cause
+
+"Root cause" answers *what is broken right now*; "long-term view + type
+safety" answers *will the same class of bug be reachable again by a
+future caller*. Both questions must be answered before declaring a fix
+complete — passing the first is not evidence of passing the second.
+
+- **Both lenses, every fix.** When proposing a fix, evaluate it under
+  both lenses: (1) does it restore the invariant at the upstream seam
+  (root cause)? (2) does the type system make the broken state
+  unrepresentable for any future caller (long-term)? A fix that
+  answers yes-to-(1) but no-to-(2) is **a runtime patch at multiple
+  consumer sites disguised as a root-cause fix** — it works today and
+  silently regresses when the next consumer is added.
+- **The "new caller tomorrow" check is type-shaped, not behavioral.**
+  Asking "if a new caller appears tomorrow, does it need to remember
+  this filter too?" is the right question — but the answer must come
+  from the *type signature*, not from documentation or convention. If
+  the answer is "the caller has to remember to call `find_*` /
+  `resolve_*` / `assert_*`", the root is still broken: the type
+  permits the buggy path. Make the resolver step required by the type
+  (return a wrapper type that only a resolver can produce; make the
+  raw type uncomparable to the resolved type).
+- **Measure radius before deferring.** The temptation to defer the
+  type-level reshape to a follow-up issue is strongest when the
+  runtime patch is in front of you and the typed reshape feels big.
+  Always measure: stub the newtype, run
+  `cargo check --workspace --all-targets 2>&1 | grep error | wc -l`,
+  revert. A small number (single or low double digits) means **do it
+  in-PR**, not as follow-up — the carina#3280 lesson (an explicit
+  in-memory note in this repo's user-memory) is that "wide blast
+  radius" intuitions have repeatedly been wrong.
+- **When the radius is genuinely large**, file the type-level
+  follow-up issue **in the same response** as the runtime fix PR —
+  not "I might file it later". Reference the runtime PR and the
+  remaining type hazard explicitly, so a future maintainer reading the
+  PR can see why the runtime fix was chosen and what stays broken at
+  the type level.
+- **Self-check at PR creation:**
+  - Does the diff add `find_*` / `resolve_*` / `lookup_*` calls at
+    multiple consumer sites? If yes, ask whether a newtype could make
+    the raw value impossible to use without resolution.
+  - Does the fix rely on every consumer remembering to do something?
+    If yes, the type system is the right place to enforce it.
+  - Is there a sibling code path that does the same dance? If yes,
+    the convention is leaking into multiple sites and the type is the
+    factoring tool.
+
+Past failure mode (carina#3324 / PR #3325 → carina#3326): a runtime
+resolver fix at three consumer sites was reviewed across five rounds
+and merged as "root-cause"; the user then asked whether the change was
+type-safe and long-term. Honest answer: no — `ResourceId` still
+permitted a routing-mismatch comparison, and a future fourth consumer
+would re-introduce the same bug. The typed reshape
+(`StateBlockAddress` newtype) became a follow-up issue rather than
+landing in the same PR. The lesson is to apply *both* lenses at PR
+creation, not after the user asks.
+
 ## Communication Style
 
 - Be terse. Do not ask permission for obvious actions (e.g., using the correct AWS profile, standard build commands).
