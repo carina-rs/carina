@@ -27,7 +27,10 @@ use wasi::http::types::{
 };
 use wasi::io::streams::StreamError;
 
-use crate::wasi_http_body::{RequestBody, inject_content_length_header};
+use crate::wasi_http_body::{
+    BLOCKING_WRITE_AND_FLUSH_MAX_BYTES, RequestBody, chunks_for_blocking_write,
+    inject_content_length_header,
+};
 
 /// When `CARINA_WASI_HTTP_TRACE=1` is set in the host environment, emit a
 /// per-phase wall-clock breakdown of each request to stderr.
@@ -343,14 +346,25 @@ fn make_request(
     Ok(sdk_response)
 }
 
-/// Write bytes to an outgoing body.
+/// Write bytes to an outgoing body, respecting the wasi:io
+/// `blocking-write-and-flush` per-call byte limit.
+///
+/// `blocking_write_and_flush` in `wasmtime-wasi-io` traps the
+/// component instance when the guest passes more than
+/// [`BLOCKING_WRITE_AND_FLUSH_MAX_BYTES`] bytes at once
+/// (carina-rs/carina#3318). The cap is part of the wasi:io WIT
+/// contract; a trap there poisons the instance, so the next guest
+/// entry fails with `cannot enter component instance`. Splitting via
+/// [`chunks_for_blocking_write`] keeps every call inside the
+/// contract, regardless of how large the SDK-buffered body is.
 fn write_body(body: &OutgoingBody, data: &[u8]) -> Result<(), ConnectorError> {
     let stream = body
         .write()
         .map_err(|()| ConnectorError::other("Failed to get output stream".into(), None))?;
-    if !data.is_empty() {
+    for chunk in chunks_for_blocking_write(data) {
+        debug_assert!(chunk.len() <= BLOCKING_WRITE_AND_FLUSH_MAX_BYTES);
         stream
-            .blocking_write_and_flush(data)
+            .blocking_write_and_flush(chunk)
             .map_err(|e| ConnectorError::other(format!("Write error: {e:?}").into(), None))?;
     }
     drop(stream);
