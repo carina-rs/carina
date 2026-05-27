@@ -765,8 +765,16 @@ fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode
             effect_label: format!("{}", id.human()),
             resource_type: id.display_type(),
             name_part: id.name_str().to_string(),
-            symbol: "x".to_string(),
-            kind: EffectKind::Delete,
+            // carina#3332: avoid the `x` glyph that shape-collides with
+            // the `✗` failure indicator. `~` matches the CLI plan
+            // tree's Remove symbol; `(remove from state)` annotation
+            // disambiguates from Update lines. Mirror Move below in
+            // using `EffectKind::Update` so the row renders yellow —
+            // `EffectKind::Delete` would color the whole row red and
+            // re-introduce the misread the symbol fix was meant to
+            // remove.
+            symbol: "~".to_string(),
+            kind: EffectKind::Update,
             detail_rows,
             children: Vec::new(),
             depth: 0,

@@ -68,21 +68,31 @@ pub(crate) async fn execute_import_effects(
     }
 }
 
+/// Format a single state-only effect line for `apply` output.
+///
+/// Extracted so the rendering can be asserted without intercepting
+/// stdout. carina#3332: the `Remove` arm previously led with a red
+/// lowercase `x`, which is visually indistinguishable from the `✗`
+/// failure indicator used elsewhere in the apply output. The leading
+/// token here is now a neutral `~` and the operation name
+/// (`removed-from-state`) carries the meaning, so a state-only
+/// success line can never be misread as a failure.
+fn format_state_only_effect_line(effect: &Effect) -> Option<String> {
+    match effect {
+        Effect::Remove { id } => Some(format!("  {} removed-from-state {}", "~".yellow(), id)),
+        Effect::Move { from, to } => Some(format!("  {} Moving {} -> {}", "->".yellow(), from, to)),
+        _ => None,
+    }
+}
+
 /// Execute state-only effects (remove, move) with user feedback.
 ///
 /// These effects only modify state and don't call the provider.
 pub(crate) fn execute_state_only_effects(plan: &Plan, result: &mut ExecutionResult) {
     for effect in plan.effects() {
-        match effect {
-            Effect::Remove { id } => {
-                println!("  {} Removing {} from state", "x".red(), id);
-                result.success_count += 1;
-            }
-            Effect::Move { from, to } => {
-                println!("  {} Moving {} -> {}", "->".yellow(), from, to);
-                result.success_count += 1;
-            }
-            _ => {}
+        if let Some(line) = format_state_only_effect_line(effect) {
+            println!("{}", line);
+            result.success_count += 1;
         }
     }
 }
@@ -247,5 +257,61 @@ mod tests {
         let reads = recorder.reads.lock().unwrap();
         assert_eq!(reads.len(), 1);
         assert_eq!(reads[0].1.as_deref(), Some("my-bucket"));
+    }
+
+    /// carina#3332: the state-only `Remove` line must not shape-collide
+    /// with the `✗` failure indicator. The previous output led with a
+    /// red lowercase `x`, which in monospace terminals reads as
+    /// failure. The fix moves the meaning into a word
+    /// (`removed-from-state`) and uses a non-cross leading token, so
+    /// the rendered line contains no `x` / `✗` glyph at all.
+    #[test]
+    fn remove_effect_line_has_no_failure_shaped_glyph() {
+        colored::control::set_override(true);
+        let id = ResourceId::new("aws.route53.RecordSet", "aws_route53_record_set_7059de08");
+        let line = format_state_only_effect_line(&Effect::Remove { id: id.clone() })
+            .expect("Remove must render a line");
+        colored::control::unset_override();
+
+        // No literal `x` or `✗` anywhere — the leading token and the
+        // word `removed-from-state` are both x-free.
+        assert!(
+            !line.contains('x'),
+            "rendered Remove line must contain no lowercase `x` glyph \
+             (it shape-collides with the failure indicator); got: {line:?}"
+        );
+        assert!(
+            !line.contains('✗'),
+            "rendered Remove line must contain no `✗`; got: {line:?}"
+        );
+        // The operation name and the id are both present in plain form
+        // so the user can read what happened to which resource.
+        assert!(
+            line.contains("removed-from-state"),
+            "rendered Remove line must name the operation; got: {line:?}"
+        );
+        assert!(
+            line.contains(&id.to_string()),
+            "rendered Remove line must include the resource id; got: {line:?}"
+        );
+    }
+
+    /// The Move arm is out of scope for #3332 (its leading `->` does
+    /// not collide with `✗`), so its rendering must stay byte-identical.
+    /// This pins the format so a future sweep of state-only output
+    /// does not change it by accident.
+    #[test]
+    fn move_effect_line_format_is_unchanged() {
+        colored::control::set_override(false);
+        let from = ResourceId::new("aws.s3.Bucket", "old");
+        let to = ResourceId::new("aws.s3.Bucket", "new");
+        let line = format_state_only_effect_line(&Effect::Move {
+            from: from.clone(),
+            to: to.clone(),
+        })
+        .expect("Move must render a line");
+        colored::control::unset_override();
+
+        assert_eq!(line, format!("  -> Moving {} -> {}", from, to));
     }
 }

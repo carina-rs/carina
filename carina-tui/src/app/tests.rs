@@ -31,6 +31,34 @@ fn app_from_plan_with_effects() {
     assert_eq!(app.nodes[1].kind, EffectKind::Delete);
 }
 
+/// carina#3332: a state-only `Remove` node must NOT use the `x`
+/// symbol (shape-collision with `✗`) and must NOT use
+/// `EffectKind::Delete` (which renders the row red — same family as
+/// the failure indicator). Pinned shape: `~` + `EffectKind::Update`
+/// so the row colors yellow, matching the CLI plan-tree fix.
+#[test]
+fn remove_effect_uses_non_failure_symbol_and_kind() {
+    let mut plan = Plan::new();
+    plan.add(Effect::Remove {
+        id: ResourceId::new("aws.route53.RecordSet", "aws_route53_record_set_7059de08"),
+    });
+
+    let app = App::new(&plan, &SchemaRegistry::new());
+    assert_eq!(app.nodes.len(), 1);
+    assert_ne!(
+        app.nodes[0].symbol, "x",
+        "Remove must not use the `x` glyph — it shape-collides with `✗`"
+    );
+    assert_eq!(app.nodes[0].symbol, "~");
+    assert_ne!(
+        app.nodes[0].kind,
+        EffectKind::Delete,
+        "Remove must not use EffectKind::Delete — that paints the row red \
+         and re-introduces the misread the symbol fix removed"
+    );
+    assert_eq!(app.nodes[0].kind, EffectKind::Update);
+}
+
 #[test]
 fn navigation() {
     let mut plan = Plan::new();
