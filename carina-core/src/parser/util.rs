@@ -7,7 +7,7 @@ use super::context::next_pair;
 use super::error::ParseError;
 use super::expressions::string_literal::{parse_string_literal, unescape_single_quoted};
 use crate::eval_value::EvalValue;
-use crate::resource::{ConcreteValue, DeferredValue, ResourceId, Value};
+use crate::resource::{ConcreteValue, DeferredValue, Value};
 
 /// Convert PascalCase to snake_case (e.g., "VpcId" → "vpc_id", "AwsAccountId" → "aws_account_id").
 pub fn pascal_to_snake(s: &str) -> String {
@@ -87,32 +87,32 @@ pub(crate) fn split_namespaced_id(namespaced: &str) -> (String, String) {
     }
 }
 
-/// Parse a resource address: `provider.service.type "name"`
-pub(crate) fn parse_resource_address(
+/// Parse a resource address into a [`StateBlockAddress`] — the
+/// routing-agnostic newtype used by `import`/`removed`/`moved` blocks.
+///
+/// The DSL `resource_address` rule (`provider.service.type "name"`)
+/// has no syntax for `provider_instance`, so the returned type
+/// deliberately has no routing field at all. A downstream consumer
+/// cannot accidentally compare the address against a routed
+/// [`ResourceId`] — the carina#3324 bug class is unrepresentable at
+/// the type level.
+pub(crate) fn parse_state_block_address(
     pair: pest::iterators::Pair<Rule>,
-) -> Result<ResourceId, ParseError> {
+) -> Result<crate::parser::ast::StateBlockAddress, ParseError> {
     let mut inner = pair.into_inner();
     let namespaced = next_pair(&mut inner, "namespaced id", "resource address")?
         .as_str()
         .to_string();
     let name_pair = next_pair(&mut inner, "resource name", "resource address")?;
-    // The name is a string literal - extract value from quotes
     let raw_name = parse_string_literal(name_pair)?;
-    // Normalize map-key trailing segment so all three input shapes
-    // (`binding.key`, `binding['key']`, `binding["key"]`) collapse
-    // to the canonical form before state lookup. See #1903.
-    let name = crate::utils::canonicalize_map_key_address(&raw_name);
-
-    // Split namespaced id into provider and resource_type
+    // Name canonicalization lives in `StateBlockAddress::new` so the
+    // invariant holds for every constructor, not just this parser
+    // path. A future programmatic caller can't bypass it.
     let (provider, resource_type) = split_namespaced_id(&namespaced);
-
-    // `to`/`moved` addresses don't carry instance routing — the resolved
-    // resource supplies its own `provider_instance` from the DSL.
-    Ok(ResourceId::with_provider(
+    Ok(crate::parser::ast::StateBlockAddress::new(
         provider,
         resource_type,
-        name,
-        None,
+        raw_name,
     ))
 }
 

@@ -3,18 +3,17 @@
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
 use crate::parser::Rule;
-use crate::parser::ast::StateBlock;
+use crate::parser::ast::{StateBlock, StateBlockAddress};
 use crate::parser::context::first_inner;
 use crate::parser::error::ParseError;
 use crate::parser::expressions::string_literal::parse_string_literal;
-use crate::parser::util::parse_resource_address;
-use crate::resource::ResourceId;
+use crate::parser::util::parse_state_block_address;
 
 /// Parse an import state block
 pub(in crate::parser) fn parse_import_state_block(
     pair: pest::iterators::Pair<Rule>,
 ) -> Result<StateBlock, ParseError> {
-    let mut to: Option<ResourceId> = None;
+    let mut to: Option<StateBlockAddress> = None;
     let mut id: Option<String> = None;
 
     for attr in pair.into_inner() {
@@ -23,7 +22,7 @@ pub(in crate::parser) fn parse_import_state_block(
             match inner.as_rule() {
                 Rule::import_to_attr => {
                     let addr = first_inner(inner, "resource address", "import to")?;
-                    to = Some(parse_resource_address(addr)?);
+                    to = Some(parse_state_block_address(addr)?);
                 }
                 Rule::import_id_attr => {
                     let str_pair = first_inner(inner, "string", "import id")?;
@@ -50,12 +49,12 @@ pub(in crate::parser) fn parse_import_state_block(
 pub(in crate::parser) fn parse_removed_block(
     pair: pest::iterators::Pair<Rule>,
 ) -> Result<StateBlock, ParseError> {
-    let mut from: Option<ResourceId> = None;
+    let mut from: Option<StateBlockAddress> = None;
 
     for attr in pair.into_inner() {
         if attr.as_rule() == Rule::removed_attr {
             let addr = first_inner(attr, "resource address", "removed from")?;
-            from = Some(parse_resource_address(addr)?);
+            from = Some(parse_state_block_address(addr)?);
         }
     }
 
@@ -71,8 +70,8 @@ pub(in crate::parser) fn parse_removed_block(
 pub(in crate::parser) fn parse_moved_block(
     pair: pest::iterators::Pair<Rule>,
 ) -> Result<StateBlock, ParseError> {
-    let mut from: Option<ResourceId> = None;
-    let mut to: Option<ResourceId> = None;
+    let mut from: Option<StateBlockAddress> = None;
+    let mut to: Option<StateBlockAddress> = None;
 
     for attr in pair.into_inner() {
         if attr.as_rule() == Rule::moved_attr {
@@ -80,11 +79,11 @@ pub(in crate::parser) fn parse_moved_block(
             match inner.as_rule() {
                 Rule::moved_from_attr => {
                     let addr = first_inner(inner, "resource address", "moved from")?;
-                    from = Some(parse_resource_address(addr)?);
+                    from = Some(parse_state_block_address(addr)?);
                 }
                 Rule::moved_to_attr => {
                     let addr = first_inner(inner, "resource address", "moved to")?;
-                    to = Some(parse_resource_address(addr)?);
+                    to = Some(parse_state_block_address(addr)?);
                 }
                 _ => {}
             }
