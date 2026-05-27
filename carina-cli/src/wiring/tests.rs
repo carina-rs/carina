@@ -384,7 +384,7 @@ fn test_resolve_enum_aliases_non_enum_values_unchanged() {
 fn import_fallback_matches_anonymous_resource_by_name_attribute() {
     use carina_core::effect::Effect;
     use carina_core::plan::Plan;
-    use carina_core::resource::{ConcreteValue, Resource, ResourceId, Value};
+    use carina_core::resource::{ConcreteValue, Resource, Value};
     use carina_core::schema::ResourceSchema;
 
     // Schema with name_attribute = "bucket_name"
@@ -403,7 +403,7 @@ fn import_fallback_matches_anonymous_resource_by_name_attribute() {
 
     // Import block with the logical name (not the hash)
     let state_blocks = vec![StateBlock::Import {
-        to: ResourceId::with_provider("awscc", "s3.Bucket", "carina-rs-state", None),
+        to: StateBlockAddress::new("awscc", "s3.Bucket", "carina-rs-state"),
         id: "carina-rs-state".to_string(),
     }];
 
@@ -468,10 +468,11 @@ fn moved_block_resolves_routed_instance_on_from_and_to() {
     let mut prev_explicit = HashMap::new();
     let mut saved_attrs = HashMap::new();
 
-    // `moved` block addresses are parsed without routing.
+    // `moved` block addresses are routing-agnostic by construction
+    // (the type makes routing unrepresentable here).
     let state_blocks = vec![StateBlock::Moved {
-        from: ResourceId::with_provider("aws", "route53.RecordSet", "old_record", None),
-        to: ResourceId::with_provider("aws", "route53.RecordSet", "new_record", None),
+        from: StateBlockAddress::new("aws", "route53.RecordSet", "old_record"),
+        to: StateBlockAddress::new("aws", "route53.RecordSet", "new_record"),
     }];
 
     let moved_pairs = materialize_moved_states(
@@ -542,10 +543,10 @@ fn removed_block_suppresses_delete_when_state_resource_is_routed_to_named_instan
         explicit_dependencies: std::collections::HashSet::new(),
     });
 
-    // `removed` block was written without routing — `from` has
-    // `provider_instance = None`.
+    // `removed` block addresses are routing-agnostic by construction
+    // — the newtype makes routing unrepresentable here.
     let state_blocks = vec![StateBlock::Removed {
-        from: ResourceId::with_provider("aws", "route53.RecordSet", "r.delegation_ns", None),
+        from: StateBlockAddress::new("aws", "route53.RecordSet", "r.delegation_ns"),
     }];
 
     add_state_block_effects(&mut plan, &state_blocks, &Some(state_file), &[], &schemas);
@@ -583,7 +584,7 @@ fn removed_block_suppresses_delete_when_state_resource_is_routed_to_named_instan
 fn import_suppresses_create_when_target_resource_is_routed_to_named_instance() {
     use carina_core::effect::Effect;
     use carina_core::plan::Plan;
-    use carina_core::resource::{Resource, ResourceId};
+    use carina_core::resource::Resource;
 
     let schemas = SchemaRegistry::new();
 
@@ -599,11 +600,11 @@ fn import_suppresses_create_when_target_resource_is_routed_to_named_instance() {
     let mut plan = Plan::new();
     plan.add(Effect::Create(resource));
 
-    // The import block was written without a routing hint
-    // (`to = aws.route53.RecordSet 'r.delegation_ns'`), so the parsed
-    // `to` carries `provider_instance = None`. Same address otherwise.
+    // The import block address has no routing slot (`StateBlockAddress`
+    // is routing-agnostic by construction). The downstream resolver
+    // is responsible for lifting routing from the matched Create.
     let state_blocks = vec![StateBlock::Import {
-        to: ResourceId::with_provider("aws", "route53.RecordSet", "r.delegation_ns", None),
+        to: StateBlockAddress::new("aws", "route53.RecordSet", "r.delegation_ns"),
         id: "|hosted-zone-id|registry-dev.carina-rs.dev|NS".to_string(),
     }];
 
@@ -633,7 +634,6 @@ fn import_suppresses_create_when_target_resource_is_routed_to_named_instance() {
 #[test]
 fn import_fallback_skips_when_already_in_state_by_name_attribute() {
     use carina_core::plan::Plan;
-    use carina_core::resource::ResourceId;
     use carina_core::schema::ResourceSchema;
     use carina_state::state::{ResourceState, StateFile};
 
@@ -652,7 +652,7 @@ fn import_fallback_skips_when_already_in_state_by_name_attribute() {
 
     let mut plan = Plan::new();
     let state_blocks = vec![StateBlock::Import {
-        to: ResourceId::with_provider("awscc", "s3.Bucket", "carina-rs-state", None),
+        to: StateBlockAddress::new("awscc", "s3.Bucket", "carina-rs-state"),
         id: "carina-rs-state".to_string(),
     }];
 

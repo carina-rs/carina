@@ -486,27 +486,160 @@ impl ExportParamLike for ParsedExportParam {
     }
 }
 
+/// An address as written in a state block (`import { to = X 'addr' }`,
+/// `removed { from = X 'addr' }`, `moved { from = X 'a', to = X 'b' }`).
+///
+/// The DSL surface form for these blocks has **no syntax for routing**
+/// — there is no slot to specify which `provider_instance` the address
+/// targets. The `provider_instance` of the matched resource (or state
+/// row) is decided downstream by looking at the let-bound resource's
+/// `directives { provider = ... }`.
+///
+/// This type is the **routing-agnostic** counterpart to
+/// [`crate::resource::ResourceId`]:
+///
+/// - Its `Eq`/`Hash` includes only `(provider, resource_type, name)`.
+///   Comparing two state-block addresses cannot silently mismatch on
+///   a routing field that the DSL never specified.
+/// - It does **not** implement `PartialEq<ResourceId>` and there is no
+///   `From<&StateBlockAddress>` / `From<&ResourceId>` shortcut. The
+///   only way to produce a `ResourceId` from a `StateBlockAddress` is
+///   via a routing-lifting lookup against the plan / state (see
+///   `resolve_import_target` and `find_desired_id` in
+///   `carina-cli/src/wiring/mod.rs`), or — only when no match
+///   exists — via the explicit
+///   [`to_unrouted_resource_id`](Self::to_unrouted_resource_id)
+///   escape hatch documented on the method itself.
+///
+/// This shape makes the carina#3324 bug class — comparing a
+/// None-routed parsed address against a routed `ResourceId` and
+/// silently missing — unrepresentable: the type signature forces every
+/// consumer to perform the resolution step explicitly. A new consumer
+/// added tomorrow cannot reach the buggy path; the compiler rejects
+/// the comparison.
+///
+/// The cross-type equality guard is enforced by the type system:
+///
+/// ```compile_fail
+/// use carina_core::parser::StateBlockAddress;
+/// use carina_core::resource::ResourceId;
+///
+/// let addr = StateBlockAddress::new("aws", "route53.RecordSet", "r");
+/// let routed = ResourceId::with_provider(
+///     "aws",
+///     "route53.RecordSet",
+///     "r",
+///     Some("management".to_string()),
+/// );
+///
+/// // The compiler rejects this — `StateBlockAddress` does not
+/// // implement `PartialEq<ResourceId>`. A new consumer cannot
+/// // silently miss a routed-vs-unrouted match the way carina#3324
+/// // did before the newtype existed.
+/// let _ = addr == routed;
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct StateBlockAddress {
+    pub provider: String,
+    pub resource_type: String,
+    pub name: crate::resource::ResourceName,
+}
+
+impl StateBlockAddress {
+    /// Construct a `StateBlockAddress`. The `name` is canonicalized
+    /// through [`crate::utils::canonicalize_map_key_address`] so all
+    /// three DSL surface forms (`binding.key`, `binding['key']`,
+    /// `binding["key"]`) collapse to the same value — the parser's
+    /// `parse_state_block_address` does the same, and the type's
+    /// `Eq`/`Hash` only match when the canonical form does. Without
+    /// canonicalization at the constructor, a programmatic caller
+    /// could build an address that silently fails to match a parsed
+    /// one (the same class of bug the newtype exists to prevent).
+    pub fn new(
+        provider: impl Into<String>,
+        resource_type: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
+        let raw_name = name.into();
+        let canonical = crate::utils::canonicalize_map_key_address(&raw_name);
+        Self {
+            provider: provider.into(),
+            resource_type: resource_type.into(),
+            name: crate::resource::ResourceName::from_string(canonical),
+        }
+    }
+
+    /// Borrow the address's name as `&str`.
+    pub fn name_str(&self) -> &str {
+        self.name.as_str()
+    }
+
+    /// Returns the display type including provider prefix, matching
+    /// [`ResourceId::display_type`] so plan/error output reads the
+    /// same for both routing-agnostic and routed addresses.
+    pub fn display_type(&self) -> String {
+        if self.provider.is_empty() {
+            self.resource_type.clone()
+        } else {
+            format!("{}.{}", self.provider, self.resource_type)
+        }
+    }
+
+    /// Last-resort lift to a [`ResourceId`] with no routing.
+    ///
+    /// Use this **only** when the address resolved against no plan or
+    /// state entry (e.g. the user wrote `import { to = X 'addr' }` for
+    /// a resource that does not exist anywhere). The resulting
+    /// `ResourceId` carries `provider_instance = None`, which is the
+    /// best the type system can do when there is no row to inherit
+    /// routing from.
+    ///
+    /// Normal resolution paths must instead inherit routing from the
+    /// matched plan Create or state row — they should never call this
+    /// method as a shortcut. Doing so re-introduces the carina#3324
+    /// bug class.
+    pub fn to_unrouted_resource_id(&self) -> crate::resource::ResourceId {
+        crate::resource::ResourceId::with_provider(
+            &self.provider,
+            &self.resource_type,
+            self.name_str(),
+            None,
+        )
+    }
+}
+
+impl std::fmt::Display for StateBlockAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.provider.is_empty() {
+            write!(f, "{}.{}", self.resource_type, self.name)
+        } else {
+            write!(f, "{}.{}.{}", self.provider, self.resource_type, self.name)
+        }
+    }
+}
+
 /// State manipulation block (import, removed, moved)
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum StateBlock {
     /// Import existing infrastructure into Carina management
     Import {
-        /// Target resource address
-        to: ResourceId,
+        /// Target resource address (routing-agnostic — see
+        /// [`StateBlockAddress`]).
+        to: StateBlockAddress,
         /// Cloud provider identifier (e.g., "vpc-0abc123def456")
         id: String,
     },
     /// Remove a resource from state without destroying it
     Removed {
-        /// Resource address to remove from state
-        from: ResourceId,
+        /// Resource address to remove from state (routing-agnostic).
+        from: StateBlockAddress,
     },
     /// Rename/move a resource in state without destroy/recreate
     Moved {
-        /// Old resource address
-        from: ResourceId,
-        /// New resource address
-        to: ResourceId,
+        /// Old resource address (routing-agnostic).
+        from: StateBlockAddress,
+        /// New resource address (routing-agnostic).
+        to: StateBlockAddress,
     },
 }
 

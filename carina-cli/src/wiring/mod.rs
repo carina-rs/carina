@@ -16,7 +16,7 @@ use carina_core::differ::{cascade_dependent_updates, create_plan};
 use carina_core::effect::Effect;
 use carina_core::identifier::{self, AnonymousIdStateInfo, PrefixStateInfo};
 use carina_core::module_resolver;
-use carina_core::parser::{ProviderConfig, StateBlock};
+use carina_core::parser::{ProviderConfig, StateBlock, StateBlockAddress};
 use carina_core::plan::Plan;
 use carina_core::provider::{
     self as provider_mod, Provider, ProviderError, ProviderFactory, ProviderNormalizer,
@@ -2056,7 +2056,7 @@ pub fn materialize_moved_states(
             let resolved_to = find_desired_id(to, current_states)
                 .or_else(|| find_desired_id(to, prev_explicit))
                 .or_else(|| find_desired_id(to, saved_attrs))
-                .unwrap_or_else(|| to.clone());
+                .unwrap_or_else(|| to.to_unrouted_resource_id());
 
             // Transfer state from the old name to the new name so the
             // differ compares desired(to) against actual(from).
@@ -2085,12 +2085,16 @@ pub fn materialize_moved_states(
 }
 
 /// Look up `to`'s full id (with any routed `provider_instance`) in
-/// `desired` by matching on `(provider, resource_type, name)` —
-/// `provider_instance` is intentionally not part of the match key,
-/// since `moved { to = X 'name' }` has no syntax for routing. Returns
+/// `desired` by matching a [`StateBlockAddress`] against the routed
+/// `ResourceId` keys. `StateBlockAddress` is routing-agnostic by
+/// construction, so this is the only place the routing for the
+/// destination of a `moved { ... }` block can be derived. Returns
 /// `None` when no matching key exists, so callers can chain across
 /// multiple maps with `.or_else(...)` (carina#3324).
-fn find_desired_id<V>(to: &ResourceId, desired: &HashMap<ResourceId, V>) -> Option<ResourceId> {
+fn find_desired_id<V>(
+    to: &StateBlockAddress,
+    desired: &HashMap<ResourceId, V>,
+) -> Option<ResourceId> {
     desired
         .keys()
         .find(|k| {
@@ -2248,7 +2252,7 @@ pub fn add_state_block_effects(
 /// 3. `name_attribute` fallback against the state file
 ///    (already-imported case).
 fn resolve_import_target(
-    to: &ResourceId,
+    to: &StateBlockAddress,
     plan: &Plan,
     state_file: &Option<StateFile>,
     registry: &SchemaRegistry,
@@ -2261,10 +2265,9 @@ fn resolve_import_target(
         )
         .and_then(|s| s.name_attribute.as_deref());
 
-    // Address-equality test that ignores `provider_instance` — the
-    // import-block surface form has no routing slot, so two ids with
-    // the same `(provider, resource_type, name)` are the same address
-    // regardless of routing.
+    // Address-equality test: `StateBlockAddress` has no
+    // `provider_instance`, so equality is naturally the 3-tuple match
+    // we want — no risk of `Eq` silently including routing.
     let same_address = |id: &ResourceId| {
         id.provider == to.provider
             && id.resource_type == to.resource_type
@@ -2315,7 +2318,7 @@ fn resolve_import_target(
         }
     }
 
-    to.clone()
+    to.to_unrouted_resource_id()
 }
 
 /// Check whether a `ProviderError` is an AWS throttling error that should be retried.

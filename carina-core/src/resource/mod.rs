@@ -195,7 +195,7 @@ impl ResourceName {
     /// `Pending`; any other input becomes `Bound`. Used by
     /// `ResourceId::new` / `with_provider` to keep the legacy
     /// `String` constructors compatible.
-    fn from_string(s: String) -> Self {
+    pub fn from_string(s: String) -> Self {
         if s.is_empty() {
             Self::Pending
         } else {
