@@ -53,8 +53,8 @@ pub mod state;
 pub use backend::{BackendConfig, BackendError, BackendResult, LOCAL_BACKEND_TYPE, StateBackend};
 pub use backend_lock::BackendLock;
 pub use backends::{
-    LocalBackend, anchored_local_path, create_backend, create_local_backend, resolve_backend,
-    resolve_backend_anchored,
+    LocalBackend, StateUrl, anchored_local_path, create_backend, create_local_backend,
+    load_state_from_url, resolve_backend, resolve_backend_anchored,
 };
 pub use lock::LockInfo;
 pub use state::{

@@ -15,7 +15,7 @@ use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 use carina_core::value::{format_value, json_to_dsl_value};
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, LockInfo, ResourceState, StateBackend,
-    StateFile, create_backend, resolve_backend,
+    StateFile, StateUrl, create_backend, load_state_from_url, resolve_backend,
 };
 
 use super::validate_and_resolve_with_config;
@@ -131,9 +131,15 @@ pub enum StateCommands {
     },
     /// List all managed resources from the state file
     List {
-        /// Path to directory containing .crn files
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        /// Path to directory containing .crn files (defaults to ".").
+        /// Mutually exclusive with --state-url.
+        path: Option<PathBuf>,
+
+        /// Read state directly from a URL, bypassing .crn / backend
+        /// resolution. Accepts s3://bucket/key, file://path, or a bare
+        /// local path. Mutually exclusive with [PATH].
+        #[arg(long, conflicts_with = "path")]
+        state_url: Option<String>,
     },
     /// Look up resource attributes from the state file
     Lookup {
@@ -141,9 +147,15 @@ pub enum StateCommands {
         #[arg(add = ArgValueCompleter::new(complete_state_lookup))]
         query: String,
 
-        /// Path to directory containing .crn files
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        /// Path to directory containing .crn files (defaults to ".").
+        /// Mutually exclusive with --state-url.
+        path: Option<PathBuf>,
+
+        /// Read state directly from a URL, bypassing .crn / backend
+        /// resolution. Accepts s3://bucket/key, file://path, or a bare
+        /// local path. Mutually exclusive with [PATH].
+        #[arg(long, conflicts_with = "path")]
+        state_url: Option<String>,
 
         /// Always output as JSON
         #[arg(long)]
@@ -151,9 +163,15 @@ pub enum StateCommands {
     },
     /// Show all managed resources with full attributes
     Show {
-        /// Path to directory containing .crn files
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        /// Path to directory containing .crn files (defaults to ".").
+        /// Mutually exclusive with --state-url.
+        path: Option<PathBuf>,
+
+        /// Read state directly from a URL, bypassing .crn / backend
+        /// resolution. Accepts s3://bucket/key, file://path, or a bare
+        /// local path. Mutually exclusive with [PATH].
+        #[arg(long, conflicts_with = "path")]
+        state_url: Option<String>,
 
         /// Display state in interactive TUI mode
         #[arg(long)]
@@ -179,12 +197,38 @@ pub async fn run_state_command(
         StateCommands::Refresh { path, lock } => {
             run_state_refresh(&path, lock, provider_context).await
         }
-        StateCommands::List { path } => run_state_list(&path, provider_context).await,
-        StateCommands::Lookup { query, path, json } => {
-            run_state_lookup(&query, &path, json, provider_context).await
+        StateCommands::List { path, state_url } => {
+            run_state_list(path.as_deref(), state_url.as_deref(), provider_context).await
         }
-        StateCommands::Show { path, tui, json } => {
-            run_state_show(&path, tui, json, provider_context).await
+        StateCommands::Lookup {
+            query,
+            path,
+            state_url,
+            json,
+        } => {
+            run_state_lookup(
+                &query,
+                path.as_deref(),
+                state_url.as_deref(),
+                json,
+                provider_context,
+            )
+            .await
+        }
+        StateCommands::Show {
+            path,
+            state_url,
+            tui,
+            json,
+        } => {
+            run_state_show(
+                path.as_deref(),
+                state_url.as_deref(),
+                tui,
+                json,
+                provider_context,
+            )
+            .await
         }
     }
 }
@@ -226,11 +270,26 @@ pub async fn run_force_unlock(
     }
 }
 
-/// Load the state file from the backend (or local file), without acquiring a lock.
+/// Load the state file, either from a configured backend (resolved via
+/// the .crn at `path`) or from a direct URL.
+///
+/// `path` and `state_url` are mutually exclusive at the clap layer
+/// (`conflicts_with = "path"`), so this helper trusts that at most one
+/// is `Some`. When both are `None`, the existing behavior applies and
+/// the path defaults to `.`.
 async fn load_state_file(
-    path: &Path,
+    path: Option<&Path>,
+    state_url: Option<&str>,
     provider_context: &ProviderContext,
 ) -> Result<StateFile, AppError> {
+    if let Some(raw) = state_url {
+        let url = StateUrl::parse(raw).map_err(AppError::Backend)?;
+        return load_state_from_url(&url).await.map_err(AppError::Backend);
+    }
+
+    let default_path = PathBuf::from(".");
+    let path = path.unwrap_or(&default_path);
+
     let loaded = load_configuration_with_config(
         path,
         provider_context,
@@ -274,8 +333,12 @@ fn format_state_list(state: &StateFile) -> Vec<String> {
 }
 
 /// Run state list command
-async fn run_state_list(path: &Path, provider_context: &ProviderContext) -> Result<(), AppError> {
-    let state = load_state_file(path, provider_context).await?;
+async fn run_state_list(
+    path: Option<&Path>,
+    state_url: Option<&str>,
+    provider_context: &ProviderContext,
+) -> Result<(), AppError> {
+    let state = load_state_file(path, state_url, provider_context).await?;
 
     if state.resources.is_empty() {
         println!("No resources in state.");
@@ -331,11 +394,12 @@ fn format_state_lookup(
 /// Run state lookup command
 async fn run_state_lookup(
     query: &str,
-    path: &Path,
+    path: Option<&Path>,
+    state_url: Option<&str>,
     json_output: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let state = load_state_file(path, provider_context).await?;
+    let state = load_state_file(path, state_url, provider_context).await?;
     let output = format_state_lookup(&state, query, json_output)?;
     println!("{}", output);
     Ok(())
@@ -403,12 +467,13 @@ fn format_state_show(state: &StateFile) -> String {
 
 /// Run state show command
 async fn run_state_show(
-    path: &Path,
+    path: Option<&Path>,
+    state_url: Option<&str>,
     tui: bool,
     json: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let state = load_state_file(path, provider_context).await?;
+    let state = load_state_file(path, state_url, provider_context).await?;
 
     if json {
         let json_str = serde_json::to_string_pretty(&state)
