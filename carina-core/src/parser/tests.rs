@@ -4087,8 +4087,70 @@ fn parse_import_block() {
             assert_eq!(to.provider, "awscc");
             assert_eq!(to.resource_type, "ec2.Vpc");
             assert_eq!(to.name_str(), "main-vpc");
-            assert_eq!(id, "vpc-0abc123def456");
+            assert_eq!(
+                id,
+                &Value::Concrete(ConcreteValue::String("vpc-0abc123def456".to_string()))
+            );
         }
+        other => panic!("Expected Import, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_import_block_preserves_interpolation_segments() {
+    // carina#3329: a `"${X.attr}|literal"`-shaped `id` in an `import`
+    // block must keep the `${...}` segment as a deferred `Expr` part,
+    // so the plan-time resolver can either resolve it to a concrete
+    // string (when the referenced binding is in scope) or stamp it
+    // as `(known after upstream apply: ...)` for display. Pre-#3329
+    // the parser collapsed the `id` to a `String` and silently
+    // dropped every `${...}` segment, presenting a partially-
+    // substituted literal (`"|literal"`) as if it were a real cloud
+    // identifier.
+    let input = r#"
+        let management_route53 = upstream_state {
+            source = "../management/route53"
+        }
+
+        import {
+            to = aws.route53.RecordSet "r.delegation_ns"
+            id = "${management_route53.apex_zone_id}|registry-dev.carina-rs.dev|NS"
+        }
+    "#;
+
+    let result = parse(input, &ProviderContext::default()).unwrap();
+    assert_eq!(result.state_blocks.len(), 1);
+    match &result.state_blocks[0] {
+        StateBlock::Import { id, .. } => match id {
+            Value::Deferred(DeferredValue::Interpolation(parts)) => {
+                // Three parts expected: ${...} expr, "|registry-dev.carina-rs.dev|" literal, "NS" literal.
+                // After canonicalization adjacent literals may merge, so check structurally:
+                let has_expr = parts
+                    .iter()
+                    .any(|p| matches!(p, InterpolationPart::Expr(_)));
+                assert!(
+                    has_expr,
+                    "expected an `Expr` part for `${{management_route53.apex_zone_id}}`, got {:?}",
+                    parts
+                );
+                let literal_concat: String = parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        InterpolationPart::Literal(s) => Some(s.as_str()),
+                        InterpolationPart::Expr(_) => None,
+                    })
+                    .collect();
+                assert!(
+                    literal_concat.contains("|registry-dev.carina-rs.dev|NS"),
+                    "expected literal segments to retain `|registry-dev.carina-rs.dev|NS`, got {:?}",
+                    parts
+                );
+            }
+            other => panic!(
+                "expected Value::Deferred(Interpolation) for interpolated import id, got {:?}",
+                other
+            ),
+        },
         other => panic!("Expected Import, got {:?}", other),
     }
 }

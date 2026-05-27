@@ -2024,7 +2024,7 @@ mod saved_plan_version_tests {
             "error must name the rejected version, got: {msg}",
         );
         assert!(
-            msg.contains("expected 4"),
+            msg.contains("expected 5"),
             "error must name the expected version, got: {msg}",
         );
         assert!(

@@ -1968,13 +1968,21 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     // retain ResourceRef values for re-resolution at apply time.
     cascade_dependent_updates(&mut plan, &sorted_resources, &current_states, ctx.schemas());
 
-    // Add state block effects (import/removed/moved) to the plan
+    // Add state block effects (import/removed/moved) to the plan.
+    // carina#3329: pass the same plan_bindings + upstream_binding_names
+    // the resource-attribute resolver uses so an `import { id = "${…}|…" }`
+    // expression is folded into a concrete cloud identifier (when the
+    // referenced binding is in scope) or stamped for display as
+    // `(known after upstream apply: …)` when the referenced upstream
+    // state has not been published yet.
     add_state_block_effects(
         &mut plan,
         &parsed.state_blocks,
         state_file,
         &moved_pairs,
         ctx.schemas(),
+        &plan_bindings,
+        &upstream_binding_names,
     );
 
     let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
@@ -2125,6 +2133,17 @@ pub fn add_state_block_effects(
     state_file: &Option<StateFile>,
     moved_pairs: &[(ResourceId, ResourceId)],
     registry: &SchemaRegistry,
+    // carina#3329: resolved bindings + the set of upstream-state
+    // binding names whose surviving refs are stamped as
+    // `Value::Deferred(DeferredValue::Unknown(UpstreamRef { … }))`.
+    // The `id = "${X.attr}|…"` interpolation inside an `import` block
+    // is resolved here against the same view that the differ uses for
+    // resource attributes (`resolve_refs_for_plan`), so a deferred
+    // upstream-state ref carries through as a `(known after upstream
+    // apply: …)` placeholder instead of being silently substituted to
+    // empty.
+    bindings: &carina_core::binding_index::ResolvedBindings,
+    unresolved_upstream_bindings: &std::collections::HashSet<&str>,
 ) {
     // Collect resource IDs that are covered by removed blocks
     // to suppress orphan Delete effects
@@ -2154,10 +2173,26 @@ pub fn add_state_block_effects(
                     .is_some()
                 });
                 if !already_in_state {
+                    // carina#3329: resolve any `${binding.attr}` segments
+                    // in `id` against the same binding view the resource
+                    // attribute resolver uses. If the referenced binding
+                    // is a same-stack `let`, this folds the interpolation
+                    // to a `Value::Concrete(ConcreteValue::String)`; if
+                    // it is an `upstream_state` binding whose state has
+                    // not been published yet, it is stamped as
+                    // `Value::Deferred(DeferredValue::Unknown(UpstreamRef))`
+                    // for display. The pre-#3329 path stored a partially-
+                    // substituted `String` and dropped the deferred-ref
+                    // signal entirely.
+                    let resolved_id = carina_core::resolver::resolve_value_for_plan(
+                        id,
+                        bindings,
+                        unresolved_upstream_bindings,
+                    );
                     suppress_create.insert(effective_to.clone());
                     new_effects.push(Effect::Import {
                         id: effective_to,
-                        identifier: id.clone(),
+                        identifier: resolved_id,
                     });
                 }
             }

@@ -159,12 +159,18 @@ fn build_plan_file<E>(
     ctx: &crate::wiring::PlanContext,
 ) -> Result<PlanFile, carina_core::value::SerializationError> {
     Ok(PlanFile {
+        // carina#3329: bumped 4→5 — `Effect::Import.identifier` is now
+        // a tagged `Value`, not a plain string, so a pre-#3329 v4 plan
+        // would otherwise fail to deserialize with an opaque serde
+        // error. The version check at apply time produces a clean
+        // "re-run plan" message instead.
+        //
         // carina#3248: bumped 3→4 — saved plans now persist
         // `compositions` so the saved-plan apply path can rebuild
         // the same `ResolvedBindings` view as the live-apply path.
-        // Older plans (version `3` and below) are rejected with a
+        // Older plans (version below current) are rejected with a
         // clear message pointing the user at re-running `plan`.
-        version: 4,
+        version: 5,
         carina_version: env!("CARGO_PKG_VERSION").to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
         source_path: path.display().to_string(),

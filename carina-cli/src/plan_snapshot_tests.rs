@@ -983,6 +983,51 @@ fn plan_snapshot_upstream_state_unresolved() {
     insta::assert_snapshot!(stripped);
 }
 
+/// carina#3329 regression: an `import { id = "${X.attr}|…" }` whose
+/// `${X.attr}` references a deferred upstream-state value must render
+/// the interpolation through plan display as a `(known after upstream
+/// apply: …)` placeholder around the literal segments rather than
+/// silently substituting the `${…}` to empty.
+///
+/// Pre-#3329 the parser stored `id` as a plain `String` and discarded
+/// every `${…}` segment, so the plan showed `id: |literal|literal` —
+/// a malformed-looking identifier presented as if it were the cloud
+/// API's real value. Operators reviewing the diff had no way to tell
+/// whether apply would re-resolve the reference or ship the partial
+/// string to AWS as-is.
+#[test]
+fn plan_snapshot_import_deferred_interpolation() {
+    let (plan, schemas, moved_origins) = build_plan_from_fixture("import_deferred_interpolation");
+    let output = format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &moved_origins,
+        &[],
+        &[],
+        None,
+        None,
+    );
+    let stripped = strip_ansi(&output);
+    assert!(
+        stripped.contains("(known after upstream apply: management_route53.apex_zone_id)"),
+        "expected the import id's `${{management_route53.apex_zone_id}}` segment to render \
+         as `(known after upstream apply: management_route53.apex_zone_id)`, got:\n{}",
+        stripped
+    );
+    assert!(
+        !stripped.lines().any(|line| line.contains("id:")
+            && line.contains("|registry-dev")
+            && !line.contains("known after upstream apply")),
+        "expected the leading `|` (caused by a silently-substituted ${{…}}) to be gone — \
+         no `id:` line should show a bare `|registry-dev…` without the deferred marker. \
+         Got:\n{}",
+        stripped
+    );
+    insta::assert_snapshot!(stripped);
+}
+
 /// Companion to `plan_snapshot_upstream_state_unresolved`: state file is
 /// present but `exports` is empty (upstream module declared but not yet
 /// applied). The same `(known after upstream apply: <ref>)` rendering

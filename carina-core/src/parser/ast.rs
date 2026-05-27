@@ -626,8 +626,16 @@ pub enum StateBlock {
         /// Target resource address (routing-agnostic — see
         /// [`StateBlockAddress`]).
         to: StateBlockAddress,
-        /// Cloud provider identifier (e.g., "vpc-0abc123def456")
-        id: String,
+        /// Cloud provider identifier (e.g., `"vpc-0abc123def456"`).
+        ///
+        /// Carried as a [`Value`] (not `String`) so a `"${X.attr}|..."`
+        /// interpolation referencing a deferred upstream-state value
+        /// stays a `Value::Deferred(DeferredValue::Interpolation)` from
+        /// parse through plan-time resolution and display. The pre-#3329
+        /// `String` shape silently dropped `${...}` segments at parse
+        /// time and presented a partially-substituted literal as if it
+        /// were a real cloud identifier. See carina#3329.
+        id: Value,
     },
     /// Remove a resource from state without destroying it
     Removed {

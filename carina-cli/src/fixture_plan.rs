@@ -281,6 +281,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &state_file,
         &moved_pairs,
         wiring.schemas(),
+        &plan_bindings,
+        &upstream_binding_names,
     );
 
     let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs

@@ -152,7 +152,7 @@ pub fn parse_with_seeded_bindings(
                                 export_params.extend(parsed_export_params);
                             }
                             Rule::import_state_block => {
-                                state_blocks.push(parse_import_state_block(stmt)?);
+                                state_blocks.push(parse_import_state_block(stmt, &ctx)?);
                             }
                             Rule::removed_block => {
                                 state_blocks.push(parse_removed_block(stmt)?);

@@ -176,6 +176,8 @@ plan-fixtures:
 	@$(MAKE) plan-upstream-state-map-dot-notation
 	@echo "---"
 	@$(MAKE) plan-deferred-for
+	@echo "---"
+	@$(MAKE) plan-import-deferred-interpolation
 	@echo ""
 	@echo "=== policy_pretty ==="
 	@$(MAKE) plan-policy-pretty
@@ -212,6 +214,8 @@ plan-upstream-state-map-dot-notation:
 	$(PLAN_FIXTURE) upstream_state_map_dot_notation
 plan-deferred-for:
 	$(PLAN_FIXTURE) deferred_for
+plan-import-deferred-interpolation:
+	$(PLAN_FIXTURE) import_deferred_interpolation
 plan-exports:
 	$(PLAN_FIXTURE) exports
 plan-exports-multifile:
@@ -236,7 +240,7 @@ plan-multi-instance-create:
 	$(PLAN_FIXTURE) multi_instance_create
 plan-multi-instance-module:
 	$(PLAN_FIXTURE) multi_instance_module
-.PHONY: plan-all-create plan-no-changes plan-empty-explicit-children-no-changes plan-no-changes-enum plan-mixed plan-delete plan-delete-list-of-maps plan-compact \
+.PHONY: plan-all-create plan-no-changes plan-empty-explicit-children-no-changes plan-no-changes-enum plan-mixed plan-delete plan-delete-list-of-maps plan-compact plan-import-deferred-interpolation \
         plan-map-diff plan-list-diff-added-struct plan-list-diff-removed-struct \
         plan-list-diff-modified-with-unchanged \
         plan-list-diff-modified-with-unchanged-nested \

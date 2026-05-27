@@ -145,8 +145,17 @@ pub enum Effect {
     Import {
         /// Target resource address
         id: ResourceId,
-        /// Cloud provider identifier (e.g., "vpc-0abc123def456")
-        identifier: String,
+        /// Cloud provider identifier (e.g., `"vpc-0abc123def456"`).
+        ///
+        /// Carried as a [`Value`] so an interpolation like
+        /// `"${upstream.attr}|literal"` whose `upstream.attr` is still
+        /// deferred at plan-time remains a
+        /// `Value::Deferred(DeferredValue::Interpolation)` for display
+        /// rather than being silently substituted to empty (carina#3329).
+        /// The executor calls `assert_fully_resolved` before passing the
+        /// identifier to the provider, so by apply time this is always
+        /// a `Value::Concrete(ConcreteValue::String)`.
+        identifier: crate::resource::Value,
     },
 
     /// Remove a resource from state without destroying it
@@ -460,9 +469,155 @@ impl Effect {
     }
 }
 
+/// Render an [`Effect::Import`] identifier for plan display.
+///
+/// Three shapes matter:
+///
+/// 1. **Concrete `String` / `EnumIdentifier`**: print the bare
+///    identifier text (no DSL string quoting — operators read this as
+///    the cloud-API identifier, not as a DSL literal).
+/// 2. **`Value::Deferred(Interpolation)`**: walk the parts and emit
+///    each one inline — `Literal` segments verbatim, `Expr` segments
+///    through [`crate::value::format_value_with_key`]. Concrete `Expr`
+///    parts therefore render as bare text and a deferred upstream ref
+///    renders as `(known after upstream apply: …)` *without* the
+///    surrounding `${…}` syntax, so the operator sees the full
+///    composite identifier exactly as it will look after apply with
+///    the deferred slot called out.
+/// 3. **Other deferred shapes**: fall through to
+///    [`crate::value::format_value_with_key`].
+///
+/// Carina#3329.
+pub fn format_import_identifier(identifier: &crate::resource::Value) -> String {
+    use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
+    match identifier {
+        Value::Concrete(ConcreteValue::String(s))
+        | Value::Concrete(ConcreteValue::EnumIdentifier(s)) => s.clone(),
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+            let mut out = String::new();
+            for part in parts {
+                match part {
+                    InterpolationPart::Literal(s) => out.push_str(s),
+                    // Recurse so a nested `Value::Deferred(Interpolation)`
+                    // produced by canonicalization stays unquoted and
+                    // un-`${…}`-wrapped at every level. Falling through
+                    // to `format_value_with_key` here would re-introduce
+                    // the wrapping the outer level was designed to
+                    // strip.
+                    InterpolationPart::Expr(v) => out.push_str(&format_import_identifier(v)),
+                }
+            }
+            out
+        }
+        other => crate::value::format_value_with_key(other, Some("id")),
+    }
+}
+
+/// Resolve an [`Effect::Import`] identifier to the concrete string the
+/// provider's `read()` needs, or return a structured error describing
+/// which deferred segment prevented resolution.
+///
+/// Centralizing the check means a future apply-side caller cannot
+/// silently ship a `Value::Deferred(…)` to the provider by rolling its
+/// own incomplete `match`: the only public path from a `Value` import
+/// identifier to a provider-ready `&str` goes through this helper.
+/// Plan-time display still calls
+/// [`crate::value::format_value_with_key`] on the same field, so a
+/// deferred upstream-state ref renders as
+/// `(known after upstream apply: …)` rather than being silently
+/// substituted to empty — see carina#3329.
+pub fn resolve_import_identifier(identifier: &crate::resource::Value) -> Result<&str, String> {
+    use crate::resource::{ConcreteValue, Value};
+    match identifier {
+        Value::Concrete(ConcreteValue::String(s)) => Ok(s.as_str()),
+        Value::Concrete(ConcreteValue::EnumIdentifier(s)) => Ok(s.as_str()),
+        other => Err(format!(
+            "import identifier did not resolve to a concrete string at apply time \
+             (got {}). A referenced upstream value has not been published yet — \
+             apply the upstream stack first, then re-run apply here.",
+            crate::value::format_value_with_key(other, Some("id"))
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_import_identifier_recurses_into_nested_interpolation() {
+        // Carina#3329 (round-2): if canonicalization or a future
+        // resolver pass produces a `Value::Deferred(Interpolation)`
+        // *inside* an `Expr` part of the outer interpolation, the
+        // helper must stay in its inline-string mode at every level
+        // rather than falling back to `format_value_with_key` (which
+        // would wrap the nested value as a DSL string literal with
+        // surrounding `"…"` quotes and `${…}` syntax).
+        use crate::resource::{
+            ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value,
+        };
+        let inner = Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
+                UnknownReason::UpstreamBareRef {
+                    binding: "u".into(),
+                },
+            ))),
+            InterpolationPart::Literal("-suffix".into()),
+        ]));
+        let outer = Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Literal("prefix-".into()),
+            InterpolationPart::Expr(inner),
+            InterpolationPart::Literal("-tail".into()),
+        ]));
+        let rendered = format_import_identifier(&outer);
+        assert_eq!(
+            rendered, "prefix-(known after upstream apply: u)-suffix-tail",
+            "nested interpolation must render inline with no `${{…}}` wrapping or quoting"
+        );
+        // Sanity: a bare concrete still renders bare.
+        assert_eq!(
+            format_import_identifier(&Value::Concrete(ConcreteValue::String("plain".into()))),
+            "plain"
+        );
+    }
+
+    #[test]
+    fn resolve_import_identifier_accepts_concrete_string() {
+        use crate::resource::{ConcreteValue, Value};
+        let v = Value::Concrete(ConcreteValue::String("vpc-0abc".into()));
+        assert_eq!(resolve_import_identifier(&v).unwrap(), "vpc-0abc");
+    }
+
+    #[test]
+    fn resolve_import_identifier_rejects_deferred_interpolation() {
+        // carina#3329: an apply-time `Effect::Import.identifier` carrying
+        // an unresolved interpolation must surface a structured error,
+        // not be silently shipped to the provider as the
+        // partially-substituted literal. Pre-#3329 the field was a
+        // `String` so the same shape would land at the provider as
+        // `|literal|literal` with no way to detect the dropped
+        // interpolation; the helper now gates that path through the
+        // `Value` type.
+        use crate::resource::{
+            ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value,
+        };
+        let v = Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
+                UnknownReason::UpstreamBareRef {
+                    binding: "upstream".into(),
+                },
+            ))),
+            InterpolationPart::Literal("|tail".into()),
+        ]));
+        let err = resolve_import_identifier(&v).unwrap_err();
+        assert!(
+            err.contains("did not resolve to a concrete string"),
+            "unexpected error message: {err}"
+        );
+        // Sanity: still passes for a concrete String/EnumIdentifier.
+        let s = Value::Concrete(ConcreteValue::EnumIdentifier("ENUM_X".into()));
+        assert_eq!(resolve_import_identifier(&s).unwrap(), "ENUM_X");
+    }
 
     #[test]
     fn read_is_not_mutating() {
@@ -627,7 +782,9 @@ mod tests {
     fn explicit_dependencies_empty_for_state_only_effects() {
         let imp = Effect::Import {
             id: ResourceId::new("s3.Bucket", "b"),
-            identifier: "x".to_string(),
+            identifier: crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+                "x".to_string(),
+            )),
         };
         let rem = Effect::Remove {
             id: ResourceId::new("s3.Bucket", "b"),
@@ -829,7 +986,9 @@ mod tests {
         };
         let import = Effect::Import {
             id: rid.clone(),
-            identifier: "x-1".to_string(),
+            identifier: crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+                "x-1".to_string(),
+            )),
         };
         let remove = Effect::Remove { id: rid.clone() };
         let mov = Effect::Move {

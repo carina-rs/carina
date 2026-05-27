@@ -426,9 +426,16 @@ pub fn build_detail_rows(
             build_create_rows(&resource.attributes, schema, detail)
         }
         Effect::Import { identifier, .. } => {
+            // carina#3329: the identifier is carried as a `Value` so a
+            // deferred upstream-state reference inside a `"${X.attr}|…"`
+            // interpolation renders as `(known after upstream apply: …)`
+            // instead of being silently substituted to empty.
+            // `format_import_identifier` prints concrete identifiers bare
+            // and falls back to the structured `format_value_with_key`
+            // shape only for the deferred / interpolation case.
             vec![DetailRow::Attribute {
                 key: "id".to_string(),
-                value: identifier.clone(),
+                value: crate::effect::format_import_identifier(identifier),
                 ref_binding: None,
                 annotation: None,
             }]
