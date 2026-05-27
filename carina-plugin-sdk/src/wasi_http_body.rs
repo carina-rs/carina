@@ -1,5 +1,19 @@
 //! Body framing for wasi:http outgoing requests.
 //!
+//! # Two invariants enforced here
+//!
+//! 1. **Every buffered body crosses the wasi:http boundary with an explicit
+//!    `Content-Length`** — see `RequestBody` / `inject_content_length_header`
+//!    below (carina-rs/carina#3254).
+//! 2. **Every call into `wasi:io::OutputStream::blocking_write_and_flush`
+//!    carries at most `BLOCKING_WRITE_AND_FLUSH_MAX_BYTES` bytes** — see
+//!    `chunks_for_blocking_write` below (carina-rs/carina#3318). The
+//!    wasi:io contract caps a single `blocking-write-and-flush` at
+//!    4096 bytes; the host `wasmtime-wasi-io` returns a *trap* (not a
+//!    recoverable error) on overflow, which leaves the WASM instance
+//!    re-entry-locked. A 4157-byte CloudControl `UpdateResource` body
+//!    triggered this; the splitter restores the contract.
+//!
 //! # Why this exists
 //!
 //! `wasi:http` and the host-side `wasmtime_wasi_http` bridge let the guest
@@ -94,6 +108,32 @@ impl RequestBody {
     }
 }
 
+/// Maximum bytes accepted by a single
+/// `wasi:io::OutputStream::blocking_write_and_flush` call.
+///
+/// Pinned by the wasi:io WIT contract; the host implementation
+/// (`wasmtime-wasi-io::impls::OutputStream::blocking_write_and_flush`)
+/// returns a `StreamError::trap` — not a recoverable error — when the
+/// guest passes more than this. A trap on the wasi:io path poisons the
+/// component instance from wasmtime's point of view, so the very next
+/// guest entry fails with `cannot enter component instance` (the
+/// cascade observed in carina-rs/carina#3318). Always feed bodies
+/// through [`chunks_for_blocking_write`] before handing them to the
+/// stream.
+pub(crate) const BLOCKING_WRITE_AND_FLUSH_MAX_BYTES: usize = 4096;
+
+/// Split `data` into chunks no larger than
+/// [`BLOCKING_WRITE_AND_FLUSH_MAX_BYTES`], in order, so each chunk can
+/// be passed to `wasi:io::OutputStream::blocking_write_and_flush`
+/// without tripping the host-side trap.
+///
+/// Empty input yields no chunks (the caller must skip the stream write
+/// entirely, the same as before the splitter existed). Concatenating
+/// the returned chunks in order reproduces the input exactly.
+pub(crate) fn chunks_for_blocking_write(data: &[u8]) -> impl Iterator<Item = &[u8]> {
+    data.chunks(BLOCKING_WRITE_AND_FLUSH_MAX_BYTES)
+}
+
 /// Add a `content-length` header to `headers` if not already present.
 ///
 /// Headers come in as the `(name, value-bytes)` list that
@@ -183,6 +223,65 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].1, b"42".to_vec());
+    }
+
+    #[test]
+    fn chunks_empty_yields_nothing() {
+        let chunks: Vec<&[u8]> = chunks_for_blocking_write(&[]).collect();
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn chunks_under_limit_yields_single_chunk() {
+        let data = vec![0xAB; BLOCKING_WRITE_AND_FLUSH_MAX_BYTES - 1];
+        let chunks: Vec<&[u8]> = chunks_for_blocking_write(&data).collect();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), BLOCKING_WRITE_AND_FLUSH_MAX_BYTES - 1);
+    }
+
+    #[test]
+    fn chunks_exactly_at_limit_yields_single_chunk() {
+        let data = vec![0xCD; BLOCKING_WRITE_AND_FLUSH_MAX_BYTES];
+        let chunks: Vec<&[u8]> = chunks_for_blocking_write(&data).collect();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), BLOCKING_WRITE_AND_FLUSH_MAX_BYTES);
+    }
+
+    #[test]
+    fn chunks_over_limit_yields_multiple_bounded_chunks() {
+        // 4157-byte body — the size of the CloudControl `UpdateResource`
+        // call that triggered carina-rs/carina#3318 on the real
+        // `awscc.iam.RolePolicy` update.
+        let data = vec![0xEF; 4157];
+        let chunks: Vec<&[u8]> = chunks_for_blocking_write(&data).collect();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), BLOCKING_WRITE_AND_FLUSH_MAX_BYTES);
+        assert_eq!(chunks[1].len(), 4157 - BLOCKING_WRITE_AND_FLUSH_MAX_BYTES);
+        // Reassembled, the chunks must equal the input.
+        let mut joined: Vec<u8> = Vec::new();
+        for c in &chunks {
+            joined.extend_from_slice(c);
+        }
+        assert_eq!(joined, data);
+        // Every chunk is within the wasi:io limit.
+        for c in &chunks {
+            assert!(c.len() <= BLOCKING_WRITE_AND_FLUSH_MAX_BYTES);
+        }
+    }
+
+    #[test]
+    fn chunks_far_over_limit_yields_only_bounded_chunks() {
+        // Stress: ten-times the limit plus a tail.
+        let total = BLOCKING_WRITE_AND_FLUSH_MAX_BYTES * 10 + 123;
+        let data = vec![0x42u8; total];
+        let chunks: Vec<&[u8]> = chunks_for_blocking_write(&data).collect();
+        let mut sum = 0;
+        for c in &chunks {
+            assert!(c.len() <= BLOCKING_WRITE_AND_FLUSH_MAX_BYTES);
+            sum += c.len();
+        }
+        assert_eq!(sum, total);
+        assert_eq!(chunks.len(), 11);
     }
 
     #[test]
