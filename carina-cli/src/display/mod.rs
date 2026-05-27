@@ -329,9 +329,12 @@ pub fn format_plan(
     }
     parts.push(format!("{} to destroy", summary.delete.to_string().red()));
     if summary.remove > 0 {
+        // carina#3332: state-only removal is not a destructive failure;
+        // color the count yellow to agree with the `~` Remove row in
+        // the tree above instead of red (which pairs with `✗`/Delete).
         parts.push(format!(
             "{} to remove from state",
-            summary.remove.to_string().red()
+            summary.remove.to_string().yellow()
         ));
     }
     if summary.moved > 0 {
@@ -464,7 +467,12 @@ impl<'a> TreeRenderContext<'a> {
             Effect::Delete { .. } => "-".red().bold(),
             Effect::Read { .. } => "<=".cyan().bold(),
             Effect::Import { .. } => "<-".cyan().bold(),
-            Effect::Remove { .. } => "x".red().bold(),
+            // carina#3332: the previous `x` (red, bold) shape-collides
+            // with the `✗` failure indicator used in apply output.
+            // Use `~` (yellow, bold) — the same family as Move's `->`
+            // and the trailing `(remove from state)` annotation
+            // disambiguates from Update's `~` line.
+            Effect::Remove { .. } => "~".yellow().bold(),
             Effect::Move { .. } => "->".yellow().bold(),
             Effect::Wait { .. } => ">".magenta().bold(),
         };
@@ -671,7 +679,12 @@ impl<'a> TreeRenderContext<'a> {
                     connector,
                     colored_symbol,
                     id.display_type().cyan().bold(),
-                    id.name_str().red().bold(),
+                    // carina#3332: name was previously `red().bold()`,
+                    // which pairs with `✗`/Delete and re-introduces the
+                    // "state-only success looks like failure" misread
+                    // even after the leading `x` glyph fix. Yellow
+                    // matches the `~` symbol family and Move's row.
+                    id.name_str().yellow().bold(),
                     "(remove from state)".dimmed()
                 )
                 .unwrap();

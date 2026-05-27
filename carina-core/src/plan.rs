@@ -420,7 +420,11 @@ fn format_effect_brief(effect: &Effect) -> String {
             id,
             crate::effect::format_import_identifier(identifier)
         ),
-        Effect::Remove { id } => format!("x {}", id),
+        // carina#3332: leading `x` shape-collides with the `✗` failure
+        // indicator used elsewhere in apply output. Use `~` here too —
+        // matches the `display`/TUI plan-tree Remove symbol and the
+        // operation word disambiguates from Update.
+        Effect::Remove { id } => format!("~ {} (remove from state)", id),
         Effect::Move { from, to } => format!("-> {} (from: {})", to, from),
         Effect::Wait {
             binding,
@@ -471,6 +475,28 @@ mod tests {
         plan.add(Effect::Create(Resource::new("acm.Certificate", "cert")));
         assert!(plan.has_mutations());
         assert_eq!(plan.mutation_count(), 1);
+    }
+
+    /// carina#3332: `Effect::Remove` in the brief renderer must not
+    /// lead with `x` (shape-collides with the `✗` failure indicator
+    /// used in apply output). Pin the new `~ ... (remove from state)`
+    /// shape so a future tweak does not silently re-introduce the
+    /// confusing glyph.
+    #[test]
+    fn format_effect_brief_remove_has_no_failure_shaped_glyph() {
+        use crate::resource::ResourceId;
+        let id = ResourceId::new("aws.route53.RecordSet", "aws_route53_record_set_7059de08");
+        let s = format_effect_brief(&Effect::Remove { id: id.clone() });
+        assert!(!s.contains('x'), "must not contain `x`; got: {s:?}");
+        assert!(!s.contains('✗'), "must not contain `✗`; got: {s:?}");
+        assert!(
+            s.contains("(remove from state)"),
+            "must name the operation; got: {s:?}"
+        );
+        assert!(
+            s.contains(&id.to_string()),
+            "must include the resource id; got: {s:?}"
+        );
     }
 
     #[test]
