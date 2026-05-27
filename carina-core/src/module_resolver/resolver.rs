@@ -20,6 +20,11 @@ pub struct ModuleResolver<'cfg> {
     pub(super) resolving: HashSet<PathBuf>,
     /// Imported module definitions by alias
     pub(super) imported_modules: HashMap<String, ParsedFile>,
+    /// `use { source = "..." }` paths by alias — the DSL-visible
+    /// source location for each imported module. Threaded into the
+    /// `ExpansionTrace` so plan rendering can label a composition
+    /// group with `module "<binding>" (<source_path>)` (carina#3322).
+    pub(super) module_paths: HashMap<String, String>,
     /// Parser configuration (decryptor, custom validators)
     pub(super) config: &'cfg ProviderContext,
 }
@@ -39,6 +44,7 @@ impl<'cfg> ModuleResolver<'cfg> {
             module_cache: HashMap::new(),
             resolving: HashSet::new(),
             imported_modules: HashMap::new(),
+            module_paths: HashMap::new(),
             config,
         }
     }
@@ -151,6 +157,8 @@ impl<'cfg> ModuleResolver<'cfg> {
         for import in imports {
             let module = self.load_module(&import.path)?;
             self.imported_modules.insert(import.alias.clone(), module);
+            self.module_paths
+                .insert(import.alias.clone(), import.path.clone());
         }
         Ok(())
     }
@@ -172,6 +180,7 @@ impl<'cfg> ModuleResolver<'cfg> {
         // Save and temporarily replace the base_dir and imported_modules
         let original_base_dir = std::mem::replace(&mut self.base_dir, base_dir.to_path_buf());
         let original_imported = std::mem::take(&mut self.imported_modules);
+        let original_paths = std::mem::take(&mut self.module_paths);
 
         // Process the module's own imports
         let imports = parsed.uses.clone();
@@ -181,6 +190,7 @@ impl<'cfg> ModuleResolver<'cfg> {
             // Restore state on error
             self.base_dir = original_base_dir;
             self.imported_modules = original_imported;
+            self.module_paths = original_paths;
             return Err(e);
         }
 
@@ -215,6 +225,7 @@ impl<'cfg> ModuleResolver<'cfg> {
                 Err(e) => {
                     self.base_dir = original_base_dir;
                     self.imported_modules = original_imported;
+                    self.module_paths = original_paths;
                     return Err(e);
                 }
             }
@@ -223,6 +234,7 @@ impl<'cfg> ModuleResolver<'cfg> {
         // Restore original state
         self.base_dir = original_base_dir;
         self.imported_modules = original_imported;
+        self.module_paths = original_paths;
 
         Ok(())
     }

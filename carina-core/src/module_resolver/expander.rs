@@ -356,8 +356,17 @@ impl ModuleResolver<'_> {
         // #3306: build the expansion trace from this call's leaves +
         // nested-expansion traces inherited from `module`, *before*
         // the struct literal moves `resources` / `data_sources`.
+        // carina#3322: stamp the call site with the DSL `use` path
+        // so plan rendering can label the group with a DSL-visible
+        // name (`module "<binding>" (<source_path>)`). `None` falls
+        // back to a path-less header — only relevant in test harnesses
+        // that bypass `process_imports`; real expansions always have
+        // a recorded path.
+        let source_path: Option<&str> =
+            self.module_paths.get(&call.module_name).map(String::as_str);
         let expansion_trace = build_expansion_trace(
             instance_prefix,
+            source_path,
             &module.expansion_trace,
             &resources,
             &data_sources,
@@ -426,14 +435,19 @@ impl ModuleResolver<'_> {
 /// first chain in the merged plan).
 pub(crate) fn build_expansion_trace(
     instance_prefix: &str,
+    source_path: Option<&str>,
     inner_trace: &crate::resource::ExpansionTrace,
     leaf_resources: &[Resource],
     leaf_data_sources: &[DataSource],
 ) -> crate::resource::ExpansionTrace {
-    let this_call_site = crate::resource::EphemeralId::new(crate::resource::ResourceId::new(
+    let id = crate::resource::EphemeralId::new(crate::resource::ResourceId::new(
         "_virtual",
         instance_prefix,
     ));
+    let this_call_site = match source_path {
+        Some(p) => crate::resource::CallSite::new(id, p),
+        None => crate::resource::CallSite::without_source(id),
+    };
 
     let mut out = crate::resource::ExpansionTrace::new();
 
