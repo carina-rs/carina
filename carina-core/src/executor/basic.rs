@@ -130,7 +130,7 @@ pub(super) async fn resolve_resource(
     let mut resolved = resource.clone();
     for (key, expr) in &resource.attributes {
         let resolved_value = unwrap_secret(resolve_ref_value(expr, bindings)?);
-        assert_fully_resolved(&resolved_value, key)?;
+        assert_fully_resolved(&resolved_value, key, bindings)?;
         resolved.attributes.insert(key.clone(), resolved_value);
     }
     renormalize(resolved, pipeline).await
@@ -150,7 +150,7 @@ pub(super) async fn resolve_resource_with_source(
     let mut resolved = target.clone();
     for (key, expr) in &source.attributes {
         let resolved_value = unwrap_secret(resolve_ref_value(expr, bindings)?);
-        assert_fully_resolved(&resolved_value, key)?;
+        assert_fully_resolved(&resolved_value, key, bindings)?;
         resolved.attributes.insert(key.clone(), resolved_value);
     }
     renormalize(resolved, pipeline).await
@@ -228,42 +228,197 @@ async fn renormalize(
 /// (`UnknownReason::UpstreamRef`) and never reaches the apply path
 /// for local refs. Treating it as unresolved here would regress
 /// `resolve_refs_for_plan`'s contract.
-fn assert_fully_resolved(value: &Value, attribute_key: &str) -> Result<(), String> {
+///
+/// # Kind-aware diagnostic (carina#3334)
+///
+/// When the unresolved value names a binding, the binding's
+/// [`BindingValueSource`] selects the remediation text:
+///
+/// - [`BindingValueSource::Upstream`] — the binding is an
+///   `upstream_state` read. `wait` blocks attach to managed-resource
+///   lifecycles in *this* configuration and cannot wake on an
+///   upstream stack's exports; the only fix is to apply the upstream
+///   stack first. The message says so verbatim.
+/// - [`BindingValueSource::Local`] / [`BindingValueSource::WaitAlias`]
+///   / unknown — the existing "add a `wait` block" hint applies (or
+///   is at least not actively misleading).
+///
+/// Sibling case carina#3252 was a data-source binding whose read
+/// state was missing from the binding view; that bug was fixed
+/// upstream (see [`crate::binding_index::ResolvedBindings`]
+/// `layer_data_source_bindings`) so the apply path no longer reaches
+/// this function for a resolved data source. If a data-source binding
+/// *does* still reach this function (e.g. a read returned 0 rows for
+/// the queried key), it falls through to the generic message — same
+/// behavior as before.
+fn assert_fully_resolved(
+    value: &Value,
+    attribute_key: &str,
+    bindings: &ResolvedBindings,
+) -> Result<(), String> {
     match value {
         Value::Concrete(ConcreteValue::List(items)) => {
             for item in items {
-                assert_fully_resolved(item, attribute_key)?;
+                assert_fully_resolved(item, attribute_key, bindings)?;
             }
             Ok(())
         }
         Value::Concrete(ConcreteValue::Map(map)) => {
             for v in map.values() {
-                assert_fully_resolved(v, attribute_key)?;
+                assert_fully_resolved(v, attribute_key, bindings)?;
             }
             Ok(())
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            assert_fully_resolved(inner, attribute_key)
+            assert_fully_resolved(inner, attribute_key, bindings)
         }
-        Value::Deferred(DeferredValue::ResourceRef { path }) => Err(format!(
-            "attribute `{attribute_key}` references `{}` which has not been published yet by the upstream resource. \
-                 Add a `wait` block on the upstream binding to synchronize on this attribute before downstream resources read it.",
-            path.to_dot_string(),
+        Value::Deferred(DeferredValue::ResourceRef { path }) => Err(unresolved_binding_message(
+            attribute_key,
+            UnresolvedSite::Ref {
+                path: path.to_dot_string(),
+            },
+            path.binding(),
+            bindings,
         )),
-        Value::Deferred(DeferredValue::BindingRef { binding }) => Err(format!(
-            "attribute `{attribute_key}` references binding `{binding}` which has not been resolved at apply time. \
-                 Add a `wait` block on the upstream binding to synchronize before downstream resources read it.",
+        Value::Deferred(DeferredValue::BindingRef { binding }) => Err(unresolved_binding_message(
+            attribute_key,
+            UnresolvedSite::Ref {
+                path: binding.clone(),
+            },
+            binding,
+            bindings,
         )),
-        Value::Deferred(DeferredValue::Interpolation(_)) => Err(format!(
-            "attribute `{attribute_key}` contains an interpolation that did not fully resolve at apply time. \
-                 At least one referenced binding has not been published yet; add a `wait` block on the upstream attribute.",
-        )),
-        Value::Deferred(DeferredValue::FunctionCall { name, .. }) => Err(format!(
-            "attribute `{attribute_key}` calls function `{name}()` whose arguments did not fully resolve at apply time. \
-                 At least one referenced binding has not been published yet; add a `wait` block on the upstream attribute.",
-        )),
+        Value::Deferred(DeferredValue::Interpolation(_)) => {
+            let leaf = pick_unresolved_binding_for_diagnostic(value, bindings);
+            Err(unresolved_binding_message(
+                attribute_key,
+                UnresolvedSite::Interpolation,
+                leaf.unwrap_or(""),
+                bindings,
+            ))
+        }
+        Value::Deferred(DeferredValue::FunctionCall { name, .. }) => {
+            let leaf = pick_unresolved_binding_for_diagnostic(value, bindings);
+            Err(unresolved_binding_message(
+                attribute_key,
+                UnresolvedSite::FunctionCall { name: name.clone() },
+                leaf.unwrap_or(""),
+                bindings,
+            ))
+        }
         _ => Ok(()),
     }
+}
+
+/// Shape of the unresolved value at the leaf of the rejected
+/// attribute. Drives the per-shape opening of the error message while
+/// the remediation text is selected by binding kind.
+enum UnresolvedSite {
+    Ref { path: String },
+    Interpolation,
+    FunctionCall { name: String },
+}
+
+/// Build the kind-aware unresolved-binding error message.
+///
+/// `referenced_binding` is the name of the binding whose missing
+/// publish is the proximate cause of the failure. For container
+/// shapes (`Interpolation`, `FunctionCall`), the caller passes the
+/// first unresolved binding found by walking the value; an empty
+/// string means "no binding could be identified", which falls back to
+/// the generic remediation.
+fn unresolved_binding_message(
+    attribute_key: &str,
+    site: UnresolvedSite,
+    referenced_binding: &str,
+    bindings: &ResolvedBindings,
+) -> String {
+    let opener = match &site {
+        UnresolvedSite::Ref { path } => format!(
+            "attribute `{attribute_key}` references `{path}` which has not been published yet by the upstream binding."
+        ),
+        UnresolvedSite::Interpolation => format!(
+            "attribute `{attribute_key}` contains an interpolation that did not fully resolve at apply time."
+        ),
+        UnresolvedSite::FunctionCall { name } => format!(
+            "attribute `{attribute_key}` calls function `{name}()` whose arguments did not fully resolve at apply time."
+        ),
+    };
+
+    let remediation = match bindings.source(referenced_binding) {
+        Some(crate::binding_index::BindingValueSource::Upstream) => format!(
+            "Binding `{referenced_binding}` comes from an `upstream_state` block, but the referenced export is not present in the upstream's saved state. \
+             Apply the upstream stack first, then re-run apply here. \
+             A `wait` block cannot be used here — `wait` only synchronizes on attributes of managed resources in this configuration."
+        ),
+        _ => "At least one referenced binding has not been published yet; add a `wait` block on the upstream binding to synchronize before downstream resources read it.".to_string(),
+    };
+
+    format!("{opener} {remediation}")
+}
+
+/// Walk a value tree and return the first binding name found inside
+/// any unresolved [`DeferredValue`] (`ResourceRef`, `BindingRef`,
+/// nested `Interpolation`, nested `FunctionCall`).
+fn collect_unresolved_bindings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
+    use crate::resource::InterpolationPart;
+    match value {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => out.push(path.binding()),
+        Value::Deferred(DeferredValue::BindingRef { binding }) => out.push(binding.as_str()),
+        Value::Deferred(DeferredValue::Secret(inner)) => collect_unresolved_bindings(inner, out),
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+            for p in parts {
+                if let InterpolationPart::Expr(v) = p {
+                    collect_unresolved_bindings(v, out);
+                }
+            }
+        }
+        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+            for a in args {
+                collect_unresolved_bindings(a, out);
+            }
+        }
+        Value::Concrete(ConcreteValue::List(items)) => {
+            for v in items {
+                collect_unresolved_bindings(v, out);
+            }
+        }
+        Value::Concrete(ConcreteValue::Map(map)) => {
+            for v in map.values() {
+                collect_unresolved_bindings(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Pick the most actionable binding name to feature in the
+/// diagnostic when a container value (`Interpolation`, `FunctionCall`)
+/// holds multiple unresolved references.
+///
+/// Selection rule: an `upstream_state` binding (whose remediation is
+/// "apply the upstream stack first") takes priority over a local /
+/// wait-alias binding (whose remediation is `wait`). Mixing the two
+/// in a single interpolation is unusual but legal — preferring
+/// Upstream means the message points at the binding the operator
+/// must act on outside the current configuration, not the one
+/// `wait` could (in principle) address.
+fn pick_unresolved_binding_for_diagnostic<'a>(
+    value: &'a Value,
+    bindings: &ResolvedBindings,
+) -> Option<&'a str> {
+    let mut names = Vec::new();
+    collect_unresolved_bindings(value, &mut names);
+    names
+        .iter()
+        .copied()
+        .find(|name| {
+            matches!(
+                bindings.source(name),
+                Some(crate::binding_index::BindingValueSource::Upstream)
+            )
+        })
+        .or_else(|| names.first().copied())
 }
 
 /// Recursively unwrap `Value::Deferred(DeferredValue::Secret(inner))` to just the inner value.
@@ -554,11 +709,15 @@ pub(super) async fn execute_basic_effect<'a>(
 #[cfg(test)]
 mod assert_fully_resolved_tests {
     //! Unit-level coverage of the apply-time fail-fast contract added
-    //! for carina#3032. The end-to-end executor variant lives at
+    //! for carina#3032 (the "did not resolve at apply" matrix) and
+    //! the kind-aware diagnostic added for carina#3334 (upstream_state
+    //! binding gets a remediation that is actually actionable, not
+    //! `wait`). The end-to-end executor variant lives at
     //! `executor::tests::test_chained_index_then_field_unresolved_at_apply_fails_with_clear_error`;
     //! these tests cover the deferred-variant matrix without going
     //! through the executor + mock provider scaffolding.
     use super::*;
+    use crate::binding_index::{BindingValueSource, ResolvedBindings};
     use crate::resource::{
         AccessPath, ConcreteValue, DeferredValue, InterpolationPart, PathSegment, Subscript,
         UnknownReason, Value,
@@ -580,11 +739,25 @@ mod assert_fully_resolved_tests {
         Value::Deferred(DeferredValue::ResourceRef { path })
     }
 
+    fn bindings_with(name: &str, source: BindingValueSource) -> ResolvedBindings {
+        let mut b = ResolvedBindings::default();
+        b.set(name, HashMap::new(), source);
+        b
+    }
+
+    fn empty_bindings() -> ResolvedBindings {
+        ResolvedBindings::default()
+    }
+
     #[test]
     fn concrete_value_is_fully_resolved() {
         assert!(
-            assert_fully_resolved(&Value::Concrete(ConcreteValue::String("ok".into())), "name",)
-                .is_ok()
+            assert_fully_resolved(
+                &Value::Concrete(ConcreteValue::String("ok".into())),
+                "name",
+                &empty_bindings(),
+            )
+            .is_ok()
         );
     }
 
@@ -595,12 +768,12 @@ mod assert_fully_resolved_tests {
         // re-resolution sweeps and must not be rejected by the local
         // fail-fast.
         let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue));
-        assert!(assert_fully_resolved(&v, "name").is_ok());
+        assert!(assert_fully_resolved(&v, "name", &empty_bindings()).is_ok());
     }
 
     #[test]
     fn direct_chained_resource_ref_is_rejected_with_path_and_wait_hint() {
-        let err = assert_fully_resolved(&dvo_chained_ref(), "name")
+        let err = assert_fully_resolved(&dvo_chained_ref(), "name", &empty_bindings())
             .expect_err("direct ResourceRef must be rejected at apply seam");
         assert!(
             err.contains("cert.domain_validation_options[0].resource_record_value"),
@@ -617,7 +790,7 @@ mod assert_fully_resolved_tests {
         // The exact carina#3032 failing form: `resource_records =
         // [cert.dvo[0].rrv]`. The list literal must be walked.
         let v = Value::Concrete(ConcreteValue::List(vec![dvo_chained_ref()]));
-        let err = assert_fully_resolved(&v, "resource_records")
+        let err = assert_fully_resolved(&v, "resource_records", &empty_bindings())
             .expect_err("list-wrapped ResourceRef must be rejected");
         assert!(err.contains("resource_record_value"), "got: {err}");
     }
@@ -626,8 +799,12 @@ mod assert_fully_resolved_tests {
     fn map_wrapped_chained_ref_is_rejected() {
         let mut m: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
         m.insert("nested".to_string(), dvo_chained_ref());
-        let err = assert_fully_resolved(&Value::Concrete(ConcreteValue::Map(m)), "tags")
-            .expect_err("map-wrapped ResourceRef must be rejected");
+        let err = assert_fully_resolved(
+            &Value::Concrete(ConcreteValue::Map(m)),
+            "tags",
+            &empty_bindings(),
+        )
+        .expect_err("map-wrapped ResourceRef must be rejected");
         assert!(err.contains("resource_record_value"), "got: {err}");
     }
 
@@ -637,7 +814,7 @@ mod assert_fully_resolved_tests {
         // secret tag would survive but the ref would still be
         // unresolved at the WASM boundary.
         let v = Value::Deferred(DeferredValue::Secret(Box::new(dvo_chained_ref())));
-        let err = assert_fully_resolved(&v, "password")
+        let err = assert_fully_resolved(&v, "password", &empty_bindings())
             .expect_err("Secret wrapping does not exempt unresolved refs");
         assert!(err.contains("resource_record_value"), "got: {err}");
     }
@@ -647,8 +824,8 @@ mod assert_fully_resolved_tests {
         let v = Value::Deferred(DeferredValue::BindingRef {
             binding: "vpc".to_string(),
         });
-        let err =
-            assert_fully_resolved(&v, "vpc_id").expect_err("bare BindingRef must be rejected");
+        let err = assert_fully_resolved(&v, "vpc_id", &empty_bindings())
+            .expect_err("bare BindingRef must be rejected");
         assert!(err.contains("vpc"), "got: {err}");
         assert!(err.contains("wait"), "got: {err}");
     }
@@ -659,7 +836,7 @@ mod assert_fully_resolved_tests {
             InterpolationPart::Literal("prefix-".to_string()),
             InterpolationPart::Expr(dvo_chained_ref()),
         ]));
-        let err = assert_fully_resolved(&v, "name")
+        let err = assert_fully_resolved(&v, "name", &empty_bindings())
             .expect_err("Interpolation that did not collapse must be rejected");
         assert!(err.contains("interpolation"), "got: {err}");
     }
@@ -670,8 +847,155 @@ mod assert_fully_resolved_tests {
             name: "concat".to_string(),
             args: vec![dvo_chained_ref()],
         });
-        let err = assert_fully_resolved(&v, "name")
+        let err = assert_fully_resolved(&v, "name", &empty_bindings())
             .expect_err("FunctionCall that did not evaluate must be rejected");
         assert!(err.contains("concat"), "got: {err}");
+    }
+
+    // -------------------------------------------------------------
+    // carina#3334: kind-aware remediation for `upstream_state`
+    // bindings. The pre-fix message proposed a `wait` block, which
+    // is structurally inapplicable to upstream_state reads — `wait`
+    // synchronizes on managed-resource lifecycles in *this* config.
+    // -------------------------------------------------------------
+
+    /// `infra.cloudfront_distribution_id` where `infra` is an
+    /// `upstream_state` binding whose owning stack has not been
+    /// applied yet (the export is absent from the upstream's saved
+    /// state). The diagnostic must point at "apply the upstream
+    /// stack first", not at `wait`.
+    #[test]
+    fn resource_ref_to_upstream_state_binding_does_not_suggest_wait() {
+        let path = AccessPath::with_segments("infra", "cloudfront_distribution_id", vec![]);
+        let v = Value::Deferred(DeferredValue::ResourceRef { path });
+        let bindings = bindings_with("infra", BindingValueSource::Upstream);
+
+        let err = assert_fully_resolved(&v, "policy_document", &bindings)
+            .expect_err("ResourceRef against unpublished upstream_state must be rejected");
+
+        assert!(
+            !err.contains("Add a `wait` block")
+                && !err.contains("add a `wait` block on the upstream binding"),
+            "upstream_state remediation must not suggest a `wait` block; got: {err}",
+        );
+        assert!(
+            err.contains("upstream_state") && err.contains("Apply the upstream stack first"),
+            "upstream_state remediation must name `upstream_state` and tell the user to apply the upstream stack first; got: {err}",
+        );
+        assert!(
+            err.contains("infra"),
+            "error must name the upstream binding; got: {err}",
+        );
+    }
+
+    /// The exact failing form from carina#3334's apply trace: an
+    /// interpolation that did not collapse, whose unresolved part
+    /// reaches an upstream_state binding through an argument /
+    /// `let` chain.
+    #[test]
+    fn interpolation_into_upstream_state_binding_does_not_suggest_wait() {
+        let path = AccessPath::with_segments("infra", "cloudfront_distribution_id", vec![]);
+        let v = Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Literal("arn:aws:cloudfront::123:distribution/".to_string()),
+            InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef { path })),
+        ]));
+        let bindings = bindings_with("infra", BindingValueSource::Upstream);
+
+        let err = assert_fully_resolved(&v, "policy_document", &bindings)
+            .expect_err("Interpolation containing upstream_state ref must be rejected");
+
+        assert!(
+            !err.contains("Add a `wait` block")
+                && !err.contains("add a `wait` block on the upstream"),
+            "interpolation-with-upstream_state must not suggest `wait`; got: {err}",
+        );
+        assert!(
+            err.contains("upstream_state") && err.contains("Apply the upstream stack first"),
+            "upstream_state remediation expected; got: {err}",
+        );
+    }
+
+    /// `BindingRef` (bare alias, not a path) against an
+    /// upstream_state binding must also get the upstream-aware
+    /// remediation.
+    #[test]
+    fn binding_ref_to_upstream_state_binding_does_not_suggest_wait() {
+        let v = Value::Deferred(DeferredValue::BindingRef {
+            binding: "infra".to_string(),
+        });
+        let bindings = bindings_with("infra", BindingValueSource::Upstream);
+
+        let err = assert_fully_resolved(&v, "policy_document", &bindings)
+            .expect_err("BindingRef against upstream_state binding must be rejected");
+
+        assert!(
+            !err.contains("Add a `wait` block")
+                && !err.contains("add a `wait` block on the upstream"),
+            "upstream_state BindingRef must not suggest `wait`; got: {err}",
+        );
+        assert!(
+            err.contains("upstream_state"),
+            "remediation must name `upstream_state`; got: {err}",
+        );
+    }
+
+    /// An interpolation whose parts reference both a local
+    /// managed-resource binding and an `upstream_state` binding must
+    /// surface the upstream-state remediation: that is the binding
+    /// the operator must address outside the current configuration,
+    /// and `wait` (the local-binding remediation) cannot fix it.
+    #[test]
+    fn interpolation_with_mixed_bindings_prefers_upstream_state_remediation() {
+        let local_path = AccessPath::with_segments("cert", "domain_validation_options", vec![]);
+        let upstream_path =
+            AccessPath::with_segments("infra", "cloudfront_distribution_id", vec![]);
+        let v = Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
+                path: local_path,
+            })),
+            InterpolationPart::Literal("-".to_string()),
+            InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
+                path: upstream_path,
+            })),
+        ]));
+
+        let mut bindings = ResolvedBindings::default();
+        bindings.set("cert", HashMap::new(), BindingValueSource::Local);
+        bindings.set("infra", HashMap::new(), BindingValueSource::Upstream);
+
+        let err = assert_fully_resolved(&v, "policy_document", &bindings)
+            .expect_err("Interpolation with unresolved upstream ref must be rejected");
+
+        assert!(
+            err.contains("upstream_state") && err.contains("Apply the upstream stack first"),
+            "mixed-binding remediation must point at upstream_state; got: {err}",
+        );
+        assert!(
+            err.contains("infra"),
+            "remediation must name the upstream binding (`infra`); got: {err}",
+        );
+    }
+
+    /// Sanity check: when the referenced binding is a *local*
+    /// managed-resource binding (the original carina#3032 scenario),
+    /// the existing `wait`-block remediation must still appear —
+    /// the kind-aware branch only kicks in for `Upstream`.
+    #[test]
+    fn local_binding_keeps_existing_wait_block_hint() {
+        let path = AccessPath::with_segments("cert", "domain_validation_options", vec![]);
+        let v = Value::Deferred(DeferredValue::ResourceRef { path });
+        let bindings = bindings_with("cert", BindingValueSource::Local);
+
+        let err = assert_fully_resolved(&v, "resource_records", &bindings)
+            .expect_err("Local ResourceRef must still be rejected with wait hint");
+
+        assert!(
+            err.contains("wait"),
+            "local-binding error must still mention `wait`; got: {err}",
+        );
+        assert!(
+            !err.contains("upstream_state"),
+            "local-binding error must not invoke upstream_state wording; got: {err}",
+        );
     }
 }
