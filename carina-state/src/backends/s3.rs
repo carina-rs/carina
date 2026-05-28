@@ -81,6 +81,24 @@ impl S3Backend {
         ))
     }
 
+    /// Construct an `S3Backend` from a bucket + key pair, resolving the
+    /// region through the AWS SDK default chain.
+    ///
+    /// This is the URL-addressed entry point (carina#3336): it goes
+    /// through the same region resolution and SDK client construction
+    /// as [`Self::from_config`] but skips the `BackendConfig` round-trip
+    /// that callers without a DSL `backend { ... }` block would otherwise
+    /// have to fabricate. `auto_create` is forced off — a read-only URL
+    /// lookup must never create infrastructure as a side effect.
+    /// `encrypt` is left at the production default (`true`) so any future
+    /// fallback write would match `from_config`'s behavior.
+    pub async fn from_url_parts(bucket: String, key: String) -> BackendResult<Self> {
+        let sdk_region = sdk_chain_region().await;
+        let region = resolve_region(None, sdk_region.as_deref())?;
+        let client = build_s3_client(&region).await;
+        Ok(Self::from_client(client, bucket, key, region, true, false))
+    }
+
     /// Construct an `S3Backend` over a caller-supplied `aws_sdk_s3::Client`.
     ///
     /// `from_config` is the production entry point — it resolves the

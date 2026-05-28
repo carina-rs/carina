@@ -101,6 +101,46 @@ async fn init_auto_creates_bucket_and_seeds_empty_state() {
     );
 }
 
+// carina#3336: end-to-end exercise of `--state-url s3://...`'s
+// happy path. Seeds an object into the in-process mock S3, reads it
+// back through the same `S3Backend::read_state` + LoadedState→StateFile
+// path that `load_state_from_url` walks for the `StateUrl::S3` arm. The
+// only difference between this test's setup and the production URL
+// loader is which `aws_sdk_s3::Client` is in the backend
+// (winterbaume-mocked here, SDK-default-chain-built in production —
+// the URL parsing + region/SDK resolution are covered by url.rs's
+// unit tests). Together they pin the full S3 read path.
+#[tokio::test]
+async fn url_loader_s3_path_reads_seeded_state() {
+    let (backend, raw_client) = mock_backend_with_client().await;
+    backend.init().await.unwrap();
+
+    let mut seeded = StateFile::new();
+    seeded.increment_serial();
+    seeded.lineage = "test-state-url-s3-loader".to_string();
+    let bytes = carina_core::utils::pretty_with_newline_bytes(&seeded).unwrap();
+
+    raw_client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key(TEST_KEY)
+        .body(ByteStream::from(bytes))
+        .send()
+        .await
+        .unwrap();
+
+    // Replicates the body of `load_state_from_url` for the `StateUrl::S3`
+    // arm: read_state, unwrap into_state, error on None.
+    let loaded = backend
+        .read_state()
+        .await
+        .unwrap()
+        .expect("seeded object should be readable")
+        .into_state();
+    assert_eq!(loaded.serial, seeded.serial);
+    assert_eq!(loaded.lineage, seeded.lineage);
+}
+
 #[tokio::test]
 async fn write_then_read_state_round_trips() {
     let backend = mock_backend().await;
