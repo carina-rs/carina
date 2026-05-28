@@ -1,0 +1,60 @@
+{
+  "version": 7,
+  "serial": 3,
+  "lineage": "test-lineage-state-lookup-modules",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "cloudfront.Distribution",
+      "name": "r-distribution",
+      "provider": "awscc",
+      "identifier": "E2E954VKWYKT8K",
+      "attributes": {
+        "id": "E2E954VKWYKT8K",
+        "domain_name": "d123abc.cloudfront.net"
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "r.distribution",
+      "dependency_bindings": []
+    },
+    {
+      "resource_type": "route53.HostedZone",
+      "name": "r-zone",
+      "provider": "awscc",
+      "identifier": "Z008131930MO3U3NYWJTM",
+      "attributes": {
+        "id": "Z008131930MO3U3NYWJTM",
+        "name": "registry-dev.carina-rs.dev."
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "r.zone",
+      "dependency_bindings": []
+    },
+    {
+      "resource_type": "s3.Bucket",
+      "name": "registry-bucket",
+      "provider": "awscc",
+      "identifier": "registry-content-dev",
+      "attributes": {
+        "bucket_name": "registry-content-dev"
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "r.bucket",
+      "dependency_bindings": []
+    }
+  ],
+  "exports": {
+    "cloudfront_distribution_id": "E2E954VKWYKT8K",
+    "zone_id": "Z008131930MO3U3NYWJTM",
+    "nameservers": ["ns-1234.awsdns-12.com", "ns-5678.awsdns-56.net"]
+  }
+}
