@@ -3,12 +3,12 @@
 //! These helpers extract the pure computation logic (no formatting/coloring)
 //! that is shared between CLI and TUI frontends.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use indexmap::IndexMap;
 
 use crate::resource::Value;
-use crate::schema::{AttributeType, ResourceSchema};
+use crate::schema::{AttributeType, ResourceSchema, empty_defs};
 
 /// Schema-aware value equality shared by the plan renderer
 /// (`detail_rows`) and the unchanged-count helper below (carina#3073).
@@ -28,9 +28,10 @@ pub(crate) fn schema_aware_equal(
     old: &Value,
     new: &Value,
     attr_type: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
 ) -> bool {
     match attr_type {
-        Some(t) => crate::differ::type_aware_equal(old, new, Some(t), None),
+        Some(t) => crate::differ::type_aware_equal(old, new, Some(t), defs, None),
         None => old.semantically_equal(new),
     }
 }
@@ -56,6 +57,7 @@ pub fn compute_unchanged_count(
     exclude: Option<&std::collections::HashSet<&str>>,
     schema: Option<&ResourceSchema>,
 ) -> usize {
+    let defs: &BTreeMap<String, AttributeType> = schema.map(|s| &s.defs).unwrap_or(empty_defs());
     from_attrs
         .iter()
         .filter(|(k, v)| {
@@ -67,7 +69,7 @@ pub fn compute_unchanged_count(
                         let attr_type = schema
                             .and_then(|s| s.attributes.get(k.as_str()))
                             .map(|a| &a.attr_type);
-                        schema_aware_equal(nv, v, attr_type)
+                        schema_aware_equal(nv, v, attr_type, defs)
                     })
                     .unwrap_or(false)
         })

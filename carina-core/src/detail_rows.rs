@@ -12,7 +12,7 @@ use crate::diff_helpers::{compute_map_diff, compute_unchanged_count, schema_awar
 use crate::effect::Effect;
 use crate::non_empty::NonEmptyVec;
 use crate::resource::{ConcreteValue, DeferredValue, ResourceId, Value};
-use crate::schema::{AttributeType, ResourceSchema, SchemaRegistry};
+use crate::schema::{AttributeType, ResourceSchema, SchemaRegistry, empty_defs};
 use crate::value::{format_value, format_value_with_key, is_list_of_maps, map_similarity};
 
 /// Controls how much detail is shown in plan output.
@@ -586,6 +586,7 @@ fn build_update_rows(
     explicit: Option<&crate::explicit::ExplicitFields>,
 ) -> Vec<DetailRow> {
     let mut rows = Vec::new();
+    let defs = schema.map(|s| &s.defs).unwrap_or(empty_defs());
 
     // Project `from.attributes` through the user-authoring tree so
     // server-side default fields the user never wrote don't inflate
@@ -630,7 +631,7 @@ fn build_update_rows(
         // Struct/List/Map internally and returns true, so no row is
         // built at all and sites 3/4/5 never run for this attribute.
         let is_same = old_value
-            .map(|ov| schema_aware_equal(ov, new_value, attr_type))
+            .map(|ov| schema_aware_equal(ov, new_value, attr_type, defs))
             .unwrap_or(false);
 
         if is_same {
@@ -638,12 +639,12 @@ fn build_update_rows(
         }
 
         if is_list_of_maps(new_value) {
-            match build_list_of_maps_diff_row(key, old_value, new_value, attr_type, detail) {
+            match build_list_of_maps_diff_row(key, old_value, new_value, attr_type, defs, detail) {
                 Some(row) => rows.push(row),
                 None => effectively_unchanged += 1,
             }
         } else if should_render_as_map_diff(old_value, new_value) {
-            match build_map_diff_row(key, old_value, new_value, attr_type, detail) {
+            match build_map_diff_row(key, old_value, new_value, attr_type, defs, detail) {
                 Some(row) => rows.push(row),
                 None => effectively_unchanged += 1,
             }
@@ -748,6 +749,7 @@ fn build_replace_rows(
     explicit: Option<&crate::explicit::ExplicitFields>,
 ) -> Vec<DetailRow> {
     let mut rows = Vec::new();
+    let defs = schema.map(|s| &s.defs).unwrap_or(empty_defs());
 
     // Show changed create-only attributes
     let mut keys: Vec<_> = changed_create_only
@@ -764,7 +766,7 @@ fn build_replace_rows(
             .map(|a| &a.attr_type);
         // Site 2 (carina#3073): schema-aware, mirrors site 1.
         let is_same = old_value
-            .map(|ov| schema_aware_equal(ov, new_value, attr_type))
+            .map(|ov| schema_aware_equal(ov, new_value, attr_type, defs))
             .unwrap_or(false);
 
         if is_same {
@@ -784,7 +786,7 @@ fn build_replace_rows(
             });
         } else if is_list_of_maps(new_value) {
             let (unchanged, modified, added, removed) =
-                compute_list_of_maps_diff_parts(old_value, new_value, attr_type, detail);
+                compute_list_of_maps_diff_parts(old_value, new_value, attr_type, defs, detail);
             rows.push(DetailRow::ReplaceListOfMapsDiff {
                 key: key.to_string(),
                 unchanged,
@@ -793,7 +795,7 @@ fn build_replace_rows(
                 removed,
             });
         } else if should_render_as_map_diff(old_value, new_value) {
-            let entries = compute_map_diff_entries(old_value, new_value, attr_type, detail);
+            let entries = compute_map_diff_entries(old_value, new_value, attr_type, defs, detail);
             rows.push(DetailRow::ReplaceMapDiff {
                 key: key.to_string(),
                 entries,
@@ -982,10 +984,11 @@ fn build_map_diff_row(
     old_value: Option<&Value>,
     new_value: &Value,
     attr_type: Option<&AttributeType>,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
     detail: DetailLevel,
 ) -> Option<DetailRow> {
     let entries = NonEmptyVec::from_vec(compute_map_diff_entries(
-        old_value, new_value, attr_type, detail,
+        old_value, new_value, attr_type, defs, detail,
     ))?;
     Some(DetailRow::MapDiff {
         key: key.to_string(),
@@ -997,6 +1000,7 @@ fn compute_map_diff_entries(
     old_value: Option<&Value>,
     new_value: &Value,
     attr_type: Option<&AttributeType>,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
     detail: DetailLevel,
 ) -> Vec<MapDiffEntryIR> {
     let new_map = match new_value {
@@ -1041,7 +1045,7 @@ fn compute_map_diff_entries(
                     matches!(&e.new_value, Value::Concrete(ConcreteValue::Map(_)))
                         || is_list_of_maps(&e.new_value);
                 if !is_recursed_container
-                    && schema_aware_equal(&e.old_value, &e.new_value, entry_type)
+                    && schema_aware_equal(&e.old_value, &e.new_value, entry_type, defs)
                 {
                     continue;
                 }
@@ -1053,6 +1057,7 @@ fn compute_map_diff_entries(
                         Some(&e.old_value),
                         &e.new_value,
                         entry_type,
+                        defs,
                         detail,
                     );
                     // #2910: `from_vec` returns None for the all-empty
@@ -1071,6 +1076,7 @@ fn compute_map_diff_entries(
                         Some(&e.old_value),
                         &e.new_value,
                         entry_type,
+                        defs,
                         detail,
                     );
                     // #2910: `from_parts` returns None when every
@@ -1146,10 +1152,11 @@ fn build_list_of_maps_diff_row(
     old_value: Option<&Value>,
     new_value: &Value,
     attr_type: Option<&AttributeType>,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
     detail: DetailLevel,
 ) -> Option<DetailRow> {
     let (unchanged, modified, added, removed) =
-        compute_list_of_maps_diff_parts(old_value, new_value, attr_type, detail);
+        compute_list_of_maps_diff_parts(old_value, new_value, attr_type, defs, detail);
     if unchanged.is_empty() && modified.is_empty() && added.is_empty() && removed.is_empty() {
         return None;
     }
@@ -1166,6 +1173,7 @@ fn compute_list_of_maps_diff_parts(
     old_value: Option<&Value>,
     new_value: &Value,
     attr_type: Option<&AttributeType>,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
     detail: DetailLevel,
 ) -> (
     Vec<String>,
@@ -1200,7 +1208,7 @@ fn compute_list_of_maps_diff_parts(
     // being reported as removed+added.
     for (ni, new_item) in new_items.iter().enumerate() {
         for (oi, old_item) in old_items.iter().enumerate() {
-            if !old_matched[oi] && schema_aware_equal(old_item, new_item, item_type) {
+            if !old_matched[oi] && schema_aware_equal(old_item, new_item, item_type, defs) {
                 old_matched[oi] = true;
                 new_matched[ni] = true;
                 break;
@@ -1295,7 +1303,7 @@ fn compute_list_of_maps_diff_parts(
                 let field_type = map_entry_subtype(item_type, k);
                 let field_same = old_map
                     .get(k)
-                    .map(|ov| schema_aware_equal(ov, &new_map[k], field_type))
+                    .map(|ov| schema_aware_equal(ov, &new_map[k], field_type, defs))
                     .unwrap_or(false);
                 if field_same {
                     // #2881: drop unchanged fields from the IR; renderers
@@ -1308,7 +1316,8 @@ fn compute_list_of_maps_diff_parts(
                 if matches!(old_val, Some(Value::Concrete(ConcreteValue::Map(_))))
                     && matches!(&new_map[k], Value::Concrete(ConcreteValue::Map(_)))
                 {
-                    let nested = compute_map_diff_entries(old_val, &new_map[k], field_type, detail);
+                    let nested =
+                        compute_map_diff_entries(old_val, &new_map[k], field_type, defs, detail);
                     // carina#3258: when every nested entry was
                     // suppressed (display-equal phantom or
                     // schema-aware leaf-skip), the parent header alone
@@ -1502,7 +1511,23 @@ fn string_list_inner_type(attr_type: &AttributeType) -> Option<&AttributeType> {
     match attr_type {
         AttributeType::List { inner, .. } => Some(inner),
         AttributeType::Union(members) => members.iter().find_map(string_list_inner_type),
-        _ => None,
+        // `AttributeType::Ref` (carina#3340): in CFN-derived schemas
+        // the resolved target is a `Struct`, never a `List<String>`.
+        // Returning `None` is the safe answer and keeps the helper
+        // free of a `defs` dependency. A future schema that uses
+        // `Ref` for list shapes would need to thread `&defs` and
+        // resolve here.
+        AttributeType::Ref(_) => None,
+        AttributeType::String
+        | AttributeType::Int
+        | AttributeType::Float
+        | AttributeType::Bool
+        | AttributeType::Duration
+        | AttributeType::StringEnum { .. }
+        | AttributeType::Custom { .. }
+        | AttributeType::CustomEnum { .. }
+        | AttributeType::Map { .. }
+        | AttributeType::Struct { .. } => None,
     }
 }
 
@@ -2763,8 +2788,13 @@ mod tests {
             Value::Concrete(ConcreteValue::Map(new_admin)),
         ]));
 
-        let (_unchanged, modified, _added, _removed) =
-            compute_list_of_maps_diff_parts(Some(&old_value), &new_value, None, DetailLevel::Full);
+        let (_unchanged, modified, _added, _removed) = compute_list_of_maps_diff_parts(
+            Some(&old_value),
+            &new_value,
+            None,
+            crate::schema::empty_defs(),
+            DetailLevel::Full,
+        );
 
         // The paired OIDC element must NOT report `action` as Changed:
         // both sides render to the same `["sts:AssumeRoleWithWebIdentity"]`
@@ -2822,8 +2852,13 @@ mod tests {
         let old_value = Value::Concrete(ConcreteValue::Map(old_principal));
         let new_value = Value::Concrete(ConcreteValue::Map(new_principal));
 
-        let entries =
-            compute_map_diff_entries(Some(&old_value), &new_value, None, DetailLevel::Full);
+        let entries = compute_map_diff_entries(
+            Some(&old_value),
+            &new_value,
+            None,
+            crate::schema::empty_defs(),
+            DetailLevel::Full,
+        );
 
         for entry in &entries {
             if let MapDiffEntryIR::Changed { key, old, new } = entry {
@@ -2987,8 +3022,13 @@ mod tests {
             ConcreteValue::Map(new_stmt),
         )]));
 
-        let (_unchanged, modified, _added, _removed) =
-            compute_list_of_maps_diff_parts(Some(&old_value), &new_value, None, DetailLevel::Full);
+        let (_unchanged, modified, _added, _removed) = compute_list_of_maps_diff_parts(
+            Some(&old_value),
+            &new_value,
+            None,
+            crate::schema::empty_defs(),
+            DetailLevel::Full,
+        );
 
         for m in &modified {
             for field in m.fields.as_slice() {
@@ -3026,8 +3066,13 @@ mod tests {
         );
         let old_value = Value::Concrete(ConcreteValue::Map(old_map));
         let new_value = Value::Concrete(ConcreteValue::Map(new_map));
-        let entries =
-            compute_map_diff_entries(Some(&old_value), &new_value, None, DetailLevel::Full);
+        let entries = compute_map_diff_entries(
+            Some(&old_value),
+            &new_value,
+            None,
+            crate::schema::empty_defs(),
+            DetailLevel::Full,
+        );
         assert!(
             entries.iter().any(|e| matches!(
                 e,
@@ -3083,8 +3128,13 @@ mod tests {
             ConcreteValue::Map(new_stmt),
         )]));
 
-        let (_unchanged, modified, _added, _removed) =
-            compute_list_of_maps_diff_parts(Some(&old_value), &new_value, None, DetailLevel::Full);
+        let (_unchanged, modified, _added, _removed) = compute_list_of_maps_diff_parts(
+            Some(&old_value),
+            &new_value,
+            None,
+            crate::schema::empty_defs(),
+            DetailLevel::Full,
+        );
 
         let password_changed = modified.iter().any(|m| {
             m.fields

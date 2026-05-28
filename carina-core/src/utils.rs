@@ -695,6 +695,21 @@ pub fn resolve_enum_value(value: &Value, parts: &NamespacedEnumParts<'_>) -> Opt
 /// }
 /// ```
 pub fn resolve_enum_value_recursive(value: &Value, attr_type: &AttributeType) -> Option<Value> {
+    resolve_enum_value_recursive_with_defs(value, attr_type, crate::schema::empty_defs())
+}
+
+/// Same as [`resolve_enum_value_recursive`] but takes the enclosing
+/// [`ResourceSchema::defs`] map so cyclic CFN definitions
+/// (`AttributeType::Ref`) can be followed during the type walk
+/// (carina#3340). Callers that hold a resource schema should prefer
+/// this entry point so a `Ref` chain inside a value tree (e.g. WAFv2
+/// `WebACL.Statement -> AndStatement -> List<Statement>`) doesn't
+/// silently lose enum normalization on the recursed cycle.
+pub fn resolve_enum_value_recursive_with_defs(
+    value: &Value,
+    attr_type: &AttributeType,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> Option<Value> {
     // First, try the leaf case: this position is itself an enum.
     if let Some(parts) = attr_type.namespaced_enum_parts()
         && let Some(resolved) = resolve_enum_value(value, &parts)
@@ -712,7 +727,7 @@ pub fn resolve_enum_value_recursive(value: &Value, attr_type: &AttributeType) ->
             for field in fields {
                 if let Some(field_value) = map.get(&field.name)
                     && let Some(new_field) =
-                        resolve_enum_value_recursive(field_value, &field.field_type)
+                        resolve_enum_value_recursive_with_defs(field_value, &field.field_type, defs)
                 {
                     rewritten.insert(field.name.clone(), new_field);
                     changed = true;
@@ -727,7 +742,7 @@ pub fn resolve_enum_value_recursive(value: &Value, attr_type: &AttributeType) ->
             let mut rewritten = items.clone();
             let mut changed = false;
             for (i, item) in items.iter().enumerate() {
-                if let Some(new_item) = resolve_enum_value_recursive(item, inner) {
+                if let Some(new_item) = resolve_enum_value_recursive_with_defs(item, inner, defs) {
                     rewritten[i] = new_item;
                     changed = true;
                 }
@@ -741,12 +756,21 @@ pub fn resolve_enum_value_recursive(value: &Value, attr_type: &AttributeType) ->
             let mut rewritten = map.clone();
             let mut changed = false;
             for (k, v) in map {
-                if let Some(new_v) = resolve_enum_value_recursive(v, inner) {
+                if let Some(new_v) = resolve_enum_value_recursive_with_defs(v, inner, defs) {
                     rewritten.insert(k.clone(), new_v);
                     changed = true;
                 }
             }
             changed.then_some(Value::Concrete(ConcreteValue::Map(rewritten)))
+        }
+        // `Ref`: follow the named target in the schema's def map and
+        // continue the walk. Without this arm a cyclic schema would
+        // silently drop enum normalization at every cycle point
+        // (carina#3340). `resolve_refs` panics on a missing def name
+        // (schema invariant violation).
+        AttributeType::Ref(_) => {
+            let resolved = attr_type.resolve_refs(defs);
+            resolve_enum_value_recursive_with_defs(value, resolved, defs)
         }
         // Scalars and Union: nothing to descend into.
         _ => None,
@@ -807,7 +831,8 @@ pub fn lift_state_string_enums_to_identifiers(
 ) {
     for (name, attr) in &schema.attributes {
         if let Some(value) = attributes.get(name)
-            && let Some(lifted) = lift_string_enum_leaves(value, &attr.attr_type)
+            && let Some(lifted) =
+                lift_string_enum_leaves_with_defs(value, &attr.attr_type, &schema.defs)
         {
             attributes.insert(name.clone(), lifted);
         }
@@ -911,6 +936,19 @@ pub fn lift_current_state_string_enums_for_data_sources(
 /// [`resolve_enum_value_recursive`]'s "rewrite only on diff" contract so
 /// callers can skip cloning.
 pub fn lift_string_enum_leaves(value: &Value, attr_type: &AttributeType) -> Option<Value> {
+    lift_string_enum_leaves_with_defs(value, attr_type, crate::schema::empty_defs())
+}
+
+/// Same as [`lift_string_enum_leaves`] but takes the enclosing
+/// [`ResourceSchema::defs`] map so cyclic CFN definitions
+/// (`AttributeType::Ref`) are followed during the value walk
+/// (carina#3340). Callers that hold a resource schema should prefer
+/// this entry point.
+pub fn lift_string_enum_leaves_with_defs(
+    value: &Value,
+    attr_type: &AttributeType,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> Option<Value> {
     // Leaf case: this position is itself a StringEnum.
     if let Some((_, values, _, dsl_map)) = attr_type.string_enum_parts() {
         if let Value::Concrete(ConcreteValue::String(s)) = value {
@@ -944,7 +982,8 @@ pub fn lift_string_enum_leaves(value: &Value, attr_type: &AttributeType) -> Opti
             let mut changed = false;
             for field in fields {
                 if let Some(field_value) = map.get(&field.name)
-                    && let Some(new_field) = lift_string_enum_leaves(field_value, &field.field_type)
+                    && let Some(new_field) =
+                        lift_string_enum_leaves_with_defs(field_value, &field.field_type, defs)
                 {
                     rewritten.insert(field.name.clone(), new_field);
                     changed = true;
@@ -959,7 +998,7 @@ pub fn lift_string_enum_leaves(value: &Value, attr_type: &AttributeType) -> Opti
             let mut rewritten = items.clone();
             let mut changed = false;
             for (i, item) in items.iter().enumerate() {
-                if let Some(new_item) = lift_string_enum_leaves(item, inner) {
+                if let Some(new_item) = lift_string_enum_leaves_with_defs(item, inner, defs) {
                     rewritten[i] = new_item;
                     changed = true;
                 }
@@ -973,12 +1012,18 @@ pub fn lift_string_enum_leaves(value: &Value, attr_type: &AttributeType) -> Opti
             let mut rewritten = map.clone();
             let mut changed = false;
             for (k, v) in map {
-                if let Some(new_v) = lift_string_enum_leaves(v, inner) {
+                if let Some(new_v) = lift_string_enum_leaves_with_defs(v, inner, defs) {
                     rewritten.insert(k.clone(), new_v);
                     changed = true;
                 }
             }
             changed.then_some(Value::Concrete(ConcreteValue::Map(rewritten)))
+        }
+        // `Ref`: resolve via defs and continue. See sibling note in
+        // `resolve_enum_value_recursive_with_defs` (carina#3340).
+        AttributeType::Ref(_) => {
+            let resolved = attr_type.resolve_refs(defs);
+            lift_string_enum_leaves_with_defs(value, resolved, defs)
         }
         // Scalars and Union: nothing to descend into.
         _ => None,

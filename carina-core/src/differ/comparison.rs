@@ -1,12 +1,12 @@
 //! Type-aware comparison logic for diffing resource attributes.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use indexmap::IndexMap;
 
 use crate::explicit::{self, ExplicitFields};
 use crate::resource::{ConcreteValue, DeferredValue, ResourceId, Value, merge_with_saved};
-use crate::schema::{AttributeType, ResourceSchema};
+use crate::schema::{AttributeType, ResourceSchema, empty_defs};
 use crate::value::{SECRET_PREFIX, SecretHashContext, argon2id_hash, value_to_json_with_context};
 
 /// Type-aware semantic comparison of two Values.
@@ -54,6 +54,7 @@ pub(crate) fn type_aware_equal(
     a: &Value,
     b: &Value,
     attr_type: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
     secret_ctx: Option<&SecretHashContext>,
 ) -> bool {
     // Secret comparison: compare the hash of the desired secret with the state hash string.
@@ -65,6 +66,10 @@ pub(crate) fn type_aware_equal(
         return secret_matches_state(inner, a, secret_ctx);
     }
 
+    // Resolve any top-level `AttributeType::Ref` chain BEFORE matching,
+    // so the wildcard arm below cannot silently swallow a `Ref` (carina#3340).
+    let attr_type = attr_type.map(|t| t.resolve_refs(defs));
+
     match attr_type {
         None => {
             // Even without type info, use type_aware_maps_equal / type_aware_lists_equal
@@ -74,11 +79,11 @@ pub(crate) fn type_aware_equal(
                 (
                     Value::Concrete(ConcreteValue::Map(ma)),
                     Value::Concrete(ConcreteValue::Map(mb)),
-                ) => type_aware_maps_equal(ma, mb, |_key| None, secret_ctx),
+                ) => type_aware_maps_equal(ma, mb, |_key| None, defs, secret_ctx),
                 (
                     Value::Concrete(ConcreteValue::List(la)),
                     Value::Concrete(ConcreteValue::List(lb)),
-                ) => type_aware_lists_equal(la, lb, None, false, secret_ctx),
+                ) => type_aware_lists_equal(la, lb, None, defs, false, secret_ctx),
                 _ => a.semantically_equal(b),
             }
         }
@@ -100,21 +105,21 @@ pub(crate) fn type_aware_equal(
                 Value::Concrete(ConcreteValue::List(la)),
                 Value::Concrete(ConcreteValue::List(lb)),
                 AttributeType::List { inner, ordered },
-            ) => type_aware_lists_equal(la, lb, Some(inner), *ordered, secret_ctx),
+            ) => type_aware_lists_equal(la, lb, Some(inner), defs, *ordered, secret_ctx),
 
             // Maps: recursive comparison with inner value type
             (
                 Value::Concrete(ConcreteValue::Map(ma)),
                 Value::Concrete(ConcreteValue::Map(mb)),
                 AttributeType::Map { value: inner, .. },
-            ) => type_aware_maps_equal(ma, mb, |_key| Some(inner.as_ref()), secret_ctx),
+            ) => type_aware_maps_equal(ma, mb, |_key| Some(inner.as_ref()), defs, secret_ctx),
 
             // Struct: per-field type-aware comparison with default-value tolerance
             (
                 Value::Concrete(ConcreteValue::Map(ma)),
                 Value::Concrete(ConcreteValue::Map(mb)),
                 AttributeType::Struct { fields, .. },
-            ) => type_aware_struct_equal(ma, mb, fields, secret_ctx),
+            ) => type_aware_struct_equal(ma, mb, fields, defs, secret_ctx),
 
             // Union: try each member type; if any says equal, they're equal
             (_, _, AttributeType::Union(types)) => {
@@ -135,7 +140,7 @@ pub(crate) fn type_aware_equal(
                     }
                     _ => types
                         .iter()
-                        .any(|t| type_aware_equal(a, b, Some(t), secret_ctx)),
+                        .any(|t| type_aware_equal(a, b, Some(t), defs, secret_ctx)),
                 }
             }
 
@@ -278,8 +283,17 @@ pub(crate) fn type_aware_equal(
 
             // Custom types with base type: delegate to base
             (_, _, AttributeType::Custom { base, .. }) => {
-                type_aware_equal(a, b, Some(base), secret_ctx)
+                type_aware_equal(a, b, Some(base), defs, secret_ctx)
             }
+
+            // `AttributeType::Ref` cannot reach this point: `resolve_refs`
+            // above peeled any `Ref` chain at the function entry. A
+            // `Ref` here would be a schema invariant violation handled
+            // by `resolve_refs`' panic. Documented explicitly so the
+            // wildcard below is provably Ref-free (carina#3340).
+            (_, _, AttributeType::Ref(_)) => unreachable!(
+                "AttributeType::Ref must be resolved by resolve_refs before reaching the match"
+            ),
 
             // All other cases: fall back to semantic equality
             _ => a.semantically_equal(b),
@@ -294,6 +308,7 @@ fn type_aware_lists_equal(
     a: &[Value],
     b: &[Value],
     inner: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
     ordered: bool,
     secret_ctx: Option<&SecretHashContext>,
 ) -> bool {
@@ -304,14 +319,14 @@ fn type_aware_lists_equal(
         // Sequential comparison: element order matters
         a.iter()
             .zip(b.iter())
-            .all(|(va, vb)| type_aware_equal(va, vb, inner, secret_ctx))
+            .all(|(va, vb)| type_aware_equal(va, vb, inner, defs, secret_ctx))
     } else {
         // Multiset comparison: order-insensitive
         let mut matched = vec![false; b.len()];
         for item_a in a {
             let mut found = false;
             for (j, item_b) in b.iter().enumerate() {
-                if !matched[j] && type_aware_equal(item_a, item_b, inner, secret_ctx) {
+                if !matched[j] && type_aware_equal(item_a, item_b, inner, defs, secret_ctx) {
                     matched[j] = true;
                     found = true;
                     break;
@@ -330,6 +345,7 @@ fn type_aware_maps_equal<'a, F>(
     a: &IndexMap<String, Value>,
     b: &IndexMap<String, Value>,
     get_type: F,
+    defs: &BTreeMap<String, AttributeType>,
     secret_ctx: Option<&SecretHashContext>,
 ) -> bool
 where
@@ -340,7 +356,7 @@ where
     }
     a.iter().all(|(k, va)| {
         b.get(k)
-            .map(|vb| type_aware_equal(va, vb, get_type(k), secret_ctx))
+            .map(|vb| type_aware_equal(va, vb, get_type(k), defs, secret_ctx))
             .unwrap_or(false)
     })
 }
@@ -355,6 +371,7 @@ fn type_aware_struct_equal(
     a: &IndexMap<String, Value>,
     b: &IndexMap<String, Value>,
     fields: &[crate::schema::StructField],
+    defs: &BTreeMap<String, AttributeType>,
     secret_ctx: Option<&SecretHashContext>,
 ) -> bool {
     let field_types: HashMap<&str, &AttributeType> = fields
@@ -366,14 +383,20 @@ fn type_aware_struct_equal(
     for (k, va) in a {
         match b.get(k) {
             Some(vb) => {
-                if !type_aware_equal(va, vb, field_types.get(k.as_str()).copied(), secret_ctx) {
+                if !type_aware_equal(
+                    va,
+                    vb,
+                    field_types.get(k.as_str()).copied(),
+                    defs,
+                    secret_ctx,
+                ) {
                     return false;
                 }
             }
             None => {
                 // Key only in `a` — must be a type default to be tolerated
                 let ft = field_types.get(k.as_str()).copied();
-                if !is_type_default(va, ft) {
+                if !is_type_default(va, ft, defs) {
                     return false;
                 }
             }
@@ -386,7 +409,7 @@ fn type_aware_struct_equal(
             continue; // Already checked above
         }
         let ft = field_types.get(k.as_str()).copied();
-        if !is_type_default(vb, ft) {
+        if !is_type_default(vb, ft, defs) {
             return false;
         }
     }
@@ -403,7 +426,14 @@ fn type_aware_struct_equal(
 /// - List: empty list
 /// - Map / Struct: empty map
 /// - Custom: delegates to the base type
-fn is_type_default(value: &Value, attr_type: Option<&AttributeType>) -> bool {
+fn is_type_default(
+    value: &Value,
+    attr_type: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
+) -> bool {
+    // Resolve top-level `Ref` chain so the wildcard arm cannot
+    // silently miss a default-value classification (carina#3340).
+    let attr_type = attr_type.map(|t| t.resolve_refs(defs));
     match (value, attr_type) {
         (Value::Concrete(ConcreteValue::Bool(false)), Some(AttributeType::Bool) | None) => true,
         (Value::Concrete(ConcreteValue::Int(0)), Some(AttributeType::Int)) => true,
@@ -432,7 +462,7 @@ fn is_type_default(value: &Value, attr_type: Option<&AttributeType>) -> bool {
             Some(AttributeType::Map { .. } | AttributeType::Struct { .. }),
         ) if m.is_empty() => true,
         // Custom types: delegate to the base type
-        (_, Some(AttributeType::Custom { base, .. })) => is_type_default(value, Some(base)),
+        (_, Some(AttributeType::Custom { base, .. })) => is_type_default(value, Some(base), defs),
         _ => false,
     }
 }
@@ -505,6 +535,11 @@ pub(super) fn find_changed_attributes(
 ) -> Vec<String> {
     let mut changed = Vec::new();
 
+    // Pull the cyclic-struct definition map (`Ref` targets) from the
+    // resource schema if available, otherwise an empty map. Walk-sites
+    // resolve `Ref` against this map (carina#3340).
+    let defs: &BTreeMap<String, AttributeType> = schema.map(|s| &s.defs).unwrap_or(empty_defs());
+
     // Project `current` through `prev_explicit` so server-side defaults
     // the user never authored disappear before any comparison runs.
     // The projection is idempotent and shape-preserving for keys the
@@ -555,13 +590,19 @@ pub(super) fn find_changed_attributes(
                 projected_current
                     .get(key)
                     .map(|cv| {
-                        type_aware_equal(cv, &effective_desired, attr_type, secret_ctx.as_ref())
+                        type_aware_equal(
+                            cv,
+                            &effective_desired,
+                            attr_type,
+                            defs,
+                            secret_ctx.as_ref(),
+                        )
                     })
                     .unwrap_or(false)
             }
             None => projected_current
                 .get(key)
-                .map(|cv| type_aware_equal(cv, desired_value, attr_type, secret_ctx.as_ref()))
+                .map(|cv| type_aware_equal(cv, desired_value, attr_type, defs, secret_ctx.as_ref()))
                 .unwrap_or(false),
         };
 

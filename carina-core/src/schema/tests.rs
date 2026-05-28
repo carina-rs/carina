@@ -4040,6 +4040,7 @@ fn walk_custom_lookup_skips_value_unknown() {
                 message: "should never be called".to_string(),
             })
         },
+        crate::schema::empty_defs(),
         &mut errors,
     );
     assert!(
@@ -4090,6 +4091,7 @@ fn union_walk_custom_lookup_succeeds_when_any_member_accepts() {
         &Value::Concrete(ConcreteValue::String("anything".to_string())),
         "attr",
         &lookup,
+        crate::schema::empty_defs(),
         &mut errors,
     );
     assert!(
@@ -4126,6 +4128,7 @@ fn union_walk_custom_lookup_emits_smallest_error_set_when_all_fail() {
         &Value::Concrete(ConcreteValue::String("anything".to_string())),
         "attr",
         &lookup,
+        crate::schema::empty_defs(),
         &mut errors,
     );
     assert_eq!(
@@ -4167,6 +4170,7 @@ fn union_walk_custom_lookup_cidr_accepts_ipv4_when_lookup_routes_correctly() {
         &Value::Concrete(ConcreteValue::String("10.0.0.0/8".to_string())),
         "cidr",
         &lookup,
+        crate::schema::empty_defs(),
         &mut errors,
     );
     assert!(
@@ -5020,4 +5024,139 @@ fn select_union_member_deferred_value_is_none() {
         binding: "some_ref".to_string(),
     });
     assert!(select_union_member(&members, &v).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// carina#3340: AttributeType::Ref + Schema for cyclic struct definitions.
+//
+// The CFN schema for WAFv2 WebACL has a cyclic definition graph:
+//     Statement -> AndStatement.Statements: List<Statement> -> ...
+// Modelled as:
+//     defs["Statement"]    = Struct { fields: [and_statement: Ref("AndStatement"), ...] }
+//     defs["AndStatement"] = Struct { fields: [statements: List(Ref("Statement"))] }
+// The root attribute references into `defs` via `Ref`.
+// ---------------------------------------------------------------------------
+
+fn cyclic_statement_schema() -> Schema {
+    let mut defs = std::collections::BTreeMap::new();
+    defs.insert(
+        "Statement".to_string(),
+        AttributeType::Struct {
+            name: "Statement".to_string(),
+            fields: vec![StructField::new(
+                "and_statement",
+                AttributeType::Ref("AndStatement".to_string()),
+            )],
+        },
+    );
+    defs.insert(
+        "AndStatement".to_string(),
+        AttributeType::Struct {
+            name: "AndStatement".to_string(),
+            fields: vec![StructField::new(
+                "statements",
+                AttributeType::List {
+                    inner: Box::new(AttributeType::Ref("Statement".to_string())),
+                    ordered: true,
+                },
+            )],
+        },
+    );
+    Schema {
+        root: AttributeType::Ref("Statement".to_string()),
+        defs,
+    }
+}
+
+#[test]
+fn schema_resolve_returns_defined_type() {
+    let schema = cyclic_statement_schema();
+    let resolved = schema.resolve("Statement").expect("Statement defined");
+    assert!(matches!(resolved, AttributeType::Struct { name, .. } if name == "Statement"));
+    assert!(schema.resolve("NoSuchThing").is_none());
+}
+
+#[test]
+fn schema_validate_well_formed_nested_statement_succeeds() {
+    let schema = cyclic_statement_schema();
+
+    let inner_statement = Value::Concrete(ConcreteValue::Map({
+        let mut m = indexmap::IndexMap::new();
+        m.insert(
+            "and_statement".to_string(),
+            Value::Concrete(ConcreteValue::Map({
+                let mut m2 = indexmap::IndexMap::new();
+                m2.insert(
+                    "statements".to_string(),
+                    Value::Concrete(ConcreteValue::List(vec![])),
+                );
+                m2
+            })),
+        );
+        m
+    }));
+
+    let outer = Value::Concrete(ConcreteValue::Map({
+        let mut m = indexmap::IndexMap::new();
+        m.insert(
+            "and_statement".to_string(),
+            Value::Concrete(ConcreteValue::Map({
+                let mut m2 = indexmap::IndexMap::new();
+                m2.insert(
+                    "statements".to_string(),
+                    Value::Concrete(ConcreteValue::List(vec![inner_statement])),
+                );
+                m2
+            })),
+        );
+        m
+    }));
+
+    let result = schema.validate(&outer);
+    assert!(
+        result.is_ok(),
+        "well-formed nested statement should validate: {result:?}"
+    );
+}
+
+#[test]
+fn schema_validate_malformed_nested_statement_fails() {
+    let schema = cyclic_statement_schema();
+
+    // and_statement.statements should be a list of Statement (= Map),
+    // but we put an Int instead.
+    let bad = Value::Concrete(ConcreteValue::Map({
+        let mut m = indexmap::IndexMap::new();
+        m.insert(
+            "and_statement".to_string(),
+            Value::Concrete(ConcreteValue::Map({
+                let mut m2 = indexmap::IndexMap::new();
+                m2.insert(
+                    "statements".to_string(),
+                    Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                        ConcreteValue::Int(42),
+                    )])),
+                );
+                m2
+            })),
+        );
+        m
+    }));
+
+    let result = schema.validate(&bad);
+    assert!(
+        result.is_err(),
+        "Int where Statement was expected should be rejected"
+    );
+}
+
+#[test]
+fn attribute_type_validate_on_ref_returns_error_without_schema() {
+    let t = AttributeType::Ref("Statement".to_string());
+    let v = Value::Concrete(ConcreteValue::String("anything".to_string()));
+    let result = t.validate(&v);
+    assert!(
+        result.is_err(),
+        "AttributeType::Ref cannot self-validate without a Schema"
+    );
 }

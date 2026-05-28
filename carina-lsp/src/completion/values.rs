@@ -659,6 +659,14 @@ impl CompletionProvider {
                 }
                 completions
             }
+            // `AttributeType::Ref` (carina#3340): in CFN-derived
+            // schemas the resolved target is a `Struct`, which has no
+            // value-position snippet anyway (block / attribute
+            // completions handle struct field entry separately).
+            // Returning an empty list is shape-consistent with the
+            // `Struct` arm. Threading `&defs` through completion is
+            // unnecessary at this layer.
+            AttributeType::Ref(_) => vec![],
             _ => vec![],
         }
     }
@@ -1961,6 +1969,17 @@ fn return_type_fits(ret: builtins::BuiltinReturnType, attr_type: &AttributeType)
         AttributeType::Float => false,
         AttributeType::Duration => false,
         AttributeType::Struct { .. } => false,
+        // `AttributeType::Ref` (carina#3340) names a cyclic CFN
+        // definition target. Resolution requires the enclosing
+        // [`Schema::defs`] map, which this completion-time helper
+        // does not carry. The resolved targets in practice are
+        // `Struct` shapes (WAFv2 `Statement`, AppSync `GraphQLApi`,
+        // ...), and no built-in currently returns `Struct` — so
+        // returning `false` here is semantically equivalent to the
+        // resolved-target arm and avoids threading `defs` through
+        // a purely completion-side helper. If a future built-in
+        // returns a struct-typed value, thread `defs` and resolve.
+        AttributeType::Ref(_) => false,
     }
 }
 

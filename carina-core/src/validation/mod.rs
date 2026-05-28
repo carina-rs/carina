@@ -603,7 +603,20 @@ pub fn is_string_compatible_type(attr_type: &AttributeType) -> bool {
             true
         }
         AttributeType::Union(types) => types.iter().all(is_string_compatible_type),
-        _ => false,
+        // `AttributeType::Ref` (carina#3340): resolved target is
+        // typically a `Struct`, not a string-shaped scalar. Returning
+        // `false` is the safe, schema-consistent answer. If a future
+        // schema uses `Ref` to point at a non-Struct, this helper
+        // should thread `&defs` and recurse via `resolve_refs`.
+        AttributeType::Ref(_) => false,
+        AttributeType::Int
+        | AttributeType::Float
+        | AttributeType::Bool
+        | AttributeType::Duration
+        | AttributeType::CustomEnum { .. }
+        | AttributeType::List { .. }
+        | AttributeType::Map { .. }
+        | AttributeType::Struct { .. } => false,
     }
 }
 
@@ -616,7 +629,20 @@ fn is_plain_string_or_string_union(attr_type: &AttributeType) -> bool {
     match attr_type {
         AttributeType::String => true,
         AttributeType::Union(types) => types.iter().all(is_plain_string_or_string_union),
-        _ => false,
+        // `Ref` resolves to a Struct in every cyclic CFN schema today;
+        // returning `false` is conservative and consistent with
+        // is_string_compatible_type. (carina#3340.)
+        AttributeType::Ref(_) => false,
+        AttributeType::Int
+        | AttributeType::Float
+        | AttributeType::Bool
+        | AttributeType::Duration
+        | AttributeType::Custom { .. }
+        | AttributeType::CustomEnum { .. }
+        | AttributeType::StringEnum { .. }
+        | AttributeType::List { .. }
+        | AttributeType::Map { .. }
+        | AttributeType::Struct { .. } => false,
     }
 }
 
@@ -646,7 +672,22 @@ fn attr_type_demands_specific_custom(attr_type: &AttributeType) -> bool {
             identity: Some(_), ..
         } => true,
         AttributeType::Union(types) => types.iter().any(attr_type_demands_specific_custom),
-        _ => false,
+        // `Ref` (carina#3340): does not itself demand a custom identity.
+        // The resolved target may carry one, but `_specific_custom`
+        // operates at the receiver type's outer shape — Union is the
+        // only nesting it traverses, by design (see doc comment).
+        AttributeType::Ref(_) => false,
+        AttributeType::String
+        | AttributeType::Int
+        | AttributeType::Float
+        | AttributeType::Bool
+        | AttributeType::Duration
+        | AttributeType::Custom { identity: None, .. }
+        | AttributeType::CustomEnum { .. }
+        | AttributeType::StringEnum { .. }
+        | AttributeType::List { .. }
+        | AttributeType::Map { .. }
+        | AttributeType::Struct { .. } => false,
     }
 }
 

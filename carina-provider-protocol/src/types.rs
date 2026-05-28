@@ -323,6 +323,15 @@ pub struct ResourceSchema {
     /// serialization across the WASM plugin boundary.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclusive_required: Vec<Vec<String>>,
+    /// Named definitions reachable via [`AttributeType::Ref`] from
+    /// this resource's attribute types. Empty for resources whose
+    /// attribute graph contains no cycles (the common case). Mirror
+    /// of [`carina_core::schema::ResourceSchema::defs`] — carries the
+    /// cyclic CFN struct map across the JSON wire form so the host
+    /// can resolve `Ref` targets at the walk-sites that need them
+    /// (carina#3340).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub defs: std::collections::BTreeMap<String, AttributeType>,
 }
 
 /// Per-resource operational configuration for timeouts and retries.
@@ -457,6 +466,20 @@ pub enum AttributeType {
         base: Box<AttributeType>,
         namespace: String,
     },
+    /// Named reference into the enclosing [`ResourceSchema::defs`]
+    /// map. Used to express cyclic CFN definition graphs (WAFv2
+    /// `WebACL.Statement`, AppSync `GraphQLApi`, ...) so the codegen
+    /// emission step does not stack-overflow on recursive struct
+    /// definitions (`Statement -> AndStatement -> List<Statement>`).
+    ///
+    /// Introduced in carina#3340. The host-side
+    /// [`carina_core::schema::AttributeType::Ref`] is the structural
+    /// counterpart; conversion in `carina-plugin-host::wasm_convert`
+    /// passes the variant through unchanged.
+    #[serde(rename = "ref")]
+    Ref {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -532,6 +555,65 @@ mod tests {
         let json = serde_json::to_string(&attr).unwrap();
         let back: AttributeType = serde_json::from_str(&json).unwrap();
         assert_eq!(json, serde_json::to_string(&back).unwrap());
+    }
+
+    #[test]
+    fn ref_attribute_type_roundtrip() {
+        // carina#3340: cyclic CFN schemas emit `Ref { name }` at the
+        // recursion point; the wire form must round-trip through
+        // serde so the host can rebuild the structural Ref variant.
+        let attr = AttributeType::Ref {
+            name: "Statement".into(),
+        };
+        let json = serde_json::to_string(&attr).unwrap();
+        assert_eq!(json, r#"{"type":"ref","name":"Statement"}"#);
+        let back: AttributeType = serde_json::from_str(&json).unwrap();
+        match back {
+            AttributeType::Ref { name } => assert_eq!(name, "Statement"),
+            other => panic!("expected Ref, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resource_schema_defs_roundtrip() {
+        // carina#3340: the `defs` map carries cyclic struct definitions
+        // (`Statement` -> `AndStatement` -> `List<Statement>` ...).
+        // Pin the wire shape so a host-side regression cannot silently
+        // lose recursion-target schema information.
+        let schema = ResourceSchema {
+            resource_type: "awscc.wafv2.WebACL".into(),
+            attributes: HashMap::new(),
+            description: None,
+            kind: SchemaKind::Managed,
+            name_attribute: None,
+            force_replace: false,
+            operation_config: None,
+            validators: vec![],
+            exclusive_required: vec![],
+            defs: std::collections::BTreeMap::from([(
+                "Statement".to_string(),
+                AttributeType::Struct {
+                    name: "Statement".into(),
+                    fields: vec![StructField {
+                        name: "and_statement".into(),
+                        field_type: AttributeType::List {
+                            inner: Box::new(AttributeType::Ref {
+                                name: "Statement".into(),
+                            }),
+                            ordered: true,
+                        },
+                        required: false,
+                        description: None,
+                        block_name: None,
+                        provider_name: None,
+                    }],
+                },
+            )]),
+        };
+        let json = serde_json::to_string(&schema).unwrap();
+        let back: ResourceSchema = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.defs.len(), 1, "defs map lost during round-trip");
+        assert!(back.defs.contains_key("Statement"));
     }
 
     #[test]
