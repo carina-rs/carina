@@ -59,8 +59,11 @@ fn read_local_state_for_completion() -> Option<StateFile> {
 
 /// Shell completion function for `state lookup` queries.
 ///
-/// Before the first `.`: completes binding names / resource names.
-/// After the `.`: completes attribute names for the matched resource.
+/// Delegates to [`complete_state_lookup_from`], which produces three
+/// candidate spaces: resource bindings/names (module-prefixed
+/// bindings like `r.distribution` included), attribute names for a
+/// resolved binding (longest-prefix match), and the `exports` /
+/// `exports.<key>` address shapes when the state carries exports.
 fn complete_state_lookup(current: &OsStr) -> Vec<CompletionCandidate> {
     let current = match current.to_str() {
         Some(s) => s,
@@ -76,32 +79,65 @@ fn complete_state_lookup(current: &OsStr) -> Vec<CompletionCandidate> {
 }
 
 /// Compute completion candidates from a state file and a partial query string.
+///
+/// Three candidate spaces are produced (carina#3338):
+///
+/// - **Resource bindings / names**: surface every binding the state
+///   carries — module-prefixed (`r.distribution`) shows up as one
+///   candidate, just like `state list` already prints it. No splitting
+///   on `.`; matched by `starts_with(current)`. (Top-level names with
+///   no binding fall back to `rs.name`.)
+/// - **`exports.<key>`** when the partial starts with `exports.` and
+///   no resource binding `exports` shadows it.
+/// - **`exports`** as a top-level candidate when the state has any
+///   exports and the partial matches it.
 fn complete_state_lookup_from(state: &StateFile, current: &str) -> Vec<CompletionCandidate> {
-    if let Some((resource_name, _attr_prefix)) = current.split_once('.') {
-        // Complete attribute names for the matched resource
-        let rs = match find_resource_by_query(state, resource_name) {
-            Some(rs) => rs,
-            None => return vec![],
-        };
-        rs.attributes
+    let resource_named_exports = state
+        .resources
+        .iter()
+        .any(|r| r.binding.as_deref() == Some("exports"));
+
+    // `exports.<key>` per-export completion. Only when no resource has
+    // claimed the `exports` binding — that resource takes precedence
+    // (matches `format_state_lookup`).
+    if !resource_named_exports && let Some(prefix) = current.strip_prefix("exports.") {
+        return state
+            .exports
+            .keys()
+            .filter(|key| key.starts_with(prefix))
+            .map(|key| CompletionCandidate::new(format!("exports.{}", key)))
+            .collect();
+    }
+
+    // Attribute completion for a known resource: `<binding>.<attr>`.
+    // Use the address resolver so module-prefixed bindings ride the
+    // same longest-prefix rule as `format_state_lookup`.
+    if let Some((before_dot, _)) = current.rsplit_once('.')
+        && let Some((rs, _)) = resolve_resource_address(state, before_dot)
+    {
+        return rs
+            .attributes
             .keys()
             .filter(|key| {
-                let full = format!("{}.{}", resource_name, key);
+                let full = format!("{}.{}", before_dot, key);
                 full.starts_with(current)
             })
-            .map(|key| CompletionCandidate::new(format!("{}.{}", resource_name, key)))
-            .collect()
-    } else {
-        // Complete resource binding names / resource names
-        let mut candidates = Vec::new();
-        for rs in &state.resources {
-            let display_name = rs.binding.as_deref().unwrap_or(&rs.name);
-            if display_name.starts_with(current) {
-                candidates.push(CompletionCandidate::new(display_name));
-            }
-        }
-        candidates
+            .map(|key| CompletionCandidate::new(format!("{}.{}", before_dot, key)))
+            .collect();
     }
+
+    // Top-level: resource bindings/names + optional `exports`.
+    let mut candidates: Vec<CompletionCandidate> = Vec::new();
+    for rs in &state.resources {
+        let display_name = rs.binding.as_deref().unwrap_or(&rs.name);
+        if display_name.starts_with(current) {
+            candidates.push(CompletionCandidate::new(display_name));
+        }
+    }
+    if !resource_named_exports && !state.exports.is_empty() && "exports".starts_with(current) {
+        candidates.push(CompletionCandidate::new("exports"));
+    }
+    candidates
 }
 
 #[derive(clap::Subcommand)]
@@ -307,7 +343,11 @@ async fn load_state_file(
         .ok_or_else(|| AppError::Config("No state file found.".to_string()))
 }
 
-/// Find a resource by binding name first, then fall back to resource name.
+/// Find a resource by binding name first, then fall back to resource
+/// name. Retained for test coverage of the precedence rule; production
+/// lookup uses [`resolve_resource_address`] which generalizes this with
+/// longest-prefix matching for module-prefixed bindings (carina#3338).
+#[cfg(test)]
 fn find_resource_by_query<'a>(state: &'a StateFile, name: &str) -> Option<&'a ResourceState> {
     // Search by binding first
     state
@@ -353,28 +393,151 @@ async fn run_state_list(
 }
 
 /// Format lookup output for a query against a state file.
-/// Returns the formatted output string on success, or an error.
+///
+/// Three address shapes are accepted (in resolution order):
+///
+/// 1. **Resource binding / name**, optionally followed by an attribute:
+///    `vpc`, `vpc.vpc_id`, `r.distribution`, `r.distribution.id`. The
+///    binding is matched by **longest-prefix**, so module-prefixed
+///    bindings (`let r = usecase { … }` → resources stored as
+///    `binding = "r.distribution"`) resolve the same way `state list`
+///    already displays them (carina#3338). The longest-prefix scan
+///    also subsumes the previous one-level form.
+/// 2. **`exports`** (full state.exports map) or **`exports.<key>`**
+///    (single export value). The deliberate downstream contract for
+///    CI / scripting consumers — a resource named `exports` still
+///    takes precedence (rule 1 runs first), so the export form only
+///    kicks in when no such binding exists.
+/// 3. When neither (1) nor (2) matches, the error names the full
+///    query as the operator typed it — so for a mistyped
+///    `r.distribution.idd` the message is "Resource 'r.distribution.idd'
+///    not found", not a stripped head.
 fn format_state_lookup(
     state: &StateFile,
     query: &str,
     json_output: bool,
 ) -> Result<String, AppError> {
-    // Parse query: "binding" or "binding.attribute"
-    let (resource_name, attribute) = match query.split_once('.') {
-        Some((name, attr)) => (name, Some(attr)),
-        None => (query, None),
+    // (1) Longest-binding-prefix match against resources.
+    if let Some((rs, attribute)) = resolve_resource_address(state, query) {
+        return format_resource_value(rs, attribute, json_output);
+    }
+
+    // (2) Exports — only when no resource named `exports` shadowed
+    // step (1) above (the loop would have matched it). The whole-map
+    // form is `exports`; per-key is `exports.<key>`.
+    if query == "exports" {
+        return Ok(serde_json::to_string_pretty(&sorted_exports(state)).unwrap());
+    }
+    if let Some(key) = query.strip_prefix("exports.") {
+        let value = state
+            .exports
+            .get(key)
+            .ok_or_else(|| AppError::Config(format!("Export key '{}' not found in state.", key)))?;
+        return if json_output {
+            Ok(serde_json::to_string_pretty(value).unwrap())
+        } else {
+            Ok(format_raw_value(value))
+        };
+    }
+
+    // (3) Nothing matched — report the full query so the operator
+    // sees the address they typed, not a stripped head.
+    Err(AppError::Config(format!(
+        "Resource '{}' not found in state.",
+        query
+    )))
+}
+
+/// Build a sorted view of `state.exports` for deterministic JSON output.
+fn sorted_exports(state: &StateFile) -> std::collections::BTreeMap<&String, &serde_json::Value> {
+    state.exports.iter().collect()
+}
+
+/// Resolve a query of the form `<binding>` or `<binding>.<attribute>`
+/// against the state's resources, picking the **longest** binding that
+/// matches a `<binding>` or `<binding>.<rest>` prefix of the query.
+///
+/// Returns `(resource, optional_attribute_name)`. The longest-prefix
+/// rule lets module-prefixed bindings (`binding = "r.distribution"`)
+/// resolve `r.distribution.id` → ("r.distribution", "id"), while a
+/// top-level `binding = "vpc"` still resolves `vpc.vpc_id` →
+/// ("vpc", "vpc_id"). Returns `None` if no binding matches a prefix.
+fn resolve_resource_address<'a>(
+    state: &'a StateFile,
+    query: &'a str,
+) -> Option<(&'a ResourceState, Option<&'a str>)> {
+    // Walk all resources, keep the one whose binding (or fallback
+    // name) matches the longest prefix of `query`. Equal-length
+    // candidates: binding wins over name (matches the historical
+    // `find_resource_by_query` precedence).
+    let mut best: Option<(&'a ResourceState, &'a str, bool)> = None;
+    for rs in &state.resources {
+        for (candidate, is_binding) in candidate_addresses(rs) {
+            if query_starts_with_address(query, candidate) {
+                let take = match &best {
+                    None => true,
+                    Some((_, prev, prev_is_binding)) => {
+                        candidate.len() > prev.len()
+                            || (candidate.len() == prev.len() && is_binding && !*prev_is_binding)
+                    }
+                };
+                if take {
+                    best = Some((rs, candidate, is_binding));
+                }
+            }
+        }
+    }
+
+    let (rs, matched, _) = best?;
+    let attribute = if query.len() == matched.len() {
+        None
+    } else {
+        // matched is a strict prefix; the byte after it must be '.'
+        // (guaranteed by query_starts_with_address).
+        Some(&query[matched.len() + 1..])
     };
+    Some((rs, attribute))
+}
 
-    let rs = find_resource_by_query(state, resource_name).ok_or_else(|| {
-        AppError::Config(format!("Resource '{}' not found in state.", resource_name))
-    })?;
+/// Candidate addresses for a resource, paired with `is_binding` so the
+/// longest-prefix tie-break can prefer bindings over names.
+fn candidate_addresses(rs: &ResourceState) -> impl Iterator<Item = (&str, bool)> {
+    rs.binding
+        .as_deref()
+        .map(|b| (b, true))
+        .into_iter()
+        .chain(std::iter::once((rs.name.as_str(), false)))
+}
 
+/// `true` if `query` is exactly `address` or starts with `address` + '.'.
+/// Bare substring `starts_with` would mis-match `r.distribution_v2`
+/// against binding `r.distribution`.
+fn query_starts_with_address(query: &str, address: &str) -> bool {
+    if query == address {
+        return true;
+    }
+    let rest = match query.strip_prefix(address) {
+        Some(r) => r,
+        None => return false,
+    };
+    rest.starts_with('.')
+}
+
+/// Render a resource attribute (or the full sorted attribute map when
+/// `attribute` is `None`) in the same shape `format_state_lookup`
+/// historically produced.
+fn format_resource_value(
+    rs: &ResourceState,
+    attribute: Option<&str>,
+    json_output: bool,
+) -> Result<String, AppError> {
     match attribute {
         Some(attr) => {
+            let display_name = rs.binding.as_deref().unwrap_or(&rs.name);
             let value = rs.attributes.get(attr).ok_or_else(|| {
                 AppError::Config(format!(
                     "Attribute '{}' not found on resource '{}'.",
-                    attr, resource_name
+                    attr, display_name
                 ))
             })?;
             if json_output {
@@ -384,7 +547,6 @@ fn format_state_lookup(
             }
         }
         None => {
-            // Full resource: output all attributes as JSON object (sorted keys for deterministic output)
             let sorted: std::collections::BTreeMap<_, _> = rs.attributes.iter().collect();
             Ok(serde_json::to_string_pretty(&sorted).unwrap())
         }
@@ -1152,10 +1314,15 @@ mod tests {
 
     /// Load the fixture state file from `tests/fixtures/state_lookup/`.
     fn load_fixture_state() -> StateFile {
+        load_fixture("state_lookup")
+    }
+
+    /// Load a named fixture state file from `tests/fixtures/<name>/`.
+    fn load_fixture(name: &str) -> StateFile {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let path = PathBuf::from(format!(
-            "{}/tests/fixtures/state_lookup/carina.state.json",
-            manifest_dir
+            "{}/tests/fixtures/{}/carina.state.json",
+            manifest_dir, name
         ));
         let contents = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("Failed to read fixture {}: {}", path.display(), e));
@@ -1488,6 +1655,236 @@ mod tests {
         assert_eq!(
             subnet_resource.dependency_bindings(),
             &std::collections::BTreeSet::from(["vpc".to_string()])
+        );
+    }
+
+    // --- carina#3338: module-prefixed bindings + exports.<key> ---
+
+    #[test]
+    fn lookup_module_prefixed_binding_full_resource() {
+        // `let r = usecase { … }` produces resources whose binding is
+        // stored as `r.<inner>` in state. `carina state list` already
+        // prints `r.distribution` as the display name — `state lookup`
+        // must accept the same address.
+        let state = load_fixture("state_lookup_modules_exports");
+        let output = format_state_lookup(&state, "r.distribution", false).unwrap();
+        assert!(
+            output.contains("E2E954VKWYKT8K"),
+            "expected full-resource lookup of r.distribution to include the id; got: {}",
+            output
+        );
+    }
+
+    #[test]
+    fn lookup_module_prefixed_binding_attribute() {
+        // `r.distribution.id` must resolve to the `id` attribute on
+        // the resource whose binding is `r.distribution` — the actual
+        // command users want to script against.
+        let state = load_fixture("state_lookup_modules_exports");
+        let output = format_state_lookup(&state, "r.distribution.id", false).unwrap();
+        assert_eq!(output, "E2E954VKWYKT8K");
+    }
+
+    #[test]
+    fn lookup_module_prefixed_binding_attribute_json() {
+        let state = load_fixture("state_lookup_modules_exports");
+        let output = format_state_lookup(&state, "r.distribution.id", true).unwrap();
+        assert_eq!(output, "\"E2E954VKWYKT8K\"");
+    }
+
+    #[test]
+    fn lookup_mistyped_module_prefixed_address_names_full_query() {
+        // Regression pin: when neither rule (1) nor (2) matches, the
+        // error must name the full query — not just the head before
+        // the first dot. A user who typed `r.bogus.id` should see
+        // their typo in the message, not the unhelpful `r`.
+        let state = load_fixture("state_lookup_modules_exports");
+        let err = format_state_lookup(&state, "r.bogus.id", false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'r.bogus.id'"),
+            "expected error to quote the full query; got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn lookup_module_prefixed_outer_alone_errors() {
+        // `r` by itself is not a resource — only `r.<inner>` is. The
+        // error message should reflect the actual unresolved address.
+        let state = load_fixture("state_lookup_modules_exports");
+        let err = format_state_lookup(&state, "r", false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'r'"),
+            "expected error mentioning 'r' was unresolved; got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn find_resource_by_module_prefixed_binding() {
+        let state = load_fixture("state_lookup_modules_exports");
+        let found = find_resource_by_query(&state, "r.distribution").unwrap();
+        assert_eq!(found.resource_type, "cloudfront.Distribution");
+    }
+
+    #[test]
+    fn lookup_exports_scalar() {
+        // `exports.<key>` reads from state.exports, the deliberate
+        // downstream contract operators script against from CI / shell.
+        let state = load_fixture("state_lookup_modules_exports");
+        let output =
+            format_state_lookup(&state, "exports.cloudfront_distribution_id", false).unwrap();
+        assert_eq!(output, "E2E954VKWYKT8K");
+    }
+
+    #[test]
+    fn lookup_exports_scalar_json() {
+        let state = load_fixture("state_lookup_modules_exports");
+        let output =
+            format_state_lookup(&state, "exports.cloudfront_distribution_id", true).unwrap();
+        assert_eq!(output, "\"E2E954VKWYKT8K\"");
+    }
+
+    #[test]
+    fn lookup_exports_list() {
+        // List/object exports should round-trip as pretty JSON in both
+        // modes (raw and --json), matching how resource-attribute
+        // composites already render.
+        let state = load_fixture("state_lookup_modules_exports");
+        let output = format_state_lookup(&state, "exports.nameservers", false).unwrap();
+        assert!(output.contains("ns-1234.awsdns-12.com"));
+        assert!(output.contains("ns-5678.awsdns-56.net"));
+    }
+
+    #[test]
+    fn lookup_exports_full_emits_object() {
+        // `exports` with no key returns the full exports map as JSON.
+        // Symmetrical with `lookup <binding>` returning the full
+        // attributes map.
+        let state = load_fixture("state_lookup_modules_exports");
+        let output = format_state_lookup(&state, "exports", false).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["cloudfront_distribution_id"], "E2E954VKWYKT8K");
+        assert_eq!(parsed["zone_id"], "Z008131930MO3U3NYWJTM");
+    }
+
+    #[test]
+    fn lookup_exports_missing_key_errors() {
+        let state = load_fixture("state_lookup_modules_exports");
+        let err = format_state_lookup(&state, "exports.does_not_exist", false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'does_not_exist'") && msg.to_lowercase().contains("export"),
+            "expected error to mention the missing export key; got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn lookup_exports_resource_binding_named_exports_takes_precedence() {
+        // Edge case: if a user happens to bind a resource as `exports`,
+        // the resource lookup must still win — they've named it
+        // explicitly, and changing the meaning would silently shadow
+        // their resource. Use the export-key form `exports.<key>` only
+        // when no resource by that name exists.
+        //
+        // This pins the precedence so a future refactor can't flip it.
+        let mut state = StateFile::new();
+        let mut rs = ResourceState::new("ec2.Vpc", "exports-vpc", "awscc");
+        rs.binding = Some("exports".to_string());
+        rs.attributes
+            .insert("vpc_id".to_string(), serde_json::json!("vpc-from-resource"));
+        state.upsert_resource(rs);
+        state
+            .exports
+            .insert("vpc_id".to_string(), serde_json::json!("from-export"));
+
+        // `exports.vpc_id` should find the resource's attribute, not
+        // the export key, because a `binding = "exports"` resource
+        // exists.
+        let output = format_state_lookup(&state, "exports.vpc_id", false).unwrap();
+        assert_eq!(output, "vpc-from-resource");
+    }
+
+    #[test]
+    fn completion_module_prefixed_bindings() {
+        // Tab-completion must offer module-prefixed bindings as
+        // candidates, otherwise the operator has no way to discover
+        // them short of reading the JSON.
+        let state = load_fixture("state_lookup_modules_exports");
+        let candidates = complete_state_lookup_from(&state, "r.");
+        let values = candidate_values(&candidates);
+        assert!(
+            values.contains(&"r.bucket".to_string()),
+            "expected r.bucket among completions; got: {:?}",
+            values
+        );
+        assert!(
+            values.contains(&"r.distribution".to_string()),
+            "expected r.distribution among completions; got: {:?}",
+            values
+        );
+        assert!(
+            values.contains(&"r.zone".to_string()),
+            "expected r.zone among completions; got: {:?}",
+            values
+        );
+    }
+
+    #[test]
+    fn completion_exports_keys_after_dot() {
+        // `exports.` should complete to the keys in state.exports.
+        let state = load_fixture("state_lookup_modules_exports");
+        let candidates = complete_state_lookup_from(&state, "exports.");
+        let values = candidate_values(&candidates);
+        assert!(
+            values.contains(&"exports.cloudfront_distribution_id".to_string()),
+            "expected exports.cloudfront_distribution_id among completions; got: {:?}",
+            values
+        );
+        assert!(
+            values.contains(&"exports.zone_id".to_string()),
+            "expected exports.zone_id among completions; got: {:?}",
+            values
+        );
+    }
+
+    #[test]
+    fn completion_attribute_on_module_prefixed_binding() {
+        // After typing `r.distribution.` the completer must resolve
+        // the module-prefixed binding and offer that resource's
+        // attribute keys, not collapse to top-level bindings.
+        // Pins the longest-prefix resolver wiring in the completion
+        // path (distinct logic from `format_state_lookup`).
+        let state = load_fixture("state_lookup_modules_exports");
+        let candidates = complete_state_lookup_from(&state, "r.distribution.");
+        let values = candidate_values(&candidates);
+        assert!(
+            values.contains(&"r.distribution.id".to_string()),
+            "expected r.distribution.id among completions; got: {:?}",
+            values
+        );
+        assert!(
+            values.contains(&"r.distribution.domain_name".to_string()),
+            "expected r.distribution.domain_name among completions; got: {:?}",
+            values
+        );
+    }
+
+    #[test]
+    fn completion_exports_top_level() {
+        // Empty / `e` prefix should surface `exports` itself as a
+        // candidate (so it's discoverable without docs), but only when
+        // the state actually has exports.
+        let state = load_fixture("state_lookup_modules_exports");
+        let candidates = complete_state_lookup_from(&state, "e");
+        let values = candidate_values(&candidates);
+        assert!(
+            values.contains(&"exports".to_string()),
+            "expected `exports` candidate for partial `e`; got: {:?}",
+            values
         );
     }
 }
