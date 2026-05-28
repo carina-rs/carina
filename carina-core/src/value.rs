@@ -1376,22 +1376,43 @@ fn peel_custom(t: &AttributeType) -> &AttributeType {
 ///
 /// See #2481, #2510.
 pub fn canonicalize_with_type(value: Value, attr_type: &AttributeType) -> Value {
+    canonicalize_with_type_and_defs(value, attr_type, crate::schema::empty_defs())
+}
+
+/// Same as [`canonicalize_with_type`] but takes the enclosing
+/// [`ResourceSchema::defs`] map so cyclic CFN definitions
+/// (`AttributeType::Ref`) are followed during the type walk
+/// (carina#3340). The `Ref` arm resolves and recurses; primitives /
+/// unions terminate as before.
+pub fn canonicalize_with_type_and_defs(
+    value: Value,
+    attr_type: &AttributeType,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> Value {
     let unwrapped = peel_custom(attr_type);
     if is_string_or_list_of_strings(unwrapped) {
         return canonicalize_to_string_list(value);
+    }
+    // `Ref`: resolve and re-dispatch. Without this arm the wildcard
+    // below silently passes the value through, so a cyclic CFN field
+    // never gets its nested `string_or_list_of_strings` collapsed
+    // (carina#3340).
+    if let AttributeType::Ref(_) = unwrapped {
+        let resolved = unwrapped.resolve_refs(defs);
+        return canonicalize_with_type_and_defs(value, resolved, defs);
     }
     match (value, unwrapped) {
         (Value::Concrete(ConcreteValue::List(items)), AttributeType::List { inner, .. }) => {
             let canonicalized = items
                 .into_iter()
-                .map(|v| canonicalize_with_type(v, inner.as_ref()))
+                .map(|v| canonicalize_with_type_and_defs(v, inner.as_ref(), defs))
                 .collect();
             Value::Concrete(ConcreteValue::List(canonicalized))
         }
         (Value::Concrete(ConcreteValue::Map(map)), AttributeType::Map { value: vt, .. }) => {
             let canonicalized = map
                 .into_iter()
-                .map(|(k, v)| (k, canonicalize_with_type(v, vt.as_ref())))
+                .map(|(k, v)| (k, canonicalize_with_type_and_defs(v, vt.as_ref(), defs)))
                 .collect();
             Value::Concrete(ConcreteValue::Map(canonicalized))
         }
@@ -1404,7 +1425,7 @@ pub fn canonicalize_with_type(value: Value, attr_type: &AttributeType) -> Value 
                         .find(|f| f.name == k || f.provider_name.as_deref() == Some(k.as_str()))
                         .map(|f| &f.field_type);
                     let canon = match field_type {
-                        Some(ft) => canonicalize_with_type(v, ft),
+                        Some(ft) => canonicalize_with_type_and_defs(v, ft, defs),
                         None => v,
                     };
                     (k, canon)
@@ -1412,9 +1433,11 @@ pub fn canonicalize_with_type(value: Value, attr_type: &AttributeType) -> Value 
                 .collect();
             Value::Concrete(ConcreteValue::Map(canonicalized))
         }
-        (Value::Deferred(DeferredValue::Secret(inner)), _) => Value::Deferred(
-            DeferredValue::Secret(Box::new(canonicalize_with_type(*inner, attr_type))),
-        ),
+        (Value::Deferred(DeferredValue::Secret(inner)), _) => {
+            Value::Deferred(DeferredValue::Secret(Box::new(
+                canonicalize_with_type_and_defs(*inner, attr_type, defs),
+            )))
+        }
         // Union: the missing nesting kind (List/Map/Struct/Secret
         // already recurse; Union was the lone gap — carina#3080).
         // `principal` is `Union[Struct{ service: Union[String,
@@ -1431,7 +1454,7 @@ pub fn canonicalize_with_type(value: Value, attr_type: &AttributeType) -> Value 
         // is identity — never guess-coerce.
         (val, AttributeType::Union(members)) => {
             match crate::schema::select_union_member(members, &val) {
-                Some(member) => canonicalize_with_type(val, member),
+                Some(member) => canonicalize_with_type_and_defs(val, member, defs),
                 None => val,
             }
         }
@@ -1486,7 +1509,9 @@ pub fn canonicalize_resources_with_schemas(
         let mut new_attrs: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
         for (key, value) in std::mem::take(&mut resource.attributes) {
             let canon = match schema.attributes.get(&key) {
-                Some(attr_schema) => canonicalize_with_type(value, &attr_schema.attr_type),
+                Some(attr_schema) => {
+                    canonicalize_with_type_and_defs(value, &attr_schema.attr_type, &schema.defs)
+                }
                 None => value,
             };
             new_attrs.insert(key, canon);
@@ -1510,7 +1535,9 @@ pub fn canonicalize_data_sources_with_schemas(
         let mut new_attrs: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
         for (key, value) in std::mem::take(&mut data_source.attributes) {
             let canon = match schema.attributes.get(&key) {
-                Some(attr_schema) => canonicalize_with_type(value, &attr_schema.attr_type),
+                Some(attr_schema) => {
+                    canonicalize_with_type_and_defs(value, &attr_schema.attr_type, &schema.defs)
+                }
                 None => value,
             };
             new_attrs.insert(key, canon);
@@ -1550,7 +1577,9 @@ pub fn canonicalize_states_with_schemas(
         let mut new_attrs = std::collections::HashMap::with_capacity(state.attributes.len());
         for (key, value) in std::mem::take(&mut state.attributes) {
             let canon = match schema.attributes.get(&key) {
-                Some(attr_schema) => canonicalize_with_type(value, &attr_schema.attr_type),
+                Some(attr_schema) => {
+                    canonicalize_with_type_and_defs(value, &attr_schema.attr_type, &schema.defs)
+                }
                 None => value,
             };
             new_attrs.insert(key, canon);

@@ -1104,6 +1104,16 @@ pub fn collect_custom_type_validators(
         for attr_schema in schema.attributes.values() {
             collect_validators_from_type(&attr_schema.attr_type, &mut validators);
         }
+        // Visit cyclic-struct definitions directly so any
+        // `Custom { identity, validate }` nested inside a `Ref` target
+        // (e.g. WAFv2 `Statement -> AndStatement` carrying a custom
+        // ARN type) gets its validator registered. The recursion in
+        // `collect_validators_from_type` stops at `Ref` to avoid
+        // infinite cycles; iterating `schema.defs.values()` here
+        // closes the loop in one bounded pass (carina#3340).
+        for def in schema.defs.values() {
+            collect_validators_from_type(def, &mut validators);
+        }
     }
 
     validators
@@ -1120,6 +1130,11 @@ pub fn collect_custom_type_names(registry: &SchemaRegistry) -> Vec<TypeIdentity>
     for (_provider, _resource_type, _kind, schema) in registry.iter() {
         for attr_schema in schema.attributes.values() {
             collect_type_names_from_type(&attr_schema.attr_type, &mut names);
+        }
+        // Walk cyclic-struct definitions for the same reason as
+        // `collect_custom_type_validators` above (carina#3340).
+        for def in schema.defs.values() {
+            collect_type_names_from_type(def, &mut names);
         }
     }
 
@@ -1167,7 +1182,22 @@ fn collect_validators_from_type(
                 collect_validators_from_type(t, validators);
             }
         }
-        _ => {}
+        // `AttributeType::Ref`: do NOT recurse into the resolved target
+        // here — that would loop forever on cyclic CFN schemas
+        // (`Statement -> AndStatement -> List<Statement>`). The
+        // callers (`collect_custom_type_validators` /
+        // `collect_custom_type_names`) walk every entry of
+        // `schema.defs` directly in a separate loop, which terminates
+        // because each def is visited exactly once. (carina#3340.)
+        AttributeType::Ref(_) => {}
+        // Primitives carry no nested Custom types and no Ref.
+        AttributeType::String
+        | AttributeType::Int
+        | AttributeType::Float
+        | AttributeType::Bool
+        | AttributeType::Duration
+        | AttributeType::StringEnum { .. }
+        | AttributeType::CustomEnum { .. } => {}
     }
 }
 
@@ -1203,7 +1233,17 @@ fn collect_type_names_from_type(
                 collect_type_names_from_type(t, names);
             }
         }
-        _ => {}
+        // See `collect_validators_from_type` for the rationale: the
+        // caller walks `schema.defs` separately to avoid infinite
+        // recursion on cyclic schemas (carina#3340).
+        AttributeType::Ref(_) => {}
+        AttributeType::String
+        | AttributeType::Int
+        | AttributeType::Float
+        | AttributeType::Bool
+        | AttributeType::Duration
+        | AttributeType::StringEnum { .. }
+        | AttributeType::CustomEnum { .. } => {}
     }
 }
 

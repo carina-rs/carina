@@ -644,6 +644,15 @@ fn proto_schema_to_core(s: &proto::ResourceSchema) -> CoreResourceSchema {
         // protocol gains explicit fields. See carina-rs/carina#2825.
         default_wait_timeout: None,
         default_wait_interval: None,
+        // Cyclic CFN struct definitions reachable via
+        // `AttributeType::Ref`. Mirrors the wire `defs` map onto the
+        // core schema so walk-sites that traverse a `Ref` can resolve
+        // it against the resource's own def table (carina#3340).
+        defs: s
+            .defs
+            .iter()
+            .map(|(k, v)| (k.clone(), proto_attr_type_to_core(v)))
+            .collect(),
     }
 }
 
@@ -781,6 +790,11 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
             validate: noop_validator(), // Validation is handled via ProviderContext.validators
             to_dsl: None,
         },
+        // Cyclic CFN struct reference (carina#3340). The host's
+        // structural counterpart is `AttributeType::Ref`; the matching
+        // `ResourceSchema.defs` map is converted alongside in
+        // `proto_schema_to_core` so resolution at walk-sites succeeds.
+        proto::AttributeType::Ref { name } => CoreAttributeType::Ref(name.clone()),
     }
 }
 
@@ -1624,6 +1638,7 @@ mod tests {
             operation_config: None,
             validators: vec![proto::ValidatorType::TagsKeyValueCheck],
             exclusive_required: vec![],
+            defs: Default::default(),
         };
         let core_schema = proto_schema_to_core(&proto_schema);
         assert!(core_schema.validator.is_some());
@@ -1641,6 +1656,7 @@ mod tests {
             operation_config: None,
             validators: vec![],
             exclusive_required: vec![],
+            defs: Default::default(),
         };
         let core_schema = proto_schema_to_core(&proto_schema);
         assert!(core_schema.validator.is_none());
@@ -1663,6 +1679,7 @@ mod tests {
                 "cidr_block".to_string(),
                 "ipv4_ipam_pool_id".to_string(),
             ]],
+            defs: Default::default(),
         };
         let core_schema = proto_schema_to_core(&proto_schema);
         assert_eq!(
@@ -1698,6 +1715,7 @@ mod tests {
             operation_config: None,
             validators: vec![],
             exclusive_required: vec![vec!["a".to_string(), "b".to_string()]],
+            defs: Default::default(),
         };
         let json = serde_json::to_string(&vec![proto_schema]).unwrap();
         let schemas = json_to_schemas(&json);
@@ -1774,6 +1792,7 @@ mod tests {
             operation_config: None,
             validators: vec![proto::ValidatorType::TagsKeyValueCheck],
             exclusive_required: vec![],
+            defs: Default::default(),
         };
         let core_schema = proto_schema_to_core(&proto_schema);
         let validator = core_schema.validator.unwrap();

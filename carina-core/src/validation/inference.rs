@@ -497,16 +497,24 @@ fn infer_resource_ref_with_visiting(
     use crate::resource::{PathSegment, Subscript};
     let mut current = &attr_schema.attr_type;
     for seg in segments {
-        current = match (seg, current) {
-            (PathSegment::Field { name }, attr) => match descend_struct_field(attr, name) {
-                Some(t) => t,
-                None => {
-                    return Err(InferenceError::UnknownAttribute {
-                        binding: binding.to_string(),
-                        attribute: format!("{}.{}", attribute, name),
-                    });
+        // Resolve a `Ref` chain at each step so Subscript arms below
+        // see the underlying List / Map / Struct shape instead of the
+        // opaque `Ref` (carina#3340). `descend_struct_field` already
+        // resolves internally for the Field arm; pre-resolving here
+        // also keeps the Subscript arms shape-matched.
+        let resolved = current.resolve_refs(&schema.defs);
+        current = match (seg, resolved) {
+            (PathSegment::Field { name }, attr) => {
+                match descend_struct_field(attr, name, &schema.defs) {
+                    Some(t) => t,
+                    None => {
+                        return Err(InferenceError::UnknownAttribute {
+                            binding: binding.to_string(),
+                            attribute: format!("{}.{}", attribute, name),
+                        });
+                    }
                 }
-            },
+            }
             (
                 PathSegment::Subscript {
                     index: Subscript::Int { .. },
@@ -544,6 +552,9 @@ fn infer_resource_ref_with_visiting(
     // forward the whole struct without naming the inner union branch.
     // The user can only "pick a branch" for a union they're directly
     // accessing, not for one buried inside a transferred value.
+    // Resolve any trailing `Ref` so the Union check and the
+    // TypeExpr projection see the underlying shape (carina#3340).
+    let current = current.resolve_refs(&schema.defs);
     if matches!(current, AttributeType::Union(_)) {
         return Err(InferenceError::UnknownType {
             reason: format!(
@@ -568,8 +579,13 @@ fn lookup_schema<'a>(
 fn descend_struct_field<'a>(
     attr_type: &'a AttributeType,
     field: &str,
+    defs: &'a std::collections::BTreeMap<String, AttributeType>,
 ) -> Option<&'a AttributeType> {
-    match attr_type {
+    // Resolve any leading `Ref` chain so a reference path inside a
+    // cyclic CFN struct (`WebACL.Statement -> AndStatement -> ...`)
+    // can be followed across the cycle (carina#3340).
+    let resolved = attr_type.resolve_refs(defs);
+    match resolved {
         AttributeType::Struct { fields, .. } => fields
             .iter()
             .find(|f| f.name == field)
@@ -647,6 +663,16 @@ fn attribute_type_to_type_expr(attr_type: &AttributeType) -> TypeExpr {
         // a "type annotation required" error instead of trusting this
         // result.
         AttributeType::Union(_) => TypeExpr::String,
+        // `Ref` requires the enclosing `Schema` to resolve — this pure
+        // attribute-type-to-type-expr conversion does not have one in
+        // scope. Returning `String` as a sentinel matches the
+        // `Union(_)` arm: callers that need precision must resolve the
+        // `Ref` via `Schema::resolve` upstream and convert the result.
+        // The carina#3340 model emits `Ref` only at cycle points in
+        // generated schemas, so this fallback path is unreachable for
+        // hand-written or codegen-produced attribute types reached
+        // through normal validation flows.
+        AttributeType::Ref(_) => TypeExpr::String,
     }
 }
 

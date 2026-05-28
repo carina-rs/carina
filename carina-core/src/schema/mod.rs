@@ -141,6 +141,7 @@ fn walk_custom_lookup(
     value: &Value,
     attr_name: &str,
     lookup: CustomTypeLookup<'_>,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
     errors: &mut Vec<TypeError>,
 ) {
     // Skip deferred-resolution values — same convention as
@@ -196,14 +197,14 @@ fn walk_custom_lookup(
         AttributeType::List { inner, .. } => {
             if let Value::Concrete(ConcreteValue::List(items)) = value {
                 for item in items {
-                    walk_custom_lookup(inner, item, attr_name, lookup, errors);
+                    walk_custom_lookup(inner, item, attr_name, lookup, defs, errors);
                 }
             }
         }
         AttributeType::Map { value: inner, .. } => {
             if let Value::Concrete(ConcreteValue::Map(map)) = value {
                 for v in map.values() {
-                    walk_custom_lookup(inner, v, attr_name, lookup, errors);
+                    walk_custom_lookup(inner, v, attr_name, lookup, defs, errors);
                 }
             }
         }
@@ -211,7 +212,7 @@ fn walk_custom_lookup(
             if let Value::Concrete(ConcreteValue::Map(map)) = value {
                 for f in fields {
                     if let Some(v) = map.get(&f.name) {
-                        walk_custom_lookup(&f.field_type, v, attr_name, lookup, errors);
+                        walk_custom_lookup(&f.field_type, v, attr_name, lookup, defs, errors);
                     }
                 }
             }
@@ -233,7 +234,7 @@ fn walk_custom_lookup(
             let mut best: Option<Vec<TypeError>> = None;
             for member in members {
                 let mut local = Vec::new();
-                walk_custom_lookup(member, value, attr_name, lookup, &mut local);
+                walk_custom_lookup(member, value, attr_name, lookup, defs, &mut local);
                 if local.is_empty() {
                     return;
                 }
@@ -251,6 +252,16 @@ fn walk_custom_lookup(
         | AttributeType::Bool
         | AttributeType::Duration
         | AttributeType::StringEnum { .. } => {}
+        // `Ref`: resolve via the schema's def map and continue the
+        // walk. The resolved target (typically a `Struct`) may carry
+        // identity-bearing custom types whose validators must run.
+        // `resolve_refs` panics on a missing def name (schema
+        // invariant violation). The first-resolve-then-recurse shape
+        // matches `Schema::validate_attr` (carina#3340).
+        AttributeType::Ref(_) => {
+            let resolved = attr_type.resolve_refs(defs);
+            walk_custom_lookup(resolved, value, attr_name, lookup, defs, errors);
+        }
     }
 }
 
@@ -525,6 +536,167 @@ pub enum AttributeType {
     },
     /// Union of multiple types (value is valid if it matches any member)
     Union(Vec<AttributeType>),
+    /// Named reference into the enclosing [`Schema`]'s definition map.
+    ///
+    /// Used to express cyclic struct definitions
+    /// (e.g. `Statement -> AndStatement -> List<Statement>` in
+    /// `AWS::WAFv2::WebACL`) without recursing at codegen time.
+    /// Resolved lazily by [`Schema::validate`] at the point of use.
+    ///
+    /// A `Ref` outside of a `Schema` context cannot be self-validated —
+    /// [`AttributeType::validate`] returns a `TypeError::ValidationFailed`
+    /// in that case. Callers who need to validate a schema that contains
+    /// `Ref` must go through [`Schema::validate`].
+    Ref(String),
+}
+
+/// A complete schema: a root attribute type together with the named
+/// definitions it can reference via [`AttributeType::Ref`].
+///
+/// Introduced in carina#3340 to model cyclic CloudFormation definition
+/// graphs (WAFv2 `WebACL.Statement`, AppSync `GraphQLApi`,
+/// StepFunctions state machine bodies, ...). The validate / diff / LSP
+/// walk-sites that may encounter a `Ref` take `&Schema` as `&self`, so
+/// the resolve step is required by the type signature rather than by
+/// convention.
+#[derive(Debug, Clone)]
+pub struct Schema {
+    /// The root attribute type. May be a `Ref` into `defs`, or any
+    /// other shape (`Struct`, `List`, primitive, ...).
+    pub root: AttributeType,
+    /// Named definitions reachable via [`AttributeType::Ref`].
+    pub defs: std::collections::BTreeMap<String, AttributeType>,
+}
+
+impl Schema {
+    /// Look up a named definition. Returns `None` if `name` is not in
+    /// `defs`; callers should treat that as a type error.
+    pub fn resolve(&self, name: &str) -> Option<&AttributeType> {
+        self.defs.get(name)
+    }
+
+    /// Validate a `Value` against this schema's `root`, resolving
+    /// any `Ref` it encounters by looking it up in `defs`.
+    pub fn validate(&self, value: &Value) -> Result<(), TypeError> {
+        self.validate_attr(&self.root, value)
+    }
+
+    /// Validate against an arbitrary `AttributeType` in the context of
+    /// this schema. Used internally to recurse through `Ref`; exposed
+    /// publicly so callers that already hold a sub-attribute (e.g. a
+    /// resource's attribute type plus the resource's struct-definition
+    /// map) can validate without re-rooting the schema.
+    pub fn validate_attr(&self, attr: &AttributeType, value: &Value) -> Result<(), TypeError> {
+        match attr {
+            AttributeType::Ref(name) => match self.resolve(name) {
+                Some(resolved) => self.validate_attr(resolved, value),
+                None => Err(TypeError::ValidationFailed {
+                    message: format!(
+                        "schema reference `{name}` is not defined in the enclosing schema"
+                    ),
+                }),
+            },
+            AttributeType::List { inner, ordered } => {
+                if let Some(ConcreteValueRef::List(items)) = value.as_concrete() {
+                    for (i, item) in items.iter().enumerate() {
+                        if let Err(inner_err) = self.validate_attr(inner, item) {
+                            return Err(TypeError::ListItemError {
+                                index: i,
+                                inner: Box::new(inner_err),
+                            });
+                        }
+                    }
+                    Ok(())
+                } else if value.as_concrete().is_none() {
+                    // Deferred — leave for the deferred-aware checker.
+                    Ok(())
+                } else {
+                    // Fall back to the standalone validator for the
+                    // not-a-list error. `ordered` is irrelevant when
+                    // the value is not even a list.
+                    let _ = ordered;
+                    AttributeType::List {
+                        inner: inner.clone(),
+                        ordered: *ordered,
+                    }
+                    .validate(value)
+                }
+            }
+            AttributeType::Map { key, value: val_ty } => {
+                if let Some(ConcreteValueRef::Map(map)) = value.as_concrete() {
+                    for (k, v) in map.iter() {
+                        let key_val = Value::Concrete(ConcreteValue::String(k.clone()));
+                        if let Err(inner_err) = self.validate_attr(key, &key_val) {
+                            return Err(TypeError::MapKeyError {
+                                key: k.clone(),
+                                inner: Box::new(inner_err),
+                            });
+                        }
+                        if let Err(inner_err) = self.validate_attr(val_ty, v) {
+                            return Err(TypeError::MapValueError {
+                                key: k.clone(),
+                                inner: Box::new(inner_err),
+                            });
+                        }
+                    }
+                    Ok(())
+                } else {
+                    AttributeType::Map {
+                        key: key.clone(),
+                        value: val_ty.clone(),
+                    }
+                    .validate(value)
+                }
+            }
+            AttributeType::Struct { name, fields } => {
+                if let Some(ConcreteValueRef::Map(map)) = value.as_concrete() {
+                    for field in fields {
+                        match map.get(&field.name) {
+                            Some(field_val) => {
+                                if let Err(inner_err) =
+                                    self.validate_attr(&field.field_type, field_val)
+                                {
+                                    return Err(TypeError::StructFieldError {
+                                        field: field.name.clone(),
+                                        inner: Box::new(inner_err),
+                                    });
+                                }
+                            }
+                            None if field.required => {
+                                return Err(TypeError::MissingRequired {
+                                    name: field.name.clone(),
+                                });
+                            }
+                            None => {}
+                        }
+                    }
+                    let _ = name;
+                    Ok(())
+                } else {
+                    AttributeType::Struct {
+                        name: name.clone(),
+                        fields: fields.clone(),
+                    }
+                    .validate(value)
+                }
+            }
+            AttributeType::Union(members) => {
+                for member in members {
+                    if self.validate_attr(member, value).is_ok() {
+                        return Ok(());
+                    }
+                }
+                Err(TypeError::TypeMismatch {
+                    expected: "Union".to_string(),
+                    got: attr.type_name(),
+                })
+            }
+            // For non-recursive variants, delegate to the standalone
+            // validator. Any `Ref` they could reach has already been
+            // peeled off by the arms above.
+            _ => attr.validate(value),
+        }
+    }
 }
 
 impl fmt::Debug for AttributeType {
@@ -594,6 +766,7 @@ impl fmt::Debug for AttributeType {
                 .field("fields", fields)
                 .finish(),
             AttributeType::Union(types) => f.debug_tuple("Union").field(types).finish(),
+            AttributeType::Ref(name) => f.debug_tuple("Ref").field(name).finish(),
         }
     }
 }
@@ -674,7 +847,61 @@ impl fmt::Display for FieldPath {
     }
 }
 
+/// Empty definition map for walk-sites whose resource schema carries
+/// no cyclic struct definitions (the common case before carina#3340's
+/// chain reaches awscc's WAFv2 WebACL).
+///
+/// Returned by reference so a single `&BTreeMap` reference can be
+/// threaded through every walk-site without per-call allocation.
+/// Walk-sites that hold a [`ResourceSchema`] should prefer `&rs.defs`
+/// to capture cyclic definitions; this constant is for sites that
+/// genuinely have no resource schema in scope (synthetic fixtures,
+/// validation helpers operating on a bare `AttributeType`).
+pub fn empty_defs() -> &'static std::collections::BTreeMap<String, AttributeType> {
+    use std::sync::OnceLock;
+    static EMPTY: OnceLock<std::collections::BTreeMap<String, AttributeType>> = OnceLock::new();
+    EMPTY.get_or_init(std::collections::BTreeMap::new)
+}
+
 impl AttributeType {
+    /// Walk through any [`AttributeType::Ref`] chain at the top of this
+    /// type, returning the first non-`Ref` target.
+    ///
+    /// Walk-sites (differ, detail_rows, LSP) must call this *before*
+    /// matching on the type, so the wildcard arm cannot silently
+    /// accept a `Ref` and discard its schema information. The
+    /// `defs` map is normally `&ResourceSchema::defs`; pass
+    /// [`empty_defs`] when no resource is in scope.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a `Ref` points to a name not present in `defs`. This
+    /// is a schema invariant (a producer that emits `Ref` must also
+    /// populate the matching def); a violation indicates a codegen
+    /// or wire-format bug, not user input.
+    pub fn resolve_refs<'a>(
+        &'a self,
+        defs: &'a std::collections::BTreeMap<String, AttributeType>,
+    ) -> &'a AttributeType {
+        let mut cur = self;
+        // A small upper bound to catch pathological cycles
+        // (`Ref("X") -> Ref("X")`) without hanging the walker.
+        for _ in 0..256 {
+            match cur {
+                AttributeType::Ref(name) => match defs.get(name) {
+                    Some(next) => cur = next,
+                    None => panic!(
+                        "AttributeType::Ref(\"{name}\") not found in schema defs; \
+                         schema invariant violated (producer must populate \
+                         ResourceSchema.defs for every Ref it emits)"
+                    ),
+                },
+                _ => return cur,
+            }
+        }
+        panic!("AttributeType::Ref chain exceeded 256 hops; pathological self-cycle in defs")
+    }
+
     /// Create a List type with default ordering (ordered=true, matching CloudFormation default).
     pub fn list(inner: AttributeType) -> Self {
         AttributeType::List {
@@ -778,6 +1005,19 @@ impl AttributeType {
     /// independently re-projected. Lists may legitimately mix concrete
     /// and deferred elements (e.g. `[vpc.id, "literal"]`).
     pub fn validate(&self, value: &Value) -> Result<(), TypeError> {
+        // `Ref` cannot be resolved without a `Schema` context. Callers
+        // who hold a schema that contains `Ref` must go through
+        // `Schema::validate` / `Schema::validate_attr`; falling through
+        // here would silently accept any value, defeating type safety
+        // (carina#3340).
+        if let AttributeType::Ref(name) = self {
+            return Err(TypeError::ValidationFailed {
+                message: format!(
+                    "internal: AttributeType::Ref(\"{name}\") reached the standalone \
+                     validator; this attribute must be validated through Schema::validate"
+                ),
+            });
+        }
         // StringEnum attributes assigned a bare `BindingRef` are the
         // shadowing collision case described in #2978: the user wrote a
         // bare identifier that happens to be a `let` binding *and* is
@@ -826,6 +1066,15 @@ impl AttributeType {
             | AttributeType::Float
             | AttributeType::Bool
             | AttributeType::Duration => self.validate_primitive(value),
+            // Unreachable: `validate` rejects `Ref` early before
+            // descending into the concrete-value dispatch. Kept as an
+            // explicit arm so the compiler enforces handling.
+            AttributeType::Ref(name) => Err(TypeError::ValidationFailed {
+                message: format!(
+                    "internal: AttributeType::Ref(\"{name}\") in validate_concrete; \
+                     this attribute must be validated through Schema::validate"
+                ),
+            }),
         }
     }
 
@@ -1447,6 +1696,7 @@ impl AttributeType {
                 let names: Vec<String> = types.iter().map(|t| t.type_name()).collect();
                 names.join(" | ")
             }
+            AttributeType::Ref(name) => format!("Ref({name})"),
         }
     }
 
@@ -2513,6 +2763,17 @@ pub struct ResourceSchema {
     /// against this resource type. `None` falls back to
     /// [`WAIT_DEFAULT_INTERVAL`].
     pub default_wait_interval: Option<std::time::Duration>,
+    /// Named definitions reachable via [`AttributeType::Ref`] from this
+    /// resource's attribute types. Empty for resources whose attribute
+    /// graph contains no cycles (the common case).
+    ///
+    /// Introduced in carina#3340 so cyclic CloudFormation definition
+    /// graphs (WAFv2 `WebACL.Statement`, AppSync `GraphQLApi`, ...) can
+    /// be represented in the type system without flattening to
+    /// `Map(String, String)` blobs. Walk-sites that traverse
+    /// `AttributeType` (differ, detail_rows, LSP) MUST consult `defs`
+    /// to resolve `Ref` variants rather than fall through a wildcard.
+    pub defs: std::collections::BTreeMap<String, AttributeType>,
 }
 
 /// Fallback total timeout when neither the user nor the resource schema
@@ -2541,7 +2802,19 @@ impl ResourceSchema {
             exclusive_required: Vec::new(),
             default_wait_timeout: None,
             default_wait_interval: None,
+            defs: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Attach a named definition reachable via [`AttributeType::Ref`].
+    ///
+    /// Used by codegen to register cyclic CFN struct definitions
+    /// (WAFv2 `WebACL.Statement`, AppSync `GraphQLApi`, ...). Each
+    /// `Ref(name)` inside this resource's attribute types is resolved
+    /// against this map.
+    pub fn with_def(mut self, name: impl Into<String>, ty: AttributeType) -> Self {
+        self.defs.insert(name.into(), ty);
+        self
     }
 
     /// Set the schema-declared default total timeout for `wait` polling.
@@ -2789,7 +3062,14 @@ impl ResourceSchema {
                     };
                     errors.push(reshaped);
                 }
-                walk_custom_lookup(&schema.attr_type, value, name, lookup, &mut errors);
+                walk_custom_lookup(
+                    &schema.attr_type,
+                    value,
+                    name,
+                    lookup,
+                    &self.defs,
+                    &mut errors,
+                );
             } else {
                 let suggestion = suggest_similar_name(name, &known);
                 errors.push(TypeError::UnknownAttribute {
@@ -2835,6 +3115,14 @@ pub fn collect_all_block_names(registry: &SchemaRegistry) -> HashMap<String, Str
             // Also collect from nested struct fields
             collect_block_names_from_type(&attr_schema.attr_type, &mut result);
         }
+        // Walk cyclic-struct definitions separately so block names on
+        // fields inside a `Ref` target (e.g. `Statement.AndStatement`)
+        // are picked up. The `Ref` arm in `collect_block_names_from_type`
+        // stops recursion to avoid loops; the visit-defs pass closes
+        // the gap (carina#3340).
+        for def in schema.defs.values() {
+            collect_block_names_from_type(def, &mut result);
+        }
     }
     result
 }
@@ -2860,7 +3148,18 @@ fn collect_block_names_from_type(attr_type: &AttributeType, result: &mut HashMap
                 collect_block_names_from_type(t, result);
             }
         }
-        _ => {}
+        // `Ref`: do not follow — the caller visits `schema.defs`
+        // entries directly to avoid infinite recursion on cyclic
+        // schemas (carina#3340).
+        AttributeType::Ref(_) => {}
+        AttributeType::String
+        | AttributeType::Int
+        | AttributeType::Float
+        | AttributeType::Bool
+        | AttributeType::Duration
+        | AttributeType::StringEnum { .. }
+        | AttributeType::Custom { .. }
+        | AttributeType::CustomEnum { .. } => {}
     }
 }
 

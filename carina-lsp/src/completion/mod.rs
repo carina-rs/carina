@@ -652,16 +652,24 @@ impl CompletionProvider {
     fn extract_struct_fields<'a>(
         &self,
         attr_type: &'a AttributeType,
+        defs: &'a std::collections::BTreeMap<String, AttributeType>,
     ) -> Option<&'a Vec<StructField>> {
+        // Resolve any leading `Ref` chain so the cyclic-CFN case
+        // (`Statement -> AndStatement -> List<Statement>`) descends
+        // through the cycle for completion (carina#3340).
+        let attr_type = attr_type.resolve_refs(defs);
         match attr_type {
             AttributeType::Struct { fields, .. } => Some(fields),
-            AttributeType::List { inner, .. } => match inner.as_ref() {
-                AttributeType::Struct { fields, .. } => Some(fields),
-                _ => None,
-            },
-            AttributeType::Union(members) => {
-                members.iter().find_map(|m| self.extract_struct_fields(m))
+            AttributeType::List { inner, .. } => {
+                let inner = inner.as_ref().resolve_refs(defs);
+                match inner {
+                    AttributeType::Struct { fields, .. } => Some(fields),
+                    _ => None,
+                }
             }
+            AttributeType::Union(members) => members
+                .iter()
+                .find_map(|m| self.extract_struct_fields(m, defs)),
             _ => None,
         }
     }
@@ -701,7 +709,7 @@ impl CompletionProvider {
         let mut current_type = &attr_schema.attr_type;
 
         for name in &attr_path[1..] {
-            let fields = self.extract_struct_fields(current_type)?;
+            let fields = self.extract_struct_fields(current_type, &schema.defs)?;
             let field = fields
                 .iter()
                 .find(|f| f.name == *name || f.block_name.as_deref() == Some(name))?;
@@ -717,7 +725,7 @@ impl CompletionProvider {
         attr_path: &[String],
     ) -> Option<&'a Vec<StructField>> {
         let attr_type = self.resolve_type_for_path(schema, attr_path)?;
-        self.extract_struct_fields(attr_type)
+        self.extract_struct_fields(attr_type, &schema.defs)
     }
 
     fn struct_field_completions(

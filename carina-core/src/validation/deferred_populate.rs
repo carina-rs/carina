@@ -233,7 +233,7 @@ fn check_ref(
         return;
     };
 
-    if path_traverses_deferred(attr_schema, path.segments()) {
+    if path_traverses_deferred(attr_schema, path.segments(), &schema.defs) {
         out.push(DeferredPopulateDiagnostic {
             message: format!(
                 "attribute `{attribute_key}` references `{}`, which is populated asynchronously by the provider after Create. \
@@ -254,7 +254,11 @@ fn check_ref(
 /// `AttributeSchema.deferred_populate=true` value is deferred-bound
 /// for *every* downstream chained access on it, even with no
 /// segments).
-fn path_traverses_deferred(top_attr: &AttributeSchema, segments: &[PathSegment]) -> bool {
+fn path_traverses_deferred(
+    top_attr: &AttributeSchema,
+    segments: &[PathSegment],
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> bool {
     if top_attr.deferred_populate {
         return true;
     }
@@ -266,7 +270,11 @@ fn path_traverses_deferred(top_attr: &AttributeSchema, segments: &[PathSegment])
         // the resulting `current_type` is the element type — no
         // deferred flag lives on List/Map themselves (they have no
         // such field on their builders).
-        match (current_type, segment) {
+        // Resolve `Ref` chains so the cyclic-CFN case
+        // (`Statement -> AndStatement -> List<Statement>`) does not
+        // bail out at the first cycle hop (carina#3340).
+        let resolved = current_type.resolve_refs(defs);
+        match (resolved, segment) {
             (AttributeType::List { inner, .. }, PathSegment::Subscript { .. }) => {
                 current_type = inner;
             }
