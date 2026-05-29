@@ -5349,3 +5349,37 @@ fn attribute_type_validate_on_ref_returns_error_without_schema() {
         "AttributeType::Ref cannot self-validate without a Schema"
     );
 }
+
+#[test]
+fn raw_shape_preserves_ref_at_top() {
+    // RawShape::Ref is the carina#3349 follow-up: transport-site
+    // callers (WASM plugin↔host serializers) must round-trip Ref
+    // without resolving it, because resolving against the local
+    // `defs` would either infinite-loop on cyclic schemas
+    // (WAFv2 WebACL.Statement) or flatten the structure the
+    // receiver needs to rebuild from `defs`.
+    let t = AttributeType::ref_("Statement");
+    match t.raw_shape() {
+        RawShape::Ref(name) => assert_eq!(name, "Statement"),
+        other => panic!("expected RawShape::Ref(\"Statement\"), got {other:?}"),
+    }
+}
+
+#[test]
+fn raw_shape_passes_through_non_ref_variants() {
+    // Sanity check that non-Ref variants still project correctly.
+    assert!(matches!(
+        AttributeType::string().raw_shape(),
+        RawShape::String
+    ));
+    assert!(matches!(AttributeType::int().raw_shape(), RawShape::Int));
+    assert!(matches!(AttributeType::bool().raw_shape(), RawShape::Bool));
+    match AttributeType::list(AttributeType::string()).raw_shape() {
+        RawShape::List { ordered, .. } => assert!(ordered),
+        other => panic!("expected RawShape::List, got {other:?}"),
+    }
+    match AttributeType::unordered_list(AttributeType::string()).raw_shape() {
+        RawShape::List { ordered, .. } => assert!(!ordered),
+        other => panic!("expected RawShape::List(unordered), got {other:?}"),
+    }
+}
