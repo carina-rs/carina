@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::schema::{AttributeType, ResourceSchema};
+use crate::schema::ResourceSchema;
 
 /// Find list literal syntax (`attr = [...]`) for the given attribute names.
 /// Returns attribute name and 1-indexed line number for each occurrence.
@@ -47,15 +47,19 @@ pub fn find_list_literal_attrs(source: &str, attr_names: &HashSet<String>) -> Ve
 /// class as carina#3349 — a raw `matches!` shape gate would silently
 /// drop `Ref`-typed attributes.
 pub fn list_struct_attr_names(schema: &ResourceSchema) -> HashSet<String> {
+    use crate::schema::Shape;
     schema
         .attributes
         .iter()
         .filter(|(_, attr_schema)| {
+            // Project onto `Shape` so any `Ref` chain is peeled at
+            // the type level (carina#3349). `Shape` has no `Ref`
+            // variant, so a `Ref`-typed attribute cannot be missed.
             matches!(
-                attr_schema.attr_type.resolve_refs(&schema.defs).as_attr(),
-                AttributeType::List { inner, .. } if matches!(
-                    inner.as_ref().resolve_refs(&schema.defs).as_attr(),
-                    AttributeType::Struct { .. }
+                attr_schema.attr_type.shape(&schema.defs),
+                Shape::List { inner, .. } if matches!(
+                    inner.shape(&schema.defs),
+                    Shape::Struct { .. }
                 )
             )
         })
