@@ -3583,19 +3583,20 @@ fn recurse_block_names_into_value(
     resource_id: &str,
     errors: &mut Vec<String>,
 ) {
-    // `ResolvedAttrType` guarantees `Ref` was peeled — the wildcard
-    // arm below is therefore safe by construction (the type system,
-    // not convention, enforces it).
-    match field_type.resolve_refs(defs).as_attr() {
-        AttributeType::Struct { fields: inner, .. } => {
+    // Project onto `Shape` so `Ref` is peeled at the type level
+    // (carina#3349). The `Shape` enum has no `Ref` variant, so the
+    // wildcard arm below cannot silently swallow a `Ref` — the bug
+    // class is structurally impossible.
+    match field_type.shape(defs) {
+        Shape::Struct { fields: inner, .. } => {
             if let Value::Concrete(ConcreteValue::Map(inner_map)) = value {
                 resolve_block_names_in_map(inner_map, inner, defs, resource_id, errors);
             }
         }
-        AttributeType::List { inner, .. } => {
-            // `List<Ref>`: peel the element type too so the walk reaches
-            // the underlying struct fields.
-            if let AttributeType::Struct { fields: inner, .. } = inner.resolve_refs(defs).as_attr()
+        Shape::List { inner, .. } => {
+            // `List<Ref>`: peel the element type too via `shape(defs)`
+            // so the walk reaches the underlying struct fields.
+            if let Shape::Struct { fields: inner, .. } = inner.shape(defs)
                 && let Value::Concrete(ConcreteValue::List(items)) = value
             {
                 for item in items.iter_mut() {
@@ -3607,8 +3608,7 @@ fn recurse_block_names_into_value(
         }
         // Other shapes (primitives, StringEnum, Custom, Map, Union) do
         // not carry block-name aliases reachable from here. `Ref` is
-        // already peeled by `resolve_refs` above — proved by the
-        // `ResolvedAttrType` return type.
+        // structurally absent from `Shape`.
         _ => {}
     }
 }
