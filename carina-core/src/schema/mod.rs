@@ -716,6 +716,149 @@ impl fmt::Debug for Shape<'_> {
     }
 }
 
+/// A `Ref`-preserving projection of [`AttributeType`] for callers that
+/// must round-trip the type *across a boundary* without resolving
+/// `Ref` against `defs` (typically: WIT/JSON serializers in WASM
+/// plugin guests that emit a [`crate::schema`] schema to the host
+/// alongside a `defs` map of its own).
+///
+/// [`Shape`] is the right view for **walk-sites** (differ, detail_rows,
+/// LSP, validation): it resolves `Ref` against the enclosing
+/// [`Schema`]'s `defs` map and is structurally guaranteed not to carry
+/// `Ref`. [`RawShape`] is the right view for **transport-sites**: the
+/// caller is not consuming the schema's meaning, only relaying its
+/// structural form, and resolving `Ref` would either (a) infinite-loop
+/// on cyclic schemas like WAFv2 `WebACL.Statement`, or (b) flatten the
+/// `defs` map into the root and lose the cyclic structure the receiver
+/// needs to re-build.
+///
+/// Mirrors [`Shape`] variant-for-variant **plus** a [`RawShape::Ref`]
+/// variant. New `AttributeType` variants must be added to both
+/// projections; the `AttrTypeKind::raw_shape` match is non-exhaustive
+/// against the source enum and the compiler will surface the omission.
+#[derive(Clone, Copy)]
+pub enum RawShape<'a> {
+    /// String — see [`AttrTypeKind::String`].
+    String,
+    /// Integer — see [`AttrTypeKind::Int`].
+    Int,
+    /// Floating-point — see [`AttrTypeKind::Float`].
+    Float,
+    /// Boolean — see [`AttrTypeKind::Bool`].
+    Bool,
+    /// Time duration — see [`AttrTypeKind::Duration`].
+    Duration,
+    /// Namespaced string enum — see [`AttrTypeKind::StringEnum`].
+    StringEnum {
+        name: &'a str,
+        values: &'a [String],
+        identity: Option<&'a TypeIdentity>,
+        dsl_aliases: &'a [(String, String)],
+    },
+    /// Structural custom type — see [`AttrTypeKind::Custom`].
+    Custom {
+        identity: Option<&'a TypeIdentity>,
+        base: &'a AttributeType,
+        pattern: Option<&'a str>,
+        length: Option<(Option<u64>, Option<u64>)>,
+        validate: &'a CustomValidator,
+        to_dsl: Option<fn(&str) -> String>,
+    },
+    /// Enum-shorthand custom type — see [`AttrTypeKind::CustomEnum`].
+    CustomEnum {
+        identity: &'a TypeIdentity,
+        base: &'a AttributeType,
+        validate: &'a CustomValidator,
+        to_dsl: Option<fn(&str) -> String>,
+    },
+    /// List with element type and ordering — see [`AttrTypeKind::List`].
+    List {
+        inner: &'a AttributeType,
+        ordered: bool,
+    },
+    /// Map with typed key/value — see [`AttrTypeKind::Map`].
+    Map {
+        key: &'a AttributeType,
+        value: &'a AttributeType,
+    },
+    /// Named struct — see [`AttrTypeKind::Struct`].
+    Struct {
+        name: &'a str,
+        fields: &'a [StructField],
+    },
+    /// Union of types — see [`AttrTypeKind::Union`].
+    Union(&'a [AttributeType]),
+    /// Named reference into the enclosing [`Schema`]'s `defs` map.
+    /// Carries the name; the receiver re-emits an `AttributeType::ref_(name)`
+    /// and looks up the definition in its own copy of `defs`.
+    Ref(&'a str),
+}
+
+impl fmt::Debug for RawShape<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RawShape::String => f.write_str("RawShape::String"),
+            RawShape::Int => f.write_str("RawShape::Int"),
+            RawShape::Float => f.write_str("RawShape::Float"),
+            RawShape::Bool => f.write_str("RawShape::Bool"),
+            RawShape::Duration => f.write_str("RawShape::Duration"),
+            RawShape::StringEnum {
+                name,
+                values,
+                identity,
+                dsl_aliases,
+            } => f
+                .debug_struct("RawShape::StringEnum")
+                .field("name", name)
+                .field("values", values)
+                .field("identity", identity)
+                .field("dsl_aliases", dsl_aliases)
+                .finish(),
+            RawShape::Custom {
+                identity,
+                base,
+                pattern,
+                length,
+                validate: _,
+                to_dsl: _,
+            } => f
+                .debug_struct("RawShape::Custom")
+                .field("identity", identity)
+                .field("base", base)
+                .field("pattern", pattern)
+                .field("length", length)
+                .finish_non_exhaustive(),
+            RawShape::CustomEnum {
+                identity,
+                base,
+                validate: _,
+                to_dsl: _,
+            } => f
+                .debug_struct("RawShape::CustomEnum")
+                .field("identity", identity)
+                .field("base", base)
+                .finish_non_exhaustive(),
+            RawShape::List { inner, ordered } => f
+                .debug_struct("RawShape::List")
+                .field("inner", inner)
+                .field("ordered", ordered)
+                .finish(),
+            RawShape::Map { key, value } => f
+                .debug_struct("RawShape::Map")
+                .field("key", key)
+                .field("value", value)
+                .finish(),
+            RawShape::Struct { name, fields } => f
+                .debug_struct("RawShape::Struct")
+                .field("name", name)
+                .field("fields", fields)
+                .finish(),
+            RawShape::Union(members) => f.debug_tuple("RawShape::Union").field(members).finish(),
+            RawShape::Ref(name) => f.debug_tuple("RawShape::Ref").field(name).finish(),
+        }
+    }
+}
+
 /// A complete schema: a root attribute type together with the named
 /// definitions it can reference via [`AttrTypeKind::Ref`].
 ///
@@ -1409,6 +1552,83 @@ impl AttributeType {
                 "resolve_refs guarantees the returned attr is not Ref; \
                  reaching this arm violates ResolvedAttrType's invariant"
             ),
+        }
+    }
+
+    /// Project this type onto a [`RawShape`] view that **preserves
+    /// `Ref`** instead of resolving it against any `defs` map.
+    ///
+    /// Intended for callers that round-trip the type across a
+    /// transport boundary (the WASM plugin↔host WIT/JSON serializers
+    /// in `carina-provider-{aws,awscc}/src/convert.rs`,
+    /// `carina-plugin-host/src/wasm_convert.rs`). At a transport
+    /// site, resolving `Ref` is wrong on two counts: cyclic schemas
+    /// like WAFv2 `WebACL.Statement` recurse forever, and even on
+    /// acyclic schemas, flattening `Ref` discards the `defs` shape
+    /// the receiver needs to reconstruct.
+    ///
+    /// Walk-sites (differ, detail_rows, LSP, validation, ...) must
+    /// keep using [`Self::shape`] — `RawShape::Ref` is reachable here
+    /// by design and a wildcard arm would silently re-introduce the
+    /// carina#3349 bug class at the walk-site.
+    pub fn raw_shape<'a>(&'a self) -> RawShape<'a> {
+        match &self.kind {
+            AttrTypeKind::String => RawShape::String,
+            AttrTypeKind::Int => RawShape::Int,
+            AttrTypeKind::Float => RawShape::Float,
+            AttrTypeKind::Bool => RawShape::Bool,
+            AttrTypeKind::Duration => RawShape::Duration,
+            AttrTypeKind::StringEnum {
+                name,
+                values,
+                identity,
+                dsl_aliases,
+            } => RawShape::StringEnum {
+                name: name.as_str(),
+                values: values.as_slice(),
+                identity: identity.as_ref(),
+                dsl_aliases: dsl_aliases.as_slice(),
+            },
+            AttrTypeKind::Custom {
+                identity,
+                base,
+                pattern,
+                length,
+                validate,
+                to_dsl,
+            } => RawShape::Custom {
+                identity: identity.as_ref(),
+                base: base.as_ref(),
+                pattern: pattern.as_deref(),
+                length: *length,
+                validate,
+                to_dsl: *to_dsl,
+            },
+            AttrTypeKind::CustomEnum {
+                identity,
+                base,
+                validate,
+                to_dsl,
+            } => RawShape::CustomEnum {
+                identity,
+                base: base.as_ref(),
+                validate,
+                to_dsl: *to_dsl,
+            },
+            AttrTypeKind::List { inner, ordered } => RawShape::List {
+                inner: inner.as_ref(),
+                ordered: *ordered,
+            },
+            AttrTypeKind::Map { key, value } => RawShape::Map {
+                key: key.as_ref(),
+                value: value.as_ref(),
+            },
+            AttrTypeKind::Struct { name, fields } => RawShape::Struct {
+                name: name.as_str(),
+                fields: fields.as_slice(),
+            },
+            AttrTypeKind::Union(members) => RawShape::Union(members.as_slice()),
+            AttrTypeKind::Ref(name) => RawShape::Ref(name.as_str()),
         }
     }
 
