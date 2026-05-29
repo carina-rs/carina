@@ -218,29 +218,32 @@ pub fn validate_resource_ref_types<E>(
             // suggestion; other shape mismatches stay silent because
             // resolver-time evaluation catches them with full location
             // context.
-            let narrowed =
-                match narrow_attribute_type(&ref_attr_schema.attr_type, ref_path.segments()) {
-                    Ok(t) => t,
-                    Err(NarrowError::UnknownStructField {
+            let narrowed = match narrow_attribute_type(
+                &ref_attr_schema.attr_type,
+                ref_path.segments(),
+                &ref_schema.defs,
+            ) {
+                Ok(t) => t,
+                Err(NarrowError::UnknownStructField {
+                    field,
+                    struct_name,
+                    known_fields,
+                }) => {
+                    let known: Vec<&str> = known_fields.iter().map(|s| s.as_str()).collect();
+                    all_errors.push(format!(
+                        "{}: unknown field '{}' on struct '{}' in reference {}; \
+                         known fields: {}.{}",
+                        resource_id,
                         field,
                         struct_name,
-                        known_fields,
-                    }) => {
-                        let known: Vec<&str> = known_fields.iter().map(|s| s.as_str()).collect();
-                        all_errors.push(format!(
-                            "{}: unknown field '{}' on struct '{}' in reference {}; \
-                         known fields: {}.{}",
-                            resource_id,
-                            field,
-                            struct_name,
-                            ref_path.to_dot_string(),
-                            known.join(", "),
-                            did_you_mean(&field, &known),
-                        ));
-                        continue;
-                    }
-                    Err(NarrowError::ShapeMismatch) => continue,
-                };
+                        ref_path.to_dot_string(),
+                        known.join(", "),
+                        did_you_mean(&field, &known),
+                    ));
+                    continue;
+                }
+                Err(NarrowError::ShapeMismatch) => continue,
+            };
             let ref_type_name = narrowed.type_name();
 
             // Directional check: source (the referenced attribute, post
@@ -1362,16 +1365,24 @@ pub(crate) fn narrow_type_expr(
 pub(crate) fn narrow_attribute_type<'a>(
     start: &'a AttributeType,
     segments: &[crate::resource::PathSegment],
+    defs: &'a std::collections::BTreeMap<String, AttributeType>,
 ) -> Result<&'a AttributeType, NarrowError> {
     use crate::resource::{PathSegment, Subscript};
+    use crate::schema::Shape;
     let mut current = start;
     for seg in segments {
-        current = match (seg, current) {
-            (PathSegment::Field { name }, AttributeType::Struct { fields, name: sn }) => {
+        // Project onto `Shape` so any `Ref` chain is peeled at the
+        // type level (carina#3349). Without this, a `Ref`-typed
+        // attribute would fall into the wildcard arm below and
+        // every nested narrowing step would mis-report a shape
+        // mismatch.
+        let shape = current.shape(defs);
+        current = match (seg, shape) {
+            (PathSegment::Field { name }, Shape::Struct { fields, name: sn }) => {
                 let Some(field) = fields.iter().find(|f| f.name == *name) else {
                     return Err(NarrowError::UnknownStructField {
                         field: name.clone(),
-                        struct_name: sn.clone(),
+                        struct_name: sn.to_string(),
                         known_fields: fields.iter().map(|f| f.name.clone()).collect(),
                     });
                 };
@@ -1379,19 +1390,19 @@ pub(crate) fn narrow_attribute_type<'a>(
             }
             // Dot-form key access against a `map(_, V)` projects to
             // `V`, mirroring the resolver's behaviour (carina#2447).
-            (PathSegment::Field { .. }, AttributeType::Map { value, .. }) => value.as_ref(),
+            (PathSegment::Field { .. }, Shape::Map { value, .. }) => value,
             (
                 PathSegment::Subscript {
                     index: Subscript::Int { .. },
                 },
-                AttributeType::List { inner, .. },
-            ) => inner.as_ref(),
+                Shape::List { inner, .. },
+            ) => inner,
             (
                 PathSegment::Subscript {
                     index: Subscript::Str { .. },
                 },
-                AttributeType::Map { value, .. },
-            ) => value.as_ref(),
+                Shape::Map { value, .. },
+            ) => value,
             _ => return Err(NarrowError::ShapeMismatch),
         };
     }
