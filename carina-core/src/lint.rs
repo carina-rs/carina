@@ -37,15 +37,26 @@ pub fn find_list_literal_attrs(source: &str, attr_names: &HashSet<String>) -> Ve
     results
 }
 
-/// Collect all List<Struct> attribute names from a schema.
+/// Collect all `List<Struct>` attribute names from a schema.
+///
+/// Peels [`AttributeType::Ref`] against `schema.defs` for both the
+/// attribute type and the list element type, so cyclic-CFN attributes
+/// (`Ref("LifecycleConfiguration")` whose def carries a
+/// `List<Ref<Rule>>` field) still classify as `List<Struct>` and get
+/// the "use block syntax instead of `[...]`" lint warning. Same bug
+/// class as carina#3349 — a raw `matches!` shape gate would silently
+/// drop `Ref`-typed attributes.
 pub fn list_struct_attr_names(schema: &ResourceSchema) -> HashSet<String> {
     schema
         .attributes
         .iter()
         .filter(|(_, attr_schema)| {
             matches!(
-                &attr_schema.attr_type,
-                AttributeType::List { inner, .. } if matches!(inner.as_ref(), AttributeType::Struct { .. })
+                attr_schema.attr_type.resolve_refs(&schema.defs).as_attr(),
+                AttributeType::List { inner, .. } if matches!(
+                    inner.as_ref().resolve_refs(&schema.defs).as_attr(),
+                    AttributeType::Struct { .. }
+                )
             )
         })
         .map(|(name, _)| name.clone())

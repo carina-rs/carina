@@ -84,11 +84,21 @@ impl CompletionProvider {
                     ..Default::default()
                 });
 
-                // For List(Struct) attributes with block_name, offer block syntax completion
+                // For List(Struct) attributes with block_name, offer block
+                // syntax completion. Peel `Ref` against `schema.defs` for
+                // both the attribute type and the list element type so the
+                // snippet still fires on cyclic-CFN attributes like
+                // `Ref("LifecycleConfiguration") -> Struct { rules:
+                // List<Ref<Struct>> with block_name("rule") }`. Same bug
+                // class as carina#3349.
+                let attr_ty_resolved = attr.attr_type.resolve_refs(&schema.defs).as_attr();
                 if let Some(bn) = &attr.block_name
                     && matches!(
-                        &attr.attr_type,
-                        AttributeType::List { inner, .. } if matches!(inner.as_ref(), AttributeType::Struct { .. })
+                        attr_ty_resolved,
+                        AttributeType::List { inner, .. } if matches!(
+                            inner.as_ref().resolve_refs(&schema.defs).as_attr(),
+                            AttributeType::Struct { .. }
+                        )
                     )
                 {
                     completions.push(CompletionItem {
@@ -354,8 +364,14 @@ impl CompletionProvider {
         if let Some(schema) = self.lookup_schema(resource_type)
             && let Some(attr_schema) = schema.attributes.get(attr_name)
         {
-            // Struct types: offer `{ }` snippet only, no built-in functions
-            if matches!(&attr_schema.attr_type, AttributeType::Struct { .. }) {
+            // Struct types: offer `{ }` snippet only, no built-in functions.
+            // Peel `Ref` against `schema.defs` so a Ref-typed struct
+            // attribute (cyclic-CFN case) also gets the snippet (same bug
+            // class as carina#3349).
+            if matches!(
+                attr_schema.attr_type.resolve_refs(&schema.defs).as_attr(),
+                AttributeType::Struct { .. }
+            ) {
                 completions.push(CompletionItem {
                     label: "{ }".to_string(),
                     kind: Some(CompletionItemKind::SNIPPET),

@@ -3827,3 +3827,89 @@ let waited = wait cert {
         diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
     );
 }
+
+#[test]
+fn lsp_accepts_block_syntax_inside_ref_typed_attribute() {
+    // Regression for carina#3349: the LSP per-keystroke diagnostic
+    // pass previously matched on `&attr_schema.attr_type` raw, so a
+    // `Ref("LifecycleConfiguration")` attribute fell through every
+    // arm and silently produced no diagnostics — including no
+    // "Required attribute 'rules' is missing" — *but the apply path
+    // through `resolve_block_names` did surface that error*. The fix
+    // peels `Ref` against `schema.defs` at every shape gate the LSP
+    // touches. Pin "valid block syntax inside a Ref-typed attribute
+    // yields no schema-shape diagnostics" so a future refactor that
+    // drops the peel cannot silently regress.
+    let engine = test_engine_with_ref_lifecycle_like_schema();
+    let src = r#"
+let bucket = awscc.s3.Bucket {
+    lifecycle_configuration = {
+        rule {
+            id = "expire-old-objects"
+        }
+        rule {
+            id = "transition-to-glacier"
+        }
+    }
+}
+"#;
+    let doc = create_document(src);
+    let diags = engine.analyze(&doc, None);
+    let block_msgs: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            d.message.contains("Required attribute 'rules'")
+                || d.message.contains("cannot use block syntax")
+                || d.message.contains("Type mismatch")
+        })
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(
+        block_msgs.is_empty(),
+        "Ref-typed attribute should not surface block-syntax / required / type-mismatch diagnostics for the documented `rule {{ }}` shape; got: {:?}",
+        block_msgs,
+    );
+}
+
+#[test]
+fn lsp_surfaces_missing_required_field_inside_ref_typed_attribute() {
+    // Positive-assertion regression for carina#3349. Unlike the
+    // sibling test above (which asserts the *absence* of false
+    // positives — passes even if the LSP peel is deleted because
+    // dropping `Ref` silently disables struct validation), this test
+    // asserts that struct-field validation actually descends through
+    // the `Ref` and reports a missing required field. Without the
+    // peel calls in `carina-lsp/src/diagnostics/mod.rs`, the
+    // `is_struct_shape` gate returns false for the Ref-typed
+    // attribute and the validator never visits the nested `rule { }`
+    // block — so a future refactor that drops the peel would fail
+    // this test outright. The `Rule.id` field is declared `.required()`
+    // in `test_engine_with_ref_lifecycle_like_schema` for this
+    // purpose.
+    let engine = test_engine_with_ref_lifecycle_like_schema();
+    let src = r#"
+let bucket = awscc.s3.Bucket {
+    lifecycle_configuration = {
+        rule {
+        }
+    }
+}
+"#;
+    let doc = create_document(src);
+    let diags = engine.analyze(&doc, None);
+    let missing_id: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            (d.message.contains("Required") || d.message.contains("required"))
+                && d.message.contains("id")
+        })
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(
+        !missing_id.is_empty(),
+        "LSP must surface 'required field id is missing' through a Ref-typed attribute. \
+         If this test fails, the Ref-peel in carina-lsp/src/diagnostics/mod.rs has \
+         regressed (same class as carina#3349). All diagnostics: {:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+    );
+}

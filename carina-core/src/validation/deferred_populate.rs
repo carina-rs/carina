@@ -273,7 +273,7 @@ fn path_traverses_deferred(
         // Resolve `Ref` chains so the cyclic-CFN case
         // (`Statement -> AndStatement -> List<Statement>`) does not
         // bail out at the first cycle hop (carina#3340).
-        let resolved = current_type.resolve_refs(defs);
+        let resolved = current_type.resolve_refs(defs).as_attr();
         match (resolved, segment) {
             (AttributeType::List { inner, .. }, PathSegment::Subscript { .. }) => {
                 current_type = inner;

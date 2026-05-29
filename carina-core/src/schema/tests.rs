@@ -2544,12 +2544,222 @@ fn resolve_block_names_nested_same_block_and_canonical_name() {
 }
 
 #[test]
+fn resolve_block_names_recurses_through_ref_attribute() {
+    // Regression for carina#3349 (awscc s3_bucket/lifecycle): the
+    // `lifecycle_configuration` attribute is typed as
+    // `AttributeType::Ref("LifecycleConfiguration")`. The
+    // `LifecycleConfiguration` def's `rules` field carries
+    // `block_name("rule")`. DSL `rule { } rule { }` blocks must be
+    // renamed to the canonical `rules` field, but the recursion in
+    // `resolve_block_names` previously fell through `_ => {}` for
+    // `Ref`, so the rename never visited fields inside the resolved
+    // def and the schema later reported `Required attribute 'rules'
+    // is missing`.
+    let mut inner_map = IndexMap::new();
+    // Two `rule { ... }` blocks: parser produces a single List value
+    // under the block name `rule`.
+    inner_map.insert(
+        "rule".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::Map({
+                let mut m = IndexMap::new();
+                m.insert(
+                    "id".to_string(),
+                    Value::Concrete(ConcreteValue::String("rule-1".to_string())),
+                );
+                m
+            })),
+            Value::Concrete(ConcreteValue::Map({
+                let mut m = IndexMap::new();
+                m.insert(
+                    "id".to_string(),
+                    Value::Concrete(ConcreteValue::String("rule-2".to_string())),
+                );
+                m
+            })),
+        ])),
+    );
+
+    let mut resources = vec![{
+        let mut r = Resource::new("s3.Bucket", "my-bucket");
+        r.set_attr(
+            "lifecycle_configuration".to_string(),
+            Value::Concrete(ConcreteValue::Map(inner_map)),
+        );
+        r
+    }];
+
+    let lifecycle_def = AttributeType::Struct {
+        name: "LifecycleConfiguration".to_string(),
+        fields: vec![
+            StructField::new(
+                "rules",
+                AttributeType::list(AttributeType::Struct {
+                    name: "Rule".to_string(),
+                    fields: vec![StructField::new("id", AttributeType::String)],
+                }),
+            )
+            .with_block_name("rule"),
+        ],
+    };
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::new(
+                "lifecycle_configuration",
+                AttributeType::Ref("LifecycleConfiguration".to_string()),
+            ))
+            .with_def("LifecycleConfiguration", lifecycle_def),
+    );
+
+    resolve_block_names(&mut resources, &schemas).unwrap();
+
+    let lifecycle = match resources[0].get_attr("lifecycle_configuration") {
+        Some(Value::Concrete(ConcreteValue::Map(m))) => m,
+        _ => panic!("expected Map"),
+    };
+    assert!(
+        lifecycle.contains_key("rules"),
+        "expected nested 'rule' block to be renamed to 'rules' through Ref-typed attribute"
+    );
+    assert!(
+        !lifecycle.contains_key("rule"),
+        "expected 'rule' key to be removed after rename"
+    );
+}
+
+#[test]
+fn resolve_block_names_recurses_through_ref_inside_struct_field() {
+    // Sibling case: a Struct attribute whose nested field is itself
+    // `AttributeType::Ref`. The fix must peel `Ref` at the nested
+    // recursion in `resolve_block_names_in_map`, not just the
+    // top-level attribute walk in `resolve_block_names`.
+    let mut inner_map = IndexMap::new();
+    let mut lifecycle_inner = IndexMap::new();
+    lifecycle_inner.insert(
+        "rule".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map({
+                let mut m = IndexMap::new();
+                m.insert(
+                    "id".to_string(),
+                    Value::Concrete(ConcreteValue::String("rule-1".to_string())),
+                );
+                m
+            }),
+        )])),
+    );
+    inner_map.insert(
+        "lifecycle".to_string(),
+        Value::Concrete(ConcreteValue::Map(lifecycle_inner)),
+    );
+
+    let mut resources = vec![{
+        let mut r = Resource::new("s3.Bucket", "my-bucket");
+        r.set_attr(
+            "wrapper".to_string(),
+            Value::Concrete(ConcreteValue::Map(inner_map)),
+        );
+        r
+    }];
+
+    let lifecycle_def = AttributeType::Struct {
+        name: "LifecycleConfiguration".to_string(),
+        fields: vec![
+            StructField::new(
+                "rules",
+                AttributeType::list(AttributeType::Struct {
+                    name: "Rule".to_string(),
+                    fields: vec![StructField::new("id", AttributeType::String)],
+                }),
+            )
+            .with_block_name("rule"),
+        ],
+    };
+
+    let wrapper_type = AttributeType::Struct {
+        name: "Wrapper".to_string(),
+        fields: vec![StructField::new(
+            "lifecycle",
+            AttributeType::Ref("LifecycleConfiguration".to_string()),
+        )],
+    };
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::new("wrapper", wrapper_type))
+            .with_def("LifecycleConfiguration", lifecycle_def),
+    );
+
+    resolve_block_names(&mut resources, &schemas).unwrap();
+
+    let wrapper = match resources[0].get_attr("wrapper") {
+        Some(Value::Concrete(ConcreteValue::Map(m))) => m,
+        _ => panic!("expected Map"),
+    };
+    let lifecycle = match wrapper.get("lifecycle") {
+        Some(Value::Concrete(ConcreteValue::Map(m))) => m,
+        _ => panic!("expected nested Map under 'lifecycle'"),
+    };
+    assert!(
+        lifecycle.contains_key("rules"),
+        "expected nested 'rule' block under Ref-typed field to be renamed to 'rules'"
+    );
+    assert!(!lifecycle.contains_key("rule"));
+}
+
+#[test]
 fn test_operation_config_default() {
     let config = OperationConfig::default();
     assert_eq!(config.delete_timeout_secs, None);
     assert_eq!(config.delete_max_retries, None);
     assert_eq!(config.create_timeout_secs, None);
     assert_eq!(config.create_max_retries, None);
+}
+
+#[test]
+fn resolved_attr_type_never_returns_ref_after_peel() {
+    // Type-safety invariant: `ResolvedAttrType::as_attr` MUST NOT
+    // return `AttributeType::Ref`. The newtype's whole purpose is to
+    // make this guarantee compiler-checked at every walk-site
+    // (carina#3349). This test pins the runtime behavior of the only
+    // constructor (`resolve_refs`) against a multi-hop Ref chain and a
+    // direct Ref-to-non-Struct shape; if a future change ever lets
+    // `Ref` escape, this test catches it before the schema walkers do.
+    let mut defs = std::collections::BTreeMap::new();
+    defs.insert("Hop1".to_string(), AttributeType::Ref("Hop2".to_string()));
+    defs.insert("Hop2".to_string(), AttributeType::Ref("Hop3".to_string()));
+    defs.insert("Hop3".to_string(), AttributeType::String);
+
+    let ref_type = AttributeType::Ref("Hop1".to_string());
+    let resolved = ref_type.resolve_refs(&defs);
+    assert!(
+        !matches!(resolved.as_attr(), AttributeType::Ref(_)),
+        "resolve_refs must never return a Ref after peeling"
+    );
+    assert!(matches!(resolved.as_attr(), AttributeType::String));
+
+    // Non-Ref input is returned as-is (identity behavior).
+    let plain = AttributeType::Int;
+    let resolved = plain.resolve_refs(&defs);
+    assert!(matches!(resolved.as_attr(), AttributeType::Int));
+}
+
+#[test]
+#[should_panic(expected = "not found in schema defs")]
+fn resolved_attr_type_panics_on_dangling_ref() {
+    // The other half of the type-safety claim: a dangling `Ref` is a
+    // schema-construction bug that must be caught immediately, not
+    // silently absorbed. This pins the existing panic behavior so a
+    // future refactor cannot accidentally turn it into "return Ref
+    // unchanged" (which would re-open the carina#3349 hazard).
+    let defs = std::collections::BTreeMap::new();
+    let ref_type = AttributeType::Ref("Missing".to_string());
+    let _ = ref_type.resolve_refs(&defs);
 }
 
 #[test]

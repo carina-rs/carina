@@ -186,10 +186,17 @@ impl DiagnosticEngine {
         let mut diagnostics = Vec::new();
 
         for (attr_name, attr_schema) in &schema.attributes {
-            // Only check List<Struct> attributes
+            // Only check List<Struct> attributes. Peel `Ref` against
+            // `schema.defs` for both the attribute type and the list
+            // element type so the hint also fires for cyclic-CFN shapes
+            // like `Ref("LifecycleConfiguration")` whose def carries a
+            // `List<Ref<Rule>>` field (same bug class as carina#3349).
             let is_list_struct = matches!(
-                &attr_schema.attr_type,
-                AttributeType::List { inner, .. } if matches!(inner.as_ref(), AttributeType::Struct { .. })
+                attr_schema.attr_type.resolve_refs(&schema.defs).as_attr(),
+                AttributeType::List { inner, .. } if matches!(
+                    inner.as_ref().resolve_refs(&schema.defs).as_attr(),
+                    AttributeType::Struct { .. }
+                )
             );
             if !is_list_struct {
                 continue;

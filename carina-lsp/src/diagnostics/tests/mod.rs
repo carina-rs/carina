@@ -194,6 +194,56 @@ pub(super) fn test_engine_with_block_name_nested() -> DiagnosticEngine {
     )
 }
 
+/// Engine carrying a single resource whose `lifecycle_configuration`
+/// attribute is typed `Ref("LifecycleConfiguration")` — mirrors the
+/// awscc S3 Bucket shape that drove carina#3349. The `rules` field
+/// inside the resolved def carries `block_name("rule")`, so DSL
+/// `rule { } rule { }` blocks must be renamed to the canonical `rules`
+/// field by `resolve_block_names` and the per-keystroke LSP diagnostic
+/// pass must shape-match through `Ref` to reach struct-field
+/// validation. Both code paths previously had `_ => {}` arms that
+/// silently dropped `Ref`.
+pub(super) fn test_engine_with_ref_lifecycle_like_schema() -> DiagnosticEngine {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+    let lifecycle_def = AttributeType::Struct {
+        name: "LifecycleConfiguration".to_string(),
+        fields: vec![
+            StructField::new(
+                "rules",
+                AttributeType::list(AttributeType::Struct {
+                    name: "Rule".to_string(),
+                    // `id` is required: omitting it from a DSL `rule { }`
+                    // block must surface a missing-required-field
+                    // diagnostic. This is the positive assertion that
+                    // pins the LSP Ref-peel fix — without the peel the
+                    // struct-field validator never visits the
+                    // Ref-typed attribute and the missing `id` slips
+                    // through silently.
+                    fields: vec![StructField::new("id", AttributeType::String).required()],
+                }),
+            )
+            .with_block_name("rule"),
+        ],
+    };
+
+    let schema = ResourceSchema::new("s3.Bucket")
+        .attribute(AttributeSchema::new(
+            "lifecycle_configuration",
+            AttributeType::Ref("LifecycleConfiguration".to_string()),
+        ))
+        .with_def("LifecycleConfiguration", lifecycle_def);
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
+
+    DiagnosticEngine::new(
+        Arc::new(schemas),
+        vec!["awscc".to_string()],
+        Arc::new(vec![]),
+    )
+}
+
 pub(super) fn custom_engine(schemas: SchemaRegistry) -> DiagnosticEngine {
     let provider_names: Vec<String> = schemas
         .iter()

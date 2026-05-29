@@ -770,7 +770,7 @@ pub fn resolve_enum_value_recursive_with_defs(
         // (schema invariant violation).
         AttributeType::Ref(_) => {
             let resolved = attr_type.resolve_refs(defs);
-            resolve_enum_value_recursive_with_defs(value, resolved, defs)
+            resolve_enum_value_recursive_with_defs(value, resolved.as_attr(), defs)
         }
         // Scalars and Union: nothing to descend into.
         _ => None,
@@ -1023,7 +1023,7 @@ pub fn lift_string_enum_leaves_with_defs(
         // `resolve_enum_value_recursive_with_defs` (carina#3340).
         AttributeType::Ref(_) => {
             let resolved = attr_type.resolve_refs(defs);
-            lift_string_enum_leaves_with_defs(value, resolved, defs)
+            lift_string_enum_leaves_with_defs(value, resolved.as_attr(), defs)
         }
         // Scalars and Union: nothing to descend into.
         _ => None,

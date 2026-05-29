@@ -530,9 +530,12 @@ impl DiagnosticEngine {
                         if let Some(attr_schema) = schema.attributes.get(canonical_name) {
                             // Check for block syntax on bare Struct attributes:
                             // Block syntax produces Value::Concrete(ConcreteValue::List), but bare Struct requires
-                            // map assignment syntax: attr = { ... }
+                            // map assignment syntax: attr = { ... }.
+                            // Peel `Ref` first so a Ref-typed bare-struct
+                            // attribute is still caught (same bug class as
+                            // carina#3349).
                             if matches!(
-                                &attr_schema.attr_type,
+                                attr_schema.attr_type.resolve_refs(&schema.defs).as_attr(),
                                 carina_core::schema::AttributeType::Struct { .. }
                             ) && matches!(attr_value, Value::Concrete(ConcreteValue::List(_)))
                             {
@@ -577,7 +580,15 @@ impl DiagnosticEngine {
                                 // is already reported with the richer diagnostic.
                                 continue;
                             }
-                            let type_error = match (&attr_schema.attr_type, attr_value) {
+                            // Peel `AttributeType::Ref` against `schema.defs`
+                            // before shape-matching so cyclic-CFN attributes
+                            // are type-checked by the LSP. Same bug class as
+                            // carina#3349: a raw match would fall through
+                            // every arm for `Ref`-typed attributes and
+                            // silently skip the per-keystroke diagnostic.
+                            let attr_ty_resolved =
+                                attr_schema.attr_type.resolve_refs(&schema.defs).as_attr();
+                            let type_error = match (attr_ty_resolved, attr_value) {
                                 // Bool type should not receive String
                                 (
                                     carina_core::schema::AttributeType::Bool,
@@ -751,12 +762,15 @@ impl DiagnosticEngine {
                                     }
                                 }
                                 // Validate List item types (non-Struct items only;
-                                // List<Struct> is handled by validate_struct_value below)
+                                // List<Struct> is handled by validate_struct_value below).
+                                // `inner.as_ref().resolve_refs(...)` so a
+                                // `List<Ref<Struct>>` correctly defers to
+                                // the struct-validation pass (carina#3349).
                                 (
                                     carina_core::schema::AttributeType::List { inner, .. },
                                     Value::Concrete(ConcreteValue::List(_)),
                                 ) if !matches!(
-                                    inner.as_ref(),
+                                    inner.as_ref().resolve_refs(&schema.defs).as_attr(),
                                     carina_core::schema::AttributeType::Struct { .. }
                                 ) =>
                                 {
@@ -819,10 +833,21 @@ impl DiagnosticEngine {
                             // don't deep-clone the field set on every
                             // keystroke (LSP `analyze_with_filename` is on
                             // the per-keystroke hot path).
-                            let is_struct_shape = match &attr_schema.attr_type {
+                            //
+                            // Peel `AttributeType::Ref` against
+                            // `schema.defs` before shape-matching so
+                            // cyclic-CFN attributes (e.g.
+                            // `awscc.s3.Bucket.lifecycle_configuration:
+                            // Ref("LifecycleConfiguration")`) still trigger
+                            // struct-field validation. Same bug class as
+                            // carina#3349 — a raw match arm would silently
+                            // drop `Ref` and skip the entire pass.
+                            let attr_ty =
+                                attr_schema.attr_type.resolve_refs(&schema.defs).as_attr();
+                            let is_struct_shape = match attr_ty {
                                 carina_core::schema::AttributeType::Struct { .. } => true,
                                 carina_core::schema::AttributeType::List { inner, .. } => matches!(
-                                    inner.as_ref(),
+                                    inner.as_ref().resolve_refs(&schema.defs).as_attr(),
                                     carina_core::schema::AttributeType::Struct { .. }
                                 ),
                                 _ => false,

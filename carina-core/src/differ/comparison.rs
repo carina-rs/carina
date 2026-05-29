@@ -67,8 +67,10 @@ pub(crate) fn type_aware_equal(
     }
 
     // Resolve any top-level `AttributeType::Ref` chain BEFORE matching,
-    // so the wildcard arm below cannot silently swallow a `Ref` (carina#3340).
-    let attr_type = attr_type.map(|t| t.resolve_refs(defs));
+    // so the wildcard arm below cannot silently swallow a `Ref`
+    // (carina#3340). The `ResolvedAttrType` wrapper makes that
+    // requirement compiler-checked rather than convention.
+    let attr_type = attr_type.map(|t| t.resolve_refs(defs).as_attr());
 
     match attr_type {
         None => {
@@ -433,7 +435,12 @@ fn is_type_default(
 ) -> bool {
     // Resolve top-level `Ref` chain so the wildcard arm cannot
     // silently miss a default-value classification (carina#3340).
-    let attr_type = attr_type.map(|t| t.resolve_refs(defs));
+    // The `ResolvedAttrType` wrapper makes the peel step compiler-
+    // checked rather than convention; collapsing back to
+    // `&AttributeType` here is safe because the wrapper's invariant
+    // is "not `Ref`" — the wildcard arm below cannot be reached by
+    // a `Ref` and never silently swallows one.
+    let attr_type = attr_type.map(|t| t.resolve_refs(defs).as_attr());
     match (value, attr_type) {
         (Value::Concrete(ConcreteValue::Bool(false)), Some(AttributeType::Bool) | None) => true,
         (Value::Concrete(ConcreteValue::Int(0)), Some(AttributeType::Int)) => true,

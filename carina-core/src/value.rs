@@ -1392,7 +1392,7 @@ pub(crate) fn canonicalize_with_type(
     // (carina#3340).
     if let AttributeType::Ref(_) = unwrapped {
         let resolved = unwrapped.resolve_refs(defs);
-        return canonicalize_with_type(value, resolved, defs);
+        return canonicalize_with_type(value, resolved.as_attr(), defs);
     }
     match (value, unwrapped) {
         (Value::Concrete(ConcreteValue::List(items)), AttributeType::List { inner, .. }) => {

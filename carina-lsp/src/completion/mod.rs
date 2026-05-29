@@ -657,11 +657,11 @@ impl CompletionProvider {
         // Resolve any leading `Ref` chain so the cyclic-CFN case
         // (`Statement -> AndStatement -> List<Statement>`) descends
         // through the cycle for completion (carina#3340).
-        let attr_type = attr_type.resolve_refs(defs);
+        let attr_type = attr_type.resolve_refs(defs).as_attr();
         match attr_type {
             AttributeType::Struct { fields, .. } => Some(fields),
             AttributeType::List { inner, .. } => {
-                let inner = inner.as_ref().resolve_refs(defs);
+                let inner = inner.as_ref().resolve_refs(defs).as_attr();
                 match inner {
                     AttributeType::Struct { fields, .. } => Some(fields),
                     _ => None,

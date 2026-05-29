@@ -13,7 +13,10 @@ use crate::resource::{ConcreteValue, ConcreteValueRef, DeferredValue, Resource, 
 use crate::utils::{extract_enum_value_with_values, validate_enum_namespace};
 use crate::value::format_value_with_key;
 
+mod resolved_attr_type;
 mod type_identity;
+
+pub use resolved_attr_type::ResolvedAttrType;
 pub use type_identity::TypeIdentity;
 
 /// Type alias for resource validator functions
@@ -554,6 +557,143 @@ pub enum AttributeType {
     /// in that case. Callers who need to validate a schema that contains
     /// `Ref` must go through [`Schema::validate`].
     Ref(String),
+}
+
+/// A view over an [`AttributeType`] with **every top-level `Ref` peeled**.
+///
+/// Returned by [`AttributeType::shape`]. The enum intentionally omits a
+/// `Ref` variant, so a `match shape { ... }` with a wildcard arm is
+/// type-system-safe — there is no path that lets a `Ref` reach the
+/// match. This is the carina#3349 invariant lifted into the type system:
+/// every walk-site that previously matched on a raw `&AttributeType` and
+/// could silently drop `Ref` in a wildcard arm now matches on a
+/// `Shape<'a>` instead, and the bug class is structurally impossible.
+///
+/// All variants carry borrowed data, so constructing a `Shape` is a
+/// cheap reborrow plus a `Ref` chain walk; the lifetime is tied to the
+/// `AttributeType` plus the `defs` map passed to `shape`.
+///
+/// Mirrors [`AttributeType`] variant-for-variant except for `Ref`. New
+/// `AttributeType` variants must be added here as well; the
+/// `AttributeType::shape` match is non-exhaustive against the source
+/// enum and the compiler will surface the omission.
+#[derive(Clone, Copy)]
+pub enum Shape<'a> {
+    /// String — see [`AttributeType::String`].
+    String,
+    /// Integer — see [`AttributeType::Int`].
+    Int,
+    /// Floating-point — see [`AttributeType::Float`].
+    Float,
+    /// Boolean — see [`AttributeType::Bool`].
+    Bool,
+    /// Time duration — see [`AttributeType::Duration`].
+    Duration,
+    /// Namespaced string enum — see [`AttributeType::StringEnum`].
+    StringEnum {
+        name: &'a str,
+        values: &'a [String],
+        identity: Option<&'a TypeIdentity>,
+        dsl_aliases: &'a [(String, String)],
+    },
+    /// Structural custom type — see [`AttributeType::Custom`].
+    Custom {
+        identity: Option<&'a TypeIdentity>,
+        base: &'a AttributeType,
+        pattern: Option<&'a str>,
+        length: Option<(Option<u64>, Option<u64>)>,
+        validate: &'a CustomValidator,
+        to_dsl: Option<fn(&str) -> String>,
+    },
+    /// Enum-shorthand custom type — see [`AttributeType::CustomEnum`].
+    CustomEnum {
+        identity: &'a TypeIdentity,
+        base: &'a AttributeType,
+        validate: &'a CustomValidator,
+        to_dsl: Option<fn(&str) -> String>,
+    },
+    /// List with element type and ordering — see [`AttributeType::List`].
+    List {
+        inner: &'a AttributeType,
+        ordered: bool,
+    },
+    /// Map with typed key/value — see [`AttributeType::Map`].
+    Map {
+        key: &'a AttributeType,
+        value: &'a AttributeType,
+    },
+    /// Named struct — see [`AttributeType::Struct`].
+    Struct {
+        name: &'a str,
+        fields: &'a [StructField],
+    },
+    /// Union of types — see [`AttributeType::Union`].
+    Union(&'a [AttributeType]),
+    // Intentionally NO Ref variant — see type-level docs.
+}
+
+impl fmt::Debug for Shape<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Shape::String => f.write_str("Shape::String"),
+            Shape::Int => f.write_str("Shape::Int"),
+            Shape::Float => f.write_str("Shape::Float"),
+            Shape::Bool => f.write_str("Shape::Bool"),
+            Shape::Duration => f.write_str("Shape::Duration"),
+            Shape::StringEnum {
+                name,
+                values,
+                identity,
+                dsl_aliases,
+            } => f
+                .debug_struct("Shape::StringEnum")
+                .field("name", name)
+                .field("values", values)
+                .field("identity", identity)
+                .field("dsl_aliases", dsl_aliases)
+                .finish(),
+            Shape::Custom {
+                identity,
+                base,
+                pattern,
+                length,
+                validate: _,
+                to_dsl: _,
+            } => f
+                .debug_struct("Shape::Custom")
+                .field("identity", identity)
+                .field("base", base)
+                .field("pattern", pattern)
+                .field("length", length)
+                .finish_non_exhaustive(),
+            Shape::CustomEnum {
+                identity,
+                base,
+                validate: _,
+                to_dsl: _,
+            } => f
+                .debug_struct("Shape::CustomEnum")
+                .field("identity", identity)
+                .field("base", base)
+                .finish_non_exhaustive(),
+            Shape::List { inner, ordered } => f
+                .debug_struct("Shape::List")
+                .field("inner", inner)
+                .field("ordered", ordered)
+                .finish(),
+            Shape::Map { key, value } => f
+                .debug_struct("Shape::Map")
+                .field("key", key)
+                .field("value", value)
+                .finish(),
+            Shape::Struct { name, fields } => f
+                .debug_struct("Shape::Struct")
+                .field("name", name)
+                .field("fields", fields)
+                .finish(),
+            Shape::Union(members) => f.debug_tuple("Shape::Union").field(members).finish(),
+        }
+    }
 }
 
 /// A complete schema: a root attribute type together with the named
@@ -1109,9 +1249,12 @@ pub fn empty_defs() -> &'static std::collections::BTreeMap<String, AttributeType
 
 impl AttributeType {
     /// Walk through any [`AttributeType::Ref`] chain at the top of this
-    /// type, returning the first non-`Ref` target.
+    /// type, returning the first non-`Ref` target wrapped in
+    /// [`ResolvedAttrType`].
     ///
-    /// Walk-sites (differ, detail_rows, LSP) must call this *before*
+    /// The wrapped return type is the type-level encoding of the
+    /// carina#3340 invariant: every walk-site (differ, detail_rows,
+    /// LSP, block-name resolution, ...) must peel `Ref` *before*
     /// matching on the type, so the wildcard arm cannot silently
     /// accept a `Ref` and discard its schema information. The
     /// `defs` map is normally `&ResourceSchema::defs`; pass
@@ -1126,7 +1269,7 @@ impl AttributeType {
     pub fn resolve_refs<'a>(
         &'a self,
         defs: &'a std::collections::BTreeMap<String, AttributeType>,
-    ) -> &'a AttributeType {
+    ) -> ResolvedAttrType<'a> {
         let mut cur = self;
         // A small upper bound to catch pathological cycles
         // (`Ref("X") -> Ref("X")`) without hanging the walker.
@@ -1140,10 +1283,95 @@ impl AttributeType {
                          ResourceSchema.defs for every Ref it emits)"
                     ),
                 },
-                _ => return cur,
+                _ => return ResolvedAttrType::new_after_peel(cur),
             }
         }
         panic!("AttributeType::Ref chain exceeded 256 hops; pathological self-cycle in defs")
+    }
+
+    /// Project this type onto a [`Shape`] view with every top-level
+    /// `Ref` already peeled against `defs`.
+    ///
+    /// Callers that need to branch on the type's shape should `match`
+    /// the returned [`Shape`] instead of `&AttributeType`. The
+    /// `Shape` enum has no `Ref` variant, so a wildcard arm in
+    /// `match attr.shape(defs) { ... }` cannot silently swallow a
+    /// `Ref` — the carina#3349 bug class is unreachable at the type
+    /// level.
+    ///
+    /// `defs` is normally `&ResourceSchema::defs` or `&Schema::defs`;
+    /// pass [`empty_defs`] when no resource is in scope.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a `Ref` points to a name not present in `defs` (same
+    /// schema invariant as [`Self::resolve_refs`]).
+    pub fn shape<'a>(
+        &'a self,
+        defs: &'a std::collections::BTreeMap<String, AttributeType>,
+    ) -> Shape<'a> {
+        let resolved = self.resolve_refs(defs).as_attr();
+        match resolved {
+            AttributeType::String => Shape::String,
+            AttributeType::Int => Shape::Int,
+            AttributeType::Float => Shape::Float,
+            AttributeType::Bool => Shape::Bool,
+            AttributeType::Duration => Shape::Duration,
+            AttributeType::StringEnum {
+                name,
+                values,
+                identity,
+                dsl_aliases,
+            } => Shape::StringEnum {
+                name: name.as_str(),
+                values: values.as_slice(),
+                identity: identity.as_ref(),
+                dsl_aliases: dsl_aliases.as_slice(),
+            },
+            AttributeType::Custom {
+                identity,
+                base,
+                pattern,
+                length,
+                validate,
+                to_dsl,
+            } => Shape::Custom {
+                identity: identity.as_ref(),
+                base: base.as_ref(),
+                pattern: pattern.as_deref(),
+                length: *length,
+                validate,
+                to_dsl: *to_dsl,
+            },
+            AttributeType::CustomEnum {
+                identity,
+                base,
+                validate,
+                to_dsl,
+            } => Shape::CustomEnum {
+                identity,
+                base: base.as_ref(),
+                validate,
+                to_dsl: *to_dsl,
+            },
+            AttributeType::List { inner, ordered } => Shape::List {
+                inner: inner.as_ref(),
+                ordered: *ordered,
+            },
+            AttributeType::Map { key, value } => Shape::Map {
+                key: key.as_ref(),
+                value: value.as_ref(),
+            },
+            AttributeType::Struct { name, fields } => Shape::Struct {
+                name: name.as_str(),
+                fields: fields.as_slice(),
+            },
+            AttributeType::Union(members) => Shape::Union(members.as_slice()),
+            AttributeType::Ref(_) => unreachable!(
+                "resolve_refs guarantees the returned attr is not Ref; \
+                 reaching this arm violates ResolvedAttrType's invariant"
+            ),
+        }
     }
 
     /// Create a List type with default ordering (ordered=true, matching CloudFormation default).
@@ -3275,9 +3503,17 @@ fn collect_block_names_from_type(attr_type: &AttributeType, result: &mut HashMap
 /// For each key in `map` that matches a `block_name` on a struct field,
 /// renames it to the canonical field name. Also recurses into nested
 /// struct values to resolve block names at all nesting levels.
+///
+/// `defs` is the resource schema's `defs` map; nested fields typed as
+/// [`AttributeType::Ref`] are peeled against it via
+/// [`AttributeType::resolve_refs`] before recursion so block-name
+/// resolution reaches inside cyclic CFN-style schemas (carina#3340 /
+/// carina#3349). A `Ref` whose name is not in `defs` is a schema
+/// invariant violation and panics through `resolve_refs`.
 fn resolve_block_names_in_map(
     map: &mut IndexMap<String, Value>,
     fields: &[StructField],
+    defs: &std::collections::BTreeMap<String, AttributeType>,
     resource_id: &str,
     errors: &mut Vec<String>,
 ) {
@@ -3326,25 +3562,54 @@ fn resolve_block_names_in_map(
             Some(v) => v,
             None => continue,
         };
-        match &field.field_type {
-            AttributeType::Struct { fields: inner, .. } => {
-                if let Value::Concrete(ConcreteValue::Map(inner_map)) = value {
-                    resolve_block_names_in_map(inner_map, inner, resource_id, errors);
-                }
+        recurse_block_names_into_value(&field.field_type, value, defs, resource_id, errors);
+    }
+}
+
+/// Drive the block-name recursion through a single `(field_type, value)`
+/// pair, peeling any [`AttributeType::Ref`] hops against `defs` before
+/// dispatching on `Struct` / `List`. Factored out so the top-level
+/// `resolve_block_names` walk and the nested `resolve_block_names_in_map`
+/// walk share the same Ref-handling code path — both used to drop `Ref`
+/// into a `_ => {}` arm (carina#3349).
+///
+/// `Ref` peeling delegates to [`AttributeType::resolve_refs`] for both
+/// the outer type and a nested `List<Ref>` element, so the panic
+/// semantics on dangling refs match every other walk-site (carina#3340).
+fn recurse_block_names_into_value(
+    field_type: &AttributeType,
+    value: &mut Value,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+    resource_id: &str,
+    errors: &mut Vec<String>,
+) {
+    // `ResolvedAttrType` guarantees `Ref` was peeled — the wildcard
+    // arm below is therefore safe by construction (the type system,
+    // not convention, enforces it).
+    match field_type.resolve_refs(defs).as_attr() {
+        AttributeType::Struct { fields: inner, .. } => {
+            if let Value::Concrete(ConcreteValue::Map(inner_map)) = value {
+                resolve_block_names_in_map(inner_map, inner, defs, resource_id, errors);
             }
-            AttributeType::List { inner, .. } => {
-                if let AttributeType::Struct { fields: inner, .. } = inner.as_ref()
-                    && let Value::Concrete(ConcreteValue::List(items)) = value
-                {
-                    for item in items.iter_mut() {
-                        if let Value::Concrete(ConcreteValue::Map(item_map)) = item {
-                            resolve_block_names_in_map(item_map, inner, resource_id, errors);
-                        }
+        }
+        AttributeType::List { inner, .. } => {
+            // `List<Ref>`: peel the element type too so the walk reaches
+            // the underlying struct fields.
+            if let AttributeType::Struct { fields: inner, .. } = inner.resolve_refs(defs).as_attr()
+                && let Value::Concrete(ConcreteValue::List(items)) = value
+            {
+                for item in items.iter_mut() {
+                    if let Value::Concrete(ConcreteValue::Map(item_map)) = item {
+                        resolve_block_names_in_map(item_map, inner, defs, resource_id, errors);
                     }
                 }
             }
-            _ => {}
         }
+        // Other shapes (primitives, StringEnum, Custom, Map, Union) do
+        // not carry block-name aliases reachable from here. `Ref` is
+        // already peeled by `resolve_refs` above — proved by the
+        // `ResolvedAttrType` return type.
+        _ => {}
     }
 }
 
@@ -3409,41 +3674,28 @@ pub fn resolve_block_names(
             resource.attributes.insert(canon_key, expr);
         }
 
-        // Recurse into nested struct values to resolve block names at all levels
+        // Recurse into nested struct values to resolve block names at
+        // all levels. `recurse_block_names_into_value` peels
+        // `AttributeType::Ref` against `schema.defs` so cyclic CFN
+        // schemas (carina#3340) still see their block-name aliases
+        // (carina#3349). The top-level walk previously dropped `Ref`
+        // into a `_ => {}` arm, which made `awscc.s3.Bucket`'s
+        // `lifecycle_configuration` (typed `Ref("LifecycleConfiguration")`)
+        // reject the documented `rule { }` block syntax with
+        // "Required attribute 'rules' is missing".
+        let resource_id = resource.id.to_string();
         for (attr_name, attr_schema) in &schema.attributes {
             let value = match resource.attributes.get_mut(attr_name) {
                 Some(v) => v,
                 None => continue,
             };
-            match &attr_schema.attr_type {
-                AttributeType::Struct { fields, .. } => {
-                    if let Value::Concrete(ConcreteValue::Map(inner_map)) = value {
-                        resolve_block_names_in_map(
-                            inner_map,
-                            fields,
-                            &resource.id.to_string(),
-                            &mut all_errors,
-                        );
-                    }
-                }
-                AttributeType::List { inner, .. } => {
-                    if let AttributeType::Struct { fields, .. } = inner.as_ref()
-                        && let Value::Concrete(ConcreteValue::List(items)) = value
-                    {
-                        for item in items.iter_mut() {
-                            if let Value::Concrete(ConcreteValue::Map(item_map)) = item {
-                                resolve_block_names_in_map(
-                                    item_map,
-                                    fields,
-                                    &resource.id.to_string(),
-                                    &mut all_errors,
-                                );
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
+            recurse_block_names_into_value(
+                &attr_schema.attr_type,
+                value,
+                &schema.defs,
+                &resource_id,
+                &mut all_errors,
+            );
         }
     }
 

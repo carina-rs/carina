@@ -324,12 +324,27 @@ pub struct CascadingUpdateAttr {
 /// nested `List<Map>`/`List<Struct>` still resolves its entries
 /// (carina#3073). Uses the canonical `build_accepted_field_map` so a
 /// `block_name`-aliased struct field resolves like `validate_struct`.
+///
+/// `defs` is the enclosing schema's `defs` map; any [`AttributeType::Ref`]
+/// reached during unwrap is peeled against it. Without this, a
+/// `Ref`-typed attribute (cyclic CFN: `lifecycle_configuration:
+/// Ref("LifecycleConfiguration")`) returns `None` for every entry —
+/// the plan-display detail rows lose schema-aware classification and
+/// the `# n unchanged attributes hidden` tally drifts (same bug class
+/// as carina#3349; carina#3340 walk-site doc-comment names
+/// `detail_rows` as a Ref-aware walker).
 fn map_entry_subtype<'a>(
     attr_type: Option<&'a AttributeType>,
     key: &str,
+    defs: &'a std::collections::BTreeMap<String, AttributeType>,
 ) -> Option<&'a AttributeType> {
     let mut t = attr_type?;
     loop {
+        // Peel any `Ref` chain before the variant match below so the
+        // wildcard arm cannot silently drop a Ref-typed attribute.
+        // `resolve_refs` panics on a dangling Ref — schema-construction
+        // bug, surfaced loudly.
+        t = t.resolve_refs(defs).as_attr();
         match t {
             AttributeType::List { inner, .. } => t = inner,
             AttributeType::Map { value, .. } => return Some(value),
@@ -1029,7 +1044,7 @@ fn compute_map_diff_entries(
     for item in diff.iter_by_key() {
         match item {
             crate::diff_helpers::MapDiffItem::Changed(e) => {
-                let entry_type = map_entry_subtype(attr_type, &e.key);
+                let entry_type = map_entry_subtype(attr_type, &e.key, defs);
                 // Site 5 (carina#3073): `compute_map_diff` flagged this
                 // entry as changed via schema-blind `semantically_equal`.
                 // For a scalar/leaf entry, re-test schema-aware: an
@@ -1192,7 +1207,11 @@ fn compute_list_of_maps_diff_parts(
 
     // The element type for the list (e.g. the IAM policy `statement`
     // `Struct`); used for schema-aware item/field equality below.
-    let item_type = match attr_type {
+    // Peel any leading `Ref` so a `Ref("…")` attribute whose def is
+    // `List<Struct>` still drops into the List arm — same bug class
+    // as carina#3349. `resolve_refs` is a no-op on non-Ref inputs.
+    let attr_type_peeled = attr_type.map(|t| t.resolve_refs(defs).as_attr());
+    let item_type = match attr_type_peeled {
         Some(AttributeType::List { inner, .. }) => Some(inner.as_ref()),
         // The attribute itself may already be the element type when
         // this is reached recursively from a Map value.
@@ -1300,7 +1319,7 @@ fn compute_list_of_maps_diff_parts(
                 // `Allow`) is treated as unchanged instead of emitting
                 // a phantom `~ effect` sub-row under a sibling-changed
                 // statement.
-                let field_type = map_entry_subtype(item_type, k);
+                let field_type = map_entry_subtype(item_type, k, defs);
                 let field_same = old_map
                     .get(k)
                     .map(|ov| schema_aware_equal(ov, &new_map[k], field_type, defs))
