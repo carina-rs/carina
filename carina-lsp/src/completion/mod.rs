@@ -653,21 +653,19 @@ impl CompletionProvider {
         &self,
         attr_type: &'a AttributeType,
         defs: &'a std::collections::BTreeMap<String, AttributeType>,
-    ) -> Option<&'a Vec<StructField>> {
-        // Resolve any leading `Ref` chain so the cyclic-CFN case
+    ) -> Option<&'a [StructField]> {
+        use carina_core::schema::Shape;
+        // Project onto `Shape` so any `Ref` chain is peeled at the
+        // type level (carina#3349). The cyclic-CFN case
         // (`Statement -> AndStatement -> List<Statement>`) descends
-        // through the cycle for completion (carina#3340).
-        let attr_type = attr_type.resolve_refs(defs).as_attr();
-        match attr_type {
-            AttributeType::Struct { fields, .. } => Some(fields),
-            AttributeType::List { inner, .. } => {
-                let inner = inner.as_ref().resolve_refs(defs).as_attr();
-                match inner {
-                    AttributeType::Struct { fields, .. } => Some(fields),
-                    _ => None,
-                }
-            }
-            AttributeType::Union(members) => members
+        // because `shape(defs)` walks `Ref` against `defs`.
+        match attr_type.shape(defs) {
+            Shape::Struct { fields, .. } => Some(fields),
+            Shape::List { inner, .. } => match inner.shape(defs) {
+                Shape::Struct { fields, .. } => Some(fields),
+                _ => None,
+            },
+            Shape::Union(members) => members
                 .iter()
                 .find_map(|m| self.extract_struct_fields(m, defs)),
             _ => None,
@@ -723,7 +721,7 @@ impl CompletionProvider {
         &self,
         schema: &'a ResourceSchema,
         attr_path: &[String],
-    ) -> Option<&'a Vec<StructField>> {
+    ) -> Option<&'a [StructField]> {
         let attr_type = self.resolve_type_for_path(schema, attr_path)?;
         self.extract_struct_fields(attr_type, &schema.defs)
     }
