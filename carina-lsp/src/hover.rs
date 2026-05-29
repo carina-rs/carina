@@ -837,7 +837,7 @@ mod tests {
     ) -> HoverProvider {
         let mut schemas = SchemaRegistry::new();
         let schema = ResourceSchema::new(resource_type).attribute(
-            AttributeSchema::new(attr_name, AttributeType::String)
+            AttributeSchema::new(attr_name, AttributeType::string())
                 .with_description(attr_description),
         );
         schemas.insert("", schema);
@@ -1006,13 +1006,13 @@ mod tests {
         let mut schemas = SchemaRegistry::new();
 
         let igw_schema = ResourceSchema::new("ec2.internet_gateway").attribute(
-            AttributeSchema::new("internet_gateway_id", AttributeType::String)
+            AttributeSchema::new("internet_gateway_id", AttributeType::string())
                 .with_description("The ID of the internet gateway (from internet_gateway schema)."),
         );
         schemas.insert("awscc", igw_schema);
 
         let attachment_schema = ResourceSchema::new("ec2.vpc_gateway_attachment").attribute(
-            AttributeSchema::new("internet_gateway_id", AttributeType::String)
+            AttributeSchema::new("internet_gateway_id", AttributeType::string())
                 .with_description(
                     "The ID of the internet gateway attached to the VPC (from vpc_gateway_attachment schema).",
                 ),
@@ -1070,14 +1070,15 @@ awscc.ec2.vpc_gateway_attachment {
 
         // `account_id` lives on organizations.account only.
         let account_schema = ResourceSchema::new("organizations.account").attribute(
-            AttributeSchema::new("account_id", AttributeType::String)
+            AttributeSchema::new("account_id", AttributeType::string())
                 .with_description("The unique identifier (ID) of the new account."),
         );
         schemas.insert("awscc", account_schema);
 
         // `awscc.sso.Assignment` intentionally has NO `account_id`.
         let assignment_schema = ResourceSchema::new("sso.Assignment").attribute(
-            AttributeSchema::new("target_id", AttributeType::String).with_description("Target id."),
+            AttributeSchema::new("target_id", AttributeType::string())
+                .with_description("Target id."),
         );
         schemas.insert("awscc", assignment_schema);
 

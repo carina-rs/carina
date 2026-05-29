@@ -718,83 +718,86 @@ fn proto_attr_schema_to_core(a: &proto::AttributeSchema) -> CoreAttributeSchema 
 
 fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
     match t {
-        proto::AttributeType::String => CoreAttributeType::String,
-        proto::AttributeType::Int => CoreAttributeType::Int,
-        proto::AttributeType::Float => CoreAttributeType::Float,
-        proto::AttributeType::Bool => CoreAttributeType::Bool,
-        proto::AttributeType::Duration => CoreAttributeType::Duration,
+        proto::AttributeType::String => CoreAttributeType::string(),
+        proto::AttributeType::Int => CoreAttributeType::int(),
+        proto::AttributeType::Float => CoreAttributeType::float(),
+        proto::AttributeType::Bool => CoreAttributeType::bool(),
+        proto::AttributeType::Duration => CoreAttributeType::duration(),
         proto::AttributeType::StringEnum {
             values,
             name,
             namespace,
             dsl_aliases,
-        } => CoreAttributeType::StringEnum {
-            name: name.clone(),
-            values: values.clone(),
+        } => CoreAttributeType::string_enum(
+            name.clone(),
+            values.clone(),
             // Lift the wire-form flat dotted prefix into the
             // structured `TypeIdentity` the core schema now carries
             // (carina#3222). The pre-#3222 core form mirrored the
             // wire form one-to-one; with the split, the wire form
             // remains flat while the core form is structural — the
             // boundary cost lives here.
-            identity: namespace
+            namespace
                 .as_deref()
                 .filter(|s| !s.is_empty())
                 .map(|ns| carina_core::schema::string_enum_identity(name, Some(ns))),
-            dsl_aliases: dsl_aliases.clone(),
-        },
-        proto::AttributeType::List { inner, ordered } => CoreAttributeType::List {
-            inner: Box::new(proto_attr_type_to_core(inner)),
-            ordered: *ordered,
-        },
+            dsl_aliases.clone(),
+        ),
+        proto::AttributeType::List { inner, ordered } => {
+            if *ordered {
+                CoreAttributeType::list(proto_attr_type_to_core(inner))
+            } else {
+                CoreAttributeType::unordered_list(proto_attr_type_to_core(inner))
+            }
+        }
         proto::AttributeType::Map { inner, key } => CoreAttributeType::map_with_key(
             proto_attr_type_to_core(key),
             proto_attr_type_to_core(inner),
         ),
-        proto::AttributeType::Struct { name, fields } => CoreAttributeType::Struct {
-            name: name.clone(),
-            fields: fields.iter().map(proto_struct_field_to_core).collect(),
-        },
+        proto::AttributeType::Struct { name, fields } => CoreAttributeType::struct_(
+            name.clone(),
+            fields.iter().map(proto_struct_field_to_core).collect(),
+        ),
         proto::AttributeType::Union { members } => {
-            CoreAttributeType::Union(members.iter().map(proto_attr_type_to_core).collect())
+            CoreAttributeType::union(members.iter().map(proto_attr_type_to_core).collect())
         }
-        proto::AttributeType::Custom { name, base } => CoreAttributeType::Custom {
-            identity: if name.is_empty() {
+        proto::AttributeType::Custom { name, base } => CoreAttributeType::custom(
+            if name.is_empty() {
                 None
             } else {
                 Some(carina_core::schema::TypeIdentity::from_dotted(name))
             },
-            base: Box::new(proto_attr_type_to_core(base)),
-            pattern: None,
-            length: None,
-            validate: noop_validator(), // Validation is handled via ProviderContext.validators
+            proto_attr_type_to_core(base),
+            None,
+            None,
+            noop_validator(), // Validation is handled via ProviderContext.validators
             // `to_dsl` is a `fn` pointer that does not survive the
             // WASM-component boundary; host-side normalization for
             // plugin-provided types is registered separately, so this
             // arm always sees `None` after the proto→core lift.
-            to_dsl: None,
-        },
+            None,
+        ),
         proto::AttributeType::CustomEnum {
             name,
             base,
             namespace,
-        } => CoreAttributeType::CustomEnum {
+        } => CoreAttributeType::custom_enum(
             // CustomEnum requires a populated identity (the
             // shorthand expansion needs the dotted prefix);
             // `string_enum_identity` is the inverse of
             // `TypeIdentity::dotted_prefix` and recovers the
             // structured form from the wire's flat `namespace + name`
             // shape.
-            identity: carina_core::schema::string_enum_identity(name, Some(namespace.as_str())),
-            base: Box::new(proto_attr_type_to_core(base)),
-            validate: noop_validator(), // Validation is handled via ProviderContext.validators
-            to_dsl: None,
-        },
+            carina_core::schema::string_enum_identity(name, Some(namespace.as_str())),
+            proto_attr_type_to_core(base),
+            noop_validator(), // Validation is handled via ProviderContext.validators
+            None,
+        ),
         // Cyclic CFN struct reference (carina#3340). The host's
         // structural counterpart is `AttributeType::Ref`; the matching
         // `ResourceSchema.defs` map is converted alongside in
         // `proto_schema_to_core` so resolution at walk-sites succeeds.
-        proto::AttributeType::Ref { name } => CoreAttributeType::Ref(name.clone()),
+        proto::AttributeType::Ref { name } => CoreAttributeType::ref_(name.clone()),
     }
 }
 
@@ -1487,17 +1490,27 @@ mod tests {
             .get("description")
             .expect("description attribute");
         assert_eq!(desc_attr.name, "description");
-        assert!(matches!(desc_attr.attr_type, CoreAttributeType::String));
+        let defs = carina_core::schema::empty_defs();
+        assert!(matches!(
+            desc_attr.attr_type.shape(defs),
+            carina_core::schema::Shape::String
+        ));
         assert!(desc_attr.required);
 
         let enabled_attr = schema.attributes.get("enabled").expect("enabled attribute");
-        assert!(matches!(enabled_attr.attr_type, CoreAttributeType::Bool));
+        assert!(matches!(
+            enabled_attr.attr_type.shape(defs),
+            carina_core::schema::Shape::Bool
+        ));
 
         let priority_attr = schema
             .attributes
             .get("priority")
             .expect("priority attribute");
-        assert!(matches!(priority_attr.attr_type, CoreAttributeType::Int));
+        assert!(matches!(
+            priority_attr.attr_type.shape(defs),
+            carina_core::schema::Shape::Int
+        ));
 
         // Ingress attribute: list with ordered=false, provider_name, block_name, removable
         let ingress_attr = schema.attributes.get("ingress").expect("ingress attribute");
@@ -1506,24 +1519,27 @@ mod tests {
         assert_eq!(ingress_attr.removable, Some(false));
 
         // List with ordered: false
-        match &ingress_attr.attr_type {
-            CoreAttributeType::List { inner, ordered } => {
+        match ingress_attr.attr_type.shape(defs) {
+            carina_core::schema::Shape::List { inner, ordered } => {
                 assert!(!ordered, "list should be unordered");
 
                 // Union inside list
-                match inner.as_ref() {
-                    CoreAttributeType::Union(members) => {
+                match inner.shape(defs) {
+                    carina_core::schema::Shape::Union(members) => {
                         assert_eq!(members.len(), 2);
 
                         // First member: struct with block_name and provider_name on fields
-                        match &members[0] {
-                            CoreAttributeType::Struct { name, fields } => {
+                        match members[0].shape(defs) {
+                            carina_core::schema::Shape::Struct { name, fields } => {
                                 assert_eq!(name, "IngressRule");
                                 assert_eq!(fields.len(), 2);
 
                                 let from_port = &fields[0];
                                 assert_eq!(from_port.name, "from_port");
-                                assert!(matches!(from_port.field_type, CoreAttributeType::Int));
+                                assert!(matches!(
+                                    from_port.field_type.shape(defs),
+                                    carina_core::schema::Shape::Int
+                                ));
                                 assert!(from_port.required);
                                 assert_eq!(
                                     from_port.description.as_deref(),
@@ -1537,7 +1553,10 @@ mod tests {
 
                                 let protocol = &fields[1];
                                 assert_eq!(protocol.name, "protocol");
-                                assert!(matches!(protocol.field_type, CoreAttributeType::String));
+                                assert!(matches!(
+                                    protocol.field_type.shape(defs),
+                                    carina_core::schema::Shape::String
+                                ));
                                 assert!(protocol.block_name.is_none());
                                 assert!(protocol.provider_name.is_none());
                             }
@@ -1545,7 +1564,10 @@ mod tests {
                         }
 
                         // Second member: String
-                        assert!(matches!(members[1], CoreAttributeType::String));
+                        assert!(matches!(
+                            members[1].shape(defs),
+                            carina_core::schema::Shape::String
+                        ));
                     }
                     other => panic!("expected Union inside list, got {:?}", other),
                 }
@@ -1560,13 +1582,14 @@ mod tests {
         // Duration-typed schema attribute via `provider_config_attribute_types`
         // (e.g. assume_role.duration in aws#342 / awscc#260) must
         // round-trip through `{"type":"Duration"}` to
-        // `CoreAttributeType::Duration` so the host's type checker
+        // `CoreAttributeType::duration()` so the host's type checker
         // accepts `duration = 30min` against that declaration.
         let json = r#"{"timeout":{"type":"Duration"}}"#;
         let types = json_to_attribute_types(json);
+        let defs = carina_core::schema::empty_defs();
         assert!(matches!(
-            types.get("timeout"),
-            Some(CoreAttributeType::Duration)
+            types.get("timeout").map(|t| t.shape(defs)),
+            Some(carina_core::schema::Shape::Duration)
         ));
     }
 
@@ -1734,12 +1757,12 @@ mod tests {
     #[test]
     fn proto_string_enum_dsl_aliases_propagate_to_core() {
         let proto_attr = proto::AttributeType::StringEnum {
+            name: "ObjectOwnership".to_string(),
             values: vec![
                 "ObjectWriter".to_string(),
                 "BucketOwnerEnforced".to_string(),
             ],
-            name: "ObjectOwnership".to_string(),
-            namespace: Some("awscc.s3.Bucket".to_string()),
+            namespace: None,
             dsl_aliases: vec![
                 ("ObjectWriter".to_string(), "object_writer".to_string()),
                 (
@@ -1749,8 +1772,9 @@ mod tests {
             ],
         };
         let core_attr = proto_attr_type_to_core(&proto_attr);
-        match core_attr {
-            CoreAttributeType::StringEnum { dsl_aliases, .. } => {
+        let defs = carina_core::schema::empty_defs();
+        match core_attr.shape(defs) {
+            carina_core::schema::Shape::StringEnum { dsl_aliases, .. } => {
                 assert_eq!(dsl_aliases.len(), 2);
                 assert!(
                     dsl_aliases
@@ -1772,8 +1796,9 @@ mod tests {
         let json = r#"{"type":"string_enum","values":["A","B"],"name":"X"}"#;
         let proto_attr: proto::AttributeType = serde_json::from_str(json).unwrap();
         let core_attr = proto_attr_type_to_core(&proto_attr);
-        match core_attr {
-            CoreAttributeType::StringEnum { dsl_aliases, .. } => {
+        let defs = carina_core::schema::empty_defs();
+        match core_attr.shape(defs) {
+            carina_core::schema::Shape::StringEnum { dsl_aliases, .. } => {
                 assert!(dsl_aliases.is_empty());
             }
             other => panic!("expected StringEnum, got {other:?}"),

@@ -10,8 +10,8 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
     // includes the provider prefix.
     let mut schemas = SchemaRegistry::new();
     let schema = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
-        .attribute(AttributeSchema::new("ipv4_netmask_length", AttributeType::Int).write_only());
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
+        .attribute(AttributeSchema::new("ipv4_netmask_length", AttributeType::int()).write_only());
     // Schema is registered with provider-prefixed key
     schemas.insert("awscc", schema);
 
@@ -77,17 +77,17 @@ fn build_state_after_apply_preserves_block_name_attribute() {
 
     let mut schemas = SchemaRegistry::new();
     let schema = ResourceSchema::new("iam.role")
-        .attribute(AttributeSchema::new("role_name", AttributeType::String).create_only())
+        .attribute(AttributeSchema::new("role_name", AttributeType::string()).create_only())
         .attribute(
             AttributeSchema::new(
                 "policies",
-                AttributeType::unordered_list(AttributeType::Struct {
-                    name: "Policy".to_string(),
-                    fields: vec![
-                        StructField::new("policy_name", AttributeType::String).required(),
-                        StructField::new("policy_document", AttributeType::String).required(),
+                AttributeType::unordered_list(AttributeType::struct_(
+                    "Policy".to_string(),
+                    vec![
+                        StructField::new("policy_name", AttributeType::string()).required(),
+                        StructField::new("policy_document", AttributeType::string()).required(),
                     ],
-                }),
+                )),
             )
             .with_block_name("policy"),
         );
@@ -217,17 +217,17 @@ fn block_name_attribute_no_diff_when_hydrated() {
     use carina_core::schema::StructField;
 
     let schema = ResourceSchema::new("awscc.iam.role")
-        .attribute(AttributeSchema::new("role_name", AttributeType::String).create_only())
+        .attribute(AttributeSchema::new("role_name", AttributeType::string()).create_only())
         .attribute(
             AttributeSchema::new(
                 "policies",
-                AttributeType::unordered_list(AttributeType::Struct {
-                    name: "Policy".to_string(),
-                    fields: vec![
-                        StructField::new("policy_name", AttributeType::String).required(),
-                        StructField::new("policy_document", AttributeType::String).required(),
+                AttributeType::unordered_list(AttributeType::struct_(
+                    "Policy".to_string(),
+                    vec![
+                        StructField::new("policy_name", AttributeType::string()).required(),
+                        StructField::new("policy_document", AttributeType::string()).required(),
                     ],
-                }),
+                )),
             )
             .with_block_name("policy"),
         );
@@ -332,14 +332,14 @@ fn block_name_attribute_state_roundtrip() {
         .attribute(
             AttributeSchema::new(
                 "operating_regions",
-                AttributeType::unordered_list(AttributeType::Struct {
-                    name: "IpamOperatingRegion".to_string(),
-                    fields: vec![StructField::new("region_name", AttributeType::String).required()],
-                }),
+                AttributeType::unordered_list(AttributeType::struct_(
+                    "IpamOperatingRegion".to_string(),
+                    vec![StructField::new("region_name", AttributeType::string()).required()],
+                )),
             )
             .with_block_name("operating_region"),
         )
-        .attribute(AttributeSchema::new("description", AttributeType::String));
+        .attribute(AttributeSchema::new("description", AttributeType::string()));
     schemas.insert("awscc", schema);
 
     // Resource with resolved block name
@@ -471,11 +471,11 @@ fn move_plus_replace_keeps_post_replace_identifier_and_attributes() {
 
     let mut schemas = SchemaRegistry::new();
     let schema = ResourceSchema::new("iam.RolePolicy")
-        .attribute(AttributeSchema::new("role_name", AttributeType::String).create_only())
-        .attribute(AttributeSchema::new("policy_name", AttributeType::String).create_only())
+        .attribute(AttributeSchema::new("role_name", AttributeType::string()).create_only())
+        .attribute(AttributeSchema::new("policy_name", AttributeType::string()).create_only())
         .attribute(AttributeSchema::new(
             "policy_document",
-            AttributeType::String,
+            AttributeType::string(),
         ));
     schemas.insert("awscc", schema);
 
@@ -656,8 +656,8 @@ fn move_plus_update_keeps_post_update_attributes() {
 
     let mut schemas = SchemaRegistry::new();
     let schema = ResourceSchema::new("ec2.Tag")
-        .attribute(AttributeSchema::new("key", AttributeType::String).create_only())
-        .attribute(AttributeSchema::new("value", AttributeType::String));
+        .attribute(AttributeSchema::new("key", AttributeType::string()).create_only())
+        .attribute(AttributeSchema::new("value", AttributeType::string()));
     schemas.insert("awscc", schema);
 
     let new_id = ResourceId::with_provider("awscc", "ec2.Tag", "tag_new", None);
@@ -747,7 +747,7 @@ fn move_alone_carries_attributes_via_current_states() {
     schemas.insert(
         "awscc",
         ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only()),
+            .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only()),
     );
 
     let new_id = ResourceId::with_provider("awscc", "s3.Bucket", "bucket_new", None);
@@ -862,7 +862,7 @@ fn failed_refresh_preserves_existing_row() {
     schemas.insert(
         "awscc",
         ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only()),
+            .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only()),
     );
 
     let id = ResourceId::with_provider("awscc", "s3.Bucket", "stuck", None);
@@ -914,7 +914,7 @@ fn move_from_overlapping_desired_resource_errors() {
     schemas.insert(
         "awscc",
         ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only()),
+            .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only()),
     );
 
     let id = ResourceId::with_provider("awscc", "s3.Bucket", "collision", None);
@@ -971,7 +971,7 @@ fn remove_overlapping_desired_resource_errors() {
     schemas.insert(
         "awscc",
         ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only()),
+            .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only()),
     );
 
     let id = ResourceId::with_provider("awscc", "s3.Bucket", "collision", None);
@@ -1022,7 +1022,7 @@ fn self_move_overlapping_desired_resource_errors() {
     schemas.insert(
         "awscc",
         ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only()),
+            .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only()),
     );
 
     let id = ResourceId::with_provider("awscc", "s3.Bucket", "self", None);

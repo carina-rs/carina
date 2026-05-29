@@ -1146,10 +1146,10 @@ fn collect_validators_from_type(
     attr_type: &crate::schema::AttributeType,
     validators: &mut HashMap<TypeIdentity, crate::parser::ValidatorFn>,
 ) {
-    use crate::schema::AttributeType;
+    use crate::schema::AttrTypeKind;
 
-    match attr_type {
-        AttributeType::Custom {
+    match &attr_type.kind {
+        AttrTypeKind::Custom {
             identity: Some(id),
             validate,
             ..
@@ -1164,20 +1164,20 @@ fn collect_validators_from_type(
                 })
             });
         }
-        AttributeType::Custom { identity: None, .. } => {}
-        AttributeType::List { inner, .. } => {
+        AttrTypeKind::Custom { identity: None, .. } => {}
+        AttrTypeKind::List { inner, .. } => {
             collect_validators_from_type(inner, validators);
         }
-        AttributeType::Map { key, value: inner } => {
+        AttrTypeKind::Map { key, value: inner } => {
             collect_validators_from_type(key, validators);
             collect_validators_from_type(inner, validators);
         }
-        AttributeType::Struct { fields, .. } => {
+        AttrTypeKind::Struct { fields, .. } => {
             for field in fields {
                 collect_validators_from_type(&field.field_type, validators);
             }
         }
-        AttributeType::Union(types) => {
+        AttrTypeKind::Union(types) => {
             for t in types {
                 collect_validators_from_type(t, validators);
             }
@@ -1189,15 +1189,15 @@ fn collect_validators_from_type(
         // `collect_custom_type_names`) walk every entry of
         // `schema.defs` directly in a separate loop, which terminates
         // because each def is visited exactly once. (carina#3340.)
-        AttributeType::Ref(_) => {}
+        AttrTypeKind::Ref(_) => {}
         // Primitives carry no nested Custom types and no Ref.
-        AttributeType::String
-        | AttributeType::Int
-        | AttributeType::Float
-        | AttributeType::Bool
-        | AttributeType::Duration
-        | AttributeType::StringEnum { .. }
-        | AttributeType::CustomEnum { .. } => {}
+        AttrTypeKind::String
+        | AttrTypeKind::Int
+        | AttrTypeKind::Float
+        | AttrTypeKind::Bool
+        | AttrTypeKind::Duration
+        | AttrTypeKind::StringEnum { .. }
+        | AttrTypeKind::CustomEnum { .. } => {}
     }
 }
 
@@ -1207,28 +1207,28 @@ fn collect_type_names_from_type(
     attr_type: &crate::schema::AttributeType,
     names: &mut std::collections::HashSet<TypeIdentity>,
 ) {
-    use crate::schema::AttributeType;
+    use crate::schema::AttrTypeKind;
 
-    match attr_type {
-        AttributeType::Custom {
+    match &attr_type.kind {
+        AttrTypeKind::Custom {
             identity: Some(id), ..
         } => {
             names.insert(id.clone());
         }
-        AttributeType::Custom { identity: None, .. } => {}
-        AttributeType::List { inner, .. } => {
+        AttrTypeKind::Custom { identity: None, .. } => {}
+        AttrTypeKind::List { inner, .. } => {
             collect_type_names_from_type(inner, names);
         }
-        AttributeType::Map { key, value: inner } => {
+        AttrTypeKind::Map { key, value: inner } => {
             collect_type_names_from_type(key, names);
             collect_type_names_from_type(inner, names);
         }
-        AttributeType::Struct { fields, .. } => {
+        AttrTypeKind::Struct { fields, .. } => {
             for field in fields {
                 collect_type_names_from_type(&field.field_type, names);
             }
         }
-        AttributeType::Union(types) => {
+        AttrTypeKind::Union(types) => {
             for t in types {
                 collect_type_names_from_type(t, names);
             }
@@ -1236,14 +1236,14 @@ fn collect_type_names_from_type(
         // See `collect_validators_from_type` for the rationale: the
         // caller walks `schema.defs` separately to avoid infinite
         // recursion on cyclic schemas (carina#3340).
-        AttributeType::Ref(_) => {}
-        AttributeType::String
-        | AttributeType::Int
-        | AttributeType::Float
-        | AttributeType::Bool
-        | AttributeType::Duration
-        | AttributeType::StringEnum { .. }
-        | AttributeType::CustomEnum { .. } => {}
+        AttrTypeKind::Ref(_) => {}
+        AttrTypeKind::String
+        | AttrTypeKind::Int
+        | AttrTypeKind::Float
+        | AttrTypeKind::Bool
+        | AttrTypeKind::Duration
+        | AttrTypeKind::StringEnum { .. }
+        | AttrTypeKind::CustomEnum { .. } => {}
     }
 }
 

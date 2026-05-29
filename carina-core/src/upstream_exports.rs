@@ -555,6 +555,7 @@ pub fn check_upstream_state_field_types<E>(
         check_ref_against_type(
             value,
             &attr_schema.attr_type,
+            &schema.defs,
             exports,
             &location,
             &mut errors,
@@ -573,11 +574,12 @@ pub fn check_upstream_state_field_types<E>(
 fn check_ref_against_type(
     value: &Value,
     expected: &AttributeType,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
     exports: &UpstreamExports,
     location: &str,
     errors: &mut Vec<UpstreamTypeError>,
 ) {
-    walk_value_against_type(value, expected, exports, location, errors);
+    walk_value_against_type(value, expected, defs, exports, location, errors);
 }
 
 /// Positional walker: descend `value` and `expected` in lockstep,
@@ -598,13 +600,20 @@ fn check_ref_against_type(
 fn walk_value_against_type(
     value: &Value,
     expected: &AttributeType,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
     exports: &UpstreamExports,
     location: &str,
     errors: &mut Vec<UpstreamTypeError>,
 ) {
+    // Project onto `Shape` so `Ref` is peeled at the type level
+    // (carina#3349). Without this, `Ref<List<T>>` / `Ref<Struct>`
+    // would fall through the wildcard arms below and the
+    // leaf-ref check would compare against the raw `Ref` instead
+    // of its resolved target.
+    let expected_shape = expected.shape(defs);
     match value {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
-            check_resource_ref_at_position(path, expected, exports, location, errors);
+            check_resource_ref_at_position(path, expected, defs, exports, location, errors);
         }
         Value::Concrete(ConcreteValue::List(items)) => {
             // Descend `list(T)` element-wise. For non-list receivers
@@ -612,21 +621,21 @@ fn walk_value_against_type(
             // already flags the kind mismatch, so we just walk each
             // element against the same expected type — the leaf-ref
             // comparison will fire if the element doesn't fit.
-            let inner = match expected {
-                AttributeType::List { inner, .. } => inner.as_ref(),
+            let inner = match expected_shape {
+                crate::schema::Shape::List { inner, .. } => inner,
                 _ => expected,
             };
             for item in items {
-                walk_value_against_type(item, inner, exports, location, errors);
+                walk_value_against_type(item, inner, defs, exports, location, errors);
             }
         }
-        Value::Concrete(ConcreteValue::Map(entries)) => match expected {
-            AttributeType::Map { value: inner, .. } => {
+        Value::Concrete(ConcreteValue::Map(entries)) => match expected_shape {
+            crate::schema::Shape::Map { value: inner, .. } => {
                 for v in entries.values() {
-                    walk_value_against_type(v, inner, exports, location, errors);
+                    walk_value_against_type(v, inner, defs, exports, location, errors);
                 }
             }
-            AttributeType::Struct { fields, .. } => {
+            crate::schema::Shape::Struct { fields, .. } => {
                 // Resolve via `build_accepted_field_map` so `block_name`
                 // aliases (`field { ... }` block syntax) reach the
                 // same field as the canonical name. Without this a
@@ -635,7 +644,14 @@ fn walk_value_against_type(
                 let accepted = crate::schema::build_accepted_field_map(fields);
                 for (key, v) in entries {
                     if let Some(field) = accepted.get(key.as_str()) {
-                        walk_value_against_type(v, &field.field_type, exports, location, errors);
+                        walk_value_against_type(
+                            v,
+                            &field.field_type,
+                            defs,
+                            exports,
+                            location,
+                            errors,
+                        );
                     }
                     // Unknown struct fields are flagged by the schema
                     // validator; don't double-report here.
@@ -650,7 +666,7 @@ fn walk_value_against_type(
                 // leaf-ref checks dispatch via
                 // `is_type_expr_compatible_with_schema`'s Union arm.
                 for v in entries.values() {
-                    walk_value_against_type(v, expected, exports, location, errors);
+                    walk_value_against_type(v, expected, defs, exports, location, errors);
                 }
             }
         },
@@ -660,12 +676,19 @@ fn walk_value_against_type(
             // regardless of where the interpolation itself appears.
             for part in parts {
                 if let crate::resource::InterpolationPart::Expr(v) = part {
-                    walk_value_against_type(v, &AttributeType::String, exports, location, errors);
+                    walk_value_against_type(
+                        v,
+                        &AttributeType::string(),
+                        defs,
+                        exports,
+                        location,
+                        errors,
+                    );
                 }
             }
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            walk_value_against_type(inner, expected, exports, location, errors);
+            walk_value_against_type(inner, expected, defs, exports, location, errors);
         }
         Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
             // Function arguments occupy function-internal positions
@@ -674,7 +697,7 @@ fn walk_value_against_type(
             // best-effort so leaf refs get *some* check; precision
             // would require typed function signatures.
             for arg in args {
-                walk_value_against_type(arg, expected, exports, location, errors);
+                walk_value_against_type(arg, expected, defs, exports, location, errors);
             }
         }
         Value::Concrete(ConcreteValue::String(_))
@@ -701,6 +724,7 @@ fn walk_value_against_type(
 fn check_resource_ref_at_position(
     path: &crate::resource::AccessPath,
     expected: &AttributeType,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
     exports: &UpstreamExports,
     location: &str,
     errors: &mut Vec<UpstreamTypeError>,
@@ -724,7 +748,7 @@ fn check_resource_ref_at_position(
         // double-reporting.
         return;
     };
-    if crate::validation::is_type_expr_compatible_with_schema(&narrowed, expected) {
+    if crate::validation::is_type_expr_compatible_with_schema(&narrowed, expected, defs) {
         return;
     }
     // String-shaped value into a string-compatible receiver. The
@@ -737,7 +761,7 @@ fn check_resource_ref_at_position(
     // strict path also doesn't recognise. The reverse direction
     // (`String → Custom { semantic_name: Some(_) }`) stays strict
     // via `attr_type_demands_specific_custom`. #2475 / #2643.
-    if narrowed.is_string_shaped() && crate::validation::is_string_compatible_type(expected) {
+    if narrowed.is_string_shaped() && crate::validation::is_string_compatible_type(expected, defs) {
         return;
     }
     errors.push(UpstreamTypeError {
@@ -1905,15 +1929,15 @@ mod tests {
             "test",
         );
         let exports = mk_typed_exports(&[("orgs", &[("count", TypeExpr::Int)])]);
-        let schemas = schema_with_attr("name", crate::schema::AttributeType::String);
+        let schemas = schema_with_attr("name", crate::schema::AttributeType::string());
         let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
         assert_eq!(errs.len(), 1, "unexpected: {errs:?}");
         assert_eq!(errs[0].binding, "orgs");
         assert_eq!(errs[0].field, "count");
         assert!(matches!(errs[0].export_type, TypeExpr::Int));
         assert!(matches!(
-            errs[0].expected_type,
-            crate::schema::AttributeType::String
+            errs[0].expected_type.kind(),
+            crate::schema::AttrTypeKind::String
         ));
         assert!(errs[0].diagnostic_message().contains("String"));
     }
@@ -1930,7 +1954,7 @@ mod tests {
             "test",
         );
         let exports = mk_typed_exports(&[("orgs", &[("region", TypeExpr::String)])]);
-        let schemas = schema_with_attr("name", crate::schema::AttributeType::String);
+        let schemas = schema_with_attr("name", crate::schema::AttributeType::string());
         let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -1958,7 +1982,7 @@ mod tests {
             },
         );
         exports.insert("orgs".to_string(), fields);
-        let schemas = schema_with_attr("name", crate::schema::AttributeType::String);
+        let schemas = schema_with_attr("name", crate::schema::AttributeType::string());
         let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -1977,7 +2001,7 @@ mod tests {
             "test",
         );
         let exports = mk_typed_exports(&[("orgs", &[("count", TypeExpr::Int)])]);
-        let schemas = schema_with_attr("name", crate::schema::AttributeType::String);
+        let schemas = schema_with_attr("name", crate::schema::AttributeType::string());
         let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -2000,7 +2024,7 @@ mod tests {
         )]);
         let schemas = schema_with_attr(
             "name",
-            crate::schema::AttributeType::list(crate::schema::AttributeType::String),
+            crate::schema::AttributeType::list(crate::schema::AttributeType::string()),
         );
         let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
         assert_eq!(errs.len(), 1, "unexpected: {errs:?}");
@@ -2026,7 +2050,7 @@ mod tests {
                 ("counts", TypeExpr::List(Box::new(TypeExpr::Int))),
             ],
         )]);
-        let schemas = schema_with_attr("name", crate::schema::AttributeType::String);
+        let schemas = schema_with_attr("name", crate::schema::AttributeType::string());
         let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
         assert_eq!(
             errs.len(),
@@ -2066,12 +2090,12 @@ mod tests {
         // hits the Union catch-all and walks each value against the
         // whole union, so the leaf `Simple(iam_oidc_provider_arn)`
         // must be assignable to the union receiver directly.
-        let principal_union = AttributeType::Union(vec![
-            AttributeType::Struct {
-                name: "IamPolicyPrincipal".to_string(),
-                fields: vec![StructField::new("federated", AttributeType::String)],
-            },
-            AttributeType::String,
+        let principal_union = AttributeType::union(vec![
+            AttributeType::struct_(
+                "IamPolicyPrincipal".to_string(),
+                vec![StructField::new("federated", AttributeType::string())],
+            ),
+            AttributeType::string(),
         ]);
         let schemas = schema_with_attr("name", principal_union);
         let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
@@ -2098,21 +2122,21 @@ mod tests {
         );
         let exports =
             mk_typed_exports(&[("orgs", &[("key_arn", TypeExpr::Simple("arn".to_string()))])]);
-        let kms_arn = AttributeType::Custom {
-            identity: Some(TypeIdentity::bare("KmsKeyArn")),
-            base: Box::new(AttributeType::Custom {
-                identity: Some(TypeIdentity::bare("Arn")),
-                base: Box::new(AttributeType::String),
-                pattern: None,
-                length: None,
-                validate: noop_validator(),
-                to_dsl: None,
-            }),
-            pattern: None,
-            length: None,
-            validate: noop_validator(),
-            to_dsl: None,
-        };
+        let kms_arn = AttributeType::custom(
+            Some(TypeIdentity::bare("KmsKeyArn")),
+            AttributeType::custom(
+                Some(TypeIdentity::bare("Arn")),
+                AttributeType::string(),
+                None,
+                None,
+                noop_validator(),
+                None,
+            ),
+            None,
+            None,
+            noop_validator(),
+            None,
+        );
         let schemas = schema_with_attr("name", kms_arn);
         let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
         assert!(
@@ -2153,14 +2177,14 @@ mod tests {
         // Receiver is `String`. Without narrowing, `map(AwsAccountId)`
         // compares against `String` and fails. With narrowing,
         // `AwsAccountId` (Custom over String) is accepted.
-        let aws_account_id = AttributeType::Custom {
-            identity: Some(TypeIdentity::bare("AwsAccountId")),
-            base: Box::new(AttributeType::String),
-            pattern: None,
-            length: None,
-            validate: noop_validator(),
-            to_dsl: None,
-        };
+        let aws_account_id = AttributeType::custom(
+            Some(TypeIdentity::bare("AwsAccountId")),
+            AttributeType::string(),
+            None,
+            None,
+            noop_validator(),
+            None,
+        );
         let schemas = schema_with_attr("name", aws_account_id);
         let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
         assert!(
@@ -2197,10 +2221,10 @@ mod tests {
                 TypeExpr::Map(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
             )],
         )]);
-        let policy_struct = AttributeType::Struct {
-            name: "IamPolicyDocument".to_string(),
-            fields: vec![StructField::new("statement", AttributeType::String).required()],
-        };
+        let policy_struct = AttributeType::struct_(
+            "IamPolicyDocument".to_string(),
+            vec![StructField::new("statement", AttributeType::string()).required()],
+        );
         let schemas = schema_with_attr("policy", policy_struct);
         let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
         assert!(
@@ -2235,7 +2259,7 @@ mod tests {
             "orgs",
             &[("accounts", TypeExpr::Map(Box::new(account_struct)))],
         )]);
-        let schemas = schema_with_attr("name", crate::schema::AttributeType::String);
+        let schemas = schema_with_attr("name", crate::schema::AttributeType::string());
         let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
         assert!(
             errs.is_empty(),
@@ -2260,7 +2284,7 @@ mod tests {
             "orgs",
             &[("regions", TypeExpr::List(Box::new(TypeExpr::String)))],
         )]);
-        let schemas = schema_with_attr("name", crate::schema::AttributeType::String);
+        let schemas = schema_with_attr("name", crate::schema::AttributeType::string());
         let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
         assert!(
             errs.is_empty(),
@@ -2300,14 +2324,14 @@ mod tests {
             "orgs",
             &[("counts", TypeExpr::Map(Box::new(TypeExpr::Int)))],
         )]);
-        let policy_struct = AttributeType::Struct {
-            name: "PolicyDoc".to_string(),
-            fields: vec![
-                StructField::new("statements", AttributeType::String)
+        let policy_struct = AttributeType::struct_(
+            "PolicyDoc".to_string(),
+            vec![
+                StructField::new("statements", AttributeType::string())
                     .required()
                     .with_block_name("statement"),
             ],
-        };
+        );
         let schemas = schema_with_attr("policy", policy_struct);
         let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
         assert_eq!(
@@ -2339,10 +2363,10 @@ mod tests {
         );
         let exports =
             mk_typed_exports(&[("orgs", &[("ports", TypeExpr::Map(Box::new(TypeExpr::Int)))])]);
-        let cfg_struct = AttributeType::Struct {
-            name: "Cfg".to_string(),
-            fields: vec![StructField::new("port", AttributeType::Int).required()],
-        };
+        let cfg_struct = AttributeType::struct_(
+            "Cfg".to_string(),
+            vec![StructField::new("port", AttributeType::int()).required()],
+        );
         let schemas = schema_with_attr("config", cfg_struct);
         let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
         assert!(
@@ -2373,10 +2397,10 @@ mod tests {
             "orgs",
             &[("counts", TypeExpr::Map(Box::new(TypeExpr::Int)))],
         )]);
-        let policy_struct = AttributeType::Struct {
-            name: "PolicyDoc".to_string(),
-            fields: vec![StructField::new("statement", AttributeType::String).required()],
-        };
+        let policy_struct = AttributeType::struct_(
+            "PolicyDoc".to_string(),
+            vec![StructField::new("statement", AttributeType::string()).required()],
+        );
         let schemas = schema_with_attr("policy", policy_struct);
         let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
         assert_eq!(
@@ -2413,10 +2437,10 @@ mod tests {
                 TypeExpr::Map(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
             )],
         )]);
-        let policy_struct = AttributeType::Struct {
-            name: "IamPolicyDocument".to_string(),
-            fields: vec![StructField::new("statement", AttributeType::String).required()],
-        };
+        let policy_struct = AttributeType::struct_(
+            "IamPolicyDocument".to_string(),
+            vec![StructField::new("statement", AttributeType::string()).required()],
+        );
         let schemas = schema_with_attr("policy", policy_struct);
         let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
         assert!(
@@ -2453,7 +2477,7 @@ mod tests {
                 TypeExpr::Map(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
             )],
         )]);
-        let schemas = schema_with_attr("tags", AttributeType::map(AttributeType::String));
+        let schemas = schema_with_attr("tags", AttributeType::map(AttributeType::string()));
         let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
         assert_eq!(
             errs.len(),
@@ -3644,7 +3668,7 @@ mod tests {
             binding: "orgs".to_string(),
             field: "count".to_string(),
             export_type: TypeExpr::Int,
-            expected_type: crate::schema::AttributeType::String,
+            expected_type: crate::schema::AttributeType::string(),
         };
         let shape_err = UpstreamForIterableShapeError {
             location: "for-expression `for x in orgs.accounts`".to_string(),

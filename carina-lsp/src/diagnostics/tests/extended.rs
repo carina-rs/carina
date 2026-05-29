@@ -264,12 +264,12 @@ fn list_item_type_validation() {
     // Use a test engine with a List(StringEnum) schema to test list item validation
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let list_enum = AttributeType::list(AttributeType::StringEnum {
-        name: "Protocol".to_string(),
-        values: vec!["tcp".to_string(), "udp".to_string()],
-        identity: None,
-        dsl_aliases: vec![],
-    });
+    let list_enum = AttributeType::list(AttributeType::string_enum(
+        "Protocol".to_string(),
+        vec!["tcp".to_string(), "udp".to_string()],
+        None,
+        vec![],
+    ));
 
     let schema = ResourceSchema::new("list.resource")
         .attribute(AttributeSchema::new("protocols", list_enum));
@@ -346,17 +346,17 @@ fn union_static_value_validated() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("name", AttributeType::String).required())
+        .attribute(AttributeSchema::new("name", AttributeType::string()).required())
         .attribute(AttributeSchema::new(
             "mode",
-            AttributeType::Union(vec![
-                AttributeType::StringEnum {
-                    name: "Mode".to_string(),
-                    values: vec!["active".to_string(), "passive".to_string()],
-                    identity: None,
-                    dsl_aliases: vec![],
-                },
-                AttributeType::Int,
+            AttributeType::union(vec![
+                AttributeType::string_enum(
+                    "Mode".to_string(),
+                    vec!["active".to_string(), "passive".to_string()],
+                    None,
+                    vec![],
+                ),
+                AttributeType::int(),
             ]),
         ));
 
@@ -399,17 +399,17 @@ fn union_valid_static_value_no_warning() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("name", AttributeType::String).required())
+        .attribute(AttributeSchema::new("name", AttributeType::string()).required())
         .attribute(AttributeSchema::new(
             "mode",
-            AttributeType::Union(vec![
-                AttributeType::StringEnum {
-                    name: "Mode".to_string(),
-                    values: vec!["active".to_string(), "passive".to_string()],
-                    identity: None,
-                    dsl_aliases: vec![],
-                },
-                AttributeType::Int,
+            AttributeType::union(vec![
+                AttributeType::string_enum(
+                    "Mode".to_string(),
+                    vec!["active".to_string(), "passive".to_string()],
+                    None,
+                    vec![],
+                ),
+                AttributeType::int(),
             ]),
         ));
 
@@ -445,17 +445,17 @@ fn union_valid_int_value_no_warning() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("name", AttributeType::String).required())
+        .attribute(AttributeSchema::new("name", AttributeType::string()).required())
         .attribute(AttributeSchema::new(
             "mode",
-            AttributeType::Union(vec![
-                AttributeType::StringEnum {
-                    name: "Mode".to_string(),
-                    values: vec!["active".to_string(), "passive".to_string()],
-                    identity: None,
-                    dsl_aliases: vec![],
-                },
-                AttributeType::Int,
+            AttributeType::union(vec![
+                AttributeType::string_enum(
+                    "Mode".to_string(),
+                    vec!["active".to_string(), "passive".to_string()],
+                    None,
+                    vec![],
+                ),
+                AttributeType::int(),
             ]),
         ));
 
@@ -1300,40 +1300,40 @@ fn resource_ref_type_check_helper_regression() {
 
     // Source resource: has a String attribute "name" and a Custom "my_id"
     let source_schema = ResourceSchema::new("source")
-        .attribute(AttributeSchema::new("name", AttributeType::String))
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
         .attribute(AttributeSchema::new(
             "my_id",
-            AttributeType::CustomEnum {
-                identity: carina_core::schema::string_enum_identity("MyId", Some("test")),
-                base: Box::new(AttributeType::String),
-                validate: legacy_validator(dummy_validate),
-                to_dsl: None,
-            },
+            AttributeType::custom_enum(
+                carina_core::schema::string_enum_identity("MyId", Some("test")),
+                AttributeType::string(),
+                legacy_validator(dummy_validate),
+                None,
+            ),
         ));
 
     // Target resource: has Union, StringEnum, and Custom attributes
     let target_schema = ResourceSchema::new("target")
         .attribute(AttributeSchema::new(
             "union_attr",
-            AttributeType::Union(vec![AttributeType::Int, AttributeType::Bool]),
+            AttributeType::union(vec![AttributeType::int(), AttributeType::bool()]),
         ))
         .attribute(AttributeSchema::new(
             "enum_attr",
-            AttributeType::StringEnum {
-                name: "Status".to_string(),
-                values: vec!["active".to_string(), "inactive".to_string()],
-                identity: None,
-                dsl_aliases: vec![],
-            },
+            AttributeType::string_enum(
+                "Status".to_string(),
+                vec!["active".to_string(), "inactive".to_string()],
+                None,
+                vec![],
+            ),
         ))
         .attribute(AttributeSchema::new(
             "custom_attr",
-            AttributeType::CustomEnum {
-                identity: carina_core::schema::string_enum_identity("MyId", Some("test")),
-                base: Box::new(AttributeType::String),
-                validate: legacy_validator(dummy_validate),
-                to_dsl: None,
-            },
+            AttributeType::custom_enum(
+                carina_core::schema::string_enum_identity("MyId", Some("test")),
+                AttributeType::string(),
+                legacy_validator(dummy_validate),
+                None,
+            ),
         ));
 
     let mut schemas = SchemaRegistry::new();
@@ -1452,10 +1452,10 @@ fn resource_validation_failed_with_attribute_points_to_attribute_line() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeError};
 
     let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("name", AttributeType::String).required())
+        .attribute(AttributeSchema::new("name", AttributeType::string()).required())
         .attribute(AttributeSchema::new(
             "tags",
-            AttributeType::map(AttributeType::String),
+            AttributeType::map(AttributeType::string()),
         ))
         .with_validator(|attrs| {
             if let Some(carina_core::resource::Value::Concrete(
@@ -1675,30 +1675,30 @@ fn map_key_validation_warns_on_invalid_key() {
 
     // Build schema: statement.condition has StringEnum keys
     let condition_type = AttributeType::map_with_key(
-        AttributeType::StringEnum {
-            name: "ConditionOperator".to_string(),
-            values: vec!["string_equals".to_string(), "string_like".to_string()],
-            identity: None,
-            dsl_aliases: vec![],
-        },
-        AttributeType::map(AttributeType::String),
+        AttributeType::string_enum(
+            "ConditionOperator".to_string(),
+            vec!["string_equals".to_string(), "string_like".to_string()],
+            None,
+            vec![],
+        ),
+        AttributeType::map(AttributeType::string()),
     );
-    let statement_type = AttributeType::Struct {
-        name: "Statement".to_string(),
-        fields: vec![
-            StructField::new("effect", AttributeType::String),
+    let statement_type = AttributeType::struct_(
+        "Statement".to_string(),
+        vec![
+            StructField::new("effect", AttributeType::string()),
             StructField::new("condition", condition_type),
         ],
-    };
+    );
     let schema = ResourceSchema::new("test.resource").attribute(AttributeSchema::new(
         "policy",
-        AttributeType::Struct {
-            name: "Policy".to_string(),
-            fields: vec![StructField::new(
+        AttributeType::struct_(
+            "Policy".to_string(),
+            vec![StructField::new(
                 "statement",
                 AttributeType::list(statement_type),
             )],
-        },
+        ),
     ));
 
     let mut schemas = SchemaRegistry::new();
@@ -1766,35 +1766,35 @@ fn distinct_semantic_customs_are_rejected() {
         .as_data_source()
         .attribute(AttributeSchema::new(
             "account_id",
-            AttributeType::Custom {
-                identity: Some(carina_core::schema::TypeIdentity::new(
+            AttributeType::custom(
+                Some(carina_core::schema::TypeIdentity::new(
                     Some("aws"),
                     Vec::<String>::new(),
                     "AwsAccountId",
                 )),
-                base: Box::new(AttributeType::String),
-                pattern: None,
-                length: None,
-                validate: legacy_validator(validate_account_id),
-                to_dsl: None,
-            },
+                AttributeType::string(),
+                None,
+                None,
+                legacy_validator(validate_account_id),
+                None,
+            ),
         ));
 
     // Target resource: has a TargetId attribute (also String-based Custom)
     let target_schema = ResourceSchema::new("sso.Assignment").attribute(AttributeSchema::new(
         "target_id",
-        AttributeType::Custom {
-            identity: Some(carina_core::schema::TypeIdentity::new(
+        AttributeType::custom(
+            Some(carina_core::schema::TypeIdentity::new(
                 Some("awscc"),
                 Vec::<String>::new(),
                 "TargetId",
             )),
-            base: Box::new(AttributeType::String),
-            pattern: None,
-            length: None,
-            validate: legacy_validator(validate_target_id),
-            to_dsl: None,
-        },
+            AttributeType::string(),
+            None,
+            None,
+            legacy_validator(validate_target_id),
+            None,
+        ),
     ));
 
     let mut schemas = SchemaRegistry::new();
@@ -1829,12 +1829,12 @@ fn exports_cross_file_ref_no_false_positive() {
     use carina_core::resource::{ConcreteValue, Value};
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let aws_account_id_type = AttributeType::Custom {
-        identity: Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
-        base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
-        validate: carina_core::schema::legacy_validator(|v| match v {
+    let aws_account_id_type = AttributeType::custom(
+        Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
+        AttributeType::string(),
+        None,
+        None,
+        carina_core::schema::legacy_validator(|v| match v {
             Value::Concrete(ConcreteValue::String(s))
                 if s.len() == 12 && s.chars().all(|c| c.is_ascii_digit()) =>
             {
@@ -1846,8 +1846,8 @@ fn exports_cross_file_ref_no_false_positive() {
             )),
             _ => Err("expected string".to_string()),
         }),
-        to_dsl: None,
-    };
+        None,
+    );
     let schema = ResourceSchema::new("organizations.account")
         .attribute(AttributeSchema::new("account_id", aws_account_id_type));
     let mut schemas = SchemaRegistry::new();
@@ -1919,7 +1919,7 @@ fn exports_ref_type_warning_survives_formatter_round_trip() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("sample.resource")
-        .attribute(AttributeSchema::new("enabled", AttributeType::Bool));
+        .attribute(AttributeSchema::new("enabled", AttributeType::bool()));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("test", schema);
     let engine = custom_engine(schemas);
@@ -1968,7 +1968,7 @@ fn exports_ref_type_warning_survives_document_reparse_after_format_edit() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("sample.resource")
-        .attribute(AttributeSchema::new("enabled", AttributeType::Bool));
+        .attribute(AttributeSchema::new("enabled", AttributeType::bool()));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("test", schema);
     let engine = custom_engine(schemas);
@@ -2106,7 +2106,7 @@ fn exports_map_type_warning_for_cross_file_ref() {
 
     // Schema: registry_prod.account_id is String — incompatible with map(bool)
     let schema = ResourceSchema::new("organizations.account")
-        .attribute(AttributeSchema::new("account_id", AttributeType::String));
+        .attribute(AttributeSchema::new("account_id", AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
     let engine = custom_engine(schemas);
@@ -2148,7 +2148,7 @@ fn exports_subscripted_cross_file_ref_does_not_false_flag() {
 
     let schema = ResourceSchema::new("organizations.account").attribute(AttributeSchema::new(
         "accounts",
-        AttributeType::map(AttributeType::String),
+        AttributeType::map(AttributeType::string()),
     ));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
@@ -3269,7 +3269,7 @@ fn exports_type_check_resolves_resource_binding_from_sibling_file() {
 
     // Schema: registry_prod.account_id is String.
     let schema = ResourceSchema::new("organizations.account")
-        .attribute(AttributeSchema::new("account_id", AttributeType::String));
+        .attribute(AttributeSchema::new("account_id", AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
     let engine = custom_engine(schemas);
@@ -3824,6 +3824,92 @@ let waited = wait cert {
     assert!(
         !diags.iter().any(|d| d.message.contains("wait")),
         "valid wait block should produce no wait-specific diagnostics; got: {:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn lsp_accepts_block_syntax_inside_ref_typed_attribute() {
+    // Regression for carina#3349: the LSP per-keystroke diagnostic
+    // pass previously matched on `&attr_schema.attr_type` raw, so a
+    // `Ref("LifecycleConfiguration")` attribute fell through every
+    // arm and silently produced no diagnostics — including no
+    // "Required attribute 'rules' is missing" — *but the apply path
+    // through `resolve_block_names` did surface that error*. The fix
+    // peels `Ref` against `schema.defs` at every shape gate the LSP
+    // touches. Pin "valid block syntax inside a Ref-typed attribute
+    // yields no schema-shape diagnostics" so a future refactor that
+    // drops the peel cannot silently regress.
+    let engine = test_engine_with_ref_lifecycle_like_schema();
+    let src = r#"
+let bucket = awscc.s3.Bucket {
+    lifecycle_configuration = {
+        rule {
+            id = "expire-old-objects"
+        }
+        rule {
+            id = "transition-to-glacier"
+        }
+    }
+}
+"#;
+    let doc = create_document(src);
+    let diags = engine.analyze(&doc, None);
+    let block_msgs: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            d.message.contains("Required attribute 'rules'")
+                || d.message.contains("cannot use block syntax")
+                || d.message.contains("Type mismatch")
+        })
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(
+        block_msgs.is_empty(),
+        "Ref-typed attribute should not surface block-syntax / required / type-mismatch diagnostics for the documented `rule {{ }}` shape; got: {:?}",
+        block_msgs,
+    );
+}
+
+#[test]
+fn lsp_surfaces_missing_required_field_inside_ref_typed_attribute() {
+    // Positive-assertion regression for carina#3349. Unlike the
+    // sibling test above (which asserts the *absence* of false
+    // positives — passes even if the LSP peel is deleted because
+    // dropping `Ref` silently disables struct validation), this test
+    // asserts that struct-field validation actually descends through
+    // the `Ref` and reports a missing required field. Without the
+    // peel calls in `carina-lsp/src/diagnostics/mod.rs`, the
+    // `is_struct_shape` gate returns false for the Ref-typed
+    // attribute and the validator never visits the nested `rule { }`
+    // block — so a future refactor that drops the peel would fail
+    // this test outright. The `Rule.id` field is declared `.required()`
+    // in `test_engine_with_ref_lifecycle_like_schema` for this
+    // purpose.
+    let engine = test_engine_with_ref_lifecycle_like_schema();
+    let src = r#"
+let bucket = awscc.s3.Bucket {
+    lifecycle_configuration = {
+        rule {
+        }
+    }
+}
+"#;
+    let doc = create_document(src);
+    let diags = engine.analyze(&doc, None);
+    let missing_id: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            (d.message.contains("Required") || d.message.contains("required"))
+                && d.message.contains("id")
+        })
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(
+        !missing_id.is_empty(),
+        "LSP must surface 'required field id is missing' through a Ref-typed attribute. \
+         If this test fails, the Ref-peel in carina-lsp/src/diagnostics/mod.rs has \
+         regressed (same class as carina#3349). All diagnostics: {:?}",
         diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
     );
 }

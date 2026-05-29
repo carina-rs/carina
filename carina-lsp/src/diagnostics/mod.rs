@@ -530,10 +530,13 @@ impl DiagnosticEngine {
                         if let Some(attr_schema) = schema.attributes.get(canonical_name) {
                             // Check for block syntax on bare Struct attributes:
                             // Block syntax produces Value::Concrete(ConcreteValue::List), but bare Struct requires
-                            // map assignment syntax: attr = { ... }
+                            // map assignment syntax: attr = { ... }.
+                            // Use `Shape` (Ref-peeled) so a Ref-typed
+                            // bare-struct attribute is still caught (same
+                            // bug class as carina#3349).
                             if matches!(
-                                &attr_schema.attr_type,
-                                carina_core::schema::AttributeType::Struct { .. }
+                                attr_schema.attr_type.shape(&schema.defs),
+                                carina_core::schema::Shape::Struct { .. }
                             ) && matches!(attr_value, Value::Concrete(ConcreteValue::List(_)))
                             {
                                 let search_name =
@@ -562,8 +565,8 @@ impl DiagnosticEngine {
                             // through to the generic match below for everything
                             // else (and when the StringEnum branch can't locate a
                             // value range).
-                            if let carina_core::schema::AttributeType::StringEnum { .. } =
-                                &attr_schema.attr_type
+                            if let carina_core::schema::Shape::StringEnum { .. } =
+                                attr_schema.attr_type.shape(&schema.defs)
                                 && let Some(diag) = build_string_enum_diagnostic(
                                     &attr_schema.attr_type,
                                     attr_value,
@@ -577,10 +580,17 @@ impl DiagnosticEngine {
                                 // is already reported with the richer diagnostic.
                                 continue;
                             }
-                            let type_error = match (&attr_schema.attr_type, attr_value) {
+                            // Use `Shape` to peel `AttributeType::Ref` against
+                            // `schema.defs` at the type-system level. Shape
+                            // intentionally has no `Ref` variant — the
+                            // wildcard arm cannot silently drop a Ref-typed
+                            // attribute (carina#3349 invariant lifted into
+                            // the type system).
+                            let attr_shape = attr_schema.attr_type.shape(&schema.defs);
+                            let type_error = match (attr_shape, attr_value) {
                                 // Bool type should not receive String
                                 (
-                                    carina_core::schema::AttributeType::Bool,
+                                    carina_core::schema::Shape::Bool,
                                     Value::Concrete(ConcreteValue::String(s)),
                                 ) => Some(format!(
                                     "Type mismatch: expected Bool, got String \"{}\". Use true or false.",
@@ -588,7 +598,7 @@ impl DiagnosticEngine {
                                 )),
                                 // Int type should not receive String
                                 (
-                                    carina_core::schema::AttributeType::Int,
+                                    carina_core::schema::Shape::Int,
                                     Value::Concrete(ConcreteValue::String(s)),
                                 ) => Some(format!(
                                     "Type mismatch: expected Int, got String \"{}\".",
@@ -596,7 +606,7 @@ impl DiagnosticEngine {
                                 )),
                                 // Float type should not receive String
                                 (
-                                    carina_core::schema::AttributeType::Float,
+                                    carina_core::schema::Shape::Float,
                                     Value::Concrete(ConcreteValue::String(s)),
                                 ) => Some(format!(
                                     "Type mismatch: expected Float, got String \"{}\".",
@@ -604,9 +614,9 @@ impl DiagnosticEngine {
                                 )),
                                 // ResourceRef type check for Union, StringEnum, and Custom types
                                 (
-                                    carina_core::schema::AttributeType::Union(_)
-                                    | carina_core::schema::AttributeType::StringEnum { .. }
-                                    | carina_core::schema::AttributeType::Custom { .. },
+                                    carina_core::schema::Shape::Union(_)
+                                    | carina_core::schema::Shape::StringEnum { .. }
+                                    | carina_core::schema::Shape::Custom { .. },
                                     Value::Deferred(DeferredValue::ResourceRef { path }),
                                 ) => check_resource_ref_type_mismatch(
                                     &binding_schema_map,
@@ -624,7 +634,7 @@ impl DiagnosticEngine {
                                 // namespace-shape fallback) — surface the
                                 // plain message so the user still sees a
                                 // diagnostic, just without the quick-fix.
-                                (carina_core::schema::AttributeType::StringEnum { .. }, value) => {
+                                (carina_core::schema::Shape::StringEnum { .. }, value) => {
                                     let schema_view =
                                         schema.schema_view_for(attr_schema.attr_type.clone());
                                     schema_view.validate(value).err().map(|e| {
@@ -639,10 +649,8 @@ impl DiagnosticEngine {
                                     })
                                 }
                                 (
-                                    carina_core::schema::AttributeType::Custom {
-                                        identity,
-                                        validate,
-                                        ..
+                                    carina_core::schema::Shape::Custom {
+                                        identity, validate, ..
                                     },
                                     value,
                                 ) => {
@@ -666,15 +674,13 @@ impl DiagnosticEngine {
                                         validate(value)
                                             .err()
                                             .or_else(|| {
-                                                identity
-                                                    .as_ref()
-                                                    .and_then(|id| lookup(id, value).err())
+                                                identity.and_then(|id| lookup(id, value).err())
                                             })
                                             .map(|inner_err| inner_err.to_string())
                                     }
                                 }
                                 (
-                                    carina_core::schema::AttributeType::CustomEnum {
+                                    carina_core::schema::Shape::CustomEnum {
                                         identity,
                                         validate,
                                         ..
@@ -731,7 +737,7 @@ impl DiagnosticEngine {
                                 }
                                 // String type - check for bare resource binding
                                 (
-                                    carina_core::schema::AttributeType::String,
+                                    carina_core::schema::Shape::String,
                                     Value::Concrete(ConcreteValue::String(s)),
                                 ) => {
                                     if let Some(binding) =
@@ -751,13 +757,16 @@ impl DiagnosticEngine {
                                     }
                                 }
                                 // Validate List item types (non-Struct items only;
-                                // List<Struct> is handled by validate_struct_value below)
+                                // List<Struct> is handled by validate_struct_value below).
+                                // Use `Shape` on the inner so a
+                                // `List<Ref<Struct>>` correctly defers to
+                                // the struct-validation pass (carina#3349).
                                 (
-                                    carina_core::schema::AttributeType::List { inner, .. },
+                                    carina_core::schema::Shape::List { inner, .. },
                                     Value::Concrete(ConcreteValue::List(_)),
                                 ) if !matches!(
-                                    inner.as_ref(),
-                                    carina_core::schema::AttributeType::Struct { .. }
+                                    inner.shape(&schema.defs),
+                                    carina_core::schema::Shape::Struct { .. }
                                 ) =>
                                 {
                                     let schema_view =
@@ -769,7 +778,7 @@ impl DiagnosticEngine {
                                 }
                                 // Validate Map value types
                                 (
-                                    carina_core::schema::AttributeType::Map { .. },
+                                    carina_core::schema::Shape::Map { .. },
                                     Value::Concrete(ConcreteValue::Map(_)),
                                 ) => {
                                     let schema_view =
@@ -784,7 +793,7 @@ impl DiagnosticEngine {
                                 // checkpoint and must not be type-checked
                                 // against Union members here — see #2847
                                 // for the bare-binding (`BindingRef`) form.
-                                (carina_core::schema::AttributeType::Union(_), value)
+                                (carina_core::schema::Shape::Union(_), value)
                                     if !matches!(
                                         value,
                                         Value::Deferred(DeferredValue::ResourceRef { .. })
@@ -819,11 +828,19 @@ impl DiagnosticEngine {
                             // don't deep-clone the field set on every
                             // keystroke (LSP `analyze_with_filename` is on
                             // the per-keystroke hot path).
-                            let is_struct_shape = match &attr_schema.attr_type {
-                                carina_core::schema::AttributeType::Struct { .. } => true,
-                                carina_core::schema::AttributeType::List { inner, .. } => matches!(
-                                    inner.as_ref(),
-                                    carina_core::schema::AttributeType::Struct { .. }
+                            //
+                            // Use `Shape` (Ref-peeled) so cyclic-CFN
+                            // attributes (e.g.
+                            // `awscc.s3.Bucket.lifecycle_configuration:
+                            // Ref("LifecycleConfiguration")`) still trigger
+                            // struct-field validation. Same bug class as
+                            // carina#3349 — a raw match arm would silently
+                            // drop `Ref` and skip the entire pass.
+                            let is_struct_shape = match attr_schema.attr_type.shape(&schema.defs) {
+                                carina_core::schema::Shape::Struct { .. } => true,
+                                carina_core::schema::Shape::List { inner, .. } => matches!(
+                                    inner.shape(&schema.defs),
+                                    carina_core::schema::Shape::Struct { .. }
                                 ),
                                 _ => false,
                             };

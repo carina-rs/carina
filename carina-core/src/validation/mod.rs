@@ -12,7 +12,7 @@ use crate::binding_index::BindingIndex;
 use crate::parser::{ModuleCall, ProviderContext, ResourceRef, TypeExpr, validate_custom_type};
 use crate::provider::ProviderFactory;
 use crate::resource::{ConcreteValue, DeferredValue, Resource, Value};
-use crate::schema::{AttributeType, SchemaRegistry, suggest_similar_name};
+use crate::schema::{AttrTypeKind, AttributeType, SchemaRegistry, Shape, suggest_similar_name};
 
 /// Render the trailing `" Did you mean 'X'?"` segment for an unknown
 /// name in a diagnostic, or an empty string when nothing close enough
@@ -218,29 +218,32 @@ pub fn validate_resource_ref_types<E>(
             // suggestion; other shape mismatches stay silent because
             // resolver-time evaluation catches them with full location
             // context.
-            let narrowed =
-                match narrow_attribute_type(&ref_attr_schema.attr_type, ref_path.segments()) {
-                    Ok(t) => t,
-                    Err(NarrowError::UnknownStructField {
+            let narrowed = match narrow_attribute_type(
+                &ref_attr_schema.attr_type,
+                ref_path.segments(),
+                &ref_schema.defs,
+            ) {
+                Ok(t) => t,
+                Err(NarrowError::UnknownStructField {
+                    field,
+                    struct_name,
+                    known_fields,
+                }) => {
+                    let known: Vec<&str> = known_fields.iter().map(|s| s.as_str()).collect();
+                    all_errors.push(format!(
+                        "{}: unknown field '{}' on struct '{}' in reference {}; \
+                         known fields: {}.{}",
+                        resource_id,
                         field,
                         struct_name,
-                        known_fields,
-                    }) => {
-                        let known: Vec<&str> = known_fields.iter().map(|s| s.as_str()).collect();
-                        all_errors.push(format!(
-                            "{}: unknown field '{}' on struct '{}' in reference {}; \
-                         known fields: {}.{}",
-                            resource_id,
-                            field,
-                            struct_name,
-                            ref_path.to_dot_string(),
-                            known.join(", "),
-                            did_you_mean(&field, &known),
-                        ));
-                        continue;
-                    }
-                    Err(NarrowError::ShapeMismatch) => continue,
-                };
+                        ref_path.to_dot_string(),
+                        known.join(", "),
+                        did_you_mean(&field, &known),
+                    ));
+                    continue;
+                }
+                Err(NarrowError::ShapeMismatch) => continue,
+            };
             let ref_type_name = narrowed.type_name();
 
             // Directional check: source (the referenced attribute, post
@@ -415,7 +418,7 @@ fn collect_ref_type_errors(
             };
 
             let ref_type = &ref_attr_schema.attr_type;
-            if !is_type_expr_compatible_with_schema(type_expr, ref_type) {
+            if !is_type_expr_compatible_with_schema(type_expr, ref_type, &ref_schema.defs) {
                 let ref_type_name = ref_type.type_name();
                 errors.push(format!(
                     "export '{}': type mismatch for '{}.{}': expected {}, got {}",
@@ -452,9 +455,15 @@ fn collect_ref_type_errors(
 }
 
 /// Check if a TypeExpr is compatible with an AttributeType from a schema.
+///
+/// `defs` carries the schema's named definitions, used to peel any
+/// `AttributeType::ref_(name)` receiver via [`AttributeType::shape`]
+/// before shape-based dispatch. Pass [`crate::schema::empty_defs()`]
+/// when no resource schema is in scope.
 pub fn is_type_expr_compatible_with_schema(
     type_expr: &crate::parser::TypeExpr,
     attr_type: &AttributeType,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> bool {
     use crate::parser::TypeExpr;
 
@@ -473,15 +482,15 @@ pub fn is_type_expr_compatible_with_schema(
         // is at least as specific as (or more general than) the
         // declared type. Issue #2358.
         TypeExpr::String => {
-            if attr_type_demands_specific_custom(attr_type) {
+            if attr_type_demands_specific_custom(attr_type, defs) {
                 return false;
             }
-            is_string_compatible_type(attr_type)
+            is_string_compatible_type(attr_type, defs)
         }
-        TypeExpr::Bool => matches!(attr_type, AttributeType::Bool),
-        TypeExpr::Int => matches!(attr_type, AttributeType::Int),
-        TypeExpr::Float => matches!(attr_type, AttributeType::Float),
-        TypeExpr::Duration => matches!(attr_type, AttributeType::Duration),
+        TypeExpr::Bool => matches!(attr_type.shape(defs), Shape::Bool),
+        TypeExpr::Int => matches!(attr_type.shape(defs), Shape::Int),
+        TypeExpr::Float => matches!(attr_type.shape(defs), Shape::Float),
+        TypeExpr::Duration => matches!(attr_type.shape(defs), Shape::Duration),
         TypeExpr::Simple(name) => {
             // Two compatibility directions both succeed:
             //
@@ -500,18 +509,23 @@ pub fn is_type_expr_compatible_with_schema(
             //    direction (`String` value into a Custom-with-
             //    semantic-name receiver) stays rejected by
             //    `attr_type_demands_specific_custom`.
-            let mut current = attr_type;
+            //
+            // The walk traverses post-Ref-peel shapes so a `Ref`
+            // pointing at a `Custom` chain is followed correctly.
+            let mut current: &AttributeType = attr_type;
             loop {
-                let type_snake = crate::parser::pascal_to_snake(&current.type_name());
+                let resolved = current.resolve_refs(defs);
+                let resolved_attr = resolved.as_attr();
+                let type_snake = crate::parser::pascal_to_snake(&resolved_attr.type_name());
                 if type_snake == *name {
                     return true;
                 }
-                match current {
-                    AttributeType::Custom { base, .. } => current = base,
+                match resolved_attr.kind() {
+                    AttrTypeKind::Custom { base, .. } => current = base.as_ref(),
                     _ => break,
                 }
             }
-            if is_plain_string_or_string_union(attr_type) {
+            if is_plain_string_or_string_union(attr_type, defs) {
                 return true;
             }
             // Issue #2663: a `Simple(name)` value is unambiguously
@@ -525,15 +539,17 @@ pub fn is_type_expr_compatible_with_schema(
             // the existing `Simple → Union<String, Int>` rejection
             // (`type_compat_simple_rejected_by_mixed_string_int_union_receiver`)
             // is preserved.
-            if let AttributeType::Union(members) = attr_type {
-                let has_plain_string = members.iter().any(|m| matches!(m, AttributeType::String));
+            if let Shape::Union(members) = attr_type.shape(defs) {
+                let has_plain_string = members
+                    .iter()
+                    .any(|m| matches!(m.shape(defs), Shape::String));
                 let others_shape_disjoint = members.iter().all(|m| {
                     matches!(
-                        m,
-                        AttributeType::String
-                            | AttributeType::List { .. }
-                            | AttributeType::Map { .. }
-                            | AttributeType::Struct { .. }
+                        m.shape(defs),
+                        Shape::String
+                            | Shape::List { .. }
+                            | Shape::Map { .. }
+                            | Shape::Struct { .. }
                     )
                 });
                 if has_plain_string && others_shape_disjoint {
@@ -542,24 +558,24 @@ pub fn is_type_expr_compatible_with_schema(
             }
             false
         }
-        TypeExpr::List(inner) => match attr_type {
-            AttributeType::List {
+        TypeExpr::List(inner) => match attr_type.shape(defs) {
+            Shape::List {
                 inner: schema_inner,
                 ..
-            } => is_type_expr_compatible_with_schema(inner, schema_inner),
+            } => is_type_expr_compatible_with_schema(inner, schema_inner, defs),
             _ => false,
         },
-        TypeExpr::Map(inner) => match attr_type {
-            AttributeType::Map {
+        TypeExpr::Map(inner) => match attr_type.shape(defs) {
+            Shape::Map {
                 value: schema_inner,
                 ..
-            } => is_type_expr_compatible_with_schema(inner, schema_inner),
+            } => is_type_expr_compatible_with_schema(inner, schema_inner, defs),
             _ => false,
         },
         TypeExpr::Struct {
             fields: expr_fields,
-        } => match attr_type {
-            AttributeType::Struct {
+        } => match attr_type.shape(defs) {
+            Shape::Struct {
                 fields: schema_fields,
                 ..
             } => {
@@ -573,19 +589,20 @@ pub fn is_type_expr_compatible_with_schema(
                 }
                 schema_fields.iter().all(|sf| {
                     expr_fields.iter().any(|(n, t)| {
-                        n == &sf.name && is_type_expr_compatible_with_schema(t, &sf.field_type)
+                        n == &sf.name
+                            && is_type_expr_compatible_with_schema(t, &sf.field_type, defs)
                     })
                 })
             }
             // A consumer annotated as `map(T)` may receive a `struct { a: T,
             // b: T }` value — the shape coerces as long as every field type
             // satisfies T.
-            AttributeType::Map {
+            Shape::Map {
                 value: schema_inner,
                 ..
             } => expr_fields
                 .iter()
-                .all(|(_, ty)| is_type_expr_compatible_with_schema(ty, schema_inner)),
+                .all(|(_, ty)| is_type_expr_compatible_with_schema(ty, schema_inner, defs)),
             _ => false,
         },
         // Sentinel for failed inference (#2360 stage 2). Never matches a
@@ -597,26 +614,27 @@ pub fn is_type_expr_compatible_with_schema(
 }
 
 /// Check if an AttributeType is string-compatible (can accept a string value).
-pub fn is_string_compatible_type(attr_type: &AttributeType) -> bool {
-    match attr_type {
-        AttributeType::String | AttributeType::Custom { .. } | AttributeType::StringEnum { .. } => {
-            true
-        }
-        AttributeType::Union(types) => types.iter().all(is_string_compatible_type),
-        // `AttributeType::Ref` (carina#3340): resolved target is
-        // typically a `Struct`, not a string-shaped scalar. Returning
-        // `false` is the safe, schema-consistent answer. If a future
-        // schema uses `Ref` to point at a non-Struct, this helper
-        // should thread `&defs` and recurse via `resolve_refs`.
-        AttributeType::Ref(_) => false,
-        AttributeType::Int
-        | AttributeType::Float
-        | AttributeType::Bool
-        | AttributeType::Duration
-        | AttributeType::CustomEnum { .. }
-        | AttributeType::List { .. }
-        | AttributeType::Map { .. }
-        | AttributeType::Struct { .. } => false,
+///
+/// `defs` is threaded so any `Ref` receiver is peeled before shape
+/// dispatch. A `Ref` target that resolves to a non-string shape
+/// (typically a `Struct`) returns false, same as before — but a
+/// `Ref` pointing at a string-compatible alias now answers correctly
+/// instead of silently rejecting.
+pub fn is_string_compatible_type(
+    attr_type: &AttributeType,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> bool {
+    match attr_type.shape(defs) {
+        Shape::String | Shape::Custom { .. } | Shape::StringEnum { .. } => true,
+        Shape::Union(types) => types.iter().all(|t| is_string_compatible_type(t, defs)),
+        Shape::Int
+        | Shape::Float
+        | Shape::Bool
+        | Shape::Duration
+        | Shape::CustomEnum { .. }
+        | Shape::List { .. }
+        | Shape::Map { .. }
+        | Shape::Struct { .. } => false,
     }
 }
 
@@ -625,24 +643,25 @@ pub fn is_string_compatible_type(attr_type: &AttributeType) -> bool {
 /// [`is_string_compatible_type`] also accepts `Custom` and `StringEnum`
 /// receivers, but those carry constraints (specific identity / fixed
 /// value set) that would be erased by accepting a `Simple(name)` value.
-fn is_plain_string_or_string_union(attr_type: &AttributeType) -> bool {
-    match attr_type {
-        AttributeType::String => true,
-        AttributeType::Union(types) => types.iter().all(is_plain_string_or_string_union),
-        // `Ref` resolves to a Struct in every cyclic CFN schema today;
-        // returning `false` is conservative and consistent with
-        // is_string_compatible_type. (carina#3340.)
-        AttributeType::Ref(_) => false,
-        AttributeType::Int
-        | AttributeType::Float
-        | AttributeType::Bool
-        | AttributeType::Duration
-        | AttributeType::Custom { .. }
-        | AttributeType::CustomEnum { .. }
-        | AttributeType::StringEnum { .. }
-        | AttributeType::List { .. }
-        | AttributeType::Map { .. }
-        | AttributeType::Struct { .. } => false,
+fn is_plain_string_or_string_union(
+    attr_type: &AttributeType,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> bool {
+    match attr_type.shape(defs) {
+        Shape::String => true,
+        Shape::Union(types) => types
+            .iter()
+            .all(|t| is_plain_string_or_string_union(t, defs)),
+        Shape::Int
+        | Shape::Float
+        | Shape::Bool
+        | Shape::Duration
+        | Shape::Custom { .. }
+        | Shape::CustomEnum { .. }
+        | Shape::StringEnum { .. }
+        | Shape::List { .. }
+        | Shape::Map { .. }
+        | Shape::Struct { .. } => false,
     }
 }
 
@@ -666,28 +685,28 @@ fn is_plain_string_or_string_union(attr_type: &AttributeType) -> bool {
 ///   no analogous strictness. If a future schema adds e.g. a
 ///   `Custom { identity: "Port", base: Int }`, those arms will
 ///   also need to consult this helper (or a sibling).
-fn attr_type_demands_specific_custom(attr_type: &AttributeType) -> bool {
-    match attr_type {
-        AttributeType::Custom {
+fn attr_type_demands_specific_custom(
+    attr_type: &AttributeType,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> bool {
+    match attr_type.shape(defs) {
+        Shape::Custom {
             identity: Some(_), ..
         } => true,
-        AttributeType::Union(types) => types.iter().any(attr_type_demands_specific_custom),
-        // `Ref` (carina#3340): does not itself demand a custom identity.
-        // The resolved target may carry one, but `_specific_custom`
-        // operates at the receiver type's outer shape — Union is the
-        // only nesting it traverses, by design (see doc comment).
-        AttributeType::Ref(_) => false,
-        AttributeType::String
-        | AttributeType::Int
-        | AttributeType::Float
-        | AttributeType::Bool
-        | AttributeType::Duration
-        | AttributeType::Custom { identity: None, .. }
-        | AttributeType::CustomEnum { .. }
-        | AttributeType::StringEnum { .. }
-        | AttributeType::List { .. }
-        | AttributeType::Map { .. }
-        | AttributeType::Struct { .. } => false,
+        Shape::Custom { identity: None, .. } => false,
+        Shape::Union(types) => types
+            .iter()
+            .any(|t| attr_type_demands_specific_custom(t, defs)),
+        Shape::String
+        | Shape::Int
+        | Shape::Float
+        | Shape::Bool
+        | Shape::Duration
+        | Shape::CustomEnum { .. }
+        | Shape::StringEnum { .. }
+        | Shape::List { .. }
+        | Shape::Map { .. }
+        | Shape::Struct { .. } => false,
     }
 }
 
@@ -1362,16 +1381,24 @@ pub(crate) fn narrow_type_expr(
 pub(crate) fn narrow_attribute_type<'a>(
     start: &'a AttributeType,
     segments: &[crate::resource::PathSegment],
+    defs: &'a std::collections::BTreeMap<String, AttributeType>,
 ) -> Result<&'a AttributeType, NarrowError> {
     use crate::resource::{PathSegment, Subscript};
+    use crate::schema::Shape;
     let mut current = start;
     for seg in segments {
-        current = match (seg, current) {
-            (PathSegment::Field { name }, AttributeType::Struct { fields, name: sn }) => {
+        // Project onto `Shape` so any `Ref` chain is peeled at the
+        // type level (carina#3349). Without this, a `Ref`-typed
+        // attribute would fall into the wildcard arm below and
+        // every nested narrowing step would mis-report a shape
+        // mismatch.
+        let shape = current.shape(defs);
+        current = match (seg, shape) {
+            (PathSegment::Field { name }, Shape::Struct { fields, name: sn }) => {
                 let Some(field) = fields.iter().find(|f| f.name == *name) else {
                     return Err(NarrowError::UnknownStructField {
                         field: name.clone(),
-                        struct_name: sn.clone(),
+                        struct_name: sn.to_string(),
                         known_fields: fields.iter().map(|f| f.name.clone()).collect(),
                     });
                 };
@@ -1379,19 +1406,19 @@ pub(crate) fn narrow_attribute_type<'a>(
             }
             // Dot-form key access against a `map(_, V)` projects to
             // `V`, mirroring the resolver's behaviour (carina#2447).
-            (PathSegment::Field { .. }, AttributeType::Map { value, .. }) => value.as_ref(),
+            (PathSegment::Field { .. }, Shape::Map { value, .. }) => value,
             (
                 PathSegment::Subscript {
                     index: Subscript::Int { .. },
                 },
-                AttributeType::List { inner, .. },
-            ) => inner.as_ref(),
+                Shape::List { inner, .. },
+            ) => inner,
             (
                 PathSegment::Subscript {
                     index: Subscript::Str { .. },
                 },
-                AttributeType::Map { value, .. },
-            ) => value.as_ref(),
+                Shape::Map { value, .. },
+            ) => value,
             _ => return Err(NarrowError::ShapeMismatch),
         };
     }

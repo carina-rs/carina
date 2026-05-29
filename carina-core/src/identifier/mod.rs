@@ -46,7 +46,7 @@ pub fn resolve_attr_prefixes(
                 if let Some(base_attr) = key.strip_suffix("_prefix")
                     && let Value::Concrete(ConcreteValue::String(prefix_value)) = value
                     && let Some(attr_schema) = schema.attributes.get(base_attr)
-                    && is_string_compatible_type(&attr_schema.attr_type)
+                    && is_string_compatible_type(&attr_schema.attr_type, &schema.defs)
                 {
                     return Some((base_attr.to_string(), prefix_value.clone()));
                 }

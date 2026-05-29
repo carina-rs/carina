@@ -79,33 +79,33 @@ impl ProviderFactory for DeferredPopulateTestFactory {
 /// rule.
 fn cert_schema() -> ResourceSchema {
     ResourceSchema::new("acm.Certificate")
-        .attribute(AttributeSchema::new("domain_name", AttributeType::String))
+        .attribute(AttributeSchema::new("domain_name", AttributeType::string()))
         .attribute(AttributeSchema::new(
             "validation_method",
-            AttributeType::String,
+            AttributeType::string(),
         ))
-        .attribute(AttributeSchema::new("status", AttributeType::String).deferred_populate())
+        .attribute(AttributeSchema::new("status", AttributeType::string()).deferred_populate())
         .attribute(AttributeSchema::new(
             "domain_validation_options",
-            AttributeType::list(AttributeType::Struct {
-                name: "DomainValidation".to_string(),
-                fields: vec![
-                    StructField::new("domain_name", AttributeType::String),
+            AttributeType::list(AttributeType::struct_(
+                "DomainValidation".to_string(),
+                vec![
+                    StructField::new("domain_name", AttributeType::string()),
                     StructField::new(
                         "resource_record",
-                        AttributeType::Struct {
-                            name: "ResourceRecord".to_string(),
-                            fields: vec![
-                                StructField::new("name", AttributeType::String),
-                                StructField::new("type", AttributeType::String),
-                                StructField::new("value", AttributeType::String),
+                        AttributeType::struct_(
+                            "ResourceRecord".to_string(),
+                            vec![
+                                StructField::new("name", AttributeType::string()),
+                                StructField::new("type", AttributeType::string()),
+                                StructField::new("value", AttributeType::string()),
                             ],
-                        },
+                        ),
                     )
                     .deferred_populate(),
-                    StructField::new("validation_status", AttributeType::String),
+                    StructField::new("validation_status", AttributeType::string()),
                 ],
-            }),
+            )),
         ))
 }
 
@@ -113,14 +113,14 @@ fn rrset_schema() -> ResourceSchema {
     ResourceSchema::new("route53.RecordSet")
         .attribute(AttributeSchema::new(
             "hosted_zone_id",
-            AttributeType::String,
+            AttributeType::string(),
         ))
-        .attribute(AttributeSchema::new("name", AttributeType::String))
-        .attribute(AttributeSchema::new("type", AttributeType::String))
-        .attribute(AttributeSchema::new("ttl", AttributeType::Int))
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
+        .attribute(AttributeSchema::new("type", AttributeType::string()))
+        .attribute(AttributeSchema::new("ttl", AttributeType::int()))
         .attribute(AttributeSchema::new(
             "resource_records",
-            AttributeType::list(AttributeType::String),
+            AttributeType::list(AttributeType::string()),
         ))
 }
 

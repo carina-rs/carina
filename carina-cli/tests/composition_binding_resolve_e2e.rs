@@ -78,14 +78,14 @@ impl ProviderFactory for AwsccTestFactory {
 
 fn role_schema() -> ResourceSchema {
     ResourceSchema::new("iam.Role")
-        .attribute(AttributeSchema::new("role_name", AttributeType::String))
-        .attribute(AttributeSchema::new("arn", AttributeType::String))
+        .attribute(AttributeSchema::new("role_name", AttributeType::string()))
+        .attribute(AttributeSchema::new("arn", AttributeType::string()))
 }
 
 fn role_policy_schema() -> ResourceSchema {
     ResourceSchema::new("iam.RolePolicy")
-        .attribute(AttributeSchema::new("role_name", AttributeType::String))
-        .attribute(AttributeSchema::new("policy_name", AttributeType::String))
+        .attribute(AttributeSchema::new("role_name", AttributeType::string()))
+        .attribute(AttributeSchema::new("policy_name", AttributeType::string()))
 }
 
 struct NoopProvider;

@@ -2601,9 +2601,9 @@ fn build_state_after_apply_persists_write_only_attributes() {
     schemas.insert(
         "awscc",
         ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
+            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
             .attribute(
-                AttributeSchema::new("ipv4_netmask_length", AttributeType::Int).write_only(),
+                AttributeSchema::new("ipv4_netmask_length", AttributeType::int()).write_only(),
             ),
     );
 
@@ -2686,9 +2686,9 @@ fn build_state_after_apply_write_only_detects_value_change() {
     schemas.insert(
         "awscc",
         ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
+            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
             .attribute(
-                AttributeSchema::new("ipv4_netmask_length", AttributeType::Int).write_only(),
+                AttributeSchema::new("ipv4_netmask_length", AttributeType::int()).write_only(),
             ),
     );
 

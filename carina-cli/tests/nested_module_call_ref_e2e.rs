@@ -72,17 +72,17 @@ impl ProviderFactory for AwsccTestFactory {
 
 fn vpc_schema() -> ResourceSchema {
     ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
-        .attribute(AttributeSchema::new("vpc_id", AttributeType::String))
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
+        .attribute(AttributeSchema::new("vpc_id", AttributeType::string()))
 }
 
 fn security_group_schema() -> ResourceSchema {
     ResourceSchema::new("ec2.SecurityGroup")
         .attribute(AttributeSchema::new(
             "group_description",
-            AttributeType::String,
+            AttributeType::string(),
         ))
-        .attribute(AttributeSchema::new("vpc_id", AttributeType::String))
+        .attribute(AttributeSchema::new("vpc_id", AttributeType::string()))
 }
 
 struct NoopProvider;

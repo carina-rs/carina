@@ -445,7 +445,15 @@ impl CompletionProvider {
         // get the same coverage as `exports {}` values (built-ins,
         // binding refs, and structural type candidates).
         if let Some(attr_type) = type_expr_to_attribute_type(&arg.type_expr) {
-            return self.value_completions_for_attribute_type(&attr_type, text, base_path);
+            // Synthetic `attr_type` is built directly from a `TypeExpr`,
+            // which never lowers to `AttributeType::Ref`; empty defs is
+            // sufficient for the Ref-peel inside compatibility checks.
+            return self.value_completions_for_attribute_type(
+                &attr_type,
+                carina_core::schema::empty_defs(),
+                text,
+                base_path,
+            );
         }
         Vec::new()
     }
@@ -972,8 +980,7 @@ fn literal_completions_from_type_expr(type_expr: &parser::TypeExpr) -> Vec<Compl
 /// reused without forking a parallel implementation.
 ///
 /// `Simple(name)` (snake_case) is reified as
-/// `AttributeType::Custom { semantic_name: <PascalCase>, base: String,
-/// .. }` — same shape `parse_exports_type_text` produces for `exports`
+/// `AttributeType::custom(None, String, None, None, noop_validator(), None)` — same shape `parse_exports_type_text` produces for `exports`
 /// annotations. The other arms cover the structural cases the
 /// dispatcher recurses through. Returns `None` for shapes that have no
 /// useful default (e.g. resource refs, `<unknown>`).
@@ -985,30 +992,26 @@ fn type_expr_to_attribute_type(
         Ok(())
     }
     match type_expr {
-        parser::TypeExpr::String => Some(AttributeType::String),
-        parser::TypeExpr::Bool => Some(AttributeType::Bool),
-        parser::TypeExpr::Int => Some(AttributeType::Int),
-        parser::TypeExpr::Float => Some(AttributeType::Float),
-        parser::TypeExpr::Duration => Some(AttributeType::Duration),
-        parser::TypeExpr::Simple(name) => Some(AttributeType::Custom {
-            identity: Some(carina_core::schema::TypeIdentity::bare(
+        parser::TypeExpr::String => Some(AttributeType::string()),
+        parser::TypeExpr::Bool => Some(AttributeType::bool()),
+        parser::TypeExpr::Int => Some(AttributeType::int()),
+        parser::TypeExpr::Float => Some(AttributeType::float()),
+        parser::TypeExpr::Duration => Some(AttributeType::duration()),
+        parser::TypeExpr::Simple(name) => Some(AttributeType::custom(
+            Some(carina_core::schema::TypeIdentity::bare(
                 parser::snake_to_pascal(name),
             )),
-            base: Box::new(AttributeType::String),
-            pattern: None,
-            length: None,
-            validate: legacy_validator(noop),
-            to_dsl: None,
-        }),
+            AttributeType::string(),
+            None,
+            None,
+            legacy_validator(noop),
+            None,
+        )),
         parser::TypeExpr::List(inner) => {
             type_expr_to_attribute_type(inner).map(AttributeType::list)
         }
-        parser::TypeExpr::Map(inner) => {
-            type_expr_to_attribute_type(inner).map(|inner_ty| AttributeType::Map {
-                key: Box::new(AttributeType::String),
-                value: Box::new(inner_ty),
-            })
-        }
+        parser::TypeExpr::Map(inner) => type_expr_to_attribute_type(inner)
+            .map(|inner_ty| AttributeType::map_with_key(AttributeType::string(), inner_ty)),
         parser::TypeExpr::Union(members) => {
             let lifted: Vec<AttributeType> = members
                 .iter()
@@ -1017,7 +1020,7 @@ fn type_expr_to_attribute_type(
             if lifted.is_empty() {
                 None
             } else {
-                Some(AttributeType::Union(lifted))
+                Some(AttributeType::union(lifted))
             }
         }
         parser::TypeExpr::StringLiteral(_)

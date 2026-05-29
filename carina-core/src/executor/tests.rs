@@ -320,9 +320,9 @@ static CANON_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
     let mut reg = SchemaRegistry::new();
     let schema = ResourceSchema::new("sg").attribute(AttributeSchema::new(
         "subject",
-        AttributeType::Union(vec![
-            AttributeType::String,
-            AttributeType::list(AttributeType::String),
+        AttributeType::union(vec![
+            AttributeType::string(),
+            AttributeType::list(AttributeType::string()),
         ]),
     ));
     reg.insert("test", schema);

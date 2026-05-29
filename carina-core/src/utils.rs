@@ -664,16 +664,16 @@ pub fn resolve_enum_value(value: &Value, parts: &NamespacedEnumParts<'_>) -> Opt
 /// use carina_core::utils::resolve_enum_value_recursive;
 /// use indexmap::IndexMap;
 ///
-/// let status_enum = AttributeType::StringEnum {
-///     name: "VersioningStatus".to_string(),
-///     values: vec!["Enabled".to_string(), "Suspended".to_string()],
-///     identity: Some(carina_core::schema::string_enum_identity("VersioningStatus", Some("aws.s3.Bucket"))),
-///     dsl_aliases: vec![],
-/// };
-/// let config = AttributeType::Struct {
-///     name: "VersioningConfiguration".to_string(),
-///     fields: vec![StructField::new("status", status_enum)],
-/// };
+/// let status_enum = AttributeType::string_enum(
+///     "VersioningStatus".to_string(),
+///     vec!["Enabled".to_string(), "Suspended".to_string()],
+///     Some(carina_core::schema::string_enum_identity("VersioningStatus", Some("aws.s3.Bucket"))),
+///     vec![],
+/// );
+/// let config = AttributeType::struct_(
+///     "VersioningConfiguration".to_string(),
+///     vec![StructField::new("status", status_enum)],
+/// );
 ///
 /// let mut inner = IndexMap::new();
 /// inner.insert("status".to_string(),
@@ -717,8 +717,11 @@ pub fn resolve_enum_value_recursive_with_defs(
         return Some(resolved);
     }
 
-    match attr_type {
-        AttributeType::Struct { fields, .. } => {
+    // Project onto Shape so `Ref` is peeled at the type level
+    // (carina#3349). The wildcard arm cannot silently swallow a
+    // `Ref` because `Shape` has no `Ref` variant.
+    match attr_type.shape(defs) {
+        crate::schema::Shape::Struct { fields, .. } => {
             let Value::Concrete(ConcreteValue::Map(map)) = value else {
                 return None;
             };
@@ -735,7 +738,7 @@ pub fn resolve_enum_value_recursive_with_defs(
             }
             changed.then_some(Value::Concrete(ConcreteValue::Map(rewritten)))
         }
-        AttributeType::List { inner, .. } => {
+        crate::schema::Shape::List { inner, .. } => {
             let Value::Concrete(ConcreteValue::List(items)) = value else {
                 return None;
             };
@@ -749,7 +752,7 @@ pub fn resolve_enum_value_recursive_with_defs(
             }
             changed.then_some(Value::Concrete(ConcreteValue::List(rewritten)))
         }
-        AttributeType::Map { value: inner, .. } => {
+        crate::schema::Shape::Map { value: inner, .. } => {
             let Value::Concrete(ConcreteValue::Map(map)) = value else {
                 return None;
             };
@@ -763,16 +766,8 @@ pub fn resolve_enum_value_recursive_with_defs(
             }
             changed.then_some(Value::Concrete(ConcreteValue::Map(rewritten)))
         }
-        // `Ref`: follow the named target in the schema's def map and
-        // continue the walk. Without this arm a cyclic schema would
-        // silently drop enum normalization at every cycle point
-        // (carina#3340). `resolve_refs` panics on a missing def name
-        // (schema invariant violation).
-        AttributeType::Ref(_) => {
-            let resolved = attr_type.resolve_refs(defs);
-            resolve_enum_value_recursive_with_defs(value, resolved, defs)
-        }
-        // Scalars and Union: nothing to descend into.
+        // Scalars and Union: nothing to descend into. `Ref` is
+        // already peeled by `shape(defs)` above.
         _ => None,
     }
 }
@@ -973,8 +968,11 @@ pub fn lift_string_enum_leaves_with_defs(
         return None;
     }
 
-    match attr_type {
-        AttributeType::Struct { fields, .. } => {
+    // Project onto Shape so `Ref` is peeled at the type level
+    // (carina#3349). The wildcard arm cannot silently swallow a
+    // `Ref` because `Shape` has no `Ref` variant.
+    match attr_type.shape(defs) {
+        crate::schema::Shape::Struct { fields, .. } => {
             let Value::Concrete(ConcreteValue::Map(map)) = value else {
                 return None;
             };
@@ -991,7 +989,7 @@ pub fn lift_string_enum_leaves_with_defs(
             }
             changed.then_some(Value::Concrete(ConcreteValue::Map(rewritten)))
         }
-        AttributeType::List { inner, .. } => {
+        crate::schema::Shape::List { inner, .. } => {
             let Value::Concrete(ConcreteValue::List(items)) = value else {
                 return None;
             };
@@ -1005,7 +1003,7 @@ pub fn lift_string_enum_leaves_with_defs(
             }
             changed.then_some(Value::Concrete(ConcreteValue::List(rewritten)))
         }
-        AttributeType::Map { value: inner, .. } => {
+        crate::schema::Shape::Map { value: inner, .. } => {
             let Value::Concrete(ConcreteValue::Map(map)) = value else {
                 return None;
             };
@@ -1019,13 +1017,8 @@ pub fn lift_string_enum_leaves_with_defs(
             }
             changed.then_some(Value::Concrete(ConcreteValue::Map(rewritten)))
         }
-        // `Ref`: resolve via defs and continue. See sibling note in
-        // `resolve_enum_value_recursive_with_defs` (carina#3340).
-        AttributeType::Ref(_) => {
-            let resolved = attr_type.resolve_refs(defs);
-            lift_string_enum_leaves_with_defs(value, resolved, defs)
-        }
-        // Scalars and Union: nothing to descend into.
+        // Scalars and Union: nothing to descend into. `Ref` is
+        // already peeled by `shape(defs)` above.
         _ => None,
     }
 }
@@ -2064,15 +2057,15 @@ mod tests {
         use indexmap::IndexMap;
 
         fn versioning_status() -> AttributeType {
-            AttributeType::StringEnum {
-                name: "VersioningStatus".to_string(),
-                values: vec!["Enabled".to_string(), "Suspended".to_string()],
-                identity: Some(crate::schema::string_enum_identity(
+            AttributeType::string_enum(
+                "VersioningStatus".to_string(),
+                vec!["Enabled".to_string(), "Suspended".to_string()],
+                Some(crate::schema::string_enum_identity(
                     "VersioningStatus",
                     Some("aws.s3.Bucket"),
                 )),
-                dsl_aliases: vec![],
-            }
+                vec![],
+            )
         }
 
         fn s(s: &str) -> Value {
@@ -2092,18 +2085,18 @@ mod tests {
         /// AWS-read side which produces the namespaced spelling.
         #[test]
         fn leaf_enum_identifier_resolves_like_string() {
-            let aliased = AttributeType::StringEnum {
-                name: "Effect".to_string(),
-                values: vec!["Allow".to_string(), "Deny".to_string()],
-                identity: Some(crate::schema::string_enum_identity(
+            let aliased = AttributeType::string_enum(
+                "Effect".to_string(),
+                vec!["Allow".to_string(), "Deny".to_string()],
+                Some(crate::schema::string_enum_identity(
                     "Effect",
                     Some("aws.iam.PolicyDocument"),
                 )),
-                dsl_aliases: vec![
+                vec![
                     ("Allow".to_string(), "allow".to_string()),
                     ("Deny".to_string(), "deny".to_string()),
                 ],
-            };
+            );
             // Bare EnumIdentifier resolves to the fully-qualified String
             // form — identical to what the String input would produce.
             let from_ei = resolve_enum_value_recursive(&ei("allow"), &aliased).unwrap();
@@ -2124,16 +2117,16 @@ mod tests {
 
         #[test]
         fn non_enum_scalar_passes_through() {
-            let resolved = resolve_enum_value_recursive(&s("hello"), &AttributeType::String);
+            let resolved = resolve_enum_value_recursive(&s("hello"), &AttributeType::string());
             assert_eq!(resolved, None);
         }
 
         #[test]
         fn struct_with_enum_field_resolves_field() {
-            let config = AttributeType::Struct {
-                name: "VersioningConfiguration".to_string(),
-                fields: vec![StructField::new("status", versioning_status())],
-            };
+            let config = AttributeType::struct_(
+                "VersioningConfiguration".to_string(),
+                vec![StructField::new("status", versioning_status())],
+            );
             let mut inner = IndexMap::new();
             inner.insert("status".to_string(), s("Enabled"));
             let input = Value::Concrete(ConcreteValue::Map(inner));
@@ -2152,10 +2145,10 @@ mod tests {
 
         #[test]
         fn struct_with_no_enum_changes_returns_none() {
-            let config = AttributeType::Struct {
-                name: "Config".to_string(),
-                fields: vec![StructField::new("name", AttributeType::String)],
-            };
+            let config = AttributeType::struct_(
+                "Config".to_string(),
+                vec![StructField::new("name", AttributeType::string())],
+            );
             let mut inner = IndexMap::new();
             inner.insert("name".to_string(), s("foo"));
             let input = Value::Concrete(ConcreteValue::Map(inner));
@@ -2165,10 +2158,7 @@ mod tests {
 
         #[test]
         fn list_of_enum_resolves_every_item() {
-            let list_t = AttributeType::List {
-                inner: Box::new(versioning_status()),
-                ordered: true,
-            };
+            let list_t = AttributeType::list(versioning_status());
             let input = Value::Concrete(ConcreteValue::List(vec![s("Enabled"), s("Suspended")]));
             let resolved = resolve_enum_value_recursive(&input, &list_t).unwrap();
             match resolved {
@@ -2183,10 +2173,7 @@ mod tests {
 
         #[test]
         fn map_of_enum_resolves_every_value() {
-            let map_t = AttributeType::Map {
-                key: Box::new(AttributeType::String),
-                value: Box::new(versioning_status()),
-            };
+            let map_t = AttributeType::map_with_key(AttributeType::string(), versioning_status());
             let mut input_map = IndexMap::new();
             input_map.insert("primary".to_string(), s("Enabled"));
             input_map.insert("secondary".to_string(), s("Suspended"));
@@ -2211,14 +2198,11 @@ mod tests {
         #[test]
         fn list_of_struct_with_enum_field_descends_into_each_item() {
             // List<Struct{status: VersioningStatus}>
-            let item_t = AttributeType::Struct {
-                name: "Rule".to_string(),
-                fields: vec![StructField::new("status", versioning_status())],
-            };
-            let list_t = AttributeType::List {
-                inner: Box::new(item_t),
-                ordered: false,
-            };
+            let item_t = AttributeType::struct_(
+                "Rule".to_string(),
+                vec![StructField::new("status", versioning_status())],
+            );
+            let list_t = AttributeType::unordered_list(item_t);
             let mut item1 = IndexMap::new();
             item1.insert("status".to_string(), s("Enabled"));
             let mut item2 = IndexMap::new();
@@ -2249,14 +2233,14 @@ mod tests {
         #[test]
         fn nested_struct_descends_recursively() {
             // Struct{outer_field: Struct{status: VersioningStatus}}
-            let inner_t = AttributeType::Struct {
-                name: "Inner".to_string(),
-                fields: vec![StructField::new("status", versioning_status())],
-            };
-            let outer_t = AttributeType::Struct {
-                name: "Outer".to_string(),
-                fields: vec![StructField::new("inner", inner_t)],
-            };
+            let inner_t = AttributeType::struct_(
+                "Inner".to_string(),
+                vec![StructField::new("status", versioning_status())],
+            );
+            let outer_t = AttributeType::struct_(
+                "Outer".to_string(),
+                vec![StructField::new("inner", inner_t)],
+            );
 
             let mut inner_map = IndexMap::new();
             inner_map.insert("status".to_string(), s("Enabled"));
@@ -2298,15 +2282,15 @@ mod tests {
             // Enum with a DSL alias: dsl_aliases maps API "Enabled" → DSL "enabled".
             // resolve_enum_value calls dsl_for(api) to render the alias,
             // so the resolved fully-qualified form uses the DSL spelling.
-            let aliased = AttributeType::StringEnum {
-                name: "VersioningStatus".to_string(),
-                values: vec!["Enabled".to_string()],
-                identity: Some(crate::schema::string_enum_identity(
+            let aliased = AttributeType::string_enum(
+                "VersioningStatus".to_string(),
+                vec!["Enabled".to_string()],
+                Some(crate::schema::string_enum_identity(
                     "VersioningStatus",
                     Some("aws.s3.Bucket"),
                 )),
-                dsl_aliases: vec![("Enabled".to_string(), "enabled".to_string())],
-            };
+                vec![("Enabled".to_string(), "enabled".to_string())],
+            );
             let resolved = resolve_enum_value_recursive(&s("Enabled"), &aliased).unwrap();
             assert_eq!(resolved, s("aws.s3.Bucket.VersioningStatus.enabled"));
         }
@@ -2314,14 +2298,11 @@ mod tests {
         #[test]
         fn map_of_struct_with_enum_field_descends() {
             // Map<String, Struct{status: VersioningStatus}>
-            let item_t = AttributeType::Struct {
-                name: "Rule".to_string(),
-                fields: vec![StructField::new("status", versioning_status())],
-            };
-            let map_t = AttributeType::Map {
-                key: Box::new(AttributeType::String),
-                value: Box::new(item_t),
-            };
+            let item_t = AttributeType::struct_(
+                "Rule".to_string(),
+                vec![StructField::new("status", versioning_status())],
+            );
+            let map_t = AttributeType::map_with_key(AttributeType::string(), item_t);
             let mut item = IndexMap::new();
             item.insert("status".to_string(), s("Enabled"));
             let mut input_map = IndexMap::new();
@@ -2346,7 +2327,7 @@ mod tests {
             // Union types are documented as not recursed; assert by
             // construction that a Union wrapping an enum yields None
             // even when the value would resolve for the enum directly.
-            let union_t = AttributeType::Union(vec![versioning_status(), AttributeType::String]);
+            let union_t = AttributeType::union(vec![versioning_status(), AttributeType::string()]);
             assert_eq!(resolve_enum_value_recursive(&s("Enabled"), &union_t), None);
         }
     }
@@ -2428,19 +2409,19 @@ mod tests {
         };
         use std::collections::HashMap;
 
-        let version_enum = AttributeType::StringEnum {
-            name: "Version".to_string(),
-            values: vec!["2012-10-17".to_string()],
-            identity: Some(crate::schema::string_enum_identity(
+        let version_enum = AttributeType::string_enum(
+            "Version".to_string(),
+            vec!["2012-10-17".to_string()],
+            Some(crate::schema::string_enum_identity(
                 "Version",
                 Some("aws.iam.PolicyDocument"),
             )),
-            dsl_aliases: vec![("2012-10-17".to_string(), "2012_10_17".to_string())],
-        };
-        let policy_struct = AttributeType::Struct {
-            name: "PolicyDocument".to_string(),
-            fields: vec![StructField::new("version", version_enum)],
-        };
+            vec![("2012-10-17".to_string(), "2012_10_17".to_string())],
+        );
+        let policy_struct = AttributeType::struct_(
+            "PolicyDocument".to_string(),
+            vec![StructField::new("version", version_enum)],
+        );
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "awscc",
@@ -2501,19 +2482,19 @@ mod tests {
         };
         use std::collections::HashMap;
 
-        let version_enum = AttributeType::StringEnum {
-            name: "Version".to_string(),
-            values: vec!["2012-10-17".to_string()],
-            identity: Some(crate::schema::string_enum_identity(
+        let version_enum = AttributeType::string_enum(
+            "Version".to_string(),
+            vec!["2012-10-17".to_string()],
+            Some(crate::schema::string_enum_identity(
                 "Version",
                 Some("aws.iam.PolicyDocument"),
             )),
-            dsl_aliases: vec![("2012-10-17".to_string(), "2012_10_17".to_string())],
-        };
-        let policy_struct = AttributeType::Struct {
-            name: "PolicyDocument".to_string(),
-            fields: vec![StructField::new("version", version_enum)],
-        };
+            vec![("2012-10-17".to_string(), "2012_10_17".to_string())],
+        );
+        let policy_struct = AttributeType::struct_(
+            "PolicyDocument".to_string(),
+            vec![StructField::new("version", version_enum)],
+        );
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "awscc",

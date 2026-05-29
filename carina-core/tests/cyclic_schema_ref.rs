@@ -34,21 +34,21 @@ use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, Schema
 /// `Statement` is `Struct { and_statement: List<Ref(Statement)> }` —
 /// the simplest shape that exercises a true cycle through `Ref`.
 fn cyclic_webacl_like_schema() -> ResourceSchema {
-    let statement_def = AttributeType::Struct {
-        name: "Statement".to_string(),
-        fields: vec![StructField::new(
+    let statement_def = AttributeType::struct_(
+        "Statement".to_string(),
+        vec![StructField::new(
             "and_statement",
-            AttributeType::list(AttributeType::Ref("Statement".to_string())),
+            AttributeType::list(AttributeType::ref_("Statement".to_string())),
         )],
-    };
+    );
 
-    let rule_struct = AttributeType::Struct {
-        name: "Rule".to_string(),
-        fields: vec![
-            StructField::new("name", AttributeType::String),
-            StructField::new("statement", AttributeType::Ref("Statement".to_string())),
+    let rule_struct = AttributeType::struct_(
+        "Rule".to_string(),
+        vec![
+            StructField::new("name", AttributeType::string()),
+            StructField::new("statement", AttributeType::ref_("Statement".to_string())),
         ],
-    };
+    );
 
     ResourceSchema::new("wafv2.WebACL")
         .attribute(AttributeSchema::new(
@@ -95,7 +95,7 @@ fn cyclic_schema_validates_a_two_level_nested_value() {
     let rules_value = Value::Concrete(ConcreteValue::List(vec![rule_value("BlockBadIPs", 1)]));
 
     let s = Schema {
-        root: AttributeType::String, // unused for this call
+        root: AttributeType::string(), // unused for this call
         defs: schema.defs.clone(),
     };
     s.validate_attr(rule_attr_type, &rules_value)
@@ -126,7 +126,7 @@ fn cyclic_schema_rejects_a_string_where_a_list_is_required_under_ref() {
     )]));
 
     let s = Schema {
-        root: AttributeType::String,
+        root: AttributeType::string(),
         defs: schema.defs.clone(),
     };
     let err = s
@@ -202,7 +202,7 @@ fn resource_schema_defs_field_default_is_empty() {
     // accidentally requires `defs` would break every existing builder
     // call.
     let schema = ResourceSchema::new("aws.s3.Bucket")
-        .attribute(AttributeSchema::new("bucket", AttributeType::String));
+        .attribute(AttributeSchema::new("bucket", AttributeType::string()));
     assert!(schema.defs.is_empty(), "defs default must be empty");
     let _: &BTreeMap<String, AttributeType> = &schema.defs;
 }
@@ -254,20 +254,20 @@ fn canonicalize_through_defs_resolves_ref_arm_and_walks_resolved_type() {
 
     // `Selectors` def is a struct with a `string_or_list_of_strings`
     // field. `selectors` attribute references it via Ref.
-    let selectors_def = AttributeType::Struct {
-        name: "Selectors".to_string(),
-        fields: vec![StructField::new(
+    let selectors_def = AttributeType::struct_(
+        "Selectors".to_string(),
+        vec![StructField::new(
             "tags",
-            AttributeType::Union(vec![
-                AttributeType::String,
-                AttributeType::list(AttributeType::String),
+            AttributeType::union(vec![
+                AttributeType::string(),
+                AttributeType::list(AttributeType::string()),
             ]),
         )],
-    };
+    );
     let schema = ResourceSchema::new("test.WithRef")
         .attribute(AttributeSchema::new(
             "selectors",
-            AttributeType::Ref("Selectors".to_string()),
+            AttributeType::ref_("Selectors".to_string()),
         ))
         .with_def("Selectors", selectors_def);
 
@@ -311,7 +311,7 @@ fn dangling_ref_surfaces_clean_validation_error() {
 
     let schema = ResourceSchema::new("test.WithDanglingRef").attribute(AttributeSchema::new(
         "broken",
-        AttributeType::Ref("Nowhere".to_string()),
+        AttributeType::ref_("Nowhere".to_string()),
     ));
     // No `with_def` call — `defs` stays empty by design.
 
@@ -350,7 +350,7 @@ fn cyclic_ref_terminates_on_finite_value() {
     let rules_value = Value::Concrete(ConcreteValue::List(vec![rule_value("Top", 2)]));
 
     let s = carina_core::schema::Schema {
-        root: AttributeType::String,
+        root: AttributeType::string(),
         defs: schema.defs.clone(),
     };
     s.validate_attr(rule_attr_type, &rules_value)
@@ -374,16 +374,13 @@ fn schema_validate_attr_map_arm_lifts_string_enum_key() {
     use carina_core::resource::ConcreteValue;
     use carina_core::schema::{AttributeType, Schema};
 
-    let key_type = AttributeType::StringEnum {
-        name: "Op".to_string(),
-        values: vec!["eq".to_string(), "neq".to_string()],
-        identity: None,
-        dsl_aliases: vec![],
-    };
-    let attr_type = AttributeType::Map {
-        key: Box::new(key_type),
-        value: Box::new(AttributeType::String),
-    };
+    let key_type = AttributeType::string_enum(
+        "Op".to_string(),
+        vec!["eq".to_string(), "neq".to_string()],
+        None,
+        vec![],
+    );
+    let attr_type = AttributeType::map_with_key(key_type, AttributeType::string());
 
     let mut payload = indexmap::IndexMap::new();
     payload.insert(

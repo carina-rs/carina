@@ -74,8 +74,8 @@ impl ProviderFactory for AwsccTestFactory {
     fn schemas(&self) -> Vec<ResourceSchema> {
         vec![
             ResourceSchema::new("ec2.Vpc")
-                .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
-                .attribute(AttributeSchema::new("vpc_id", AttributeType::String)),
+                .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
+                .attribute(AttributeSchema::new("vpc_id", AttributeType::string())),
         ]
     }
 }

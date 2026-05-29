@@ -329,7 +329,7 @@ fn replace_when_create_only_attr_changed() {
     schemas.insert(
         "",
         crate::schema::ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
+            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only()),
     );
 
     let plan = create_plan(
@@ -381,10 +381,10 @@ fn normal_update_when_non_create_only_attr_changed() {
     schemas.insert(
         "",
         crate::schema::ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only())
+            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only())
             .attribute(AttributeSchema::new(
                 "enable_dns_support",
-                AttributeType::Bool,
+                AttributeType::bool(),
             )),
     );
 
@@ -452,7 +452,7 @@ fn replace_when_schema_force_replace() {
         crate::schema::ResourceSchema::new("ec2.internet_gateway")
             .attribute(crate::schema::AttributeSchema::new(
                 "tags",
-                AttributeType::String,
+                AttributeType::string(),
             ))
             .force_replace(),
     );
@@ -512,10 +512,10 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
     schemas.insert(
         "",
         crate::schema::ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only())
+            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only())
             .attribute(AttributeSchema::new(
                 "enable_dns_support",
-                AttributeType::Bool,
+                AttributeType::bool(),
             )),
     );
 
@@ -570,7 +570,7 @@ fn replace_carries_create_before_destroy_directives() {
     schemas.insert(
         "",
         crate::schema::ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
+            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only()),
     );
 
     let plan = create_plan(
@@ -692,7 +692,7 @@ fn replace_with_provider_prefixed_schema_key() {
     schemas.insert(
         "awscc",
         crate::schema::ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
+            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only()),
     );
 
     let plan = create_plan(
@@ -1017,33 +1017,33 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
     use crate::schema::{ResourceSchema, StructField};
 
     // Build a schema that matches ec2.security_group's security_group_egress attribute
-    let egress_struct = AttributeType::Struct {
-        name: "Egress".to_string(),
-        fields: vec![
-            StructField::new("cidr_ip", AttributeType::String),
-            StructField::new("description", AttributeType::String),
-            StructField::new("from_port", AttributeType::Int),
+    let egress_struct = AttributeType::struct_(
+        "Egress".to_string(),
+        vec![
+            StructField::new("cidr_ip", AttributeType::string()),
+            StructField::new("description", AttributeType::string()),
+            StructField::new("from_port", AttributeType::int()),
             StructField::new(
                 "ip_protocol",
-                AttributeType::StringEnum {
-                    name: "IpProtocol".to_string(),
-                    values: vec![
+                AttributeType::string_enum(
+                    "IpProtocol".to_string(),
+                    vec![
                         "tcp".to_string(),
                         "udp".to_string(),
                         "icmp".to_string(),
                         "-1".to_string(),
                         "all".to_string(),
                     ],
-                    identity: Some(crate::schema::string_enum_identity(
+                    Some(crate::schema::string_enum_identity(
                         "IpProtocol",
                         Some("awscc.ec2.SecurityGroup"),
                     )),
-                    dsl_aliases: vec![("-1".to_string(), "all".to_string())],
-                },
+                    vec![("-1".to_string(), "all".to_string())],
+                ),
             ),
-            StructField::new("to_port", AttributeType::Int),
+            StructField::new("to_port", AttributeType::int()),
         ],
-    };
+    );
     let schema = ResourceSchema::new("awscc.ec2.SecurityGroup").attribute(
         crate::schema::AttributeSchema::new(
             "security_group_egress",
@@ -1235,25 +1235,22 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
 fn diff_false_positive_when_ordered_true_for_struct_list() {
     use crate::schema::{ResourceSchema, StructField};
 
-    let egress_struct = AttributeType::Struct {
-        name: "Egress".to_string(),
-        fields: vec![
-            StructField::new("cidr_ip", AttributeType::String),
-            StructField::new("description", AttributeType::String),
-            StructField::new("from_port", AttributeType::Int),
-            StructField::new("ip_protocol", AttributeType::String),
-            StructField::new("to_port", AttributeType::Int),
+    let egress_struct = AttributeType::struct_(
+        "Egress".to_string(),
+        vec![
+            StructField::new("cidr_ip", AttributeType::string()),
+            StructField::new("description", AttributeType::string()),
+            StructField::new("from_port", AttributeType::int()),
+            StructField::new("ip_protocol", AttributeType::string()),
+            StructField::new("to_port", AttributeType::int()),
         ],
-    };
+    );
 
     // Bug: ordered: true causes positional comparison of struct list items
     let schema_ordered = ResourceSchema::new("awscc.ec2.SecurityGroup").attribute(
         crate::schema::AttributeSchema::new(
             "security_group_egress",
-            AttributeType::List {
-                inner: Box::new(egress_struct.clone()),
-                ordered: true,
-            },
+            AttributeType::list(egress_struct.clone()),
         ),
     );
 
@@ -1357,18 +1354,18 @@ fn diff_no_change_for_compound_word_dsl_alias() {
     let schema =
         ResourceSchema::new("aws.s3.BucketOwnershipControls").attribute(AttributeSchema::new(
             "object_ownership",
-            AttributeType::StringEnum {
-                name: "ObjectOwnership".to_string(),
-                values: vec![
+            AttributeType::string_enum(
+                "ObjectOwnership".to_string(),
+                vec![
                     "BucketOwnerEnforced".to_string(),
                     "BucketOwnerPreferred".to_string(),
                     "ObjectWriter".to_string(),
                 ],
-                identity: Some(crate::schema::string_enum_identity(
+                Some(crate::schema::string_enum_identity(
                     "ObjectOwnership",
                     Some("aws.s3.BucketOwnershipControls"),
                 )),
-                dsl_aliases: vec![
+                vec![
                     (
                         "BucketOwnerEnforced".to_string(),
                         "bucket_owner_enforced".to_string(),
@@ -1379,7 +1376,7 @@ fn diff_no_change_for_compound_word_dsl_alias() {
                     ),
                     ("ObjectWriter".to_string(), "object_writer".to_string()),
                 ],
-            },
+            ),
         ));
 
     // Desired: API-canonical bare spelling (output of pass-2 in

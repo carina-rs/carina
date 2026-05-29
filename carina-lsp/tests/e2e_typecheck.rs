@@ -39,18 +39,18 @@ fn messages_of(diags: &[tower_lsp::lsp_types::Diagnostic]) -> Vec<&String> {
 // ---------------------------------------------------------------
 
 fn enum_schemas() -> SchemaRegistry {
-    let mode = AttributeType::StringEnum {
-        name: "Mode".to_string(),
-        values: vec!["fast".to_string(), "slow".to_string()],
-        identity: Some(carina_core::schema::string_enum_identity(
+    let mode = AttributeType::string_enum(
+        "Mode".to_string(),
+        vec!["fast".to_string(), "slow".to_string()],
+        Some(carina_core::schema::string_enum_identity(
             "Mode",
             Some("test.r"),
         )),
-        dsl_aliases: vec![],
-    };
+        vec![],
+    );
     single_schema_map(
         ResourceSchema::new("r.mode_holder")
-            .attribute(AttributeSchema::new("name", AttributeType::String))
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
             .attribute(AttributeSchema::new("mode", mode)),
     )
 }
@@ -138,16 +138,16 @@ fn region_schemas() -> SchemaRegistry {
         s.replace('-', "_")
     }
 
-    let region_custom = AttributeType::CustomEnum {
-        identity: carina_core::schema::string_enum_identity("Region", Some("test")),
-        base: Box::new(AttributeType::String),
-        validate: legacy_validator(validate_region),
-        to_dsl: Some(to_dsl),
-    };
+    let region_custom = AttributeType::custom_enum(
+        carina_core::schema::string_enum_identity("Region", Some("test")),
+        AttributeType::string(),
+        legacy_validator(validate_region),
+        Some(to_dsl),
+    );
 
     single_schema_map(
         ResourceSchema::new("r.region_holder")
-            .attribute(AttributeSchema::new("name", AttributeType::String))
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
             .attribute(AttributeSchema::new("region", region_custom)),
     )
 }
@@ -249,21 +249,21 @@ fn nested_struct_schemas() -> SchemaRegistry {
     // Single Struct holding another single Struct — keeps the fixture in
     // block syntax (no list literals) so the test exercises only the
     // nested-Struct type-check path, not the prefer-block-syntax warning.
-    let inner = AttributeType::Struct {
-        name: "Inner".to_string(),
-        fields: vec![StructField::new("leaf", AttributeType::Int)],
-    };
-    let outer = AttributeType::Struct {
-        name: "Outer".to_string(),
-        fields: vec![
+    let inner = AttributeType::struct_(
+        "Inner".to_string(),
+        vec![StructField::new("leaf", AttributeType::int())],
+    );
+    let outer = AttributeType::struct_(
+        "Outer".to_string(),
+        vec![
             StructField::new("inner", inner),
-            StructField::new("label", AttributeType::String),
+            StructField::new("label", AttributeType::string()),
         ],
-    };
+    );
 
     single_schema_map(
         ResourceSchema::new("r.nested")
-            .attribute(AttributeSchema::new("name", AttributeType::String))
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
             .attribute(AttributeSchema::new("outer", outer)),
     )
 }
@@ -300,10 +300,10 @@ test.r.nested {
 // ---------------------------------------------------------------
 
 fn union_schemas() -> SchemaRegistry {
-    let union = AttributeType::Union(vec![AttributeType::Int, AttributeType::String]);
+    let union = AttributeType::union(vec![AttributeType::int(), AttributeType::string()]);
     single_schema_map(
         ResourceSchema::new("r.union")
-            .attribute(AttributeSchema::new("name", AttributeType::String))
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
             .attribute(AttributeSchema::new("value", union)),
     )
 }
@@ -366,14 +366,14 @@ fn resource_ref_schemas() -> SchemaRegistry {
     // Producer: declares a `name` and an `id` attribute marked read-only
     // (provider-computed). Consumers reference it via `<binding>.id`.
     let producer = ResourceSchema::new("r.producer")
-        .attribute(AttributeSchema::new("name", AttributeType::String))
-        .attribute(AttributeSchema::new("id", AttributeType::String).read_only());
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
+        .attribute(AttributeSchema::new("id", AttributeType::string()).read_only());
 
     // Consumer: takes a string `target_id`. The fixture below feeds it the
     // producer's computed `id` via a ResourceRef declared in a sibling file.
     let consumer = ResourceSchema::new("r.consumer")
-        .attribute(AttributeSchema::new("name", AttributeType::String))
-        .attribute(AttributeSchema::new("target_id", AttributeType::String));
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
+        .attribute(AttributeSchema::new("target_id", AttributeType::string()));
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert(producer.resource_type.clone(), producer);
@@ -424,8 +424,8 @@ let upstream = test.r.producer {
 fn unknown_attribute_emits_suggestion() {
     let engine = engine_with_schemas(single_schema_map(
         ResourceSchema::new("r.suggester")
-            .attribute(AttributeSchema::new("name", AttributeType::String))
-            .attribute(AttributeSchema::new("description", AttributeType::String)),
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(AttributeSchema::new("description", AttributeType::string())),
     ));
     // Misspell `description` as `descritpion` — engine should suggest the
     // correct name in its diagnostic message.
@@ -460,21 +460,21 @@ test.r.suggester {
 // ---------------------------------------------------------------
 
 fn list_struct_schemas() -> SchemaRegistry {
-    let inner = AttributeType::Struct {
-        name: "Inner".to_string(),
-        fields: vec![StructField::new("leaf", AttributeType::Int)],
-    };
-    let outer = AttributeType::list(AttributeType::Struct {
-        name: "Outer".to_string(),
-        fields: vec![
+    let inner = AttributeType::struct_(
+        "Inner".to_string(),
+        vec![StructField::new("leaf", AttributeType::int())],
+    );
+    let outer = AttributeType::list(AttributeType::struct_(
+        "Outer".to_string(),
+        vec![
             StructField::new("inner", inner),
-            StructField::new("label", AttributeType::String),
+            StructField::new("label", AttributeType::string()),
         ],
-    });
+    ));
 
     single_schema_map(
         ResourceSchema::new("r.list_nested")
-            .attribute(AttributeSchema::new("name", AttributeType::String))
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
             .attribute(AttributeSchema::new("outer", outer).with_block_name("outer")),
     )
 }
@@ -524,14 +524,14 @@ test.r.list_nested {
 // would silently pass even if the LSP forgot to honour the rename, so a
 // dedicated case is needed.
 fn list_struct_renamed_block_schemas() -> SchemaRegistry {
-    let rule = AttributeType::list(AttributeType::Struct {
-        name: "Rule".to_string(),
-        fields: vec![StructField::new("days", AttributeType::Int)],
-    });
+    let rule = AttributeType::list(AttributeType::struct_(
+        "Rule".to_string(),
+        vec![StructField::new("days", AttributeType::int())],
+    ));
 
     single_schema_map(
         ResourceSchema::new("r.renamed_block")
-            .attribute(AttributeSchema::new("name", AttributeType::String))
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
             .attribute(AttributeSchema::new("rules", rule).with_block_name("rule")),
     )
 }

@@ -8,7 +8,7 @@ use tower_lsp::lsp_types::{
 
 use carina_core::builtins;
 use carina_core::parser::snake_to_pascal;
-use carina_core::schema::{AttributeType, TypeIdentity, legacy_validator};
+use carina_core::schema::{AttributeType, Shape, TypeIdentity, legacy_validator};
 
 use super::{CompletionProvider, DslSource};
 
@@ -84,11 +84,20 @@ impl CompletionProvider {
                     ..Default::default()
                 });
 
-                // For List(Struct) attributes with block_name, offer block syntax completion
+                // For List(Struct) attributes with block_name, offer block
+                // syntax completion. Use `Shape` (Ref-peeled) for both the
+                // attribute type and the list element type so the snippet
+                // still fires on cyclic-CFN attributes like
+                // `Ref("LifecycleConfiguration") -> Struct { rules:
+                // List<Ref<Struct>> with block_name("rule") }`. Same bug
+                // class as carina#3349.
                 if let Some(bn) = &attr.block_name
                     && matches!(
-                        &attr.attr_type,
-                        AttributeType::List { inner, .. } if matches!(inner.as_ref(), AttributeType::Struct { .. })
+                        attr.attr_type.shape(&schema.defs),
+                        Shape::List { inner, .. } if matches!(
+                            inner.shape(&schema.defs),
+                            Shape::Struct { .. }
+                        )
                     )
                 {
                     completions.push(CompletionItem {
@@ -244,6 +253,7 @@ impl CompletionProvider {
                     if !carina_core::validation::is_type_expr_compatible_with_schema(
                         export_type,
                         &attr_schema.attr_type,
+                        &schema.defs,
                     ) {
                         continue;
                     }
@@ -266,13 +276,21 @@ impl CompletionProvider {
             }
         }
 
-        // Target attribute type, if the schema knows about this
-        // (resource_type, attr_name) pair. Used by both the arguments
-        // filter just below and the for-binding filter further down.
-        let target_attr_type = self
-            .lookup_schema(resource_type)
+        // Target attribute type + the schema's `defs` table, if the
+        // schema knows about this (resource_type, attr_name) pair.
+        // Both are used by the arguments filter just below and the
+        // for-binding filter further down; `defs` is threaded into
+        // `is_type_expr_compatible_with_schema` so any `Ref` receiver
+        // resolves correctly.
+        let target_schema = self.lookup_schema(resource_type);
+        let target_attr_type = target_schema
             .and_then(|s| s.attributes.get(attr_name))
             .map(|a| &a.attr_type);
+        let target_defs: &std::collections::BTreeMap<String, carina_core::schema::AttributeType> =
+            match target_schema {
+                Some(s) => &s.defs,
+                None => carina_core::schema::empty_defs(),
+            };
 
         // In-scope bare identifiers: `let` bindings + `arguments {}`
         // parameters (#2624 / #2642). When the target attribute's
@@ -310,6 +328,7 @@ impl CompletionProvider {
                     carina_core::validation::is_type_expr_compatible_with_schema(
                         arg_type_expr,
                         attr_type,
+                        target_defs,
                     )
                 }));
             }
@@ -337,6 +356,7 @@ impl CompletionProvider {
                 && !carina_core::validation::is_type_expr_compatible_with_schema(
                     &element_type,
                     attr_type,
+                    target_defs,
                 )
             {
                 continue;
@@ -354,8 +374,14 @@ impl CompletionProvider {
         if let Some(schema) = self.lookup_schema(resource_type)
             && let Some(attr_schema) = schema.attributes.get(attr_name)
         {
-            // Struct types: offer `{ }` snippet only, no built-in functions
-            if matches!(&attr_schema.attr_type, AttributeType::Struct { .. }) {
+            // Struct types: offer `{ }` snippet only, no built-in functions.
+            // Use `Shape` (Ref-peeled) so a Ref-typed struct attribute
+            // (cyclic-CFN case) also gets the snippet (same bug class as
+            // carina#3349).
+            if matches!(
+                attr_schema.attr_type.shape(&schema.defs),
+                Shape::Struct { .. }
+            ) {
                 completions.push(CompletionItem {
                     label: "{ }".to_string(),
                     kind: Some(CompletionItemKind::SNIPPET),
@@ -522,8 +548,9 @@ impl CompletionProvider {
     /// Extract the Custom type's kind name from an AttributeType, if it
     /// is a Custom type with a structured identity.
     fn extract_custom_type_name(attr_type: &AttributeType) -> Option<&str> {
-        match attr_type {
-            AttributeType::Custom {
+        let defs = carina_core::schema::empty_defs();
+        match attr_type.shape(defs) {
+            Shape::Custom {
                 identity: Some(id), ..
             } => Some(&id.kind),
             _ => None,
@@ -535,8 +562,9 @@ impl CompletionProvider {
         attr_type: &AttributeType,
         resource_type: Option<&str>,
     ) -> Vec<CompletionItem> {
-        match attr_type {
-            AttributeType::Bool => {
+        let defs = carina_core::schema::empty_defs();
+        match attr_type.shape(defs) {
+            Shape::Bool => {
                 vec![
                     CompletionItem {
                         label: "true".to_string(),
@@ -552,7 +580,7 @@ impl CompletionProvider {
                     },
                 ]
             }
-            AttributeType::StringEnum {
+            Shape::StringEnum {
                 name,
                 values,
                 identity,
@@ -563,7 +591,7 @@ impl CompletionProvider {
                 // type when the enum has no provider scope of its
                 // own — this matches the pre-#3222 `namespace`
                 // fallback rule for bare enums.
-                let id_prefix = identity.as_ref().and_then(|id| id.dotted_prefix());
+                let id_prefix = identity.and_then(|id| id.dotted_prefix());
                 let effective_ns = id_prefix.as_deref().or(if !name.is_empty() {
                     resource_type
                 } else {
@@ -571,10 +599,10 @@ impl CompletionProvider {
                 });
                 self.string_enum_completions(name, values, effective_ns, dsl_aliases)
             }
-            AttributeType::Int => {
+            Shape::Int => {
                 vec![] // No specific completions for integers
             }
-            AttributeType::Float => {
+            Shape::Float => {
                 vec![] // No specific completions for floats
             }
             // Curated unit-snippet completions for Duration attributes,
@@ -583,7 +611,7 @@ impl CompletionProvider {
             // short — common timeout magnitudes — rather than every
             // unit alias, because the user types a digit prefix
             // anyway and only needs hint candidates for the unit.
-            AttributeType::Duration => vec![
+            Shape::Duration => vec![
                 CompletionItem {
                     label: "30s".to_string(),
                     kind: Some(CompletionItemKind::VALUE),
@@ -609,10 +637,10 @@ impl CompletionProvider {
                     ..Default::default()
                 },
             ],
-            AttributeType::Custom {
+            Shape::Custom {
                 identity: Some(id), ..
             } if id.kind == "Cidr" || id.kind == "Ipv4Cidr" => self.cidr_completions(),
-            AttributeType::Custom {
+            Shape::Custom {
                 identity: Some(id), ..
             } if id.kind == "Ipv6Cidr" => self.ipv6_cidr_completions(),
             // Generic ARN snippet only for the bare `Arn` type. Specific
@@ -624,7 +652,7 @@ impl CompletionProvider {
             // family snippets can be added as additional arms later if
             // the per-type formats are useful enough to justify the
             // surface. See #2621.
-            AttributeType::Custom {
+            Shape::Custom {
                 identity: Some(id), ..
             } if id.kind == "Arn" => self.arn_completions(),
             // AvailabilityZone is split into two distinct types post-S2.5:
@@ -633,7 +661,7 @@ impl CompletionProvider {
             // lives in `segments`. We surface AZ-letter completions only for
             // zone-name typed sinks — zone-id values look like `usw2-az1` and
             // are not derivable from region code + letter.
-            AttributeType::Custom {
+            Shape::Custom {
                 identity: Some(id), ..
             } if id.kind == "ZoneName"
                 && id.segments.first().map(String::as_str) == Some("AvailabilityZone") =>
@@ -641,13 +669,11 @@ impl CompletionProvider {
                 self.availability_zone_completions(id)
             }
             // List(non-Struct): delegate to inner type completions
-            AttributeType::List { inner, .. } => self.completions_for_type(inner, resource_type),
+            Shape::List { inner, .. } => self.completions_for_type(inner, resource_type),
             // Map: delegate to inner value type completions
-            AttributeType::Map { value: inner, .. } => {
-                self.completions_for_type(inner, resource_type)
-            }
+            Shape::Map { value: inner, .. } => self.completions_for_type(inner, resource_type),
             // Union: collect completions from all member types
-            AttributeType::Union(members) => {
+            Shape::Union(members) => {
                 let mut completions = Vec::new();
                 let mut seen_labels = std::collections::HashSet::new();
                 for member in members {
@@ -659,14 +685,7 @@ impl CompletionProvider {
                 }
                 completions
             }
-            // `AttributeType::Ref` (carina#3340): in CFN-derived
-            // schemas the resolved target is a `Struct`, which has no
-            // value-position snippet anyway (block / attribute
-            // completions handle struct field entry separately).
-            // Returning an empty list is shape-consistent with the
-            // `Struct` arm. Threading `&defs` through completion is
-            // unnecessary at this layer.
-            AttributeType::Ref(_) => vec![],
+            // Shape has no Ref variant by design — peeled via shape(defs).
             _ => vec![],
         }
     }
@@ -1248,10 +1267,9 @@ impl CompletionProvider {
             return Vec::new();
         };
         let effective = if in_nested {
-            match &annotation {
-                AttributeType::List { inner, .. } | AttributeType::Map { value: inner, .. } => {
-                    (**inner).clone()
-                }
+            let defs = carina_core::schema::empty_defs();
+            match annotation.shape(defs) {
+                Shape::List { inner, .. } | Shape::Map { value: inner, .. } => inner.clone(),
                 // Inside `{ ... }` of a non-collection annotation we
                 // don't know what the user means — fall silent.
                 _ => return Vec::new(),
@@ -1290,14 +1308,21 @@ impl CompletionProvider {
     pub(super) fn value_completions_for_attribute_type(
         &self,
         attr_type: &AttributeType,
+        attr_defs: &std::collections::BTreeMap<String, AttributeType>,
         text: &str,
         base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {
         let mut items = self.completions_for_type(attr_type, None);
         items.extend(Self::builtin_function_completions_for_type(attr_type));
         items.extend(self.resource_ref_completions_for_type(attr_type, text, base_path));
-        items.extend(self.module_call_binding_ref_completions_for_type(attr_type, text, base_path));
-        items.extend(self.upstream_state_ref_completions_for_type(attr_type, text, base_path));
+        items.extend(
+            self.module_call_binding_ref_completions_for_type(
+                attr_type, attr_defs, text, base_path,
+            ),
+        );
+        items.extend(
+            self.upstream_state_ref_completions_for_type(attr_type, attr_defs, text, base_path),
+        );
         items
     }
 
@@ -1312,6 +1337,7 @@ impl CompletionProvider {
     fn upstream_state_ref_completions_for_type(
         &self,
         target: &AttributeType,
+        target_defs: &std::collections::BTreeMap<String, AttributeType>,
         text: &str,
         base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {
@@ -1338,6 +1364,7 @@ impl CompletionProvider {
                 if !carina_core::validation::is_type_expr_compatible_with_schema(
                     export_type,
                     target,
+                    target_defs,
                 ) {
                     continue;
                 }
@@ -1412,6 +1439,7 @@ impl CompletionProvider {
     fn module_call_binding_ref_completions_for_type(
         &self,
         target: &AttributeType,
+        target_defs: &std::collections::BTreeMap<String, AttributeType>,
         text: &str,
         base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {
@@ -1440,8 +1468,11 @@ impl CompletionProvider {
                 let Some(ref export_ty) = export.type_expr else {
                     continue;
                 };
-                if !carina_core::validation::is_type_expr_compatible_with_schema(export_ty, target)
-                {
+                if !carina_core::validation::is_type_expr_compatible_with_schema(
+                    export_ty,
+                    target,
+                    target_defs,
+                ) {
                     continue;
                 }
                 let full_ref = format!("{}.{}", binding_name, export.name);
@@ -1946,40 +1977,37 @@ fn infer_for_binding_type(
 ///   type is unknown at this layer.
 fn return_type_fits(ret: builtins::BuiltinReturnType, attr_type: &AttributeType) -> bool {
     use builtins::BuiltinReturnType as R;
-    match attr_type {
-        AttributeType::Union(members) => members.iter().any(|m| return_type_fits(ret, m)),
-        AttributeType::String => matches!(ret, R::String | R::Any),
-        AttributeType::Int => matches!(ret, R::Int | R::Any),
+    // Shape's deliberate omission of a `Ref` variant lifts the
+    // carina#3349 invariant (Ref must be peeled before a wildcard
+    // arm sees it) into the type system: this match cannot leak Ref
+    // into the trailing wildcard. Pass `empty_defs` because this
+    // completion-time helper does not carry the schema's defs map —
+    // unresolved Ref attrs simply fall through to `false`, which is
+    // shape-consistent with the historical `Struct => false` arm.
+    let defs = carina_core::schema::empty_defs();
+    match attr_type.shape(defs) {
+        Shape::Union(members) => members.iter().any(|m| return_type_fits(ret, m)),
+        Shape::String => matches!(ret, R::String | R::Any),
+        Shape::Int => matches!(ret, R::Int | R::Any),
         // No built-in currently returns a Bool; leave as unfit.
-        AttributeType::Bool => false,
-        AttributeType::List { .. } => matches!(ret, R::List | R::Any),
-        AttributeType::Map { .. } => matches!(ret, R::Map | R::Any),
+        Shape::Bool => false,
+        Shape::List { .. } => matches!(ret, R::List | R::Any),
+        Shape::Map { .. } => matches!(ret, R::Map | R::Any),
         // StringEnum expects a specific identifier form; no built-in
         // currently produces such values, and `Any` alone doesn't give us
         // enough confidence to suggest one.
-        AttributeType::StringEnum { .. } => false,
+        Shape::StringEnum { .. } => false,
         // Custom types carry a semantic meaning (Cidr, AwsAccountId, Arn,
         // …) that built-ins don't declare. Not even `Any` fits — we need
         // a semantic return annotation before a built-in can be suggested
         // here. CustomEnum (carina#3222) is even more specific — the
         // value must be a namespaced enum identifier, which no built-in
         // can synthesise.
-        AttributeType::Custom { .. } | AttributeType::CustomEnum { .. } => false,
+        Shape::Custom { .. } | Shape::CustomEnum { .. } => false,
         // Float, Duration, and Struct attributes — no matching built-in today.
-        AttributeType::Float => false,
-        AttributeType::Duration => false,
-        AttributeType::Struct { .. } => false,
-        // `AttributeType::Ref` (carina#3340) names a cyclic CFN
-        // definition target. Resolution requires the enclosing
-        // [`Schema::defs`] map, which this completion-time helper
-        // does not carry. The resolved targets in practice are
-        // `Struct` shapes (WAFv2 `Statement`, AppSync `GraphQLApi`,
-        // ...), and no built-in currently returns `Struct` — so
-        // returning `false` here is semantically equivalent to the
-        // resolved-target arm and avoids threading `defs` through
-        // a purely completion-side helper. If a future built-in
-        // returns a struct-typed value, thread `defs` and resolve.
-        AttributeType::Ref(_) => false,
+        Shape::Float => false,
+        Shape::Duration => false,
+        Shape::Struct { .. } => false,
     }
 }
 
@@ -2013,31 +2041,31 @@ fn parse_exports_type_text(text: &str) -> Option<AttributeType> {
     }
     if let Some(inner) = strip_generic("map", text) {
         let inner_ty = parse_exports_type_text(inner)?;
-        return Some(AttributeType::Map {
-            key: Box::new(AttributeType::String),
-            value: Box::new(inner_ty),
-        });
+        return Some(AttributeType::map_with_key(
+            AttributeType::string(),
+            inner_ty,
+        ));
     }
     match text {
         // Post-Phase C, primitive types are PascalCase. Accept only the new
         // spellings at the surface.
-        "String" => Some(AttributeType::String),
-        "Int" => Some(AttributeType::Int),
-        "Float" => Some(AttributeType::Float),
-        "Bool" => Some(AttributeType::Bool),
+        "String" => Some(AttributeType::string()),
+        "Int" => Some(AttributeType::int()),
+        "Float" => Some(AttributeType::float()),
+        "Bool" => Some(AttributeType::bool()),
         // Custom types also ship in PascalCase now (e.g. `AwsAccountId`,
         // `Ipv4Cidr`). Carry the PascalCase form as a bare identity.
         name if name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
             && name.chars().all(|c| c.is_ascii_alphanumeric()) =>
         {
-            Some(AttributeType::Custom {
-                identity: Some(carina_core::schema::TypeIdentity::bare(name)),
-                base: Box::new(AttributeType::String),
-                pattern: None,
-                length: None,
-                validate: legacy_validator(noop_validate),
-                to_dsl: None,
-            })
+            Some(AttributeType::custom(
+                Some(carina_core::schema::TypeIdentity::bare(name)),
+                AttributeType::string(),
+                None,
+                None,
+                legacy_validator(noop_validate),
+                None,
+            ))
         }
         _ => None,
     }

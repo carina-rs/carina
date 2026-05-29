@@ -831,8 +831,8 @@ mod tests {
 
     fn vpc_schema() -> ResourceSchema {
         ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("name", AttributeType::String))
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
     }
 
     fn registry_with_vpc() -> SchemaRegistry {

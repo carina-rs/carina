@@ -71,13 +71,13 @@ impl ProviderFactory for WaitTestFactory {
 
 fn cert_schema() -> ResourceSchema {
     ResourceSchema::new("acm.Certificate")
-        .attribute(AttributeSchema::new("domain_name", AttributeType::String))
+        .attribute(AttributeSchema::new("domain_name", AttributeType::string()))
         .attribute(AttributeSchema::new(
             "validation_method",
-            AttributeType::String,
+            AttributeType::string(),
         ))
-        .attribute(AttributeSchema::new("status", AttributeType::String))
-        .attribute(AttributeSchema::new("arn", AttributeType::String))
+        .attribute(AttributeSchema::new("status", AttributeType::string()))
+        .attribute(AttributeSchema::new("arn", AttributeType::string()))
 }
 
 struct NoopProvider;

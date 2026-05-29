@@ -251,18 +251,18 @@ impl Provider for NoopProvider {
 // ============================================================================
 
 fn enum_schemas() -> SchemaRegistry {
-    let mode = AttributeType::StringEnum {
-        name: "Mode".to_string(),
-        values: vec!["fast".to_string(), "slow".to_string()],
-        identity: Some(carina_core::schema::string_enum_identity(
+    let mode = AttributeType::string_enum(
+        "Mode".to_string(),
+        vec!["fast".to_string(), "slow".to_string()],
+        Some(carina_core::schema::string_enum_identity(
             "Mode",
             Some("test.r"),
         )),
-        dsl_aliases: vec![],
-    };
+        vec![],
+    );
     single_schema_map(
         ResourceSchema::new("r.mode_holder")
-            .attribute(AttributeSchema::new("name", AttributeType::String))
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
             .attribute(AttributeSchema::new("mode", mode)),
     )
 }
@@ -353,16 +353,16 @@ fn region_schemas() -> SchemaRegistry {
         s.replace('-', "_")
     }
 
-    let region_custom = AttributeType::CustomEnum {
-        identity: carina_core::schema::string_enum_identity("Region", Some("test")),
-        base: Box::new(AttributeType::String),
-        validate: legacy_validator(validate_region),
-        to_dsl: Some(to_dsl),
-    };
+    let region_custom = AttributeType::custom_enum(
+        carina_core::schema::string_enum_identity("Region", Some("test")),
+        AttributeType::string(),
+        legacy_validator(validate_region),
+        Some(to_dsl),
+    );
 
     single_schema_map(
         ResourceSchema::new("r.region_holder")
-            .attribute(AttributeSchema::new("name", AttributeType::String))
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
             .attribute(AttributeSchema::new("region", region_custom)),
     )
 }
@@ -466,21 +466,21 @@ test.r.region_holder {
 // ============================================================================
 
 fn nested_struct_schemas() -> SchemaRegistry {
-    let inner = AttributeType::Struct {
-        name: "Inner".to_string(),
-        fields: vec![StructField::new("leaf", AttributeType::Int)],
-    };
-    let outer = AttributeType::Struct {
-        name: "Outer".to_string(),
-        fields: vec![
+    let inner = AttributeType::struct_(
+        "Inner".to_string(),
+        vec![StructField::new("leaf", AttributeType::int())],
+    );
+    let outer = AttributeType::struct_(
+        "Outer".to_string(),
+        vec![
             StructField::new("inner", inner),
-            StructField::new("label", AttributeType::String),
+            StructField::new("label", AttributeType::string()),
         ],
-    };
+    );
 
     single_schema_map(
         ResourceSchema::new("r.nested")
-            .attribute(AttributeSchema::new("name", AttributeType::String))
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
             .attribute(AttributeSchema::new("outer", outer)),
     )
 }
@@ -518,10 +518,10 @@ test.r.nested {
 // ============================================================================
 
 fn union_schemas() -> SchemaRegistry {
-    let union = AttributeType::Union(vec![AttributeType::Int, AttributeType::String]);
+    let union = AttributeType::union(vec![AttributeType::int(), AttributeType::string()]);
     single_schema_map(
         ResourceSchema::new("r.union")
-            .attribute(AttributeSchema::new("name", AttributeType::String))
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
             .attribute(AttributeSchema::new("value", union)),
     )
 }
@@ -587,11 +587,11 @@ test.r.union {
 
 fn resource_ref_schemas() -> SchemaRegistry {
     let producer = ResourceSchema::new("r.producer")
-        .attribute(AttributeSchema::new("name", AttributeType::String))
-        .attribute(AttributeSchema::new("id", AttributeType::String).read_only());
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
+        .attribute(AttributeSchema::new("id", AttributeType::string()).read_only());
     let consumer = ResourceSchema::new("r.consumer")
-        .attribute(AttributeSchema::new("name", AttributeType::String))
-        .attribute(AttributeSchema::new("target_id", AttributeType::String));
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
+        .attribute(AttributeSchema::new("target_id", AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("test", producer);
     schemas.insert("test", consumer);
@@ -651,8 +651,8 @@ let upstream = test.r.producer {
 fn unknown_attribute_emits_suggestion_parity() {
     let schemas = single_schema_map(
         ResourceSchema::new("r.suggester")
-            .attribute(AttributeSchema::new("name", AttributeType::String))
-            .attribute(AttributeSchema::new("description", AttributeType::String)),
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(AttributeSchema::new("description", AttributeType::string())),
     );
     let fixture = write_fixture(&[(
         "main.crn",
@@ -683,20 +683,20 @@ test.r.suggester {
 // ============================================================================
 
 fn list_struct_schemas() -> SchemaRegistry {
-    let inner = AttributeType::Struct {
-        name: "Inner".to_string(),
-        fields: vec![StructField::new("leaf", AttributeType::Int)],
-    };
-    let outer = AttributeType::list(AttributeType::Struct {
-        name: "Outer".to_string(),
-        fields: vec![
+    let inner = AttributeType::struct_(
+        "Inner".to_string(),
+        vec![StructField::new("leaf", AttributeType::int())],
+    );
+    let outer = AttributeType::list(AttributeType::struct_(
+        "Outer".to_string(),
+        vec![
             StructField::new("inner", inner),
-            StructField::new("label", AttributeType::String),
+            StructField::new("label", AttributeType::string()),
         ],
-    });
+    ));
     single_schema_map(
         ResourceSchema::new("r.list_nested")
-            .attribute(AttributeSchema::new("name", AttributeType::String))
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
             .attribute(AttributeSchema::new("outer", outer).with_block_name("outer")),
     )
 }
@@ -736,13 +736,13 @@ test.r.list_nested {
 }
 
 fn list_struct_renamed_block_schemas() -> SchemaRegistry {
-    let rule = AttributeType::list(AttributeType::Struct {
-        name: "Rule".to_string(),
-        fields: vec![StructField::new("days", AttributeType::Int)],
-    });
+    let rule = AttributeType::list(AttributeType::struct_(
+        "Rule".to_string(),
+        vec![StructField::new("days", AttributeType::int())],
+    ));
     single_schema_map(
         ResourceSchema::new("r.renamed_block")
-            .attribute(AttributeSchema::new("name", AttributeType::String))
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
             .attribute(AttributeSchema::new("rules", rule).with_block_name("rule")),
     )
 }
@@ -845,18 +845,18 @@ impl ProviderFactory for WasmStyleProviderFactory {
 }
 
 fn wasm_style_vpc_schema() -> ResourceSchema {
-    let vpc_id_type = AttributeType::Custom {
-        identity: Some(carina_core::schema::TypeIdentity::bare("VpcId")),
-        pattern: None,
-        length: None,
-        base: Box::new(AttributeType::String),
-        validate: noop_validator(),
-        to_dsl: None,
-    };
+    let vpc_id_type = AttributeType::custom(
+        Some(carina_core::schema::TypeIdentity::bare("VpcId")),
+        AttributeType::string(),
+        None,
+        None,
+        noop_validator(),
+        None,
+    );
     ResourceSchema::new("ec2.security_group")
         .attribute(AttributeSchema::new(
             "group_description",
-            AttributeType::String,
+            AttributeType::string(),
         ))
         .attribute(AttributeSchema::new("vpc_id", vpc_id_type))
 }
@@ -936,14 +936,14 @@ awsccmock.ec2.security_group {
 }
 
 fn wasm_style_subnet_schema() -> ResourceSchema {
-    let vpc_id_type = AttributeType::Custom {
-        identity: Some(carina_core::schema::TypeIdentity::bare("VpcId")),
-        pattern: None,
-        length: None,
-        base: Box::new(AttributeType::String),
-        validate: noop_validator(),
-        to_dsl: None,
-    };
+    let vpc_id_type = AttributeType::custom(
+        Some(carina_core::schema::TypeIdentity::bare("VpcId")),
+        AttributeType::string(),
+        None,
+        None,
+        noop_validator(),
+        None,
+    );
     ResourceSchema::new("ec2.subnet").attribute(AttributeSchema::new(
         "vpc_ids",
         AttributeType::list(vpc_id_type),
@@ -1050,19 +1050,19 @@ fn vpc_id_validate_2358(v: &Value) -> Result<(), String> {
 }
 
 fn vpc_id_custom_type_2358() -> AttributeType {
-    AttributeType::Custom {
-        identity: Some(carina_core::schema::TypeIdentity::bare("VpcId")),
-        pattern: None,
-        length: None,
-        base: Box::new(AttributeType::String),
-        validate: legacy_validator(vpc_id_validate_2358),
-        to_dsl: None,
-    }
+    AttributeType::custom(
+        Some(carina_core::schema::TypeIdentity::bare("VpcId")),
+        AttributeType::string(),
+        None,
+        None,
+        legacy_validator(vpc_id_validate_2358),
+        None,
+    )
 }
 
 fn vpc_resource_schema_2358() -> ResourceSchema {
     ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
         .attribute(AttributeSchema::new("vpc_id", vpc_id_custom_type_2358()))
 }
 
@@ -1070,7 +1070,7 @@ fn security_group_schema_2358() -> ResourceSchema {
     ResourceSchema::new("ec2.SecurityGroup")
         .attribute(AttributeSchema::new(
             "group_description",
-            AttributeType::String,
+            AttributeType::string(),
         ))
         .attribute(AttributeSchema::new("vpc_id", vpc_id_custom_type_2358()))
 }

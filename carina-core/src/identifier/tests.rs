@@ -5,7 +5,7 @@ use indexmap::IndexMap;
 
 fn make_s3_bucket_schema() -> ResourceSchema {
     ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::new("bucket_name", AttributeType::String))
+        .attribute(AttributeSchema::new("bucket_name", AttributeType::string()))
 }
 
 fn registry_with_s3_bucket() -> SchemaRegistry {
@@ -201,8 +201,8 @@ fn test_reconcile_anonymous_id_partial_create_only_match() {
     // When one create-only property changes but another stays the same,
     // reconciliation should restore the state's identifier.
     let schema = ResourceSchema::new("iam.role")
-        .attribute(AttributeSchema::new("role_name", AttributeType::String).create_only())
-        .attribute(AttributeSchema::new("path", AttributeType::String).create_only());
+        .attribute(AttributeSchema::new("role_name", AttributeType::string()).create_only())
+        .attribute(AttributeSchema::new("path", AttributeType::string()).create_only());
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
     let providers = vec![ProviderConfig {
@@ -271,8 +271,8 @@ fn test_reconcile_anonymous_id_partial_create_only_match() {
 fn test_reconcile_anonymous_id_no_match_when_all_differ() {
     // When ALL create-only properties differ, no reconciliation (truly new resource)
     let schema = ResourceSchema::new("iam.role")
-        .attribute(AttributeSchema::new("role_name", AttributeType::String).create_only())
-        .attribute(AttributeSchema::new("path", AttributeType::String).create_only());
+        .attribute(AttributeSchema::new("role_name", AttributeType::string()).create_only())
+        .attribute(AttributeSchema::new("path", AttributeType::string()).create_only());
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
 
@@ -312,8 +312,8 @@ fn test_reconcile_anonymous_id_no_match_when_all_same() {
     // When ALL create-only properties match, the hash should also match,
     // so no reconciliation is needed (same identifier)
     let schema = ResourceSchema::new("iam.role")
-        .attribute(AttributeSchema::new("role_name", AttributeType::String).create_only())
-        .attribute(AttributeSchema::new("path", AttributeType::String).create_only());
+        .attribute(AttributeSchema::new("role_name", AttributeType::string()).create_only())
+        .attribute(AttributeSchema::new("path", AttributeType::string()).create_only());
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
 
@@ -354,7 +354,7 @@ fn test_reconcile_anonymous_id_single_create_only_no_reconcile() {
     // With only one create-only property, changing it means ALL changed,
     // so no reconciliation (matched=0 or mismatched=0)
     let schema = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only());
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only());
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
 
@@ -391,7 +391,7 @@ fn test_anonymous_resource_inside_module_keeps_instance_prefix() {
     use crate::resource::ModuleSource;
 
     let schema = ResourceSchema::new("iam.RolePolicy")
-        .attribute(AttributeSchema::new("policy_name", AttributeType::String));
+        .attribute(AttributeSchema::new("policy_name", AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
     let providers = vec![ProviderConfig {
@@ -442,10 +442,10 @@ fn test_anonymous_resource_inside_module_keeps_instance_prefix() {
 fn test_anonymous_resource_no_create_only_properties() {
     // Resources with no create-only properties should still work as anonymous resources
     let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::new("domain", AttributeType::String))
+        .attribute(AttributeSchema::new("domain", AttributeType::string()))
         .attribute(AttributeSchema::new(
             "tags",
-            AttributeType::map(AttributeType::String),
+            AttributeType::map(AttributeType::string()),
         ));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
@@ -485,7 +485,7 @@ fn test_anonymous_resource_no_create_only_properties() {
 fn test_anonymous_resource_no_create_only_deterministic() {
     // Same attributes should produce the same identifier
     let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::new("domain", AttributeType::String));
+        .attribute(AttributeSchema::new("domain", AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
     let providers = vec![ProviderConfig {
@@ -527,7 +527,7 @@ fn test_anonymous_resource_no_create_only_deterministic() {
 fn test_anonymous_resource_no_create_only_collision() {
     // Two identical anonymous resources with no create-only properties should collide
     let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::new("domain", AttributeType::String));
+        .attribute(AttributeSchema::new("domain", AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
     let providers = vec![ProviderConfig {
@@ -569,13 +569,13 @@ fn test_identity_attribute_prevents_collision() {
     // This simulates route53.record_set where `name` is create-only (same)
     // but `type` is identity (A vs AAAA).
     let schema = ResourceSchema::new("route53.record_set")
-        .attribute(AttributeSchema::new("name", AttributeType::String).create_only())
-        .attribute(AttributeSchema::new("hosted_zone_id", AttributeType::String).create_only())
-        .attribute(AttributeSchema::new("type", AttributeType::String).identity())
-        .attribute(AttributeSchema::new("ttl", AttributeType::String))
+        .attribute(AttributeSchema::new("name", AttributeType::string()).create_only())
+        .attribute(AttributeSchema::new("hosted_zone_id", AttributeType::string()).create_only())
+        .attribute(AttributeSchema::new("type", AttributeType::string()).identity())
+        .attribute(AttributeSchema::new("ttl", AttributeType::string()))
         .attribute(AttributeSchema::new(
             "resource_records",
-            AttributeType::list(AttributeType::String),
+            AttributeType::list(AttributeType::string()),
         ));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
@@ -700,9 +700,9 @@ fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
     // When schema has no create-only properties and an attribute changes,
     // Hamming distance reconciliation should match with the closest state entry.
     let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::new("domain", AttributeType::String))
-        .attribute(AttributeSchema::new("tag_name", AttributeType::String))
-        .attribute(AttributeSchema::new("tag_env", AttributeType::String));
+        .attribute(AttributeSchema::new("domain", AttributeType::string()))
+        .attribute(AttributeSchema::new("tag_name", AttributeType::string()))
+        .attribute(AttributeSchema::new("tag_env", AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
     let providers = vec![ProviderConfig {
@@ -785,7 +785,7 @@ fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
 fn test_reconcile_anonymous_id_no_create_only_no_match_when_distant() {
     // Completely different resources should not reconcile
     let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::new("domain", AttributeType::String));
+        .attribute(AttributeSchema::new("domain", AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
 
@@ -818,8 +818,8 @@ fn test_reconcile_anonymous_id_create_only_exists_but_none_set() {
     // Case A: Schema has create-only properties, but user didn't set any.
     // Should use SimHash-based Hamming distance reconciliation.
     let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::new("domain", AttributeType::String))
-        .attribute(AttributeSchema::new("public_ipv4_pool", AttributeType::String).create_only());
+        .attribute(AttributeSchema::new("domain", AttributeType::string()))
+        .attribute(AttributeSchema::new("public_ipv4_pool", AttributeType::string()).create_only());
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
     let providers = vec![ProviderConfig {
@@ -1003,10 +1003,10 @@ fn test_simhash_all_attributes_changed_large_distance() {
 fn test_reconcile_no_create_only_picks_closest_among_multiple_state_entries() {
     // When multiple state entries exist, reconciliation should pick the closest one
     let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::new("domain", AttributeType::String))
-        .attribute(AttributeSchema::new("tag_name", AttributeType::String))
-        .attribute(AttributeSchema::new("tag_env", AttributeType::String))
-        .attribute(AttributeSchema::new("tag_team", AttributeType::String));
+        .attribute(AttributeSchema::new("domain", AttributeType::string()))
+        .attribute(AttributeSchema::new("tag_name", AttributeType::string()))
+        .attribute(AttributeSchema::new("tag_env", AttributeType::string()))
+        .attribute(AttributeSchema::new("tag_team", AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
     let providers = vec![ProviderConfig {
@@ -1116,7 +1116,7 @@ fn test_reconcile_no_create_only_picks_closest_among_multiple_state_entries() {
 fn test_reconcile_no_create_only_same_id_in_state_no_change() {
     // If state already has the same identifier, no reconciliation needed
     let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::new("domain", AttributeType::String));
+        .attribute(AttributeSchema::new("domain", AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
     let providers = vec![ProviderConfig {
@@ -1158,7 +1158,7 @@ fn test_reconcile_no_create_only_same_id_in_state_no_change() {
 fn test_reconcile_no_create_only_empty_state() {
     // No state entries = no reconciliation
     let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::new("domain", AttributeType::String));
+        .attribute(AttributeSchema::new("domain", AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
 
@@ -1180,9 +1180,9 @@ fn test_reconcile_no_create_only_empty_state() {
 fn test_compute_anonymous_id_uses_simhash_for_no_create_only() {
     // Verify that changing one attribute produces a different but nearby identifier
     let schema = ResourceSchema::new("ec2.internet_gateway")
-        .attribute(AttributeSchema::new("tag_name", AttributeType::String))
-        .attribute(AttributeSchema::new("tag_env", AttributeType::String))
-        .attribute(AttributeSchema::new("tag_team", AttributeType::String));
+        .attribute(AttributeSchema::new("tag_name", AttributeType::string()))
+        .attribute(AttributeSchema::new("tag_env", AttributeType::string()))
+        .attribute(AttributeSchema::new("tag_team", AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
     let providers = vec![ProviderConfig {
@@ -1240,11 +1240,11 @@ fn test_compute_anonymous_id_simhash_vs_create_only_hash_independent() {
     // Resources with create-only properties use standard hash,
     // resources without use SimHash. Verify both work side by side.
     let schema_with_co = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only())
-        .attribute(AttributeSchema::new("tag_name", AttributeType::String));
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only())
+        .attribute(AttributeSchema::new("tag_name", AttributeType::string()));
     let schema_without_co = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::new("domain", AttributeType::String))
-        .attribute(AttributeSchema::new("tag_name", AttributeType::String));
+        .attribute(AttributeSchema::new("domain", AttributeType::string()))
+        .attribute(AttributeSchema::new("tag_name", AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema_with_co);
     schemas.insert("awscc", schema_without_co);
@@ -1300,8 +1300,8 @@ fn test_reconcile_create_only_path_unaffected_by_simhash_changes() {
     // Verify that resources WITH create-only properties still use the
     // existing partial-match reconciliation, not Hamming distance.
     let schema = ResourceSchema::new("iam.role")
-        .attribute(AttributeSchema::new("role_name", AttributeType::String).create_only())
-        .attribute(AttributeSchema::new("path", AttributeType::String).create_only());
+        .attribute(AttributeSchema::new("role_name", AttributeType::string()).create_only())
+        .attribute(AttributeSchema::new("path", AttributeType::string()).create_only());
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
 
@@ -1345,7 +1345,7 @@ fn test_compute_anonymous_id_stable_with_prefixed_create_only_attribute() {
     // the anonymous identifier should be based on the prefix, not the
     // randomly generated name. This ensures the hash is stable across runs.
     let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only());
+        .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only());
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
     let providers = vec![ProviderConfig {
@@ -1390,7 +1390,7 @@ fn test_compute_anonymous_id_stable_with_prefixed_create_only_attribute() {
 fn test_compute_anonymous_id_different_prefix_produces_different_id() {
     // Different prefixes should produce different anonymous identifiers
     let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only());
+        .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only());
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
     let providers = vec![ProviderConfig {
@@ -1435,9 +1435,9 @@ fn test_reconcile_skips_let_bound_resources() {
     // Let-bound (named) resources should never be reconciled, even if their
     // name doesn't exist in state. The _binding attribute marks them as named.
     let schema = ResourceSchema::new("ec2.security_group_ingress")
-        .attribute(AttributeSchema::new("cidr_ip", AttributeType::String).create_only())
-        .attribute(AttributeSchema::new("ip_protocol", AttributeType::String).create_only())
-        .attribute(AttributeSchema::new("description", AttributeType::String).create_only());
+        .attribute(AttributeSchema::new("cidr_ip", AttributeType::string()).create_only())
+        .attribute(AttributeSchema::new("ip_protocol", AttributeType::string()).create_only())
+        .attribute(AttributeSchema::new("description", AttributeType::string()).create_only());
     let mut schemas = SchemaRegistry::new();
     schemas.insert("aws", schema);
 
@@ -1491,9 +1491,9 @@ fn test_reconcile_skips_when_multiple_partial_matches() {
     // reconciliation should skip rather than picking the first match.
     // This prevents a new SG rule from hijacking an unrelated state entry.
     let schema = ResourceSchema::new("ec2.security_group_ingress")
-        .attribute(AttributeSchema::new("cidr_ip", AttributeType::String).create_only())
-        .attribute(AttributeSchema::new("ip_protocol", AttributeType::String).create_only())
-        .attribute(AttributeSchema::new("description", AttributeType::String).create_only());
+        .attribute(AttributeSchema::new("cidr_ip", AttributeType::string()).create_only())
+        .attribute(AttributeSchema::new("ip_protocol", AttributeType::string()).create_only())
+        .attribute(AttributeSchema::new("description", AttributeType::string()).create_only());
     let mut schemas = SchemaRegistry::new();
     schemas.insert("aws", schema);
 
@@ -1564,16 +1564,16 @@ fn test_reconcile_eip_tag_update_with_unset_create_only_props() {
     // SimHash reconciliation should match the resource as an in-place update,
     // not a replace (delete+create).
     let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::new("domain", AttributeType::String))
-        .attribute(AttributeSchema::new("address", AttributeType::String).create_only())
-        .attribute(AttributeSchema::new("ipam_pool_id", AttributeType::String).create_only())
+        .attribute(AttributeSchema::new("domain", AttributeType::string()))
+        .attribute(AttributeSchema::new("address", AttributeType::string()).create_only())
+        .attribute(AttributeSchema::new("ipam_pool_id", AttributeType::string()).create_only())
         .attribute(
-            AttributeSchema::new("network_border_group", AttributeType::String).create_only(),
+            AttributeSchema::new("network_border_group", AttributeType::string()).create_only(),
         )
-        .attribute(AttributeSchema::new("transfer_address", AttributeType::String).create_only())
+        .attribute(AttributeSchema::new("transfer_address", AttributeType::string()).create_only())
         .attribute(AttributeSchema::new(
             "tags",
-            AttributeType::map(AttributeType::String),
+            AttributeType::map(AttributeType::string()),
         ));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
@@ -1682,9 +1682,9 @@ fn test_reconcile_does_not_swap_named_resources_with_overlapping_create_only() {
     // Both resources are named (let-bound) and already match state entries by name.
     // Reconciliation should leave them unchanged.
     let schema = ResourceSchema::new("ec2.security_group_ingress")
-        .attribute(AttributeSchema::new("cidr_ip", AttributeType::String).create_only())
-        .attribute(AttributeSchema::new("ip_protocol", AttributeType::String).create_only())
-        .attribute(AttributeSchema::new("description", AttributeType::String).create_only());
+        .attribute(AttributeSchema::new("cidr_ip", AttributeType::string()).create_only())
+        .attribute(AttributeSchema::new("ip_protocol", AttributeType::string()).create_only())
+        .attribute(AttributeSchema::new("description", AttributeType::string()).create_only());
     let mut schemas = SchemaRegistry::new();
     schemas.insert("aws", schema);
 
@@ -1764,7 +1764,7 @@ fn test_reconcile_does_not_swap_named_resources_with_overlapping_create_only() {
 
 fn make_sso_instance_registry() -> SchemaRegistry {
     let schema = ResourceSchema::new("sso.Instance")
-        .attribute(AttributeSchema::new("name", AttributeType::String).create_only());
+        .attribute(AttributeSchema::new("name", AttributeType::string()).create_only());
     let mut r = SchemaRegistry::new();
     r.insert("awscc", schema);
     r
@@ -1938,7 +1938,7 @@ fn test_detect_rename_ignores_non_hash_state_names() {
 /// Registry with NO create-only attributes — like `awscc.sso.Instance`.
 fn make_sso_instance_registry_no_create_only() -> SchemaRegistry {
     let schema = ResourceSchema::new("sso.Instance")
-        .attribute(AttributeSchema::new("name", AttributeType::String));
+        .attribute(AttributeSchema::new("name", AttributeType::string()));
     let mut r = SchemaRegistry::new();
     r.insert("awscc", schema);
     r
@@ -2234,7 +2234,7 @@ fn test_detect_rename_no_create_only_skips_when_two_orphans_tie_on_distance() {
 #[test]
 fn anonymous_identifier_includes_provider_prefix() {
     let schema = ResourceSchema::new("iam.RolePolicy")
-        .attribute(AttributeSchema::new("policy_name", AttributeType::String));
+        .attribute(AttributeSchema::new("policy_name", AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
     let providers = vec![ProviderConfig {
@@ -2272,7 +2272,7 @@ fn anonymous_identifier_includes_provider_prefix() {
 #[test]
 fn anonymous_identifier_provider_prefix_for_aws_provider() {
     let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::new("bucket_name", AttributeType::String));
+        .attribute(AttributeSchema::new("bucket_name", AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("aws", schema);
     let providers = vec![ProviderConfig {
@@ -2306,7 +2306,7 @@ fn anonymous_identifier_provider_prefix_for_aws_provider() {
 fn reconcile_simhash_match_keeps_new_format_identifier_and_emits_rename() {
     // Schema with NO create-only attrs forces the SimHash-distance branch.
     let schema = ResourceSchema::new("iam.RolePolicy")
-        .attribute(AttributeSchema::new("policy_name", AttributeType::String));
+        .attribute(AttributeSchema::new("policy_name", AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
     let providers = vec![ProviderConfig {

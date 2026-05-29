@@ -38,7 +38,7 @@ use crate::parser::File;
 use crate::resource::{
     AccessPath, ConcreteValue, DeferredValue, InterpolationPart, PathSegment, Value,
 };
-use crate::schema::{AttributeSchema, AttributeType, SchemaKind, SchemaRegistry};
+use crate::schema::{AttrTypeKind, AttributeSchema, AttributeType, SchemaKind, SchemaRegistry};
 
 /// One diagnostic for a deferred-populate-bound chained reference
 /// that lacks a synchronizing `wait` block.
@@ -273,15 +273,15 @@ fn path_traverses_deferred(
         // Resolve `Ref` chains so the cyclic-CFN case
         // (`Statement -> AndStatement -> List<Statement>`) does not
         // bail out at the first cycle hop (carina#3340).
-        let resolved = current_type.resolve_refs(defs);
-        match (resolved, segment) {
-            (AttributeType::List { inner, .. }, PathSegment::Subscript { .. }) => {
+        let resolved = current_type.resolve_refs(defs).as_attr();
+        match (resolved.kind(), segment) {
+            (AttrTypeKind::List { inner, .. }, PathSegment::Subscript { .. }) => {
                 current_type = inner;
             }
-            (AttributeType::Map { value, .. }, PathSegment::Subscript { .. }) => {
+            (AttrTypeKind::Map { value, .. }, PathSegment::Subscript { .. }) => {
                 current_type = value;
             }
-            (AttributeType::Struct { fields, .. }, PathSegment::Field { name }) => {
+            (AttrTypeKind::Struct { fields, .. }, PathSegment::Field { name }) => {
                 let Some(field) = fields.iter().find(|f| &f.name == name) else {
                     return false;
                 };
@@ -320,14 +320,14 @@ mod tests {
     fn cert_schema_with_dvo_inner_field_deferred() -> ResourceSchema {
         ResourceSchema::new("acm.Certificate").attribute(AttributeSchema::new(
             "domain_validation_options",
-            AttributeType::list(AttributeType::Struct {
-                name: "DomainValidationOption".to_string(),
-                fields: vec![
-                    StructField::new("domain_name", AttributeType::String),
-                    StructField::new("resource_record_value", AttributeType::String)
+            AttributeType::list(AttributeType::struct_(
+                "DomainValidationOption".to_string(),
+                vec![
+                    StructField::new("domain_name", AttributeType::string()),
+                    StructField::new("resource_record_value", AttributeType::string())
                         .deferred_populate(),
                 ],
-            }),
+            )),
         ))
     }
 
@@ -335,9 +335,9 @@ mod tests {
         ResourceSchema::new("route53.RecordSet")
             .attribute(AttributeSchema::new(
                 "resource_records",
-                AttributeType::list(AttributeType::String),
+                AttributeType::list(AttributeType::string()),
             ))
-            .attribute(AttributeSchema::new("name", AttributeType::String))
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
     }
 
     fn dvo_chained_ref(field: &str) -> Value {
@@ -489,15 +489,15 @@ mod tests {
         let schema = ResourceSchema::new("rds.DBInstance").attribute(
             AttributeSchema::new(
                 "endpoint",
-                AttributeType::Struct {
-                    name: "Endpoint".to_string(),
-                    fields: vec![StructField::new("address", AttributeType::String)],
-                },
+                AttributeType::struct_(
+                    "Endpoint".to_string(),
+                    vec![StructField::new("address", AttributeType::string())],
+                ),
             )
             .deferred_populate(),
         );
         let consumer = ResourceSchema::new("ec2.Instance")
-            .attribute(AttributeSchema::new("user_data", AttributeType::String));
+            .attribute(AttributeSchema::new("user_data", AttributeType::string()));
         let mut r = SchemaRegistry::new();
         r.insert("aws", schema);
         r.insert("aws", consumer);

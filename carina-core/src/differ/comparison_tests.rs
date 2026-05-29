@@ -9,14 +9,14 @@ fn type_aware_int_float_coercion() {
     assert!(type_aware_equal(
         &Value::Concrete(ConcreteValue::Int(42)),
         &Value::Concrete(ConcreteValue::Float(42.0)),
-        Some(&AttributeType::Float),
+        Some(&AttributeType::float()),
         crate::schema::empty_defs(),
         None,
     ));
     assert!(type_aware_equal(
         &Value::Concrete(ConcreteValue::Float(42.0)),
         &Value::Concrete(ConcreteValue::Int(42)),
-        Some(&AttributeType::Float),
+        Some(&AttributeType::float()),
         crate::schema::empty_defs(),
         None,
     ));
@@ -24,7 +24,7 @@ fn type_aware_int_float_coercion() {
     assert!(!type_aware_equal(
         &Value::Concrete(ConcreteValue::Int(42)),
         &Value::Concrete(ConcreteValue::Float(42.5)),
-        Some(&AttributeType::Float),
+        Some(&AttributeType::float()),
         crate::schema::empty_defs(),
         None,
     ));
@@ -44,7 +44,7 @@ fn type_aware_int_float_coercion_for_int_type() {
     assert!(type_aware_equal(
         &Value::Concrete(ConcreteValue::Int(10)),
         &Value::Concrete(ConcreteValue::Float(10.0)),
-        Some(&AttributeType::Int),
+        Some(&AttributeType::int()),
         crate::schema::empty_defs(),
         None,
     ));
@@ -52,7 +52,7 @@ fn type_aware_int_float_coercion_for_int_type() {
 
 #[test]
 fn type_aware_list_with_inner_type() {
-    let list_type = AttributeType::unordered_list(AttributeType::Float);
+    let list_type = AttributeType::unordered_list(AttributeType::float());
     // List of Int vs Float with coercion (unordered, so reordering is fine)
     assert!(type_aware_equal(
         &Value::Concrete(ConcreteValue::List(vec![
@@ -73,13 +73,13 @@ fn type_aware_list_with_inner_type() {
 fn type_aware_struct_per_field() {
     use crate::schema::StructField;
 
-    let struct_type = AttributeType::Struct {
-        name: "Config".to_string(),
-        fields: vec![
-            StructField::new("count", AttributeType::Float),
-            StructField::new("name", AttributeType::String),
+    let struct_type = AttributeType::struct_(
+        "Config".to_string(),
+        vec![
+            StructField::new("count", AttributeType::float()),
+            StructField::new("name", AttributeType::string()),
         ],
-    };
+    );
     let a = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         ("count".to_string(), Value::Concrete(ConcreteValue::Int(5))),
         (
@@ -108,7 +108,7 @@ fn type_aware_struct_per_field() {
 
 #[test]
 fn type_aware_union_numeric() {
-    let union_type = AttributeType::Union(vec![AttributeType::Int, AttributeType::Float]);
+    let union_type = AttributeType::union(vec![AttributeType::int(), AttributeType::float()]);
     assert!(type_aware_equal(
         &Value::Concrete(ConcreteValue::Int(7)),
         &Value::Concrete(ConcreteValue::Float(7.0)),
@@ -120,14 +120,14 @@ fn type_aware_union_numeric() {
 
 #[test]
 fn type_aware_custom_delegates_to_base() {
-    let custom_type = AttributeType::Custom {
-        identity: Some(TypeIdentity::bare("Port")),
-        base: Box::new(AttributeType::Float),
-        pattern: None,
-        length: None,
-        validate: noop_validator(),
-        to_dsl: None,
-    };
+    let custom_type = AttributeType::custom(
+        Some(TypeIdentity::bare("Port")),
+        AttributeType::float(),
+        None,
+        None,
+        noop_validator(),
+        None,
+    );
     assert!(type_aware_equal(
         &Value::Concrete(ConcreteValue::Int(8080)),
         &Value::Concrete(ConcreteValue::Float(8080.0)),
@@ -144,7 +144,7 @@ fn type_aware_diff_no_change_with_schema() {
     let mut schema = ResourceSchema::new("test.resource");
     schema.attributes.insert(
         "port".to_string(),
-        AttributeSchema::new("port", AttributeType::Float),
+        AttributeSchema::new("port", AttributeType::float()),
     );
 
     let desired = Resource::new("test.resource", "test")
@@ -179,13 +179,13 @@ fn type_aware_struct_ignores_default_bool_false() {
     use crate::schema::StructField;
 
     // Struct with an optional bool field (bucket_key_enabled)
-    let struct_type = AttributeType::Struct {
-        name: "ServerSideEncryptionRule".to_string(),
-        fields: vec![
-            StructField::new("bucket_key_enabled", AttributeType::Bool),
-            StructField::new("sse_algorithm", AttributeType::String),
+    let struct_type = AttributeType::struct_(
+        "ServerSideEncryptionRule".to_string(),
+        vec![
+            StructField::new("bucket_key_enabled", AttributeType::bool()),
+            StructField::new("sse_algorithm", AttributeType::string()),
         ],
-    };
+    );
 
     // Desired: only sse_algorithm specified (no bucket_key_enabled)
     let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
@@ -221,13 +221,13 @@ fn type_aware_struct_ignores_default_bool_false() {
 fn type_aware_struct_does_not_ignore_non_default_bool() {
     use crate::schema::StructField;
 
-    let struct_type = AttributeType::Struct {
-        name: "ServerSideEncryptionRule".to_string(),
-        fields: vec![
-            StructField::new("bucket_key_enabled", AttributeType::Bool),
-            StructField::new("sse_algorithm", AttributeType::String),
+    let struct_type = AttributeType::struct_(
+        "ServerSideEncryptionRule".to_string(),
+        vec![
+            StructField::new("bucket_key_enabled", AttributeType::bool()),
+            StructField::new("sse_algorithm", AttributeType::string()),
         ],
-    };
+    );
 
     // Desired: only sse_algorithm
     let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
@@ -262,19 +262,19 @@ fn type_aware_struct_does_not_ignore_non_default_bool() {
 #[test]
 fn type_aware_string_enum_namespaced_vs_raw() {
     // StringEnum with namespace
-    let enum_type = AttributeType::StringEnum {
-        name: "ServerSideEncryptionByDefaultSseAlgorithm".to_string(),
-        values: vec![
+    let enum_type = AttributeType::string_enum(
+        "ServerSideEncryptionByDefaultSseAlgorithm".to_string(),
+        vec![
             "aws:kms".to_string(),
             "AES256".to_string(),
             "aws:kms:dsse".to_string(),
         ],
-        identity: Some(crate::schema::string_enum_identity(
+        Some(crate::schema::string_enum_identity(
             "ServerSideEncryptionByDefaultSseAlgorithm",
             Some("awscc.s3.Bucket"),
         )),
-        dsl_aliases: vec![],
-    };
+        vec![],
+    );
 
     // Namespaced form vs raw string
     assert!(
@@ -330,12 +330,12 @@ fn type_aware_string_enum_namespaced_vs_raw() {
 /// the differ reports a phantom replacement on every post-apply plan.
 #[test]
 fn type_aware_custom_enum_canonical_vs_namespaced_identifier() {
-    let az_type = AttributeType::CustomEnum {
-        identity: TypeIdentity::new(Some("aws"), ["AvailabilityZone"], "ZoneName"),
-        base: Box::new(AttributeType::String),
-        validate: noop_validator(),
-        to_dsl: Some(|s: &str| s.replace('-', "_")),
-    };
+    let az_type = AttributeType::custom_enum(
+        TypeIdentity::new(Some("aws"), ["AvailabilityZone"], "ZoneName"),
+        AttributeType::string(),
+        noop_validator(),
+        Some(|s: &str| s.replace('-', "_")),
+    );
 
     // Provider-read AWS canonical form vs DSL fully-qualified identifier.
     // State side stores `String("ap-northeast-1a")`; the DSL parser turns
@@ -430,21 +430,21 @@ fn type_aware_custom_enum_canonical_vs_namespaced_identifier() {
 fn type_aware_struct_ignores_default_string_enum_empty() {
     use crate::schema::StructField;
 
-    let struct_type = AttributeType::Struct {
-        name: "Config".to_string(),
-        fields: vec![
-            StructField::new("name", AttributeType::String),
+    let struct_type = AttributeType::struct_(
+        "Config".to_string(),
+        vec![
+            StructField::new("name", AttributeType::string()),
             StructField::new(
                 "status",
-                AttributeType::StringEnum {
-                    name: "Status".to_string(),
-                    values: vec!["Active".to_string(), "Inactive".to_string()],
-                    identity: None,
-                    dsl_aliases: vec![],
-                },
+                AttributeType::string_enum(
+                    "Status".to_string(),
+                    vec!["Active".to_string(), "Inactive".to_string()],
+                    None,
+                    vec![],
+                ),
             ),
         ],
-    };
+    );
 
     // Desired: only name specified
     let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
@@ -480,23 +480,23 @@ fn type_aware_struct_ignores_default_string_enum_empty() {
 fn type_aware_struct_ignores_default_custom_type() {
     use crate::schema::StructField;
 
-    let struct_type = AttributeType::Struct {
-        name: "Config".to_string(),
-        fields: vec![
-            StructField::new("name", AttributeType::String),
+    let struct_type = AttributeType::struct_(
+        "Config".to_string(),
+        vec![
+            StructField::new("name", AttributeType::string()),
             StructField::new(
                 "port",
-                AttributeType::Custom {
-                    identity: Some(TypeIdentity::bare("Port")),
-                    base: Box::new(AttributeType::Int),
-                    pattern: None,
-                    length: None,
-                    validate: noop_validator(),
-                    to_dsl: None,
-                },
+                AttributeType::custom(
+                    Some(TypeIdentity::bare("Port")),
+                    AttributeType::int(),
+                    None,
+                    None,
+                    noop_validator(),
+                    None,
+                ),
             ),
         ],
-    };
+    );
 
     // Desired: only name specified
     let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
@@ -529,19 +529,19 @@ fn type_aware_struct_ignores_default_custom_type() {
 fn type_aware_struct_ignores_default_nested_struct_empty() {
     use crate::schema::StructField;
 
-    let struct_type = AttributeType::Struct {
-        name: "Outer".to_string(),
-        fields: vec![
-            StructField::new("name", AttributeType::String),
+    let struct_type = AttributeType::struct_(
+        "Outer".to_string(),
+        vec![
+            StructField::new("name", AttributeType::string()),
             StructField::new(
                 "inner",
-                AttributeType::Struct {
-                    name: "Inner".to_string(),
-                    fields: vec![StructField::new("value", AttributeType::String)],
-                },
+                AttributeType::struct_(
+                    "Inner".to_string(),
+                    vec![StructField::new("value", AttributeType::string())],
+                ),
             ),
         ],
-    };
+    );
 
     // Desired: only name specified
     let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
@@ -576,10 +576,7 @@ fn type_aware_struct_ignores_default_nested_struct_empty() {
 #[test]
 fn type_aware_ordered_list_detects_reorder() {
     // An ordered list (insertionOrder=true) should detect reordering as a change
-    let ordered_list_type = AttributeType::List {
-        inner: Box::new(AttributeType::String),
-        ordered: true,
-    };
+    let ordered_list_type = AttributeType::list(AttributeType::string());
 
     // Same elements, different order
     let a = Value::Concrete(ConcreteValue::List(vec![
@@ -622,10 +619,7 @@ fn type_aware_ordered_list_detects_reorder() {
 #[test]
 fn type_aware_unordered_list_ignores_reorder() {
     // An unordered list (insertionOrder=false) should treat reordering as no change
-    let unordered_list_type = AttributeType::List {
-        inner: Box::new(AttributeType::String),
-        ordered: false,
-    };
+    let unordered_list_type = AttributeType::unordered_list(AttributeType::string());
 
     let a = Value::Concrete(ConcreteValue::List(vec![
         Value::Concrete(ConcreteValue::String("a".to_string())),
@@ -655,8 +649,8 @@ fn write_only_attr_in_desired_not_in_current_no_diff() {
     use crate::schema::{AttributeSchema, ResourceSchema};
 
     let schema = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
-        .attribute(AttributeSchema::new("ipv4_netmask_length", AttributeType::Int).write_only());
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
+        .attribute(AttributeSchema::new("ipv4_netmask_length", AttributeType::int()).write_only());
 
     let desired = HashMap::from([
         (
@@ -687,8 +681,8 @@ fn write_only_attr_in_both_same_value_no_diff() {
     use crate::schema::{AttributeSchema, ResourceSchema};
 
     let schema = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
-        .attribute(AttributeSchema::new("ipv4_netmask_length", AttributeType::Int).write_only());
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
+        .attribute(AttributeSchema::new("ipv4_netmask_length", AttributeType::int()).write_only());
 
     let desired = HashMap::from([
         (
@@ -724,8 +718,8 @@ fn write_only_attr_in_both_different_value_detects_diff() {
     use crate::schema::{AttributeSchema, ResourceSchema};
 
     let schema = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
-        .attribute(AttributeSchema::new("ipv4_netmask_length", AttributeType::Int).write_only());
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
+        .attribute(AttributeSchema::new("ipv4_netmask_length", AttributeType::int()).write_only());
 
     let desired = HashMap::from([
         (
@@ -760,8 +754,8 @@ fn non_write_only_attr_in_desired_not_in_current_detects_diff() {
     use crate::schema::{AttributeSchema, ResourceSchema};
 
     let schema = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
-        .attribute(AttributeSchema::new("enable_dns", AttributeType::Bool));
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
+        .attribute(AttributeSchema::new("enable_dns", AttributeType::bool()));
 
     let desired = HashMap::from([
         (
@@ -1118,7 +1112,7 @@ fn secret_in_map_with_refresh_no_false_diff() {
     // Build schema with tags as Map(String)
     let schema = ResourceSchema::new("ec2.Vpc").attribute(AttributeSchema::new(
         "tags",
-        AttributeType::map(AttributeType::String),
+        AttributeType::map(AttributeType::string()),
     ));
 
     let desired = HashMap::from([("tags".to_string(), desired_tags)]);
@@ -1144,9 +1138,9 @@ fn secret_in_map_with_refresh_no_false_diff() {
 /// Helper: build the `Union[String, list(String)]` shape used by
 /// IAM-style `string_or_list_of_strings` schema fields.
 fn string_or_list_of_strings_type() -> AttributeType {
-    AttributeType::Union(vec![
-        AttributeType::String,
-        AttributeType::list(AttributeType::String),
+    AttributeType::union(vec![
+        AttributeType::string(),
+        AttributeType::list(AttributeType::string()),
     ])
 }
 
@@ -1217,14 +1211,14 @@ fn union_string_or_list_through_custom_wrapper() {
     // `Custom` wrappers around the union must remain transparent —
     // the comparator delegates `Custom { base, .. }` to its `base`.
     let inner = string_or_list_of_strings_type();
-    let custom = AttributeType::Custom {
-        identity: Some(TypeIdentity::bare("PolicyConditionValue")),
-        base: Box::new(inner),
-        pattern: None,
-        length: None,
-        validate: std::sync::Arc::new(|_| Ok(())),
-        to_dsl: None,
-    };
+    let custom = AttributeType::custom(
+        Some(TypeIdentity::bare("PolicyConditionValue")),
+        inner,
+        None,
+        None,
+        std::sync::Arc::new(|_| Ok(())),
+        None,
+    );
     let a = Value::Concrete(ConcreteValue::StringList(vec!["x".to_string()]));
     let b = Value::Concrete(ConcreteValue::StringList(vec!["x".to_string()]));
     assert!(type_aware_equal(
@@ -1248,18 +1242,18 @@ fn carina3080_principal_scalar_vs_singleton_is_no_change_via_pipeline() {
     use crate::schema::{AttributeSchema, ResourceSchema, StructField};
     use crate::value::{canonicalize_resources_with_schemas, canonicalize_states_with_schemas};
 
-    let principal = AttributeType::Union(vec![
-        AttributeType::Struct {
-            name: "PrincipalStruct".to_string(),
-            fields: vec![StructField::new(
+    let principal = AttributeType::union(vec![
+        AttributeType::struct_(
+            "PrincipalStruct".to_string(),
+            vec![StructField::new(
                 "service",
-                AttributeType::Union(vec![
-                    AttributeType::String,
-                    AttributeType::list(AttributeType::String),
+                AttributeType::union(vec![
+                    AttributeType::string(),
+                    AttributeType::list(AttributeType::string()),
                 ]),
             )],
-        },
-        AttributeType::String,
+        ),
+        AttributeType::string(),
     ]);
     let mut schema = ResourceSchema::new("iam.policy");
     schema.attributes.insert(
@@ -1354,21 +1348,23 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
     use crate::schema::{AttributeSchema, ResourceSchema, StructField};
     use crate::value::{canonicalize_resources_with_schemas, canonicalize_states_with_schemas};
 
-    let method_enum = |name: &str, values: &[&str]| AttributeType::StringEnum {
-        name: name.to_string(),
-        values: values.iter().map(|s| s.to_string()).collect(),
-        identity: Some(crate::schema::string_enum_identity(
-            name,
-            Some("awscc.cloudfront.Distribution"),
-        )),
-        dsl_aliases: values
-            .iter()
-            .map(|s| (s.to_string(), s.to_lowercase()))
-            .collect(),
+    let method_enum = |name: &str, values: &[&str]| {
+        AttributeType::string_enum(
+            name.to_string(),
+            values.iter().map(|s| s.to_string()).collect(),
+            Some(crate::schema::string_enum_identity(
+                name,
+                Some("awscc.cloudfront.Distribution"),
+            )),
+            values
+                .iter()
+                .map(|s| (s.to_string(), s.to_lowercase()))
+                .collect(),
+        )
     };
-    let default_cache_behavior = AttributeType::Struct {
-        name: "DefaultCacheBehavior".to_string(),
-        fields: vec![
+    let default_cache_behavior = AttributeType::struct_(
+        "DefaultCacheBehavior".to_string(),
+        vec![
             StructField::new(
                 "allowed_methods",
                 AttributeType::unordered_list(method_enum(
@@ -1388,8 +1384,8 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
             // User-authored scalar fields, so the test also covers the
             // "authored field survives projection and compares equal"
             // path alongside the read-back-default stripping.
-            StructField::new("compress", AttributeType::Bool).with_provider_name("Compress"),
-            StructField::new("target_origin_id", AttributeType::String)
+            StructField::new("compress", AttributeType::bool()).with_provider_name("Compress"),
+            StructField::new("target_origin_id", AttributeType::string())
                 .with_provider_name("TargetOriginId"),
             StructField::new(
                 "viewer_protocol_policy",
@@ -1400,14 +1396,14 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
             )
             .with_provider_name("ViewerProtocolPolicy"),
         ],
-    };
-    let distribution_config = AttributeType::Struct {
-        name: "DistributionConfig".to_string(),
-        fields: vec![
+    );
+    let distribution_config = AttributeType::struct_(
+        "DistributionConfig".to_string(),
+        vec![
             StructField::new("default_cache_behavior", default_cache_behavior)
                 .with_provider_name("DefaultCacheBehavior"),
         ],
-    };
+    );
     let mut schema = ResourceSchema::new("cloudfront.Distribution");
     schema.attributes.insert(
         "distribution_config".to_string(),
@@ -1603,26 +1599,28 @@ fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline()
     use crate::schema::{AttributeSchema, ResourceSchema, StructField};
     use crate::value::{canonicalize_resources_with_schemas, canonicalize_states_with_schemas};
 
-    let method_enum = |name: &str, values: &[&str]| AttributeType::StringEnum {
-        name: name.to_string(),
-        values: values.iter().map(|s| s.to_string()).collect(),
-        identity: Some(crate::schema::string_enum_identity(
-            name,
-            Some("awscc.cloudfront.Distribution"),
-        )),
-        dsl_aliases: values
-            .iter()
-            .map(|s| (s.to_string(), s.to_lowercase()))
-            .collect(),
+    let method_enum = |name: &str, values: &[&str]| {
+        AttributeType::string_enum(
+            name.to_string(),
+            values.iter().map(|s| s.to_string()).collect(),
+            Some(crate::schema::string_enum_identity(
+                name,
+                Some("awscc.cloudfront.Distribution"),
+            )),
+            values
+                .iter()
+                .map(|s| (s.to_string(), s.to_lowercase()))
+                .collect(),
+        )
     };
     // The only load-bearing difference for the `allowed_methods`
     // verdict vs the no-change test: `list` (ordered: true) instead of
     // `unordered_list`. (This test uses a trimmed shape — no
     // `cached_methods`, no read-back-default state block — since only
     // the `allowed_methods` ordering is under test here.)
-    let default_cache_behavior = AttributeType::Struct {
-        name: "DefaultCacheBehavior".to_string(),
-        fields: vec![
+    let default_cache_behavior = AttributeType::struct_(
+        "DefaultCacheBehavior".to_string(),
+        vec![
             StructField::new(
                 "allowed_methods",
                 AttributeType::list(method_enum(
@@ -1632,14 +1630,14 @@ fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline()
             )
             .with_provider_name("AllowedMethods"),
         ],
-    };
-    let distribution_config = AttributeType::Struct {
-        name: "DistributionConfig".to_string(),
-        fields: vec![
+    );
+    let distribution_config = AttributeType::struct_(
+        "DistributionConfig".to_string(),
+        vec![
             StructField::new("default_cache_behavior", default_cache_behavior)
                 .with_provider_name("DefaultCacheBehavior"),
         ],
-    };
+    );
     let mut schema = ResourceSchema::new("cloudfront.Distribution");
     schema.attributes.insert(
         "distribution_config".to_string(),

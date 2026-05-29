@@ -13,13 +13,16 @@ use crate::resource::{ConcreteValue, ConcreteValueRef, DeferredValue, Resource, 
 use crate::utils::{extract_enum_value_with_values, validate_enum_namespace};
 use crate::value::format_value_with_key;
 
+mod resolved_attr_type;
 mod type_identity;
+
+pub use resolved_attr_type::ResolvedAttrType;
 pub use type_identity::TypeIdentity;
 
 /// Type alias for resource validator functions
 pub type ResourceValidator = fn(&HashMap<String, Value>) -> Result<(), Vec<TypeError>>;
 
-/// Validator stored on `AttributeType::Custom`. Boxed as `Arc<dyn Fn>` so it
+/// Validator stored on `AttrTypeKind::Custom`. Boxed as `Arc<dyn Fn>` so it
 /// can capture provider-side state (region, account ID, schema handles) and
 /// return a structured `TypeError` directly — both of which a bare `fn`
 /// pointer cannot do. See #2217.
@@ -55,7 +58,7 @@ pub fn noop_validator() -> CustomValidator {
     validator(|_| Ok(()))
 }
 
-/// External validator looked up by `AttributeType::Custom.identity`
+/// External validator looked up by `AttrTypeKind::Custom.identity`
 /// at validation time. Used to bridge to provider-supplied validators
 /// (the `ProviderContext.validators` map and WASM factory's
 /// `validate_custom_type`) that the schema itself cannot carry across
@@ -78,7 +81,7 @@ pub fn no_lookup() -> CustomTypeLookup<'static> {
 
 /// If `value` is a bare reference to a `let` binding (no access path,
 /// no attribute selector), return the binding name. Otherwise return
-/// `None`. Used by `AttributeType::validate` to detect the collision
+/// `None`. Used by `AttrTypeKind::validate` to detect the collision
 /// case from #2978: a StringEnum attribute receives a bare identifier
 /// that the parser already resolved as a binding reference rather than
 /// as the enum's DSL alias of the same spelling.
@@ -145,7 +148,7 @@ fn walk_custom_lookup(
     errors: &mut Vec<TypeError>,
 ) {
     // Skip deferred-resolution values — same convention as
-    // `AttributeType::validate`, plus `ResourceRef` / `Interpolation`
+    // `AttrTypeKind::validate`, plus `ResourceRef` / `Interpolation`
     // which only resolve to a concrete string at apply time.
     if matches!(
         value,
@@ -157,8 +160,8 @@ fn walk_custom_lookup(
     ) {
         return;
     }
-    match attr_type {
-        AttributeType::Custom { identity, .. } => {
+    match &attr_type.kind {
+        AttrTypeKind::Custom { identity, .. } => {
             if let Some(id) = identity
                 && let Err(e) = lookup(id, value)
             {
@@ -177,7 +180,7 @@ fn walk_custom_lookup(
                 });
             }
         }
-        AttributeType::CustomEnum { identity, .. } => {
+        AttrTypeKind::CustomEnum { identity, .. } => {
             // CustomEnum carries a mandatory identity; the lookup
             // path is otherwise identical to the structural Custom
             // arm above. (The split exists only at the validate /
@@ -194,21 +197,21 @@ fn walk_custom_lookup(
                 });
             }
         }
-        AttributeType::List { inner, .. } => {
+        AttrTypeKind::List { inner, .. } => {
             if let Value::Concrete(ConcreteValue::List(items)) = value {
                 for item in items {
                     walk_custom_lookup(inner, item, attr_name, lookup, defs, errors);
                 }
             }
         }
-        AttributeType::Map { value: inner, .. } => {
+        AttrTypeKind::Map { value: inner, .. } => {
             if let Value::Concrete(ConcreteValue::Map(map)) = value {
                 for v in map.values() {
                     walk_custom_lookup(inner, v, attr_name, lookup, defs, errors);
                 }
             }
         }
-        AttributeType::Struct { fields, .. } => {
+        AttrTypeKind::Struct { fields, .. } => {
             if let Value::Concrete(ConcreteValue::Map(map)) = value {
                 for f in fields {
                     if let Some(v) = map.get(&f.name) {
@@ -217,7 +220,7 @@ fn walk_custom_lookup(
                 }
             }
         }
-        AttributeType::Union(members) => {
+        AttrTypeKind::Union(members) => {
             // Union semantics: a value is valid if *any* member accepts
             // it. The previous loop walked every member and pushed
             // every error, so a value that legitimately matched one arm
@@ -246,12 +249,12 @@ fn walk_custom_lookup(
                 errors.extend(b);
             }
         }
-        AttributeType::String
-        | AttributeType::Int
-        | AttributeType::Float
-        | AttributeType::Bool
-        | AttributeType::Duration
-        | AttributeType::StringEnum { .. } => {}
+        AttrTypeKind::String
+        | AttrTypeKind::Int
+        | AttrTypeKind::Float
+        | AttrTypeKind::Bool
+        | AttrTypeKind::Duration
+        | AttrTypeKind::StringEnum { .. } => {}
         // `Ref`: resolve via the schema's def map and continue the
         // walk. The resolved target (typically a `Struct`) may carry
         // identity-bearing custom types whose validators must run.
@@ -259,7 +262,7 @@ fn walk_custom_lookup(
         // as `ValidationFailed`; here we just skip the custom-lookup
         // walk so a user-facing dangling-Ref does not abort the
         // process (carina#3345).
-        AttributeType::Ref(name) => match defs.get(name) {
+        AttrTypeKind::Ref(name) => match defs.get(name) {
             Some(resolved) => {
                 walk_custom_lookup(resolved, value, attr_name, lookup, defs, errors);
             }
@@ -416,9 +419,29 @@ impl StructField {
     }
 }
 
-/// Attribute type
+/// Attribute type — opaque public type wrapping an internal
+/// [`AttrTypeKind`] enum. External code constructs values via the
+/// `pub` constructors (`AttrTypeKind::string()`, `::list(...)`,
+/// `::ref_(...)`, etc.) and inspects via [`AttrTypeKind::shape`] (or,
+/// in-crate, [`AttrTypeKind::kind`]).
+///
+/// The inner enum is `pub(crate)`, so callers outside `carina-core`
+/// cannot pattern-match a raw `&AttributeType` against the
+/// [`AttrTypeKind::Ref`] variant — the carina#3349 bug class
+/// (silent `Ref` drop in a wildcard arm of an external `match`) is
+/// structurally impossible at the type level.
 #[derive(Clone)]
-pub enum AttributeType {
+pub struct AttributeType {
+    pub(crate) kind: AttrTypeKind,
+}
+
+/// Internal variant enum carried by [`AttributeType`]. `pub(crate)` so
+/// it is visible to every file inside `carina-core` (validation, value
+/// canonicalization, differ, detail rows, etc.) but hidden from
+/// downstream crates. External code uses [`AttrTypeKind::shape`] (the
+/// `Ref`-peeled view) or the constructor methods on [`AttributeType`].
+#[derive(Clone)]
+pub(crate) enum AttrTypeKind {
     /// String
     String,
     /// Integer
@@ -461,7 +484,7 @@ pub enum AttributeType {
     },
     /// Structurally-validated custom type — values carry their own
     /// format (e.g. `arn:aws:s3:::bucket-name`, `vpc-12345678`) and
-    /// reach the validator verbatim. Distinct from [`AttributeType::CustomEnum`],
+    /// reach the validator verbatim. Distinct from [`AttrTypeKind::CustomEnum`],
     /// which gates the value through `expand_enum_shorthand` first.
     ///
     /// The split was introduced in carina#3222 (S2.5c-followup) so the
@@ -492,7 +515,7 @@ pub enum AttributeType {
         /// `.` that the DSL form does not carry — the closure strips
         /// it so the differ does not report a phantom diff.
         ///
-        /// Distinct from [`AttributeType::CustomEnum`]'s `to_dsl`,
+        /// Distinct from [`AttrTypeKind::CustomEnum`]'s `to_dsl`,
         /// which expands the *DSL spelling* of enum variants. Here
         /// the closure is a generic state→DSL normalizer.
         /// `Option<fn>` because closures cannot cross the WASM
@@ -504,7 +527,7 @@ pub enum AttributeType {
     /// through `expand_enum_shorthand` to a fully-qualified form
     /// (`aws.Region.us_east_1`, …) before reaching the validator.
     ///
-    /// Sibling of [`AttributeType::Custom`]; both replace the older
+    /// Sibling of [`AttrTypeKind::Custom`]; both replace the older
     /// single `Custom` variant whose `namespace.is_some()` flag
     /// distinguished the two cases at runtime. Identity is mandatory
     /// here — without one there is no namespace to expand into.
@@ -550,14 +573,151 @@ pub enum AttributeType {
     /// Resolved lazily by [`Schema::validate`] at the point of use.
     ///
     /// A `Ref` outside of a `Schema` context cannot be self-validated —
-    /// [`AttributeType::validate`] returns a `TypeError::ValidationFailed`
+    /// [`AttrTypeKind::validate`] returns a `TypeError::ValidationFailed`
     /// in that case. Callers who need to validate a schema that contains
     /// `Ref` must go through [`Schema::validate`].
     Ref(String),
 }
 
+/// A view over an [`AttributeType`] with **every top-level `Ref` peeled**.
+///
+/// Returned by [`AttrTypeKind::shape`]. The enum intentionally omits a
+/// `Ref` variant, so a `match shape { ... }` with a wildcard arm is
+/// type-system-safe — there is no path that lets a `Ref` reach the
+/// match. This is the carina#3349 invariant lifted into the type system:
+/// every walk-site that previously matched on a raw `&AttributeType` and
+/// could silently drop `Ref` in a wildcard arm now matches on a
+/// `Shape<'a>` instead, and the bug class is structurally impossible.
+///
+/// All variants carry borrowed data, so constructing a `Shape` is a
+/// cheap reborrow plus a `Ref` chain walk; the lifetime is tied to the
+/// `AttributeType` plus the `defs` map passed to `shape`.
+///
+/// Mirrors [`AttributeType`] variant-for-variant except for `Ref`. New
+/// `AttributeType` variants must be added here as well; the
+/// `AttrTypeKind::shape` match is non-exhaustive against the source
+/// enum and the compiler will surface the omission.
+#[derive(Clone, Copy)]
+pub enum Shape<'a> {
+    /// String — see [`AttrTypeKind::String`].
+    String,
+    /// Integer — see [`AttrTypeKind::Int`].
+    Int,
+    /// Floating-point — see [`AttrTypeKind::Float`].
+    Float,
+    /// Boolean — see [`AttrTypeKind::Bool`].
+    Bool,
+    /// Time duration — see [`AttrTypeKind::Duration`].
+    Duration,
+    /// Namespaced string enum — see [`AttrTypeKind::StringEnum`].
+    StringEnum {
+        name: &'a str,
+        values: &'a [String],
+        identity: Option<&'a TypeIdentity>,
+        dsl_aliases: &'a [(String, String)],
+    },
+    /// Structural custom type — see [`AttrTypeKind::Custom`].
+    Custom {
+        identity: Option<&'a TypeIdentity>,
+        base: &'a AttributeType,
+        pattern: Option<&'a str>,
+        length: Option<(Option<u64>, Option<u64>)>,
+        validate: &'a CustomValidator,
+        to_dsl: Option<fn(&str) -> String>,
+    },
+    /// Enum-shorthand custom type — see [`AttrTypeKind::CustomEnum`].
+    CustomEnum {
+        identity: &'a TypeIdentity,
+        base: &'a AttributeType,
+        validate: &'a CustomValidator,
+        to_dsl: Option<fn(&str) -> String>,
+    },
+    /// List with element type and ordering — see [`AttrTypeKind::List`].
+    List {
+        inner: &'a AttributeType,
+        ordered: bool,
+    },
+    /// Map with typed key/value — see [`AttrTypeKind::Map`].
+    Map {
+        key: &'a AttributeType,
+        value: &'a AttributeType,
+    },
+    /// Named struct — see [`AttrTypeKind::Struct`].
+    Struct {
+        name: &'a str,
+        fields: &'a [StructField],
+    },
+    /// Union of types — see [`AttrTypeKind::Union`].
+    Union(&'a [AttributeType]),
+    // Intentionally NO Ref variant — see type-level docs.
+}
+
+impl fmt::Debug for Shape<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Shape::String => f.write_str("Shape::String"),
+            Shape::Int => f.write_str("Shape::Int"),
+            Shape::Float => f.write_str("Shape::Float"),
+            Shape::Bool => f.write_str("Shape::Bool"),
+            Shape::Duration => f.write_str("Shape::Duration"),
+            Shape::StringEnum {
+                name,
+                values,
+                identity,
+                dsl_aliases,
+            } => f
+                .debug_struct("Shape::StringEnum")
+                .field("name", name)
+                .field("values", values)
+                .field("identity", identity)
+                .field("dsl_aliases", dsl_aliases)
+                .finish(),
+            Shape::Custom {
+                identity,
+                base,
+                pattern,
+                length,
+                validate: _,
+                to_dsl: _,
+            } => f
+                .debug_struct("Shape::Custom")
+                .field("identity", identity)
+                .field("base", base)
+                .field("pattern", pattern)
+                .field("length", length)
+                .finish_non_exhaustive(),
+            Shape::CustomEnum {
+                identity,
+                base,
+                validate: _,
+                to_dsl: _,
+            } => f
+                .debug_struct("Shape::CustomEnum")
+                .field("identity", identity)
+                .field("base", base)
+                .finish_non_exhaustive(),
+            Shape::List { inner, ordered } => f
+                .debug_struct("Shape::List")
+                .field("inner", inner)
+                .field("ordered", ordered)
+                .finish(),
+            Shape::Map { key, value } => f
+                .debug_struct("Shape::Map")
+                .field("key", key)
+                .field("value", value)
+                .finish(),
+            Shape::Struct { name, fields } => f
+                .debug_struct("Shape::Struct")
+                .field("name", name)
+                .field("fields", fields)
+                .finish(),
+            Shape::Union(members) => f.debug_tuple("Shape::Union").field(members).finish(),
+        }
+    }
+}
+
 /// A complete schema: a root attribute type together with the named
-/// definitions it can reference via [`AttributeType::Ref`].
+/// definitions it can reference via [`AttrTypeKind::Ref`].
 ///
 /// Introduced in carina#3340 to model cyclic CloudFormation definition
 /// graphs (WAFv2 `WebACL.Statement`, AppSync `GraphQLApi`,
@@ -570,7 +730,7 @@ pub struct Schema {
     /// The root attribute type. May be a `Ref` into `defs`, or any
     /// other shape (`Struct`, `List`, primitive, ...).
     pub root: AttributeType,
-    /// Named definitions reachable via [`AttributeType::Ref`].
+    /// Named definitions reachable via [`AttrTypeKind::Ref`].
     pub defs: std::collections::BTreeMap<String, AttributeType>,
 }
 
@@ -599,13 +759,13 @@ impl Schema {
     /// **Do not** call [`Self::validate`] or [`Self::validate_collect`]
     /// on a Schema produced by `with_defs`; those entry points walk
     /// `self.root`, which here is a non-load-bearing
-    /// `AttributeType::String` and will silently validate every
+    /// `AttrTypeKind::String` and will silently validate every
     /// value as a String.
     pub fn with_defs(defs: std::collections::BTreeMap<String, AttributeType>) -> Self {
         Self {
             // `validate_attr(attr, value)` ignores `self.root`; pick
             // the cheapest leaf as a non-load-bearing placeholder.
-            root: AttributeType::String,
+            root: AttributeType::string(),
             defs,
         }
     }
@@ -639,8 +799,8 @@ impl Schema {
     }
 
     /// Schema-aware path-collecting validator. Equivalent to
-    /// [`AttributeType::validate_collect`] but resolves
-    /// `AttributeType::Ref` against `defs` at every walk-site, so the
+    /// [`AttrTypeKind::validate_collect`] but resolves
+    /// `AttrTypeKind::Ref` against `defs` at every walk-site, so the
     /// LSP per-keystroke diagnostic pass surfaces real per-field
     /// errors against cyclic CFN-style schemas instead of the
     /// standalone-validator sentinel (carina#3345).
@@ -662,7 +822,7 @@ impl Schema {
         out: &mut Vec<(FieldPath, TypeError)>,
     ) {
         // Peel Ref so the downstream arms never have to think about it.
-        if let AttributeType::Ref(name) = attr {
+        if let AttrTypeKind::Ref(name) = &attr.kind {
             match self.resolve(name) {
                 Some(resolved) => {
                     self.collect_attr_into(resolved, path, value, out);
@@ -683,8 +843,8 @@ impl Schema {
         let Some(concrete) = value.as_concrete() else {
             return;
         };
-        match attr {
-            AttributeType::Struct { name, fields } => {
+        match &attr.kind {
+            AttrTypeKind::Struct { name, fields } => {
                 // Mirror the pre-#3345 standalone-validator collect_struct
                 // behavior, but route field walks through
                 // collect_attr_into so Ref-typed fields are resolved
@@ -749,7 +909,7 @@ impl Schema {
                     }
                 }
             }
-            AttributeType::List { inner, .. } => {
+            AttrTypeKind::List { inner, .. } => {
                 let Some(items) = (match concrete {
                     ConcreteValueRef::List(items) => Some(items),
                     _ => None,
@@ -775,7 +935,7 @@ impl Schema {
             // the current path. If a Union-of-structs shape is ever
             // introduced, this arm should recurse via collect_attr_into
             // on the selected member to preserve per-field paths.
-            AttributeType::Union(_) => {
+            AttrTypeKind::Union(_) => {
                 if let Err(e) = self.validate_attr(attr, value) {
                     out.push((path.clone(), e));
                 }
@@ -797,8 +957,8 @@ impl Schema {
     /// resource's attribute type plus the resource's struct-definition
     /// map) can validate without re-rooting the schema.
     pub fn validate_attr(&self, attr: &AttributeType, value: &Value) -> Result<(), TypeError> {
-        match attr {
-            AttributeType::Ref(name) => match self.resolve(name) {
+        match &attr.kind {
+            AttrTypeKind::Ref(name) => match self.resolve(name) {
                 Some(resolved) => self.validate_attr(resolved, value),
                 None => Err(TypeError::ValidationFailed {
                     message: format!(
@@ -806,7 +966,7 @@ impl Schema {
                     ),
                 }),
             },
-            AttributeType::List { inner, ordered } => {
+            AttrTypeKind::List { inner, ordered } => {
                 if let Some(ConcreteValueRef::List(items)) = value.as_concrete() {
                     for (i, item) in items.iter().enumerate() {
                         if let Err(inner_err) = self.validate_attr(inner, item) {
@@ -825,14 +985,16 @@ impl Schema {
                     // not-a-list error. `ordered` is irrelevant when
                     // the value is not even a list.
                     let _ = ordered;
-                    AttributeType::List {
-                        inner: inner.clone(),
-                        ordered: *ordered,
+                    AttributeType {
+                        kind: AttrTypeKind::List {
+                            inner: inner.clone(),
+                            ordered: *ordered,
+                        },
                     }
                     .validate(value)
                 }
             }
-            AttributeType::Map { key, value: val_ty } => {
+            AttrTypeKind::Map { key, value: val_ty } => {
                 if let Some(ConcreteValueRef::Map(map)) = value.as_concrete() {
                     for (k, v) in map.iter() {
                         let key_val = lift_map_key(key, k);
@@ -851,14 +1013,16 @@ impl Schema {
                     }
                     Ok(())
                 } else {
-                    AttributeType::Map {
-                        key: key.clone(),
-                        value: val_ty.clone(),
+                    AttributeType {
+                        kind: AttrTypeKind::Map {
+                            key: key.clone(),
+                            value: val_ty.clone(),
+                        },
                     }
                     .validate(value)
                 }
             }
-            AttributeType::Struct { name, fields } => {
+            AttrTypeKind::Struct { name, fields } => {
                 if let Some(ConcreteValueRef::Map(map)) = value.as_concrete() {
                     for field in fields {
                         match map.get(&field.name) {
@@ -883,14 +1047,16 @@ impl Schema {
                     let _ = name;
                     Ok(())
                 } else {
-                    AttributeType::Struct {
-                        name: name.clone(),
-                        fields: fields.clone(),
+                    AttributeType {
+                        kind: AttrTypeKind::Struct {
+                            name: name.clone(),
+                            fields: fields.clone(),
+                        },
                     }
                     .validate(value)
                 }
             }
-            AttributeType::Union(members) => {
+            AttrTypeKind::Union(members) => {
                 // Mirror `validate_union`'s best-scoring selection so
                 // the StringEnum-rich diagnostic (variant list, alias
                 // hints) survives when the user-supplied value shape
@@ -928,18 +1094,30 @@ impl Schema {
     }
 }
 
+impl fmt::Debug for AttrTypeKind {
+    // Forward to AttributeType's Debug to keep one source of truth for
+    // formatting. The wrapper is a transparent newtype-style struct,
+    // so the rendered output is identical to the historical Debug.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Wrap in a transient AttributeType and dispatch through its
+        // Debug impl.
+        let wrapped = AttributeType { kind: self.clone() };
+        fmt::Debug::fmt(&wrapped, f)
+    }
+}
+
 impl fmt::Debug for AttributeType {
     // Hand-written so that `Custom.validate` (an `Arc<dyn Fn>`, which does
     // not implement `Debug`) can be rendered as a placeholder. Every other
     // variant matches what `#[derive(Debug)]` would produce.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AttributeType::String => f.write_str("String"),
-            AttributeType::Int => f.write_str("Int"),
-            AttributeType::Float => f.write_str("Float"),
-            AttributeType::Bool => f.write_str("Bool"),
-            AttributeType::Duration => f.write_str("Duration"),
-            AttributeType::StringEnum {
+        match &self.kind {
+            AttrTypeKind::String => f.write_str("String"),
+            AttrTypeKind::Int => f.write_str("Int"),
+            AttrTypeKind::Float => f.write_str("Float"),
+            AttrTypeKind::Bool => f.write_str("Bool"),
+            AttrTypeKind::Duration => f.write_str("Duration"),
+            AttrTypeKind::StringEnum {
                 name,
                 values,
                 identity,
@@ -951,7 +1129,7 @@ impl fmt::Debug for AttributeType {
                 .field("identity", identity)
                 .field("dsl_aliases", dsl_aliases)
                 .finish(),
-            AttributeType::Custom {
+            AttrTypeKind::Custom {
                 identity,
                 base,
                 pattern,
@@ -967,7 +1145,7 @@ impl fmt::Debug for AttributeType {
                 .field("to_dsl", to_dsl)
                 .field("validate", &"<closure>")
                 .finish(),
-            AttributeType::CustomEnum {
+            AttrTypeKind::CustomEnum {
                 identity,
                 base,
                 to_dsl,
@@ -979,23 +1157,23 @@ impl fmt::Debug for AttributeType {
                 .field("to_dsl", to_dsl)
                 .field("validate", &"<closure>")
                 .finish(),
-            AttributeType::List { inner, ordered } => f
+            AttrTypeKind::List { inner, ordered } => f
                 .debug_struct("List")
                 .field("inner", inner)
                 .field("ordered", ordered)
                 .finish(),
-            AttributeType::Map { key, value } => f
+            AttrTypeKind::Map { key, value } => f
                 .debug_struct("Map")
                 .field("key", key)
                 .field("value", value)
                 .finish(),
-            AttributeType::Struct { name, fields } => f
+            AttrTypeKind::Struct { name, fields } => f
                 .debug_struct("Struct")
                 .field("name", name)
                 .field("fields", fields)
                 .finish(),
-            AttributeType::Union(types) => f.debug_tuple("Union").field(types).finish(),
-            AttributeType::Ref(name) => f.debug_tuple("Ref").field(name).finish(),
+            AttrTypeKind::Union(types) => f.debug_tuple("Union").field(types).finish(),
+            AttrTypeKind::Ref(name) => f.debug_tuple("Ref").field(name).finish(),
         }
     }
 }
@@ -1019,7 +1197,7 @@ impl fmt::Display for FieldPathStep {
 }
 
 /// Path from the validated value's root to the location that produced
-/// a particular [`TypeError`]. Used by [`AttributeType::validate_collect`]
+/// a particular [`TypeError`]. Used by [`AttrTypeKind::validate_collect`]
 /// so the LSP can map errors back to source positions without
 /// re-running validation itself (#2214).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1084,7 +1262,7 @@ impl fmt::Display for FieldPath {
 /// and the standalone `validate_map` so the two walkers cannot
 /// drift again (carina#3347).
 pub(crate) fn lift_map_key(key_type: &AttributeType, key: &str) -> Value {
-    if matches!(key_type, AttributeType::StringEnum { .. }) {
+    if matches!(&key_type.kind, AttrTypeKind::StringEnum { .. }) {
         Value::Concrete(ConcreteValue::EnumIdentifier(key.to_string()))
     } else {
         Value::Concrete(ConcreteValue::String(key.to_string()))
@@ -1108,10 +1286,13 @@ pub fn empty_defs() -> &'static std::collections::BTreeMap<String, AttributeType
 }
 
 impl AttributeType {
-    /// Walk through any [`AttributeType::Ref`] chain at the top of this
-    /// type, returning the first non-`Ref` target.
+    /// Walk through any [`AttrTypeKind::Ref`] chain at the top of this
+    /// type, returning the first non-`Ref` target wrapped in
+    /// [`ResolvedAttrType`].
     ///
-    /// Walk-sites (differ, detail_rows, LSP) must call this *before*
+    /// The wrapped return type is the type-level encoding of the
+    /// carina#3340 invariant: every walk-site (differ, detail_rows,
+    /// LSP, block-name resolution, ...) must peel `Ref` *before*
     /// matching on the type, so the wildcard arm cannot silently
     /// accept a `Ref` and discard its schema information. The
     /// `defs` map is normally `&ResourceSchema::defs`; pass
@@ -1126,13 +1307,13 @@ impl AttributeType {
     pub fn resolve_refs<'a>(
         &'a self,
         defs: &'a std::collections::BTreeMap<String, AttributeType>,
-    ) -> &'a AttributeType {
+    ) -> ResolvedAttrType<'a> {
         let mut cur = self;
         // A small upper bound to catch pathological cycles
         // (`Ref("X") -> Ref("X")`) without hanging the walker.
         for _ in 0..256 {
-            match cur {
-                AttributeType::Ref(name) => match defs.get(name) {
+            match &cur.kind {
+                AttrTypeKind::Ref(name) => match defs.get(name) {
                     Some(next) => cur = next,
                     None => panic!(
                         "AttributeType::Ref(\"{name}\") not found in schema defs; \
@@ -1140,38 +1321,253 @@ impl AttributeType {
                          ResourceSchema.defs for every Ref it emits)"
                     ),
                 },
-                _ => return cur,
+                _ => return ResolvedAttrType::new_after_peel(cur),
             }
         }
         panic!("AttributeType::Ref chain exceeded 256 hops; pathological self-cycle in defs")
     }
 
+    /// Project this type onto a [`Shape`] view with every top-level
+    /// `Ref` already peeled against `defs`.
+    ///
+    /// Callers that need to branch on the type's shape should `match`
+    /// the returned [`Shape`] instead of `&AttributeType`. The
+    /// `Shape` enum has no `Ref` variant, so a wildcard arm in
+    /// `match attr.shape(defs) { ... }` cannot silently swallow a
+    /// `Ref` — the carina#3349 bug class is unreachable at the type
+    /// level.
+    ///
+    /// `defs` is normally `&ResourceSchema::defs` or `&Schema::defs`;
+    /// pass [`empty_defs`] when no resource is in scope.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a `Ref` points to a name not present in `defs` (same
+    /// schema invariant as [`Self::resolve_refs`]).
+    pub fn shape<'a>(
+        &'a self,
+        defs: &'a std::collections::BTreeMap<String, AttributeType>,
+    ) -> Shape<'a> {
+        let resolved = self.resolve_refs(defs).as_attr();
+        match &resolved.kind {
+            AttrTypeKind::String => Shape::String,
+            AttrTypeKind::Int => Shape::Int,
+            AttrTypeKind::Float => Shape::Float,
+            AttrTypeKind::Bool => Shape::Bool,
+            AttrTypeKind::Duration => Shape::Duration,
+            AttrTypeKind::StringEnum {
+                name,
+                values,
+                identity,
+                dsl_aliases,
+            } => Shape::StringEnum {
+                name: name.as_str(),
+                values: values.as_slice(),
+                identity: identity.as_ref(),
+                dsl_aliases: dsl_aliases.as_slice(),
+            },
+            AttrTypeKind::Custom {
+                identity,
+                base,
+                pattern,
+                length,
+                validate,
+                to_dsl,
+            } => Shape::Custom {
+                identity: identity.as_ref(),
+                base: base.as_ref(),
+                pattern: pattern.as_deref(),
+                length: *length,
+                validate,
+                to_dsl: *to_dsl,
+            },
+            AttrTypeKind::CustomEnum {
+                identity,
+                base,
+                validate,
+                to_dsl,
+            } => Shape::CustomEnum {
+                identity,
+                base: base.as_ref(),
+                validate,
+                to_dsl: *to_dsl,
+            },
+            AttrTypeKind::List { inner, ordered } => Shape::List {
+                inner: inner.as_ref(),
+                ordered: *ordered,
+            },
+            AttrTypeKind::Map { key, value } => Shape::Map {
+                key: key.as_ref(),
+                value: value.as_ref(),
+            },
+            AttrTypeKind::Struct { name, fields } => Shape::Struct {
+                name: name.as_str(),
+                fields: fields.as_slice(),
+            },
+            AttrTypeKind::Union(members) => Shape::Union(members.as_slice()),
+            AttrTypeKind::Ref(_) => unreachable!(
+                "resolve_refs guarantees the returned attr is not Ref; \
+                 reaching this arm violates ResolvedAttrType's invariant"
+            ),
+        }
+    }
+
+    /// In-crate inspector for the wrapped variant enum. The
+    /// `pub(crate)` visibility keeps external code on
+    /// [`Self::shape`] (the `Ref`-peeled view); internal code that
+    /// needs to dispatch on a `Ref`-bearing raw view uses this.
+    #[inline]
+    pub(crate) fn kind(&self) -> &AttrTypeKind {
+        &self.kind
+    }
+
+    /// Create the primitive `String` type.
+    pub fn string() -> Self {
+        AttributeType {
+            kind: AttrTypeKind::String,
+        }
+    }
+
+    /// Create the primitive `Int` type.
+    pub fn int() -> Self {
+        AttributeType {
+            kind: AttrTypeKind::Int,
+        }
+    }
+
+    /// Create the primitive `Float` type.
+    pub fn float() -> Self {
+        AttributeType {
+            kind: AttrTypeKind::Float,
+        }
+    }
+
+    /// Create the primitive `Bool` type.
+    pub fn bool() -> Self {
+        AttributeType {
+            kind: AttrTypeKind::Bool,
+        }
+    }
+
+    /// Create the `Duration` primitive type.
+    pub fn duration() -> Self {
+        AttributeType {
+            kind: AttrTypeKind::Duration,
+        }
+    }
+
+    /// Create a `StringEnum` type.
+    pub fn string_enum(
+        name: impl Into<String>,
+        values: Vec<String>,
+        identity: Option<TypeIdentity>,
+        dsl_aliases: Vec<(String, String)>,
+    ) -> Self {
+        AttributeType {
+            kind: AttrTypeKind::StringEnum {
+                name: name.into(),
+                values,
+                identity,
+                dsl_aliases,
+            },
+        }
+    }
+
+    /// Create a structural `Custom` type.
+    pub fn custom(
+        identity: Option<TypeIdentity>,
+        base: AttributeType,
+        pattern: Option<String>,
+        length: Option<(Option<u64>, Option<u64>)>,
+        validate: CustomValidator,
+        to_dsl: Option<fn(&str) -> String>,
+    ) -> Self {
+        AttributeType {
+            kind: AttrTypeKind::Custom {
+                identity,
+                base: Box::new(base),
+                pattern,
+                length,
+                validate,
+                to_dsl,
+            },
+        }
+    }
+
+    /// Create an enum-shorthand `CustomEnum` type.
+    pub fn custom_enum(
+        identity: TypeIdentity,
+        base: AttributeType,
+        validate: CustomValidator,
+        to_dsl: Option<fn(&str) -> String>,
+    ) -> Self {
+        AttributeType {
+            kind: AttrTypeKind::CustomEnum {
+                identity,
+                base: Box::new(base),
+                validate,
+                to_dsl,
+            },
+        }
+    }
+
+    /// Create a `Struct` type.
+    pub fn struct_(name: impl Into<String>, fields: Vec<StructField>) -> Self {
+        AttributeType {
+            kind: AttrTypeKind::Struct {
+                name: name.into(),
+                fields,
+            },
+        }
+    }
+
+    /// Create a `Union` type from member types.
+    pub fn union(members: Vec<AttributeType>) -> Self {
+        AttributeType {
+            kind: AttrTypeKind::Union(members),
+        }
+    }
+
+    /// Create a `Ref` type referencing a named definition in the
+    /// enclosing [`Schema`]'s `defs` map.
+    pub fn ref_(name: impl Into<String>) -> Self {
+        AttributeType {
+            kind: AttrTypeKind::Ref(name.into()),
+        }
+    }
+
     /// Create a List type with default ordering (ordered=true, matching CloudFormation default).
     pub fn list(inner: AttributeType) -> Self {
-        AttributeType::List {
-            inner: Box::new(inner),
-            ordered: true,
+        AttributeType {
+            kind: AttrTypeKind::List {
+                inner: Box::new(inner),
+                ordered: true,
+            },
         }
     }
 
     /// Create an unordered List type (insertionOrder=false).
     pub fn unordered_list(inner: AttributeType) -> Self {
-        AttributeType::List {
-            inner: Box::new(inner),
-            ordered: false,
+        AttributeType {
+            kind: AttrTypeKind::List {
+                inner: Box::new(inner),
+                ordered: false,
+            },
         }
     }
 
     /// Create a Map type with unconstrained string keys.
     pub fn map(value: AttributeType) -> Self {
-        Self::map_with_key(AttributeType::String, value)
+        Self::map_with_key(AttributeType::string(), value)
     }
 
     /// Create a Map type with a typed key constraint.
     pub fn map_with_key(key: AttributeType, value: AttributeType) -> Self {
-        AttributeType::Map {
-            key: Box::new(key),
-            value: Box::new(value),
+        AttributeType {
+            kind: AttrTypeKind::Map {
+                key: Box::new(key),
+                value: Box::new(value),
+            },
         }
     }
 
@@ -1189,8 +1585,8 @@ impl AttributeType {
     }
 
     pub fn string_enum_parts(&self) -> Option<StringEnumParts<'_>> {
-        match self {
-            AttributeType::StringEnum {
+        match &self.kind {
+            AttrTypeKind::StringEnum {
                 name,
                 values,
                 identity,
@@ -1206,8 +1602,8 @@ impl AttributeType {
     }
 
     pub fn namespaced_enum_parts(&self) -> Option<NamespacedEnumParts<'_>> {
-        match self {
-            AttributeType::StringEnum {
+        match &self.kind {
+            AttrTypeKind::StringEnum {
                 name,
                 identity: Some(id),
                 dsl_aliases,
@@ -1216,7 +1612,7 @@ impl AttributeType {
                 let prefix = id.dotted_prefix()?;
                 Some((name, prefix, DslMap::Aliases(dsl_aliases)))
             }
-            AttributeType::CustomEnum {
+            AttrTypeKind::CustomEnum {
                 identity, to_dsl, ..
             } => {
                 // `CustomEnum` always carries an identity with a
@@ -1254,7 +1650,7 @@ impl AttributeType {
         // `Schema::validate` / `Schema::validate_attr`; falling through
         // here would silently accept any value, defeating type safety
         // (carina#3340).
-        if let AttributeType::Ref(name) = self {
+        if let AttrTypeKind::Ref(name) = &self.kind {
             return Err(TypeError::ValidationFailed {
                 message: format!(
                     "internal: AttributeType::Ref(\"{name}\") reached the standalone \
@@ -1270,12 +1666,12 @@ impl AttributeType {
         // fully-qualified, or quoted string). Without this check the
         // deferred value flows through validation unchecked and only
         // surfaces later as a `${vpc}`-style error from the resolver.
-        if let AttributeType::StringEnum {
+        if let AttrTypeKind::StringEnum {
             name,
             values,
             identity,
             dsl_aliases,
-        } = self
+        } = &self.kind
             && let Some(binding) = bare_binding_name(value)
             && enum_alias_collides_with(binding, values, dsl_aliases)
         {
@@ -1297,23 +1693,23 @@ impl AttributeType {
     }
 
     fn validate_concrete(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
-        match self {
-            AttributeType::StringEnum { .. } => self.validate_string_enum(value),
-            AttributeType::Custom { .. } => self.validate_custom(value),
-            AttributeType::CustomEnum { .. } => self.validate_custom_enum(value),
-            AttributeType::List { .. } => self.validate_list(value),
-            AttributeType::Map { .. } => self.validate_map(value),
-            AttributeType::Struct { .. } => self.validate_struct(value),
-            AttributeType::Union(_) => self.validate_union(value),
-            AttributeType::String
-            | AttributeType::Int
-            | AttributeType::Float
-            | AttributeType::Bool
-            | AttributeType::Duration => self.validate_primitive(value),
+        match &self.kind {
+            AttrTypeKind::StringEnum { .. } => self.validate_string_enum(value),
+            AttrTypeKind::Custom { .. } => self.validate_custom(value),
+            AttrTypeKind::CustomEnum { .. } => self.validate_custom_enum(value),
+            AttrTypeKind::List { .. } => self.validate_list(value),
+            AttrTypeKind::Map { .. } => self.validate_map(value),
+            AttrTypeKind::Struct { .. } => self.validate_struct(value),
+            AttrTypeKind::Union(_) => self.validate_union(value),
+            AttrTypeKind::String
+            | AttrTypeKind::Int
+            | AttrTypeKind::Float
+            | AttrTypeKind::Bool
+            | AttrTypeKind::Duration => self.validate_primitive(value),
             // Unreachable: `validate` rejects `Ref` early before
             // descending into the concrete-value dispatch. Kept as an
             // explicit arm so the compiler enforces handling.
-            AttributeType::Ref(name) => Err(TypeError::ValidationFailed {
+            AttrTypeKind::Ref(name) => Err(TypeError::ValidationFailed {
                 message: format!(
                     "internal: AttributeType::Ref(\"{name}\") in validate_concrete; \
                      this attribute must be validated through Schema::validate"
@@ -1332,18 +1728,16 @@ impl AttributeType {
     /// The pre-Phase-2 `Value::Concrete(ConcreteValue::String(_)) | Value::Deferred(DeferredValue::ResourceRef{ .. }) |
     /// Value::Deferred(DeferredValue::Interpolation(_))` arm is now structurally unrepresentable.
     fn validate_primitive(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
-        match (self, value) {
-            (AttributeType::String, ConcreteValueRef::String(_)) => Ok(()),
-            (AttributeType::Int, ConcreteValueRef::Int(_)) => Ok(()),
-            (AttributeType::Float, ConcreteValueRef::Float(f)) if f.is_finite() => Ok(()),
-            (AttributeType::Float, ConcreteValueRef::Float(f)) => {
-                Err(TypeError::ValidationFailed {
-                    message: format!("non-finite float value: {f}"),
-                })
-            }
-            (AttributeType::Float, ConcreteValueRef::Int(_)) => Ok(()),
-            (AttributeType::Bool, ConcreteValueRef::Bool(_)) => Ok(()),
-            (AttributeType::Duration, ConcreteValueRef::Duration(_)) => Ok(()),
+        match (&self.kind, value) {
+            (AttrTypeKind::String, ConcreteValueRef::String(_)) => Ok(()),
+            (AttrTypeKind::Int, ConcreteValueRef::Int(_)) => Ok(()),
+            (AttrTypeKind::Float, ConcreteValueRef::Float(f)) if f.is_finite() => Ok(()),
+            (AttrTypeKind::Float, ConcreteValueRef::Float(f)) => Err(TypeError::ValidationFailed {
+                message: format!("non-finite float value: {f}"),
+            }),
+            (AttrTypeKind::Float, ConcreteValueRef::Int(_)) => Ok(()),
+            (AttrTypeKind::Bool, ConcreteValueRef::Bool(_)) => Ok(()),
+            (AttrTypeKind::Duration, ConcreteValueRef::Duration(_)) => Ok(()),
             _ => Err(TypeError::TypeMismatch {
                 expected: self.type_name(),
                 got: value.type_name().to_string(),
@@ -1360,12 +1754,12 @@ impl AttributeType {
     /// `Value::Deferred(DeferredValue::Interpolation)` and `Value::Deferred(DeferredValue::ResourceRef)` short-circuits
     /// are gone — the dispatcher filters deferred values.
     fn validate_string_enum(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
-        let AttributeType::StringEnum {
+        let AttrTypeKind::StringEnum {
             name,
             values,
             identity,
             dsl_aliases,
-        } = self
+        } = &self.kind
         else {
             unreachable!("validate_string_enum called on non-StringEnum");
         };
@@ -1530,7 +1924,7 @@ impl AttributeType {
     ///
     /// Pre-carina#3222 this function also handled enum-shaped Customs
     /// (gated on `namespace.is_some()`); those are now
-    /// [`AttributeType::CustomEnum`] and dispatched separately by
+    /// [`AttrTypeKind::CustomEnum`] and dispatched separately by
     /// [`Self::validate_custom_enum`], so the enum-shorthand gate is
     /// gone — the structurally-validated arm is the only thing left.
     ///
@@ -1538,7 +1932,7 @@ impl AttributeType {
     /// guard for `Value::Deferred(DeferredValue::ResourceRef)`/`Value::Deferred(DeferredValue::Interpolation)` is gone —
     /// the dispatcher filters them out in [`Self::validate`].
     fn validate_custom(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
-        let AttributeType::Custom { validate, .. } = self else {
+        let AttrTypeKind::Custom { validate, .. } = &self.kind else {
             unreachable!("validate_custom called on non-Custom");
         };
         validate(&value.to_owned_value())
@@ -1556,9 +1950,9 @@ impl AttributeType {
     /// is structurally impossible here because structural `Custom`
     /// cannot reach this dispatch.
     fn validate_custom_enum(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
-        let AttributeType::CustomEnum {
+        let AttrTypeKind::CustomEnum {
             validate, identity, ..
-        } = self
+        } = &self.kind
         else {
             unreachable!("validate_custom_enum called on non-CustomEnum");
         };
@@ -1577,7 +1971,7 @@ impl AttributeType {
     /// `Ok(())` immediately. Type fitness for upstream list refs is
     /// the deferred-aware checker's job.
     fn validate_list(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
-        let AttributeType::List { inner, .. } = self else {
+        let AttrTypeKind::List { inner, .. } = &self.kind else {
             unreachable!("validate_list called on non-List");
         };
         // `ConcreteValueRef::StringList` is the canonicalized form for
@@ -1616,10 +2010,10 @@ impl AttributeType {
     /// `validate_list` migration — deferred values are filtered at the
     /// dispatcher and cannot reach here.
     fn validate_map(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
-        let AttributeType::Map {
+        let AttrTypeKind::Map {
             key: key_type,
             value: inner,
-        } = self
+        } = &self.kind
         else {
             unreachable!("validate_map called on non-Map");
         };
@@ -1657,7 +2051,7 @@ impl AttributeType {
     /// Phase 2 of RFC #2972: takes [`ConcreteValueRef`]; deferred values
     /// are filtered upstream by the dispatcher.
     fn validate_struct(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
-        let AttributeType::Struct { name, fields } = self else {
+        let AttrTypeKind::Struct { name, fields } = &self.kind else {
             unreachable!("validate_struct called on non-Struct");
         };
 
@@ -1725,7 +2119,7 @@ impl AttributeType {
     /// shares any structural similarity, fall through to `TypeMismatch`.
     /// See #2219.
     fn validate_union(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
-        let AttributeType::Union(types) = self else {
+        let AttrTypeKind::Union(types) = &self.kind else {
             unreachable!("validate_union called on non-Union");
         };
         let mut best: Option<(u32, TypeError)> = None;
@@ -1751,32 +2145,32 @@ impl AttributeType {
     }
 
     pub fn type_name(&self) -> String {
-        match self {
-            AttributeType::String => "String".to_string(),
-            AttributeType::Int => "Int".to_string(),
-            AttributeType::Float => "Float".to_string(),
-            AttributeType::Bool => "Bool".to_string(),
-            AttributeType::Duration => "Duration".to_string(),
-            AttributeType::StringEnum { name, .. } => name.clone(),
-            AttributeType::Custom {
+        match &self.kind {
+            AttrTypeKind::String => "String".to_string(),
+            AttrTypeKind::Int => "Int".to_string(),
+            AttrTypeKind::Float => "Float".to_string(),
+            AttrTypeKind::Bool => "Bool".to_string(),
+            AttrTypeKind::Duration => "Duration".to_string(),
+            AttrTypeKind::StringEnum { name, .. } => name.clone(),
+            AttrTypeKind::Custom {
                 identity,
                 pattern,
                 length,
                 ..
             } => custom_display_name(identity.as_ref(), pattern.as_deref(), length.as_ref()),
-            AttributeType::CustomEnum { identity, .. } => {
+            AttrTypeKind::CustomEnum { identity, .. } => {
                 // CustomEnum carries no pattern/length — the value form
                 // is a namespaced enum, fully described by its identity.
                 custom_display_name(Some(identity), None, None)
             }
-            AttributeType::List { inner, .. } => format!("List<{}>", inner.type_name()),
-            AttributeType::Map { value: inner, .. } => format!("Map<{}>", inner.type_name()),
-            AttributeType::Struct { name, .. } => format!("Struct({})", name),
-            AttributeType::Union(types) => {
+            AttrTypeKind::List { inner, .. } => format!("List<{}>", inner.type_name()),
+            AttrTypeKind::Map { value: inner, .. } => format!("Map<{}>", inner.type_name()),
+            AttrTypeKind::Struct { name, .. } => format!("Struct({})", name),
+            AttrTypeKind::Union(types) => {
                 let names: Vec<String> = types.iter().map(|t| t.type_name()).collect();
                 names.join(" | ")
             }
-            AttributeType::Ref(name) => format!("Ref({name})"),
+            AttrTypeKind::Ref(name) => format!("Ref({name})"),
         }
     }
 
@@ -1784,8 +2178,8 @@ impl AttributeType {
     /// For Union types, returns true if any member accepts the name.
     /// For other types, returns true if self.type_name() == name.
     pub fn accepts_type_name(&self, name: &str) -> bool {
-        match self {
-            AttributeType::Union(types) => types.iter().any(|t| t.accepts_type_name(name)),
+        match &self.kind {
+            AttrTypeKind::Union(types) => types.iter().any(|t| t.accepts_type_name(name)),
             _ => self.type_name() == name,
         }
     }
@@ -1794,7 +2188,7 @@ impl AttributeType {
     /// Used for cross-schema type compatibility: all String-based Custom types
     /// are considered compatible with each other.
     pub fn is_string_based_custom(&self) -> bool {
-        matches!(self, AttributeType::Custom { base, .. } if matches!(**base, AttributeType::String))
+        matches!(&self.kind, AttrTypeKind::Custom { base, .. } if matches!(base.kind, AttrTypeKind::String))
     }
 
     /// Check if a value of `self`'s type can be assigned to a sink of
@@ -1843,14 +2237,14 @@ impl AttributeType {
     /// regex-containment proofs through the type system. Loosening here
     /// re-introduces the silent-false-positive class that #2218 closed.
     pub fn is_assignable_to(&self, sink: &AttributeType) -> bool {
-        use AttributeType::*;
-        if let Union(members) = sink {
+        use AttrTypeKind::*;
+        if let Union(members) = &sink.kind {
             return members.iter().any(|m| self.is_assignable_to(m));
         }
-        if let Union(members) = self {
+        if let Union(members) = &self.kind {
             return members.iter().all(|m| m.is_assignable_to(sink));
         }
-        match (self, sink) {
+        match (&self.kind, &sink.kind) {
             (
                 Custom {
                     identity: Some(s_id),
@@ -1894,9 +2288,9 @@ impl AttributeType {
                 }
                 s_base.is_assignable_to(k_base)
             }
-            (Custom { base, .. }, non_custom) => base.is_assignable_to(non_custom),
+            (Custom { base, .. }, _non_custom_kind) => base.is_assignable_to(sink),
             (_non_custom, Custom { .. }) => false,
-            (a, b) => a.type_name() == b.type_name(),
+            (_a, _b) => self.type_name() == sink.type_name(),
         }
     }
 }
@@ -1949,8 +2343,8 @@ pub fn string_enum_identity(name: &str, namespace: Option<&str>) -> TypeIdentity
 /// On a tie, the first member at the maximum wins — `validate_union`
 /// uses strict `>` so declaration order is preserved.
 pub(crate) fn union_member_score(member: &AttributeType, value: ConcreteValueRef<'_>) -> u32 {
-    use AttributeType as AT;
-    match (member, value) {
+    use AttrTypeKind as AT;
+    match (&member.kind, value) {
         // Map↔Struct: the original heuristic. Highest score so a
         // Struct member's "Unknown field 'x'" wins over a sibling's
         // generic `TypeMismatch`.
@@ -2054,8 +2448,8 @@ pub(crate) fn select_union_member<'a>(
 /// Both the canonical `name` and any `block_name` alias resolve to the
 /// same field, so users can write either form interchangeably.
 ///
-/// Used by both [`AttributeType::validate`] (single-shot) and
-/// [`AttributeType::validate_collect`] (path-tagged) so the two paths
+/// Used by both [`AttrTypeKind::validate`] (single-shot) and
+/// [`AttrTypeKind::validate_collect`] (path-tagged) so the two paths
 /// agree on which keys are accepted (#2214 — the LSP previously did
 /// this alias resolution itself, which let the two validators drift).
 pub(crate) fn build_accepted_field_map(fields: &[StructField]) -> HashMap<&str, &StructField> {
@@ -2143,7 +2537,7 @@ fn string_enum_value_matches(input: &str, expected: &str) -> bool {
 /// context. Presence of `attribute` and `type_name` is independent — both,
 /// either, or neither may be set. `expected` is rendered as-is; callers are
 /// responsible for passing fully-qualified variants for namespaced enums.
-/// Reshape an error from `AttributeType::validate` into a shape-mismatch
+/// Reshape an error from `AttrTypeKind::validate` into a shape-mismatch
 /// diagnostic when the attribute's value came from a quoted string literal
 /// and the schema expects an enum-shaped identifier (a `StringEnum`, or a
 /// namespaced `Custom` type).
@@ -2163,7 +2557,7 @@ fn reshape_for_string_literal(
     attr_name: &str,
 ) -> TypeError {
     // StringEnum: the error already has enough structure to reshape cleanly.
-    if matches!(attr_type, AttributeType::StringEnum { .. }) {
+    if matches!(&attr_type.kind, AttrTypeKind::StringEnum { .. }) {
         return tagged.into_string_literal_diagnostic();
     }
 
@@ -2178,7 +2572,7 @@ fn reshape_for_string_literal(
     // Pre-#3222 this matched on `Custom { namespace: Some(_), .. }`
     // — the runtime enum-marker form. The shape moved to a sibling
     // variant, so the match is now structural.
-    if let AttributeType::CustomEnum { identity, .. } = attr_type
+    if let AttrTypeKind::CustomEnum { identity, .. } = &attr_type.kind
         && let Value::Concrete(ConcreteValue::String(typed)) = value
         && let TypeError::ValidationFailed { message } = &tagged
     {
@@ -2342,7 +2736,7 @@ pub enum TypeError {
         value: String,
         /// Attribute the value was assigned to (e.g. `"target_id"`). Set by
         /// caller-side wrapping (see `TypeError::with_attribute`) — the
-        /// `AttributeType::validate` primitive itself doesn't know the name.
+        /// `AttrTypeKind::validate` primitive itself doesn't know the name.
         attribute: Option<String>,
         /// Name of the `StringEnum` type that was being matched against
         /// (e.g. `"TargetType"`). Set when available so the diagnostic can
@@ -2444,7 +2838,7 @@ impl TypeError {
     /// Callers that know which attribute produced the error (e.g. the
     /// attribute loop in `ResourceSchema::validate`) wrap the primitive
     /// error before it reaches CLI/LSP diagnostic text. This keeps
-    /// `AttributeType::validate` unaware of attribute names while still
+    /// `AttrTypeKind::validate` unaware of attribute names while still
     /// letting the final message say `for 'target_id'`.
     ///
     /// See #2098. `InvalidEnumVariant` is the only variant enriched for
@@ -2843,7 +3237,7 @@ pub struct ResourceSchema {
     /// against this resource type. `None` falls back to
     /// [`WAIT_DEFAULT_INTERVAL`].
     pub default_wait_interval: Option<std::time::Duration>,
-    /// Named definitions reachable via [`AttributeType::Ref`] from this
+    /// Named definitions reachable via [`AttrTypeKind::Ref`] from this
     /// resource's attribute types. Empty for resources whose attribute
     /// graph contains no cycles (the common case).
     ///
@@ -2886,7 +3280,7 @@ impl ResourceSchema {
         }
     }
 
-    /// Attach a named definition reachable via [`AttributeType::Ref`].
+    /// Attach a named definition reachable via [`AttrTypeKind::Ref`].
     ///
     /// Used by codegen to register cyclic CFN struct definitions
     /// (WAFv2 `WebACL.Statement`, AppSync `GraphQLApi`, ...). Each
@@ -3054,7 +3448,7 @@ impl ResourceSchema {
     ///
     /// Use this in every place that needs to validate or canonicalize
     /// against a single attribute of the resource: the resulting
-    /// `Schema` is the only API that resolves `AttributeType::Ref`
+    /// `Schema` is the only API that resolves `AttrTypeKind::Ref`
     /// against this resource's def map, so a future caller that needs
     /// per-attribute validation cannot accidentally drop `defs`
     /// (carina#3345). The `root` argument is typically
@@ -3097,7 +3491,7 @@ impl ResourceSchema {
     }
 
     /// As [`validate_with_origins`], but also runs `lookup` on every
-    /// `AttributeType::Custom` value reached during traversal so
+    /// `AttrTypeKind::Custom` value reached during traversal so
     /// provider-supplied validators that the schema itself cannot
     /// carry (WASM plugin path) still get to reject bad values.
     pub fn validate_with_origins_and_lookup(
@@ -3136,8 +3530,8 @@ impl ResourceSchema {
         // Build a `Schema` view over this resource's `defs` once so
         // every attribute validation walks the same def map. Routing
         // through `Schema::validate_attr` is what makes cyclic CFN
-        // attributes (`AttributeType::Ref`) resolve correctly; the
-        // `defs`-less `AttributeType::validate(value)` call this
+        // attributes (`AttrTypeKind::Ref`) resolve correctly; the
+        // `defs`-less `AttrTypeKind::validate(value)` call this
         // replaced trips the "reached the standalone validator"
         // sentinel for every Ref-containing attribute (carina#3345,
         // post-#3340 awscc `s3.Bucket/*` failures).
@@ -3235,8 +3629,8 @@ pub fn collect_all_block_names(registry: &SchemaRegistry) -> HashMap<String, Str
 }
 
 fn collect_block_names_from_type(attr_type: &AttributeType, result: &mut HashMap<String, String>) {
-    match attr_type {
-        AttributeType::Struct { fields, .. } => {
+    match &attr_type.kind {
+        AttrTypeKind::Struct { fields, .. } => {
             for field in fields {
                 if let Some(bn) = &field.block_name {
                     result.insert(field.name.clone(), bn.clone());
@@ -3244,13 +3638,13 @@ fn collect_block_names_from_type(attr_type: &AttributeType, result: &mut HashMap
                 collect_block_names_from_type(&field.field_type, result);
             }
         }
-        AttributeType::List { inner, .. } => {
+        AttrTypeKind::List { inner, .. } => {
             collect_block_names_from_type(inner, result);
         }
-        AttributeType::Map { value: inner, .. } => {
+        AttrTypeKind::Map { value: inner, .. } => {
             collect_block_names_from_type(inner, result);
         }
-        AttributeType::Union(types) => {
+        AttrTypeKind::Union(types) => {
             for t in types {
                 collect_block_names_from_type(t, result);
             }
@@ -3258,15 +3652,15 @@ fn collect_block_names_from_type(attr_type: &AttributeType, result: &mut HashMap
         // `Ref`: do not follow — the caller visits `schema.defs`
         // entries directly to avoid infinite recursion on cyclic
         // schemas (carina#3340).
-        AttributeType::Ref(_) => {}
-        AttributeType::String
-        | AttributeType::Int
-        | AttributeType::Float
-        | AttributeType::Bool
-        | AttributeType::Duration
-        | AttributeType::StringEnum { .. }
-        | AttributeType::Custom { .. }
-        | AttributeType::CustomEnum { .. } => {}
+        AttrTypeKind::Ref(_) => {}
+        AttrTypeKind::String
+        | AttrTypeKind::Int
+        | AttrTypeKind::Float
+        | AttrTypeKind::Bool
+        | AttrTypeKind::Duration
+        | AttrTypeKind::StringEnum { .. }
+        | AttrTypeKind::Custom { .. }
+        | AttrTypeKind::CustomEnum { .. } => {}
     }
 }
 
@@ -3275,9 +3669,17 @@ fn collect_block_names_from_type(attr_type: &AttributeType, result: &mut HashMap
 /// For each key in `map` that matches a `block_name` on a struct field,
 /// renames it to the canonical field name. Also recurses into nested
 /// struct values to resolve block names at all nesting levels.
+///
+/// `defs` is the resource schema's `defs` map; nested fields typed as
+/// [`AttrTypeKind::Ref`] are peeled against it via
+/// [`AttrTypeKind::resolve_refs`] before recursion so block-name
+/// resolution reaches inside cyclic CFN-style schemas (carina#3340 /
+/// carina#3349). A `Ref` whose name is not in `defs` is a schema
+/// invariant violation and panics through `resolve_refs`.
 fn resolve_block_names_in_map(
     map: &mut IndexMap<String, Value>,
     fields: &[StructField],
+    defs: &std::collections::BTreeMap<String, AttributeType>,
     resource_id: &str,
     errors: &mut Vec<String>,
 ) {
@@ -3326,25 +3728,54 @@ fn resolve_block_names_in_map(
             Some(v) => v,
             None => continue,
         };
-        match &field.field_type {
-            AttributeType::Struct { fields: inner, .. } => {
-                if let Value::Concrete(ConcreteValue::Map(inner_map)) = value {
-                    resolve_block_names_in_map(inner_map, inner, resource_id, errors);
-                }
+        recurse_block_names_into_value(&field.field_type, value, defs, resource_id, errors);
+    }
+}
+
+/// Drive the block-name recursion through a single `(field_type, value)`
+/// pair, peeling any [`AttrTypeKind::Ref`] hops against `defs` before
+/// dispatching on `Struct` / `List`. Factored out so the top-level
+/// `resolve_block_names` walk and the nested `resolve_block_names_in_map`
+/// walk share the same Ref-handling code path — both used to drop `Ref`
+/// into a `_ => {}` arm (carina#3349).
+///
+/// `Ref` peeling delegates to [`AttrTypeKind::resolve_refs`] for both
+/// the outer type and a nested `List<Ref>` element, so the panic
+/// semantics on dangling refs match every other walk-site (carina#3340).
+fn recurse_block_names_into_value(
+    field_type: &AttributeType,
+    value: &mut Value,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+    resource_id: &str,
+    errors: &mut Vec<String>,
+) {
+    // Project onto `Shape` so `Ref` is peeled at the type level
+    // (carina#3349). The `Shape` enum has no `Ref` variant, so the
+    // wildcard arm below cannot silently swallow a `Ref` — the bug
+    // class is structurally impossible.
+    match field_type.shape(defs) {
+        Shape::Struct { fields: inner, .. } => {
+            if let Value::Concrete(ConcreteValue::Map(inner_map)) = value {
+                resolve_block_names_in_map(inner_map, inner, defs, resource_id, errors);
             }
-            AttributeType::List { inner, .. } => {
-                if let AttributeType::Struct { fields: inner, .. } = inner.as_ref()
-                    && let Value::Concrete(ConcreteValue::List(items)) = value
-                {
-                    for item in items.iter_mut() {
-                        if let Value::Concrete(ConcreteValue::Map(item_map)) = item {
-                            resolve_block_names_in_map(item_map, inner, resource_id, errors);
-                        }
+        }
+        Shape::List { inner, .. } => {
+            // `List<Ref>`: peel the element type too via `shape(defs)`
+            // so the walk reaches the underlying struct fields.
+            if let Shape::Struct { fields: inner, .. } = inner.shape(defs)
+                && let Value::Concrete(ConcreteValue::List(items)) = value
+            {
+                for item in items.iter_mut() {
+                    if let Value::Concrete(ConcreteValue::Map(item_map)) = item {
+                        resolve_block_names_in_map(item_map, inner, defs, resource_id, errors);
                     }
                 }
             }
-            _ => {}
         }
+        // Other shapes (primitives, StringEnum, Custom, Map, Union) do
+        // not carry block-name aliases reachable from here. `Ref` is
+        // structurally absent from `Shape`.
+        _ => {}
     }
 }
 
@@ -3409,41 +3840,28 @@ pub fn resolve_block_names(
             resource.attributes.insert(canon_key, expr);
         }
 
-        // Recurse into nested struct values to resolve block names at all levels
+        // Recurse into nested struct values to resolve block names at
+        // all levels. `recurse_block_names_into_value` peels
+        // `AttrTypeKind::Ref` against `schema.defs` so cyclic CFN
+        // schemas (carina#3340) still see their block-name aliases
+        // (carina#3349). The top-level walk previously dropped `Ref`
+        // into a `_ => {}` arm, which made `awscc.s3.Bucket`'s
+        // `lifecycle_configuration` (typed `Ref("LifecycleConfiguration")`)
+        // reject the documented `rule { }` block syntax with
+        // "Required attribute 'rules' is missing".
+        let resource_id = resource.id.to_string();
         for (attr_name, attr_schema) in &schema.attributes {
             let value = match resource.attributes.get_mut(attr_name) {
                 Some(v) => v,
                 None => continue,
             };
-            match &attr_schema.attr_type {
-                AttributeType::Struct { fields, .. } => {
-                    if let Value::Concrete(ConcreteValue::Map(inner_map)) = value {
-                        resolve_block_names_in_map(
-                            inner_map,
-                            fields,
-                            &resource.id.to_string(),
-                            &mut all_errors,
-                        );
-                    }
-                }
-                AttributeType::List { inner, .. } => {
-                    if let AttributeType::Struct { fields, .. } = inner.as_ref()
-                        && let Value::Concrete(ConcreteValue::List(items)) = value
-                    {
-                        for item in items.iter_mut() {
-                            if let Value::Concrete(ConcreteValue::Map(item_map)) = item {
-                                resolve_block_names_in_map(
-                                    item_map,
-                                    fields,
-                                    &resource.id.to_string(),
-                                    &mut all_errors,
-                                );
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
+            recurse_block_names_into_value(
+                &attr_schema.attr_type,
+                value,
+                &schema.defs,
+                &resource_id,
+                &mut all_errors,
+            );
         }
     }
 
@@ -3462,12 +3880,12 @@ pub mod types {
 
     /// Positive integer type
     pub fn positive_int() -> AttributeType {
-        AttributeType::Custom {
-            identity: Some(TypeIdentity::bare("PositiveInt")),
-            base: Box::new(AttributeType::Int),
-            pattern: None,
-            length: None,
-            validate: legacy_validator(|value| {
+        AttributeType::custom(
+            Some(TypeIdentity::bare("PositiveInt")),
+            AttributeType::int(),
+            None,
+            None,
+            legacy_validator(|value| {
                 if let Value::Concrete(ConcreteValue::Int(n)) = value {
                     if *n > 0 {
                         Ok(())
@@ -3478,85 +3896,85 @@ pub mod types {
                     Err("Expected integer".to_string())
                 }
             }),
-            to_dsl: None,
-        }
+            None,
+        )
     }
 
     /// IPv4 CIDR block type (e.g., "10.0.0.0/16")
     pub fn ipv4_cidr() -> AttributeType {
-        AttributeType::Custom {
-            identity: Some(TypeIdentity::bare("Ipv4Cidr")),
-            base: Box::new(AttributeType::String),
-            pattern: None,
-            length: None,
-            validate: legacy_validator(|value| {
+        AttributeType::custom(
+            Some(TypeIdentity::bare("Ipv4Cidr")),
+            AttributeType::string(),
+            None,
+            None,
+            legacy_validator(|value| {
                 if let Value::Concrete(ConcreteValue::String(s)) = value {
                     validate_ipv4_cidr(s)
                 } else {
                     Err("Expected string".to_string())
                 }
             }),
-            to_dsl: None,
-        }
+            None,
+        )
     }
 
     /// IPv4 address type (e.g., "10.0.1.5", "192.168.0.1")
     pub fn ipv4_address() -> AttributeType {
-        AttributeType::Custom {
-            identity: Some(TypeIdentity::bare("Ipv4Address")),
-            base: Box::new(AttributeType::String),
-            pattern: None,
-            length: None,
-            validate: legacy_validator(|value| {
+        AttributeType::custom(
+            Some(TypeIdentity::bare("Ipv4Address")),
+            AttributeType::string(),
+            None,
+            None,
+            legacy_validator(|value| {
                 if let Value::Concrete(ConcreteValue::String(s)) = value {
                     validate_ipv4_address(s)
                 } else {
                     Err("Expected string".to_string())
                 }
             }),
-            to_dsl: None,
-        }
+            None,
+        )
     }
 
     /// IPv6 address type (e.g., "2001:db8::1", "::1")
     pub fn ipv6_address() -> AttributeType {
-        AttributeType::Custom {
-            identity: Some(TypeIdentity::bare("Ipv6Address")),
-            base: Box::new(AttributeType::String),
-            pattern: None,
-            length: None,
-            validate: legacy_validator(|value| {
+        AttributeType::custom(
+            Some(TypeIdentity::bare("Ipv6Address")),
+            AttributeType::string(),
+            None,
+            None,
+            legacy_validator(|value| {
                 if let Value::Concrete(ConcreteValue::String(s)) = value {
                     validate_ipv6_address(s)
                 } else {
                     Err("Expected string".to_string())
                 }
             }),
-            to_dsl: None,
-        }
+            None,
+        )
     }
 
     /// IPv6 CIDR block type (e.g., "2001:db8::/32", "::/0")
     pub fn ipv6_cidr() -> AttributeType {
-        AttributeType::Custom {
-            identity: Some(TypeIdentity::bare("Ipv6Cidr")),
-            base: Box::new(AttributeType::String),
-            pattern: None,
-            length: None,
-            validate: legacy_validator(|value| {
+        AttributeType::custom(
+            Some(TypeIdentity::bare("Ipv6Cidr")),
+            AttributeType::string(),
+            None,
+            None,
+            legacy_validator(|value| {
                 if let Value::Concrete(ConcreteValue::String(s)) = value {
                     validate_ipv6_cidr(s)
                 } else {
                     Err("Expected string".to_string())
                 }
             }),
-            to_dsl: None,
-        }
+            None,
+        )
     }
 
     /// CIDR block type that accepts both IPv4 and IPv6 (e.g., "10.0.0.0/16" or "2001:db8::/32")
     pub fn cidr() -> AttributeType {
-        AttributeType::Union(vec![ipv4_cidr(), ipv6_cidr()])
+        AttributeType::union(vec![ipv4_cidr(), ipv6_cidr()])
     }
 
     /// Email address type (RFC 5322-ish lightweight validation).
@@ -3565,20 +3983,20 @@ pub mod types {
     /// requires a non-empty local part, a single `@`, and a domain that
     /// contains at least one dot with non-empty labels.
     pub fn email() -> AttributeType {
-        AttributeType::Custom {
-            identity: Some(TypeIdentity::bare("Email")),
-            base: Box::new(AttributeType::String),
-            pattern: None,
-            length: None,
-            validate: legacy_validator(|value| {
+        AttributeType::custom(
+            Some(TypeIdentity::bare("Email")),
+            AttributeType::string(),
+            None,
+            None,
+            legacy_validator(|value| {
                 if let Value::Concrete(ConcreteValue::String(s)) = value {
                     validate_email(s)
                 } else {
                     Err("Expected string".to_string())
                 }
             }),
-            to_dsl: None,
-        }
+            None,
+        )
     }
 }
 

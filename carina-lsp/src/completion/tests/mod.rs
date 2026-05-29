@@ -81,22 +81,22 @@ pub(super) fn test_provider_with_custom_types() -> CompletionProvider {
 pub(super) fn test_provider_with_block_name_nested() -> CompletionProvider {
     // Nested struct where a StructField has block_name set.
     // Schema: config -> transitions (List<Struct>, block_name="transition") -> each has "days" + "storage_class"
-    let transition_struct = AttributeType::Struct {
-        name: "Transition".to_string(),
-        fields: vec![
-            StructField::new("days", AttributeType::Int),
-            StructField::new("storage_class", AttributeType::String),
+    let transition_struct = AttributeType::struct_(
+        "Transition".to_string(),
+        vec![
+            StructField::new("days", AttributeType::int()),
+            StructField::new("storage_class", AttributeType::string()),
         ],
-    };
+    );
 
-    let config_struct = AttributeType::Struct {
-        name: "Config".to_string(),
-        fields: vec![
+    let config_struct = AttributeType::struct_(
+        "Config".to_string(),
+        vec![
             StructField::new("transitions", AttributeType::list(transition_struct))
                 .with_block_name("transition"),
-            StructField::new("enabled", AttributeType::Bool),
+            StructField::new("enabled", AttributeType::bool()),
         ],
-    };
+    );
 
     let schema = ResourceSchema::new("block.resource")
         .attribute(AttributeSchema::new("config", config_struct));
@@ -108,21 +108,21 @@ pub(super) fn test_provider_with_block_name_nested() -> CompletionProvider {
 }
 
 pub(super) fn test_provider_with_nested_structs() -> CompletionProvider {
-    let inner_struct = AttributeType::Struct {
-        name: "InnerStruct".to_string(),
-        fields: vec![
-            StructField::new("leaf_field", AttributeType::String),
-            StructField::new("leaf_bool", AttributeType::Bool),
+    let inner_struct = AttributeType::struct_(
+        "InnerStruct".to_string(),
+        vec![
+            StructField::new("leaf_field", AttributeType::string()),
+            StructField::new("leaf_bool", AttributeType::bool()),
         ],
-    };
+    );
 
-    let outer_struct = AttributeType::Struct {
-        name: "OuterStruct".to_string(),
-        fields: vec![
+    let outer_struct = AttributeType::struct_(
+        "OuterStruct".to_string(),
+        vec![
             StructField::new("inner", inner_struct),
-            StructField::new("outer_field", AttributeType::String),
+            StructField::new("outer_field", AttributeType::string()),
         ],
-    };
+    );
 
     let schema = ResourceSchema::new("nested.resource")
         .attribute(AttributeSchema::new("outer", outer_struct));
@@ -138,7 +138,7 @@ pub(super) fn test_provider_with_nested_structs() -> CompletionProvider {
 /// without needing real provider schemas.
 pub(super) fn test_provider_single_attr() -> CompletionProvider {
     let schema = ResourceSchema::new("foo.bar")
-        .attribute(AttributeSchema::new("attr", AttributeType::String));
+        .attribute(AttributeSchema::new("attr", AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("test", schema);
     CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![])
@@ -148,12 +148,12 @@ pub(super) fn test_provider_single_attr() -> CompletionProvider {
 /// `region_completions_data`, so tests can detect region pollution in
 /// type-incompatible completion paths (see #1974).
 pub(super) fn test_provider_with_enum_and_regions() -> CompletionProvider {
-    let status_enum = AttributeType::StringEnum {
-        name: "VersioningStatus".to_string(),
-        values: vec!["Enabled".to_string(), "Suspended".to_string()],
-        identity: None,
-        dsl_aliases: vec![],
-    };
+    let status_enum = AttributeType::string_enum(
+        "VersioningStatus".to_string(),
+        vec!["Enabled".to_string(), "Suspended".to_string()],
+        None,
+        vec![],
+    );
     let schema = ResourceSchema::new("s3.Bucket")
         .attribute(AttributeSchema::new("versioning_status", status_enum));
     let mut schemas = SchemaRegistry::new();
@@ -181,18 +181,18 @@ pub(super) fn test_provider_with_enum_and_regions() -> CompletionProvider {
 /// Provider with StringEnum that has name but no namespace (simulates WASM provider).
 pub(super) fn test_provider_with_nameless_enum() -> CompletionProvider {
     // Top-level attribute with StringEnum (no namespace)
-    let status_enum = AttributeType::StringEnum {
-        name: "VersioningStatus".to_string(),
-        values: vec!["Enabled".to_string(), "Suspended".to_string()],
-        identity: None,
-        dsl_aliases: vec![],
-    };
+    let status_enum = AttributeType::string_enum(
+        "VersioningStatus".to_string(),
+        vec!["Enabled".to_string(), "Suspended".to_string()],
+        None,
+        vec![],
+    );
 
     // Nested struct field with StringEnum (no namespace)
-    let versioning_struct = AttributeType::Struct {
-        name: "VersioningConfiguration".to_string(),
-        fields: vec![StructField::new("status", status_enum.clone())],
-    };
+    let versioning_struct = AttributeType::struct_(
+        "VersioningConfiguration".to_string(),
+        vec![StructField::new("status", status_enum.clone())],
+    );
 
     let schema = ResourceSchema::new("s3.Bucket")
         .attribute(AttributeSchema::new("versioning_status", status_enum))
@@ -217,16 +217,16 @@ pub(super) fn test_provider_with_vpc_and_security_group() -> CompletionProvider 
     fn noop_validate(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let vpc_id_custom = AttributeType::Custom {
-        identity: Some(carina_core::schema::TypeIdentity::bare("VpcId")),
-        base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
-        validate: legacy_validator(noop_validate),
-        to_dsl: None,
-    };
+    let vpc_id_custom = AttributeType::custom(
+        Some(carina_core::schema::TypeIdentity::bare("VpcId")),
+        AttributeType::string(),
+        None,
+        None,
+        legacy_validator(noop_validate),
+        None,
+    );
     let vpc = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
         .attribute(AttributeSchema::new("vpc_id", vpc_id_custom.clone()));
     let security_group = ResourceSchema::new("ec2.SecurityGroup")
         .attribute(AttributeSchema::new("vpc_id", vpc_id_custom));
@@ -245,23 +245,23 @@ pub(super) fn test_provider_with_custom_semantic_attr() -> CompletionProvider {
     fn noop_validate(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let account_id = AttributeType::Custom {
-        identity: Some(carina_core::schema::TypeIdentity::bare("aws_account_id")),
-        base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
-        validate: legacy_validator(noop_validate),
-        to_dsl: None,
-    };
-    let principal_type = AttributeType::StringEnum {
-        name: "PrincipalType".to_string(),
-        values: vec!["GROUP".to_string(), "USER".to_string()],
-        identity: Some(carina_core::schema::string_enum_identity(
+    let account_id = AttributeType::custom(
+        Some(carina_core::schema::TypeIdentity::bare("aws_account_id")),
+        AttributeType::string(),
+        None,
+        None,
+        legacy_validator(noop_validate),
+        None,
+    );
+    let principal_type = AttributeType::string_enum(
+        "PrincipalType".to_string(),
+        vec!["GROUP".to_string(), "USER".to_string()],
+        Some(carina_core::schema::string_enum_identity(
             "PrincipalType",
             Some("awscc.sso.Assignment"),
         )),
-        dsl_aliases: vec![],
-    };
+        vec![],
+    );
     let schema = ResourceSchema::new("sso.Assignment")
         .attribute(AttributeSchema::new("principal_type", principal_type))
         .attribute(AttributeSchema::new("target_id", account_id));
