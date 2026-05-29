@@ -81,7 +81,7 @@ fn invalid_enum_variant_bare_display() {
         identity: None,
         dsl_aliases: vec![],
     };
-    let err = t
+    let err = carina_core::schema::Schema::flat(t.clone())
         .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "zzz".to_string(),
         )))
@@ -104,7 +104,7 @@ fn invalid_enum_variant_with_dsl_aliases_display() {
             ("Suspended".to_string(), "suspended".to_string()),
         ],
     };
-    let err = t
+    let err = carina_core::schema::Schema::flat(t.clone())
         .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "zzz".to_string(),
         )))

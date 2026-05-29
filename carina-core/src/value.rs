@@ -1369,22 +1369,15 @@ fn peel_custom(t: &AttributeType) -> &AttributeType {
 ///   type for the schema) or carry an unresolved expression that must
 ///   be canonicalized after resolution by a later pass.
 ///
-/// For non-`string_or_list_of_strings` types, the function still
-/// recurses into containers so that struct/list/map fields whose
-/// declared type *is* the union are canonicalized in place. Returns
-/// `value` unchanged when no nested canonicalization applies.
+/// `defs` carries the enclosing [`crate::schema::ResourceSchema::defs`]
+/// map so cyclic CFN definitions (`AttributeType::Ref`) are followed
+/// during the walk (carina#3340). The `Ref` arm resolves and recurses;
+/// primitives / unions terminate as before. Pass
+/// [`crate::schema::empty_defs()`] when the caller is confident no
+/// `Ref` is reachable.
 ///
 /// See #2481, #2510.
-pub fn canonicalize_with_type(value: Value, attr_type: &AttributeType) -> Value {
-    canonicalize_with_type_and_defs(value, attr_type, crate::schema::empty_defs())
-}
-
-/// Same as [`canonicalize_with_type`] but takes the enclosing
-/// [`ResourceSchema::defs`] map so cyclic CFN definitions
-/// (`AttributeType::Ref`) are followed during the type walk
-/// (carina#3340). The `Ref` arm resolves and recurses; primitives /
-/// unions terminate as before.
-pub fn canonicalize_with_type_and_defs(
+pub(crate) fn canonicalize_with_type(
     value: Value,
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
@@ -1399,20 +1392,20 @@ pub fn canonicalize_with_type_and_defs(
     // (carina#3340).
     if let AttributeType::Ref(_) = unwrapped {
         let resolved = unwrapped.resolve_refs(defs);
-        return canonicalize_with_type_and_defs(value, resolved, defs);
+        return canonicalize_with_type(value, resolved, defs);
     }
     match (value, unwrapped) {
         (Value::Concrete(ConcreteValue::List(items)), AttributeType::List { inner, .. }) => {
             let canonicalized = items
                 .into_iter()
-                .map(|v| canonicalize_with_type_and_defs(v, inner.as_ref(), defs))
+                .map(|v| canonicalize_with_type(v, inner.as_ref(), defs))
                 .collect();
             Value::Concrete(ConcreteValue::List(canonicalized))
         }
         (Value::Concrete(ConcreteValue::Map(map)), AttributeType::Map { value: vt, .. }) => {
             let canonicalized = map
                 .into_iter()
-                .map(|(k, v)| (k, canonicalize_with_type_and_defs(v, vt.as_ref(), defs)))
+                .map(|(k, v)| (k, canonicalize_with_type(v, vt.as_ref(), defs)))
                 .collect();
             Value::Concrete(ConcreteValue::Map(canonicalized))
         }
@@ -1425,7 +1418,7 @@ pub fn canonicalize_with_type_and_defs(
                         .find(|f| f.name == k || f.provider_name.as_deref() == Some(k.as_str()))
                         .map(|f| &f.field_type);
                     let canon = match field_type {
-                        Some(ft) => canonicalize_with_type_and_defs(v, ft, defs),
+                        Some(ft) => canonicalize_with_type(v, ft, defs),
                         None => v,
                     };
                     (k, canon)
@@ -1433,11 +1426,9 @@ pub fn canonicalize_with_type_and_defs(
                 .collect();
             Value::Concrete(ConcreteValue::Map(canonicalized))
         }
-        (Value::Deferred(DeferredValue::Secret(inner)), _) => {
-            Value::Deferred(DeferredValue::Secret(Box::new(
-                canonicalize_with_type_and_defs(*inner, attr_type, defs),
-            )))
-        }
+        (Value::Deferred(DeferredValue::Secret(inner)), _) => Value::Deferred(
+            DeferredValue::Secret(Box::new(canonicalize_with_type(*inner, attr_type, defs))),
+        ),
         // Union: the missing nesting kind (List/Map/Struct/Secret
         // already recurse; Union was the lone gap — carina#3080).
         // `principal` is `Union[Struct{ service: Union[String,
@@ -1454,7 +1445,7 @@ pub fn canonicalize_with_type_and_defs(
         // is identity — never guess-coerce.
         (val, AttributeType::Union(members)) => {
             match crate::schema::select_union_member(members, &val) {
-                Some(member) => canonicalize_with_type_and_defs(val, member, defs),
+                Some(member) => canonicalize_with_type(val, member, defs),
                 None => val,
             }
         }
@@ -1510,7 +1501,7 @@ pub fn canonicalize_resources_with_schemas(
         for (key, value) in std::mem::take(&mut resource.attributes) {
             let canon = match schema.attributes.get(&key) {
                 Some(attr_schema) => {
-                    canonicalize_with_type_and_defs(value, &attr_schema.attr_type, &schema.defs)
+                    canonicalize_with_type(value, &attr_schema.attr_type, &schema.defs)
                 }
                 None => value,
             };
@@ -1536,7 +1527,7 @@ pub fn canonicalize_data_sources_with_schemas(
         for (key, value) in std::mem::take(&mut data_source.attributes) {
             let canon = match schema.attributes.get(&key) {
                 Some(attr_schema) => {
-                    canonicalize_with_type_and_defs(value, &attr_schema.attr_type, &schema.defs)
+                    canonicalize_with_type(value, &attr_schema.attr_type, &schema.defs)
                 }
                 None => value,
             };
@@ -1578,7 +1569,7 @@ pub fn canonicalize_states_with_schemas(
         for (key, value) in std::mem::take(&mut state.attributes) {
             let canon = match schema.attributes.get(&key) {
                 Some(attr_schema) => {
-                    canonicalize_with_type_and_defs(value, &attr_schema.attr_type, &schema.defs)
+                    canonicalize_with_type(value, &attr_schema.attr_type, &schema.defs)
                 }
                 None => value,
             };
@@ -3240,7 +3231,7 @@ mod tests {
     fn canonicalize_scalar_to_string_list() {
         let t = string_or_list_of_strings();
         let v = Value::Concrete(ConcreteValue::String("repo:foo:*".to_string()));
-        let canon = canonicalize_with_type(v, &t);
+        let canon = canonicalize_with_type(v, &t, crate::schema::empty_defs());
         assert_eq!(
             canon,
             Value::Concrete(ConcreteValue::StringList(vec!["repo:foo:*".to_string()]))
@@ -3253,7 +3244,7 @@ mod tests {
         let v = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
             ConcreteValue::String("repo:foo:*".to_string()),
         )]));
-        let canon = canonicalize_with_type(v, &t);
+        let canon = canonicalize_with_type(v, &t, crate::schema::empty_defs());
         assert_eq!(
             canon,
             Value::Concrete(ConcreteValue::StringList(vec!["repo:foo:*".to_string()]))
@@ -3268,7 +3259,7 @@ mod tests {
             Value::Concrete(ConcreteValue::String("b".to_string())),
             Value::Concrete(ConcreteValue::String("c".to_string())),
         ]));
-        let canon = canonicalize_with_type(v, &t);
+        let canon = canonicalize_with_type(v, &t, crate::schema::empty_defs());
         assert_eq!(
             canon,
             Value::Concrete(ConcreteValue::StringList(vec![
@@ -3283,14 +3274,18 @@ mod tests {
     fn canonicalize_idempotent_on_string_list() {
         let t = string_or_list_of_strings();
         let v = Value::Concrete(ConcreteValue::StringList(vec!["a".to_string()]));
-        let canon = canonicalize_with_type(v.clone(), &t);
+        let canon = canonicalize_with_type(v.clone(), &t, crate::schema::empty_defs());
         assert_eq!(canon, v);
     }
 
     #[test]
     fn canonicalize_passes_through_non_applicable_type() {
         let v = Value::Concrete(ConcreteValue::String("foo".to_string()));
-        let canon = canonicalize_with_type(v.clone(), &AttributeType::String);
+        let canon = canonicalize_with_type(
+            v.clone(),
+            &AttributeType::String,
+            crate::schema::empty_defs(),
+        );
         assert_eq!(canon, v);
     }
 
@@ -3302,7 +3297,7 @@ mod tests {
         let v = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
             ConcreteValue::Int(1),
         )]));
-        let canon = canonicalize_with_type(v.clone(), &t);
+        let canon = canonicalize_with_type(v.clone(), &t, crate::schema::empty_defs());
         assert_eq!(canon, v);
     }
 
@@ -3321,7 +3316,7 @@ mod tests {
             Value::Concrete(ConcreteValue::String("s3:GetObject".to_string())),
         );
         let v = Value::Concrete(ConcreteValue::Map(map));
-        let canon = canonicalize_with_type(v, &t);
+        let canon = canonicalize_with_type(v, &t, crate::schema::empty_defs());
         match canon {
             Value::Concrete(ConcreteValue::Map(m)) => {
                 assert_eq!(
@@ -3350,7 +3345,7 @@ mod tests {
             Value::Concrete(ConcreteValue::String("s3:GetObject".to_string())),
         );
         let v = Value::Concrete(ConcreteValue::Map(map));
-        let canon = canonicalize_with_type(v, &t);
+        let canon = canonicalize_with_type(v, &t, crate::schema::empty_defs());
         match canon {
             Value::Concrete(ConcreteValue::Map(m)) => {
                 assert_eq!(
@@ -3394,7 +3389,7 @@ mod tests {
             )),
         );
         let v = Value::Concrete(ConcreteValue::Map(map));
-        let canon = canonicalize_with_type(v, &t);
+        let canon = canonicalize_with_type(v, &t, crate::schema::empty_defs());
         match canon {
             Value::Concrete(ConcreteValue::Map(m)) => {
                 assert_eq!(
@@ -3419,7 +3414,7 @@ mod tests {
             )])),
         );
         let v = Value::Concrete(ConcreteValue::Map(map));
-        let canon = canonicalize_with_type(v, &t);
+        let canon = canonicalize_with_type(v, &t, crate::schema::empty_defs());
         match canon {
             Value::Concrete(ConcreteValue::Map(m)) => {
                 assert_eq!(
@@ -3439,7 +3434,7 @@ mod tests {
     fn canonicalize_union_string_member_passthrough() {
         let t = principal_union();
         let v = Value::Concrete(ConcreteValue::String("*".to_string()));
-        let canon = canonicalize_with_type(v.clone(), &t);
+        let canon = canonicalize_with_type(v.clone(), &t, crate::schema::empty_defs());
         assert_eq!(canon, v);
     }
 
@@ -3449,7 +3444,7 @@ mod tests {
     fn canonicalize_union_no_matching_member_is_identity() {
         let t = AttributeType::Union(vec![AttributeType::Int, AttributeType::Bool]);
         let v = Value::Concrete(ConcreteValue::String("not-an-int".to_string()));
-        let canon = canonicalize_with_type(v.clone(), &t);
+        let canon = canonicalize_with_type(v.clone(), &t, crate::schema::empty_defs());
         assert_eq!(canon, v);
     }
 
@@ -3465,7 +3460,7 @@ mod tests {
             Value::Concrete(ConcreteValue::String("repo:foo:*".to_string())),
         );
         let v = Value::Concrete(ConcreteValue::Map(map));
-        let canon = canonicalize_with_type(v, &t);
+        let canon = canonicalize_with_type(v, &t, crate::schema::empty_defs());
         match canon {
             Value::Concrete(ConcreteValue::Map(m)) => {
                 assert_eq!(
@@ -3492,7 +3487,7 @@ mod tests {
             to_dsl: None,
         };
         let v = Value::Concrete(ConcreteValue::String("x".to_string()));
-        let canon = canonicalize_with_type(v, &t);
+        let canon = canonicalize_with_type(v, &t, crate::schema::empty_defs());
         assert_eq!(
             canon,
             Value::Concrete(ConcreteValue::StringList(vec!["x".to_string()]))
@@ -3505,7 +3500,7 @@ mod tests {
         let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
             ConcreteValue::String("s".to_string()),
         ))));
-        let canon = canonicalize_with_type(v, &t);
+        let canon = canonicalize_with_type(v, &t, crate::schema::empty_defs());
         match canon {
             Value::Deferred(DeferredValue::Secret(inner)) => {
                 assert_eq!(

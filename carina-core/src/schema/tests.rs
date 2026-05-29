@@ -3240,7 +3240,7 @@ mod validate_collect_tests {
             ),
             ("mfa_delete", Value::Concrete(ConcreteValue::Bool(false))),
         ]);
-        let errors = ty.validate_collect(&v);
+        let errors = crate::schema::Schema::flat(ty.clone()).validate_collect(&v);
         assert!(
             errors.is_empty(),
             "valid struct must produce no errors, got {errors:?}"
@@ -3263,7 +3263,7 @@ mod validate_collect_tests {
             ),
             ("mfa", Value::Concrete(ConcreteValue::Bool(false))),
         ]);
-        let errors = ty.validate_collect(&v);
+        let errors = crate::schema::Schema::flat(ty.clone()).validate_collect(&v);
         assert_eq!(
             errors.len(),
             2,
@@ -3292,7 +3292,7 @@ mod validate_collect_tests {
                 Value::Concrete(ConcreteValue::String("not an int".to_string())),
             )]),
         )]);
-        let errors = outer.validate_collect(&v);
+        let errors = crate::schema::Schema::flat(outer.clone()).validate_collect(&v);
         assert_eq!(errors.len(), 1, "got {errors:?}");
         let (path, _err) = &errors[0];
         let steps: Vec<String> = path.steps().iter().map(|s| s.to_string()).collect();
@@ -3320,7 +3320,7 @@ mod validate_collect_tests {
             )]),
             map_value(vec![("name", Value::Concrete(ConcreteValue::Int(42)))]),
         ]));
-        let errors = outer_attr.validate_collect(&v);
+        let errors = crate::schema::Schema::flat(outer_attr.clone()).validate_collect(&v);
         assert_eq!(errors.len(), 1, "got {errors:?}");
         let path = &errors[0].0;
         let steps: Vec<String> = path.steps().iter().map(|s| s.to_string()).collect();
@@ -3346,7 +3346,7 @@ mod validate_collect_tests {
             "transition",
             Value::Concrete(ConcreteValue::String("ok".to_string())),
         )]);
-        let errors = ty.validate_collect(&v);
+        let errors = crate::schema::Schema::flat(ty.clone()).validate_collect(&v);
         assert!(
             errors.is_empty(),
             "block_name alias must not flag the field as unknown, got {errors:?}"
@@ -3366,7 +3366,7 @@ mod validate_collect_tests {
             "vpc_id",
             Value::resource_ref("vpc".to_string(), "id".to_string(), vec![]),
         )]);
-        let errors = ty.validate_collect(&v);
+        let errors = crate::schema::Schema::flat(ty.clone()).validate_collect(&v);
         assert!(
             errors.is_empty(),
             "ResourceRef in struct field must not produce an error, got {errors:?}"
@@ -3388,7 +3388,7 @@ mod validate_collect_tests {
             "statuus",
             Value::Concrete(ConcreteValue::String("x".to_string())),
         )]);
-        let errors = ty.validate_collect(&v);
+        let errors = crate::schema::Schema::flat(ty.clone()).validate_collect(&v);
         assert_eq!(errors.len(), 1);
         match &errors[0].1 {
             TypeError::UnknownStructField {

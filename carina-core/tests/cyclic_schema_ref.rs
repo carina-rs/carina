@@ -207,6 +207,156 @@ fn resource_schema_defs_field_default_is_empty() {
     let _: &BTreeMap<String, AttributeType> = &schema.defs;
 }
 
+/// Regression for carina#3345: `ResourceSchema::validate` must route a
+/// `Ref`-containing attribute through `Schema::validate_attr` so the
+/// enclosing `defs` are in scope, not through the standalone
+/// `AttributeType::validate` which can only reject `Ref` with the
+/// "reached the standalone validator" sentinel.
+///
+/// The 7 awscc `s3.Bucket/*` apply failures from the 2026-05-29
+/// acceptance run all hit this site (`schema/mod.rs:3053`).
+#[test]
+fn resource_schema_validate_routes_ref_through_defs() {
+    let schema = cyclic_webacl_like_schema();
+
+    let mut attrs = HashMap::new();
+    attrs.insert(
+        "rules".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![rule_value("BlockBadIPs", 1)])),
+    );
+
+    let result = schema.validate(&attrs);
+    assert!(
+        result.is_ok(),
+        "ResourceSchema::validate on a Ref-typed attribute with valid value \
+         must succeed, but got: {:?}",
+        result.err()
+    );
+}
+
+/// Regression for carina#3345 Symptom B: `Schema::canonicalize_attr`
+/// must drive the `Ref` arm through the schema's `defs` map and
+/// canonicalize the resolved type's inner shape. This pins the
+/// public Schema-aware canonicalization entry point used by providers
+/// when normalising upstream state — the awscc
+/// `ec2_vpc_endpoint/{gateway,interface}` plan-verify failures hit
+/// this path with `Ref("DnsOptionsSpecification")` and a defs-less
+/// caller panicked at `schema/mod.rs:893`.
+///
+/// The schema here pairs a `Ref` with a leaf type whose
+/// canonicalization is observable (`String → StringList` via the
+/// `string_or_list_of_strings` collapse #2481/#2510) so a "Ref not
+/// followed" regression would leave the raw `String` in place
+/// instead of folding it to `StringList`.
+#[test]
+fn canonicalize_through_defs_resolves_ref_arm_and_walks_resolved_type() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+    // `Selectors` def is a struct with a `string_or_list_of_strings`
+    // field. `selectors` attribute references it via Ref.
+    let selectors_def = AttributeType::Struct {
+        name: "Selectors".to_string(),
+        fields: vec![StructField::new(
+            "tags",
+            AttributeType::Union(vec![
+                AttributeType::String,
+                AttributeType::list(AttributeType::String),
+            ]),
+        )],
+    };
+    let schema = ResourceSchema::new("test.WithRef")
+        .attribute(AttributeSchema::new(
+            "selectors",
+            AttributeType::Ref("Selectors".to_string()),
+        ))
+        .with_def("Selectors", selectors_def);
+
+    let attr_type = &schema.attributes["selectors"].attr_type;
+
+    // Construct the value with a bare `String` under `tags`, which
+    // `canonicalize_with_type` must collapse to `StringList`
+    // *if* the Ref is followed and the resolved struct's field type
+    // is consulted.
+    let mut payload = indexmap::IndexMap::new();
+    payload.insert(
+        "tags".to_string(),
+        Value::Concrete(ConcreteValue::String("env=prod".to_string())),
+    );
+    let value = Value::Concrete(ConcreteValue::Map(payload));
+
+    let canon = schema
+        .schema_view_for(attr_type.clone())
+        .canonicalize(value);
+
+    let Value::Concrete(ConcreteValue::Map(canon_map)) = canon else {
+        panic!("canonicalized value must remain a Map");
+    };
+    let tags = canon_map.get("tags").expect("tags must be present");
+    assert!(
+        matches!(tags, Value::Concrete(ConcreteValue::StringList(_))),
+        "Ref must be resolved against defs and `tags` collapsed to \
+         StringList via string_or_list_of_strings (carina#3345 \
+         Symptom B). Got: {tags:?}"
+    );
+}
+
+/// Regression for carina#3345: a `Ref("Missing")` whose name is
+/// absent from `defs` must surface a clean `ValidationFailed` with
+/// the documented error string rather than a panic or a silent
+/// pass-through. `ResourceSchema::validate` is the user-facing
+/// entry point that surfaces this.
+#[test]
+fn dangling_ref_surfaces_clean_validation_error() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let schema = ResourceSchema::new("test.WithDanglingRef").attribute(AttributeSchema::new(
+        "broken",
+        AttributeType::Ref("Nowhere".to_string()),
+    ));
+    // No `with_def` call — `defs` stays empty by design.
+
+    let mut attrs = HashMap::new();
+    attrs.insert(
+        "broken".to_string(),
+        Value::Concrete(ConcreteValue::String("anything".to_string())),
+    );
+
+    let errors = schema
+        .validate(&attrs)
+        .expect_err("dangling Ref must fail validation");
+    let combined: String = errors
+        .iter()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        combined.contains("schema reference `Nowhere` is not defined"),
+        "expected dangling-Ref message, got: {combined}"
+    );
+}
+
+/// Regression for carina#3345: a true cyclic def (`Statement` →
+/// `List<Ref(Statement)>`) over a finite value must terminate, not
+/// blow the stack or hang.  This pins the load-bearing termination
+/// invariant for `Schema::validate_attr`'s recursion on Ref-cycles.
+#[test]
+fn cyclic_ref_terminates_on_finite_value() {
+    let schema = cyclic_webacl_like_schema();
+    let rule_attr_type = &schema.attributes["rules"].attr_type;
+
+    // 3-level nesting: outer rule contains a statement whose
+    // `and_statement` carries two statements, each of which has
+    // its own `and_statement: []`. Exercises the cycle twice.
+    let rules_value = Value::Concrete(ConcreteValue::List(vec![rule_value("Top", 2)]));
+
+    let s = carina_core::schema::Schema {
+        root: AttributeType::String,
+        defs: schema.defs.clone(),
+    };
+    s.validate_attr(rule_attr_type, &rules_value)
+        .expect("finite cyclic value must validate (carina#3345)");
+}
+
 fn build_resource(id: &ResourceId, attrs: &[(&str, Value)]) -> Resource {
     // The DSL-layer `Resource::new` constructor takes (resource_type,
     // name) and synthesizes an `id`. Use it here so the test does not

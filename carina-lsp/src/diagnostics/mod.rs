@@ -625,7 +625,9 @@ impl DiagnosticEngine {
                                 // plain message so the user still sees a
                                 // diagnostic, just without the quick-fix.
                                 (carina_core::schema::AttributeType::StringEnum { .. }, value) => {
-                                    attr_schema.attr_type.validate(value).err().map(|e| {
+                                    let schema_view =
+                                        schema.schema_view_for(attr_schema.attr_type.clone());
+                                    schema_view.validate(value).err().map(|e| {
                                         let tagged = e.with_attribute(attr_name);
                                         let reshaped =
                                             if resource_quoted_string_attrs.contains(attr_name) {
@@ -758,8 +760,9 @@ impl DiagnosticEngine {
                                     carina_core::schema::AttributeType::Struct { .. }
                                 ) =>
                                 {
-                                    attr_schema
-                                        .attr_type
+                                    let schema_view =
+                                        schema.schema_view_for(attr_schema.attr_type.clone());
+                                    schema_view
                                         .validate(attr_value)
                                         .err()
                                         .map(|e| e.with_attribute(attr_name).to_string())
@@ -768,11 +771,14 @@ impl DiagnosticEngine {
                                 (
                                     carina_core::schema::AttributeType::Map { .. },
                                     Value::Concrete(ConcreteValue::Map(_)),
-                                ) => attr_schema
-                                    .attr_type
-                                    .validate(attr_value)
-                                    .err()
-                                    .map(|e| e.with_attribute(attr_name).to_string()),
+                                ) => {
+                                    let schema_view =
+                                        schema.schema_view_for(attr_schema.attr_type.clone());
+                                    schema_view
+                                        .validate(attr_value)
+                                        .err()
+                                        .map(|e| e.with_attribute(attr_name).to_string())
+                                }
                                 // Validate Union static values (non-ResourceRef, non-BindingRef).
                                 // Ref-shaped values are unresolved at this
                                 // checkpoint and must not be type-checked
@@ -785,8 +791,9 @@ impl DiagnosticEngine {
                                             | Value::Deferred(DeferredValue::BindingRef { .. })
                                     ) =>
                                 {
-                                    attr_schema
-                                        .attr_type
+                                    let schema_view =
+                                        schema.schema_view_for(attr_schema.attr_type.clone());
+                                    schema_view
                                         .validate(value)
                                         .err()
                                         .map(|e| e.with_attribute(attr_name).to_string())
@@ -821,11 +828,13 @@ impl DiagnosticEngine {
                                 _ => false,
                             };
                             if is_struct_shape {
+                                let schema_view =
+                                    schema.schema_view_for(attr_schema.attr_type.clone());
                                 diagnostics.extend(self.validate_struct_value(
                                     doc,
                                     attr_name,
                                     attr_value,
-                                    &attr_schema.attr_type,
+                                    &schema_view,
                                 ));
                             }
                         }
@@ -1391,7 +1400,11 @@ fn build_string_enum_diagnostic(
     value_range: Option<tower_lsp::lsp_types::Range>,
 ) -> Option<Diagnostic> {
     use crate::code_action::{EnumDiagnosticData, EnumDiagnosticKind};
-    let err = attr_type.validate(attr_value).err()?;
+    // `StringEnum` carries no `AttributeType::Ref` by construction, so an
+    // empty `defs` is sound here.
+    let err = carina_core::schema::Schema::flat(attr_type.clone())
+        .validate(attr_value)
+        .err()?;
     let tagged = err.with_attribute(attr_name);
     // Reshape into the shape-mismatch diagnostic when the value came
     // from a quoted string literal — mirrors CLI behavior (#2094).
