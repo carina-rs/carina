@@ -555,6 +555,7 @@ pub fn check_upstream_state_field_types<E>(
         check_ref_against_type(
             value,
             &attr_schema.attr_type,
+            &schema.defs,
             exports,
             &location,
             &mut errors,
@@ -573,11 +574,12 @@ pub fn check_upstream_state_field_types<E>(
 fn check_ref_against_type(
     value: &Value,
     expected: &AttributeType,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
     exports: &UpstreamExports,
     location: &str,
     errors: &mut Vec<UpstreamTypeError>,
 ) {
-    walk_value_against_type(value, expected, exports, location, errors);
+    walk_value_against_type(value, expected, defs, exports, location, errors);
 }
 
 /// Positional walker: descend `value` and `expected` in lockstep,
@@ -598,10 +600,17 @@ fn check_ref_against_type(
 fn walk_value_against_type(
     value: &Value,
     expected: &AttributeType,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
     exports: &UpstreamExports,
     location: &str,
     errors: &mut Vec<UpstreamTypeError>,
 ) {
+    // Project onto `Shape` so `Ref` is peeled at the type level
+    // (carina#3349). Without this, `Ref<List<T>>` / `Ref<Struct>`
+    // would fall through the wildcard arms below and the
+    // leaf-ref check would compare against the raw `Ref` instead
+    // of its resolved target.
+    let expected_shape = expected.shape(defs);
     match value {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             check_resource_ref_at_position(path, expected, exports, location, errors);
@@ -612,21 +621,21 @@ fn walk_value_against_type(
             // already flags the kind mismatch, so we just walk each
             // element against the same expected type — the leaf-ref
             // comparison will fire if the element doesn't fit.
-            let inner = match expected {
-                AttributeType::List { inner, .. } => inner.as_ref(),
+            let inner = match expected_shape {
+                crate::schema::Shape::List { inner, .. } => inner,
                 _ => expected,
             };
             for item in items {
-                walk_value_against_type(item, inner, exports, location, errors);
+                walk_value_against_type(item, inner, defs, exports, location, errors);
             }
         }
-        Value::Concrete(ConcreteValue::Map(entries)) => match expected {
-            AttributeType::Map { value: inner, .. } => {
+        Value::Concrete(ConcreteValue::Map(entries)) => match expected_shape {
+            crate::schema::Shape::Map { value: inner, .. } => {
                 for v in entries.values() {
-                    walk_value_against_type(v, inner, exports, location, errors);
+                    walk_value_against_type(v, inner, defs, exports, location, errors);
                 }
             }
-            AttributeType::Struct { fields, .. } => {
+            crate::schema::Shape::Struct { fields, .. } => {
                 // Resolve via `build_accepted_field_map` so `block_name`
                 // aliases (`field { ... }` block syntax) reach the
                 // same field as the canonical name. Without this a
@@ -635,7 +644,14 @@ fn walk_value_against_type(
                 let accepted = crate::schema::build_accepted_field_map(fields);
                 for (key, v) in entries {
                     if let Some(field) = accepted.get(key.as_str()) {
-                        walk_value_against_type(v, &field.field_type, exports, location, errors);
+                        walk_value_against_type(
+                            v,
+                            &field.field_type,
+                            defs,
+                            exports,
+                            location,
+                            errors,
+                        );
                     }
                     // Unknown struct fields are flagged by the schema
                     // validator; don't double-report here.
@@ -650,7 +666,7 @@ fn walk_value_against_type(
                 // leaf-ref checks dispatch via
                 // `is_type_expr_compatible_with_schema`'s Union arm.
                 for v in entries.values() {
-                    walk_value_against_type(v, expected, exports, location, errors);
+                    walk_value_against_type(v, expected, defs, exports, location, errors);
                 }
             }
         },
@@ -660,12 +676,19 @@ fn walk_value_against_type(
             // regardless of where the interpolation itself appears.
             for part in parts {
                 if let crate::resource::InterpolationPart::Expr(v) = part {
-                    walk_value_against_type(v, &AttributeType::String, exports, location, errors);
+                    walk_value_against_type(
+                        v,
+                        &AttributeType::String,
+                        defs,
+                        exports,
+                        location,
+                        errors,
+                    );
                 }
             }
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            walk_value_against_type(inner, expected, exports, location, errors);
+            walk_value_against_type(inner, expected, defs, exports, location, errors);
         }
         Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
             // Function arguments occupy function-internal positions
@@ -674,7 +697,7 @@ fn walk_value_against_type(
             // best-effort so leaf refs get *some* check; precision
             // would require typed function signatures.
             for arg in args {
-                walk_value_against_type(arg, expected, exports, location, errors);
+                walk_value_against_type(arg, expected, defs, exports, location, errors);
             }
         }
         Value::Concrete(ConcreteValue::String(_))
