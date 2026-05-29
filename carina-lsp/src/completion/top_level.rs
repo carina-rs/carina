@@ -445,7 +445,15 @@ impl CompletionProvider {
         // get the same coverage as `exports {}` values (built-ins,
         // binding refs, and structural type candidates).
         if let Some(attr_type) = type_expr_to_attribute_type(&arg.type_expr) {
-            return self.value_completions_for_attribute_type(&attr_type, text, base_path);
+            // Synthetic `attr_type` is built directly from a `TypeExpr`,
+            // which never lowers to `AttributeType::Ref`; empty defs is
+            // sufficient for the Ref-peel inside compatibility checks.
+            return self.value_completions_for_attribute_type(
+                &attr_type,
+                carina_core::schema::empty_defs(),
+                text,
+                base_path,
+            );
         }
         Vec::new()
     }

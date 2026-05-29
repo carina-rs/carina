@@ -1181,7 +1181,11 @@ impl DiagnosticEngine {
             })?;
         let attr_schema = schema.attributes.get(attr)?;
         let ref_type = &attr_schema.attr_type;
-        if carina_core::validation::is_type_expr_compatible_with_schema(type_expr, ref_type) {
+        if carina_core::validation::is_type_expr_compatible_with_schema(
+            type_expr,
+            ref_type,
+            &schema.defs,
+        ) {
             return None;
         }
         Some(format!(

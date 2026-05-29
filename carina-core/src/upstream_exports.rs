@@ -613,7 +613,7 @@ fn walk_value_against_type(
     let expected_shape = expected.shape(defs);
     match value {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
-            check_resource_ref_at_position(path, expected, exports, location, errors);
+            check_resource_ref_at_position(path, expected, defs, exports, location, errors);
         }
         Value::Concrete(ConcreteValue::List(items)) => {
             // Descend `list(T)` element-wise. For non-list receivers
@@ -724,6 +724,7 @@ fn walk_value_against_type(
 fn check_resource_ref_at_position(
     path: &crate::resource::AccessPath,
     expected: &AttributeType,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
     exports: &UpstreamExports,
     location: &str,
     errors: &mut Vec<UpstreamTypeError>,
@@ -747,7 +748,7 @@ fn check_resource_ref_at_position(
         // double-reporting.
         return;
     };
-    if crate::validation::is_type_expr_compatible_with_schema(&narrowed, expected) {
+    if crate::validation::is_type_expr_compatible_with_schema(&narrowed, expected, defs) {
         return;
     }
     // String-shaped value into a string-compatible receiver. The
@@ -760,7 +761,7 @@ fn check_resource_ref_at_position(
     // strict path also doesn't recognise. The reverse direction
     // (`String → Custom { semantic_name: Some(_) }`) stays strict
     // via `attr_type_demands_specific_custom`. #2475 / #2643.
-    if narrowed.is_string_shaped() && crate::validation::is_string_compatible_type(expected) {
+    if narrowed.is_string_shaped() && crate::validation::is_string_compatible_type(expected, defs) {
         return;
     }
     errors.push(UpstreamTypeError {

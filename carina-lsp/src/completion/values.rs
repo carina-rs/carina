@@ -254,6 +254,7 @@ impl CompletionProvider {
                     if !carina_core::validation::is_type_expr_compatible_with_schema(
                         export_type,
                         &attr_schema.attr_type,
+                        &schema.defs,
                     ) {
                         continue;
                     }
@@ -276,13 +277,21 @@ impl CompletionProvider {
             }
         }
 
-        // Target attribute type, if the schema knows about this
-        // (resource_type, attr_name) pair. Used by both the arguments
-        // filter just below and the for-binding filter further down.
-        let target_attr_type = self
-            .lookup_schema(resource_type)
+        // Target attribute type + the schema's `defs` table, if the
+        // schema knows about this (resource_type, attr_name) pair.
+        // Both are used by the arguments filter just below and the
+        // for-binding filter further down; `defs` is threaded into
+        // `is_type_expr_compatible_with_schema` so any `Ref` receiver
+        // resolves correctly.
+        let target_schema = self.lookup_schema(resource_type);
+        let target_attr_type = target_schema
             .and_then(|s| s.attributes.get(attr_name))
             .map(|a| &a.attr_type);
+        let target_defs: &std::collections::BTreeMap<String, carina_core::schema::AttributeType> =
+            match target_schema {
+                Some(s) => &s.defs,
+                None => carina_core::schema::empty_defs(),
+            };
 
         // In-scope bare identifiers: `let` bindings + `arguments {}`
         // parameters (#2624 / #2642). When the target attribute's
@@ -320,6 +329,7 @@ impl CompletionProvider {
                     carina_core::validation::is_type_expr_compatible_with_schema(
                         arg_type_expr,
                         attr_type,
+                        target_defs,
                     )
                 }));
             }
@@ -347,6 +357,7 @@ impl CompletionProvider {
                 && !carina_core::validation::is_type_expr_compatible_with_schema(
                     &element_type,
                     attr_type,
+                    target_defs,
                 )
             {
                 continue;
@@ -1306,14 +1317,21 @@ impl CompletionProvider {
     pub(super) fn value_completions_for_attribute_type(
         &self,
         attr_type: &AttributeType,
+        attr_defs: &std::collections::BTreeMap<String, AttributeType>,
         text: &str,
         base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {
         let mut items = self.completions_for_type(attr_type, None);
         items.extend(Self::builtin_function_completions_for_type(attr_type));
         items.extend(self.resource_ref_completions_for_type(attr_type, text, base_path));
-        items.extend(self.module_call_binding_ref_completions_for_type(attr_type, text, base_path));
-        items.extend(self.upstream_state_ref_completions_for_type(attr_type, text, base_path));
+        items.extend(
+            self.module_call_binding_ref_completions_for_type(
+                attr_type, attr_defs, text, base_path,
+            ),
+        );
+        items.extend(
+            self.upstream_state_ref_completions_for_type(attr_type, attr_defs, text, base_path),
+        );
         items
     }
 
@@ -1328,6 +1346,7 @@ impl CompletionProvider {
     fn upstream_state_ref_completions_for_type(
         &self,
         target: &AttributeType,
+        target_defs: &std::collections::BTreeMap<String, AttributeType>,
         text: &str,
         base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {
@@ -1354,6 +1373,7 @@ impl CompletionProvider {
                 if !carina_core::validation::is_type_expr_compatible_with_schema(
                     export_type,
                     target,
+                    target_defs,
                 ) {
                     continue;
                 }
@@ -1428,6 +1448,7 @@ impl CompletionProvider {
     fn module_call_binding_ref_completions_for_type(
         &self,
         target: &AttributeType,
+        target_defs: &std::collections::BTreeMap<String, AttributeType>,
         text: &str,
         base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {
@@ -1456,8 +1477,11 @@ impl CompletionProvider {
                 let Some(ref export_ty) = export.type_expr else {
                     continue;
                 };
-                if !carina_core::validation::is_type_expr_compatible_with_schema(export_ty, target)
-                {
+                if !carina_core::validation::is_type_expr_compatible_with_schema(
+                    export_ty,
+                    target,
+                    target_defs,
+                ) {
                     continue;
                 }
                 let full_ref = format!("{}.{}", binding_name, export.name);

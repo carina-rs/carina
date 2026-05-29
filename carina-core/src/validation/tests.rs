@@ -1300,7 +1300,11 @@ fn is_type_expr_compatible_struct_rejects_missing_schema_field_when_expr_has_ext
             StructField::new("b", AttributeType::String),
         ],
     };
-    assert!(!is_type_expr_compatible_with_schema(&expr, &schema));
+    assert!(!is_type_expr_compatible_with_schema(
+        &expr,
+        &schema,
+        crate::schema::empty_defs()
+    ));
 }
 
 #[test]
@@ -1319,7 +1323,11 @@ fn is_type_expr_compatible_struct_matches_same_shape_schema() {
             StructField::new("value", AttributeType::Int),
         ],
     };
-    assert!(is_type_expr_compatible_with_schema(&expr, &schema));
+    assert!(is_type_expr_compatible_with_schema(
+        &expr,
+        &schema,
+        crate::schema::empty_defs()
+    ));
 }
 
 #[test]
@@ -1336,7 +1344,11 @@ fn is_type_expr_compatible_struct_flows_into_map_when_fields_share_type() {
         key: Box::new(AttributeType::String),
         value: Box::new(AttributeType::String),
     };
-    assert!(is_type_expr_compatible_with_schema(&expr, &schema));
+    assert!(is_type_expr_compatible_with_schema(
+        &expr,
+        &schema,
+        crate::schema::empty_defs()
+    ));
 }
 
 #[test]
@@ -1348,7 +1360,11 @@ fn is_type_expr_compatible_struct_rejects_map_with_wrong_element_type() {
         key: Box::new(AttributeType::String),
         value: Box::new(AttributeType::Int),
     };
-    assert!(!is_type_expr_compatible_with_schema(&expr, &schema));
+    assert!(!is_type_expr_compatible_with_schema(
+        &expr,
+        &schema,
+        crate::schema::empty_defs()
+    ));
 }
 
 // Issue #2358: a generic `TypeExpr::String` declaration must not satisfy
@@ -1364,14 +1380,17 @@ fn is_type_expr_compatible_unknown_rejects_all_concrete_receivers() {
     assert!(!is_type_expr_compatible_with_schema(
         &TypeExpr::Unknown,
         &AttributeType::String,
+        crate::schema::empty_defs(),
     ));
     assert!(!is_type_expr_compatible_with_schema(
         &TypeExpr::Unknown,
         &AttributeType::Int,
+        crate::schema::empty_defs(),
     ));
     assert!(!is_type_expr_compatible_with_schema(
         &TypeExpr::Unknown,
         &AttributeType::Bool,
+        crate::schema::empty_defs(),
     ));
 }
 
@@ -1392,6 +1411,7 @@ fn is_type_expr_compatible_unknown_rejects_custom_receiver() {
     assert!(!is_type_expr_compatible_with_schema(
         &TypeExpr::Unknown,
         &custom,
+        crate::schema::empty_defs(),
     ));
 }
 
@@ -1410,7 +1430,11 @@ fn is_type_expr_compatible_string_rejects_custom_with_semantic_name() {
         to_dsl: None,
     };
     assert!(
-        !is_type_expr_compatible_with_schema(&TypeExpr::String, &schema),
+        !is_type_expr_compatible_with_schema(
+            &TypeExpr::String,
+            &schema,
+            crate::schema::empty_defs()
+        ),
         "TypeExpr::String must not satisfy Custom{{semantic_name:VpcId}}"
     );
 }
@@ -1434,7 +1458,11 @@ fn is_type_expr_compatible_string_accepts_custom_without_semantic_name() {
         to_dsl: None,
     };
     assert!(
-        is_type_expr_compatible_with_schema(&TypeExpr::String, &schema),
+        is_type_expr_compatible_with_schema(
+            &TypeExpr::String,
+            &schema,
+            crate::schema::empty_defs()
+        ),
         "TypeExpr::String must satisfy Custom with no semantic_name"
     );
 }
@@ -1461,7 +1489,11 @@ fn is_type_expr_compatible_string_rejects_union_containing_specific_custom() {
         },
     ]);
     assert!(
-        !is_type_expr_compatible_with_schema(&TypeExpr::String, &schema),
+        !is_type_expr_compatible_with_schema(
+            &TypeExpr::String,
+            &schema,
+            crate::schema::empty_defs()
+        ),
         "TypeExpr::String must not satisfy a Union containing Custom{{semantic}}"
     );
 }
@@ -1485,7 +1517,11 @@ fn is_type_expr_compatible_string_rejects_union_of_only_specific_customs() {
     };
     let schema = AttributeType::Union(vec![mk("VpcId"), mk("SubnetId")]);
     assert!(
-        !is_type_expr_compatible_with_schema(&TypeExpr::String, &schema),
+        !is_type_expr_compatible_with_schema(
+            &TypeExpr::String,
+            &schema,
+            crate::schema::empty_defs()
+        ),
         "TypeExpr::String must not satisfy a Union of only specific-Custom alternatives"
     );
 }
@@ -1505,7 +1541,11 @@ fn is_type_expr_compatible_string_accepts_union_of_only_strings() {
         },
     ]);
     assert!(
-        is_type_expr_compatible_with_schema(&TypeExpr::String, &schema),
+        is_type_expr_compatible_with_schema(
+            &TypeExpr::String,
+            &schema,
+            crate::schema::empty_defs()
+        ),
         "TypeExpr::String must satisfy a Union of only string-shaped non-specific types"
     );
 }
@@ -1529,7 +1569,11 @@ fn is_type_expr_compatible_simple_vpcid_accepts_custom_vpcid() {
     };
     // Parser normalizes `: VpcId` to TypeExpr::Simple("vpc_id") (snake).
     let expr = TypeExpr::Simple("vpc_id".to_string());
-    assert!(is_type_expr_compatible_with_schema(&expr, &schema));
+    assert!(is_type_expr_compatible_with_schema(
+        &expr,
+        &schema,
+        crate::schema::empty_defs()
+    ));
 }
 
 #[test]
@@ -1761,6 +1805,7 @@ fn type_compat_subtype_accepted() {
     assert!(is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("arn".to_string()),
         &kms_key_arn,
+        crate::schema::empty_defs(),
     ));
 }
 
@@ -1785,6 +1830,7 @@ fn type_compat_sibling_rejected() {
     assert!(!is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("kms_key_arn".to_string()),
         &iam_role_arn,
+        crate::schema::empty_defs(),
     ));
 }
 
@@ -1809,6 +1855,7 @@ fn type_compat_resource_id_subtype() {
     assert!(is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("aws_resource_id".to_string()),
         &vpc_id,
+        crate::schema::empty_defs(),
     ));
 }
 
@@ -1833,6 +1880,7 @@ fn type_compat_resource_id_siblings_rejected() {
     assert!(!is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("vpc_id".to_string()),
         &subnet_id,
+        crate::schema::empty_defs(),
     ));
 }
 
@@ -1849,6 +1897,7 @@ fn type_compat_exact_match() {
     assert!(is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("arn".to_string()),
         &arn,
+        crate::schema::empty_defs(),
     ));
 }
 
@@ -1862,6 +1911,7 @@ fn type_compat_simple_rejected_by_mixed_string_int_union_receiver() {
     assert!(!is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("aws_account_id".to_string()),
         &mixed,
+        crate::schema::empty_defs(),
     ));
 }
 
@@ -1876,6 +1926,7 @@ fn type_compat_simple_subtypes_into_plain_string() {
     assert!(is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("aws_account_id".to_string()),
         &AttributeType::String,
+        crate::schema::empty_defs(),
     ));
 }
 
@@ -1911,6 +1962,7 @@ fn type_compat_simple_into_union_struct_or_string() {
             is_type_expr_compatible_with_schema(
                 &TypeExpr::Simple(name.to_string()),
                 &principal_union,
+                crate::schema::empty_defs(),
             ),
             "Simple({name}) should be assignable to Union<Struct, String>"
         );
@@ -1937,6 +1989,7 @@ fn type_compat_simple_rejected_when_union_has_other_scalar() {
     assert!(!is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("iam_oidc_provider_arn".to_string()),
         &mixed,
+        crate::schema::empty_defs(),
     ));
 }
 
@@ -1958,6 +2011,7 @@ fn type_compat_simple_rejected_when_union_has_no_plain_string() {
     assert!(!is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("iam_oidc_provider_arn".to_string()),
         &no_string,
+        crate::schema::empty_defs(),
     ));
 }
 
@@ -1983,6 +2037,7 @@ fn type_compat_simple_rejected_when_union_has_string_shaped_peer() {
     assert!(!is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("iam_oidc_provider_arn".to_string()),
         &with_custom,
+        crate::schema::empty_defs(),
     ));
     let with_enum = AttributeType::Union(vec![
         AttributeType::String,
@@ -1996,6 +2051,7 @@ fn type_compat_simple_rejected_when_union_has_string_shaped_peer() {
     assert!(!is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("iam_oidc_provider_arn".to_string()),
         &with_enum,
+        crate::schema::empty_defs(),
     ));
 }
 
