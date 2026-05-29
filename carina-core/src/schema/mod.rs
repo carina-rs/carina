@@ -835,7 +835,7 @@ impl Schema {
             AttributeType::Map { key, value: val_ty } => {
                 if let Some(ConcreteValueRef::Map(map)) = value.as_concrete() {
                     for (k, v) in map.iter() {
-                        let key_val = Value::Concrete(ConcreteValue::String(k.clone()));
+                        let key_val = lift_map_key(key, k);
                         if let Err(inner_err) = self.validate_attr(key, &key_val) {
                             return Err(TypeError::MapKeyError {
                                 key: k.clone(),
@@ -1073,6 +1073,21 @@ impl fmt::Display for FieldPath {
             first = false;
         }
         Ok(())
+    }
+}
+
+/// Lift a `Map` key string into the `Value` shape its `key_type`
+/// expects. `StringEnum` map keys are lifted to `EnumIdentifier` so
+/// the strict carina#2986 validator accepts the bare-identifier form
+/// users write in source; every other key type lowers to `String`
+/// (carina#2996). Shared between `Schema::validate_attr`'s Map arm
+/// and the standalone `validate_map` so the two walkers cannot
+/// drift again (carina#3347).
+pub(crate) fn lift_map_key(key_type: &AttributeType, key: &str) -> Value {
+    if matches!(key_type, AttributeType::StringEnum { .. }) {
+        Value::Concrete(ConcreteValue::EnumIdentifier(key.to_string()))
+    } else {
+        Value::Concrete(ConcreteValue::String(key.to_string()))
     }
 }
 
@@ -1614,19 +1629,8 @@ impl AttributeType {
                 got: value.type_name().to_string(),
             });
         };
-        // carina#2996: map-literal grammar is `(identifier | string) "="
-        // expression`, and both shapes lower to the same `String` key by
-        // the time we see them. For `StringEnum` keys, lift the key into
-        // `EnumIdentifier` form so the strict carina#2986 validator
-        // accepts it — there is no other syntax for writing an enum-
-        // shaped map key.
-        let key_is_enum = matches!(key_type.as_ref(), AttributeType::StringEnum { .. });
         for k in map.keys() {
-            let key_value = if key_is_enum {
-                Value::Concrete(ConcreteValue::EnumIdentifier(k.clone()))
-            } else {
-                Value::Concrete(ConcreteValue::String(k.clone()))
-            };
+            let key_value = lift_map_key(key_type, k);
             key_type
                 .validate(&key_value)
                 .map_err(|e| TypeError::MapKeyError {

@@ -357,6 +357,60 @@ fn cyclic_ref_terminates_on_finite_value() {
         .expect("finite cyclic value must validate (carina#3345)");
 }
 
+/// Regression for carina#3347: `Schema::validate_attr`'s `Map` arm
+/// must lift a `Map<StringEnum, ...>` key into `EnumIdentifier` shape
+/// before validating it, mirroring `validate_map`'s pre-existing
+/// `key_is_enum` special case (carina#2996). Without this lift, a
+/// Map key written as a bare identifier in source surfaces as
+/// `StringLiteralExpectedEnum` because the lift wraps the key as a
+/// plain `String`.
+///
+/// The carina#3346 migration routed every production validate call
+/// through `Schema::validate_attr`, exposing this latent divergence
+/// as a `validate_iam_policy_document` regression in awscc#282 when
+/// pulling the new rev.
+#[test]
+fn schema_validate_attr_map_arm_lifts_string_enum_key() {
+    use carina_core::resource::ConcreteValue;
+    use carina_core::schema::{AttributeType, Schema};
+
+    let key_type = AttributeType::StringEnum {
+        name: "Op".to_string(),
+        values: vec!["eq".to_string(), "neq".to_string()],
+        identity: None,
+        dsl_aliases: vec![],
+    };
+    let attr_type = AttributeType::Map {
+        key: Box::new(key_type),
+        value: Box::new(AttributeType::String),
+    };
+
+    let mut payload = indexmap::IndexMap::new();
+    payload.insert(
+        "eq".to_string(),
+        Value::Concrete(ConcreteValue::String("x".to_string())),
+    );
+    let value = Value::Concrete(ConcreteValue::Map(payload));
+
+    let schema = Schema::flat(attr_type);
+    schema
+        .validate(&value)
+        .expect("a bare-identifier Map key for a StringEnum key type must validate");
+
+    // Negative case: an unknown enum variant must still fail
+    // (guard against a "lift everything to EnumIdentifier and accept"
+    // regression).
+    let mut bad_payload = indexmap::IndexMap::new();
+    bad_payload.insert(
+        "unknown".to_string(),
+        Value::Concrete(ConcreteValue::String("x".to_string())),
+    );
+    let bad_value = Value::Concrete(ConcreteValue::Map(bad_payload));
+    schema
+        .validate(&bad_value)
+        .expect_err("an unknown StringEnum Map key must fail validation");
+}
+
 fn build_resource(id: &ResourceId, attrs: &[(&str, Value)]) -> Resource {
     // The DSL-layer `Resource::new` constructor takes (resource_type,
     // name) and synthesizes an `id`. Use it here so the test does not
