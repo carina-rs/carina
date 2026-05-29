@@ -1386,30 +1386,28 @@ pub(crate) fn canonicalize_with_type(
     if is_string_or_list_of_strings(unwrapped) {
         return canonicalize_to_string_list(value);
     }
-    // `Ref`: resolve and re-dispatch. Without this arm the wildcard
-    // below silently passes the value through, so a cyclic CFN field
-    // never gets its nested `string_or_list_of_strings` collapsed
-    // (carina#3340).
-    if let AttributeType::Ref(_) = unwrapped {
-        let resolved = unwrapped.resolve_refs(defs);
-        return canonicalize_with_type(value, resolved.as_attr(), defs);
-    }
-    match (value, unwrapped) {
-        (Value::Concrete(ConcreteValue::List(items)), AttributeType::List { inner, .. }) => {
+    // Dispatch via `Shape` so the `Ref` arm cannot fall into a tuple
+    // wildcard. `shape(defs)` peels any top-level `Ref` chain before
+    // returning, so the match below sees the resolved shape directly.
+    // Without this, the historical wildcard `(v, _) => v` silently
+    // passed Ref-typed values through without canonicalization —
+    // exactly the carina#3340 / carina#3349 bug class.
+    match (value, unwrapped.shape(defs)) {
+        (Value::Concrete(ConcreteValue::List(items)), crate::schema::Shape::List { inner, .. }) => {
             let canonicalized = items
                 .into_iter()
-                .map(|v| canonicalize_with_type(v, inner.as_ref(), defs))
+                .map(|v| canonicalize_with_type(v, inner, defs))
                 .collect();
             Value::Concrete(ConcreteValue::List(canonicalized))
         }
-        (Value::Concrete(ConcreteValue::Map(map)), AttributeType::Map { value: vt, .. }) => {
+        (Value::Concrete(ConcreteValue::Map(map)), crate::schema::Shape::Map { value: vt, .. }) => {
             let canonicalized = map
                 .into_iter()
-                .map(|(k, v)| (k, canonicalize_with_type(v, vt.as_ref(), defs)))
+                .map(|(k, v)| (k, canonicalize_with_type(v, vt, defs)))
                 .collect();
             Value::Concrete(ConcreteValue::Map(canonicalized))
         }
-        (Value::Concrete(ConcreteValue::Map(map)), AttributeType::Struct { fields, .. }) => {
+        (Value::Concrete(ConcreteValue::Map(map)), crate::schema::Shape::Struct { fields, .. }) => {
             let canonicalized = map
                 .into_iter()
                 .map(|(k, v)| {
@@ -1443,7 +1441,7 @@ pub(crate) fn canonicalize_with_type(
         // validator's — then re-dispatch so the existing arms
         // canonicalize it. `None` (no member shares the value's shape)
         // is identity — never guess-coerce.
-        (val, AttributeType::Union(members)) => {
+        (val, crate::schema::Shape::Union(members)) => {
             match crate::schema::select_union_member(members, &val) {
                 Some(member) => canonicalize_with_type(val, member, defs),
                 None => val,
