@@ -1,8 +1,9 @@
 //! LSP adapter that runs core's path-tagged validator
-//! ([`AttributeType::validate_collect`]) and anchors each error at
-//! its source position. The recursive struct/list-of-struct walk
-//! lives entirely in `carina-core` after #2214; this module just
-//! translates `(FieldPath, TypeError)` to LSP diagnostics.
+//! ([`carina_core::schema::Schema::validate_collect`]) and anchors
+//! each error at its source position. The recursive
+//! struct/list-of-struct walk lives entirely in `carina-core` after
+//! #2214; this module just translates `(FieldPath, TypeError)` to LSP
+//! diagnostics.
 
 use std::collections::HashMap;
 
@@ -11,29 +12,32 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 use crate::document::Document;
 use crate::position;
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeType, FieldPath, FieldPathStep, ResourceSchema};
+use carina_core::schema::{FieldPath, FieldPathStep, ResourceSchema};
 
 use super::{DiagnosticEngine, carina_diagnostic};
 
 impl DiagnosticEngine {
-    /// Run [`AttributeType::validate_collect`] against the resource
-    /// attribute's schema and translate each `(FieldPath, TypeError)`
-    /// into an LSP `Diagnostic` anchored at the offending source
-    /// position. The LSP no longer recurses into nested struct shapes
-    /// — that responsibility belongs to the core validator (#2214).
+    /// Run [`carina_core::schema::Schema::validate_collect`] against
+    /// the resource attribute's schema and translate each
+    /// `(FieldPath, TypeError)` into an LSP `Diagnostic` anchored at
+    /// the offending source position. The LSP no longer recurses into
+    /// nested struct shapes — that responsibility belongs to the core
+    /// validator (#2214).
     ///
-    /// Takes `&AttributeType` (rather than `&[StructField]`) so the
-    /// per-keystroke diagnostic pass borrows the schema instead of
-    /// deep-cloning every `StructField` (which itself contains
-    /// recursive `AttributeType` sub-trees).
+    /// `schema_view` carries `ResourceSchema::defs` so a cyclic
+    /// CFN-style `AttributeType::Ref` resolves correctly
+    /// (carina#3345). Construct it via
+    /// [`carina_core::schema::ResourceSchema::schema_view_for`] so
+    /// `defs` stays threaded through every per-keystroke diagnostic
+    /// pass.
     pub(super) fn validate_struct_value(
         &self,
         doc: &Document,
         attr_name: &str,
         value: &Value,
-        ty: &AttributeType,
+        schema_view: &carina_core::schema::Schema,
     ) -> Vec<Diagnostic> {
-        let errors = ty.validate_collect(value);
+        let errors = schema_view.validate_collect(value);
         let mut diagnostics = Vec::new();
         for (path, err) in errors {
             if let Some((line, col, end_col)) = self.range_for_path(doc, attr_name, &path) {

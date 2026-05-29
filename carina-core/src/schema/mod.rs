@@ -255,13 +255,19 @@ fn walk_custom_lookup(
         // `Ref`: resolve via the schema's def map and continue the
         // walk. The resolved target (typically a `Struct`) may carry
         // identity-bearing custom types whose validators must run.
-        // `resolve_refs` panics on a missing def name (schema
-        // invariant violation). The first-resolve-then-recurse shape
-        // matches `Schema::validate_attr` (carina#3340).
-        AttributeType::Ref(_) => {
-            let resolved = attr_type.resolve_refs(defs);
-            walk_custom_lookup(resolved, value, attr_name, lookup, defs, errors);
-        }
+        // A missing def name is reported by `Schema::validate_attr`
+        // as `ValidationFailed`; here we just skip the custom-lookup
+        // walk so a user-facing dangling-Ref does not abort the
+        // process (carina#3345).
+        AttributeType::Ref(name) => match defs.get(name) {
+            Some(resolved) => {
+                walk_custom_lookup(resolved, value, attr_name, lookup, defs, errors);
+            }
+            None => {
+                // Skip — the `validate_attr` pass already emitted
+                // the dangling-Ref diagnostic for this attribute.
+            }
+        },
     }
 }
 
@@ -569,6 +575,41 @@ pub struct Schema {
 }
 
 impl Schema {
+    /// Construct a `Schema` from `root` with an empty `defs` map. A
+    /// `Ref` reached during walking surfaces as a clean
+    /// `ValidationFailed` (`schema reference '<name>' is not defined
+    /// in the enclosing schema`); callers expecting `Ref` to resolve
+    /// must populate `defs`. Typical uses: unit-test fixtures, leaf
+    /// validation, provider-config schemas that are known flat.
+    pub fn flat(root: AttributeType) -> Self {
+        Self {
+            root,
+            defs: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Construct a `Schema` that carries only `defs`, with a
+    /// placeholder `root`. Use when the call shape is "iterate
+    /// attributes against a shared def map" and the per-call
+    /// attribute is supplied through [`Self::validate_attr`]
+    /// (which ignores `self.root`). Examples:
+    /// `ResourceSchema::validate_inner`, provider-config validation
+    /// in `carina-core::validation` and `carina-lsp::diagnostics`.
+    ///
+    /// **Do not** call [`Self::validate`] or [`Self::validate_collect`]
+    /// on a Schema produced by `with_defs`; those entry points walk
+    /// `self.root`, which here is a non-load-bearing
+    /// `AttributeType::String` and will silently validate every
+    /// value as a String.
+    pub fn with_defs(defs: std::collections::BTreeMap<String, AttributeType>) -> Self {
+        Self {
+            // `validate_attr(attr, value)` ignores `self.root`; pick
+            // the cheapest leaf as a non-load-bearing placeholder.
+            root: AttributeType::String,
+            defs,
+        }
+    }
+
     /// Look up a named definition. Returns `None` if `name` is not in
     /// `defs`; callers should treat that as a type error.
     pub fn resolve(&self, name: &str) -> Option<&AttributeType> {
@@ -579,6 +620,175 @@ impl Schema {
     /// any `Ref` it encounters by looking it up in `defs`.
     pub fn validate(&self, value: &Value) -> Result<(), TypeError> {
         self.validate_attr(&self.root, value)
+    }
+
+    /// Canonicalize a `Value` against `attr_type` using this schema's
+    /// `defs` map. The Schema-aware entry point for the
+    /// `string_or_list_of_strings` and `Ref` walks (carina#3345). This
+    /// is the only way to invoke canonicalization from outside
+    /// `carina-core`, so callers cannot accidentally drop `defs`.
+    pub fn canonicalize_attr(&self, attr: &AttributeType, value: Value) -> Value {
+        crate::value::canonicalize_with_type(value, attr, &self.defs)
+    }
+
+    /// Canonicalize a `Value` against this schema's `root`. Wrapper
+    /// over [`Self::canonicalize_attr`] for the common case where the
+    /// caller is driving from `Schema::root`.
+    pub fn canonicalize(&self, value: Value) -> Value {
+        self.canonicalize_attr(&self.root, value)
+    }
+
+    /// Schema-aware path-collecting validator. Equivalent to
+    /// [`AttributeType::validate_collect`] but resolves
+    /// `AttributeType::Ref` against `defs` at every walk-site, so the
+    /// LSP per-keystroke diagnostic pass surfaces real per-field
+    /// errors against cyclic CFN-style schemas instead of the
+    /// standalone-validator sentinel (carina#3345).
+    ///
+    /// Returns `(FieldPath, TypeError)` pairs anchored at each
+    /// offending location, mirroring the non-Schema-aware variant for
+    /// downstream consumers like the LSP range mapper.
+    pub fn validate_collect(&self, value: &Value) -> Vec<(FieldPath, TypeError)> {
+        let mut out = Vec::new();
+        self.collect_attr_into(&self.root, &FieldPath::new(), value, &mut out);
+        out
+    }
+
+    fn collect_attr_into(
+        &self,
+        attr: &AttributeType,
+        path: &FieldPath,
+        value: &Value,
+        out: &mut Vec<(FieldPath, TypeError)>,
+    ) {
+        // Peel Ref so the downstream arms never have to think about it.
+        if let AttributeType::Ref(name) = attr {
+            match self.resolve(name) {
+                Some(resolved) => {
+                    self.collect_attr_into(resolved, path, value, out);
+                }
+                None => {
+                    out.push((
+                        path.clone(),
+                        TypeError::ValidationFailed {
+                            message: format!(
+                                "schema reference `{name}` is not defined in the enclosing schema"
+                            ),
+                        },
+                    ));
+                }
+            }
+            return;
+        }
+        let Some(concrete) = value.as_concrete() else {
+            return;
+        };
+        match attr {
+            AttributeType::Struct { name, fields } => {
+                // Mirror the pre-#3345 standalone-validator collect_struct
+                // behavior, but route field walks through
+                // collect_attr_into so Ref-typed fields are resolved
+                // against self.defs.
+                if matches!(concrete, ConcreteValueRef::List(_)) {
+                    out.push((
+                        path.clone(),
+                        TypeError::BlockSyntaxNotAllowed {
+                            attribute: name.to_string(),
+                        },
+                    ));
+                    return;
+                }
+                let Some(map) = (match concrete {
+                    ConcreteValueRef::Map(m) => Some(m),
+                    _ => None,
+                }) else {
+                    out.push((
+                        path.clone(),
+                        TypeError::TypeMismatch {
+                            expected: attr.type_name(),
+                            got: concrete.type_name().to_string(),
+                        },
+                    ));
+                    return;
+                };
+
+                let accepted = build_accepted_field_map(fields);
+                let canonical_field_names: Vec<&str> =
+                    fields.iter().map(|f| f.name.as_str()).collect();
+
+                // Required-field check.
+                for f in fields {
+                    if f.required && !map.contains_key(&f.name) {
+                        let field_path = path.push_field(f.name.clone());
+                        out.push((
+                            field_path,
+                            TypeError::MissingRequired {
+                                name: f.name.clone(),
+                            },
+                        ));
+                    }
+                }
+
+                for (k, v) in map {
+                    match accepted.get(k.as_str()) {
+                        Some(field) => {
+                            let next_path = path.push_field(k.clone());
+                            self.collect_attr_into(&field.field_type, &next_path, v, out);
+                        }
+                        None => {
+                            let suggestion = suggest_similar_name(k, &canonical_field_names);
+                            out.push((
+                                path.push_field(k.clone()),
+                                TypeError::UnknownStructField {
+                                    struct_name: name.to_string(),
+                                    field: k.clone(),
+                                    suggestion,
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+            AttributeType::List { inner, .. } => {
+                let Some(items) = (match concrete {
+                    ConcreteValueRef::List(items) => Some(items),
+                    _ => None,
+                }) else {
+                    out.push((
+                        path.clone(),
+                        TypeError::TypeMismatch {
+                            expected: attr.type_name(),
+                            got: concrete.type_name().to_string(),
+                        },
+                    ));
+                    return;
+                };
+                for (i, item) in items.iter().enumerate() {
+                    let next_path = path.push_index(i);
+                    self.collect_attr_into(inner, &next_path, item, out);
+                }
+            }
+            // Union of leaves is the only Union shape in the current
+            // schema vocabulary (e.g. `string_or_list_of_strings`).
+            // Delegate to `validate_attr` which runs the best-scoring
+            // member selection and returns a single error anchored at
+            // the current path. If a Union-of-structs shape is ever
+            // introduced, this arm should recurse via collect_attr_into
+            // on the selected member to preserve per-field paths.
+            AttributeType::Union(_) => {
+                if let Err(e) = self.validate_attr(attr, value) {
+                    out.push((path.clone(), e));
+                }
+            }
+            _ => {
+                // For non-recursive shapes the existing single-shot
+                // dispatcher is correct. Forward any error under the
+                // current path.
+                if let Err(e) = self.validate_attr(attr, value) {
+                    out.push((path.clone(), e));
+                }
+            }
+        }
     }
 
     /// Validate against an arbitrary `AttributeType` in the context of
@@ -681,15 +891,34 @@ impl Schema {
                 }
             }
             AttributeType::Union(members) => {
+                // Mirror `validate_union`'s best-scoring selection so
+                // the StringEnum-rich diagnostic (variant list, alias
+                // hints) survives when the user-supplied value shape
+                // most closely matches a StringEnum member — the LSP
+                // quick-fix depends on the structured payload (#2309).
+                let Some(concrete) = value.as_concrete() else {
+                    return Ok(());
+                };
+                let mut best: Option<(u32, TypeError)> = None;
                 for member in members {
-                    if self.validate_attr(member, value).is_ok() {
-                        return Ok(());
+                    match self.validate_attr(member, value) {
+                        Ok(()) => return Ok(()),
+                        Err(e) => {
+                            let score = union_member_score(member, concrete);
+                            if score > 0
+                                && best
+                                    .as_ref()
+                                    .is_none_or(|(prev_score, _)| score > *prev_score)
+                            {
+                                best = Some((score, e));
+                            }
+                        }
                     }
                 }
-                Err(TypeError::TypeMismatch {
-                    expected: "Union".to_string(),
-                    got: attr.type_name(),
-                })
+                Err(best.map(|(_, e)| e).unwrap_or(TypeError::TypeMismatch {
+                    expected: attr.type_name(),
+                    got: concrete.type_name().to_string(),
+                }))
             }
             // For non-recursive variants, delegate to the standalone
             // validator. Any `Ref` they could reach has already been
@@ -1004,7 +1233,7 @@ impl AttributeType {
     /// `inner.validate(&Value)` again, so each nested element is
     /// independently re-projected. Lists may legitimately mix concrete
     /// and deferred elements (e.g. `[vpc.id, "literal"]`).
-    pub fn validate(&self, value: &Value) -> Result<(), TypeError> {
+    pub(crate) fn validate(&self, value: &Value) -> Result<(), TypeError> {
         // `Ref` cannot be resolved without a `Schema` context. Callers
         // who hold a schema that contains `Ref` must go through
         // `Schema::validate` / `Schema::validate_attr`; falling through
@@ -1075,159 +1304,6 @@ impl AttributeType {
                      this attribute must be validated through Schema::validate"
                 ),
             }),
-        }
-    }
-
-    /// Validate a value and collect every error along with the
-    /// [`FieldPath`] from the value's root to the offending location
-    /// (#2214).
-    ///
-    /// This is the path-tagged sibling of [`Self::validate`]: where
-    /// `validate` returns the first error wrapped in
-    /// `StructFieldError` / `ListItemError` / `MapValueError` enclosure
-    /// and stops, `validate_collect` keeps walking through every
-    /// field of every nested struct (and every item of a list-of-struct)
-    /// so a downstream tool like the LSP can surface every problem at
-    /// once with positional information.
-    ///
-    /// For non-Struct, non-List<Struct> shapes the result is exactly
-    /// one error (or none) — there is no nested context to descend
-    /// into, so this method is no slower than `validate` for primitives.
-    pub fn validate_collect(&self, value: &Value) -> Vec<(FieldPath, TypeError)> {
-        let mut out = Vec::new();
-        self.collect_into(&FieldPath::new(), value, &mut out);
-        out
-    }
-
-    fn collect_into(&self, path: &FieldPath, value: &Value, out: &mut Vec<(FieldPath, TypeError)>) {
-        // Project to the concrete axis. Deferred values contribute no
-        // type-check errors at this layer — the deferred-aware checker
-        // covers them.
-        let Some(concrete) = value.as_concrete() else {
-            return;
-        };
-
-        match self {
-            AttributeType::Struct { name, fields } => {
-                self.collect_struct(path, name, fields, concrete, out);
-            }
-            AttributeType::List { inner, .. } => {
-                self.collect_list(path, inner, concrete, out);
-            }
-            // For everything else the existing single-shot validator is
-            // already correct: it returns at most one error and there
-            // is no nested structure to recurse into. Forward the error
-            // (if any) under the current path.
-            _ => {
-                if let Err(e) = self.validate_concrete(concrete) {
-                    out.push((path.clone(), e));
-                }
-            }
-        }
-    }
-
-    fn collect_struct(
-        &self,
-        path: &FieldPath,
-        name: &str,
-        fields: &[StructField],
-        value: ConcreteValueRef<'_>,
-        out: &mut Vec<(FieldPath, TypeError)>,
-    ) {
-        // Block syntax → List([Map(...)]) for List<Struct>; bare Struct
-        // rejects List with `BlockSyntaxNotAllowed`.
-        if matches!(value, ConcreteValueRef::List(_)) {
-            out.push((
-                path.clone(),
-                TypeError::BlockSyntaxNotAllowed {
-                    attribute: name.to_string(),
-                },
-            ));
-            return;
-        }
-        let ConcreteValueRef::Map(map) = value else {
-            out.push((
-                path.clone(),
-                TypeError::TypeMismatch {
-                    expected: self.type_name(),
-                    got: value.type_name().to_string(),
-                },
-            ));
-            return;
-        };
-
-        // Map every accepted name (canonical + block_name alias) to the
-        // canonical `StructField`. Pre-#2214 the LSP did this alias
-        // resolution itself; now the core validator is the single
-        // source of truth and `validate_struct` shares the same map
-        // (#2214 reconciliation).
-        let accepted = build_accepted_field_map(fields);
-        let canonical_field_names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
-
-        // Required-field check.
-        for f in fields {
-            if f.required && !map.contains_key(&f.name) {
-                let field_path = path.push_field(f.name.clone());
-                out.push((
-                    field_path,
-                    TypeError::MissingRequired {
-                        name: f.name.clone(),
-                    },
-                ));
-            }
-        }
-
-        // Each present field — descend (for nested struct/list of
-        // struct) or run the leaf validator. `collect_into` projects
-        // the field value through `as_concrete()` again, so deferred
-        // field values silently contribute no errors here. Phase 2 of
-        // RFC #2972 makes this a single, type-aware filter point
-        // instead of the old per-site `matches!(v, Value::Deferred(DeferredValue::ResourceRef)
-        // { .. })` skip.
-        for (k, v) in map {
-            match accepted.get(k.as_str()) {
-                Some(field) => {
-                    let next_path = path.push_field(k.clone());
-                    field.field_type.collect_into(&next_path, v, out);
-                }
-                None => {
-                    let suggestion = suggest_similar_name(k, &canonical_field_names);
-                    out.push((
-                        path.push_field(k.clone()),
-                        TypeError::UnknownStructField {
-                            struct_name: name.to_string(),
-                            field: k.clone(),
-                            suggestion,
-                        },
-                    ));
-                }
-            }
-        }
-    }
-
-    fn collect_list(
-        &self,
-        path: &FieldPath,
-        inner: &AttributeType,
-        value: ConcreteValueRef<'_>,
-        out: &mut Vec<(FieldPath, TypeError)>,
-    ) {
-        let ConcreteValueRef::List(items) = value else {
-            out.push((
-                path.clone(),
-                TypeError::TypeMismatch {
-                    expected: self.type_name(),
-                    got: value.type_name().to_string(),
-                },
-            ));
-            return;
-        };
-        // For List<Struct> we want per-item descent so each item's
-        // errors carry a `[i]` step in the path. For plain List<T>
-        // this still works — each item runs the leaf validator under
-        // the indexed path.
-        for (i, item) in items.iter().enumerate() {
-            inner.collect_into(&path.push_index(i), item, out);
         }
     }
 
@@ -2969,6 +3045,23 @@ impl ResourceSchema {
             .collect()
     }
 
+    /// Construct a [`Schema`] view rooted at `root` and carrying this
+    /// resource's `defs` map.
+    ///
+    /// Use this in every place that needs to validate or canonicalize
+    /// against a single attribute of the resource: the resulting
+    /// `Schema` is the only API that resolves `AttributeType::Ref`
+    /// against this resource's def map, so a future caller that needs
+    /// per-attribute validation cannot accidentally drop `defs`
+    /// (carina#3345). The `root` argument is typically
+    /// `attr_schema.attr_type.clone()`.
+    pub fn schema_view_for(&self, root: AttributeType) -> Schema {
+        Schema {
+            root,
+            defs: self.defs.clone(),
+        }
+    }
+
     /// Validate resource attributes.
     ///
     /// This variant does not have origin information for string values, so
@@ -3036,6 +3129,16 @@ impl ResourceSchema {
             known.push(bn.as_str());
         }
 
+        // Build a `Schema` view over this resource's `defs` once so
+        // every attribute validation walks the same def map. Routing
+        // through `Schema::validate_attr` is what makes cyclic CFN
+        // attributes (`AttributeType::Ref`) resolve correctly; the
+        // `defs`-less `AttributeType::validate(value)` call this
+        // replaced trips the "reached the standalone validator"
+        // sentinel for every Ref-containing attribute (carina#3345,
+        // post-#3340 awscc `s3.Bucket/*` failures).
+        let schema_view = Schema::with_defs(self.defs.clone());
+
         // Type check each attribute and reject unknown ones
         for (name, value) in attributes {
             // Skip parser-internal attributes (leading `_`, e.g.
@@ -3050,7 +3153,7 @@ impl ResourceSchema {
             let canonical = bn_map.get(name).map(|s| s.as_str()).unwrap_or(name);
 
             if let Some(schema) = self.attributes.get(canonical) {
-                if let Err(e) = schema.attr_type.validate(value) {
+                if let Err(e) = schema_view.validate_attr(&schema.attr_type, value) {
                     // Tag the error with the attribute name the user actually
                     // wrote (which may be a block-name alias), so diagnostics
                     // point back at a token that appears in their source.

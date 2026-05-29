@@ -279,11 +279,15 @@ impl DiagnosticEngine {
             };
 
             // Host-side type-level validation (catches malformed namespace
-            // identifiers, invalid enum values, etc.).
+            // identifiers, invalid enum values, etc.). Provider configs
+            // are flat (no cyclic CFN-style `AttributeType::Ref` today),
+            // so a single empty-`defs` `Schema` view is sufficient.
             let attr_types = factory.provider_config_attribute_types();
+            let schema_view =
+                carina_core::schema::Schema::with_defs(std::collections::BTreeMap::new());
             for (attr_name, value) in &provider.attributes {
                 if let Some(attr_type) = attr_types.get(attr_name)
-                    && let Err(e) = attr_type.validate(value)
+                    && let Err(e) = schema_view.validate_attr(attr_type, value)
                     && let Some((line, col)) =
                         self.find_provider_attr_position(doc, &provider.name, attr_name)
                 {
