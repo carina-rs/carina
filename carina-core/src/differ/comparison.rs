@@ -433,43 +433,49 @@ fn is_type_default(
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
 ) -> bool {
-    // Resolve top-level `Ref` chain so the wildcard arm cannot
-    // silently miss a default-value classification (carina#3340).
-    // The `ResolvedAttrType` wrapper makes the peel step compiler-
-    // checked rather than convention; collapsing back to
-    // `&AttributeType` here is safe because the wrapper's invariant
-    // is "not `Ref`" — the wildcard arm below cannot be reached by
-    // a `Ref` and never silently swallows one.
-    let attr_type = attr_type.map(|t| t.resolve_refs(defs).as_attr());
-    match (value, attr_type) {
-        (Value::Concrete(ConcreteValue::Bool(false)), Some(AttributeType::Bool) | None) => true,
-        (Value::Concrete(ConcreteValue::Int(0)), Some(AttributeType::Int)) => true,
-        (Value::Concrete(ConcreteValue::Float(f)), Some(AttributeType::Float)) if *f == 0.0 => true,
-        (Value::Concrete(ConcreteValue::Duration(d)), Some(AttributeType::Duration))
+    // Dispatch through `Shape` so the wildcard arm cannot be reached
+    // by a `Ref`-typed `attr_type` (carina#3340 / carina#3349). The
+    // `Shape` enum has no `Ref` variant by construction, so the type
+    // system rather than convention enforces that every default-value
+    // classification has seen its target shape.
+    let shape = attr_type.map(|t| t.shape(defs));
+    match (value, shape) {
+        (Value::Concrete(ConcreteValue::Bool(false)), Some(crate::schema::Shape::Bool) | None) => {
+            true
+        }
+        (Value::Concrete(ConcreteValue::Int(0)), Some(crate::schema::Shape::Int)) => true,
+        (Value::Concrete(ConcreteValue::Float(f)), Some(crate::schema::Shape::Float))
+            if *f == 0.0 =>
+        {
+            true
+        }
+        (Value::Concrete(ConcreteValue::Duration(d)), Some(crate::schema::Shape::Duration))
             if d.is_zero() =>
         {
             true
         }
-        (Value::Concrete(ConcreteValue::String(s)), Some(AttributeType::String))
+        (Value::Concrete(ConcreteValue::String(s)), Some(crate::schema::Shape::String))
             if s.is_empty() =>
         {
             true
         }
         (
             Value::Concrete(ConcreteValue::String(s) | ConcreteValue::EnumIdentifier(s)),
-            Some(AttributeType::StringEnum { .. }),
+            Some(crate::schema::Shape::StringEnum { .. }),
         ) if s.is_empty() => true,
-        (Value::Concrete(ConcreteValue::List(l)), Some(AttributeType::List { .. }))
+        (Value::Concrete(ConcreteValue::List(l)), Some(crate::schema::Shape::List { .. }))
             if l.is_empty() =>
         {
             true
         }
         (
             Value::Concrete(ConcreteValue::Map(m)),
-            Some(AttributeType::Map { .. } | AttributeType::Struct { .. }),
+            Some(crate::schema::Shape::Map { .. } | crate::schema::Shape::Struct { .. }),
         ) if m.is_empty() => true,
         // Custom types: delegate to the base type
-        (_, Some(AttributeType::Custom { base, .. })) => is_type_default(value, Some(base), defs),
+        (_, Some(crate::schema::Shape::Custom { base, .. })) => {
+            is_type_default(value, Some(base), defs)
+        }
         _ => false,
     }
 }
