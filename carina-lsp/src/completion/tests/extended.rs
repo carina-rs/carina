@@ -176,12 +176,12 @@ outer {
 fn list_string_enum_completions() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let list_enum = AttributeType::list(AttributeType::StringEnum {
-        name: "Protocol".to_string(),
-        values: vec!["tcp".to_string(), "udp".to_string(), "icmp".to_string()],
-        identity: None,
-        dsl_aliases: vec![],
-    });
+    let list_enum = AttributeType::list(AttributeType::string_enum(
+        "Protocol".to_string(),
+        vec!["tcp".to_string(), "udp".to_string(), "icmp".to_string()],
+        None,
+        vec![],
+    ));
 
     let schema = ResourceSchema::new("list.resource")
         .attribute(AttributeSchema::new("protocols", list_enum));
@@ -193,12 +193,12 @@ fn list_string_enum_completions() {
         CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
 
     let completions = provider.completions_for_type(
-        &AttributeType::list(AttributeType::StringEnum {
-            name: "Protocol".to_string(),
-            values: vec!["tcp".to_string(), "udp".to_string(), "icmp".to_string()],
-            identity: None,
-            dsl_aliases: vec![],
-        }),
+        &AttributeType::list(AttributeType::string_enum(
+            "Protocol".to_string(),
+            vec!["tcp".to_string(), "udp".to_string(), "icmp".to_string()],
+            None,
+            vec![],
+        )),
         None,
     );
 
@@ -240,14 +240,14 @@ fn union_completions_include_member_types() {
 
     let provider = test_provider();
     let completions = provider.completions_for_type(
-        &AttributeType::Union(vec![
-            AttributeType::StringEnum {
-                name: "Mode".to_string(),
-                values: vec!["active".to_string(), "passive".to_string()],
-                identity: None,
-                dsl_aliases: vec![],
-            },
-            AttributeType::Bool,
+        &AttributeType::union(vec![
+            AttributeType::string_enum(
+                "Mode".to_string(),
+                vec!["active".to_string(), "passive".to_string()],
+                None,
+                vec![],
+            ),
+            AttributeType::bool(),
         ]),
         None,
     );
@@ -284,7 +284,7 @@ fn union_completions_dedup_labels() {
 
     let provider = test_provider();
     let completions = provider.completions_for_type(
-        &AttributeType::Union(vec![AttributeType::Bool, AttributeType::Bool]),
+        &AttributeType::union(vec![AttributeType::bool(), AttributeType::bool()]),
         None,
     );
 
@@ -302,7 +302,8 @@ fn map_completions_delegate_to_inner_type() {
     use carina_core::schema::AttributeType;
 
     let provider = test_provider();
-    let completions = provider.completions_for_type(&AttributeType::map(AttributeType::Bool), None);
+    let completions =
+        provider.completions_for_type(&AttributeType::map(AttributeType::bool()), None);
 
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
@@ -340,9 +341,9 @@ fn no_completions_for_unknown_resource_type_in_block() {
 
     // Create a provider with two schemas
     let schema_a = ResourceSchema::new("a.resource")
-        .attribute(AttributeSchema::new("attr_a", AttributeType::String));
+        .attribute(AttributeSchema::new("attr_a", AttributeType::string()));
     let schema_b = ResourceSchema::new("b.resource")
-        .attribute(AttributeSchema::new("attr_b", AttributeType::String));
+        .attribute(AttributeSchema::new("attr_b", AttributeType::string()));
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert("test", schema_a);
@@ -1086,13 +1087,13 @@ fn map_key_completions_from_string_enum_key_type() {
         "arn_like".to_string(),
     ];
     let map_type = AttributeType::map_with_key(
-        AttributeType::StringEnum {
-            name: "ConditionOperator".to_string(),
-            values: condition_keys.clone(),
-            identity: None,
-            dsl_aliases: vec![],
-        },
-        AttributeType::map(AttributeType::String),
+        AttributeType::string_enum(
+            "ConditionOperator".to_string(),
+            condition_keys.clone(),
+            None,
+            vec![],
+        ),
+        AttributeType::map(AttributeType::string()),
     );
     let schema =
         ResourceSchema::new("resource").attribute(AttributeSchema::new("condition", map_type));
@@ -1139,22 +1140,22 @@ fn union_struct_field_completions() {
     use std::sync::Arc;
 
     // principal: Union([Struct { fields: [service, aws, federated] }, String])
-    let principal_type = AttributeType::Union(vec![
-        AttributeType::Struct {
-            name: "Principal".to_string(),
-            fields: vec![
-                StructField::new("service", AttributeType::String),
-                StructField::new("aws", AttributeType::String),
-                StructField::new("federated", AttributeType::String),
+    let principal_type = AttributeType::union(vec![
+        AttributeType::struct_(
+            "Principal".to_string(),
+            vec![
+                StructField::new("service", AttributeType::string()),
+                StructField::new("aws", AttributeType::string()),
+                StructField::new("federated", AttributeType::string()),
             ],
-        },
-        AttributeType::String,
+        ),
+        AttributeType::string(),
     ]);
 
-    let statement_type = AttributeType::Struct {
-        name: "Statement".to_string(),
-        fields: vec![StructField::new("principal", principal_type)],
-    };
+    let statement_type = AttributeType::struct_(
+        "Statement".to_string(),
+        vec![StructField::new("principal", principal_type)],
+    );
 
     let schema = ResourceSchema::new("resource")
         .attribute(AttributeSchema::new("statement", statement_type));
@@ -2698,14 +2699,14 @@ fn exports_map_value_offers_matching_resource_refs() {
     fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let account_id = AttributeType::Custom {
-        identity: Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
-        base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
-        validate: legacy_validator(validate_noop),
-        to_dsl: None,
-    };
+    let account_id = AttributeType::custom(
+        Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
+        AttributeType::string(),
+        None,
+        None,
+        legacy_validator(validate_noop),
+        None,
+    );
     let schema = ResourceSchema::new("organizations.account")
         .attribute(AttributeSchema::new("account_id", account_id));
     let mut schemas = SchemaRegistry::new();
@@ -2782,14 +2783,14 @@ fn exports_map_value_multiple_entries_returns_refs() {
     fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let account_id = AttributeType::Custom {
-        identity: Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
-        base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
-        validate: legacy_validator(validate_noop),
-        to_dsl: None,
-    };
+    let account_id = AttributeType::custom(
+        Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
+        AttributeType::string(),
+        None,
+        None,
+        legacy_validator(validate_noop),
+        None,
+    );
     let schema = ResourceSchema::new("organizations.account")
         .attribute(AttributeSchema::new("account_id", account_id));
     let mut schemas = SchemaRegistry::new();
@@ -2839,14 +2840,14 @@ fn exports_map_value_includes_bindings_from_sibling_files() {
     fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let account_id = AttributeType::Custom {
-        identity: Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
-        base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
-        validate: legacy_validator(validate_noop),
-        to_dsl: None,
-    };
+    let account_id = AttributeType::custom(
+        Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
+        AttributeType::string(),
+        None,
+        None,
+        legacy_validator(validate_noop),
+        None,
+    );
     let schema = ResourceSchema::new("organizations.account")
         .attribute(AttributeSchema::new("account_id", account_id));
     let mut schemas = SchemaRegistry::new();
@@ -2896,14 +2897,14 @@ fn custom_type_value_ref_includes_sibling_file_bindings() {
     fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let account_id = AttributeType::Custom {
-        identity: Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
-        base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
-        validate: legacy_validator(validate_noop),
-        to_dsl: None,
-    };
+    let account_id = AttributeType::custom(
+        Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
+        AttributeType::string(),
+        None,
+        None,
+        legacy_validator(validate_noop),
+        None,
+    );
     let account_schema = ResourceSchema::new("organizations.account")
         .attribute(AttributeSchema::new("account_id", account_id.clone()));
     let consumer_schema = ResourceSchema::new("organizations.policy_target_attachment")
@@ -2951,7 +2952,7 @@ fn argument_parameters_include_sibling_file_args() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::new("name", AttributeType::String));
+        .attribute(AttributeSchema::new("name", AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
     let provider =
@@ -2996,14 +2997,14 @@ fn binding_dot_completion_resolves_sibling_file_binding() {
     fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let account_id = AttributeType::Custom {
-        identity: Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
-        base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
-        validate: legacy_validator(validate_noop),
-        to_dsl: None,
-    };
+    let account_id = AttributeType::custom(
+        Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
+        AttributeType::string(),
+        None,
+        None,
+        legacy_validator(validate_noop),
+        None,
+    );
     let account_schema = ResourceSchema::new("organizations.account")
         .attribute(AttributeSchema::new("account_id", account_id.clone()));
     let consumer_schema = ResourceSchema::new("organizations.policy_target_attachment")
@@ -3051,7 +3052,7 @@ fn upstream_state_export_suggested_in_value_position() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("foo.bar")
-        .attribute(AttributeSchema::new("attr", AttributeType::String));
+        .attribute(AttributeSchema::new("attr", AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("test", schema);
     let provider =
@@ -3100,7 +3101,7 @@ fn upstream_state_export_filtered_by_attribute_type() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("foo.bar")
-        .attribute(AttributeSchema::new("attr", AttributeType::String));
+        .attribute(AttributeSchema::new("attr", AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("test", schema);
     let provider =
@@ -3160,7 +3161,7 @@ fn upstream_state_export_multiple_bindings_and_sibling_exports_file() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("foo.bar")
-        .attribute(AttributeSchema::new("attr", AttributeType::String));
+        .attribute(AttributeSchema::new("attr", AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("test", schema);
     let provider =
@@ -3231,14 +3232,14 @@ fn upstream_state_string_export_not_offered_to_specific_custom_receiver() {
     fn noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let vpc_id_type = AttributeType::Custom {
-        identity: Some(carina_core::schema::TypeIdentity::bare("VpcId")),
-        pattern: None,
-        length: None,
-        base: Box::new(AttributeType::String),
-        validate: legacy_validator(noop),
-        to_dsl: None,
-    };
+    let vpc_id_type = AttributeType::custom(
+        Some(carina_core::schema::TypeIdentity::bare("VpcId")),
+        AttributeType::string(),
+        None,
+        None,
+        legacy_validator(noop),
+        None,
+    );
     let schema = ResourceSchema::new("ec2.SecurityGroup")
         .attribute(AttributeSchema::new("vpc_id", vpc_id_type));
     let mut schemas = SchemaRegistry::new();

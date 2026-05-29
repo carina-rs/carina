@@ -8,7 +8,7 @@
 //! exclusively by [`super::AttributeType::resolve_refs`] after
 //! peeling every `Ref` hop. A future contributor adding code in
 //! `schema/mod.rs` (or any other carina-core file) cannot synthesise a
-//! `ResolvedAttrType(&AttributeType::Ref(...))` because the
+//! `ResolvedAttrType(&AttributeType::ref_(...))` because the
 //! constructor is module-private to *this* file, not module-private to
 //! `schema/`.
 //!
@@ -16,7 +16,7 @@
 //! `ResolvedAttrType` doc-comment for the carina#3340 / carina#3349
 //! invariant being enforced.
 
-use super::AttributeType;
+use super::{AttrTypeKind, AttributeType};
 
 /// A reference to an [`AttributeType`] that is **guaranteed not to be**
 /// [`AttributeType::Ref`].
@@ -39,12 +39,12 @@ pub struct ResolvedAttrType<'a>(&'a AttributeType);
 
 impl<'a> ResolvedAttrType<'a> {
     /// **Internal** — only invoke after every `Ref` hop has been
-    /// peeled.  Calling this with `&AttributeType::Ref(_)` violates
+    /// peeled.  Calling this with `&AttributeType::ref_(_)` violates
     /// the type's invariant; the only legitimate caller is
     /// [`super::AttributeType::resolve_refs`].
     pub(super) fn new_after_peel(inner: &'a AttributeType) -> Self {
         debug_assert!(
-            !matches!(inner, AttributeType::Ref(_)),
+            !matches!(&inner.kind, AttrTypeKind::Ref(_)),
             "ResolvedAttrType constructor reached with an unpeeled Ref; \
              only AttributeType::resolve_refs may produce this type"
         );

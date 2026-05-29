@@ -54,9 +54,9 @@ fn create_before_destroy_generates_temporary_name_for_name_attribute() {
     schemas.insert(
         "",
         ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only())
+            .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only())
             .attribute(
-                AttributeSchema::new("object_lock_enabled", AttributeType::Bool).create_only(),
+                AttributeSchema::new("object_lock_enabled", AttributeType::bool()).create_only(),
             )
             .with_name_attribute("bucket_name"),
     );
@@ -141,9 +141,9 @@ fn create_before_destroy_generates_temporary_name_with_can_rename() {
         ResourceSchema::new("logs.LogGroup")
             .attribute(
                 // log_group_name is NOT create-only in this test (can be renamed)
-                AttributeSchema::new("log_group_name", AttributeType::String),
+                AttributeSchema::new("log_group_name", AttributeType::string()),
             )
-            .attribute(AttributeSchema::new("kms_key_id", AttributeType::String).create_only())
+            .attribute(AttributeSchema::new("kms_key_id", AttributeType::string()).create_only())
             .with_name_attribute("log_group_name"),
     );
 
@@ -208,9 +208,9 @@ fn no_temporary_name_without_create_before_destroy() {
     schemas.insert(
         "",
         ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only())
+            .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only())
             .attribute(
-                AttributeSchema::new("object_lock_enabled", AttributeType::Bool).create_only(),
+                AttributeSchema::new("object_lock_enabled", AttributeType::bool()).create_only(),
             )
             .with_name_attribute("bucket_name"),
     );
@@ -279,9 +279,9 @@ fn no_temporary_name_when_name_prefix_is_used() {
     schemas.insert(
         "",
         ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only())
+            .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only())
             .attribute(
-                AttributeSchema::new("object_lock_enabled", AttributeType::Bool).create_only(),
+                AttributeSchema::new("object_lock_enabled", AttributeType::bool()).create_only(),
             )
             .with_name_attribute("bucket_name"),
     );
@@ -337,7 +337,7 @@ fn no_temporary_name_without_name_attribute_in_schema() {
     schemas.insert(
         "",
         ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
+            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only()),
         // No name_attribute set
     );
 
@@ -403,9 +403,9 @@ fn no_temporary_name_when_name_attribute_changes() {
     schemas.insert(
         "",
         ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only())
+            .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only())
             .attribute(
-                AttributeSchema::new("object_lock_enabled", AttributeType::Bool).create_only(),
+                AttributeSchema::new("object_lock_enabled", AttributeType::bool()).create_only(),
             )
             .with_name_attribute("bucket_name"),
     );
@@ -738,10 +738,10 @@ fn create_plan_filters_non_removable_attribute_removal() {
     schemas.insert(
         "",
         ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("region", AttributeType::String).non_removable())
+            .attribute(AttributeSchema::new("region", AttributeType::string()).non_removable())
             .attribute(AttributeSchema::new(
                 "tags",
-                AttributeType::map(AttributeType::String),
+                AttributeType::map(AttributeType::string()),
             )),
     );
 
@@ -811,8 +811,8 @@ fn create_plan_skips_update_when_only_non_removable_removal() {
     schemas.insert(
         "",
         ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::new("bucket", AttributeType::String).required())
-            .attribute(AttributeSchema::new("region", AttributeType::String).non_removable()),
+            .attribute(AttributeSchema::new("bucket", AttributeType::string()).required())
+            .attribute(AttributeSchema::new("region", AttributeType::string()).non_removable()),
     );
 
     let plan = create_plan(
@@ -952,7 +952,7 @@ fn prevent_destroy_blocks_replace() {
     schemas.insert(
         "",
         ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
+            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only()),
     );
 
     let plan = create_plan(
@@ -1278,7 +1278,7 @@ fn wait_uses_schema_default_timeout_when_omitted() {
     schemas.insert(
         "",
         ResourceSchema::new("acm.Certificate")
-            .attribute(AttributeSchema::new("status", AttributeType::String))
+            .attribute(AttributeSchema::new("status", AttributeType::string()))
             .with_default_wait_timeout(std::time::Duration::from_secs(99))
             .with_default_wait_interval(std::time::Duration::from_secs(7)),
     );

@@ -2,13 +2,13 @@ use super::*;
 
 #[test]
 fn attribute_schema_write_only_default_false() {
-    let attr = AttributeSchema::new("ipv4_netmask_length", AttributeType::Int);
+    let attr = AttributeSchema::new("ipv4_netmask_length", AttributeType::int());
     assert!(!attr.write_only);
 }
 
 #[test]
 fn attribute_schema_write_only_builder() {
-    let attr = AttributeSchema::new("ipv4_netmask_length", AttributeType::Int).write_only();
+    let attr = AttributeSchema::new("ipv4_netmask_length", AttributeType::int()).write_only();
     assert!(attr.write_only);
 }
 
@@ -28,7 +28,7 @@ fn resource_schema_as_data_source_sets_kind() {
 
 #[test]
 fn validate_string_type() {
-    let t = AttributeType::String;
+    let t = AttributeType::string();
     assert!(
         t.validate(&Value::Concrete(ConcreteValue::String("hello".to_string())))
             .is_ok()
@@ -45,15 +45,15 @@ fn validate_string_enum_type() {
     // `ConcreteValue::EnumIdentifier`. Constructed-by-hand strings are
     // rejected as `StringLiteralExpectedEnum` — see
     // `validate_string_enum_rejects_quoted_string_literal` for that path.
-    let t = AttributeType::StringEnum {
-        name: "AddressFamily".to_string(),
-        values: vec!["IPv4".to_string(), "IPv6".to_string()],
-        identity: Some(crate::schema::string_enum_identity(
+    let t = AttributeType::string_enum(
+        "AddressFamily".to_string(),
+        vec!["IPv4".to_string(), "IPv6".to_string()],
+        Some(crate::schema::string_enum_identity(
             "AddressFamily",
             Some("awscc.ec2.ipam_pool"),
         )),
-        dsl_aliases: vec![],
-    };
+        vec![],
+    );
     assert!(
         t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "awscc.ec2.ipam_pool.AddressFamily.IPv4".to_string()
@@ -87,15 +87,15 @@ fn validate_string_enum_rejects_quoted_string_literal() {
     // emits `StringLiteralExpectedEnum` with the full expected variant
     // list so the LSP code action can offer "drop quotes / use
     // identifier form" without re-deriving candidates.
-    let t = AttributeType::StringEnum {
-        name: "AddressFamily".to_string(),
-        values: vec!["IPv4".to_string(), "IPv6".to_string()],
-        identity: Some(crate::schema::string_enum_identity(
+    let t = AttributeType::string_enum(
+        "AddressFamily".to_string(),
+        vec!["IPv4".to_string(), "IPv6".to_string()],
+        Some(crate::schema::string_enum_identity(
             "AddressFamily",
             Some("awscc.ec2.ipam_pool"),
         )),
-        dsl_aliases: vec![],
-    };
+        vec![],
+    );
     let err = t
         .validate(&Value::Concrete(ConcreteValue::String("IPv4".to_string())))
         .unwrap_err();
@@ -107,35 +107,35 @@ fn validate_string_enum_rejects_quoted_string_literal() {
 
 #[test]
 fn string_enum_type_name_uses_declared_name() {
-    let t = AttributeType::StringEnum {
-        name: "VersioningStatus".to_string(),
-        values: vec!["Enabled".to_string(), "Suspended".to_string()],
-        identity: Some(crate::schema::string_enum_identity(
+    let t = AttributeType::string_enum(
+        "VersioningStatus".to_string(),
+        vec!["Enabled".to_string(), "Suspended".to_string()],
+        Some(crate::schema::string_enum_identity(
             "VersioningStatus",
             Some("aws.s3.Bucket"),
         )),
-        dsl_aliases: vec![],
-    };
+        vec![],
+    );
     assert_eq!(t.type_name(), "VersioningStatus");
 }
 
 #[test]
 fn validate_string_enum_accepts_dsl_alias() {
-    let t = AttributeType::StringEnum {
-        name: "IpProtocol".to_string(),
-        values: vec![
+    let t = AttributeType::string_enum(
+        "IpProtocol".to_string(),
+        vec![
             "tcp".to_string(),
             "udp".to_string(),
             "icmp".to_string(),
             "icmpv6".to_string(),
             "-1".to_string(),
         ],
-        identity: Some(crate::schema::string_enum_identity(
+        Some(crate::schema::string_enum_identity(
             "IpProtocol",
             Some("awscc.ec2.SecurityGroup"),
         )),
-        dsl_aliases: vec![("-1".to_string(), "all".to_string())],
-    };
+        vec![("-1".to_string(), "all".to_string())],
+    );
     // Canonical "-1" is rewritten to DSL "all" — the DSL surface must
     // not accept the API form when an alias is registered. Users
     // write `all`. Updated for carina#2980 / carina#2986.
@@ -174,18 +174,18 @@ fn validate_string_enum_accepts_dsl_alias() {
 fn validate_string_enum_all_without_dsl_aliases_requires_explicit_variant() {
     // Without "all" as a direct variant or in `dsl_aliases`, the bare
     // identifier `all` is not accepted. Issue #1428.
-    let without_all = AttributeType::StringEnum {
-        name: String::new(),
-        values: vec![
+    let without_all = AttributeType::string_enum(
+        String::new(),
+        vec![
             "tcp".to_string(),
             "udp".to_string(),
             "icmp".to_string(),
             "icmpv6".to_string(),
             "-1".to_string(),
         ],
-        identity: None,
-        dsl_aliases: vec![],
-    };
+        None,
+        vec![],
+    );
     // Without "all" in values and no dsl_aliases entry mapping to "all", it is rejected
     assert!(
         without_all
@@ -196,9 +196,9 @@ fn validate_string_enum_all_without_dsl_aliases_requires_explicit_variant() {
     );
 
     // With "all" added to values, it is accepted even without dsl_aliases
-    let with_all = AttributeType::StringEnum {
-        name: String::new(),
-        values: vec![
+    let with_all = AttributeType::string_enum(
+        String::new(),
+        vec![
             "tcp".to_string(),
             "udp".to_string(),
             "icmp".to_string(),
@@ -206,9 +206,9 @@ fn validate_string_enum_all_without_dsl_aliases_requires_explicit_variant() {
             "-1".to_string(),
             "all".to_string(),
         ],
-        identity: None,
-        dsl_aliases: vec![],
-    };
+        None,
+        vec![],
+    );
     assert!(
         with_all
             .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
@@ -222,15 +222,15 @@ fn validate_string_enum_all_without_dsl_aliases_requires_explicit_variant() {
 fn validate_string_enum_accepts_values_with_dots() {
     // Values like "ipsec.1" contain dots that should not be treated as
     // namespace separators (issue #611)
-    let t = AttributeType::StringEnum {
-        name: "Type".to_string(),
-        values: vec!["ipsec.1".to_string()],
-        identity: Some(crate::schema::string_enum_identity(
+    let t = AttributeType::string_enum(
+        "Type".to_string(),
+        vec!["ipsec.1".to_string()],
+        Some(crate::schema::string_enum_identity(
             "Type",
             Some("awscc.ec2.vpn_gateway"),
         )),
-        dsl_aliases: vec![],
-    };
+        vec![],
+    );
     // Bare identifier with dot should match directly (carried as
     // `EnumIdentifier` under strict mode — the test name still says
     // "Quoted string" for historical reasons but values are written
@@ -266,15 +266,15 @@ fn invalid_enum_error_preserves_user_typed_string_literal() {
     // the error verbatim (echoed inside double quotes per the
     // `format_string_literal_expected_enum` shape) without leaking the
     // synthesized namespaced form.
-    let t = AttributeType::StringEnum {
-        name: "TargetType".to_string(),
-        values: vec!["AWS_ACCOUNT".to_string()],
-        identity: Some(crate::schema::string_enum_identity(
+    let t = AttributeType::string_enum(
+        "TargetType".to_string(),
+        vec!["AWS_ACCOUNT".to_string()],
+        Some(crate::schema::string_enum_identity(
             "TargetType",
             Some("awscc.sso.Assignment"),
         )),
-        dsl_aliases: vec![],
-    };
+        vec![],
+    );
     let err = t
         .validate(&Value::Concrete(ConcreteValue::String("aaa".to_string())))
         .unwrap_err();
@@ -295,15 +295,15 @@ fn invalid_enum_error_names_the_enum_type_and_fully_qualified_variants() {
     // expected and list allowed variants in their fully-qualified form
     // so the user can copy-paste one into their .crn without having to
     // synthesize the namespace prefix.
-    let t = AttributeType::StringEnum {
-        name: "TargetType".to_string(),
-        values: vec!["AWS_ACCOUNT".to_string()],
-        identity: Some(crate::schema::string_enum_identity(
+    let t = AttributeType::string_enum(
+        "TargetType".to_string(),
+        vec!["AWS_ACCOUNT".to_string()],
+        Some(crate::schema::string_enum_identity(
             "TargetType",
             Some("awscc.sso.Assignment"),
         )),
-        dsl_aliases: vec![],
-    };
+        vec![],
+    );
     let err = t
         .validate(&Value::Concrete(ConcreteValue::String("aaa".to_string())))
         .unwrap_err();
@@ -325,15 +325,15 @@ fn with_attribute_adds_attribute_name_to_enum_error() {
     // `InvalidEnumVariant` (for genuine wrong-variant inputs) and
     // `StringLiteralExpectedEnum` (the strict-mode quoted-string
     // rejection). Pin both behaviors:
-    let t = AttributeType::StringEnum {
-        name: "TargetType".to_string(),
-        values: vec!["AWS_ACCOUNT".to_string()],
-        identity: Some(crate::schema::string_enum_identity(
+    let t = AttributeType::string_enum(
+        "TargetType".to_string(),
+        vec!["AWS_ACCOUNT".to_string()],
+        Some(crate::schema::string_enum_identity(
             "TargetType",
             Some("awscc.sso.Assignment"),
         )),
-        dsl_aliases: vec![],
-    };
+        vec![],
+    );
     // String-literal path (strict-mode rejection): rendered as
     // `'target_id' (TargetType) expects an enum identifier, got a
     // string literal "aaa"...`.
@@ -396,15 +396,15 @@ fn schema_validate_wraps_enum_error_with_attribute_name() {
     let schema = ResourceSchema::new("test.assignment").attribute(
         AttributeSchema::new(
             "target_type",
-            AttributeType::StringEnum {
-                name: "TargetType".to_string(),
-                values: vec!["AWS_ACCOUNT".to_string()],
-                identity: Some(crate::schema::string_enum_identity(
+            AttributeType::string_enum(
+                "TargetType".to_string(),
+                vec!["AWS_ACCOUNT".to_string()],
+                Some(crate::schema::string_enum_identity(
                     "TargetType",
                     Some("awscc.sso.Assignment"),
                 )),
-                dsl_aliases: vec![],
-            },
+                vec![],
+            ),
         )
         .required(),
     );
@@ -529,15 +529,15 @@ fn schema_validate_with_origins_emits_string_literal_diagnostic_for_quoted_enum(
     let schema = ResourceSchema::new("test.assignment").attribute(
         AttributeSchema::new(
             "target_type",
-            AttributeType::StringEnum {
-                name: "TargetType".to_string(),
-                values: vec!["AWS_ACCOUNT".to_string()],
-                identity: Some(crate::schema::string_enum_identity(
+            AttributeType::string_enum(
+                "TargetType".to_string(),
+                vec!["AWS_ACCOUNT".to_string()],
+                Some(crate::schema::string_enum_identity(
                     "TargetType",
                     Some("awscc.sso.Assignment"),
                 )),
-                dsl_aliases: vec![],
-            },
+                vec![],
+            ),
         )
         .required(),
     );
@@ -581,15 +581,15 @@ fn schema_validate_with_origins_leaves_valid_values_alone() {
     let schema = ResourceSchema::new("test.assignment").attribute(
         AttributeSchema::new(
             "target_type",
-            AttributeType::StringEnum {
-                name: "TargetType".to_string(),
-                values: vec!["AWS_ACCOUNT".to_string()],
-                identity: Some(crate::schema::string_enum_identity(
+            AttributeType::string_enum(
+                "TargetType".to_string(),
+                vec!["AWS_ACCOUNT".to_string()],
+                Some(crate::schema::string_enum_identity(
                     "TargetType",
                     Some("awscc.sso.Assignment"),
                 )),
-                dsl_aliases: vec![],
-            },
+                vec![],
+            ),
         )
         .required(),
     );
@@ -624,12 +624,12 @@ fn schema_validate_with_origins_reshapes_custom_namespaced_type() {
     let schema = ResourceSchema::new("test.r.mode_holder").attribute(
         AttributeSchema::new(
             "mode",
-            AttributeType::CustomEnum {
-                identity: crate::schema::string_enum_identity("Mode", Some("test.r")),
-                base: Box::new(AttributeType::String),
-                validate: legacy_validator(validate_mode),
-                to_dsl: None,
-            },
+            AttributeType::custom_enum(
+                crate::schema::string_enum_identity("Mode", Some("test.r")),
+                AttributeType::string(),
+                legacy_validator(validate_mode),
+                None,
+            ),
         )
         .required(),
     );
@@ -661,12 +661,12 @@ fn schema_validate_with_origins_reshapes_custom_namespaced_type() {
 fn invalid_enum_error_without_namespace_uses_bare_variants() {
     // Non-namespaced enums must keep emitting bare variant names — there's
     // no namespace to prefix with.
-    let t = AttributeType::StringEnum {
-        name: "Mode".to_string(),
-        values: vec!["fast".to_string(), "slow".to_string()],
-        identity: None,
-        dsl_aliases: vec![],
-    };
+    let t = AttributeType::string_enum(
+        "Mode".to_string(),
+        vec!["fast".to_string(), "slow".to_string()],
+        None,
+        vec![],
+    );
     let err = t
         .validate(&Value::Concrete(ConcreteValue::String("zzz".to_string())))
         .unwrap_err();
@@ -688,15 +688,15 @@ fn invalid_enum_error_preserves_bare_identifier_form() {
     // path produces the same `Value::Concrete(ConcreteValue::String(...))`), the error echoes the
     // full form back — still the "user-typed" form because that's what
     // was in the Value. This verifies the fix doesn't regress that case.
-    let t = AttributeType::StringEnum {
-        name: "TargetType".to_string(),
-        values: vec!["AWS_ACCOUNT".to_string()],
-        identity: Some(crate::schema::string_enum_identity(
+    let t = AttributeType::string_enum(
+        "TargetType".to_string(),
+        vec!["AWS_ACCOUNT".to_string()],
+        Some(crate::schema::string_enum_identity(
             "TargetType",
             Some("awscc.sso.Assignment"),
         )),
-        dsl_aliases: vec![],
-    };
+        vec![],
+    );
     let input = "awscc.sso.Assignment.TargetType.NOT_REAL".to_string();
     let err = t
         .validate(&Value::Concrete(ConcreteValue::String(input.clone())))
@@ -710,19 +710,19 @@ fn invalid_enum_error_preserves_bare_identifier_form() {
 
 #[test]
 fn validate_string_enum_rejects_double_namespace() {
-    let t = AttributeType::StringEnum {
-        name: "InstanceTenancy".to_string(),
-        values: vec![
+    let t = AttributeType::string_enum(
+        "InstanceTenancy".to_string(),
+        vec![
             "default".to_string(),
             "dedicated".to_string(),
             "host".to_string(),
         ],
-        identity: Some(crate::schema::string_enum_identity(
+        Some(crate::schema::string_enum_identity(
             "InstanceTenancy",
             Some("awscc.ec2.Vpc"),
         )),
-        dsl_aliases: vec![],
-    };
+        vec![],
+    );
     // Double-namespace must be rejected
     assert!(
         t.validate(&Value::Concrete(ConcreteValue::String(
@@ -734,7 +734,7 @@ fn validate_string_enum_rejects_double_namespace() {
 
 #[test]
 fn validate_float_type() {
-    let t = AttributeType::Float;
+    let t = AttributeType::float();
     assert!(
         t.validate(&Value::Concrete(ConcreteValue::Float(2.5)))
             .is_ok()
@@ -756,7 +756,7 @@ fn validate_float_type() {
 
 #[test]
 fn validate_float_rejects_non_finite() {
-    let t = AttributeType::Float;
+    let t = AttributeType::float();
     assert!(
         t.validate(&Value::Concrete(ConcreteValue::Float(f64::NAN)))
             .is_err()
@@ -773,7 +773,7 @@ fn validate_float_rejects_non_finite() {
 
 #[test]
 fn validate_int_rejects_float() {
-    let t = AttributeType::Int;
+    let t = AttributeType::int();
     assert!(t.validate(&Value::Concrete(ConcreteValue::Int(42))).is_ok());
     assert!(
         t.validate(&Value::Concrete(ConcreteValue::Float(2.5)))
@@ -799,9 +799,9 @@ fn validate_positive_int() {
 #[test]
 fn validate_resource_schema() {
     let schema = ResourceSchema::new("resource")
-        .attribute(AttributeSchema::new("name", AttributeType::String).required())
+        .attribute(AttributeSchema::new("name", AttributeType::string()).required())
         .attribute(AttributeSchema::new("count", types::positive_int()))
-        .attribute(AttributeSchema::new("enabled", AttributeType::Bool));
+        .attribute(AttributeSchema::new("enabled", AttributeType::bool()));
 
     let mut attrs = HashMap::new();
     attrs.insert(
@@ -820,7 +820,7 @@ fn validate_resource_schema() {
 #[test]
 fn missing_required_attribute() {
     let schema = ResourceSchema::new("bucket")
-        .attribute(AttributeSchema::new("name", AttributeType::String).required());
+        .attribute(AttributeSchema::new("name", AttributeType::string()).required());
 
     let attrs = HashMap::new();
     let result = schema.validate(&attrs);
@@ -896,14 +896,14 @@ fn validate_cidr_type() {
 
 #[test]
 fn validate_struct_type() {
-    let t = AttributeType::Struct {
-        name: "Ingress".to_string(),
-        fields: vec![
-            StructField::new("ip_protocol", AttributeType::String).required(),
-            StructField::new("from_port", AttributeType::Int),
-            StructField::new("to_port", AttributeType::Int),
+    let t = AttributeType::struct_(
+        "Ingress".to_string(),
+        vec![
+            StructField::new("ip_protocol", AttributeType::string()).required(),
+            StructField::new("from_port", AttributeType::int()),
+            StructField::new("to_port", AttributeType::int()),
         ],
-    };
+    );
 
     // Valid: all required fields present
     let mut map = IndexMap::new();
@@ -953,15 +953,15 @@ fn validate_struct_type() {
 
 #[test]
 fn struct_rejects_unknown_field() {
-    let t = AttributeType::Struct {
-        name: "Ingress".to_string(),
-        fields: vec![
-            StructField::new("ip_protocol", AttributeType::String).required(),
-            StructField::new("from_port", AttributeType::Int),
-            StructField::new("to_port", AttributeType::Int),
-            StructField::new("cidr_ip", AttributeType::String),
+    let t = AttributeType::struct_(
+        "Ingress".to_string(),
+        vec![
+            StructField::new("ip_protocol", AttributeType::string()).required(),
+            StructField::new("from_port", AttributeType::int()),
+            StructField::new("to_port", AttributeType::int()),
+            StructField::new("cidr_ip", AttributeType::string()),
         ],
-    };
+    );
 
     // Unknown field should be rejected
     let mut map = IndexMap::new();
@@ -992,15 +992,15 @@ fn struct_rejects_unknown_field() {
 
 #[test]
 fn struct_suggests_similar_field() {
-    let t = AttributeType::Struct {
-        name: "Ingress".to_string(),
-        fields: vec![
-            StructField::new("ip_protocol", AttributeType::String),
-            StructField::new("from_port", AttributeType::Int),
-            StructField::new("to_port", AttributeType::Int),
-            StructField::new("cidr_ip", AttributeType::String),
+    let t = AttributeType::struct_(
+        "Ingress".to_string(),
+        vec![
+            StructField::new("ip_protocol", AttributeType::string()),
+            StructField::new("from_port", AttributeType::int()),
+            StructField::new("to_port", AttributeType::int()),
+            StructField::new("cidr_ip", AttributeType::string()),
         ],
-    };
+    );
 
     // Typo: "ip_protcol" -> should suggest "ip_protocol"
     let mut map = IndexMap::new();
@@ -1050,13 +1050,13 @@ fn struct_suggests_similar_field() {
 
 #[test]
 fn struct_error_message_format() {
-    let t = AttributeType::Struct {
-        name: "SecurityGroupIngress".to_string(),
-        fields: vec![
-            StructField::new("vpc_id", AttributeType::String),
-            StructField::new("cidr_ip", AttributeType::String),
+    let t = AttributeType::struct_(
+        "SecurityGroupIngress".to_string(),
+        vec![
+            StructField::new("vpc_id", AttributeType::string()),
+            StructField::new("cidr_ip", AttributeType::string()),
         ],
-    };
+    );
 
     // With suggestion
     let mut map = IndexMap::new();
@@ -1122,10 +1122,10 @@ fn test_suggest_similar_name() {
 
 #[test]
 fn validate_list_of_struct() {
-    let struct_type = AttributeType::Struct {
-        name: "Ingress".to_string(),
-        fields: vec![StructField::new("ip_protocol", AttributeType::String).required()],
-    };
+    let struct_type = AttributeType::struct_(
+        "Ingress".to_string(),
+        vec![StructField::new("ip_protocol", AttributeType::string()).required()],
+    );
     let list_type = AttributeType::list(struct_type);
 
     let mut item = IndexMap::new();
@@ -1149,10 +1149,10 @@ fn validate_list_of_struct() {
 fn struct_rejects_block_syntax_single_element() {
     // Block syntax produces Value::Concrete(ConcreteValue::List([Value::Map(...)])) which should be rejected
     // for bare Struct attributes
-    let struct_type = AttributeType::Struct {
-        name: "VersioningConfiguration".to_string(),
-        fields: vec![StructField::new("status", AttributeType::String).required()],
-    };
+    let struct_type = AttributeType::struct_(
+        "VersioningConfiguration".to_string(),
+        vec![StructField::new("status", AttributeType::string()).required()],
+    );
 
     let mut map = IndexMap::new();
     map.insert(
@@ -1180,10 +1180,10 @@ fn struct_rejects_block_syntax_single_element() {
 #[test]
 fn struct_rejects_block_syntax_multiple_elements() {
     // Multiple blocks for a bare Struct attribute should also be rejected
-    let struct_type = AttributeType::Struct {
-        name: "VersioningConfiguration".to_string(),
-        fields: vec![StructField::new("status", AttributeType::String).required()],
-    };
+    let struct_type = AttributeType::struct_(
+        "VersioningConfiguration".to_string(),
+        vec![StructField::new("status", AttributeType::string()).required()],
+    );
 
     let mut map1 = IndexMap::new();
     map1.insert(
@@ -1570,8 +1570,8 @@ fn resource_validator_called() {
     }
 
     let schema = ResourceSchema::new("test")
-        .attribute(AttributeSchema::new("name", AttributeType::String))
-        .attribute(AttributeSchema::new("forbidden", AttributeType::String))
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
+        .attribute(AttributeSchema::new("forbidden", AttributeType::string()))
         .with_validator(my_validator);
 
     // Valid: no forbidden attribute
@@ -1653,12 +1653,12 @@ fn exclusive_required_with_resource_schema() {
     }
 
     let schema = ResourceSchema::new("subnet")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
         .attribute(AttributeSchema::new(
             "ipv4_ipam_pool_id",
-            AttributeType::String,
+            AttributeType::string(),
         ))
-        .attribute(AttributeSchema::new("vpc_id", AttributeType::String).required())
+        .attribute(AttributeSchema::new("vpc_id", AttributeType::string()).required())
         .with_validator(subnet_validator);
 
     // Valid: has cidr_block only
@@ -1717,10 +1717,10 @@ fn exclusive_required_declarative() {
     // Same semantics as the closure-based form above, but declared as data
     // so it can cross the WASM plugin boundary.
     let schema = ResourceSchema::new("vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
         .attribute(AttributeSchema::new(
             "ipv4_ipam_pool_id",
-            AttributeType::String,
+            AttributeType::string(),
         ))
         .exclusive_required(&["cidr_block", "ipv4_ipam_pool_id"]);
 
@@ -1766,10 +1766,10 @@ fn exclusive_required_declarative() {
 #[test]
 fn exclusive_required_multiple_groups() {
     let schema = ResourceSchema::new("multi")
-        .attribute(AttributeSchema::new("a", AttributeType::String))
-        .attribute(AttributeSchema::new("b", AttributeType::String))
-        .attribute(AttributeSchema::new("x", AttributeType::String))
-        .attribute(AttributeSchema::new("y", AttributeType::String))
+        .attribute(AttributeSchema::new("a", AttributeType::string()))
+        .attribute(AttributeSchema::new("b", AttributeType::string()))
+        .attribute(AttributeSchema::new("x", AttributeType::string()))
+        .attribute(AttributeSchema::new("y", AttributeType::string()))
         .exclusive_required(&["a", "b"])
         .exclusive_required(&["x", "y"]);
 
@@ -1800,12 +1800,12 @@ fn exclusive_required_multiple_groups() {
 #[test]
 fn validate_union_type() {
     // Create two Custom types that validate different prefixes
-    let type_a = AttributeType::Custom {
-        identity: Some(TypeIdentity::bare("TypeA")),
-        base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
-        validate: legacy_validator(|value| {
+    let type_a = AttributeType::custom(
+        Some(TypeIdentity::bare("TypeA")),
+        AttributeType::string(),
+        None,
+        None,
+        legacy_validator(|value| {
             if let Value::Concrete(ConcreteValue::String(s)) = value {
                 if s.starts_with("a-") {
                     Ok(())
@@ -1816,15 +1816,14 @@ fn validate_union_type() {
                 Err("Expected string".to_string())
             }
         }),
-
-        to_dsl: None,
-    };
-    let type_b = AttributeType::Custom {
-        identity: Some(TypeIdentity::bare("TypeB")),
-        base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
-        validate: legacy_validator(|value| {
+        None,
+    );
+    let type_b = AttributeType::custom(
+        Some(TypeIdentity::bare("TypeB")),
+        AttributeType::string(),
+        None,
+        None,
+        legacy_validator(|value| {
             if let Value::Concrete(ConcreteValue::String(s)) = value {
                 if s.starts_with("b-") {
                     Ok(())
@@ -1835,11 +1834,10 @@ fn validate_union_type() {
                 Err("Expected string".to_string())
             }
         }),
+        None,
+    );
 
-        to_dsl: None,
-    };
-
-    let union_type = AttributeType::Union(vec![type_a, type_b]);
+    let union_type = AttributeType::union(vec![type_a, type_b]);
 
     // Valid: matches first member
     assert!(
@@ -1879,15 +1877,15 @@ fn validate_union_type() {
 
 #[test]
 fn union_struct_unknown_field_shows_specific_error() {
-    let principal_type = AttributeType::Union(vec![
-        AttributeType::Struct {
-            name: "Principal".to_string(),
-            fields: vec![
-                StructField::new("service", AttributeType::String),
-                StructField::new("federated", AttributeType::String),
+    let principal_type = AttributeType::union(vec![
+        AttributeType::struct_(
+            "Principal".to_string(),
+            vec![
+                StructField::new("service", AttributeType::string()),
+                StructField::new("federated", AttributeType::string()),
             ],
-        },
-        AttributeType::String,
+        ),
+        AttributeType::string(),
     ]);
 
     let mut map = IndexMap::new();
@@ -1916,67 +1914,67 @@ fn union_struct_unknown_field_shows_specific_error() {
 
 #[test]
 fn union_type_name() {
-    let type_a = AttributeType::Custom {
-        identity: Some(TypeIdentity::bare("TypeA")),
-        base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
-        validate: noop_validator(),
-        to_dsl: None,
-    };
-    let type_b = AttributeType::Custom {
-        identity: Some(TypeIdentity::bare("TypeB")),
-        base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
-        validate: noop_validator(),
-        to_dsl: None,
-    };
+    let type_a = AttributeType::custom(
+        Some(TypeIdentity::bare("TypeA")),
+        AttributeType::string(),
+        None,
+        None,
+        noop_validator(),
+        None,
+    );
+    let type_b = AttributeType::custom(
+        Some(TypeIdentity::bare("TypeB")),
+        AttributeType::string(),
+        None,
+        None,
+        noop_validator(),
+        None,
+    );
 
-    let union_type = AttributeType::Union(vec![type_a, type_b]);
+    let union_type = AttributeType::union(vec![type_a, type_b]);
     assert_eq!(union_type.type_name(), "TypeA | TypeB");
 }
 
 #[test]
 fn union_accepts_type_name() {
-    let type_a = AttributeType::Custom {
-        identity: Some(TypeIdentity::bare("TypeA")),
-        base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
-        validate: noop_validator(),
-        to_dsl: None,
-    };
-    let type_b = AttributeType::Custom {
-        identity: Some(TypeIdentity::bare("TypeB")),
-        base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
-        validate: noop_validator(),
-        to_dsl: None,
-    };
+    let type_a = AttributeType::custom(
+        Some(TypeIdentity::bare("TypeA")),
+        AttributeType::string(),
+        None,
+        None,
+        noop_validator(),
+        None,
+    );
+    let type_b = AttributeType::custom(
+        Some(TypeIdentity::bare("TypeB")),
+        AttributeType::string(),
+        None,
+        None,
+        noop_validator(),
+        None,
+    );
 
-    let union_type = AttributeType::Union(vec![type_a, type_b]);
+    let union_type = AttributeType::union(vec![type_a, type_b]);
     assert!(union_type.accepts_type_name("TypeA"));
     assert!(union_type.accepts_type_name("TypeB"));
     assert!(!union_type.accepts_type_name("TypeC"));
 
     // Non-union types
-    let simple = AttributeType::String;
+    let simple = AttributeType::string();
     assert!(simple.accepts_type_name("String"));
     assert!(!simple.accepts_type_name("Int"));
 }
 
 #[test]
 fn with_block_name_builder() {
-    let attr = AttributeSchema::new("operating_regions", AttributeType::String)
+    let attr = AttributeSchema::new("operating_regions", AttributeType::string())
         .with_block_name("operating_region");
     assert_eq!(attr.block_name.as_deref(), Some("operating_region"));
 }
 
 #[test]
 fn block_name_default_is_none() {
-    let attr = AttributeSchema::new("name", AttributeType::String);
+    let attr = AttributeSchema::new("name", AttributeType::string());
     assert!(attr.block_name.is_none());
 }
 
@@ -1984,10 +1982,10 @@ fn block_name_default_is_none() {
 fn block_name_map_returns_mapping() {
     let schema = ResourceSchema::new("test.resource")
         .attribute(
-            AttributeSchema::new("operating_regions", AttributeType::String)
+            AttributeSchema::new("operating_regions", AttributeType::string())
                 .with_block_name("operating_region"),
         )
-        .attribute(AttributeSchema::new("name", AttributeType::String));
+        .attribute(AttributeSchema::new("name", AttributeType::string()));
 
     let map = schema.block_name_map();
     assert_eq!(map.len(), 1);
@@ -1997,7 +1995,7 @@ fn block_name_map_returns_mapping() {
 #[test]
 fn block_name_map_empty_when_no_block_names() {
     let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::new("name", AttributeType::String));
+        .attribute(AttributeSchema::new("name", AttributeType::string()));
 
     let map = schema.block_name_map();
     assert!(map.is_empty());
@@ -2028,7 +2026,7 @@ fn resolve_block_names_renames_key() {
     schemas.insert(
         "",
         ResourceSchema::new("ec2.ipam").attribute(
-            AttributeSchema::new("operating_regions", AttributeType::String)
+            AttributeSchema::new("operating_regions", AttributeType::string())
                 .with_block_name("operating_region"),
         ),
     );
@@ -2054,7 +2052,7 @@ fn resolve_block_names_noop_when_no_match() {
     schemas.insert(
         "",
         ResourceSchema::new("ec2.ipam")
-            .attribute(AttributeSchema::new("name", AttributeType::String)),
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
     );
 
     resolve_block_names(&mut resources, &schemas).unwrap();
@@ -2101,7 +2099,7 @@ fn resolve_block_names_errors_on_mixed_syntax() {
     schemas.insert(
         "",
         ResourceSchema::new("ec2.ipam").attribute(
-            AttributeSchema::new("operating_regions", AttributeType::String)
+            AttributeSchema::new("operating_regions", AttributeType::string())
                 .with_block_name("operating_region"),
         ),
     );
@@ -2137,10 +2135,7 @@ fn resolve_block_names_skips_unknown_schema() {
 fn struct_field_with_block_name() {
     let field = StructField::new(
         "transitions",
-        AttributeType::list(AttributeType::Struct {
-            name: "Transition".to_string(),
-            fields: vec![],
-        }),
+        AttributeType::list(AttributeType::struct_("Transition".to_string(), vec![])),
     )
     .with_block_name("transition");
     assert_eq!(field.block_name.as_deref(), Some("transition"));
@@ -2179,19 +2174,19 @@ fn resolve_block_names_nested_struct() {
         "",
         ResourceSchema::new("s3.Bucket").attribute(AttributeSchema::new(
             "lifecycle_configuration",
-            AttributeType::Struct {
-                name: "LifecycleConfiguration".to_string(),
-                fields: vec![
+            AttributeType::struct_(
+                "LifecycleConfiguration".to_string(),
+                vec![
                     StructField::new(
                         "transitions",
-                        AttributeType::list(AttributeType::Struct {
-                            name: "Transition".to_string(),
-                            fields: vec![],
-                        }),
+                        AttributeType::list(AttributeType::struct_(
+                            "Transition".to_string(),
+                            vec![],
+                        )),
                     )
                     .with_block_name("transition"),
                 ],
-            },
+            ),
         )),
     );
 
@@ -2247,26 +2242,23 @@ fn resolve_block_names_singular_field_not_renamed_when_assigned() {
         "",
         ResourceSchema::new("s3.Bucket").attribute(AttributeSchema::new(
             "lifecycle_configuration",
-            AttributeType::Struct {
-                name: "LifecycleConfiguration".to_string(),
-                fields: vec![
+            AttributeType::struct_(
+                "LifecycleConfiguration".to_string(),
+                vec![
                     StructField::new(
                         "transition",
-                        AttributeType::Struct {
-                            name: "Transition".to_string(),
-                            fields: vec![],
-                        },
+                        AttributeType::struct_("Transition".to_string(), vec![]),
                     ),
                     StructField::new(
                         "transitions",
-                        AttributeType::list(AttributeType::Struct {
-                            name: "Transition".to_string(),
-                            fields: vec![],
-                        }),
+                        AttributeType::list(AttributeType::struct_(
+                            "Transition".to_string(),
+                            vec![],
+                        )),
                     )
                     .with_block_name("transition"),
                 ],
-            },
+            ),
         )),
     );
 
@@ -2321,26 +2313,23 @@ fn resolve_block_names_block_syntax_renamed_when_singular_field_exists() {
         "",
         ResourceSchema::new("s3.Bucket").attribute(AttributeSchema::new(
             "lifecycle_configuration",
-            AttributeType::Struct {
-                name: "LifecycleConfiguration".to_string(),
-                fields: vec![
+            AttributeType::struct_(
+                "LifecycleConfiguration".to_string(),
+                vec![
                     StructField::new(
                         "transition",
-                        AttributeType::Struct {
-                            name: "Transition".to_string(),
-                            fields: vec![],
-                        },
+                        AttributeType::struct_("Transition".to_string(), vec![]),
                     ),
                     StructField::new(
                         "transitions",
-                        AttributeType::list(AttributeType::Struct {
-                            name: "Transition".to_string(),
-                            fields: vec![],
-                        }),
+                        AttributeType::list(AttributeType::struct_(
+                            "Transition".to_string(),
+                            vec![],
+                        )),
                     )
                     .with_block_name("transition"),
                 ],
-            },
+            ),
         )),
     );
 
@@ -2391,10 +2380,10 @@ fn resolve_block_names_same_block_and_canonical_name() {
         ResourceSchema::new("ec2.SecurityGroup").attribute(
             AttributeSchema::new(
                 "ingress",
-                AttributeType::list(AttributeType::Struct {
-                    name: "Ingress".to_string(),
-                    fields: vec![StructField::new("ip_protocol", AttributeType::String)],
-                }),
+                AttributeType::list(AttributeType::struct_(
+                    "Ingress".to_string(),
+                    vec![StructField::new("ip_protocol", AttributeType::string())],
+                )),
             )
             .with_block_name("ingress"),
         ),
@@ -2450,10 +2439,10 @@ fn resolve_block_names_same_block_and_canonical_name_multiple_items() {
         ResourceSchema::new("ec2.SecurityGroup").attribute(
             AttributeSchema::new(
                 "ingress",
-                AttributeType::list(AttributeType::Struct {
-                    name: "Ingress".to_string(),
-                    fields: vec![StructField::new("ip_protocol", AttributeType::String)],
-                }),
+                AttributeType::list(AttributeType::struct_(
+                    "Ingress".to_string(),
+                    vec![StructField::new("ip_protocol", AttributeType::string())],
+                )),
             )
             .with_block_name("ingress"),
         ),
@@ -2506,22 +2495,22 @@ fn resolve_block_names_nested_same_block_and_canonical_name() {
         "",
         ResourceSchema::new("test.resource").attribute(AttributeSchema::new(
             "config",
-            AttributeType::Struct {
-                name: "Config".to_string(),
-                fields: vec![
+            AttributeType::struct_(
+                "Config".to_string(),
+                vec![
                     StructField::new(
                         "tag",
-                        AttributeType::list(AttributeType::Struct {
-                            name: "Tag".to_string(),
-                            fields: vec![
-                                StructField::new("key", AttributeType::String),
-                                StructField::new("value", AttributeType::String),
+                        AttributeType::list(AttributeType::struct_(
+                            "Tag".to_string(),
+                            vec![
+                                StructField::new("key", AttributeType::string()),
+                                StructField::new("value", AttributeType::string()),
                             ],
-                        }),
+                        )),
                     )
                     .with_block_name("tag"),
                 ],
-            },
+            ),
         )),
     );
 
@@ -2547,7 +2536,7 @@ fn resolve_block_names_nested_same_block_and_canonical_name() {
 fn resolve_block_names_recurses_through_ref_attribute() {
     // Regression for carina#3349 (awscc s3_bucket/lifecycle): the
     // `lifecycle_configuration` attribute is typed as
-    // `AttributeType::Ref("LifecycleConfiguration")`. The
+    // `AttributeType::ref_("LifecycleConfiguration")`. The
     // `LifecycleConfiguration` def's `rules` field carries
     // `block_name("rule")`. DSL `rule { } rule { }` blocks must be
     // renamed to the canonical `rules` field, but the recursion in
@@ -2589,19 +2578,19 @@ fn resolve_block_names_recurses_through_ref_attribute() {
         r
     }];
 
-    let lifecycle_def = AttributeType::Struct {
-        name: "LifecycleConfiguration".to_string(),
-        fields: vec![
+    let lifecycle_def = AttributeType::struct_(
+        "LifecycleConfiguration".to_string(),
+        vec![
             StructField::new(
                 "rules",
-                AttributeType::list(AttributeType::Struct {
-                    name: "Rule".to_string(),
-                    fields: vec![StructField::new("id", AttributeType::String)],
-                }),
+                AttributeType::list(AttributeType::struct_(
+                    "Rule".to_string(),
+                    vec![StructField::new("id", AttributeType::string())],
+                )),
             )
             .with_block_name("rule"),
         ],
-    };
+    );
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -2609,7 +2598,7 @@ fn resolve_block_names_recurses_through_ref_attribute() {
         ResourceSchema::new("s3.Bucket")
             .attribute(AttributeSchema::new(
                 "lifecycle_configuration",
-                AttributeType::Ref("LifecycleConfiguration".to_string()),
+                AttributeType::ref_("LifecycleConfiguration".to_string()),
             ))
             .with_def("LifecycleConfiguration", lifecycle_def),
     );
@@ -2665,27 +2654,27 @@ fn resolve_block_names_recurses_through_ref_inside_struct_field() {
         r
     }];
 
-    let lifecycle_def = AttributeType::Struct {
-        name: "LifecycleConfiguration".to_string(),
-        fields: vec![
+    let lifecycle_def = AttributeType::struct_(
+        "LifecycleConfiguration".to_string(),
+        vec![
             StructField::new(
                 "rules",
-                AttributeType::list(AttributeType::Struct {
-                    name: "Rule".to_string(),
-                    fields: vec![StructField::new("id", AttributeType::String)],
-                }),
+                AttributeType::list(AttributeType::struct_(
+                    "Rule".to_string(),
+                    vec![StructField::new("id", AttributeType::string())],
+                )),
             )
             .with_block_name("rule"),
         ],
-    };
+    );
 
-    let wrapper_type = AttributeType::Struct {
-        name: "Wrapper".to_string(),
-        fields: vec![StructField::new(
+    let wrapper_type = AttributeType::struct_(
+        "Wrapper".to_string(),
+        vec![StructField::new(
             "lifecycle",
-            AttributeType::Ref("LifecycleConfiguration".to_string()),
+            AttributeType::ref_("LifecycleConfiguration".to_string()),
         )],
-    };
+    );
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -2731,22 +2720,22 @@ fn resolved_attr_type_never_returns_ref_after_peel() {
     // direct Ref-to-non-Struct shape; if a future change ever lets
     // `Ref` escape, this test catches it before the schema walkers do.
     let mut defs = std::collections::BTreeMap::new();
-    defs.insert("Hop1".to_string(), AttributeType::Ref("Hop2".to_string()));
-    defs.insert("Hop2".to_string(), AttributeType::Ref("Hop3".to_string()));
-    defs.insert("Hop3".to_string(), AttributeType::String);
+    defs.insert("Hop1".to_string(), AttributeType::ref_("Hop2".to_string()));
+    defs.insert("Hop2".to_string(), AttributeType::ref_("Hop3".to_string()));
+    defs.insert("Hop3".to_string(), AttributeType::string());
 
-    let ref_type = AttributeType::Ref("Hop1".to_string());
+    let ref_type = AttributeType::ref_("Hop1".to_string());
     let resolved = ref_type.resolve_refs(&defs);
     assert!(
-        !matches!(resolved.as_attr(), AttributeType::Ref(_)),
+        !matches!(resolved.as_attr().kind(), AttrTypeKind::Ref(_)),
         "resolve_refs must never return a Ref after peeling"
     );
-    assert!(matches!(resolved.as_attr(), AttributeType::String));
+    assert!(matches!(resolved.as_attr().kind(), AttrTypeKind::String));
 
     // Non-Ref input is returned as-is (identity behavior).
-    let plain = AttributeType::Int;
+    let plain = AttributeType::int();
     let resolved = plain.resolve_refs(&defs);
-    assert!(matches!(resolved.as_attr(), AttributeType::Int));
+    assert!(matches!(resolved.as_attr().kind(), AttrTypeKind::Int));
 }
 
 #[test]
@@ -2758,7 +2747,7 @@ fn resolved_attr_type_panics_on_dangling_ref() {
     // future refactor cannot accidentally turn it into "return Ref
     // unchanged" (which would re-open the carina#3349 hazard).
     let defs = std::collections::BTreeMap::new();
-    let ref_type = AttributeType::Ref("Missing".to_string());
+    let ref_type = AttributeType::ref_("Missing".to_string());
     let _ = ref_type.resolve_refs(&defs);
 }
 
@@ -2785,7 +2774,7 @@ fn test_resource_schema_without_operation_config() {
 #[test]
 fn validate_rejects_unknown_attribute() {
     let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::new("bucket_name", AttributeType::String));
+        .attribute(AttributeSchema::new("bucket_name", AttributeType::string()));
 
     let mut attrs = HashMap::new();
     attrs.insert(
@@ -2807,10 +2796,10 @@ fn validate_rejects_unknown_attribute() {
 #[test]
 fn validate_allows_known_attributes_only() {
     let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::new("bucket_name", AttributeType::String))
+        .attribute(AttributeSchema::new("bucket_name", AttributeType::string()))
         .attribute(AttributeSchema::new(
             "tags",
-            AttributeType::map(AttributeType::String),
+            AttributeType::map(AttributeType::string()),
         ));
 
     let mut attrs = HashMap::new();
@@ -2829,7 +2818,7 @@ fn validate_allows_known_attributes_only() {
 #[test]
 fn validate_unknown_attribute_with_suggestion() {
     let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::new("bucket_name", AttributeType::String));
+        .attribute(AttributeSchema::new("bucket_name", AttributeType::string()));
 
     let mut attrs = HashMap::new();
     attrs.insert(
@@ -2855,10 +2844,7 @@ fn validate_accepts_block_name_alias() {
     let schema = ResourceSchema::new("ec2.SecurityGroup").attribute(
         AttributeSchema::new(
             "ingress_rules",
-            AttributeType::List {
-                inner: Box::new(AttributeType::String),
-                ordered: false,
-            },
+            AttributeType::unordered_list(AttributeType::string()),
         )
         .with_block_name("ingress_rule"),
     );
@@ -2877,7 +2863,7 @@ fn validate_accepts_block_name_alias() {
 #[test]
 fn validate_skips_internal_attributes() {
     let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::new("bucket_name", AttributeType::String));
+        .attribute(AttributeSchema::new("bucket_name", AttributeType::string()));
 
     let mut attrs = HashMap::new();
     attrs.insert(
@@ -2893,58 +2879,58 @@ fn validate_skips_internal_attributes() {
 }
 
 fn make_custom(name: &str, base: AttributeType) -> AttributeType {
-    AttributeType::Custom {
-        identity: Some(TypeIdentity::bare(name)),
-        base: Box::new(base),
-        pattern: None,
-        length: None,
-        validate: noop_validator(),
-        to_dsl: None,
-    }
+    AttributeType::custom(
+        Some(TypeIdentity::bare(name)),
+        base,
+        None,
+        None,
+        noop_validator(),
+        None,
+    )
 }
 
 fn make_custom_anon_pattern(pattern: &str) -> AttributeType {
-    AttributeType::Custom {
-        identity: None,
-        base: Box::new(AttributeType::String),
-        pattern: Some(pattern.to_string()),
-        length: None,
-        validate: noop_validator(),
-        to_dsl: None,
-    }
+    AttributeType::custom(
+        None,
+        AttributeType::string(),
+        Some(pattern.to_string()),
+        None,
+        noop_validator(),
+        None,
+    )
 }
 
 fn make_custom_anon_len(min: u64, max: u64) -> AttributeType {
-    AttributeType::Custom {
-        identity: None,
-        base: Box::new(AttributeType::String),
-        pattern: None,
-        length: Some((Some(min), Some(max))),
-        validate: noop_validator(),
-        to_dsl: None,
-    }
+    AttributeType::custom(
+        None,
+        AttributeType::string(),
+        None,
+        Some((Some(min), Some(max))),
+        noop_validator(),
+        None,
+    )
 }
 
 #[test]
 fn assignable_allows_same_primitives() {
-    assert!(AttributeType::String.is_assignable_to(&AttributeType::String));
-    assert!(AttributeType::Int.is_assignable_to(&AttributeType::Int));
-    assert!(!AttributeType::Int.is_assignable_to(&AttributeType::String));
-    assert!(!AttributeType::Bool.is_assignable_to(&AttributeType::Int));
+    assert!(AttributeType::string().is_assignable_to(&AttributeType::string()));
+    assert!(AttributeType::int().is_assignable_to(&AttributeType::int()));
+    assert!(!AttributeType::int().is_assignable_to(&AttributeType::string()));
+    assert!(!AttributeType::bool().is_assignable_to(&AttributeType::int()));
 }
 
 #[test]
 fn assignable_rejects_distinct_semantic_names() {
-    let vpc = make_custom("VpcId", AttributeType::String);
-    let subnet = make_custom("SubnetId", AttributeType::String);
+    let vpc = make_custom("VpcId", AttributeType::string());
+    let subnet = make_custom("SubnetId", AttributeType::string());
     assert!(!vpc.is_assignable_to(&subnet));
     assert!(!subnet.is_assignable_to(&vpc));
 }
 
 #[test]
 fn assignable_allows_same_semantic_name() {
-    let a = make_custom("VpcId", AttributeType::String);
-    let b = make_custom("VpcId", AttributeType::String);
+    let a = make_custom("VpcId", AttributeType::string());
+    let b = make_custom("VpcId", AttributeType::string());
     assert!(a.is_assignable_to(&b));
 }
 
@@ -2955,17 +2941,19 @@ fn assignable_allows_same_semantic_name() {
 /// the same type because the strings were equal.
 #[test]
 fn assignable_rejects_same_kind_across_providers() {
-    let provider_custom = |provider: &str| AttributeType::Custom {
-        identity: Some(TypeIdentity::new(
-            Some(provider),
-            Vec::<String>::new(),
-            "Region",
-        )),
-        base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
-        validate: noop_validator(),
-        to_dsl: None,
+    let provider_custom = |provider: &str| {
+        AttributeType::custom(
+            Some(TypeIdentity::new(
+                Some(provider),
+                Vec::<String>::new(),
+                "Region",
+            )),
+            AttributeType::string(),
+            None,
+            None,
+            noop_validator(),
+            None,
+        )
     };
     let aws_region = provider_custom("aws");
     let gcp_region = provider_custom("gcp");
@@ -2980,13 +2968,15 @@ fn assignable_rejects_same_kind_across_providers() {
 /// carina#3218.
 #[test]
 fn assignable_specific_arn_flows_into_generic_arn() {
-    let mk = |segments: &[&str]| AttributeType::Custom {
-        identity: Some(TypeIdentity::new(Some("aws"), segments.to_vec(), "Arn")),
-        base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
-        validate: noop_validator(),
-        to_dsl: None,
+    let mk = |segments: &[&str]| {
+        AttributeType::custom(
+            Some(TypeIdentity::new(Some("aws"), segments.to_vec(), "Arn")),
+            AttributeType::string(),
+            None,
+            None,
+            noop_validator(),
+            None,
+        )
     };
     let generic = mk(&[]);
     let role_arn = mk(&["iam", "Role"]);
@@ -3009,13 +2999,15 @@ fn assignable_specific_arn_flows_into_generic_arn() {
 /// source axis is accepted (widening).
 #[test]
 fn assignable_identity_axis_directionality() {
-    let mk = |provider: Option<&str>, segments: &[&str]| AttributeType::Custom {
-        identity: Some(TypeIdentity::new(provider, segments.to_vec(), "Arn")),
-        base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
-        validate: noop_validator(),
-        to_dsl: None,
+    let mk = |provider: Option<&str>, segments: &[&str]| {
+        AttributeType::custom(
+            Some(TypeIdentity::new(provider, segments.to_vec(), "Arn")),
+            AttributeType::string(),
+            None,
+            None,
+            noop_validator(),
+            None,
+        )
     };
 
     // provider: None source → Some sink rejected
@@ -3035,21 +3027,21 @@ fn assignable_identity_axis_directionality() {
 #[test]
 fn assignable_narrow_to_anonymous_unconstrained_sink() {
     // Semantic source with no pattern assigns to fully-anonymous unconstrained sink.
-    let account = make_custom("AwsAccountId", AttributeType::String);
-    let anon = AttributeType::Custom {
-        identity: None,
-        base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
-        validate: noop_validator(),
-        to_dsl: None,
-    };
+    let account = make_custom("AwsAccountId", AttributeType::string());
+    let anon = AttributeType::custom(
+        None,
+        AttributeType::string(),
+        None,
+        None,
+        noop_validator(),
+        None,
+    );
     assert!(account.is_assignable_to(&anon));
 }
 
 #[test]
 fn assignable_source_without_pattern_rejected_by_patterned_sink() {
-    let account = make_custom("AwsAccountId", AttributeType::String);
+    let account = make_custom("AwsAccountId", AttributeType::string());
     let anon = make_custom_anon_pattern("^\\d{12}$");
     // Source has no pattern; sink demands one → NG.
     assert!(!account.is_assignable_to(&anon));
@@ -3065,42 +3057,42 @@ fn assignable_anon_to_anon_length_containment() {
 
 #[test]
 fn assignable_rejects_non_custom_to_custom() {
-    let vpc = make_custom("VpcId", AttributeType::String);
-    assert!(!AttributeType::String.is_assignable_to(&vpc));
+    let vpc = make_custom("VpcId", AttributeType::string());
+    assert!(!AttributeType::string().is_assignable_to(&vpc));
 }
 
 #[test]
 fn assignable_custom_to_non_custom_recurses_on_base() {
     // AwsAccountId (base: String) assigns to a plain String sink.
-    let account = make_custom("AwsAccountId", AttributeType::String);
-    assert!(account.is_assignable_to(&AttributeType::String));
+    let account = make_custom("AwsAccountId", AttributeType::string());
+    assert!(account.is_assignable_to(&AttributeType::string()));
 }
 
 #[test]
 fn assignable_union_sink_accepts_assignable_member() {
-    let vpc = make_custom("VpcId", AttributeType::String);
-    let other_vpc = make_custom("VpcId", AttributeType::String);
-    let union = AttributeType::Union(vec![vpc, AttributeType::String]);
+    let vpc = make_custom("VpcId", AttributeType::string());
+    let other_vpc = make_custom("VpcId", AttributeType::string());
+    let union = AttributeType::union(vec![vpc, AttributeType::string()]);
     assert!(other_vpc.is_assignable_to(&union));
 }
 
 #[test]
 fn assignable_union_source_requires_all_members_assignable() {
     // All members of source must be assignable to sink.
-    let vpc = make_custom("VpcId", AttributeType::String);
-    let anon_any = AttributeType::Custom {
-        identity: None,
-        base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
-        validate: noop_validator(),
-        to_dsl: None,
-    };
-    let both_ok = AttributeType::Union(vec![vpc.clone(), vpc.clone()]);
+    let vpc = make_custom("VpcId", AttributeType::string());
+    let anon_any = AttributeType::custom(
+        None,
+        AttributeType::string(),
+        None,
+        None,
+        noop_validator(),
+        None,
+    );
+    let both_ok = AttributeType::union(vec![vpc.clone(), vpc.clone()]);
     assert!(both_ok.is_assignable_to(&vpc));
 
-    let subnet = make_custom("SubnetId", AttributeType::String);
-    let mixed = AttributeType::Union(vec![vpc.clone(), subnet]);
+    let subnet = make_custom("SubnetId", AttributeType::string());
+    let mixed = AttributeType::union(vec![vpc.clone(), subnet]);
     // One member (SubnetId) not assignable to VpcId sink → whole union NG.
     assert!(!mixed.is_assignable_to(&vpc));
 
@@ -3112,15 +3104,15 @@ fn assignable_union_source_requires_all_members_assignable() {
 fn semantic_custom_assigns_to_anonymous_unconstrained_sink() {
     // Replaces the old buggy `is_compatible_with_two_string_based_customs`
     // which asserted VpcId <-> SubnetId were symmetric-compatible.
-    let vpc = make_custom("VpcId", AttributeType::String);
-    let anon = AttributeType::Custom {
-        identity: None,
-        base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
-        validate: noop_validator(),
-        to_dsl: None,
-    };
+    let vpc = make_custom("VpcId", AttributeType::string());
+    let anon = AttributeType::custom(
+        None,
+        AttributeType::string(),
+        None,
+        None,
+        noop_validator(),
+        None,
+    );
     assert!(vpc.is_assignable_to(&anon));
     // Reverse: anon has no proof it's a VpcId → NG.
     assert!(!anon.is_assignable_to(&vpc));
@@ -3128,8 +3120,8 @@ fn semantic_custom_assigns_to_anonymous_unconstrained_sink() {
 
 #[test]
 fn assignable_int_custom_rejects_string_custom() {
-    let int_custom = make_custom("Port", AttributeType::Int);
-    let string_custom = make_custom("VpcId", AttributeType::String);
+    let int_custom = make_custom("Port", AttributeType::int());
+    let string_custom = make_custom("VpcId", AttributeType::string());
     assert!(!int_custom.is_assignable_to(&string_custom));
 }
 
@@ -3152,14 +3144,14 @@ fn make_custom_anon_pattern_and_len(
     pattern: Option<&str>,
     length: Option<(Option<u64>, Option<u64>)>,
 ) -> AttributeType {
-    AttributeType::Custom {
-        identity: None,
-        base: Box::new(AttributeType::String),
-        pattern: pattern.map(str::to_string),
+    AttributeType::custom(
+        None,
+        AttributeType::string(),
+        pattern.map(str::to_string),
         length,
-        validate: noop_validator(),
-        to_dsl: None,
-    }
+        noop_validator(),
+        None,
+    )
 }
 
 #[test]
@@ -3262,16 +3254,16 @@ fn assignable_anon_length_both_none_compatible() {
 
 #[test]
 fn custom_carries_semantic_name_pattern_length() {
-    let t = AttributeType::Custom {
-        identity: Some(TypeIdentity::bare("VpcId")),
-        base: Box::new(AttributeType::String),
-        pattern: Some("^vpc-[a-f0-9]+$".to_string()),
-        length: Some((Some(8), Some(21))),
-        validate: noop_validator(),
-        to_dsl: None,
-    };
-    match t {
-        AttributeType::Custom {
+    let t = AttributeType::custom(
+        Some(TypeIdentity::bare("VpcId")),
+        AttributeType::string(),
+        Some("^vpc-[a-f0-9]+$".to_string()),
+        Some((Some(8), Some(21))),
+        noop_validator(),
+        None,
+    );
+    match t.kind() {
+        AttrTypeKind::Custom {
             identity,
             pattern,
             length,
@@ -3279,7 +3271,7 @@ fn custom_carries_semantic_name_pattern_length() {
         } => {
             assert_eq!(identity.as_ref().map(|id| id.kind.as_str()), Some("VpcId"));
             assert_eq!(pattern.as_deref(), Some("^vpc-[a-f0-9]+$"));
-            assert_eq!(length, Some((Some(8), Some(21))));
+            assert_eq!(*length, Some((Some(8), Some(21))));
         }
         _ => panic!("expected Custom"),
     }
@@ -3287,40 +3279,40 @@ fn custom_carries_semantic_name_pattern_length() {
 
 #[test]
 fn custom_type_name_anonymous_pattern_only() {
-    let t = AttributeType::Custom {
-        identity: None,
-        base: Box::new(AttributeType::String),
-        pattern: Some("^foo$".to_string()),
-        length: None,
-        validate: noop_validator(),
-        to_dsl: None,
-    };
+    let t = AttributeType::custom(
+        None,
+        AttributeType::string(),
+        Some("^foo$".to_string()),
+        None,
+        noop_validator(),
+        None,
+    );
     assert_eq!(t.type_name(), "String(pattern)");
 }
 
 #[test]
 fn custom_type_name_anonymous_length_only() {
-    let t = AttributeType::Custom {
-        identity: None,
-        base: Box::new(AttributeType::String),
-        pattern: None,
-        length: Some((Some(1), Some(64))),
-        validate: noop_validator(),
-        to_dsl: None,
-    };
+    let t = AttributeType::custom(
+        None,
+        AttributeType::string(),
+        None,
+        Some((Some(1), Some(64))),
+        noop_validator(),
+        None,
+    );
     assert_eq!(t.type_name(), "String(len: 1..=64)");
 }
 
 #[test]
 fn custom_type_name_anonymous_pattern_and_length() {
-    let t = AttributeType::Custom {
-        identity: None,
-        base: Box::new(AttributeType::String),
-        pattern: Some("^.*$".to_string()),
-        length: Some((Some(1), Some(64))),
-        validate: noop_validator(),
-        to_dsl: None,
-    };
+    let t = AttributeType::custom(
+        None,
+        AttributeType::string(),
+        Some("^.*$".to_string()),
+        Some((Some(1), Some(64))),
+        noop_validator(),
+        None,
+    );
     assert_eq!(t.type_name(), "String(pattern, len: 1..=64)");
 }
 
@@ -3357,10 +3349,10 @@ fn validate_email_type() {
     let t = types::email();
 
     // Type identity: Custom with kind "Email" and String base
-    match &t {
-        AttributeType::Custom { identity, base, .. } => {
+    match t.kind() {
+        AttrTypeKind::Custom { identity, base, .. } => {
             assert_eq!(identity.as_ref().map(|id| id.kind.as_str()), Some("Email"));
-            assert!(matches!(**base, AttributeType::String));
+            assert!(matches!(base.kind(), AttrTypeKind::String));
         }
         other => panic!("Expected AttributeType::Custom, got: {:?}", other),
     }
@@ -3420,10 +3412,7 @@ mod validate_collect_tests {
     use indexmap::IndexMap;
 
     fn struct_type(name: &str, fields: Vec<StructField>) -> AttributeType {
-        AttributeType::Struct {
-            name: name.to_string(),
-            fields,
-        }
+        AttributeType::struct_(name.to_string(), fields)
     }
 
     fn map_value(entries: Vec<(&str, Value)>) -> Value {
@@ -3439,8 +3428,8 @@ mod validate_collect_tests {
         let ty = struct_type(
             "Versioning",
             vec![
-                StructField::new("status", AttributeType::String).required(),
-                StructField::new("mfa_delete", AttributeType::Bool),
+                StructField::new("status", AttributeType::string()).required(),
+                StructField::new("mfa_delete", AttributeType::bool()),
             ],
         );
         let v = map_value(vec![
@@ -3464,7 +3453,7 @@ mod validate_collect_tests {
         // first.
         let ty = struct_type(
             "Versioning",
-            vec![StructField::new("status", AttributeType::String)],
+            vec![StructField::new("status", AttributeType::string())],
         );
         let v = map_value(vec![
             (
@@ -3492,7 +3481,7 @@ mod validate_collect_tests {
         // walk back to the source position.
         let inner = struct_type(
             "Inner",
-            vec![StructField::new("count", AttributeType::Int).required()],
+            vec![StructField::new("count", AttributeType::int()).required()],
         );
         let outer = struct_type("Outer", vec![StructField::new("nested", inner).required()]);
         let v = map_value(vec![(
@@ -3515,12 +3504,9 @@ mod validate_collect_tests {
         // so the LSP can locate the offending block.
         let inner = struct_type(
             "Item",
-            vec![StructField::new("name", AttributeType::String).required()],
+            vec![StructField::new("name", AttributeType::string()).required()],
         );
-        let outer_attr = AttributeType::List {
-            inner: Box::new(inner),
-            ordered: true,
-        };
+        let outer_attr = AttributeType::list(inner);
 
         // Two list items, second one has wrong type for `name`
         let v = Value::Concrete(ConcreteValue::List(vec![
@@ -3548,7 +3534,7 @@ mod validate_collect_tests {
         let ty = struct_type(
             "Lifecycle",
             vec![
-                StructField::new("transitions", AttributeType::String)
+                StructField::new("transitions", AttributeType::string())
                     .with_block_name("transition"),
             ],
         );
@@ -3570,7 +3556,7 @@ mod validate_collect_tests {
         // fields whose value is `vpc.id` etc.
         let ty = struct_type(
             "Subnet",
-            vec![StructField::new("vpc_id", AttributeType::Int)],
+            vec![StructField::new("vpc_id", AttributeType::int())],
         );
         let v = map_value(vec![(
             "vpc_id",
@@ -3592,7 +3578,7 @@ mod validate_collect_tests {
         // suggestion, which #2214 fixes.
         let ty = struct_type(
             "Versioning",
-            vec![StructField::new("status", AttributeType::String)],
+            vec![StructField::new("status", AttributeType::string())],
         );
         let v = map_value(vec![(
             "statuus",
@@ -3665,18 +3651,18 @@ fn expected_includes_to_dsl_aliases_with_alias_flag() {
     // value and the alias appear in `expected`. The alias must be
     // marked `is_alias = true` so consumers (LSP code action) can
     // prefer the canonical form.
-    let t = AttributeType::StringEnum {
-        name: "VersioningStatus".to_string(),
-        values: vec!["Enabled".to_string(), "Suspended".to_string()],
-        identity: Some(crate::schema::string_enum_identity(
+    let t = AttributeType::string_enum(
+        "VersioningStatus".to_string(),
+        vec!["Enabled".to_string(), "Suspended".to_string()],
+        Some(crate::schema::string_enum_identity(
             "VersioningStatus",
             Some("aws.s3.Bucket"),
         )),
-        dsl_aliases: vec![
+        vec![
             ("Enabled".to_string(), "enabled".to_string()),
             ("Suspended".to_string(), "suspended".to_string()),
         ],
-    };
+    );
     // Use `EnumIdentifier` so the strict-mode validator reaches the
     // wrong-variant branch (`InvalidEnumVariant`). A `String` here would
     // be rejected earlier as `StringLiteralExpectedEnum` — that path is
@@ -3731,12 +3717,12 @@ fn custom_namespaced_string_literal_routes_validator_text_to_extra_message() {
     let schema = ResourceSchema::new("test.r.mode_holder").attribute(
         AttributeSchema::new(
             "mode",
-            AttributeType::CustomEnum {
-                identity: crate::schema::string_enum_identity("Mode", Some("test.r")),
-                base: Box::new(AttributeType::String),
-                validate: legacy_validator(validate_mode),
-                to_dsl: None,
-            },
+            AttributeType::custom_enum(
+                crate::schema::string_enum_identity("Mode", Some("test.r")),
+                AttributeType::string(),
+                legacy_validator(validate_mode),
+                None,
+            ),
         )
         .required(),
     );
@@ -3835,14 +3821,14 @@ fn union_string_vs_string_enum_picks_enum_error_for_string_input() {
     // that lands in the enum-variant matcher. A `String` here would
     // short-circuit to `StringLiteralExpectedEnum`, which is a
     // different concern covered separately.
-    let union_type = AttributeType::Union(vec![
-        AttributeType::Int,
-        AttributeType::StringEnum {
-            name: "Mode".to_string(),
-            values: vec!["fast".to_string(), "slow".to_string()],
-            identity: None,
-            dsl_aliases: vec![],
-        },
+    let union_type = AttributeType::union(vec![
+        AttributeType::int(),
+        AttributeType::string_enum(
+            "Mode".to_string(),
+            vec!["fast".to_string(), "slow".to_string()],
+            None,
+            vec![],
+        ),
     ]);
     let err = union_type
         .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
@@ -3867,12 +3853,12 @@ fn union_list_vs_list_struct_picks_inner_struct_error() {
     // one Map has an unknown field. The List<Struct> member's nested
     // `UnknownStructField { field: "typo", ... }` error should surface
     // — the user has to know that "typo" isn't a valid field on Item.
-    let union_type = AttributeType::Union(vec![
-        AttributeType::list(AttributeType::String),
-        AttributeType::list(AttributeType::Struct {
-            name: "Item".to_string(),
-            fields: vec![StructField::new("name", AttributeType::String)],
-        }),
+    let union_type = AttributeType::union(vec![
+        AttributeType::list(AttributeType::string()),
+        AttributeType::list(AttributeType::struct_(
+            "Item".to_string(),
+            vec![StructField::new("name", AttributeType::string())],
+        )),
     ]);
     let mut bad = IndexMap::new();
     bad.insert(
@@ -3905,16 +3891,16 @@ fn union_string_vs_custom_picks_custom_error_for_string_input() {
             _ => Err("must start with 'arn:'".to_string()),
         }
     }
-    let union_type = AttributeType::Union(vec![
-        AttributeType::Int,
-        AttributeType::Custom {
-            identity: Some(TypeIdentity::bare("Arn")),
-            base: Box::new(AttributeType::String),
-            pattern: None,
-            length: None,
-            validate: legacy_validator(must_be_arn),
-            to_dsl: None,
-        },
+    let union_type = AttributeType::union(vec![
+        AttributeType::int(),
+        AttributeType::custom(
+            Some(TypeIdentity::bare("Arn")),
+            AttributeType::string(),
+            None,
+            None,
+            legacy_validator(must_be_arn),
+            None,
+        ),
     ]);
     let err = union_type
         .validate(&Value::Concrete(ConcreteValue::String(
@@ -3939,7 +3925,7 @@ fn union_falls_through_to_type_mismatch_when_no_member_matches_shape() {
     // Int | Bool: input is a Map. Neither member shares a constructor
     // with Map. The result is a generic TypeMismatch — there's no
     // "closer" candidate to surface.
-    let union_type = AttributeType::Union(vec![AttributeType::Int, AttributeType::Bool]);
+    let union_type = AttributeType::union(vec![AttributeType::int(), AttributeType::bool()]);
     let mut map = IndexMap::new();
     map.insert(
         "k".to_string(),
@@ -3973,16 +3959,16 @@ fn union_custom_with_int_base_picks_custom_error_for_int_input() {
     // accepts any `Value::Concrete(ConcreteValue::Int)`, so we have to keep it second; bind
     // through a Custom on top so the actual reachable failure path
     // is the `Custom` one.
-    let union_type = AttributeType::Union(vec![
-        AttributeType::Custom {
-            identity: Some(TypeIdentity::bare("PositiveInt")),
-            base: Box::new(AttributeType::Int),
-            pattern: None,
-            length: None,
-            validate: legacy_validator(must_be_positive),
-            to_dsl: None,
-        },
-        AttributeType::Bool,
+    let union_type = AttributeType::union(vec![
+        AttributeType::custom(
+            Some(TypeIdentity::bare("PositiveInt")),
+            AttributeType::int(),
+            None,
+            None,
+            legacy_validator(must_be_positive),
+            None,
+        ),
+        AttributeType::bool(),
     ]);
     let err = union_type
         .validate(&Value::Concrete(ConcreteValue::Int(-5)))
@@ -4007,12 +3993,12 @@ fn union_struct_member_still_wins_for_map_input_regression() {
     // `union_struct_unknown_field_shows_specific_error` but is kept
     // here so a future scoring tweak that drops this case fails
     // immediately.
-    let union_type = AttributeType::Union(vec![
-        AttributeType::Struct {
-            name: "Principal".to_string(),
-            fields: vec![StructField::new("service", AttributeType::String)],
-        },
-        AttributeType::String,
+    let union_type = AttributeType::union(vec![
+        AttributeType::struct_(
+            "Principal".to_string(),
+            vec![StructField::new("service", AttributeType::string())],
+        ),
+        AttributeType::string(),
     ]);
     let mut map = IndexMap::new();
     map.insert(
@@ -4040,12 +4026,12 @@ fn custom_validator_can_capture_external_state() {
     // closure-capable validator can. This is the core acceptance for
     // #2217 (closure-capable Custom validator).
     let allowed_region = "ap-northeast-1".to_string();
-    let attr = AttributeType::Custom {
-        identity: Some(TypeIdentity::bare("Region")),
-        base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
-        validate: validator(move |v| match v {
+    let attr = AttributeType::custom(
+        Some(TypeIdentity::bare("Region")),
+        AttributeType::string(),
+        None,
+        None,
+        validator(move |v| match v {
             Value::Concrete(ConcreteValue::String(s)) if s == &allowed_region => Ok(()),
             Value::Concrete(ConcreteValue::String(s)) => Err(TypeError::ValidationFailed {
                 message: format!("expected region {}, got {}", allowed_region, s),
@@ -4055,9 +4041,8 @@ fn custom_validator_can_capture_external_state() {
                 got: other.type_name(),
             }),
         }),
-
-        to_dsl: None,
-    };
+        None,
+    );
     assert!(
         attr.validate(&Value::Concrete(ConcreteValue::String(
             "ap-northeast-1".to_string()
@@ -4083,12 +4068,12 @@ fn custom_validator_returns_structured_type_error_directly() {
     // bypassing the legacy `String -> ValidationFailed` round-trip.
     // This is what unlocks LSP code-action quick-fixes for Custom-typed
     // attributes (see #2220 / #2309 for the structured-error path).
-    let attr = AttributeType::Custom {
-        identity: Some(TypeIdentity::bare("Mode")),
-        base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
-        validate: validator(|v| match v {
+    let attr = AttributeType::custom(
+        Some(TypeIdentity::bare("Mode")),
+        AttributeType::string(),
+        None,
+        None,
+        validator(|v| match v {
             Value::Concrete(ConcreteValue::String(s)) if s == "fast" || s == "slow" => Ok(()),
             Value::Concrete(ConcreteValue::String(s)) => Err(TypeError::InvalidEnumVariant {
                 value: s.clone(),
@@ -4104,9 +4089,8 @@ fn custom_validator_returns_structured_type_error_directly() {
                 got: other.type_name(),
             }),
         }),
-
-        to_dsl: None,
-    };
+        None,
+    );
     let err = attr
         .validate(&Value::Concrete(ConcreteValue::String(
             "medium".to_string(),
@@ -4205,15 +4189,15 @@ fn validate_skips_value_unknown_for_primitive_types() {
     // parse-time validation with `expected <type>, got unknown`.
     use crate::resource::{AccessPath, UnknownReason};
     let unknown = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue));
-    assert!(AttributeType::String.validate(&unknown).is_ok());
-    assert!(AttributeType::Int.validate(&unknown).is_ok());
-    assert!(AttributeType::Bool.validate(&unknown).is_ok());
+    assert!(AttributeType::string().validate(&unknown).is_ok());
+    assert!(AttributeType::int().validate(&unknown).is_ok());
+    assert!(AttributeType::bool().validate(&unknown).is_ok());
 
     let upstream = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
         path: AccessPath::with_fields("net", "vpc", vec!["vpc_id".into()]),
     }));
-    assert!(AttributeType::String.validate(&upstream).is_ok());
-    assert!(AttributeType::Int.validate(&upstream).is_ok());
+    assert!(AttributeType::string().validate(&upstream).is_ok());
+    assert!(AttributeType::int().validate(&upstream).is_ok());
 }
 
 #[test]
@@ -4231,14 +4215,14 @@ fn walk_custom_lookup_skips_value_unknown() {
                 .to_string(),
         })
     });
-    let custom_type = AttributeType::Custom {
-        base: Box::new(AttributeType::String),
-        validate: always_fail,
-        identity: Some(TypeIdentity::bare("vpc_id")),
-        pattern: None,
-        length: None,
-        to_dsl: None,
-    };
+    let custom_type = AttributeType::custom(
+        Some(TypeIdentity::bare("vpc_id")),
+        AttributeType::string(),
+        None,
+        None,
+        always_fail,
+        None,
+    );
 
     let mut errors = Vec::new();
     walk_custom_lookup(
@@ -4275,15 +4259,17 @@ fn union_walk_custom_lookup_succeeds_when_any_member_accepts() {
     // arm by name and rejects the other. The Union must succeed
     // because the approving arm matches; the sibling's failure is
     // discarded.
-    let custom = |name: &str| AttributeType::Custom {
-        base: Box::new(AttributeType::String),
-        validate: validator(|_v: &Value| Ok(())),
-        identity: Some(TypeIdentity::bare(name)),
-        pattern: None,
-        length: None,
-        to_dsl: None,
+    let custom = |name: &str| {
+        AttributeType::custom(
+            Some(TypeIdentity::bare(name)),
+            AttributeType::string(),
+            None,
+            None,
+            validator(|_v: &Value| Ok(())),
+            None,
+        )
     };
-    let union = AttributeType::Union(vec![custom("ok_arm"), custom("fail_arm")]);
+    let union = AttributeType::union(vec![custom("ok_arm"), custom("fail_arm")]);
 
     let lookup = |id: &TypeIdentity, _v: &Value| -> Result<(), TypeError> {
         if id.kind == "ok_arm" {
@@ -4316,15 +4302,17 @@ fn union_walk_custom_lookup_emits_smallest_error_set_when_all_fail() {
     // sibling failure sets (the smaller one if they differ), not the
     // sum. Both arms emit a single error here, so the Union's error
     // count must be 1, not 2.
-    let custom = |name: &str| AttributeType::Custom {
-        base: Box::new(AttributeType::String),
-        validate: validator(|_v: &Value| Ok(())),
-        identity: Some(TypeIdentity::bare(name)),
-        pattern: None,
-        length: None,
-        to_dsl: None,
+    let custom = |name: &str| {
+        AttributeType::custom(
+            Some(TypeIdentity::bare(name)),
+            AttributeType::string(),
+            None,
+            None,
+            validator(|_v: &Value| Ok(())),
+            None,
+        )
     };
-    let union = AttributeType::Union(vec![custom("a"), custom("b")]);
+    let union = AttributeType::union(vec![custom("a"), custom("b")]);
 
     let lookup = |id: &TypeIdentity, _v: &Value| -> Result<(), TypeError> {
         Err(TypeError::ValidationFailed {
@@ -4357,7 +4345,7 @@ fn union_walk_custom_lookup_cidr_accepts_ipv4_when_lookup_routes_correctly() {
     // `"10.0.0.0/8"` and rejects `Ipv6Cidr`. The Union must surface
     // no errors — the previous loop would have pushed the IPv6
     // rejection through anyway. This is the awscc#217 reproduction.
-    let cidr = AttributeType::Union(vec![types::ipv4_cidr(), types::ipv6_cidr()]);
+    let cidr = AttributeType::union(vec![types::ipv4_cidr(), types::ipv6_cidr()]);
 
     let lookup = |id: &TypeIdentity, value: &Value| -> Result<(), TypeError> {
         let Value::Concrete(ConcreteValue::String(s)) = value else {
@@ -4411,18 +4399,18 @@ fn dsl_aliases_validator_accepts_dsl_spellings_only() {
     // bare-DSL forms (`bucket_owner_enforced`,
     // `awscc.s3.Bucket.ObjectOwnership.bucket_owner_enforced`) are
     // accepted.
-    let t = AttributeType::StringEnum {
-        name: "ObjectOwnership".to_string(),
-        values: vec![
+    let t = AttributeType::string_enum(
+        "ObjectOwnership".to_string(),
+        vec![
             "ObjectWriter".to_string(),
             "BucketOwnerPreferred".to_string(),
             "BucketOwnerEnforced".to_string(),
         ],
-        identity: Some(crate::schema::string_enum_identity(
+        Some(crate::schema::string_enum_identity(
             "ObjectOwnership",
             Some("awscc.s3.Bucket"),
         )),
-        dsl_aliases: vec![
+        vec![
             ("ObjectWriter".to_string(), "object_writer".to_string()),
             (
                 "BucketOwnerPreferred".to_string(),
@@ -4433,7 +4421,7 @@ fn dsl_aliases_validator_accepts_dsl_spellings_only() {
                 "bucket_owner_enforced".to_string(),
             ),
         ],
-    };
+    );
 
     // Bare API spelling: REJECTED under strict mode (the DSL alias
     // rewrite invalidates the API spelling — users must type the DSL
@@ -4500,19 +4488,19 @@ fn enum_without_dsl_aliases_accepts_api_spelling_as_before() {
     // accepted via the `values` list. This is the staged-migration
     // hook — strictness flips on per enum as codegen populates the
     // table, so a partial sweep never breaks compilation.
-    let t = AttributeType::StringEnum {
-        name: "TrafficType".to_string(),
-        values: vec![
+    let t = AttributeType::string_enum(
+        "TrafficType".to_string(),
+        vec![
             "ACCEPT".to_string(),
             "REJECT".to_string(),
             "ALL".to_string(),
         ],
-        identity: Some(crate::schema::string_enum_identity(
+        Some(crate::schema::string_enum_identity(
             "TrafficType",
             Some("aws.ec2.FlowLog"),
         )),
-        dsl_aliases: vec![],
-    };
+        vec![],
+    );
     assert!(
         t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "ALL".to_string()
@@ -4527,18 +4515,18 @@ fn dsl_aliases_diagnostic_tags_alias_entries_distinct_from_canonical() {
     // The `expected` list carried by `TypeError::InvalidEnumVariant`
     // tags each entry with `is_alias`, so an LSP code action can
     // suggest the canonical form. Pin the tagging.
-    let t = AttributeType::StringEnum {
-        name: "VersioningStatus".to_string(),
-        values: vec!["Enabled".to_string(), "Suspended".to_string()],
-        identity: Some(crate::schema::string_enum_identity(
+    let t = AttributeType::string_enum(
+        "VersioningStatus".to_string(),
+        vec!["Enabled".to_string(), "Suspended".to_string()],
+        Some(crate::schema::string_enum_identity(
             "VersioningStatus",
             Some("aws.s3.Bucket"),
         )),
-        dsl_aliases: vec![
+        vec![
             ("Enabled".to_string(), "enabled".to_string()),
             ("Suspended".to_string(), "suspended".to_string()),
         ],
-    };
+    );
     // Use `EnumIdentifier` so the strict-mode validator reaches the
     // unknown-variant branch (the alias-tagging behavior we want to
     // pin). A `String` here would take the `StringLiteralExpectedEnum`
@@ -4571,15 +4559,15 @@ fn dsl_aliases_empty_keeps_api_only_validation() {
     // providers and for enums whose API spelling already matches the
     // DSL spelling. Validation must continue to accept the API
     // spelling and nothing else.
-    let t = AttributeType::StringEnum {
-        name: "Status".to_string(),
-        values: vec!["active".to_string(), "inactive".to_string()],
-        identity: Some(crate::schema::string_enum_identity(
+    let t = AttributeType::string_enum(
+        "Status".to_string(),
+        vec!["active".to_string(), "inactive".to_string()],
+        Some(crate::schema::string_enum_identity(
             "Status",
             Some("test.r"),
         )),
-        dsl_aliases: vec![],
-    };
+        vec![],
+    );
     assert!(
         t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "active".to_string()
@@ -4611,18 +4599,18 @@ mod string_enum_binding_collision {
         // Mirrors the awscc.ec2.FlowLog.ResourceType enum that
         // surfaced the issue. The `"vpc"` alias is what collides with
         // a `let vpc = ...` binding name in real fixtures.
-        AttributeType::StringEnum {
-            name: "ResourceType".to_string(),
-            values: vec![
+        AttributeType::string_enum(
+            "ResourceType".to_string(),
+            vec![
                 "NetworkInterface".to_string(),
                 "Subnet".to_string(),
                 "VPC".to_string(),
             ],
-            identity: Some(crate::schema::string_enum_identity(
+            Some(crate::schema::string_enum_identity(
                 "ResourceType",
                 Some("awscc.ec2.FlowLog"),
             )),
-            dsl_aliases: vec![
+            vec![
                 (
                     "NetworkInterface".to_string(),
                     "network_interface".to_string(),
@@ -4630,7 +4618,7 @@ mod string_enum_binding_collision {
                 ("Subnet".to_string(), "subnet".to_string()),
                 ("VPC".to_string(), "vpc".to_string()),
             ],
-        }
+        )
     }
 
     #[test]
@@ -4700,7 +4688,7 @@ mod string_enum_binding_collision {
         // Other AttributeType kinds (e.g., String) must not be
         // affected by the collision check — many of them legitimately
         // accept a `BindingRef`.
-        let t = AttributeType::String;
+        let t = AttributeType::string();
         let value = Value::Deferred(DeferredValue::BindingRef {
             binding: "vpc".to_string(),
         });
@@ -4832,22 +4820,22 @@ mod dsl_map_api_for {
 
 // carina#2996: `Map<StringEnum, V>` bare-identifier key acceptance.
 fn condition_operator_map(value: AttributeType) -> AttributeType {
-    AttributeType::Map {
-        key: Box::new(AttributeType::StringEnum {
-            name: "ConditionOperator".to_string(),
-            values: vec![
+    AttributeType::map_with_key(
+        AttributeType::string_enum(
+            "ConditionOperator".to_string(),
+            vec![
                 "string_equals".to_string(),
                 "string_not_equals".to_string(),
                 "arn_like".to_string(),
             ],
-            identity: Some(crate::schema::string_enum_identity(
+            Some(crate::schema::string_enum_identity(
                 "ConditionOperator",
                 Some("aws.iam.ConditionOperator"),
             )),
-            dsl_aliases: vec![],
-        }),
-        value: Box::new(value),
-    }
+            vec![],
+        ),
+        value,
+    )
 }
 
 fn map_value_with_one_key(key: &str) -> Value {
@@ -4861,7 +4849,7 @@ fn map_value_with_one_key(key: &str) -> Value {
 
 #[test]
 fn validate_map_with_string_enum_key_accepts_bare_identifier_spelling() {
-    let map_t = condition_operator_map(AttributeType::String);
+    let map_t = condition_operator_map(AttributeType::string());
     let val = map_value_with_one_key("string_equals");
     assert!(
         map_t.validate(&val).is_ok(),
@@ -4875,18 +4863,18 @@ fn validate_map_with_string_enum_key_accepts_dsl_alias_spelling() {
     // `IpProtocol` has a `("-1", "all")` alias: DSL must accept `all`
     // both at attribute-value position (already covered) and at
     // map-key position when used as `Map<StringEnum<IpProtocol>, V>`.
-    let map_t = AttributeType::Map {
-        key: Box::new(AttributeType::StringEnum {
-            name: "IpProtocol".to_string(),
-            values: vec!["tcp".to_string(), "-1".to_string()],
-            identity: Some(crate::schema::string_enum_identity(
+    let map_t = AttributeType::map_with_key(
+        AttributeType::string_enum(
+            "IpProtocol".to_string(),
+            vec!["tcp".to_string(), "-1".to_string()],
+            Some(crate::schema::string_enum_identity(
                 "IpProtocol",
                 Some("awscc.ec2.SecurityGroup"),
             )),
-            dsl_aliases: vec![("-1".to_string(), "all".to_string())],
-        }),
-        value: Box::new(AttributeType::String),
-    };
+            vec![("-1".to_string(), "all".to_string())],
+        ),
+        AttributeType::string(),
+    );
     let val = map_value_with_one_key("all");
     assert!(
         map_t.validate(&val).is_ok(),
@@ -4897,7 +4885,7 @@ fn validate_map_with_string_enum_key_accepts_dsl_alias_spelling() {
 
 #[test]
 fn validate_map_with_string_enum_key_rejects_unknown_variant() {
-    let map_t = condition_operator_map(AttributeType::String);
+    let map_t = condition_operator_map(AttributeType::string());
     let val = map_value_with_one_key("not_a_variant");
     // The diagnostic must surface as `MapKeyError(InvalidEnumVariant)`,
     // not the `StringLiteralExpectedEnum` shape that misled the user
@@ -4928,47 +4916,41 @@ fn lift_state_string_enums_to_identifiers_fixes_awscc251() {
     use crate::utils::lift_state_string_enums_to_identifiers;
     use indexmap::IndexMap;
 
-    let version_enum = AttributeType::StringEnum {
-        name: "Version".to_string(),
-        values: vec!["2012-10-17".to_string(), "2008-10-17".to_string()],
-        identity: Some(crate::schema::string_enum_identity(
+    let version_enum = AttributeType::string_enum(
+        "Version".to_string(),
+        vec!["2012-10-17".to_string(), "2008-10-17".to_string()],
+        Some(crate::schema::string_enum_identity(
             "Version",
             Some("aws.iam.PolicyDocument"),
         )),
-        dsl_aliases: vec![
+        vec![
             ("2012-10-17".to_string(), "2012_10_17".to_string()),
             ("2008-10-17".to_string(), "2008_10_17".to_string()),
         ],
-    };
-    let effect_enum = AttributeType::StringEnum {
-        name: "Effect".to_string(),
-        values: vec!["Allow".to_string(), "Deny".to_string()],
-        identity: Some(crate::schema::string_enum_identity(
+    );
+    let effect_enum = AttributeType::string_enum(
+        "Effect".to_string(),
+        vec!["Allow".to_string(), "Deny".to_string()],
+        Some(crate::schema::string_enum_identity(
             "Effect",
             Some("aws.iam.PolicyDocument"),
         )),
-        dsl_aliases: vec![
+        vec![
             ("Allow".to_string(), "allow".to_string()),
             ("Deny".to_string(), "deny".to_string()),
         ],
-    };
-    let statement_struct = AttributeType::Struct {
-        name: "Statement".to_string(),
-        fields: vec![StructField::new("effect", effect_enum)],
-    };
-    let policy_struct = AttributeType::Struct {
-        name: "PolicyDocument".to_string(),
-        fields: vec![
+    );
+    let statement_struct = AttributeType::struct_(
+        "Statement".to_string(),
+        vec![StructField::new("effect", effect_enum)],
+    );
+    let policy_struct = AttributeType::struct_(
+        "PolicyDocument".to_string(),
+        vec![
             StructField::new("version", version_enum),
-            StructField::new(
-                "statement",
-                AttributeType::List {
-                    inner: Box::new(statement_struct),
-                    ordered: false,
-                },
-            ),
+            StructField::new("statement", AttributeType::unordered_list(statement_struct)),
         ],
-    };
+    );
     let schema = ResourceSchema::new("aws.iam.role_policy")
         .attribute(AttributeSchema::new("policy", policy_struct));
 
@@ -5050,19 +5032,19 @@ fn lift_state_string_enums_is_idempotent_and_preserves_invalid() {
     use crate::utils::lift_state_string_enums_to_identifiers;
     use indexmap::IndexMap;
 
-    let version_enum = AttributeType::StringEnum {
-        name: "Version".to_string(),
-        values: vec!["2012-10-17".to_string()],
-        identity: Some(crate::schema::string_enum_identity(
+    let version_enum = AttributeType::string_enum(
+        "Version".to_string(),
+        vec!["2012-10-17".to_string()],
+        Some(crate::schema::string_enum_identity(
             "Version",
             Some("aws.iam.PolicyDocument"),
         )),
-        dsl_aliases: vec![("2012-10-17".to_string(), "2012_10_17".to_string())],
-    };
-    let policy_struct = AttributeType::Struct {
-        name: "PolicyDocument".to_string(),
-        fields: vec![StructField::new("version", version_enum)],
-    };
+        vec![("2012-10-17".to_string(), "2012_10_17".to_string())],
+    );
+    let policy_struct = AttributeType::struct_(
+        "PolicyDocument".to_string(),
+        vec![StructField::new("version", version_enum)],
+    );
     let schema = ResourceSchema::new("aws.iam.role_policy")
         .attribute(AttributeSchema::new("policy", policy_struct));
 
@@ -5125,17 +5107,17 @@ fn lift_state_string_enums_is_idempotent_and_preserves_invalid() {
 
 fn principal_union_schema() -> Vec<AttributeType> {
     vec![
-        AttributeType::Struct {
-            name: "PrincipalStruct".to_string(),
-            fields: vec![StructField::new(
+        AttributeType::struct_(
+            "PrincipalStruct".to_string(),
+            vec![StructField::new(
                 "service",
-                AttributeType::Union(vec![
-                    AttributeType::String,
-                    AttributeType::list(AttributeType::String),
+                AttributeType::union(vec![
+                    AttributeType::string(),
+                    AttributeType::list(AttributeType::string()),
                 ]),
             )],
-        },
-        AttributeType::String,
+        ),
+        AttributeType::string(),
     ]
 }
 
@@ -5152,7 +5134,7 @@ fn select_union_member_picks_struct_for_map_value() {
     let v = Value::Concrete(ConcreteValue::Map(map));
     let chosen = select_union_member(&members, &v).expect("a Map must select a member");
     assert!(
-        matches!(chosen, AttributeType::Struct { .. }),
+        matches!(chosen.kind(), AttrTypeKind::Struct { .. }),
         "a Map value must select the Struct member, got {chosen:?}"
     );
 }
@@ -5172,22 +5154,22 @@ fn select_union_member_map_never_picks_string_member() {
     // Struct-before-String (the real `string_or_principal_struct` order).
     let a = principal_union_schema();
     assert!(matches!(
-        select_union_member(&a, &v),
-        Some(AttributeType::Struct { .. })
+        select_union_member(&a, &v).map(|m| m.kind()),
+        Some(AttrTypeKind::Struct { .. })
     ));
 
     // String-before-Struct: still must not pick String for a Map.
     let b = vec![
-        AttributeType::String,
-        AttributeType::Struct {
-            name: "PrincipalStruct".to_string(),
-            fields: vec![StructField::new("service", AttributeType::String)],
-        },
+        AttributeType::string(),
+        AttributeType::struct_(
+            "PrincipalStruct".to_string(),
+            vec![StructField::new("service", AttributeType::string())],
+        ),
     ];
     assert!(
         matches!(
-            select_union_member(&b, &v),
-            Some(AttributeType::Struct { .. })
+            select_union_member(&b, &v).map(|m| m.kind()),
+            Some(AttrTypeKind::Struct { .. })
         ),
         "a Map must select Struct even when String is declared first"
     );
@@ -5198,8 +5180,8 @@ fn select_union_member_map_never_picks_string_member() {
 #[test]
 fn select_union_member_scalar_selects_string_or_list() {
     let members = vec![
-        AttributeType::String,
-        AttributeType::list(AttributeType::String),
+        AttributeType::string(),
+        AttributeType::list(AttributeType::string()),
     ];
     let v = Value::Concrete(ConcreteValue::String(
         "cloudfront.amazonaws.com".to_string(),
@@ -5220,7 +5202,7 @@ fn select_union_member_scalar_selects_string_or_list() {
 /// No member shares the value's shape → `None` (identity at call site).
 #[test]
 fn select_union_member_no_match_is_none() {
-    let members = vec![AttributeType::Int, AttributeType::Bool];
+    let members = vec![AttributeType::int(), AttributeType::bool()];
     let v = Value::Concrete(ConcreteValue::String("not-an-int".to_string()));
     assert!(select_union_member(&members, &v).is_none());
 }
@@ -5251,29 +5233,26 @@ fn cyclic_statement_schema() -> Schema {
     let mut defs = std::collections::BTreeMap::new();
     defs.insert(
         "Statement".to_string(),
-        AttributeType::Struct {
-            name: "Statement".to_string(),
-            fields: vec![StructField::new(
+        AttributeType::struct_(
+            "Statement".to_string(),
+            vec![StructField::new(
                 "and_statement",
-                AttributeType::Ref("AndStatement".to_string()),
+                AttributeType::ref_("AndStatement".to_string()),
             )],
-        },
+        ),
     );
     defs.insert(
         "AndStatement".to_string(),
-        AttributeType::Struct {
-            name: "AndStatement".to_string(),
-            fields: vec![StructField::new(
+        AttributeType::struct_(
+            "AndStatement".to_string(),
+            vec![StructField::new(
                 "statements",
-                AttributeType::List {
-                    inner: Box::new(AttributeType::Ref("Statement".to_string())),
-                    ordered: true,
-                },
+                AttributeType::list(AttributeType::ref_("Statement".to_string())),
             )],
-        },
+        ),
     );
     Schema {
-        root: AttributeType::Ref("Statement".to_string()),
+        root: AttributeType::ref_("Statement".to_string()),
         defs,
     }
 }
@@ -5282,7 +5261,7 @@ fn cyclic_statement_schema() -> Schema {
 fn schema_resolve_returns_defined_type() {
     let schema = cyclic_statement_schema();
     let resolved = schema.resolve("Statement").expect("Statement defined");
-    assert!(matches!(resolved, AttributeType::Struct { name, .. } if name == "Statement"));
+    assert!(matches!(resolved.kind(), AttrTypeKind::Struct { name, .. } if name == "Statement"));
     assert!(schema.resolve("NoSuchThing").is_none());
 }
 
@@ -5362,7 +5341,7 @@ fn schema_validate_malformed_nested_statement_fails() {
 
 #[test]
 fn attribute_type_validate_on_ref_returns_error_without_schema() {
-    let t = AttributeType::Ref("Statement".to_string());
+    let t = AttributeType::ref_("Statement".to_string());
     let v = Value::Concrete(ConcreteValue::String("anything".to_string()));
     let result = t.validate(&v);
     assert!(

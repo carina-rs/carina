@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use crate::builtins::{BuiltinReturnType, builtin_functions};
 use crate::parser::TypeExpr;
 use crate::resource::{ConcreteValue, DeferredValue, Value};
-use crate::schema::{AttributeType, ResourceSchema, SchemaKind, SchemaRegistry};
+use crate::schema::{AttrTypeKind, AttributeType, ResourceSchema, SchemaKind, SchemaRegistry};
 
 /// Why inference failed. Carries the rhs description so downstream
 /// callers can render an actionable "type annotation required" error
@@ -503,9 +503,9 @@ fn infer_resource_ref_with_visiting(
         // resolves internally for the Field arm; pre-resolving here
         // also keeps the Subscript arms shape-matched.
         let resolved = current.resolve_refs(&schema.defs).as_attr();
-        current = match (seg, resolved) {
-            (PathSegment::Field { name }, attr) => {
-                match descend_struct_field(attr, name, &schema.defs) {
+        current = match (seg, &resolved.kind) {
+            (PathSegment::Field { name }, _) => {
+                match descend_struct_field(resolved, name, &schema.defs) {
                     Some(t) => t,
                     None => {
                         return Err(InferenceError::UnknownAttribute {
@@ -519,13 +519,13 @@ fn infer_resource_ref_with_visiting(
                 PathSegment::Subscript {
                     index: Subscript::Int { .. },
                 },
-                AttributeType::List { inner, .. },
+                AttrTypeKind::List { inner, .. },
             ) => inner,
             (
                 PathSegment::Subscript {
                     index: Subscript::Str { .. },
                 },
-                AttributeType::Map { value, .. },
+                AttrTypeKind::Map { value, .. },
             ) => value,
             _ => {
                 return Err(InferenceError::UnknownType {
@@ -555,7 +555,7 @@ fn infer_resource_ref_with_visiting(
     // Resolve any trailing `Ref` so the Union check and the
     // TypeExpr projection see the underlying shape (carina#3340).
     let current = current.resolve_refs(&schema.defs).as_attr();
-    if matches!(current, AttributeType::Union(_)) {
+    if matches!(&current.kind, AttrTypeKind::Union(_)) {
         return Err(InferenceError::UnknownType {
             reason: format!(
                 "rhs `{}.{}` resolves to a union type; annotate the export to pick a branch",
@@ -584,9 +584,8 @@ fn descend_struct_field<'a>(
     // Resolve any leading `Ref` chain so a reference path inside a
     // cyclic CFN struct (`WebACL.Statement -> AndStatement -> ...`)
     // can be followed across the cycle (carina#3340).
-    let resolved = attr_type.resolve_refs(defs).as_attr();
-    match resolved {
-        AttributeType::Struct { fields, .. } => fields
+    match attr_type.shape(defs) {
+        crate::schema::Shape::Struct { fields, .. } => fields
             .iter()
             .find(|f| f.name == field)
             .map(|f| &f.field_type),
@@ -612,13 +611,13 @@ fn descend_struct_field<'a>(
 ///   string when matched against an annotation; specific enum
 ///   identities are not currently expressible at the `TypeExpr` level).
 fn attribute_type_to_type_expr(attr_type: &AttributeType) -> TypeExpr {
-    match attr_type {
-        AttributeType::String => TypeExpr::String,
-        AttributeType::Int => TypeExpr::Int,
-        AttributeType::Float => TypeExpr::Float,
-        AttributeType::Bool => TypeExpr::Bool,
-        AttributeType::Duration => TypeExpr::Duration,
-        AttributeType::Custom {
+    match attr_type.kind() {
+        AttrTypeKind::String => TypeExpr::String,
+        AttrTypeKind::Int => TypeExpr::Int,
+        AttrTypeKind::Float => TypeExpr::Float,
+        AttrTypeKind::Bool => TypeExpr::Bool,
+        AttrTypeKind::Duration => TypeExpr::Duration,
+        AttrTypeKind::Custom {
             identity: Some(id), ..
         } => match &id.provider {
             Some(provider) => TypeExpr::SchemaType {
@@ -628,12 +627,12 @@ fn attribute_type_to_type_expr(attr_type: &AttributeType) -> TypeExpr {
             },
             None => TypeExpr::Simple(crate::parser::pascal_to_snake(&id.kind)),
         },
-        AttributeType::Custom { base, .. } => attribute_type_to_type_expr(base),
+        AttrTypeKind::Custom { base, .. } => attribute_type_to_type_expr(base),
         // CustomEnum's identity is mandatory and always provider-
         // scoped (an enum-shorthand needs the dotted prefix), so the
         // bare-identity / fall-through-to-base arms above do not
         // apply.
-        AttributeType::CustomEnum { identity, .. } => match &identity.provider {
+        AttrTypeKind::CustomEnum { identity, .. } => match &identity.provider {
             Some(provider) => TypeExpr::SchemaType {
                 provider: provider.clone(),
                 path: identity.segments.join("."),
@@ -641,14 +640,14 @@ fn attribute_type_to_type_expr(attr_type: &AttributeType) -> TypeExpr {
             },
             None => TypeExpr::Simple(crate::parser::pascal_to_snake(&identity.kind)),
         },
-        AttributeType::StringEnum { .. } => TypeExpr::String,
-        AttributeType::List { inner, .. } => {
+        AttrTypeKind::StringEnum { .. } => TypeExpr::String,
+        AttrTypeKind::List { inner, .. } => {
             TypeExpr::List(Box::new(attribute_type_to_type_expr(inner)))
         }
-        AttributeType::Map { value, .. } => {
+        AttrTypeKind::Map { value, .. } => {
             TypeExpr::Map(Box::new(attribute_type_to_type_expr(value)))
         }
-        AttributeType::Struct { fields, .. } => TypeExpr::Struct {
+        AttrTypeKind::Struct { fields, .. } => TypeExpr::Struct {
             fields: fields
                 .iter()
                 .map(|f| (f.name.clone(), attribute_type_to_type_expr(&f.field_type)))
@@ -662,7 +661,7 @@ fn attribute_type_to_type_expr(attr_type: &AttributeType) -> TypeExpr {
         // about precision should detect the union upstream and emit
         // a "type annotation required" error instead of trusting this
         // result.
-        AttributeType::Union(_) => TypeExpr::String,
+        AttrTypeKind::Union(_) => TypeExpr::String,
         // `Ref` requires the enclosing `Schema` to resolve — this pure
         // attribute-type-to-type-expr conversion does not have one in
         // scope. Returning `String` as a sentinel matches the
@@ -672,7 +671,7 @@ fn attribute_type_to_type_expr(attr_type: &AttributeType) -> TypeExpr {
         // generated schemas, so this fallback path is unreachable for
         // hand-written or codegen-produced attribute types reached
         // through normal validation flows.
-        AttributeType::Ref(_) => TypeExpr::String,
+        AttrTypeKind::Ref(_) => TypeExpr::String,
     }
 }
 
@@ -788,19 +787,19 @@ mod tests {
     }
 
     fn vpc_id_custom() -> AttributeType {
-        AttributeType::Custom {
-            identity: Some(TypeIdentity::bare("VpcId")),
-            pattern: None,
-            length: None,
-            base: Box::new(AttributeType::String),
-            validate: legacy_validator(noop),
-            to_dsl: None,
-        }
+        AttributeType::custom(
+            Some(TypeIdentity::bare("VpcId")),
+            AttributeType::string(),
+            None,
+            None,
+            legacy_validator(noop),
+            None,
+        )
     }
 
     fn vpc_schema() -> ResourceSchema {
         ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
+            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
             .attribute(AttributeSchema::new("vpc_id", vpc_id_custom()))
     }
 
@@ -952,10 +951,10 @@ mod tests {
         // Locks the descent loop so a future refactor cannot silently
         // break field-path traversal.
         use crate::schema::StructField;
-        let tags_struct = AttributeType::Struct {
-            name: "Tags".to_string(),
-            fields: vec![StructField::new("environment", AttributeType::String)],
-        };
+        let tags_struct = AttributeType::struct_(
+            "Tags",
+            vec![StructField::new("environment", AttributeType::string())],
+        );
         let schema =
             ResourceSchema::new("ec2.Vpc").attribute(AttributeSchema::new("tags", tags_struct));
         let mut schemas = SchemaRegistry::new();
@@ -1084,10 +1083,7 @@ mod tests {
         // not `List<String>`. Without subscript handling the inferer
         // would type the value as the collection itself and a
         // downstream `: String` receiver would spuriously reject.
-        let list_str = AttributeType::List {
-            inner: Box::new(AttributeType::String),
-            ordered: true,
-        };
+        let list_str = AttributeType::list(AttributeType::string());
         let schema =
             ResourceSchema::new("ec2.Vpc").attribute(AttributeSchema::new("subnets", list_str));
         let mut schemas = SchemaRegistry::new();
@@ -1176,7 +1172,7 @@ mod tests {
         // A `Union` receiver carries multiple alternatives; projecting
         // it to one branch silently lets the value satisfy alternatives
         // it doesn't. Demand annotation instead.
-        let union_attr = AttributeType::Union(vec![AttributeType::String, AttributeType::Int]);
+        let union_attr = AttributeType::union(vec![AttributeType::string(), AttributeType::int()]);
         let schema = ResourceSchema::new("ec2.Vpc")
             .attribute(AttributeSchema::new("polymorphic", union_attr));
         let mut schemas = SchemaRegistry::new();
@@ -1235,23 +1231,20 @@ mod tests {
         // must not be blocked. Inference accepts this and projects the
         // outer Struct into a TypeExpr::Struct.
         use crate::schema::StructField;
-        let inner_struct = AttributeType::Struct {
-            name: "Statement".to_string(),
-            fields: vec![StructField::new(
+        let inner_struct = AttributeType::struct_(
+            "Statement",
+            vec![StructField::new(
                 "principal",
-                AttributeType::Union(vec![AttributeType::String, AttributeType::Int]),
+                AttributeType::union(vec![AttributeType::string(), AttributeType::int()]),
             )],
-        };
-        let outer_struct = AttributeType::Struct {
-            name: "PolicyDocument".to_string(),
-            fields: vec![StructField::new(
+        );
+        let outer_struct = AttributeType::struct_(
+            "PolicyDocument",
+            vec![StructField::new(
                 "statement",
-                AttributeType::List {
-                    inner: Box::new(inner_struct),
-                    ordered: true,
-                },
+                AttributeType::list(inner_struct),
             )],
-        };
+        );
         let schema = ResourceSchema::new("iam.Policy")
             .attribute(AttributeSchema::new("policy_document", outer_struct));
         let mut schemas = SchemaRegistry::new();

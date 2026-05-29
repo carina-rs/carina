@@ -1272,7 +1272,7 @@ fn unknown_attribute_fallback_has_no_type_pollution() {
     use std::sync::Arc;
 
     let schema = ResourceSchema::new("foo.bar")
-        .attribute(AttributeSchema::new("known_attr", AttributeType::String));
+        .attribute(AttributeSchema::new("known_attr", AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("test", schema);
     let regions = vec![CompletionValue {

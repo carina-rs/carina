@@ -442,7 +442,7 @@ fn unknown_binding_reference_reports_error() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        make_schema("ec2.Subnet", vec![("vpc_id", AttributeType::String)]),
+        make_schema("ec2.Subnet", vec![("vpc_id", AttributeType::string())]),
     );
 
     // Subnet references "vpc" binding which doesn't exist
@@ -465,11 +465,11 @@ fn unknown_attribute_reference_reports_error() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        make_schema("ec2.Vpc", vec![("cidr_block", AttributeType::String)]),
+        make_schema("ec2.Vpc", vec![("cidr_block", AttributeType::string())]),
     );
     schemas.insert(
         "awscc",
-        make_schema("ec2.Subnet", vec![("vpc_id", AttributeType::String)]),
+        make_schema("ec2.Subnet", vec![("vpc_id", AttributeType::string())]),
     );
 
     // VPC resource with binding
@@ -503,7 +503,7 @@ fn unknown_attribute_reference_suggests_similar_name() {
         "awscc",
         make_schema(
             "ec2.internet_gateway",
-            vec![("internet_gateway_id", AttributeType::String)],
+            vec![("internet_gateway_id", AttributeType::string())],
         ),
     );
     schemas.insert(
@@ -511,8 +511,8 @@ fn unknown_attribute_reference_suggests_similar_name() {
         make_schema(
             "ec2.route",
             vec![
-                ("route_table_id", AttributeType::String),
-                ("gateway_id", AttributeType::String),
+                ("route_table_id", AttributeType::string()),
+                ("gateway_id", AttributeType::string()),
             ],
         ),
     );
@@ -547,11 +547,11 @@ fn unknown_attribute_reference_no_suggestion_when_too_different() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        make_schema("ec2.Vpc", vec![("cidr_block", AttributeType::String)]),
+        make_schema("ec2.Vpc", vec![("cidr_block", AttributeType::string())]),
     );
     schemas.insert(
         "awscc",
-        make_schema("ec2.Subnet", vec![("vpc_id", AttributeType::String)]),
+        make_schema("ec2.Subnet", vec![("vpc_id", AttributeType::string())]),
     );
 
     let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc", None).with_binding("vpc");
@@ -601,12 +601,12 @@ fn ref_type_mismatch_inside_for_body_is_rejected() {
     // test.r.vpc exposes `vpc_id: Int`
     schemas.insert(
         "test",
-        make_schema("r.vpc", vec![("vpc_id", AttributeType::Int)]),
+        make_schema("r.vpc", vec![("vpc_id", AttributeType::int())]),
     );
     // test.r.pool_user requires `pool_id: Bool` — incompatible with Int.
     schemas.insert(
         "test",
-        make_schema("r.pool_user", vec![("pool_id", AttributeType::Bool)]),
+        make_schema("r.pool_user", vec![("pool_id", AttributeType::bool())]),
     );
 
     let result = validate_resource_ref_types(&parsed, &schemas, &HashSet::new());
@@ -1293,13 +1293,13 @@ fn is_type_expr_compatible_struct_rejects_missing_schema_field_when_expr_has_ext
             ("c".to_string(), TypeExpr::Int),
         ],
     };
-    let schema = AttributeType::Struct {
-        name: "Row".to_string(),
-        fields: vec![
-            StructField::new("a", AttributeType::Int),
-            StructField::new("b", AttributeType::String),
+    let schema = AttributeType::struct_(
+        "Row".to_string(),
+        vec![
+            StructField::new("a", AttributeType::int()),
+            StructField::new("b", AttributeType::string()),
         ],
-    };
+    );
     assert!(!is_type_expr_compatible_with_schema(
         &expr,
         &schema,
@@ -1316,13 +1316,13 @@ fn is_type_expr_compatible_struct_matches_same_shape_schema() {
             ("value".to_string(), TypeExpr::Int),
         ],
     };
-    let schema = AttributeType::Struct {
-        name: "Row".to_string(),
-        fields: vec![
-            StructField::new("name", AttributeType::String),
-            StructField::new("value", AttributeType::Int),
+    let schema = AttributeType::struct_(
+        "Row".to_string(),
+        vec![
+            StructField::new("name", AttributeType::string()),
+            StructField::new("value", AttributeType::int()),
         ],
-    };
+    );
     assert!(is_type_expr_compatible_with_schema(
         &expr,
         &schema,
@@ -1340,10 +1340,7 @@ fn is_type_expr_compatible_struct_flows_into_map_when_fields_share_type() {
             ("b".to_string(), TypeExpr::String),
         ],
     };
-    let schema = AttributeType::Map {
-        key: Box::new(AttributeType::String),
-        value: Box::new(AttributeType::String),
-    };
+    let schema = AttributeType::map_with_key(AttributeType::string(), AttributeType::string());
     assert!(is_type_expr_compatible_with_schema(
         &expr,
         &schema,
@@ -1356,10 +1353,7 @@ fn is_type_expr_compatible_struct_rejects_map_with_wrong_element_type() {
     let expr = TypeExpr::Struct {
         fields: vec![("a".to_string(), TypeExpr::String)],
     };
-    let schema = AttributeType::Map {
-        key: Box::new(AttributeType::String),
-        value: Box::new(AttributeType::Int),
-    };
+    let schema = AttributeType::map_with_key(AttributeType::string(), AttributeType::int());
     assert!(!is_type_expr_compatible_with_schema(
         &expr,
         &schema,
@@ -1379,17 +1373,17 @@ fn is_type_expr_compatible_unknown_rejects_all_concrete_receivers() {
     // actionable "type annotation required" instead.
     assert!(!is_type_expr_compatible_with_schema(
         &TypeExpr::Unknown,
-        &AttributeType::String,
+        &AttributeType::string(),
         crate::schema::empty_defs(),
     ));
     assert!(!is_type_expr_compatible_with_schema(
         &TypeExpr::Unknown,
-        &AttributeType::Int,
+        &AttributeType::int(),
         crate::schema::empty_defs(),
     ));
     assert!(!is_type_expr_compatible_with_schema(
         &TypeExpr::Unknown,
-        &AttributeType::Bool,
+        &AttributeType::bool(),
         crate::schema::empty_defs(),
     ));
 }
@@ -1400,14 +1394,14 @@ fn is_type_expr_compatible_unknown_rejects_custom_receiver() {
     fn noop(_v: &crate::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let custom = AttributeType::Custom {
-        identity: Some(TypeIdentity::bare("VpcId")),
-        pattern: None,
-        length: None,
-        base: Box::new(AttributeType::String),
-        validate: legacy_validator(noop),
-        to_dsl: None,
-    };
+    let custom = AttributeType::custom(
+        Some(TypeIdentity::bare("VpcId")),
+        AttributeType::string(),
+        None,
+        None,
+        legacy_validator(noop),
+        None,
+    );
     assert!(!is_type_expr_compatible_with_schema(
         &TypeExpr::Unknown,
         &custom,
@@ -1421,14 +1415,14 @@ fn is_type_expr_compatible_string_rejects_custom_with_semantic_name() {
     fn noop(_v: &crate::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let schema = AttributeType::Custom {
-        identity: Some(TypeIdentity::bare("VpcId")),
-        pattern: None,
-        length: None,
-        base: Box::new(AttributeType::String),
-        validate: legacy_validator(noop),
-        to_dsl: None,
-    };
+    let schema = AttributeType::custom(
+        Some(TypeIdentity::bare("VpcId")),
+        AttributeType::string(),
+        None,
+        None,
+        legacy_validator(noop),
+        None,
+    );
     assert!(
         !is_type_expr_compatible_with_schema(
             &TypeExpr::String,
@@ -1449,14 +1443,14 @@ fn is_type_expr_compatible_string_accepts_custom_without_semantic_name() {
     fn noop(_v: &crate::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let schema = AttributeType::Custom {
-        identity: None,
-        pattern: Some("^.+$".to_string()),
-        length: None,
-        base: Box::new(AttributeType::String),
-        validate: legacy_validator(noop),
-        to_dsl: None,
-    };
+    let schema = AttributeType::custom(
+        None,
+        AttributeType::string(),
+        Some("^.+$".to_string()),
+        None,
+        legacy_validator(noop),
+        None,
+    );
     assert!(
         is_type_expr_compatible_with_schema(
             &TypeExpr::String,
@@ -1477,16 +1471,16 @@ fn is_type_expr_compatible_string_rejects_union_containing_specific_custom() {
     fn noop(_v: &crate::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let schema = AttributeType::Union(vec![
-        AttributeType::String,
-        AttributeType::Custom {
-            identity: Some(TypeIdentity::bare("VpcId")),
-            pattern: None,
-            length: None,
-            base: Box::new(AttributeType::String),
-            validate: legacy_validator(noop),
-            to_dsl: None,
-        },
+    let schema = AttributeType::union(vec![
+        AttributeType::string(),
+        AttributeType::custom(
+            Some(TypeIdentity::bare("VpcId")),
+            AttributeType::string(),
+            None,
+            None,
+            legacy_validator(noop),
+            None,
+        ),
     ]);
     assert!(
         !is_type_expr_compatible_with_schema(
@@ -1507,15 +1501,17 @@ fn is_type_expr_compatible_string_rejects_union_of_only_specific_customs() {
     fn noop(_v: &crate::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let mk = |name: &str| AttributeType::Custom {
-        identity: Some(TypeIdentity::bare(name)),
-        pattern: None,
-        length: None,
-        base: Box::new(AttributeType::String),
-        validate: legacy_validator(noop),
-        to_dsl: None,
+    let mk = |name: &str| {
+        AttributeType::custom(
+            Some(TypeIdentity::bare(name)),
+            AttributeType::string(),
+            None,
+            None,
+            legacy_validator(noop),
+            None,
+        )
     };
-    let schema = AttributeType::Union(vec![mk("VpcId"), mk("SubnetId")]);
+    let schema = AttributeType::union(vec![mk("VpcId"), mk("SubnetId")]);
     assert!(
         !is_type_expr_compatible_with_schema(
             &TypeExpr::String,
@@ -1531,14 +1527,14 @@ fn is_type_expr_compatible_string_rejects_union_of_only_specific_customs() {
 // exists, so the value can safely flow into any branch).
 #[test]
 fn is_type_expr_compatible_string_accepts_union_of_only_strings() {
-    let schema = AttributeType::Union(vec![
-        AttributeType::String,
-        AttributeType::StringEnum {
-            name: "Mode".to_string(),
-            values: vec!["A".to_string(), "B".to_string()],
-            identity: None,
-            dsl_aliases: vec![],
-        },
+    let schema = AttributeType::union(vec![
+        AttributeType::string(),
+        AttributeType::string_enum(
+            "Mode".to_string(),
+            vec!["A".to_string(), "B".to_string()],
+            None,
+            vec![],
+        ),
     ]);
     assert!(
         is_type_expr_compatible_with_schema(
@@ -1559,14 +1555,14 @@ fn is_type_expr_compatible_simple_vpcid_accepts_custom_vpcid() {
     fn noop(_v: &crate::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let schema = AttributeType::Custom {
-        identity: Some(TypeIdentity::bare("VpcId")),
-        pattern: None,
-        length: None,
-        base: Box::new(AttributeType::String),
-        validate: legacy_validator(noop),
-        to_dsl: None,
-    };
+    let schema = AttributeType::custom(
+        Some(TypeIdentity::bare("VpcId")),
+        AttributeType::string(),
+        None,
+        None,
+        legacy_validator(noop),
+        None,
+    );
     // Parser normalizes `: VpcId` to TypeExpr::Simple("vpc_id") (snake).
     let expr = TypeExpr::Simple("vpc_id".to_string());
     assert!(is_type_expr_compatible_with_schema(
@@ -1633,17 +1629,17 @@ fn attribute_param_ref_type_mismatch_detected() {
         );
 
     let mut role_schema = ResourceSchema::new("iam.role");
-    role_schema = role_schema.attribute(AttributeSchema::new("role_name", AttributeType::String));
+    role_schema = role_schema.attribute(AttributeSchema::new("role_name", AttributeType::string()));
     role_schema = role_schema.attribute(AttributeSchema::new(
         "arn",
-        AttributeType::Custom {
-            identity: Some(TypeIdentity::bare("IamRoleArn")),
-            base: Box::new(AttributeType::String),
-            pattern: None,
-            length: None,
-            validate: noop_validator(),
-            to_dsl: None,
-        },
+        AttributeType::custom(
+            Some(TypeIdentity::bare("IamRoleArn")),
+            AttributeType::string(),
+            None,
+            None,
+            noop_validator(),
+            None,
+        ),
     ));
 
     let mut schemas = SchemaRegistry::new();
@@ -1787,21 +1783,21 @@ fn validate_export_params_rejects_type_mismatch() {
 #[test]
 fn type_compat_subtype_accepted() {
     // arn accepts KmsKeyArn (subtype via base chain: KmsKeyArn → Arn)
-    let kms_key_arn = AttributeType::Custom {
-        identity: Some(TypeIdentity::bare("KmsKeyArn")),
-        base: Box::new(AttributeType::Custom {
-            identity: Some(TypeIdentity::bare("Arn")),
-            base: Box::new(AttributeType::String),
-            pattern: None,
-            length: None,
-            validate: noop_validator(),
-            to_dsl: None,
-        }),
-        pattern: None,
-        length: None,
-        validate: noop_validator(),
-        to_dsl: None,
-    };
+    let kms_key_arn = AttributeType::custom(
+        Some(TypeIdentity::bare("KmsKeyArn")),
+        AttributeType::custom(
+            Some(TypeIdentity::bare("Arn")),
+            AttributeType::string(),
+            None,
+            None,
+            noop_validator(),
+            None,
+        ),
+        None,
+        None,
+        noop_validator(),
+        None,
+    );
     assert!(is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("arn".to_string()),
         &kms_key_arn,
@@ -1812,21 +1808,21 @@ fn type_compat_subtype_accepted() {
 #[test]
 fn type_compat_sibling_rejected() {
     // kms_key_arn rejects IamRoleArn (sibling: IamRoleArn → Arn, not KmsKeyArn)
-    let iam_role_arn = AttributeType::Custom {
-        identity: Some(TypeIdentity::bare("IamRoleArn")),
-        base: Box::new(AttributeType::Custom {
-            identity: Some(TypeIdentity::bare("Arn")),
-            base: Box::new(AttributeType::String),
-            pattern: None,
-            length: None,
-            validate: noop_validator(),
-            to_dsl: None,
-        }),
-        pattern: None,
-        length: None,
-        validate: noop_validator(),
-        to_dsl: None,
-    };
+    let iam_role_arn = AttributeType::custom(
+        Some(TypeIdentity::bare("IamRoleArn")),
+        AttributeType::custom(
+            Some(TypeIdentity::bare("Arn")),
+            AttributeType::string(),
+            None,
+            None,
+            noop_validator(),
+            None,
+        ),
+        None,
+        None,
+        noop_validator(),
+        None,
+    );
     assert!(!is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("kms_key_arn".to_string()),
         &iam_role_arn,
@@ -1837,21 +1833,21 @@ fn type_compat_sibling_rejected() {
 #[test]
 fn type_compat_resource_id_subtype() {
     // aws_resource_id accepts VpcId (subtype)
-    let vpc_id = AttributeType::Custom {
-        identity: Some(TypeIdentity::bare("VpcId")),
-        base: Box::new(AttributeType::Custom {
-            identity: Some(TypeIdentity::bare("AwsResourceId")),
-            base: Box::new(AttributeType::String),
-            pattern: None,
-            length: None,
-            validate: noop_validator(),
-            to_dsl: None,
-        }),
-        pattern: None,
-        length: None,
-        validate: noop_validator(),
-        to_dsl: None,
-    };
+    let vpc_id = AttributeType::custom(
+        Some(TypeIdentity::bare("VpcId")),
+        AttributeType::custom(
+            Some(TypeIdentity::bare("AwsResourceId")),
+            AttributeType::string(),
+            None,
+            None,
+            noop_validator(),
+            None,
+        ),
+        None,
+        None,
+        noop_validator(),
+        None,
+    );
     assert!(is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("aws_resource_id".to_string()),
         &vpc_id,
@@ -1862,21 +1858,21 @@ fn type_compat_resource_id_subtype() {
 #[test]
 fn type_compat_resource_id_siblings_rejected() {
     // vpc_id rejects SubnetId (sibling)
-    let subnet_id = AttributeType::Custom {
-        identity: Some(TypeIdentity::bare("SubnetId")),
-        base: Box::new(AttributeType::Custom {
-            identity: Some(TypeIdentity::bare("AwsResourceId")),
-            base: Box::new(AttributeType::String),
-            pattern: None,
-            length: None,
-            validate: noop_validator(),
-            to_dsl: None,
-        }),
-        pattern: None,
-        length: None,
-        validate: noop_validator(),
-        to_dsl: None,
-    };
+    let subnet_id = AttributeType::custom(
+        Some(TypeIdentity::bare("SubnetId")),
+        AttributeType::custom(
+            Some(TypeIdentity::bare("AwsResourceId")),
+            AttributeType::string(),
+            None,
+            None,
+            noop_validator(),
+            None,
+        ),
+        None,
+        None,
+        noop_validator(),
+        None,
+    );
     assert!(!is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("vpc_id".to_string()),
         &subnet_id,
@@ -1886,14 +1882,14 @@ fn type_compat_resource_id_siblings_rejected() {
 
 #[test]
 fn type_compat_exact_match() {
-    let arn = AttributeType::Custom {
-        identity: Some(TypeIdentity::bare("Arn")),
-        base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
-        validate: noop_validator(),
-        to_dsl: None,
-    };
+    let arn = AttributeType::custom(
+        Some(TypeIdentity::bare("Arn")),
+        AttributeType::string(),
+        None,
+        None,
+        noop_validator(),
+        None,
+    );
     assert!(is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("arn".to_string()),
         &arn,
@@ -1907,7 +1903,7 @@ fn type_compat_simple_rejected_by_mixed_string_int_union_receiver() {
     // `Union` receiver is plain String. A receiver typed
     // `Union<[String, Int]>` cannot accept a `Simple(name)` value
     // because the Int member would silently reinterpret the data.
-    let mixed = AttributeType::Union(vec![AttributeType::String, AttributeType::Int]);
+    let mixed = AttributeType::union(vec![AttributeType::string(), AttributeType::int()]);
     assert!(!is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("aws_account_id".to_string()),
         &mixed,
@@ -1925,7 +1921,7 @@ fn type_compat_simple_subtypes_into_plain_string() {
     // and #2643.
     assert!(is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("aws_account_id".to_string()),
-        &AttributeType::String,
+        &AttributeType::string(),
         crate::schema::empty_defs(),
     ));
 }
@@ -1941,12 +1937,12 @@ fn type_compat_simple_subtypes_into_plain_string() {
 #[test]
 fn type_compat_simple_into_union_struct_or_string() {
     use crate::schema::StructField;
-    let principal_union = AttributeType::Union(vec![
-        AttributeType::Struct {
-            name: "IamPolicyPrincipal".to_string(),
-            fields: vec![StructField::new("federated", AttributeType::String)],
-        },
-        AttributeType::String,
+    let principal_union = AttributeType::union(vec![
+        AttributeType::struct_(
+            "IamPolicyPrincipal".to_string(),
+            vec![StructField::new("federated", AttributeType::string())],
+        ),
+        AttributeType::string(),
     ]);
     // Issue #2663 enumerates the full set of ARN refinements that
     // should reach the principal slot; pin each one against the same
@@ -1978,13 +1974,13 @@ fn type_compat_simple_into_union_struct_or_string() {
 #[test]
 fn type_compat_simple_rejected_when_union_has_other_scalar() {
     use crate::schema::StructField;
-    let mixed = AttributeType::Union(vec![
-        AttributeType::Struct {
-            name: "Principal".to_string(),
-            fields: vec![StructField::new("federated", AttributeType::String)],
-        },
-        AttributeType::String,
-        AttributeType::Int,
+    let mixed = AttributeType::union(vec![
+        AttributeType::struct_(
+            "Principal".to_string(),
+            vec![StructField::new("federated", AttributeType::string())],
+        ),
+        AttributeType::string(),
+        AttributeType::int(),
     ]);
     assert!(!is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("iam_oidc_provider_arn".to_string()),
@@ -1998,15 +1994,12 @@ fn type_compat_simple_rejected_when_union_has_other_scalar() {
 #[test]
 fn type_compat_simple_rejected_when_union_has_no_plain_string() {
     use crate::schema::StructField;
-    let no_string = AttributeType::Union(vec![
-        AttributeType::Struct {
-            name: "Principal".to_string(),
-            fields: vec![StructField::new("federated", AttributeType::String)],
-        },
-        AttributeType::List {
-            inner: Box::new(AttributeType::String),
-            ordered: true,
-        },
+    let no_string = AttributeType::union(vec![
+        AttributeType::struct_(
+            "Principal".to_string(),
+            vec![StructField::new("federated", AttributeType::string())],
+        ),
+        AttributeType::list(AttributeType::string()),
     ]);
     assert!(!is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("iam_oidc_provider_arn".to_string()),
@@ -2025,28 +2018,28 @@ fn type_compat_simple_rejected_when_union_has_no_plain_string() {
 // allow-list, this test will fail and force a re-think.
 #[test]
 fn type_compat_simple_rejected_when_union_has_string_shaped_peer() {
-    let arn = AttributeType::Custom {
-        identity: Some(TypeIdentity::bare("Arn")),
-        base: Box::new(AttributeType::String),
-        pattern: None,
-        length: None,
-        validate: noop_validator(),
-        to_dsl: None,
-    };
-    let with_custom = AttributeType::Union(vec![AttributeType::String, arn]);
+    let arn = AttributeType::custom(
+        Some(TypeIdentity::bare("Arn")),
+        AttributeType::string(),
+        None,
+        None,
+        noop_validator(),
+        None,
+    );
+    let with_custom = AttributeType::union(vec![AttributeType::string(), arn]);
     assert!(!is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("iam_oidc_provider_arn".to_string()),
         &with_custom,
         crate::schema::empty_defs(),
     ));
-    let with_enum = AttributeType::Union(vec![
-        AttributeType::String,
-        AttributeType::StringEnum {
-            name: "Status".to_string(),
-            values: vec!["enabled".to_string(), "disabled".to_string()],
-            identity: None,
-            dsl_aliases: vec![],
-        },
+    let with_enum = AttributeType::union(vec![
+        AttributeType::string(),
+        AttributeType::string_enum(
+            "Status".to_string(),
+            vec!["enabled".to_string(), "disabled".to_string()],
+            None,
+            vec![],
+        ),
     ]);
     assert!(!is_type_expr_compatible_with_schema(
         &TypeExpr::Simple("iam_oidc_provider_arn".to_string()),
@@ -2064,7 +2057,7 @@ fn validate_export_param_ref_types_map_accepts_compatible_types() {
         "awscc",
         make_schema(
             "organizations.account",
-            vec![("account_id", AttributeType::String)],
+            vec![("account_id", AttributeType::string())],
         ),
     );
 
@@ -2109,7 +2102,7 @@ fn validate_export_param_ref_types_map_rejects_type_mismatch() {
         "awscc",
         make_schema(
             "organizations.account",
-            vec![("account_id", AttributeType::String)],
+            vec![("account_id", AttributeType::string())],
         ),
     );
 
@@ -2191,7 +2184,7 @@ fn validate_export_param_ref_types_against_inferred_inputs() {
         "awscc",
         make_schema(
             "organizations.account",
-            vec![("account_id", AttributeType::String)],
+            vec![("account_id", AttributeType::string())],
         ),
     );
 
@@ -2229,7 +2222,7 @@ fn validate_resources_accepts_resource_ref_in_list_position() {
             "route53.RecordSet",
             vec![(
                 "resource_records",
-                AttributeType::list(AttributeType::String),
+                AttributeType::list(AttributeType::string()),
             )],
         ),
     );
@@ -2275,10 +2268,10 @@ fn validate_resources_accepts_resource_ref_in_struct_field_position() {
             "test.StructHolder",
             vec![(
                 "config",
-                AttributeType::Struct {
-                    name: "Config".to_string(),
-                    fields: vec![StructField::new("name", AttributeType::String)],
-                },
+                AttributeType::struct_(
+                    "Config".to_string(),
+                    vec![StructField::new("name", AttributeType::string())],
+                ),
             )],
         ),
     );
@@ -2316,10 +2309,7 @@ fn validate_resources_accepts_resource_ref_in_map_position() {
             "test.MapHolder",
             vec![(
                 "tags",
-                AttributeType::Map {
-                    key: Box::new(AttributeType::String),
-                    value: Box::new(AttributeType::String),
-                },
+                AttributeType::map_with_key(AttributeType::string(), AttributeType::string()),
             )],
         ),
     );
@@ -2351,8 +2341,8 @@ fn validate_resources_rejects_missing_exclusive_required() {
     let schema = make_schema(
         "ec2.Vpc",
         vec![
-            ("cidr_block", AttributeType::String),
-            ("ipv4_ipam_pool_id", AttributeType::String),
+            ("cidr_block", AttributeType::string()),
+            ("ipv4_ipam_pool_id", AttributeType::string()),
         ],
     )
     .exclusive_required(&["cidr_block", "ipv4_ipam_pool_id"]);
@@ -2400,12 +2390,12 @@ fn enum_membership_violation_in_for_body_is_flagged() {
             "r.mode_holder",
             vec![(
                 "mode",
-                AttributeType::StringEnum {
-                    name: "Mode".to_string(),
-                    values: vec!["on".to_string(), "off".to_string()],
-                    identity: None,
-                    dsl_aliases: vec![],
-                },
+                AttributeType::string_enum(
+                    "Mode".to_string(),
+                    vec!["on".to_string(), "off".to_string()],
+                    None,
+                    vec![],
+                ),
             )],
         ),
     );
@@ -2435,12 +2425,12 @@ fn mode_schema() -> SchemaRegistry {
             "r.mode_holder",
             vec![(
                 "mode",
-                AttributeType::StringEnum {
-                    name: "Mode".to_string(),
-                    values: vec!["fast".to_string(), "slow".to_string()],
-                    identity: Some(crate::schema::string_enum_identity("Mode", Some("test.r"))),
-                    dsl_aliases: vec![],
-                },
+                AttributeType::string_enum(
+                    "Mode".to_string(),
+                    vec!["fast".to_string(), "slow".to_string()],
+                    Some(crate::schema::string_enum_identity("Mode", Some("test.r"))),
+                    vec![],
+                ),
             )],
         ),
     );
@@ -2575,7 +2565,7 @@ fn read_against_managed_only_type_is_rejected() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        make_schema("ec2.Vpc", vec![("cidr_block", AttributeType::String)]),
+        make_schema("ec2.Vpc", vec![("cidr_block", AttributeType::string())]),
     );
 
     let parsed = crate::parser::parse(
@@ -2651,23 +2641,20 @@ fn ref_with_chained_subscript_then_field_narrows_through_list() {
             "acm.Certificate",
             vec![(
                 "domain_validation_options",
-                AttributeType::List {
-                    inner: Box::new(AttributeType::Struct {
-                        name: "DomainValidationOption".to_string(),
-                        fields: vec![
-                            StructField::new("resource_record_name", AttributeType::String),
-                            StructField::new("resource_record_value", AttributeType::String),
-                        ],
-                    }),
-                    ordered: true,
-                },
+                AttributeType::list(AttributeType::struct_(
+                    "DomainValidationOption".to_string(),
+                    vec![
+                        StructField::new("resource_record_name", AttributeType::string()),
+                        StructField::new("resource_record_value", AttributeType::string()),
+                    ],
+                )),
             )],
         ),
     );
     // `aws.route53.RecordSet.name` is a plain String.
     schemas.insert(
         "aws",
-        make_schema("route53.RecordSet", vec![("name", AttributeType::String)]),
+        make_schema("route53.RecordSet", vec![("name", AttributeType::string())]),
     );
 
     let cert = Resource::with_provider("aws", "acm.Certificate", "main", None).with_binding("cert");
@@ -2717,20 +2704,17 @@ fn ref_with_chained_subscript_then_field_rejects_real_mismatch() {
             "acm.Certificate",
             vec![(
                 "domain_validation_options",
-                AttributeType::List {
-                    inner: Box::new(AttributeType::Struct {
-                        name: "DomainValidationOption".to_string(),
-                        fields: vec![StructField::new("rotation_count", AttributeType::Int)],
-                    }),
-                    ordered: true,
-                },
+                AttributeType::list(AttributeType::struct_(
+                    "DomainValidationOption".to_string(),
+                    vec![StructField::new("rotation_count", AttributeType::int())],
+                )),
             )],
         ),
     );
     // Receiver `name` is String — the chained access yields Int.
     schemas.insert(
         "aws",
-        make_schema("route53.RecordSet", vec![("name", AttributeType::String)]),
+        make_schema("route53.RecordSet", vec![("name", AttributeType::string())]),
     );
 
     let cert = Resource::with_provider("aws", "acm.Certificate", "main", None).with_binding("cert");
@@ -2790,31 +2774,28 @@ fn ref_with_chained_field_on_struct_flags_unknown_field() {
             "acm.Certificate",
             vec![(
                 "domain_validation_options",
-                AttributeType::List {
-                    inner: Box::new(AttributeType::Struct {
-                        name: "DomainValidation".to_string(),
-                        fields: vec![
-                            StructField::new("domain_name", AttributeType::String),
-                            StructField::new(
-                                "resource_record",
-                                AttributeType::Struct {
-                                    name: "ResourceRecord".to_string(),
-                                    fields: vec![
-                                        StructField::new("name", AttributeType::String),
-                                        StructField::new("value", AttributeType::String),
-                                    ],
-                                },
+                AttributeType::list(AttributeType::struct_(
+                    "DomainValidation".to_string(),
+                    vec![
+                        StructField::new("domain_name", AttributeType::string()),
+                        StructField::new(
+                            "resource_record",
+                            AttributeType::struct_(
+                                "ResourceRecord".to_string(),
+                                vec![
+                                    StructField::new("name", AttributeType::string()),
+                                    StructField::new("value", AttributeType::string()),
+                                ],
                             ),
-                        ],
-                    }),
-                    ordered: true,
-                },
+                        ),
+                    ],
+                )),
             )],
         ),
     );
     schemas.insert(
         "aws",
-        make_schema("route53.RecordSet", vec![("name", AttributeType::String)]),
+        make_schema("route53.RecordSet", vec![("name", AttributeType::string())]),
     );
 
     let cert = Resource::with_provider("aws", "acm.Certificate", "main", None).with_binding("cert");

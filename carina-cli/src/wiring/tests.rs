@@ -249,7 +249,7 @@ fn test_merge_default_tags_prevents_false_diff() {
     // merge_default_tags checks for the presence of "tags" in the schema.
     let schema = ResourceSchema::new("s3.Bucket").attribute(AttributeSchema::new(
         "tags",
-        AttributeType::map(AttributeType::String),
+        AttributeType::map(AttributeType::string()),
     ));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);

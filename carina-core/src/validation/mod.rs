@@ -12,7 +12,7 @@ use crate::binding_index::BindingIndex;
 use crate::parser::{ModuleCall, ProviderContext, ResourceRef, TypeExpr, validate_custom_type};
 use crate::provider::ProviderFactory;
 use crate::resource::{ConcreteValue, DeferredValue, Resource, Value};
-use crate::schema::{AttributeType, SchemaRegistry, Shape, suggest_similar_name};
+use crate::schema::{AttrTypeKind, AttributeType, SchemaRegistry, Shape, suggest_similar_name};
 
 /// Render the trailing `" Did you mean 'X'?"` segment for an unknown
 /// name in a diagnostic, or an empty string when nothing close enough
@@ -457,7 +457,7 @@ fn collect_ref_type_errors(
 /// Check if a TypeExpr is compatible with an AttributeType from a schema.
 ///
 /// `defs` carries the schema's named definitions, used to peel any
-/// `AttributeType::Ref(name)` receiver via [`AttributeType::shape`]
+/// `AttributeType::ref_(name)` receiver via [`AttributeType::shape`]
 /// before shape-based dispatch. Pass [`crate::schema::empty_defs()`]
 /// when no resource schema is in scope.
 pub fn is_type_expr_compatible_with_schema(
@@ -520,8 +520,8 @@ pub fn is_type_expr_compatible_with_schema(
                 if type_snake == *name {
                     return true;
                 }
-                match resolved_attr {
-                    AttributeType::Custom { base, .. } => current = base.as_ref(),
+                match resolved_attr.kind() {
+                    AttrTypeKind::Custom { base, .. } => current = base.as_ref(),
                     _ => break,
                 }
             }

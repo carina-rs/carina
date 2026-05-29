@@ -90,22 +90,22 @@ impl ProviderFactory for AwsStub {
     fn schemas(&self) -> Vec<ResourceSchema> {
         vec![
             ResourceSchema::new("acm.Certificate")
-                .attribute(AttributeSchema::new("domain_name", AttributeType::String))
+                .attribute(AttributeSchema::new("domain_name", AttributeType::string()))
                 .attribute(AttributeSchema::new(
                     "validation_method",
-                    AttributeType::String,
+                    AttributeType::string(),
                 ))
-                .attribute(AttributeSchema::new("status", AttributeType::String))
+                .attribute(AttributeSchema::new("status", AttributeType::string()))
                 .attribute(AttributeSchema::new(
                     "certificate_arn",
-                    AttributeType::String,
+                    AttributeType::string(),
                 )),
             // distribution_config's exact shape is irrelevant here —
             // this test asserts wait-binding propagation, not schema
             // validation of the nested map.
             ResourceSchema::new("cloudfront.Distribution").attribute(AttributeSchema::new(
                 "distribution_config",
-                AttributeType::String,
+                AttributeType::string(),
             )),
         ]
     }

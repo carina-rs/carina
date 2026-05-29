@@ -7,7 +7,7 @@ use indexmap::IndexMap;
 use thiserror::Error;
 
 use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value};
-use crate::schema::AttributeType;
+use crate::schema::{AttrTypeKind, AttributeType};
 use crate::utils::{convert_enum_value, is_dsl_enum_format};
 
 /// Where in the pipeline a `Value` is being serialized. Used so the
@@ -1323,7 +1323,7 @@ pub fn map_similarity(a: &Value, b: &Value) -> usize {
 /// in either order — peeling through `Custom` wrappers.
 fn is_string_or_list_of_strings(attr_type: &AttributeType) -> bool {
     let unwrapped = peel_custom(attr_type);
-    let AttributeType::Union(members) = unwrapped else {
+    let AttrTypeKind::Union(members) = &unwrapped.kind else {
         return false;
     };
     if members.len() != 2 {
@@ -1332,10 +1332,10 @@ fn is_string_or_list_of_strings(attr_type: &AttributeType) -> bool {
     let mut has_string = false;
     let mut has_list_of_string = false;
     for m in members {
-        match peel_custom(m) {
-            AttributeType::String => has_string = true,
-            AttributeType::List { inner, .. }
-                if matches!(peel_custom(inner.as_ref()), AttributeType::String) =>
+        match &peel_custom(m).kind {
+            AttrTypeKind::String => has_string = true,
+            AttrTypeKind::List { inner, .. }
+                if matches!(&peel_custom(inner.as_ref()).kind, AttrTypeKind::String) =>
             {
                 has_list_of_string = true;
             }
@@ -1347,7 +1347,7 @@ fn is_string_or_list_of_strings(attr_type: &AttributeType) -> bool {
 
 fn peel_custom(t: &AttributeType) -> &AttributeType {
     let mut cur = t;
-    while let AttributeType::Custom { base, .. } = cur {
+    while let AttrTypeKind::Custom { base, .. } = &cur.kind {
         cur = base.as_ref();
     }
     cur
@@ -3219,9 +3219,9 @@ mod tests {
     // ---- canonicalize_with_type tests (#2481, #2510) ----
 
     fn string_or_list_of_strings() -> AttributeType {
-        AttributeType::Union(vec![
-            AttributeType::String,
-            AttributeType::list(AttributeType::String),
+        AttributeType::union(vec![
+            AttributeType::string(),
+            AttributeType::list(AttributeType::string()),
         ])
     }
 
@@ -3281,7 +3281,7 @@ mod tests {
         let v = Value::Concrete(ConcreteValue::String("foo".to_string()));
         let canon = canonicalize_with_type(
             v.clone(),
-            &AttributeType::String,
+            &AttributeType::string(),
             crate::schema::empty_defs(),
         );
         assert_eq!(canon, v);
@@ -3301,13 +3301,13 @@ mod tests {
 
     #[test]
     fn canonicalize_recurses_into_struct_fields() {
-        let t = AttributeType::Struct {
-            name: "Statement".to_string(),
-            fields: vec![crate::schema::StructField::new(
+        let t = AttributeType::struct_(
+            "Statement".to_string(),
+            vec![crate::schema::StructField::new(
                 "action",
                 string_or_list_of_strings(),
             )],
-        };
+        );
         let mut map = IndexMap::new();
         map.insert(
             "action".to_string(),
@@ -3330,13 +3330,13 @@ mod tests {
 
     #[test]
     fn canonicalize_recurses_into_struct_via_provider_name() {
-        let t = AttributeType::Struct {
-            name: "Statement".to_string(),
-            fields: vec![
+        let t = AttributeType::struct_(
+            "Statement".to_string(),
+            vec![
                 crate::schema::StructField::new("action", string_or_list_of_strings())
                     .with_provider_name("Action"),
             ],
-        };
+        );
         let mut map = IndexMap::new();
         map.insert(
             "Action".to_string(),
@@ -3364,15 +3364,15 @@ mod tests {
     /// to `StringList` — on both the bare-scalar (desired) and the
     /// singleton-list (aws-read) spelling.
     fn principal_union() -> AttributeType {
-        AttributeType::Union(vec![
-            AttributeType::Struct {
-                name: "PrincipalStruct".to_string(),
-                fields: vec![crate::schema::StructField::new(
+        AttributeType::union(vec![
+            AttributeType::struct_(
+                "PrincipalStruct".to_string(),
+                vec![crate::schema::StructField::new(
                     "service",
                     string_or_list_of_strings(),
                 )],
-            },
-            AttributeType::String,
+            ),
+            AttributeType::string(),
         ])
     }
 
@@ -3440,7 +3440,7 @@ mod tests {
     /// (safe fallthrough; never guess-coerce).
     #[test]
     fn canonicalize_union_no_matching_member_is_identity() {
-        let t = AttributeType::Union(vec![AttributeType::Int, AttributeType::Bool]);
+        let t = AttributeType::union(vec![AttributeType::int(), AttributeType::bool()]);
         let v = Value::Concrete(ConcreteValue::String("not-an-int".to_string()));
         let canon = canonicalize_with_type(v.clone(), &t, crate::schema::empty_defs());
         assert_eq!(canon, v);
@@ -3448,10 +3448,7 @@ mod tests {
 
     #[test]
     fn canonicalize_recurses_into_map_value_type() {
-        let t = AttributeType::Map {
-            key: Box::new(AttributeType::String),
-            value: Box::new(string_or_list_of_strings()),
-        };
+        let t = AttributeType::map_with_key(AttributeType::string(), string_or_list_of_strings());
         let mut map = IndexMap::new();
         map.insert(
             "token.actions.githubusercontent.com:sub".to_string(),
@@ -3476,14 +3473,14 @@ mod tests {
     fn canonicalize_through_custom_wrapper() {
         use crate::schema::TypeIdentity;
         // Custom wrappers must be transparent for type matching.
-        let t = AttributeType::Custom {
-            identity: Some(TypeIdentity::bare("PolicyConditionValue")),
-            base: Box::new(string_or_list_of_strings()),
-            pattern: None,
-            length: None,
-            validate: std::sync::Arc::new(|_| Ok(())),
-            to_dsl: None,
-        };
+        let t = AttributeType::custom(
+            Some(TypeIdentity::bare("PolicyConditionValue")),
+            string_or_list_of_strings(),
+            None,
+            None,
+            std::sync::Arc::new(|_| Ok(())),
+            None,
+        );
         let v = Value::Concrete(ConcreteValue::String("x".to_string()));
         let canon = canonicalize_with_type(v, &t, crate::schema::empty_defs());
         assert_eq!(
@@ -3897,12 +3894,12 @@ mod tests {
         use crate::schema::{
             AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
         };
-        let principal = AttributeType::Union(vec![
-            AttributeType::Struct {
-                name: "PrincipalStruct".to_string(),
-                fields: vec![StructField::new("service", string_or_list_of_strings())],
-            },
-            AttributeType::String,
+        let principal = AttributeType::union(vec![
+            AttributeType::struct_(
+                "PrincipalStruct".to_string(),
+                vec![StructField::new("service", string_or_list_of_strings())],
+            ),
+            AttributeType::string(),
         ]);
         let mut registry = SchemaRegistry::new();
         registry.insert(
@@ -3971,7 +3968,7 @@ mod tests {
         // so a Union[String, list(String)] member's `list(String)`
         // branch validates the canonical form cleanly.
         use crate::schema::AttributeType;
-        let list_of_string = AttributeType::list(AttributeType::String);
+        let list_of_string = AttributeType::list(AttributeType::string());
         let v = Value::Concrete(ConcreteValue::StringList(vec![
             "a".to_string(),
             "b".to_string(),

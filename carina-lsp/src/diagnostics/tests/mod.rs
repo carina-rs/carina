@@ -30,21 +30,21 @@ pub(super) fn test_engine_reversed() -> DiagnosticEngine {
 pub(super) fn test_engine_with_nested_structs() -> DiagnosticEngine {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
-    let inner_struct = AttributeType::list(AttributeType::Struct {
-        name: "InnerStruct".to_string(),
-        fields: vec![
-            StructField::new("leaf_field", AttributeType::String),
-            StructField::new("leaf_int", AttributeType::Int),
+    let inner_struct = AttributeType::list(AttributeType::struct_(
+        "InnerStruct".to_string(),
+        vec![
+            StructField::new("leaf_field", AttributeType::string()),
+            StructField::new("leaf_int", AttributeType::int()),
         ],
-    });
+    ));
 
-    let outer_struct = AttributeType::list(AttributeType::Struct {
-        name: "OuterStruct".to_string(),
-        fields: vec![
+    let outer_struct = AttributeType::list(AttributeType::struct_(
+        "OuterStruct".to_string(),
+        vec![
             StructField::new("inner", inner_struct),
-            StructField::new("outer_field", AttributeType::String),
+            StructField::new("outer_field", AttributeType::string()),
         ],
-    });
+    ));
 
     let schema = ResourceSchema::new("nested.resource")
         .attribute(AttributeSchema::new("outer", outer_struct));
@@ -64,8 +64,8 @@ pub(super) fn test_engine_with_nested_structs() -> DiagnosticEngine {
 pub(super) fn test_engine_with_wait_target() -> DiagnosticEngine {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
     let schema = ResourceSchema::new("acm.Certificate")
-        .attribute(AttributeSchema::new("domain_name", AttributeType::String))
-        .attribute(AttributeSchema::new("status", AttributeType::String));
+        .attribute(AttributeSchema::new("domain_name", AttributeType::string()))
+        .attribute(AttributeSchema::new("status", AttributeType::string()));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("aws", schema);
     DiagnosticEngine::new(Arc::new(schemas), vec!["aws".to_string()], Arc::new(vec![]))
@@ -74,12 +74,12 @@ pub(super) fn test_engine_with_wait_target() -> DiagnosticEngine {
 pub(super) fn test_engine_with_enum_attr() -> DiagnosticEngine {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let mode_enum = AttributeType::StringEnum {
-        name: "Mode".to_string(),
-        values: vec!["fast".to_string(), "slow".to_string()],
-        identity: None,
-        dsl_aliases: vec![],
-    };
+    let mode_enum = AttributeType::string_enum(
+        "Mode".to_string(),
+        vec!["fast".to_string(), "slow".to_string()],
+        None,
+        vec![],
+    );
 
     let schema =
         ResourceSchema::new("r.mode_holder").attribute(AttributeSchema::new("mode", mode_enum));
@@ -101,15 +101,15 @@ pub(super) fn test_engine_with_enum_attr() -> DiagnosticEngine {
 pub(super) fn test_engine_with_namespaced_enum_attr() -> DiagnosticEngine {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let mode_enum = AttributeType::StringEnum {
-        name: "Mode".to_string(),
-        values: vec!["fast".to_string(), "slow".to_string()],
-        identity: Some(carina_core::schema::string_enum_identity(
+    let mode_enum = AttributeType::string_enum(
+        "Mode".to_string(),
+        vec!["fast".to_string(), "slow".to_string()],
+        Some(carina_core::schema::string_enum_identity(
             "Mode",
             Some("test.r"),
         )),
-        dsl_aliases: vec![],
-    };
+        vec![],
+    );
 
     let schema =
         ResourceSchema::new("r.mode_holder").attribute(AttributeSchema::new("mode", mode_enum));
@@ -141,12 +141,12 @@ pub(super) fn test_engine_with_custom_namespaced_attr() -> DiagnosticEngine {
         }
     }
 
-    let mode_custom = AttributeType::CustomEnum {
-        identity: carina_core::schema::string_enum_identity("Mode", Some("test.r")),
-        base: Box::new(AttributeType::String),
-        validate: legacy_validator(validate_mode),
-        to_dsl: None,
-    };
+    let mode_custom = AttributeType::custom_enum(
+        carina_core::schema::string_enum_identity("Mode", Some("test.r")),
+        AttributeType::string(),
+        legacy_validator(validate_mode),
+        None,
+    );
 
     let schema =
         ResourceSchema::new("r.mode_holder").attribute(AttributeSchema::new("mode", mode_custom));
@@ -164,22 +164,22 @@ pub(super) fn test_engine_with_custom_namespaced_attr() -> DiagnosticEngine {
 pub(super) fn test_engine_with_block_name_nested() -> DiagnosticEngine {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
-    let transition_struct = AttributeType::Struct {
-        name: "Transition".to_string(),
-        fields: vec![
-            StructField::new("days", AttributeType::Int),
-            StructField::new("storage_class", AttributeType::String),
+    let transition_struct = AttributeType::struct_(
+        "Transition".to_string(),
+        vec![
+            StructField::new("days", AttributeType::int()),
+            StructField::new("storage_class", AttributeType::string()),
         ],
-    };
+    );
 
-    let config_struct = AttributeType::Struct {
-        name: "Config".to_string(),
-        fields: vec![
+    let config_struct = AttributeType::struct_(
+        "Config".to_string(),
+        vec![
             StructField::new("transitions", AttributeType::list(transition_struct))
                 .with_block_name("transition"),
-            StructField::new("enabled", AttributeType::Bool),
+            StructField::new("enabled", AttributeType::bool()),
         ],
-    };
+    );
 
     let schema = ResourceSchema::new("block.resource")
         .attribute(AttributeSchema::new("config", config_struct));
@@ -206,13 +206,13 @@ pub(super) fn test_engine_with_block_name_nested() -> DiagnosticEngine {
 pub(super) fn test_engine_with_ref_lifecycle_like_schema() -> DiagnosticEngine {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
-    let lifecycle_def = AttributeType::Struct {
-        name: "LifecycleConfiguration".to_string(),
-        fields: vec![
+    let lifecycle_def = AttributeType::struct_(
+        "LifecycleConfiguration".to_string(),
+        vec![
             StructField::new(
                 "rules",
-                AttributeType::list(AttributeType::Struct {
-                    name: "Rule".to_string(),
+                AttributeType::list(AttributeType::struct_(
+                    "Rule".to_string(),
                     // `id` is required: omitting it from a DSL `rule { }`
                     // block must surface a missing-required-field
                     // diagnostic. This is the positive assertion that
@@ -220,17 +220,17 @@ pub(super) fn test_engine_with_ref_lifecycle_like_schema() -> DiagnosticEngine {
                     // struct-field validator never visits the
                     // Ref-typed attribute and the missing `id` slips
                     // through silently.
-                    fields: vec![StructField::new("id", AttributeType::String).required()],
-                }),
+                    vec![StructField::new("id", AttributeType::string()).required()],
+                )),
             )
             .with_block_name("rule"),
         ],
-    };
+    );
 
     let schema = ResourceSchema::new("s3.Bucket")
         .attribute(AttributeSchema::new(
             "lifecycle_configuration",
-            AttributeType::Ref("LifecycleConfiguration".to_string()),
+            AttributeType::ref_("LifecycleConfiguration".to_string()),
         ))
         .with_def("LifecycleConfiguration", lifecycle_def);
 

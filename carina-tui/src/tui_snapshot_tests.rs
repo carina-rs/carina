@@ -246,18 +246,18 @@ fn snapshot_create_with_schema() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::String).required())
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).required())
         .attribute(
-            AttributeSchema::new("enable_dns_support", AttributeType::Bool)
+            AttributeSchema::new("enable_dns_support", AttributeType::bool())
                 .with_default(Value::Concrete(ConcreteValue::Bool(true))),
         )
         .attribute(
-            AttributeSchema::new("enable_dns_hostnames", AttributeType::Bool)
+            AttributeSchema::new("enable_dns_hostnames", AttributeType::bool())
                 .with_default(Value::Concrete(ConcreteValue::Bool(false))),
         )
-        .attribute(AttributeSchema::new("vpc_id", AttributeType::String).read_only())
+        .attribute(AttributeSchema::new("vpc_id", AttributeType::string()).read_only())
         .attribute(
-            AttributeSchema::new("default_security_group_id", AttributeType::String).read_only(),
+            AttributeSchema::new("default_security_group_id", AttributeType::string()).read_only(),
         );
 
     let mut schemas = SchemaRegistry::new();

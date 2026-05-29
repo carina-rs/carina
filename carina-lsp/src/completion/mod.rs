@@ -16,7 +16,7 @@ use tower_lsp::lsp_types::{Command, CompletionItem, CompletionItemKind, Position
 
 use crate::document::Document;
 use carina_core::schema::{
-    AttributeType, CompletionValue, ResourceSchema, SchemaKind, SchemaRegistry, StructField,
+    AttributeType, CompletionValue, ResourceSchema, SchemaKind, SchemaRegistry, Shape, StructField,
 };
 
 pub struct CompletionProvider {
@@ -784,7 +784,8 @@ impl CompletionProvider {
         attr_path: &[String],
     ) -> Option<&'a AttributeType> {
         let attr_type = self.resolve_type_for_path(schema, attr_path)?;
-        if let AttributeType::Map { key, .. } = attr_type {
+        let defs = carina_core::schema::empty_defs();
+        if let Shape::Map { key, .. } = attr_type.shape(defs) {
             Some(key)
         } else {
             None
@@ -797,8 +798,9 @@ impl CompletionProvider {
         key_type: &AttributeType,
         trigger_suggest: &Command,
     ) -> Vec<CompletionItem> {
-        match key_type {
-            AttributeType::StringEnum { values, .. } => values
+        let defs = carina_core::schema::empty_defs();
+        match key_type.shape(defs) {
+            Shape::StringEnum { values, .. } => values
                 .iter()
                 .map(|v| CompletionItem {
                     label: v.clone(),

@@ -694,18 +694,18 @@ provider awscc {
         let schema = ResourceSchema::new("ec2.SecurityGroup")
             .attribute(crate::schema::AttributeSchema::new(
                 "security_group_ingress",
-                AttributeType::list(AttributeType::Struct {
-                    name: "Ingress".to_string(),
-                    fields: vec![StructField::new("ip_protocol", AttributeType::String)],
-                }),
+                AttributeType::list(AttributeType::struct_(
+                    "Ingress".to_string(),
+                    vec![StructField::new("ip_protocol", AttributeType::string())],
+                )),
             ))
             .attribute(crate::schema::AttributeSchema::new(
                 "tags",
-                AttributeType::list(AttributeType::String),
+                AttributeType::list(AttributeType::string()),
             ))
             .attribute(crate::schema::AttributeSchema::new(
                 "group_description",
-                AttributeType::String,
+                AttributeType::string(),
             ));
 
         let names = list_struct_attr_names(&schema);

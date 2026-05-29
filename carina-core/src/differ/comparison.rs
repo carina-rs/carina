@@ -135,9 +135,12 @@ pub(crate) fn type_aware_equal(
                     | (
                         Value::Concrete(ConcreteValue::Float(f)),
                         Value::Concrete(ConcreteValue::Int(i)),
-                    ) if types
-                        .iter()
-                        .any(|t| matches!(t, AttributeType::Float | AttributeType::Int)) =>
+                    ) if types.iter().any(|t| {
+                        matches!(
+                            &t.kind,
+                            crate::schema::AttrTypeKind::Float | crate::schema::AttrTypeKind::Int
+                        )
+                    }) =>
                     {
                         (*i as f64) == *f && (*i as f64) as i64 == *i
                     }

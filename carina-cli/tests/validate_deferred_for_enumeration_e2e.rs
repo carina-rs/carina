@@ -79,10 +79,10 @@ impl ProviderFactory for ForTestFactory {
 
 fn cert_schema() -> ResourceSchema {
     ResourceSchema::new("acm.Certificate")
-        .attribute(AttributeSchema::new("domain_name", AttributeType::String))
+        .attribute(AttributeSchema::new("domain_name", AttributeType::string()))
         .attribute(AttributeSchema::new(
             "validation_method",
-            AttributeType::String,
+            AttributeType::string(),
         ))
         // Provider-read/computed collection that the `for` iterates.
         // Element type is immaterial here — the loop is deferred at
@@ -91,10 +91,7 @@ fn cert_schema() -> ResourceSchema {
         // element schema.
         .attribute(AttributeSchema::new(
             "domain_validation_options",
-            AttributeType::List {
-                inner: Box::new(AttributeType::String),
-                ordered: true,
-            },
+            AttributeType::list(AttributeType::string()),
         ))
 }
 
@@ -102,17 +99,14 @@ fn record_set_schema() -> ResourceSchema {
     ResourceSchema::new("route53.RecordSet")
         .attribute(AttributeSchema::new(
             "hosted_zone_id",
-            AttributeType::String,
+            AttributeType::string(),
         ))
-        .attribute(AttributeSchema::new("name", AttributeType::String))
-        .attribute(AttributeSchema::new("type", AttributeType::String))
-        .attribute(AttributeSchema::new("ttl", AttributeType::Int))
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
+        .attribute(AttributeSchema::new("type", AttributeType::string()))
+        .attribute(AttributeSchema::new("ttl", AttributeType::int()))
         .attribute(AttributeSchema::new(
             "resource_records",
-            AttributeType::List {
-                inner: Box::new(AttributeType::String),
-                ordered: true,
-            },
+            AttributeType::list(AttributeType::string()),
         ))
 }
 

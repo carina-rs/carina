@@ -22,23 +22,23 @@ use support::fixture::{analyze, engine_with_schemas, write_fixture};
 use tower_lsp::lsp_types::{Diagnostic, Url};
 
 fn versioning_schema() -> SchemaRegistry {
-    let versioning = AttributeType::StringEnum {
-        name: "VersioningStatus".to_string(),
-        values: vec!["Enabled".to_string(), "Suspended".to_string()],
-        identity: Some(carina_core::schema::string_enum_identity(
+    let versioning = AttributeType::string_enum(
+        "VersioningStatus".to_string(),
+        vec!["Enabled".to_string(), "Suspended".to_string()],
+        Some(carina_core::schema::string_enum_identity(
             "VersioningStatus",
             Some("aws.s3.Bucket"),
         )),
-        dsl_aliases: vec![
+        vec![
             ("Enabled".to_string(), "enabled".to_string()),
             ("Suspended".to_string(), "suspended".to_string()),
         ],
-    };
+    );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
         ResourceSchema::new("s3.bucket")
-            .attribute(AttributeSchema::new("name", AttributeType::String))
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
             .attribute(AttributeSchema::new("versioning", versioning)),
     );
     schemas
@@ -172,17 +172,17 @@ fn string_literal_emits_string_literal_kind_and_replaces_quotes() {
 // ---------------------------------------------------------------------------
 
 fn bare_mode_schema() -> SchemaRegistry {
-    let mode = AttributeType::StringEnum {
-        name: "Mode".to_string(),
-        values: vec!["fast".to_string(), "slow".to_string()],
-        identity: None,
-        dsl_aliases: vec![],
-    };
+    let mode = AttributeType::string_enum(
+        "Mode".to_string(),
+        vec!["fast".to_string(), "slow".to_string()],
+        None,
+        vec![],
+    );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
         ResourceSchema::new("r.mode_holder")
-            .attribute(AttributeSchema::new("name", AttributeType::String))
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
             .attribute(AttributeSchema::new("mode", mode)),
     );
     schemas

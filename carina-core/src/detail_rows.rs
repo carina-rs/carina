@@ -359,10 +359,10 @@ fn map_entry_subtype<'a>(
             crate::schema::Shape::Union(members) => {
                 t = members.iter().find(|m| {
                     matches!(
-                        m,
-                        AttributeType::Struct { .. }
-                            | AttributeType::Map { .. }
-                            | AttributeType::List { .. }
+                        &m.kind,
+                        crate::schema::AttrTypeKind::Struct { .. }
+                            | crate::schema::AttrTypeKind::Map { .. }
+                            | crate::schema::AttrTypeKind::List { .. }
                     )
                 })?;
             }
@@ -1211,11 +1211,11 @@ fn compute_list_of_maps_diff_parts(
     // `List<Struct>` still drops into the List arm — same bug class
     // as carina#3349. `resolve_refs` is a no-op on non-Ref inputs.
     let attr_type_peeled = attr_type.map(|t| t.resolve_refs(defs).as_attr());
-    let item_type = match attr_type_peeled {
-        Some(AttributeType::List { inner, .. }) => Some(inner.as_ref()),
+    let item_type = match attr_type_peeled.map(|t| (&t.kind, t)) {
+        Some((crate::schema::AttrTypeKind::List { inner, .. }, _)) => Some(inner.as_ref()),
         // The attribute itself may already be the element type when
         // this is reached recursively from a Map value.
-        other => other,
+        _ => attr_type_peeled,
     };
 
     let mut old_matched = vec![false; old_items.len()];
@@ -1527,26 +1527,27 @@ fn compute_string_list_change(
 /// `Union` members to find the first `List` arm. Returns `None` when
 /// `attr_type` resolves to nothing list-shaped.
 fn string_list_inner_type(attr_type: &AttributeType) -> Option<&AttributeType> {
-    match attr_type {
-        AttributeType::List { inner, .. } => Some(inner),
-        AttributeType::Union(members) => members.iter().find_map(string_list_inner_type),
+    use crate::schema::AttrTypeKind;
+    match &attr_type.kind {
+        AttrTypeKind::List { inner, .. } => Some(inner),
+        AttrTypeKind::Union(members) => members.iter().find_map(string_list_inner_type),
         // `AttributeType::Ref` (carina#3340): in CFN-derived schemas
         // the resolved target is a `Struct`, never a `List<String>`.
         // Returning `None` is the safe answer and keeps the helper
         // free of a `defs` dependency. A future schema that uses
         // `Ref` for list shapes would need to thread `&defs` and
         // resolve here.
-        AttributeType::Ref(_) => None,
-        AttributeType::String
-        | AttributeType::Int
-        | AttributeType::Float
-        | AttributeType::Bool
-        | AttributeType::Duration
-        | AttributeType::StringEnum { .. }
-        | AttributeType::Custom { .. }
-        | AttributeType::CustomEnum { .. }
-        | AttributeType::Map { .. }
-        | AttributeType::Struct { .. } => None,
+        AttrTypeKind::Ref(_) => None,
+        AttrTypeKind::String
+        | AttrTypeKind::Int
+        | AttrTypeKind::Float
+        | AttrTypeKind::Bool
+        | AttrTypeKind::Duration
+        | AttrTypeKind::StringEnum { .. }
+        | AttrTypeKind::Custom { .. }
+        | AttrTypeKind::CustomEnum { .. }
+        | AttrTypeKind::Map { .. }
+        | AttrTypeKind::Struct { .. } => None,
     }
 }
 
@@ -2224,45 +2225,42 @@ mod tests {
     /// map the API spelling to the DSL alias, mirroring the real
     /// provider schema (`Allow`↔`allow`, `2012-10-17`↔`2012_10_17`).
     fn iam_policy_registry() -> SchemaRegistry {
-        let effect = AttributeType::StringEnum {
-            name: "Effect".to_string(),
-            values: vec!["Allow".to_string(), "Deny".to_string()],
-            identity: None,
-            dsl_aliases: vec![
+        let effect = AttributeType::string_enum(
+            "Effect".to_string(),
+            vec!["Allow".to_string(), "Deny".to_string()],
+            None,
+            vec![
                 ("Allow".to_string(), "allow".to_string()),
                 ("Deny".to_string(), "deny".to_string()),
             ],
-        };
-        let version = AttributeType::StringEnum {
-            name: "Version".to_string(),
-            values: vec!["2012-10-17".to_string(), "2008-10-17".to_string()],
-            identity: None,
-            dsl_aliases: vec![
+        );
+        let version = AttributeType::string_enum(
+            "Version".to_string(),
+            vec!["2012-10-17".to_string(), "2008-10-17".to_string()],
+            None,
+            vec![
                 ("2012-10-17".to_string(), "2012_10_17".to_string()),
                 ("2008-10-17".to_string(), "2008_10_17".to_string()),
             ],
-        };
-        let statement = AttributeType::List {
-            inner: Box::new(AttributeType::Struct {
-                name: "Statement".to_string(),
-                fields: vec![
-                    StructField::new("effect", effect),
-                    StructField::new("action", AttributeType::String),
-                ],
-            }),
-            ordered: false,
-        };
-        let policy = AttributeType::Struct {
-            name: "PolicyDocument".to_string(),
-            fields: vec![
+        );
+        let statement = AttributeType::unordered_list(AttributeType::struct_(
+            "Statement".to_string(),
+            vec![
+                StructField::new("effect", effect),
+                StructField::new("action", AttributeType::string()),
+            ],
+        ));
+        let policy = AttributeType::struct_(
+            "PolicyDocument".to_string(),
+            vec![
                 StructField::new("version", version),
                 StructField::new("statement", statement),
             ],
-        };
+        );
         let schema = ResourceSchema::new("iam.Role")
             .attribute(AttributeSchema::new("policy", policy))
-            .attribute(AttributeSchema::new("description", AttributeType::String))
-            .attribute(AttributeSchema::new("region", AttributeType::String));
+            .attribute(AttributeSchema::new("description", AttributeType::string()))
+            .attribute(AttributeSchema::new("region", AttributeType::string()));
         let mut registry = SchemaRegistry::new();
         registry.insert("", schema);
         registry
@@ -2478,19 +2476,16 @@ mod tests {
     /// whose only change is an enum-equal value must produce no row.
     #[test]
     fn update_map_of_string_enum_enum_equal_value_no_phantom() {
-        let enum_t = AttributeType::StringEnum {
-            name: "Mode".to_string(),
-            values: vec!["On".to_string(), "Off".to_string()],
-            identity: None,
-            dsl_aliases: vec![
+        let enum_t = AttributeType::string_enum(
+            "Mode".to_string(),
+            vec!["On".to_string(), "Off".to_string()],
+            None,
+            vec![
                 ("On".to_string(), "on".to_string()),
                 ("Off".to_string(), "off".to_string()),
             ],
-        };
-        let map_t = AttributeType::Map {
-            key: Box::new(AttributeType::String),
-            value: Box::new(enum_t),
-        };
+        );
+        let map_t = AttributeType::map_with_key(AttributeType::string(), enum_t);
         let schema = ResourceSchema::new("x.Thing").attribute(AttributeSchema::new("modes", map_t));
         let mut registry = SchemaRegistry::new();
         registry.insert("", schema);
@@ -2648,21 +2643,18 @@ mod tests {
     }
 
     fn modes_registry() -> SchemaRegistry {
-        let mode = AttributeType::StringEnum {
-            name: "Mode".to_string(),
-            values: vec!["Allow".to_string(), "Deny".to_string()],
-            identity: None,
-            dsl_aliases: vec![
+        let mode = AttributeType::string_enum(
+            "Mode".to_string(),
+            vec!["Allow".to_string(), "Deny".to_string()],
+            None,
+            vec![
                 ("Allow".to_string(), "allow".to_string()),
                 ("Deny".to_string(), "deny".to_string()),
             ],
-        };
+        );
         let schema = ResourceSchema::new("x.Thing").attribute(AttributeSchema::new(
             "modes",
-            AttributeType::List {
-                inner: Box::new(mode),
-                ordered: false,
-            },
+            AttributeType::unordered_list(mode),
         ));
         let mut registry = SchemaRegistry::new();
         registry.insert("", schema);

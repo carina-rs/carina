@@ -502,11 +502,11 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
     // Schema for ec2.subnet with vpc_id as create-only
     let subnet_schema = ResourceSchema::new("ec2.Subnet")
         .attribute(
-            AttributeSchema::new("vpc_id", AttributeType::String)
+            AttributeSchema::new("vpc_id", AttributeType::string())
                 .required()
                 .create_only(),
         )
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::String).required());
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).required());
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert("", subnet_schema);
@@ -666,16 +666,16 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
     // Schema: vpc_id and availability_zone are both create-only on ec2.subnet
     let subnet_schema = ResourceSchema::new("ec2.Subnet")
         .attribute(
-            AttributeSchema::new("vpc_id", AttributeType::String)
+            AttributeSchema::new("vpc_id", AttributeType::string())
                 .required()
                 .create_only(),
         )
         .attribute(
-            AttributeSchema::new("availability_zone", AttributeType::String)
+            AttributeSchema::new("availability_zone", AttributeType::string())
                 .required()
                 .create_only(),
         )
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::String).required());
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).required());
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert("", subnet_schema);
@@ -814,14 +814,14 @@ fn auto_detect_create_before_destroy_when_resource_has_dependents() {
 
     // Schema: cidr_block is create-only on ec2.vpc
     let vpc_schema = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only());
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only());
     let subnet_schema = ResourceSchema::new("ec2.Subnet")
         .attribute(
-            AttributeSchema::new("vpc_id", AttributeType::String)
+            AttributeSchema::new("vpc_id", AttributeType::string())
                 .required()
                 .create_only(),
         )
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::String).required());
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).required());
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert("", vpc_schema);
@@ -940,12 +940,12 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
     // Schema: vpc_id is create-only, tags is NOT create-only
     let subnet_schema = ResourceSchema::new("ec2.Subnet")
         .attribute(
-            AttributeSchema::new("vpc_id", AttributeType::String)
+            AttributeSchema::new("vpc_id", AttributeType::string())
                 .required()
                 .create_only(),
         )
-        .attribute(AttributeSchema::new("tags", AttributeType::String))
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::String).required());
+        .attribute(AttributeSchema::new("tags", AttributeType::string()))
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).required());
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert("", subnet_schema);
@@ -1068,11 +1068,11 @@ fn cascade_prevent_destroy_blocks_promotion_to_replace() {
     // Schema: vpc_id is create-only on ec2.subnet
     let subnet_schema = ResourceSchema::new("ec2.Subnet")
         .attribute(
-            AttributeSchema::new("vpc_id", AttributeType::String)
+            AttributeSchema::new("vpc_id", AttributeType::string())
                 .required()
                 .create_only(),
         )
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::String).required());
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).required());
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert("", subnet_schema);
@@ -1195,12 +1195,12 @@ fn cascade_prevent_destroy_blocks_merge_upgrade_to_replace() {
     // Schema: vpc_id is create-only, tags is NOT
     let subnet_schema = ResourceSchema::new("ec2.Subnet")
         .attribute(
-            AttributeSchema::new("vpc_id", AttributeType::String)
+            AttributeSchema::new("vpc_id", AttributeType::string())
                 .required()
                 .create_only(),
         )
-        .attribute(AttributeSchema::new("tags", AttributeType::String))
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::String).required());
+        .attribute(AttributeSchema::new("tags", AttributeType::string()))
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).required());
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert("", subnet_schema);

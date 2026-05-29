@@ -548,8 +548,9 @@ impl CompletionProvider {
     /// Extract the Custom type's kind name from an AttributeType, if it
     /// is a Custom type with a structured identity.
     fn extract_custom_type_name(attr_type: &AttributeType) -> Option<&str> {
-        match attr_type {
-            AttributeType::Custom {
+        let defs = carina_core::schema::empty_defs();
+        match attr_type.shape(defs) {
+            Shape::Custom {
                 identity: Some(id), ..
             } => Some(&id.kind),
             _ => None,
@@ -561,8 +562,9 @@ impl CompletionProvider {
         attr_type: &AttributeType,
         resource_type: Option<&str>,
     ) -> Vec<CompletionItem> {
-        match attr_type {
-            AttributeType::Bool => {
+        let defs = carina_core::schema::empty_defs();
+        match attr_type.shape(defs) {
+            Shape::Bool => {
                 vec![
                     CompletionItem {
                         label: "true".to_string(),
@@ -578,7 +580,7 @@ impl CompletionProvider {
                     },
                 ]
             }
-            AttributeType::StringEnum {
+            Shape::StringEnum {
                 name,
                 values,
                 identity,
@@ -589,7 +591,7 @@ impl CompletionProvider {
                 // type when the enum has no provider scope of its
                 // own — this matches the pre-#3222 `namespace`
                 // fallback rule for bare enums.
-                let id_prefix = identity.as_ref().and_then(|id| id.dotted_prefix());
+                let id_prefix = identity.and_then(|id| id.dotted_prefix());
                 let effective_ns = id_prefix.as_deref().or(if !name.is_empty() {
                     resource_type
                 } else {
@@ -597,10 +599,10 @@ impl CompletionProvider {
                 });
                 self.string_enum_completions(name, values, effective_ns, dsl_aliases)
             }
-            AttributeType::Int => {
+            Shape::Int => {
                 vec![] // No specific completions for integers
             }
-            AttributeType::Float => {
+            Shape::Float => {
                 vec![] // No specific completions for floats
             }
             // Curated unit-snippet completions for Duration attributes,
@@ -609,7 +611,7 @@ impl CompletionProvider {
             // short — common timeout magnitudes — rather than every
             // unit alias, because the user types a digit prefix
             // anyway and only needs hint candidates for the unit.
-            AttributeType::Duration => vec![
+            Shape::Duration => vec![
                 CompletionItem {
                     label: "30s".to_string(),
                     kind: Some(CompletionItemKind::VALUE),
@@ -635,10 +637,10 @@ impl CompletionProvider {
                     ..Default::default()
                 },
             ],
-            AttributeType::Custom {
+            Shape::Custom {
                 identity: Some(id), ..
             } if id.kind == "Cidr" || id.kind == "Ipv4Cidr" => self.cidr_completions(),
-            AttributeType::Custom {
+            Shape::Custom {
                 identity: Some(id), ..
             } if id.kind == "Ipv6Cidr" => self.ipv6_cidr_completions(),
             // Generic ARN snippet only for the bare `Arn` type. Specific
@@ -650,7 +652,7 @@ impl CompletionProvider {
             // family snippets can be added as additional arms later if
             // the per-type formats are useful enough to justify the
             // surface. See #2621.
-            AttributeType::Custom {
+            Shape::Custom {
                 identity: Some(id), ..
             } if id.kind == "Arn" => self.arn_completions(),
             // AvailabilityZone is split into two distinct types post-S2.5:
@@ -659,7 +661,7 @@ impl CompletionProvider {
             // lives in `segments`. We surface AZ-letter completions only for
             // zone-name typed sinks — zone-id values look like `usw2-az1` and
             // are not derivable from region code + letter.
-            AttributeType::Custom {
+            Shape::Custom {
                 identity: Some(id), ..
             } if id.kind == "ZoneName"
                 && id.segments.first().map(String::as_str) == Some("AvailabilityZone") =>
@@ -667,13 +669,11 @@ impl CompletionProvider {
                 self.availability_zone_completions(id)
             }
             // List(non-Struct): delegate to inner type completions
-            AttributeType::List { inner, .. } => self.completions_for_type(inner, resource_type),
+            Shape::List { inner, .. } => self.completions_for_type(inner, resource_type),
             // Map: delegate to inner value type completions
-            AttributeType::Map { value: inner, .. } => {
-                self.completions_for_type(inner, resource_type)
-            }
+            Shape::Map { value: inner, .. } => self.completions_for_type(inner, resource_type),
             // Union: collect completions from all member types
-            AttributeType::Union(members) => {
+            Shape::Union(members) => {
                 let mut completions = Vec::new();
                 let mut seen_labels = std::collections::HashSet::new();
                 for member in members {
@@ -685,14 +685,7 @@ impl CompletionProvider {
                 }
                 completions
             }
-            // `AttributeType::Ref` (carina#3340): in CFN-derived
-            // schemas the resolved target is a `Struct`, which has no
-            // value-position snippet anyway (block / attribute
-            // completions handle struct field entry separately).
-            // Returning an empty list is shape-consistent with the
-            // `Struct` arm. Threading `&defs` through completion is
-            // unnecessary at this layer.
-            AttributeType::Ref(_) => vec![],
+            // Shape has no Ref variant by design — peeled via shape(defs).
             _ => vec![],
         }
     }
@@ -1274,10 +1267,9 @@ impl CompletionProvider {
             return Vec::new();
         };
         let effective = if in_nested {
-            match &annotation {
-                AttributeType::List { inner, .. } | AttributeType::Map { value: inner, .. } => {
-                    (**inner).clone()
-                }
+            let defs = carina_core::schema::empty_defs();
+            match annotation.shape(defs) {
+                Shape::List { inner, .. } | Shape::Map { value: inner, .. } => inner.clone(),
                 // Inside `{ ... }` of a non-collection annotation we
                 // don't know what the user means — fall silent.
                 _ => return Vec::new(),
@@ -1985,40 +1977,37 @@ fn infer_for_binding_type(
 ///   type is unknown at this layer.
 fn return_type_fits(ret: builtins::BuiltinReturnType, attr_type: &AttributeType) -> bool {
     use builtins::BuiltinReturnType as R;
-    match attr_type {
-        AttributeType::Union(members) => members.iter().any(|m| return_type_fits(ret, m)),
-        AttributeType::String => matches!(ret, R::String | R::Any),
-        AttributeType::Int => matches!(ret, R::Int | R::Any),
+    // Shape's deliberate omission of a `Ref` variant lifts the
+    // carina#3349 invariant (Ref must be peeled before a wildcard
+    // arm sees it) into the type system: this match cannot leak Ref
+    // into the trailing wildcard. Pass `empty_defs` because this
+    // completion-time helper does not carry the schema's defs map —
+    // unresolved Ref attrs simply fall through to `false`, which is
+    // shape-consistent with the historical `Struct => false` arm.
+    let defs = carina_core::schema::empty_defs();
+    match attr_type.shape(defs) {
+        Shape::Union(members) => members.iter().any(|m| return_type_fits(ret, m)),
+        Shape::String => matches!(ret, R::String | R::Any),
+        Shape::Int => matches!(ret, R::Int | R::Any),
         // No built-in currently returns a Bool; leave as unfit.
-        AttributeType::Bool => false,
-        AttributeType::List { .. } => matches!(ret, R::List | R::Any),
-        AttributeType::Map { .. } => matches!(ret, R::Map | R::Any),
+        Shape::Bool => false,
+        Shape::List { .. } => matches!(ret, R::List | R::Any),
+        Shape::Map { .. } => matches!(ret, R::Map | R::Any),
         // StringEnum expects a specific identifier form; no built-in
         // currently produces such values, and `Any` alone doesn't give us
         // enough confidence to suggest one.
-        AttributeType::StringEnum { .. } => false,
+        Shape::StringEnum { .. } => false,
         // Custom types carry a semantic meaning (Cidr, AwsAccountId, Arn,
         // …) that built-ins don't declare. Not even `Any` fits — we need
         // a semantic return annotation before a built-in can be suggested
         // here. CustomEnum (carina#3222) is even more specific — the
         // value must be a namespaced enum identifier, which no built-in
         // can synthesise.
-        AttributeType::Custom { .. } | AttributeType::CustomEnum { .. } => false,
+        Shape::Custom { .. } | Shape::CustomEnum { .. } => false,
         // Float, Duration, and Struct attributes — no matching built-in today.
-        AttributeType::Float => false,
-        AttributeType::Duration => false,
-        AttributeType::Struct { .. } => false,
-        // `AttributeType::Ref` (carina#3340) names a cyclic CFN
-        // definition target. Resolution requires the enclosing
-        // [`Schema::defs`] map, which this completion-time helper
-        // does not carry. The resolved targets in practice are
-        // `Struct` shapes (WAFv2 `Statement`, AppSync `GraphQLApi`,
-        // ...), and no built-in currently returns `Struct` — so
-        // returning `false` here is semantically equivalent to the
-        // resolved-target arm and avoids threading `defs` through
-        // a purely completion-side helper. If a future built-in
-        // returns a struct-typed value, thread `defs` and resolve.
-        AttributeType::Ref(_) => false,
+        Shape::Float => false,
+        Shape::Duration => false,
+        Shape::Struct { .. } => false,
     }
 }
 
@@ -2052,31 +2041,31 @@ fn parse_exports_type_text(text: &str) -> Option<AttributeType> {
     }
     if let Some(inner) = strip_generic("map", text) {
         let inner_ty = parse_exports_type_text(inner)?;
-        return Some(AttributeType::Map {
-            key: Box::new(AttributeType::String),
-            value: Box::new(inner_ty),
-        });
+        return Some(AttributeType::map_with_key(
+            AttributeType::string(),
+            inner_ty,
+        ));
     }
     match text {
         // Post-Phase C, primitive types are PascalCase. Accept only the new
         // spellings at the surface.
-        "String" => Some(AttributeType::String),
-        "Int" => Some(AttributeType::Int),
-        "Float" => Some(AttributeType::Float),
-        "Bool" => Some(AttributeType::Bool),
+        "String" => Some(AttributeType::string()),
+        "Int" => Some(AttributeType::int()),
+        "Float" => Some(AttributeType::float()),
+        "Bool" => Some(AttributeType::bool()),
         // Custom types also ship in PascalCase now (e.g. `AwsAccountId`,
         // `Ipv4Cidr`). Carry the PascalCase form as a bare identity.
         name if name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
             && name.chars().all(|c| c.is_ascii_alphanumeric()) =>
         {
-            Some(AttributeType::Custom {
-                identity: Some(carina_core::schema::TypeIdentity::bare(name)),
-                base: Box::new(AttributeType::String),
-                pattern: None,
-                length: None,
-                validate: legacy_validator(noop_validate),
-                to_dsl: None,
-            })
+            Some(AttributeType::custom(
+                Some(carina_core::schema::TypeIdentity::bare(name)),
+                AttributeType::string(),
+                None,
+                None,
+                legacy_validator(noop_validate),
+                None,
+            ))
         }
         _ => None,
     }
