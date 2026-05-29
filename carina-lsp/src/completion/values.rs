@@ -8,7 +8,7 @@ use tower_lsp::lsp_types::{
 
 use carina_core::builtins;
 use carina_core::parser::snake_to_pascal;
-use carina_core::schema::{AttributeType, TypeIdentity, legacy_validator};
+use carina_core::schema::{AttributeType, Shape, TypeIdentity, legacy_validator};
 
 use super::{CompletionProvider, DslSource};
 
@@ -85,19 +85,18 @@ impl CompletionProvider {
                 });
 
                 // For List(Struct) attributes with block_name, offer block
-                // syntax completion. Peel `Ref` against `schema.defs` for
-                // both the attribute type and the list element type so the
-                // snippet still fires on cyclic-CFN attributes like
+                // syntax completion. Use `Shape` (Ref-peeled) for both the
+                // attribute type and the list element type so the snippet
+                // still fires on cyclic-CFN attributes like
                 // `Ref("LifecycleConfiguration") -> Struct { rules:
                 // List<Ref<Struct>> with block_name("rule") }`. Same bug
                 // class as carina#3349.
-                let attr_ty_resolved = attr.attr_type.resolve_refs(&schema.defs).as_attr();
                 if let Some(bn) = &attr.block_name
                     && matches!(
-                        attr_ty_resolved,
-                        AttributeType::List { inner, .. } if matches!(
-                            inner.as_ref().resolve_refs(&schema.defs).as_attr(),
-                            AttributeType::Struct { .. }
+                        attr.attr_type.shape(&schema.defs),
+                        Shape::List { inner, .. } if matches!(
+                            inner.shape(&schema.defs),
+                            Shape::Struct { .. }
                         )
                     )
                 {
@@ -376,12 +375,12 @@ impl CompletionProvider {
             && let Some(attr_schema) = schema.attributes.get(attr_name)
         {
             // Struct types: offer `{ }` snippet only, no built-in functions.
-            // Peel `Ref` against `schema.defs` so a Ref-typed struct
-            // attribute (cyclic-CFN case) also gets the snippet (same bug
-            // class as carina#3349).
+            // Use `Shape` (Ref-peeled) so a Ref-typed struct attribute
+            // (cyclic-CFN case) also gets the snippet (same bug class as
+            // carina#3349).
             if matches!(
-                attr_schema.attr_type.resolve_refs(&schema.defs).as_attr(),
-                AttributeType::Struct { .. }
+                attr_schema.attr_type.shape(&schema.defs),
+                Shape::Struct { .. }
             ) {
                 completions.push(CompletionItem {
                     label: "{ }".to_string(),
