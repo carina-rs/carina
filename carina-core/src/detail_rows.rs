@@ -340,15 +340,15 @@ fn map_entry_subtype<'a>(
 ) -> Option<&'a AttributeType> {
     let mut t = attr_type?;
     loop {
-        // Peel any `Ref` chain before the variant match below so the
-        // wildcard arm cannot silently drop a Ref-typed attribute.
-        // `resolve_refs` panics on a dangling Ref — schema-construction
-        // bug, surfaced loudly.
-        t = t.resolve_refs(defs).as_attr();
-        match t {
-            AttributeType::List { inner, .. } => t = inner,
-            AttributeType::Map { value, .. } => return Some(value),
-            AttributeType::Struct { fields, .. } => {
+        // Project onto `Shape` so any `Ref` chain is peeled at the
+        // type level (carina#3349). The wildcard arm cannot
+        // silently drop a `Ref` because `Shape` has no `Ref`
+        // variant. `shape(defs)` panics on a dangling `Ref` —
+        // schema-construction bug, surfaced loudly.
+        match t.shape(defs) {
+            crate::schema::Shape::List { inner, .. } => t = inner,
+            crate::schema::Shape::Map { value, .. } => return Some(value),
+            crate::schema::Shape::Struct { fields, .. } => {
                 // Canonical field accessor — resolves `block_name`
                 // aliases too, matching `validate_struct` /
                 // `collect_struct` (#2214).
@@ -356,7 +356,7 @@ fn map_entry_subtype<'a>(
                     .get(key)
                     .map(|f| &f.field_type);
             }
-            AttributeType::Union(members) => {
+            crate::schema::Shape::Union(members) => {
                 t = members.iter().find(|m| {
                     matches!(
                         m,
