@@ -717,8 +717,11 @@ pub fn resolve_enum_value_recursive_with_defs(
         return Some(resolved);
     }
 
-    match attr_type {
-        AttributeType::Struct { fields, .. } => {
+    // Project onto Shape so `Ref` is peeled at the type level
+    // (carina#3349). The wildcard arm cannot silently swallow a
+    // `Ref` because `Shape` has no `Ref` variant.
+    match attr_type.shape(defs) {
+        crate::schema::Shape::Struct { fields, .. } => {
             let Value::Concrete(ConcreteValue::Map(map)) = value else {
                 return None;
             };
@@ -735,7 +738,7 @@ pub fn resolve_enum_value_recursive_with_defs(
             }
             changed.then_some(Value::Concrete(ConcreteValue::Map(rewritten)))
         }
-        AttributeType::List { inner, .. } => {
+        crate::schema::Shape::List { inner, .. } => {
             let Value::Concrete(ConcreteValue::List(items)) = value else {
                 return None;
             };
@@ -749,7 +752,7 @@ pub fn resolve_enum_value_recursive_with_defs(
             }
             changed.then_some(Value::Concrete(ConcreteValue::List(rewritten)))
         }
-        AttributeType::Map { value: inner, .. } => {
+        crate::schema::Shape::Map { value: inner, .. } => {
             let Value::Concrete(ConcreteValue::Map(map)) = value else {
                 return None;
             };
@@ -763,16 +766,8 @@ pub fn resolve_enum_value_recursive_with_defs(
             }
             changed.then_some(Value::Concrete(ConcreteValue::Map(rewritten)))
         }
-        // `Ref`: follow the named target in the schema's def map and
-        // continue the walk. Without this arm a cyclic schema would
-        // silently drop enum normalization at every cycle point
-        // (carina#3340). `resolve_refs` panics on a missing def name
-        // (schema invariant violation).
-        AttributeType::Ref(_) => {
-            let resolved = attr_type.resolve_refs(defs);
-            resolve_enum_value_recursive_with_defs(value, resolved.as_attr(), defs)
-        }
-        // Scalars and Union: nothing to descend into.
+        // Scalars and Union: nothing to descend into. `Ref` is
+        // already peeled by `shape(defs)` above.
         _ => None,
     }
 }
@@ -973,8 +968,11 @@ pub fn lift_string_enum_leaves_with_defs(
         return None;
     }
 
-    match attr_type {
-        AttributeType::Struct { fields, .. } => {
+    // Project onto Shape so `Ref` is peeled at the type level
+    // (carina#3349). The wildcard arm cannot silently swallow a
+    // `Ref` because `Shape` has no `Ref` variant.
+    match attr_type.shape(defs) {
+        crate::schema::Shape::Struct { fields, .. } => {
             let Value::Concrete(ConcreteValue::Map(map)) = value else {
                 return None;
             };
@@ -991,7 +989,7 @@ pub fn lift_string_enum_leaves_with_defs(
             }
             changed.then_some(Value::Concrete(ConcreteValue::Map(rewritten)))
         }
-        AttributeType::List { inner, .. } => {
+        crate::schema::Shape::List { inner, .. } => {
             let Value::Concrete(ConcreteValue::List(items)) = value else {
                 return None;
             };
@@ -1005,7 +1003,7 @@ pub fn lift_string_enum_leaves_with_defs(
             }
             changed.then_some(Value::Concrete(ConcreteValue::List(rewritten)))
         }
-        AttributeType::Map { value: inner, .. } => {
+        crate::schema::Shape::Map { value: inner, .. } => {
             let Value::Concrete(ConcreteValue::Map(map)) = value else {
                 return None;
             };
@@ -1019,13 +1017,8 @@ pub fn lift_string_enum_leaves_with_defs(
             }
             changed.then_some(Value::Concrete(ConcreteValue::Map(rewritten)))
         }
-        // `Ref`: resolve via defs and continue. See sibling note in
-        // `resolve_enum_value_recursive_with_defs` (carina#3340).
-        AttributeType::Ref(_) => {
-            let resolved = attr_type.resolve_refs(defs);
-            lift_string_enum_leaves_with_defs(value, resolved.as_attr(), defs)
-        }
-        // Scalars and Union: nothing to descend into.
+        // Scalars and Union: nothing to descend into. `Ref` is
+        // already peeled by `shape(defs)` above.
         _ => None,
     }
 }
