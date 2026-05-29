@@ -66,13 +66,14 @@ pub(crate) fn type_aware_equal(
         return secret_matches_state(inner, a, secret_ctx);
     }
 
-    // Resolve any top-level `AttributeType::Ref` chain BEFORE matching,
-    // so the wildcard arm below cannot silently swallow a `Ref`
-    // (carina#3340). The `ResolvedAttrType` wrapper makes that
-    // requirement compiler-checked rather than convention.
-    let attr_type = attr_type.map(|t| t.resolve_refs(defs).as_attr());
+    // Dispatch through `Shape` so the wildcard `_ => …` arm cannot be
+    // reached by a `Ref`-typed attr_type. Shape has no `Ref` variant,
+    // so the carina#3340 / carina#3349 invariant is moved from a
+    // hand-written `resolve_refs` + `Ref(_) => unreachable!()` guard
+    // into the type system.
+    let shape = attr_type.map(|t| t.shape(defs));
 
-    match attr_type {
+    match shape {
         None => {
             // Even without type info, use type_aware_maps_equal / type_aware_lists_equal
             // for Maps/Lists so that nested Secret values are compared via their hashes.
@@ -94,37 +95,37 @@ pub(crate) fn type_aware_equal(
             (
                 Value::Concrete(ConcreteValue::Int(i)),
                 Value::Concrete(ConcreteValue::Float(f)),
-                AttributeType::Float | AttributeType::Int,
+                crate::schema::Shape::Float | crate::schema::Shape::Int,
             ) => (*i as f64) == *f && (*i as f64) as i64 == *i,
             (
                 Value::Concrete(ConcreteValue::Float(f)),
                 Value::Concrete(ConcreteValue::Int(i)),
-                AttributeType::Float | AttributeType::Int,
+                crate::schema::Shape::Float | crate::schema::Shape::Int,
             ) => *f == (*i as f64) && (*i as f64) as i64 == *i,
 
             // Lists: ordered or multiset comparison with inner type awareness
             (
                 Value::Concrete(ConcreteValue::List(la)),
                 Value::Concrete(ConcreteValue::List(lb)),
-                AttributeType::List { inner, ordered },
-            ) => type_aware_lists_equal(la, lb, Some(inner), defs, *ordered, secret_ctx),
+                crate::schema::Shape::List { inner, ordered },
+            ) => type_aware_lists_equal(la, lb, Some(inner), defs, ordered, secret_ctx),
 
             // Maps: recursive comparison with inner value type
             (
                 Value::Concrete(ConcreteValue::Map(ma)),
                 Value::Concrete(ConcreteValue::Map(mb)),
-                AttributeType::Map { value: inner, .. },
-            ) => type_aware_maps_equal(ma, mb, |_key| Some(inner.as_ref()), defs, secret_ctx),
+                crate::schema::Shape::Map { value: inner, .. },
+            ) => type_aware_maps_equal(ma, mb, |_key| Some(inner), defs, secret_ctx),
 
             // Struct: per-field type-aware comparison with default-value tolerance
             (
                 Value::Concrete(ConcreteValue::Map(ma)),
                 Value::Concrete(ConcreteValue::Map(mb)),
-                AttributeType::Struct { fields, .. },
+                crate::schema::Shape::Struct { fields, .. },
             ) => type_aware_struct_equal(ma, mb, fields, defs, secret_ctx),
 
             // Union: try each member type; if any says equal, they're equal
-            (_, _, AttributeType::Union(types)) => {
+            (_, _, crate::schema::Shape::Union(types)) => {
                 // Also check Int/Float coercion for unions containing numeric types
                 match (a, b) {
                     (
@@ -157,7 +158,7 @@ pub(crate) fn type_aware_equal(
             (
                 a,
                 b,
-                AttributeType::StringEnum {
+                crate::schema::Shape::StringEnum {
                     values,
                     dsl_aliases,
                     ..
@@ -222,7 +223,7 @@ pub(crate) fn type_aware_equal(
             (
                 a,
                 b,
-                AttributeType::CustomEnum {
+                crate::schema::Shape::CustomEnum {
                     identity: _,
                     to_dsl,
                     ..
@@ -284,18 +285,16 @@ pub(crate) fn type_aware_equal(
             }
 
             // Custom types with base type: delegate to base
-            (_, _, AttributeType::Custom { base, .. }) => {
+            (_, _, crate::schema::Shape::Custom { base, .. }) => {
                 type_aware_equal(a, b, Some(base), defs, secret_ctx)
             }
 
-            // `AttributeType::Ref` cannot reach this point: `resolve_refs`
-            // above peeled any `Ref` chain at the function entry. A
-            // `Ref` here would be a schema invariant violation handled
-            // by `resolve_refs`' panic. Documented explicitly so the
-            // wildcard below is provably Ref-free (carina#3340).
-            (_, _, AttributeType::Ref(_)) => unreachable!(
-                "AttributeType::Ref must be resolved by resolve_refs before reaching the match"
-            ),
+            // `Shape` has no `Ref` variant by construction (see
+            // `crate::schema::Shape`'s type-level docs), so the
+            // carina#3340 / carina#3349 invariant — "every walk-site
+            // peels Ref before matching" — is enforced by the type
+            // system rather than by a hand-written `Ref(_) =>
+            // unreachable!()` arm.
 
             // All other cases: fall back to semantic equality
             _ => a.semantically_equal(b),
