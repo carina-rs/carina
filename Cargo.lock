@@ -895,6 +895,7 @@ dependencies = [
  "indexmap",
  "pest",
  "pest_derive",
+ "regex",
  "semver",
  "serde",
  "serde_json",

@@ -389,6 +389,37 @@ fn with_attribute_is_noop_for_variants_that_dont_carry_attribute() {
 }
 
 #[test]
+fn custom_constraint_errors_format_type_and_attribute_context() {
+    let pattern = TypeError::PatternMismatch {
+        value: "ABC".to_string(),
+        pattern: "^[a-z]+$".to_string(),
+        attribute: None,
+        type_name: Some("EntityDescription".to_string()),
+    };
+    assert_eq!(
+        pattern.to_string(),
+        "Invalid EntityDescription value 'ABC': does not match required pattern /^[a-z]+$/"
+    );
+    assert_eq!(
+        pattern.with_attribute("description").to_string(),
+        "Invalid value 'ABC' for 'description' (EntityDescription): does not match required pattern /^[a-z]+$/"
+    );
+
+    let length = TypeError::LengthOutOfRange {
+        value: "".to_string(),
+        length: 0,
+        min: Some(1),
+        max: None,
+        attribute: None,
+        type_name: Some("EntityDescription".to_string()),
+    };
+    assert_eq!(
+        length.with_attribute("description").to_string(),
+        "Invalid value '' for 'description' (EntityDescription): length 0 is outside allowed range [1, ]"
+    );
+}
+
+#[test]
 fn schema_validate_wraps_enum_error_with_attribute_name() {
     // End-to-end at the ResourceSchema boundary: the attribute loop in
     // `ResourceSchema::validate` must wrap type errors with the attribute
@@ -3275,6 +3306,236 @@ fn custom_carries_semantic_name_pattern_length() {
         }
         _ => panic!("expected Custom"),
     }
+}
+
+#[test]
+fn custom_pattern_rejects_and_accepts_string_values() {
+    let attr = AttributeType::custom(
+        None,
+        AttributeType::string(),
+        Some("^[a-z]+$".to_string()),
+        None,
+        noop_validator(),
+        None,
+    );
+
+    let err = attr
+        .validate(&Value::Concrete(ConcreteValue::String("ABC".to_string())))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        TypeError::PatternMismatch {
+            value: "ABC".to_string(),
+            pattern: "^[a-z]+$".to_string(),
+            attribute: None,
+            type_name: None,
+        }
+    );
+    assert!(
+        attr.validate(&Value::Concrete(ConcreteValue::String("abc".to_string())))
+            .is_ok()
+    );
+}
+
+#[test]
+fn custom_pattern_and_length_passes_still_run_validator() {
+    let attr = AttributeType::custom(
+        None,
+        AttributeType::string(),
+        Some("^[a-z]+$".to_string()),
+        Some((Some(1), Some(10))),
+        validator(|_| {
+            Err(TypeError::ValidationFailed {
+                message: "closure rejected".to_string(),
+            })
+        }),
+        None,
+    );
+
+    let err = attr
+        .validate(&Value::Concrete(ConcreteValue::String("abc".to_string())))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        TypeError::ValidationFailed {
+            message: "closure rejected".to_string(),
+        }
+    );
+}
+
+#[test]
+fn custom_pattern_rejects_wafv2_description_parentheses() {
+    let pattern = r"^[a-zA-Z0-9=:#@/\-,.][a-zA-Z0-9+=:#@/\-,.\s]+[a-zA-Z0-9+=:#@/\-,.]{1,256}$";
+    let attr = AttributeType::custom(
+        Some(TypeIdentity::bare("EntityDescription")),
+        AttributeType::string(),
+        Some(pattern.to_string()),
+        None,
+        noop_validator(),
+        None,
+    );
+
+    let err = attr
+        .validate(&Value::Concrete(ConcreteValue::String(
+            "Protects the Carina Provider Registry (dev) CloudFront distribution".to_string(),
+        )))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        TypeError::PatternMismatch {
+            value: "Protects the Carina Provider Registry (dev) CloudFront distribution"
+                .to_string(),
+            pattern: pattern.to_string(),
+            attribute: None,
+            type_name: Some("EntityDescription".to_string()),
+        }
+    );
+    assert!(
+        attr.validate(&Value::Concrete(ConcreteValue::String(
+            "Protects the registry dev distribution".to_string()
+        )))
+        .is_ok()
+    );
+}
+
+#[test]
+fn custom_length_uses_character_count_not_bytes() {
+    let attr = AttributeType::custom(
+        None,
+        AttributeType::string(),
+        None,
+        Some((Some(1), Some(5))),
+        noop_validator(),
+        None,
+    );
+
+    let err = attr
+        .validate(&Value::Concrete(ConcreteValue::String(
+            "abcdef".to_string(),
+        )))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        TypeError::LengthOutOfRange {
+            value: "abcdef".to_string(),
+            length: 6,
+            min: Some(1),
+            max: Some(5),
+            attribute: None,
+            type_name: None,
+        }
+    );
+    assert!(
+        attr.validate(&Value::Concrete(ConcreteValue::String("abcde".to_string())))
+            .is_ok()
+    );
+    assert!(
+        attr.validate(&Value::Concrete(ConcreteValue::String(
+            "ねこに".to_string()
+        )))
+        .is_ok()
+    );
+}
+
+#[test]
+fn custom_length_enforces_minimum_bound() {
+    let attr = AttributeType::custom(
+        None,
+        AttributeType::string(),
+        None,
+        Some((Some(2), None)),
+        noop_validator(),
+        None,
+    );
+
+    let err = attr
+        .validate(&Value::Concrete(ConcreteValue::String("a".to_string())))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        TypeError::LengthOutOfRange {
+            value: "a".to_string(),
+            length: 1,
+            min: Some(2),
+            max: None,
+            attribute: None,
+            type_name: None,
+        }
+    );
+    assert!(
+        attr.validate(&Value::Concrete(ConcreteValue::String("ab".to_string())))
+            .is_ok()
+    );
+}
+
+#[test]
+fn custom_non_string_base_skips_pattern_and_length() {
+    let attr = AttributeType::custom(
+        None,
+        AttributeType::int(),
+        Some("^[a-z]+$".to_string()),
+        Some((Some(100), Some(200))),
+        noop_validator(),
+        None,
+    );
+
+    assert!(
+        attr.validate(&Value::Concrete(ConcreteValue::Int(5)))
+            .is_ok()
+    );
+}
+
+#[test]
+fn custom_uncompilable_pattern_is_non_fatal() {
+    let pattern = r"(?=x)";
+    assert!(
+        regex::Regex::new(pattern).is_err(),
+        "test must use a pattern unsupported by the regex crate"
+    );
+    let attr = AttributeType::custom(
+        None,
+        AttributeType::string(),
+        Some(pattern.to_string()),
+        None,
+        noop_validator(),
+        None,
+    );
+
+    assert!(
+        attr.validate(&Value::Concrete(ConcreteValue::String(
+            "anything".to_string()
+        )))
+        .is_ok()
+    );
+}
+
+#[test]
+fn schema_validate_attr_dispatches_to_custom_pattern_validation() {
+    let attr = AttributeType::custom(
+        Some(TypeIdentity::bare("Slug")),
+        AttributeType::string(),
+        Some("^[a-z]+$".to_string()),
+        None,
+        noop_validator(),
+        None,
+    );
+    let schema = Schema::flat(AttributeType::string());
+
+    let err = schema
+        .validate_attr(
+            &attr,
+            &Value::Concrete(ConcreteValue::String("ABC".to_string())),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err,
+        TypeError::PatternMismatch {
+            value: "ABC".to_string(),
+            pattern: "^[a-z]+$".to_string(),
+            attribute: None,
+            type_name: Some("Slug".to_string()),
+        }
+    );
 }
 
 #[test]

@@ -11,6 +11,7 @@ homepage.workspace = true
 futures = "0.3"
 pest = "2"
 pest_derive = "2"
+regex = "1" # Full regex is required: awscc CFN patterns use \p{...} Unicode classes that regex-lite cannot compile (awscc#295).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 semver = "1"

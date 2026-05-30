@@ -761,15 +761,20 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
         proto::AttributeType::Union { members } => {
             CoreAttributeType::union(members.iter().map(proto_attr_type_to_core).collect())
         }
-        proto::AttributeType::Custom { name, base } => CoreAttributeType::custom(
+        proto::AttributeType::Custom {
+            name,
+            base,
+            pattern,
+            length,
+        } => CoreAttributeType::custom(
             if name.is_empty() {
                 None
             } else {
                 Some(carina_core::schema::TypeIdentity::from_dotted(name))
             },
             proto_attr_type_to_core(base),
-            None,
-            None,
+            pattern.clone(),
+            *length,
             noop_validator(), // Validation is handled via ProviderContext.validators
             // `to_dsl` is a `fn` pointer that does not survive the
             // WASM-component boundary; host-side normalization for
@@ -1802,6 +1807,34 @@ mod tests {
                 assert!(dsl_aliases.is_empty());
             }
             other => panic!("expected StringEnum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_custom_pattern_and_length_propagate_to_core() {
+        let proto_attr = proto::AttributeType::Custom {
+            name: "awscc.wafv2.WebACL.EntityDescription".to_string(),
+            base: Box::new(proto::AttributeType::String),
+            pattern: Some("^x$".to_string()),
+            length: Some((Some(1), Some(9))),
+        };
+        let core_attr = proto_attr_type_to_core(&proto_attr);
+        let defs = carina_core::schema::empty_defs();
+        match core_attr.shape(defs) {
+            carina_core::schema::Shape::Custom {
+                identity,
+                pattern,
+                length,
+                ..
+            } => {
+                assert_eq!(
+                    identity.map(|id| id.kind.as_str()),
+                    Some("EntityDescription")
+                );
+                assert_eq!(pattern, Some("^x$"));
+                assert_eq!(length, Some((Some(1), Some(9))));
+            }
+            other => panic!("expected Custom, got {other:?}"),
         }
     }
 
