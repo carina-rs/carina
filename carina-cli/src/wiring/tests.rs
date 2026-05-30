@@ -2532,10 +2532,17 @@ mod wait_until_enum_alias {
     };
     use carina_core::schema::{AttributeType, ResourceSchema};
 
-    /// Minimal aws-like factory that knows the ACM `status` enum alias
-    /// `Issued` -> `ISSUED` (`convert_enum_value("aws.acm.Certificate.Status.Issued")`
-    /// yields `"Issued"`, so that is the alias-map key). Everything else
-    /// is stubbed to the bare minimum the helper needs (it only consults
+    /// Minimal aws-like factory that mirrors the REAL
+    /// `carina-provider-aws` ACM `status` enum reverse alias:
+    /// `("status", "issued") => "ISSUED"` (snake_case DSL spelling →
+    /// canonical AWS value; verified against
+    /// `carina-provider-aws/.../acm/certificate.rs`). The DSL value
+    /// `aws.acm.Certificate.Status.issued` — the exact form in the
+    /// reopened issue #3358 — passes through `convert_enum_value` to the
+    /// trailing segment `"issued"`, which is the alias-map key. Keying on
+    /// PascalCase `"Issued"` would NOT match the real provider, so the
+    /// test would prove a path production never exercises. Everything
+    /// else is stubbed to the minimum the helper needs (it only consults
     /// `get_enum_alias_reverse`).
     struct AcmAliasFactory;
 
@@ -2579,7 +2586,7 @@ mod wait_until_enum_alias {
             value: &str,
         ) -> Option<String> {
             match (resource_type, attr_name, value) {
-                ("acm.Certificate", "status", "Issued") => Some("ISSUED".to_string()),
+                ("acm.Certificate", "status", "issued") => Some("ISSUED".to_string()),
                 _ => None,
             }
         }
@@ -2640,13 +2647,15 @@ mod wait_until_enum_alias {
         WaitBinding {
             binding: "cert_issued".into(),
             target: "cert".into(),
-            until_raw: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
+            // The exact DSL form from the reopened issue #3358
+            // (snake_case `issued`, matching the real provider alias).
+            until_raw: "cert.status == aws.acm.Certificate.Status.issued".to_string(),
             until_predicate: UntilPredicateAst {
                 lhs_segments: vec!["cert".to_string(), "status".to_string()],
                 // Exactly what `lower_until_rhs` produces for the enum form:
                 // the raw dotted identifier, NOT the canonical value.
                 rhs: Value::Concrete(ConcreteValue::String(
-                    "aws.acm.Certificate.Status.Issued".to_string(),
+                    "aws.acm.Certificate.Status.issued".to_string(),
                 )),
             },
             timeout_secs: Some(60),
