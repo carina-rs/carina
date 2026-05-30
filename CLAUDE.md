@@ -333,7 +333,7 @@ benchmark (build in worktree A, then the same commit in worktree B) the
 second worktree took 7.6s with plain sccache because rustc still
 recompiled most crates (`user` time stayed at ~10s).
 
-[`sccache-wrapper`](https://github.com/moriyoshi/winterbaume/tree/main/tools/sccache-wrapper)
+[`sccache-wrapper`](https://github.com/moriyoshi/sccache-wrapper)
 is a `RUSTC_WRAPPER` that normalizes the workspace root to a
 `@@WORKSPACE@@` placeholder *before* computing the cache key, then
 delegates to sccache. With it, worktree B of the same benchmark hit the
@@ -343,14 +343,14 @@ cache for all 52 crates and finished in 1.6s (`user` time ~1.3s) — a
 Setup:
 
 ```bash
-# Build the wrapper from the winterbaume repo. Unset RUSTC_WRAPPER first
+# Build the wrapper from the sccache-wrapper repo. Unset RUSTC_WRAPPER first
 # to avoid the wrapper recursively invoking itself during its own build.
-git clone --depth 1 https://github.com/moriyoshi/winterbaume.git /tmp/winterbaume
-( cd /tmp/winterbaume && RUSTC_WRAPPER= cargo build -p sccache-wrapper --release )
+git clone --depth 1 https://github.com/moriyoshi/sccache-wrapper.git /tmp/sccache-wrapper
+( cd /tmp/sccache-wrapper && RUSTC_WRAPPER= cargo build --release )
 
 # Install the binary somewhere on PATH (or note its absolute path).
 mkdir -p ~/.local/bin
-cp /tmp/winterbaume/target/release/sccache-wrapper ~/.local/bin/
+cp /tmp/sccache-wrapper/target/release/sccache-wrapper ~/.local/bin/
 
 # Point .cargo/config.toml at the wrapper instead of sccache directly.
 cat > .cargo/config.toml << 'EOF'
@@ -360,7 +360,7 @@ rustc-wrapper = "/Users/<you>/.local/bin/sccache-wrapper"
 [env]
 # Shared rustc cache — keep it OUTSIDE any worktree so every worktree
 # reads and writes the same cache.
-WB_RUSTC_CACHE_DIR = "/Users/<you>/.cache/winterbaume-rustc-cache"
+WB_RUSTC_CACHE_DIR = "/Users/<you>/.cache/sccache-wrapper-rustc-cache"
 EOF
 ```
 
@@ -387,7 +387,7 @@ treating it as the established default (#2290).
 
 ### Multi-Worktree Parallel Verify
 
-When 2+ `git wt` worktrees are running `cargo nextest run` (or any
+When 2+ worktrees are running `cargo nextest run` (or any
 cargo build) at the same time, each worktree's verify cycle gets
 noticeably slower. The contention has three sources, in rough order
 of severity:
@@ -692,17 +692,15 @@ fix passed unit tests but never ran against the real infra fixture.
 
 ### Worktree-Based Development
 
-**IMPORTANT: Use `git wt` (NOT `git worktree`).** `git wt` is a separate tool (`/opt/homebrew/bin/git-wt`) with its own syntax. NEVER use `git worktree` commands.
-
 ```bash
 # Create worktree for a new task
-git wt <branch-name> main
+git worktree add .worktrees/<branch-name> -b <branch-name> main
 
 # List worktrees
-git wt
+git worktree list
 
-# Delete worktree after PR is merged (from main worktree, not feature worktree)
-git wt -d <branch-name>
+# Delete worktree after PR is merged (from the main worktree, not the feature worktree)
+git worktree remove .worktrees/<branch-name>
 ```
 
 ### Submodule Initialization
@@ -735,6 +733,50 @@ git remote prune origin           # Remove stale remote tracking branches
 - Always write a failing reproducing test BEFORE implementing the fix.
 - For TTY/rendering bugs, use PTY-based reproduction.
 - Run full verify/review/CI gates before merge.
+
+## Multi-Agent Workflows
+
+Claude Code's `Workflow` tool runs a deterministic script that fans
+work out across many subagents (parallel finders, adversarial
+verifiers, pipeline stages). It can spawn dozens of agents and consume
+a large amount of tokens, so it is **opt-in**: only run it when the
+work explicitly calls for multi-agent orchestration. Default to a
+single agent (or the `Agent` tool for one focused subtask) otherwise.
+
+When a workflow IS warranted in this repo, these are the high-value
+patterns:
+
+- **Broad audits / sweeps.** AWS-error-display style sweeps,
+  enum-alias/`snake_case` convention sweeps, or any "apply the same
+  mechanical change across N sibling sites" task. Fan out one agent
+  per file/site, verify each independently. Pairs with the
+  root-cause rule: use a workflow to *find every sibling site* so the
+  one upstream fix is provably complete, not to patch each site.
+- **Blast-radius investigation before a typed reshape.** When deciding
+  whether a newtype/typestate reshape lands in-PR or as a follow-up
+  (see "Measure radius before deferring"), fan out readers across the
+  affected crates to enumerate every call site in parallel. Prefer
+  dagayn's `get_impact_radius` first; escalate to a workflow only when
+  the graph result is ambiguous or needs source-level confirmation at
+  many sites.
+- **Multi-repo checks.** pick-issue / meta-tracker work that must scan
+  all three carina-rs repos (carina, carina-provider-aws,
+  carina-provider-awscc) — one agent per repo, then synthesize.
+- **Adversarial self-review.** The 5-round self-review can be
+  structured as a workflow: independent reviewers per dimension
+  (correctness, type-safety, root-cause vs symptom), each finding
+  verified by a skeptic prompted to refute it.
+
+Constraints specific to this repo:
+
+- A workflow does NOT relax any gate. Each agent still runs the
+  crate-scoped verify cycle (`cargo check -p` → `cargo nextest run` →
+  doctests → clippy → `scripts/check-*.sh`), and findings still need a
+  reproducing test before a fix lands.
+- Agents that mutate files in parallel must use `isolation: 'worktree'`
+  to avoid clobbering each other; read-only finders do not need it.
+- Have agents return structured output (the `schema` option) rather
+  than prose when you will post-process their results.
 
 <!-- dagayn MCP tools -->
 ## MCP Tools: dagayn
