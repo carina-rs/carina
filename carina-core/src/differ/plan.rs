@@ -512,6 +512,40 @@ pub fn create_plan(
             .or(schema_timeout)
             .unwrap_or(WAIT_DEFAULT_TIMEOUT);
         let interval = schema_interval.unwrap_or(WAIT_DEFAULT_INTERVAL);
+        // A gated wait is still elided when it has no work to do.
+        // carina#3101 covers "no consumer is changing ⇒ the wait gates
+        // nothing ⇒ elide". carina#3358 extends that: even when a
+        // consumer *is* changing (so `gates_a_pending_change` is true),
+        // an unchanged target whose cached state already satisfies the
+        // `until` predicate gives the wait nothing to do — on `apply` it
+        // would poll-and-return immediately. Dragging such a wait into
+        // the plan is pure noise (a `> <binding> (until …)` node with no
+        // pending work), so suppress it. The wait *does* have work when:
+        //   1. the target has no resolved identifier at plan time
+        //      (`ResolvedAtApply`; typically created this run) — its
+        //      post-apply attributes are unknown, must poll;
+        //   2. the target has a mutating effect in this plan — cached
+        //      attributes are stale, must re-poll; or
+        //   3. the target is unchanged but its cached state does not yet
+        //      satisfy the predicate (missing state ⇒ treat as work).
+        let wait_has_work = match &target {
+            WaitTarget::ResolvedAtApply => true,
+            WaitTarget::Known(_) => {
+                let target_is_mutating = plan
+                    .effects()
+                    .iter()
+                    .any(|e| e.resource_id() == &target_id && e.is_mutating());
+                let target_needs_wait = current_states
+                    .get(&target_id)
+                    .map(|s| !until.evaluate(&s.attributes))
+                    .unwrap_or(true);
+
+                target_is_mutating || target_needs_wait
+            }
+        };
+        if !wait_has_work {
+            continue;
+        }
         plan.add(Effect::Wait {
             // Lower BindingName -> String at the AST→Effect seam: the
             // executor IR (Effect) is string-keyed and is the separate
