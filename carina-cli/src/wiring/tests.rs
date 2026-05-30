@@ -2513,3 +2513,257 @@ mod kind_default_source_tests {
         assert_eq!(kind_default_source(&configs, "awscc"), None);
     }
 }
+
+/// carina#3358 (reopened after PR #3359): an enum-form `until` predicate
+/// must be resolved to the canonical AWS value before the differ lowers
+/// the wait into `Effect::Wait`, so an already-satisfied wait is elided.
+///
+/// PR #3359's gate calls `until.evaluate(&state.attributes)`. The parser
+/// lowers `until = cert.status == aws.acm.Certificate.Status.Issued` into
+/// the RAW dotted string `"aws.acm.Certificate.Status.Issued"`; the
+/// canonical state value is `"ISSUED"`. Unless the alias is resolved the
+/// two never compare equal, so the gate's `target_needs_wait` stays
+/// `true` and the no-op wait is emitted — the exact registry-dev repro.
+mod wait_until_enum_alias {
+    use super::super::*;
+    use carina_core::parser::{UntilPredicateAst, WaitBinding};
+    use carina_core::provider::{
+        BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer, ProviderResult,
+    };
+    use carina_core::schema::{AttributeType, ResourceSchema};
+
+    /// Minimal aws-like factory that knows the ACM `status` enum alias
+    /// `Issued` -> `ISSUED` (`convert_enum_value("aws.acm.Certificate.Status.Issued")`
+    /// yields `"Issued"`, so that is the alias-map key). Everything else
+    /// is stubbed to the bare minimum the helper needs (it only consults
+    /// `get_enum_alias_reverse`).
+    struct AcmAliasFactory;
+
+    impl ProviderFactory for AcmAliasFactory {
+        fn name(&self) -> &str {
+            "aws"
+        }
+        fn display_name(&self) -> &str {
+            "AWS (carina#3358 enum-alias stub)"
+        }
+        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+            HashMap::new()
+        }
+        fn validate_config(&self, _a: &IndexMap<String, Value>) -> Result<(), String> {
+            Ok(())
+        }
+        fn extract_region(&self, _a: &IndexMap<String, Value>) -> String {
+            "us-east-1".to_string()
+        }
+        fn create_provider(
+            &self,
+            _b: Option<&str>,
+            _a: &IndexMap<String, Value>,
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            Box::pin(async { Ok(Box::new(StubProvider) as Box<dyn Provider>) })
+        }
+        fn create_normalizer(
+            &self,
+            _b: Option<&str>,
+            _a: &IndexMap<String, Value>,
+        ) -> BoxFuture<'_, Box<dyn ProviderNormalizer>> {
+            Box::pin(async { Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer> })
+        }
+        fn schemas(&self) -> Vec<ResourceSchema> {
+            vec![ResourceSchema::new("acm.Certificate")]
+        }
+        fn get_enum_alias_reverse(
+            &self,
+            resource_type: &str,
+            attr_name: &str,
+            value: &str,
+        ) -> Option<String> {
+            match (resource_type, attr_name, value) {
+                ("acm.Certificate", "status", "Issued") => Some("ISSUED".to_string()),
+                _ => None,
+            }
+        }
+    }
+
+    // The helper only consults `factory.get_enum_alias_reverse`; the
+    // provider is never instantiated. These methods exist only to
+    // satisfy the trait and are unreachable in these tests.
+    struct StubProvider;
+    impl Provider for StubProvider {
+        fn name(&self) -> &str {
+            "aws"
+        }
+        fn read(
+            &self,
+            id: &ResourceId,
+            _i: Option<&str>,
+            _r: carina_core::provider::ReadRequest,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            let id = id.clone();
+            Box::pin(async move { Ok(State::not_found(id)) })
+        }
+        fn read_data_source(
+            &self,
+            r: &carina_core::resource::DataSource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            let id = r.id.clone();
+            Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
+        }
+        fn create(
+            &self,
+            id: &ResourceId,
+            _r: carina_core::provider::CreateRequest,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            let id = id.clone();
+            Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
+        }
+        fn update(
+            &self,
+            id: &ResourceId,
+            _i: &str,
+            _r: carina_core::provider::UpdateRequest,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            let id = id.clone();
+            Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
+        }
+        fn delete(
+            &self,
+            _id: &ResourceId,
+            _i: &str,
+            _r: carina_core::provider::DeleteRequest,
+        ) -> BoxFuture<'_, ProviderResult<()>> {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    fn enum_wait_binding() -> WaitBinding {
+        WaitBinding {
+            binding: "cert_issued".into(),
+            target: "cert".into(),
+            until_raw: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
+            until_predicate: UntilPredicateAst {
+                lhs_segments: vec!["cert".to_string(), "status".to_string()],
+                // Exactly what `lower_until_rhs` produces for the enum form:
+                // the raw dotted identifier, NOT the canonical value.
+                rhs: Value::Concrete(ConcreteValue::String(
+                    "aws.acm.Certificate.Status.Issued".to_string(),
+                )),
+            },
+            timeout_secs: Some(60),
+            depends_on: vec![],
+            line: 1,
+        }
+    }
+
+    fn cert_resource() -> Resource {
+        // Unchanged cert: desired matches state (status already ISSUED).
+        let mut r = Resource::with_provider("aws", "acm.Certificate", "cert", None);
+        r.binding = Some("cert".to_string());
+        r.set_attr(
+            "status".to_string(),
+            Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+        );
+        r
+    }
+
+    fn changed_consumer() -> Resource {
+        // New (absent from state) → Create → mutating; references the
+        // wait binding so `gates_a_pending_change` is satisfied.
+        let mut r = Resource::with_provider("aws", "cloudfront.Distribution", "dist", None);
+        r.binding = Some("dist".to_string());
+        r.dependency_bindings.insert("cert_issued".to_string());
+        r
+    }
+
+    fn cert_state() -> HashMap<ResourceId, State> {
+        let id = ResourceId::with_provider("aws", "acm.Certificate", "cert", None);
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "status".to_string(),
+            Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+        );
+        let mut states = HashMap::new();
+        states.insert(
+            id.clone(),
+            State::existing(id, attrs).with_identifier("arn:aws:acm:::certificate/abc"),
+        );
+        states
+    }
+
+    /// The fix's core: `resolve_enum_aliases_in_wait_bindings` rewrites
+    /// the raw enum RHS to the canonical AWS value using the target
+    /// resource's `(provider, resource_type)` and the factory alias map.
+    #[test]
+    fn helper_resolves_until_rhs_enum_alias_to_canonical() {
+        let ctx = WiringContext::new(vec![Box::new(AcmAliasFactory) as Box<dyn ProviderFactory>]);
+        let mut waits = vec![enum_wait_binding()];
+        let resources = vec![cert_resource()];
+
+        resolve_enum_aliases_in_wait_bindings(&ctx, &mut waits, &resources, &[]);
+
+        assert_eq!(
+            waits[0].until_predicate.rhs,
+            Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+            "until RHS enum identifier must resolve to the canonical AWS value"
+        );
+    }
+
+    /// End-to-end logic at the plan seam: with the RAW enum RHS the
+    /// differ emits a no-op wait (the bug); after the wiring's
+    /// enum-alias resolution it is elided. Drives the real
+    /// `resolve_enum_aliases_in_wait_bindings` -> `create_plan` pair the
+    /// plan path uses.
+    #[test]
+    fn create_plan_elides_already_satisfied_wait_after_enum_alias_resolution() {
+        let ctx = WiringContext::new(vec![Box::new(AcmAliasFactory) as Box<dyn ProviderFactory>]);
+        let resources = vec![cert_resource(), changed_consumer()];
+        let states = cert_state();
+
+        // Bug repro: unresolved RAW enum RHS → wait wrongly emitted.
+        let raw_waits = vec![enum_wait_binding()];
+        let plan_raw = create_plan(
+            &resources,
+            &[],
+            &states,
+            &HashMap::new(),
+            ctx.schemas(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &raw_waits,
+        );
+        assert!(
+            plan_raw
+                .effects()
+                .iter()
+                .any(|e| matches!(e, Effect::Wait { .. })),
+            "precondition: with the raw enum RHS the differ emits the no-op \
+             wait (the carina#3358 bug); effects were {:?}",
+            plan_raw.effects()
+        );
+
+        // Fixed: resolve the alias first → predicate satisfied → elided.
+        let mut waits = vec![enum_wait_binding()];
+        resolve_enum_aliases_in_wait_bindings(&ctx, &mut waits, &resources, &[]);
+        let plan_fixed = create_plan(
+            &resources,
+            &[],
+            &states,
+            &HashMap::new(),
+            ctx.schemas(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &waits,
+        );
+        assert!(
+            !plan_fixed
+                .effects()
+                .iter()
+                .any(|e| matches!(e, Effect::Wait { .. })),
+            "carina#3358: after enum-alias resolution the already-satisfied \
+             wait must be elided; effects were {:?}",
+            plan_fixed.effects()
+        );
+    }
+}

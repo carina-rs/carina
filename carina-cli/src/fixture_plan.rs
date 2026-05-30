@@ -256,6 +256,18 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &state_file,
     );
 
+    // carina#3358: resolve `until` predicate enum aliases before the
+    // differ lowers the wait, the same step the plan/apply pipelines run.
+    // The fixture harness uses an empty factory set so this is a no-op
+    // here, but keeping the sibling call consistent means a fixture that
+    // ever gains real factories cannot silently regress.
+    let mut wait_bindings = parsed.wait_bindings.clone();
+    crate::wiring::resolve_enum_aliases_in_wait_bindings(
+        &wiring,
+        &mut wait_bindings,
+        &resources,
+        &data_sources_for_plan,
+    );
     let mut plan = create_plan(
         &resources,
         &data_sources_for_plan,
@@ -265,7 +277,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &saved_attrs,
         &prev_explicit,
         &orphan_dependencies,
-        &parsed.wait_bindings,
+        &wait_bindings,
     );
 
     cascade_dependent_updates(

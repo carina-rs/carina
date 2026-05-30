@@ -829,6 +829,73 @@ pub fn resolve_enum_aliases_in_states(
     }
 }
 
+/// Resolve enum-alias values in each `wait` binding's `until` predicate
+/// RHS to their canonical AWS form, mirroring [`resolve_enum_aliases_in_states`]
+/// for resources/states.
+///
+/// carina#3358: the parser lowers an enum-form predicate
+/// (`until = cert.status == aws.acm.Certificate.Status.Issued`) into a
+/// raw dotted-identifier string (`"aws.acm.Certificate.Status.Issued"`)
+/// — see `lower_until_rhs` in
+/// `carina-core/src/parser/expressions/wait_expr.rs`, whose comment
+/// promises "the differ resolves these to canonical AWS string values at
+/// plan time". Nothing did: the plan-path enum-alias pass canonicalized
+/// `resources` and `current_states` but never `wait_bindings`. So
+/// `WaitPredicate::evaluate` compared the raw DSL identifier against the
+/// AWS-canonical state value (`"ISSUED"`) and never matched — both in the
+/// plan-time elision gate (carina#3359) and in the executor's apply-time
+/// poll (`carina-core/src/executor/wait.rs`), which would poll to
+/// timeout. This closes that gap at the single seam by reusing the exact
+/// per-value resolver (`resolve_value_alias`) the resource/state passes
+/// use, so the `Effect::Wait.until.value` `create_plan` persists is
+/// canonical.
+///
+/// The predicate attribute is `lhs_segments[1]` (segment 0 is the target
+/// binding root). The target resource's `(provider, resource_type)` is
+/// recovered by matching `wb.target` against the already-resolved managed
+/// resources and data sources. Bindings whose target/attr/factory cannot
+/// be resolved are left unchanged (target validation lives in
+/// `carina_core::validation::wait`).
+pub(crate) fn resolve_enum_aliases_in_wait_bindings(
+    ctx: &WiringContext,
+    wait_bindings: &mut [carina_core::parser::WaitBinding],
+    resources: &[Resource],
+    data_sources: &[carina_core::resource::DataSource],
+) {
+    for wb in wait_bindings.iter_mut() {
+        let Some(attr_name) = wb.until_predicate.lhs_segments.get(1).cloned() else {
+            continue;
+        };
+        let target = wb.target.as_str();
+        // Recover the target's identity from the resolved sets that
+        // `create_plan` itself consumes, so provider/resource_type match
+        // what the differ sees.
+        let target_id = resources
+            .iter()
+            .find(|r| r.binding.as_deref() == Some(target))
+            .map(|r| &r.id)
+            .or_else(|| {
+                data_sources
+                    .iter()
+                    .find(|d| d.binding.as_deref() == Some(target))
+                    .map(|d| &d.id)
+            });
+        let Some(id) = target_id else { continue };
+        if id.provider.is_empty() {
+            continue;
+        }
+        let Some(factory) = provider_mod::find_factory(ctx.factories(), &id.provider) else {
+            continue;
+        };
+        carina_core::value::resolve_value_alias(
+            &mut wb.until_predicate.rhs,
+            &id.resource_type,
+            &attr_name,
+            factory,
+        );
+    }
+}
+
 pub fn check_unused_bindings<E: carina_core::parser::ExportParamLike>(
     parsed: &carina_core::parser::File<E>,
 ) -> Vec<String> {
@@ -2012,6 +2079,18 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         .as_ref()
         .map(|sf| sf.build_directives())
         .unwrap_or_default();
+    // carina#3358: canonicalize the `until` predicate RHS enum aliases
+    // before the differ lowers the wait into `Effect::Wait`, using the
+    // same resolver the resource/state passes use. Without this an
+    // enum-form predicate's raw DSL identifier never matches the
+    // AWS-canonical state value.
+    let mut wait_bindings = parsed.wait_bindings.clone();
+    resolve_enum_aliases_in_wait_bindings(
+        &ctx,
+        &mut wait_bindings,
+        &resources,
+        &data_sources_for_plan,
+    );
     let mut plan = create_plan(
         &resources,
         &data_sources_for_plan,
@@ -2021,7 +2100,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         &saved_attrs,
         &prev_explicit,
         &orphan_dependencies,
-        &parsed.wait_bindings,
+        &wait_bindings,
     );
 
     // Populate cascading updates for Replace effects with create_before_destroy.

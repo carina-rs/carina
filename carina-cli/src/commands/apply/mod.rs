@@ -1203,6 +1203,19 @@ async fn run_apply_locked(
         .map(|sf| sf.build_directives())
         .unwrap_or_default();
     let schemas = ctx.schemas();
+    // carina#3358: canonicalize the `until` predicate RHS enum aliases
+    // before the differ lowers the wait into `Effect::Wait`, mirroring
+    // the plan path (`create_plan_from_parsed_with_upstream`). The apply
+    // path is a separate pipeline that calls `create_plan` directly, so
+    // it needs the same resolution or an enum-form `until` predicate
+    // would poll to timeout against the canonical state value.
+    let mut wait_bindings = parsed.wait_bindings.clone();
+    crate::wiring::resolve_enum_aliases_in_wait_bindings(
+        ctx,
+        &mut wait_bindings,
+        &resources_for_plan,
+        &data_sources_for_plan,
+    );
     let mut plan = create_plan(
         &resources_for_plan,
         &data_sources_for_plan,
@@ -1212,7 +1225,7 @@ async fn run_apply_locked(
         &saved_attrs,
         &prev_explicit,
         &orphan_dependencies,
-        &parsed.wait_bindings,
+        &wait_bindings,
     );
 
     // Populate cascading updates for create_before_destroy Replace effects.
