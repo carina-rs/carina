@@ -1436,6 +1436,7 @@ impl WasmProviderFactory {
             .call_info(&mut store)
             .await
             .map_err(|e| format!("Failed to call info(): {e}"))?;
+        wasm_convert::check_protocol_version(&info_json)?;
 
         let schemas_json = bindings
             .call_schemas(&mut store)
@@ -1545,6 +1546,7 @@ impl WasmProviderFactory {
             .call_info(&mut store)
             .await
             .map_err(|e| format!("Failed to call info(): {e}"))?;
+        wasm_convert::check_protocol_version(&info_json)?;
 
         let schemas_json = bindings
             .call_schemas(&mut store)

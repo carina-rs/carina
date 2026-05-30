@@ -344,7 +344,11 @@ macro_rules! export_provider {
                 fn info() -> String {
                     let provider = get_provider().lock().unwrap();
                     let info = $crate::CarinaProvider::info(&*provider);
-                    serde_json::to_string(&info).unwrap_or_else(|_| "{}".to_string())
+                    let envelope = $crate::protocol::types::ProviderInfoEnvelope {
+                        info,
+                        protocol_version: $crate::protocol::PROTOCOL_VERSION,
+                    };
+                    serde_json::to_string(&envelope).unwrap_or_else(|_| "{}".to_string())
                 }
 
                 fn schemas() -> String {
@@ -835,7 +839,11 @@ macro_rules! export_provider {
                 fn info() -> String {
                     let provider = get_provider().lock().unwrap();
                     let info = $crate::CarinaProvider::info(&*provider);
-                    serde_json::to_string(&info).unwrap_or_else(|_| "{}".to_string())
+                    let envelope = $crate::protocol::types::ProviderInfoEnvelope {
+                        info,
+                        protocol_version: $crate::protocol::PROTOCOL_VERSION,
+                    };
+                    serde_json::to_string(&envelope).unwrap_or_else(|_| "{}".to_string())
                 }
 
                 fn schemas() -> String {
