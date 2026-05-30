@@ -9,7 +9,7 @@
 current_branch=$(git symbolic-ref --short HEAD 2>/dev/null)
 if [ "$current_branch" = "main" ] || [ "$current_branch" = "master" ]; then
     echo "ERROR: Direct commits to '$current_branch' are not allowed."
-    echo "Create a feature branch first: git wt <branch-name> main"
+    echo "Create a feature branch first: git worktree add .worktrees/<branch-name> -b <branch-name> main"
     exit 1
 fi
 
