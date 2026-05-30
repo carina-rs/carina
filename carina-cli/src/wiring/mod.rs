@@ -584,14 +584,24 @@ impl<'a> PlanPreprocessor<'a> {
         Self { normalizer, ctx }
     }
 
-    /// Run the full normalization pipeline on desired resources and current states.
+    /// Run the full normalization pipeline on desired resources, current
+    /// states, and `wait` predicates.
     ///
-    /// Call after `resolve_refs_with_state_and_remote()` and before `create_plan()`.
+    /// Call after `resolve_refs_with_state_and_remote()` and before
+    /// `create_plan()`. This is the single seam both the plan and apply
+    /// pipelines traverse, so the three enum-alias passes
+    /// (resources, states, and — carina#3358 — wait `until` predicates)
+    /// live here together: a `create_plan` caller that runs `prepare`
+    /// cannot canonicalize resources/states while silently skipping
+    /// waits. `wait_bindings` is mutated in place; pass the same slice
+    /// on to `create_plan`.
     pub async fn prepare(
         &self,
         resources: &mut [Resource],
         current_states: &mut HashMap<ResourceId, State>,
         provider_configs: &[ProviderConfig],
+        data_sources: &[carina_core::resource::DataSource],
+        wait_bindings: &mut [carina_core::parser::WaitBinding],
     ) {
         // RFC #2371 stage 2 + #2387: strip every attribute the WASM
         // provider boundary refuses to serialize — `Value::Deferred(DeferredValue::Unknown)`
@@ -624,6 +634,12 @@ impl<'a> PlanPreprocessor<'a> {
         }
         resolve_enum_aliases_with_ctx(self.ctx, resources);
         resolve_enum_aliases_in_states(self.ctx, current_states);
+        // carina#3358: the `until` predicate RHS is the third enum-alias
+        // axis. Resolve it here, beside the resource/state passes, so the
+        // shared seam keeps all three in lockstep. `resources` carry
+        // their real `id`/`binding` (stripping only touched attributes),
+        // so target lookup is valid at this point.
+        resolve_enum_aliases_in_wait_bindings(self.ctx, wait_bindings, resources, data_sources);
         restore_stripped_attributes(resources, stripped);
     }
 }
@@ -2068,10 +2084,18 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     carina_core::value::canonicalize_states_with_schemas(&mut current_states, ctx.schemas());
 
     // Run the normalization pipeline: normalize_desired → normalize_state →
-    // merge_default_tags → resolve_enum_aliases (order matters).
+    // merge_default_tags → resolve_enum_aliases (resources, states, and
+    // wait `until` predicates — carina#3358). Order matters.
+    let mut wait_bindings = parsed.wait_bindings.clone();
     let preprocessor = PlanPreprocessor::new(&provider, &ctx);
     preprocessor
-        .prepare(&mut resources, &mut current_states, &parsed.providers)
+        .prepare(
+            &mut resources,
+            &mut current_states,
+            &parsed.providers,
+            &data_sources_for_plan,
+            &mut wait_bindings,
+        )
         .await;
 
     // Build directives map from state file for orphaned resource deletion
@@ -2079,18 +2103,6 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         .as_ref()
         .map(|sf| sf.build_directives())
         .unwrap_or_default();
-    // carina#3358: canonicalize the `until` predicate RHS enum aliases
-    // before the differ lowers the wait into `Effect::Wait`, using the
-    // same resolver the resource/state passes use. Without this an
-    // enum-form predicate's raw DSL identifier never matches the
-    // AWS-canonical state value.
-    let mut wait_bindings = parsed.wait_bindings.clone();
-    resolve_enum_aliases_in_wait_bindings(
-        &ctx,
-        &mut wait_bindings,
-        &resources,
-        &data_sources_for_plan,
-    );
     let mut plan = create_plan(
         &resources,
         &data_sources_for_plan,

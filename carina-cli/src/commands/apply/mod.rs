@@ -1189,12 +1189,18 @@ async fn run_apply_locked(
     carina_core::value::canonicalize_states_with_schemas(&mut current_states, ctx.schemas());
 
     // Run the normalization pipeline (same as plan path in wiring.rs).
+    // `prepare` also canonicalizes the wait `until` predicate enum
+    // aliases (carina#3358); the apply path is a separate pipeline that
+    // calls `create_plan` directly, so it relies on the same shared seam.
+    let mut wait_bindings = parsed.wait_bindings.clone();
     let preprocessor = crate::wiring::PlanPreprocessor::new(&provider, ctx);
     preprocessor
         .prepare(
             &mut resources_for_plan,
             &mut current_states,
             &parsed.providers,
+            &data_sources_for_plan,
+            &mut wait_bindings,
         )
         .await;
 
@@ -1203,19 +1209,6 @@ async fn run_apply_locked(
         .map(|sf| sf.build_directives())
         .unwrap_or_default();
     let schemas = ctx.schemas();
-    // carina#3358: canonicalize the `until` predicate RHS enum aliases
-    // before the differ lowers the wait into `Effect::Wait`, mirroring
-    // the plan path (`create_plan_from_parsed_with_upstream`). The apply
-    // path is a separate pipeline that calls `create_plan` directly, so
-    // it needs the same resolution or an enum-form `until` predicate
-    // would poll to timeout against the canonical state value.
-    let mut wait_bindings = parsed.wait_bindings.clone();
-    crate::wiring::resolve_enum_aliases_in_wait_bindings(
-        ctx,
-        &mut wait_bindings,
-        &resources_for_plan,
-        &data_sources_for_plan,
-    );
     let mut plan = create_plan(
         &resources_for_plan,
         &data_sources_for_plan,

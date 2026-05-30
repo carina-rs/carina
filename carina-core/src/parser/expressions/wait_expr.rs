@@ -395,6 +395,11 @@ mod tests {
             "cert.status == aws.acm.Certificate.Status.Issued"
         );
         assert_eq!(we.until_predicate.lhs_segments, vec!["cert", "status"]);
+        // The RHS is kept as the RAW dotted identifier here; enum-alias
+        // resolution to the canonical AWS value happens downstream in the
+        // plan/apply pipeline (`resolve_enum_aliases_in_wait_bindings`,
+        // carina#3358). If this ever pre-resolves at parse time, that
+        // wiring step — and its tests — must be revisited.
         assert_eq!(
             we.until_predicate.rhs,
             Value::Concrete(ConcreteValue::String(
