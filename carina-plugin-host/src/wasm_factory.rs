@@ -998,8 +998,9 @@ fn add_wasi_sans_sockets_to_linker<T: WasiView>(linker: &mut Linker<T>) -> wasmt
 async fn create_instance(
     engine: &Engine,
     component: &Component,
+    provider_kind: Option<&str>,
 ) -> Result<(Store<HostState>, WasmBindings), String> {
-    let wasi_ctx = WasiCtxBuilder::new().inherit_stderr().build();
+    let wasi_ctx = build_sandboxed_wasi_ctx(provider_kind);
     let host_state = HostState {
         wasi_ctx,
         http_ctx: None,
@@ -1022,11 +1023,26 @@ async fn create_instance(
     Ok((store, WasmBindings::Basic(bindings)))
 }
 
-/// Environment variables allowed to pass through to WASM plugins.
+/// Environment variables exposed to **every** WASM guest, regardless of
+/// provider kind.
 ///
-/// Only variables needed by the AWS SDK and for debugging are included.
-/// All other host environment variables are hidden from plugins.
-const WASM_ENV_ALLOWLIST: &[&str] = &[
+/// These are provider-agnostic utilities, NOT credentials. Credentials
+/// live in per-provider-kind partitions below so that one provider's
+/// secret never reaches another provider's guest.
+const SHARED_ENV_ALLOWLIST: &[&str] = &[
+    "HOME",
+    "RUST_LOG",
+    // When set to "1", the WASM-side wasi:http bridge in carina-plugin-sdk
+    // emits a per-phase wall-clock breakdown of each request to stderr.
+    // Off by default; intended for diagnosing transport-level latency.
+    "CARINA_WASI_HTTP_TRACE",
+];
+
+/// Environment variables exposed only to the AWS providers (`aws`,
+/// `awscc`). These are exactly the AWS SDK's auto-discovered credential
+/// and region inputs; the SDK's own chain (`aws_config::defaults().load()`)
+/// reads them — the host merely makes them visible inside the sandbox.
+const AWS_ENV_ALLOWLIST: &[&str] = &[
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
@@ -1036,26 +1052,93 @@ const WASM_ENV_ALLOWLIST: &[&str] = &[
     "AWS_EC2_METADATA_DISABLED",
     "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
     "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-    "HOME",
-    "RUST_LOG",
-    // When set to "1", the WASM-side wasi:http bridge in carina-plugin-sdk
-    // emits a per-phase wall-clock breakdown of each request to stderr.
-    // Off by default; intended for diagnosing transport-level latency.
-    "CARINA_WASI_HTTP_TRACE",
 ];
 
-/// Build a WASI context that only exposes allowlisted environment variables.
-fn build_sandboxed_wasi_ctx() -> WasiCtx {
+/// Environment variables exposed only to the GitHub provider.
+const GITHUB_ENV_ALLOWLIST: &[&str] = &["GITHUB_TOKEN"];
+
+/// A provider kind whose credential partition the host knows about.
+///
+/// The WASM guest reports a free-form provider name via `info()`; that
+/// raw string is classified once into this closed enum by
+/// [`ProviderKind::from_name`]. Keeping the classification in a closed
+/// enum makes [`credential_partition`] an *exhaustive* match: adding a
+/// new credentialed provider forces a new arm to be handled at compile
+/// time, so a future provider cannot silently fall through and receive
+/// no credentials by omission (the "new caller tomorrow" guarantee —
+/// the type, not a convention, answers what partition a provider gets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderKind {
+    /// AWS native-SDK and Cloud Control providers; both consume the AWS
+    /// SDK's auto-discovered credential/region env inputs.
+    Aws,
+    /// The GitHub provider.
+    GitHub,
+    /// Any provider the host has no credential partition for (e.g. the
+    /// mock provider, or the kind-less info/schemas instance). Receives
+    /// the shared group only — never another provider's credentials.
+    Other,
+}
+
+impl ProviderKind {
+    /// Classify a guest-reported provider name. Unrecognized names map to
+    /// [`ProviderKind::Other`] (fail-closed: no credentials), so a typo or
+    /// casing drift in a provider's `info()` name yields *fewer* secrets,
+    /// never another provider's.
+    fn from_name(name: Option<&str>) -> Self {
+        match name {
+            Some("aws") | Some("awscc") => ProviderKind::Aws,
+            Some("github") => ProviderKind::GitHub,
+            _ => ProviderKind::Other,
+        }
+    }
+
+    /// The credential env-var partition for this kind. Exhaustive by
+    /// construction — a new `ProviderKind` variant will not compile until
+    /// its partition is decided here.
+    fn credential_partition(self) -> &'static [&'static str] {
+        match self {
+            ProviderKind::Aws => AWS_ENV_ALLOWLIST,
+            ProviderKind::GitHub => GITHUB_ENV_ALLOWLIST,
+            ProviderKind::Other => &[],
+        }
+    }
+}
+
+/// Resolve the set of allowlisted env-var names a given provider's guest
+/// may receive: the shared group plus that kind's own credential
+/// partition.
+///
+/// `name` is the provider name as reported by `info()` (`"aws"`,
+/// `"awscc"`, `"github"`, ...). `None` is the kind-less info/schemas
+/// instance, which calls neither `initialize` nor any credentialed
+/// operation and therefore gets the shared group only — no credentials.
+fn env_keys_for_kind(name: Option<&str>) -> Vec<&'static str> {
+    let mut keys: Vec<&'static str> = SHARED_ENV_ALLOWLIST.to_vec();
+    keys.extend_from_slice(ProviderKind::from_name(name).credential_partition());
+    keys
+}
+
+/// Build a WASI context that only exposes the env vars allowlisted for
+/// `provider_kind` (its credential partition plus the shared group).
+///
+/// See [`env_keys_for_kind`] for the partitioning rule.
+fn build_sandboxed_wasi_ctx(provider_kind: Option<&str>) -> WasiCtx {
     let mut builder = WasiCtxBuilder::new();
     builder.inherit_stderr();
-    for key in WASM_ENV_ALLOWLIST {
+    let keys = env_keys_for_kind(provider_kind);
+    for key in &keys {
         if let Ok(val) = std::env::var(key) {
             builder.env(key, &val);
         }
     }
-    // Auto-disable IMDS if metadata endpoints are unreachable,
-    // unless the user has explicitly set the variable.
-    if std::env::var("AWS_EC2_METADATA_DISABLED").is_err() && !is_metadata_available() {
+    // Auto-disable IMDS if metadata endpoints are unreachable, unless the
+    // user has explicitly set the variable. Only relevant for the AWS
+    // partition, which is the only one carrying AWS_EC2_METADATA_DISABLED.
+    if keys.contains(&"AWS_EC2_METADATA_DISABLED")
+        && std::env::var("AWS_EC2_METADATA_DISABLED").is_err()
+        && !is_metadata_available()
+    {
         builder.env("AWS_EC2_METADATA_DISABLED", "true");
     }
     builder.build()
@@ -1064,8 +1147,9 @@ fn build_sandboxed_wasi_ctx() -> WasiCtx {
 async fn create_instance_with_http(
     engine: &Engine,
     component: &Component,
+    provider_kind: Option<&str>,
 ) -> Result<(Store<HostState>, WasmBindings), String> {
-    let wasi_ctx = build_sandboxed_wasi_ctx();
+    let wasi_ctx = build_sandboxed_wasi_ctx(provider_kind);
     let host_state = HostState {
         wasi_ctx,
         http_ctx: Some(WasiHttpCtx::new()),
@@ -1108,11 +1192,12 @@ type CreateInstanceResult = Result<(Store<HostState>, WasmBindings, bool), Strin
 fn create_instance_auto<'a>(
     engine: &'a Engine,
     component: &'a Component,
+    provider_kind: Option<&'a str>,
 ) -> BoxFuture<'a, CreateInstanceResult> {
     Box::pin(async move {
-        match create_instance_with_http(engine, component).await {
+        match create_instance_with_http(engine, component, provider_kind).await {
             Ok((store, bindings)) => Ok((store, bindings, true)),
-            Err(http_err) => match create_instance(engine, component).await {
+            Err(http_err) => match create_instance(engine, component, provider_kind).await {
                 Ok((store, bindings)) => Ok((store, bindings, false)),
                 Err(basic_err) => Err(format_dual_instantiation_error(&http_err, &basic_err)),
             },
@@ -1345,7 +1430,8 @@ impl WasmProviderFactory {
             )
         })?;
 
-        let (mut store, bindings, enable_http) = create_instance_auto(&engine, &component).await?;
+        let (mut store, bindings, enable_http) =
+            create_instance_auto(&engine, &component, None).await?;
         let info_json = bindings
             .call_info(&mut store)
             .await
@@ -1453,7 +1539,8 @@ impl WasmProviderFactory {
                 )
             })?;
 
-        let (mut store, bindings, enable_http) = create_instance_auto(&engine, &component).await?;
+        let (mut store, bindings, enable_http) =
+            create_instance_auto(&engine, &component, None).await?;
         let info_json = bindings
             .call_info(&mut store)
             .await
@@ -1508,10 +1595,15 @@ impl WasmProviderFactory {
         &self,
         attributes: &IndexMap<String, Value>,
     ) -> Result<(Store<HostState>, WasmBindings), String> {
+        // This is the credentialed runtime instance (it calls
+        // `initialize` and then read/create/update/delete). The provider
+        // kind is known here (`self.name`, learned from `info()` at load
+        // time), so the guest receives only its own credential partition.
+        let kind = Some(self.name.as_str());
         let (mut store, bindings) = if self.enable_http {
-            create_instance_with_http(&self.engine, &self.component).await?
+            create_instance_with_http(&self.engine, &self.component, kind).await?
         } else {
-            create_instance(&self.engine, &self.component).await?
+            create_instance(&self.engine, &self.component, kind).await?
         };
         let wit_attrs =
             wasm_convert::core_to_wit_value_map(attributes).map_err(|e| e.to_string())?;
@@ -2156,31 +2248,116 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_wasm_env_allowlist_contains_required_vars() {
-        // Verify the allowlist contains the expected AWS and utility variables
-        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_ACCESS_KEY_ID"));
-        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_SECRET_ACCESS_KEY"));
-        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_SESSION_TOKEN"));
-        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_REGION"));
-        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_DEFAULT_REGION"));
-        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_ENDPOINT_URL"));
-        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_EC2_METADATA_DISABLED"));
-        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"));
-        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_CONTAINER_CREDENTIALS_FULL_URI"));
-        assert!(WASM_ENV_ALLOWLIST.contains(&"HOME"));
-        assert!(WASM_ENV_ALLOWLIST.contains(&"RUST_LOG"));
-        assert!(WASM_ENV_ALLOWLIST.contains(&"CARINA_WASI_HTTP_TRACE"));
+    fn test_aws_partition_contains_required_vars() {
+        // The AWS providers (aws, awscc) receive the AWS SDK's
+        // auto-discovered credential/region inputs.
+        let keys = env_keys_for_kind(Some("aws"));
+        assert!(keys.contains(&"AWS_ACCESS_KEY_ID"));
+        assert!(keys.contains(&"AWS_SECRET_ACCESS_KEY"));
+        assert!(keys.contains(&"AWS_SESSION_TOKEN"));
+        assert!(keys.contains(&"AWS_REGION"));
+        assert!(keys.contains(&"AWS_DEFAULT_REGION"));
+        assert!(keys.contains(&"AWS_ENDPOINT_URL"));
+        assert!(keys.contains(&"AWS_EC2_METADATA_DISABLED"));
+        assert!(keys.contains(&"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"));
+        assert!(keys.contains(&"AWS_CONTAINER_CREDENTIALS_FULL_URI"));
+        // awscc shares the same AWS partition.
+        assert!(env_keys_for_kind(Some("awscc")).contains(&"AWS_ACCESS_KEY_ID"));
     }
 
     #[test]
-    fn test_wasm_env_allowlist_excludes_sensitive_vars() {
-        // Verify that common sensitive/unrelated variables are NOT in the allowlist
-        assert!(!WASM_ENV_ALLOWLIST.contains(&"PATH"));
-        assert!(!WASM_ENV_ALLOWLIST.contains(&"SHELL"));
-        assert!(!WASM_ENV_ALLOWLIST.contains(&"USER"));
-        assert!(!WASM_ENV_ALLOWLIST.contains(&"SSH_AUTH_SOCK"));
-        assert!(!WASM_ENV_ALLOWLIST.contains(&"GITHUB_TOKEN"));
-        assert!(!WASM_ENV_ALLOWLIST.contains(&"DATABASE_URL"));
+    fn test_shared_vars_reach_every_kind() {
+        // Provider-agnostic utility vars reach every guest, including
+        // the kind-less (info/schemas) instance.
+        for kind in [Some("aws"), Some("awscc"), Some("github"), None] {
+            let keys = env_keys_for_kind(kind);
+            assert!(keys.contains(&"HOME"), "HOME missing for {kind:?}");
+            assert!(keys.contains(&"RUST_LOG"), "RUST_LOG missing for {kind:?}");
+            assert!(
+                keys.contains(&"CARINA_WASI_HTTP_TRACE"),
+                "CARINA_WASI_HTTP_TRACE missing for {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_github_token_is_partitioned_to_github_only() {
+        // GITHUB_TOKEN reaches the github guest...
+        assert!(env_keys_for_kind(Some("github")).contains(&"GITHUB_TOKEN"));
+        // ...and NEVER the aws / awscc guests (the partition is a real
+        // isolation boundary, not a flat global list).
+        assert!(!env_keys_for_kind(Some("aws")).contains(&"GITHUB_TOKEN"));
+        assert!(!env_keys_for_kind(Some("awscc")).contains(&"GITHUB_TOKEN"));
+        // ...and not the kind-less info/schemas instance either.
+        assert!(!env_keys_for_kind(None).contains(&"GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn test_aws_creds_never_reach_github_guest() {
+        // Symmetric isolation: AWS credentials must not leak into the
+        // github guest.
+        let github = env_keys_for_kind(Some("github"));
+        assert!(!github.contains(&"AWS_ACCESS_KEY_ID"));
+        assert!(!github.contains(&"AWS_SECRET_ACCESS_KEY"));
+        assert!(!github.contains(&"AWS_SESSION_TOKEN"));
+    }
+
+    #[test]
+    fn test_no_partition_leaks_sensitive_unrelated_vars() {
+        // Common sensitive/unrelated variables are in NO partition.
+        for kind in [Some("aws"), Some("awscc"), Some("github"), None] {
+            let keys = env_keys_for_kind(kind);
+            for forbidden in ["PATH", "SHELL", "USER", "SSH_AUTH_SOCK", "DATABASE_URL"] {
+                assert!(
+                    !keys.contains(&forbidden),
+                    "{forbidden} leaked into {kind:?} partition"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_unknown_kind_gets_shared_only() {
+        // An unrecognized provider kind receives only the shared group —
+        // no credentials of any provider.
+        let keys = env_keys_for_kind(Some("totally-unknown-provider"));
+        assert!(keys.contains(&"HOME"));
+        assert!(!keys.contains(&"AWS_ACCESS_KEY_ID"));
+        assert!(!keys.contains(&"GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn test_provider_kind_classification() {
+        assert_eq!(ProviderKind::from_name(Some("aws")), ProviderKind::Aws);
+        assert_eq!(ProviderKind::from_name(Some("awscc")), ProviderKind::Aws);
+        assert_eq!(
+            ProviderKind::from_name(Some("github")),
+            ProviderKind::GitHub
+        );
+        // Unknown / mock / kind-less all fail closed to Other.
+        assert_eq!(ProviderKind::from_name(Some("mock")), ProviderKind::Other);
+        assert_eq!(ProviderKind::from_name(None), ProviderKind::Other);
+        // Casing/spelling drift fails closed (does NOT match Aws/GitHub).
+        assert_eq!(ProviderKind::from_name(Some("AWS")), ProviderKind::Other);
+        assert_eq!(ProviderKind::from_name(Some("GitHub")), ProviderKind::Other);
+    }
+
+    #[test]
+    fn test_other_kind_has_empty_credential_partition() {
+        // The fail-closed kind carries no credentials — only the shared
+        // group reaches it (asserted via env_keys_for_kind above).
+        assert!(ProviderKind::Other.credential_partition().is_empty());
+    }
+
+    #[test]
+    fn test_imds_var_only_in_aws_partition() {
+        // AWS_EC2_METADATA_DISABLED gates the IMDS auto-disable probe in
+        // build_sandboxed_wasi_ctx; that probe must run only for the AWS
+        // partition. Pin the gate condition: the var is present for aws,
+        // absent for github / None.
+        assert!(env_keys_for_kind(Some("aws")).contains(&"AWS_EC2_METADATA_DISABLED"));
+        assert!(!env_keys_for_kind(Some("github")).contains(&"AWS_EC2_METADATA_DISABLED"));
+        assert!(!env_keys_for_kind(None).contains(&"AWS_EC2_METADATA_DISABLED"));
     }
 
     #[test]
@@ -2188,7 +2365,8 @@ mod tests {
         // Verify that building the sandboxed context succeeds even when
         // allowlisted variables are not set in the environment.
         // This confirms the `if let Ok(val)` guard handles missing vars.
-        let _ctx = build_sandboxed_wasi_ctx();
+        let _ctx = build_sandboxed_wasi_ctx(Some("aws"));
+        let _ctx_none = build_sandboxed_wasi_ctx(None);
     }
 
     #[test]
@@ -2307,9 +2485,10 @@ mod tests {
     }
 
     #[test]
-    fn test_ecs_env_vars_in_allowlist() {
-        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"));
-        assert!(WASM_ENV_ALLOWLIST.contains(&"AWS_CONTAINER_CREDENTIALS_FULL_URI"));
+    fn test_ecs_env_vars_in_aws_partition() {
+        let keys = env_keys_for_kind(Some("aws"));
+        assert!(keys.contains(&"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"));
+        assert!(keys.contains(&"AWS_CONTAINER_CREDENTIALS_FULL_URI"));
     }
 
     #[test]
