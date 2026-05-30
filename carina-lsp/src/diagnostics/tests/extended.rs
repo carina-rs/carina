@@ -3083,6 +3083,48 @@ fn lsp_quoted_literal_on_namespaced_custom_says_got_a_string_literal() {
     );
 }
 
+#[test]
+fn lsp_custom_string_pattern_mismatch_reports_required_pattern() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
+
+    let bucket_name = AttributeType::custom(
+        Some(carina_core::schema::TypeIdentity::bare("BucketName")),
+        AttributeType::string(),
+        Some("^prod-[a-z0-9]+$".to_string()),
+        None,
+        legacy_validator(|_| Ok(())),
+        None,
+    );
+    let schema = ResourceSchema::new("s3.bucket")
+        .attribute(AttributeSchema::new("bucket_name", bucket_name));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("aws", schema);
+    let engine = custom_engine(schemas);
+
+    let doc = create_document(
+        r#"aws.s3.bucket {
+  bucket_name = "dev_bucket"
+}
+"#,
+    );
+    let diagnostics = engine.analyze(&doc, None);
+    let pattern_mismatch = diagnostics
+        .iter()
+        .find(|d| d.message.contains("does not match required pattern"))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected pattern mismatch diagnostic, got: {:?}",
+                diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+            )
+        });
+
+    assert!(
+        pattern_mismatch.message.contains("^prod-[a-z0-9]+$"),
+        "diagnostic must include the schema pattern, got: {}",
+        pattern_mismatch.message
+    );
+}
+
 // #2131 / #2132: a ResourceRef whose root is declared in a sibling `.crn`
 // must NOT be flagged `Undefined resource`. The LSP text-scan used to
 // feed on the current file's bindings plus a hand-rolled sibling scan
