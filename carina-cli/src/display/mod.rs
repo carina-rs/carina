@@ -1241,6 +1241,64 @@ fn strike_lines(rendered: &str) -> String {
     out
 }
 
+/// Re-apply the tree gutter to every continuation line of a rendered,
+/// multi-line attribute-value block.
+///
+/// `format_value_pretty` lays out a vertical value (list-of-struct,
+/// list-of-scalars, expanded map) with its continuation lines indented by
+/// **plain spaces** sized to the parent attribute's column width. The
+/// caller emits `<attr_prefix><key>: <block>` and the `attr_prefix` —
+/// which carries the `│` tree glyph for a nested resource — lands only on
+/// the first physical row. Every continuation row then floats at the same
+/// column but without the `│`, detaching the value from the tree until the
+/// next sibling row snaps the gutter back (#3356). This is the CLI
+/// analogue of the continuation-row gutter loss #2523 fixed for the TUI
+/// (`carina-tui`); the same value-block class reaches the CLI renderer via
+/// the list-expansion path, so #2523's TUI-side fix does not cover it.
+///
+/// The fix is to swap the first `attr_prefix` columns of leading
+/// whitespace on each continuation line for `attr_prefix` itself, so the
+/// gutter glyph is restored at its column while the value-relative indent
+/// past it is preserved. Lines shorter than the gutter (the blank
+/// inter-element separators injected for #2555) collapse to the bare
+/// gutter with no trailing padding, matching how the tree draws its own
+/// `│`-only continuation lines.
+///
+/// Only continuation lines are touched; line 0 is returned verbatim
+/// because the caller emits `attr_prefix` (or the diff `+ {` opener) ahead
+/// of it directly. Leading whitespace is plain (the per-line colorizers
+/// keep the indent unstyled), so splitting on the first column boundary
+/// never lands inside an ANSI escape.
+fn reindent_with_gutter(block: &str, attr_prefix: &str) -> String {
+    if !block.contains('\n') {
+        return block.to_string();
+    }
+    let gutter_cols = attr_prefix.chars().count();
+    let mut out = String::with_capacity(block.len() + attr_prefix.len());
+    for (i, line) in block.split('\n').enumerate() {
+        if i == 0 {
+            out.push_str(line);
+            continue;
+        }
+        out.push('\n');
+        // Drop the first `gutter_cols` leading spaces (always plain ASCII
+        // spaces from `format_value_pretty`'s indenters), then keep
+        // whatever indentation/content follows that column. ASCII spaces
+        // are 1 byte each, so the column count is the byte count.
+        let leading_spaces = line.bytes().take_while(|&b| b == b' ').count();
+        let drop = leading_spaces.min(gutter_cols);
+        let rest = &line[drop..];
+        if rest.is_empty() {
+            // Blank separator line: emit the bare gutter, no trailing pad.
+            out.push_str(attr_prefix.trim_end());
+        } else {
+            out.push_str(attr_prefix);
+            out.push_str(rest);
+        }
+    }
+    out
+}
+
 /// Apply type-based coloring to a value, with dimmed modifier for default values.
 fn colored_value_dimmed(rendered: &str) -> String {
     // List: color each element individually
@@ -1327,6 +1385,7 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
                 Effect::Delete { .. } => strike_lines(&pretty),
                 _ => colored_value(&pretty, false),
             };
+            let cv = reindent_with_gutter(&cv, attr_prefix);
             writeln!(out, "{}{}: {}", attr_prefix, key, cv).unwrap();
         }
         DetailRow::MapExpanded { key, entries } => {
@@ -1338,9 +1397,10 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
                 // before the next sibling key so the list boundary stays
                 // visible — the `*` marker disambiguates element starts
                 // but not element ends (#2555). The blank only fires
-                // when a sibling actually follows.
+                // when a sibling actually follows. It carries the bare
+                // gutter so the tree bar stays continuous (#3356).
                 if prev_needs_separator {
-                    writeln!(out).unwrap();
+                    writeln!(out, "{}", attr_prefix.trim_end()).unwrap();
                 }
                 prev_needs_separator = carina_core::value::needs_trailing_separator(&entry.value);
                 let layout = carina_core::value::PrettyLayout {
@@ -1352,6 +1412,7 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
                     Effect::Delete { .. } => strike_lines(&pretty),
                     _ => colored_value(&pretty, false),
                 };
+                let cv = reindent_with_gutter(&cv, attr_prefix);
                 if let Some(ann) = &entry.annotation {
                     writeln!(
                         out,
@@ -1793,16 +1854,19 @@ fn render_added_removed_block(
     // Fields render at `attr_prefix.cols + 6`: 2 leading spaces, "+ {" is 3
     // chars, then 1 more for the inner `  ` padding before the key — same
     // column the modified-with-nested branch above uses for its
-    // `Unchanged` arm at `{attr_prefix}      `.
+    // `Unchanged` arm at `{attr_prefix}      `. The indent carries
+    // `attr_prefix` (not bare spaces) so a nested resource's `│` gutter is
+    // drawn on every field row, not dropped (#3356).
     let field_indent_cols = attr_prefix.chars().count() + 6;
-    let field_indent = " ".repeat(field_indent_cols);
+    let field_indent = format!("{}      ", attr_prefix);
     let mut prev_needs_separator = false;
     for (key, value) in &item.fields {
         // Mirror `format_map_vertical` / `MapExpanded`: a multi-element
         // list-of-maps child needs a blank line before the next sibling
-        // key so the boundary stays visible (#2555).
+        // key so the boundary stays visible (#2555). The blank still
+        // carries the bare gutter so the tree bar stays continuous.
         if prev_needs_separator {
-            writeln!(out).unwrap();
+            writeln!(out, "{}", attr_prefix.trim_end()).unwrap();
         }
         prev_needs_separator = carina_core::value::needs_trailing_separator(value);
         let layout = carina_core::value::PrettyLayout {
@@ -1814,6 +1878,7 @@ fn render_added_removed_block(
             ListOfMapsDiffItemKind::Added => colored_value(&pretty, false),
             ListOfMapsDiffItemKind::Removed => strike_lines(&pretty),
         };
+        let cv = reindent_with_gutter(&cv, attr_prefix);
         writeln!(out, "{}{}: {}", field_indent, key, cv).unwrap();
     }
     writeln!(out, "{}    }}", attr_prefix).unwrap();

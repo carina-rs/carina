@@ -136,6 +136,8 @@ plan-fixtures:
 	@echo ""
 	@echo "=== destroy_orphans ==="
 	@$(MAKE) plan-destroy-orphans
+	@echo "---"
+	@$(MAKE) plan-destroy-list-struct-child-gutter
 	@echo ""
 	@echo "=== read_only_attrs ==="
 	@$(MAKE) plan-read-only-attrs
@@ -186,6 +188,10 @@ plan-fixtures:
 	@echo "---"
 	@$(MAKE) plan-policy-pretty-dynamic-key-list
 	@echo "---"
+	@$(MAKE) plan-list-struct-child-gutter
+	@echo "---"
+	@$(MAKE) plan-list-diff-added-struct-child-gutter
+	@echo "---"
 	@$(MAKE) plan-pretty-long-string-list
 	@echo "---"
 	@$(MAKE) plan-pretty-short-string-list
@@ -226,6 +232,12 @@ plan-policy-pretty-nested:
 	$(PLAN_FIXTURE) policy_pretty_nested
 plan-policy-pretty-dynamic-key-list:
 	$(PLAN_FIXTURE) policy_pretty_dynamic_key_list
+plan-list-struct-child-gutter:
+	$(PLAN_FIXTURE) list_struct_child_gutter
+plan-list-diff-added-struct-child-gutter:
+	$(PLAN_FIXTURE) list_diff_added_struct_child_gutter
+plan-destroy-list-struct-child-gutter:
+	$(PLAN_FIXTURE) destroy_list_struct_child_gutter --destroy
 plan-pretty-long-string-list:
 	$(PLAN_FIXTURE) pretty_long_string_list
 plan-pretty-short-string-list:
@@ -251,6 +263,8 @@ plan-multi-instance-module:
         plan-upstream-state-map-subscript plan-upstream-state-map-dot-notation \
         plan-deferred-for plan-exports plan-exports-multifile plan-policy-pretty \
         plan-policy-pretty-nested plan-policy-pretty-dynamic-key-list \
+        plan-list-struct-child-gutter plan-list-diff-added-struct-child-gutter \
+        plan-destroy-list-struct-child-gutter \
         plan-pretty-long-string-list plan-pretty-short-string-list plan-provider-prefix \
         plan-module-anonymous-resource plan-server-default-struct-leaf \
         plan-multi-instance-create plan-multi-instance-module \

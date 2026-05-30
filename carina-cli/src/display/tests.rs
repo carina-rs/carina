@@ -1701,3 +1701,54 @@ fn test_composition_header_drops_parens_for_none_source_path() {
     let header = strip_ansi(&format_composition_header("r", None));
     assert_eq!(header, r#"+ module "r""#);
 }
+
+/// carina#3356: `reindent_with_gutter` restores the tree gutter on every
+/// continuation line of a multi-line value block. The caller emits
+/// `attr_prefix` ahead of line 0, so line 0 is returned verbatim; each
+/// later line's leading `attr_prefix`-width spaces are swapped for the
+/// gutter string, preserving the value-relative indent past the gutter.
+#[test]
+fn test_reindent_with_gutter_restores_gutter_on_continuation_lines() {
+    // attr_prefix is 8 columns wide: 5 spaces, `│`, 2 spaces.
+    let attr_prefix = "     │  ";
+    // `format_value_pretty`-style block: line 0 bare (caller prepends the
+    // prefix), continuation lines indented with plain spaces sized to the
+    // gutter width + value indent. The `*`-marked element key sits 2 cols
+    // past the gutter; the sibling continuation key aligns 2 further in.
+    let block = "\n          * action: \"x\"\n            effect: \"y\"";
+    let out = reindent_with_gutter(block, attr_prefix);
+    assert_eq!(
+        out,
+        "\n     │    * action: \"x\"\n     │      effect: \"y\"",
+    );
+}
+
+/// A blank inter-element separator (empty line) collapses to the bare
+/// gutter with no trailing padding, matching the tree's own `│`-only
+/// continuation lines (and avoiding trailing-whitespace noise).
+#[test]
+fn test_reindent_with_gutter_blank_line_becomes_bare_gutter() {
+    let attr_prefix = "     │  ";
+    let block = "\n          * a: \"x\"\n\n          * b: \"y\"";
+    let out = reindent_with_gutter(block, attr_prefix);
+    assert_eq!(out, "\n     │    * a: \"x\"\n     │\n     │    * b: \"y\"",);
+}
+
+/// A single-line value has no continuation rows, so it is returned
+/// unchanged — the caller's `attr_prefix` on line 0 already suffices.
+#[test]
+fn test_reindent_with_gutter_single_line_unchanged() {
+    assert_eq!(reindent_with_gutter("\"scalar\"", "     │  "), "\"scalar\"");
+}
+
+/// For a root resource the gutter is pure spaces, so reindenting is a
+/// no-op (leading spaces swapped for an equal-width run of spaces) and a
+/// blank separator trims back to empty — existing root-level snapshots
+/// must stay byte-identical.
+#[test]
+fn test_reindent_with_gutter_no_gutter_is_noop() {
+    let attr_prefix = "      "; // 6 spaces, no `│`
+    let block = "\n        * a: \"x\"\n\n        * b: \"y\"";
+    let out = reindent_with_gutter(block, attr_prefix);
+    assert_eq!(out, block);
+}
