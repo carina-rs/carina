@@ -1478,3 +1478,220 @@ fn wait_emitted_when_a_consumer_has_a_pending_change() {
         plan.effects()
     );
 }
+
+/// carina#3358: an already-satisfied wait whose target is unchanged must
+/// be elided even when a consumer has a pending change that merely
+/// *references* the wait. The wait has no work to do — on `apply` its
+/// `until` predicate is already true, so it would poll-and-return
+/// immediately, contributing nothing. Mirrors the registry-dev stack:
+/// cert (unchanged, already ISSUED) + a changed distribution that wires
+/// in `web_acl_id` while still referencing `cert_issued`.
+#[test]
+fn wait_omitted_when_already_satisfied_and_target_unchanged() {
+    use crate::effect::Effect;
+    use crate::parser::{UntilPredicateAst, WaitBinding};
+
+    // cert: exists with status == ISSUED and is unchanged (desired
+    // matches state) → NoChange, no mutating effect on the target.
+    let cert = Resource::new("acm.Certificate", "cert")
+        .with_binding("cert")
+        .with_attribute(
+            "status",
+            Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+        );
+    // dist is new (absent from current_states) → Create → mutating.
+    // It references the wait binding, so the wait "gates a pending change".
+    let mut dist = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
+    dist.dependency_bindings.insert("cert_issued".to_string());
+    let resources = vec![cert, dist];
+
+    let mut cert_state_attrs = HashMap::new();
+    cert_state_attrs.insert(
+        "status".to_string(),
+        Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+    );
+    let mut current_states = HashMap::new();
+    current_states.insert(
+        ResourceId::new("acm.Certificate", "cert"),
+        State::existing(ResourceId::new("acm.Certificate", "cert"), cert_state_attrs)
+            .with_identifier("arn:aws:acm:::certificate/abc"),
+    );
+
+    let wait = WaitBinding {
+        binding: "cert_issued".into(),
+        target: "cert".into(),
+        until_raw: "cert.status == ISSUED".to_string(),
+        until_predicate: UntilPredicateAst {
+            lhs_segments: vec!["cert".to_string(), "status".to_string()],
+            rhs: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+        },
+        timeout_secs: Some(60),
+        depends_on: vec![],
+        line: 1,
+    };
+
+    let plan = create_plan(
+        &resources,
+        &[],
+        &current_states,
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &[wait],
+    );
+
+    assert!(
+        !plan
+            .effects()
+            .iter()
+            .any(|e| matches!(e, Effect::Wait { .. })),
+        "carina#3358: an already-satisfied wait whose target is unchanged \
+         must be elided even when a consumer has a pending change that \
+         merely references it; effects were {:?}",
+        plan.effects()
+    );
+}
+
+/// carina#3358 counterpart: when the wait's target *is* changing in the
+/// same plan, the cached state is stale — its post-apply attributes are
+/// unknown, so the wait must still be emitted to re-poll on `apply`.
+/// Here the target is new (`WaitTarget::ResolvedAtApply`).
+#[test]
+fn wait_emitted_when_target_is_changing_even_if_cached_state_satisfies() {
+    use crate::effect::Effect;
+    use crate::parser::{UntilPredicateAst, WaitBinding};
+
+    // cert is new (absent from current_states) → Create → mutating
+    // target. Even though no cached state exists, the wait must poll
+    // post-apply.
+    let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
+    let mut dist = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
+    dist.dependency_bindings.insert("cert_issued".to_string());
+    let resources = vec![cert, dist];
+
+    let wait = WaitBinding {
+        binding: "cert_issued".into(),
+        target: "cert".into(),
+        until_raw: "cert.status == ISSUED".to_string(),
+        until_predicate: UntilPredicateAst {
+            lhs_segments: vec!["cert".to_string(), "status".to_string()],
+            rhs: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+        },
+        timeout_secs: Some(60),
+        depends_on: vec![],
+        line: 1,
+    };
+
+    let plan = create_plan(
+        &resources,
+        &[],
+        &HashMap::new(),
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &[wait],
+    );
+
+    assert!(
+        plan.effects()
+            .iter()
+            .any(|e| matches!(e, Effect::Wait { binding, .. } if binding == "cert_issued")),
+        "carina#3358: the wait must still be emitted when its target is \
+         changing in this plan (cached state is stale); effects were {:?}",
+        plan.effects()
+    );
+}
+
+/// carina#3358: pins the `WaitTarget::Known` + `target_is_mutating`
+/// branch of `wait_has_work`. An *existing* target (resolved identifier
+/// in state → `Known`) whose cached state already satisfies the
+/// predicate, but which has a pending `Update` in this plan, must still
+/// emit the wait: the cached `ISSUED` is stale relative to the
+/// about-to-apply change, so the executor must re-poll. Without this
+/// test the `target_is_mutating ||` half of the gate is dead under the
+/// suite and could be silently dropped, re-introducing the bug for
+/// changing-but-Known targets.
+#[test]
+fn wait_emitted_when_known_target_has_pending_update_even_if_cached_state_satisfies() {
+    use crate::effect::Effect;
+    use crate::parser::{UntilPredicateAst, WaitBinding};
+
+    // cert EXISTS in state with an identifier (→ WaitTarget::Known) and
+    // its cached `status` already satisfies the predicate, BUT it has a
+    // pending Update (desired `domain_name` differs from state).
+    let cert = Resource::new("acm.Certificate", "cert")
+        .with_binding("cert")
+        .with_attribute(
+            "domain_name",
+            Value::Concrete(ConcreteValue::String("new.example.com".to_string())),
+        );
+    let mut dist = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
+    dist.dependency_bindings.insert("cert_issued".to_string());
+    let resources = vec![cert, dist];
+
+    let mut cert_state_attrs = HashMap::new();
+    cert_state_attrs.insert(
+        "status".to_string(),
+        Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+    );
+    cert_state_attrs.insert(
+        "domain_name".to_string(),
+        Value::Concrete(ConcreteValue::String("old.example.com".to_string())),
+    );
+    let mut current_states = HashMap::new();
+    current_states.insert(
+        ResourceId::new("acm.Certificate", "cert"),
+        State::existing(ResourceId::new("acm.Certificate", "cert"), cert_state_attrs)
+            .with_identifier("arn:aws:acm:::certificate/abc"),
+    );
+
+    let wait = WaitBinding {
+        binding: "cert_issued".into(),
+        target: "cert".into(),
+        until_raw: "cert.status == ISSUED".to_string(),
+        until_predicate: UntilPredicateAst {
+            lhs_segments: vec!["cert".to_string(), "status".to_string()],
+            rhs: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+        },
+        timeout_secs: Some(60),
+        depends_on: vec![],
+        line: 1,
+    };
+
+    let plan = create_plan(
+        &resources,
+        &[],
+        &current_states,
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &[wait],
+    );
+
+    // Precondition: cert really has a pending Update (Known + mutating),
+    // so this hits the `target_is_mutating` arm — not `ResolvedAtApply`
+    // and not the `target_needs_wait` arm.
+    assert!(
+        plan.effects()
+            .iter()
+            .any(|e| matches!(e, Effect::Update { id, .. }
+            if id == &ResourceId::new("acm.Certificate", "cert"))),
+        "test precondition: cert must have a pending Update; effects were {:?}",
+        plan.effects()
+    );
+    assert!(
+        plan.effects()
+            .iter()
+            .any(|e| matches!(e, Effect::Wait { binding, .. } if binding == "cert_issued")),
+        "carina#3358: the wait must still be emitted when an existing \
+         (Known) target has a pending Update, even though its cached \
+         state satisfies the predicate; effects were {:?}",
+        plan.effects()
+    );
+}
