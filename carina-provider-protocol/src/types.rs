@@ -205,6 +205,19 @@ pub struct ProviderInfo {
     pub version: String,
 }
 
+/// Wire envelope for info(): carries the provider's metadata plus the
+/// PROTOCOL_VERSION the SDK was compiled against, so the host can
+/// reject a provider built against an older protocol (carina#3365).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderInfoEnvelope {
+    #[serde(flatten)]
+    pub info: ProviderInfo,
+    /// Defaults to 0 for providers predating the envelope, so the host
+    /// detects them as below any minimum.
+    #[serde(default)]
+    pub protocol_version: u32,
+}
+
 /// Completion value for LSP completions, serializable for WIT transport.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionValue {
@@ -680,6 +693,39 @@ mod tests {
         let json = r#"{"name":"old","display_name":"Old Provider","version":"1.0.0"}"#;
         let info: ProviderInfo = serde_json::from_str(json).unwrap();
         assert!(info.capabilities.is_empty());
+    }
+
+    #[test]
+    fn test_provider_info_envelope_flat_roundtrip_and_default_protocol_version() {
+        let envelope = ProviderInfoEnvelope {
+            info: ProviderInfo {
+                name: "test".into(),
+                display_name: "Test Provider".into(),
+                capabilities: vec!["normalize_desired".into()],
+                version: "1.2.3".into(),
+            },
+            protocol_version: crate::PROTOCOL_VERSION,
+        };
+
+        let json = serde_json::to_string(&envelope).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["name"], "test");
+        assert_eq!(value["display_name"], "Test Provider");
+        assert_eq!(value["capabilities"][0], "normalize_desired");
+        assert_eq!(value["version"], "1.2.3");
+        assert_eq!(value["protocol_version"], crate::PROTOCOL_VERSION);
+
+        let back: ProviderInfoEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.info.name, "test");
+        assert_eq!(back.info.display_name, "Test Provider");
+        assert_eq!(back.info.capabilities, vec!["normalize_desired"]);
+        assert_eq!(back.info.version, "1.2.3");
+        assert_eq!(back.protocol_version, crate::PROTOCOL_VERSION);
+
+        let old_json = r#"{"name":"old","display_name":"Old Provider","version":"1.0.0"}"#;
+        let old: ProviderInfoEnvelope = serde_json::from_str(old_json).unwrap();
+        assert_eq!(old.info.name, "old");
+        assert_eq!(old.protocol_version, 0);
     }
 
     #[test]

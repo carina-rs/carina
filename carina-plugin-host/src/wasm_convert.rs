@@ -594,6 +594,27 @@ pub fn json_to_provider_info(json: &str) -> (String, String, String) {
     }
 }
 
+/// Reject a provider whose protocol is older than this host's
+/// carina_provider_protocol::PROTOCOL_VERSION. The SDK stamps the
+/// version it was compiled against into the info() envelope, so this is a
+/// compile-time fact of the provider's protocol crate, not a value the
+/// author sets. A provider predating the envelope omits the field ->
+/// deserializes to 0 -> below any host minimum (the carina#3364 class).
+/// carina#3365.
+pub fn check_protocol_version(info_json: &str) -> Result<(), String> {
+    let envelope: proto::ProviderInfoEnvelope =
+        serde_json::from_str(info_json).map_err(|e| format!("invalid provider info: {e}"))?;
+    let host = carina_provider_protocol::PROTOCOL_VERSION;
+    if envelope.protocol_version < host {
+        return Err(format!(
+            "provider '{}' was built against protocol version {} but this host \
+             requires version {}; rebuild the provider against the current carina protocol",
+            envelope.info.name, envelope.protocol_version, host
+        ));
+    }
+    Ok(())
+}
+
 /// Deserialize JSON to a Vec of core ResourceSchemas.
 pub fn json_to_schemas(json: &str) -> Vec<CoreResourceSchema> {
     let proto_schemas: Vec<proto::ResourceSchema> = serde_json::from_str(json).unwrap_or_default();
@@ -1388,6 +1409,46 @@ mod tests {
         assert_eq!(name, "unknown");
         assert_eq!(display, "Unknown Provider");
         assert_eq!(version, "0.0.0");
+    }
+
+    #[test]
+    fn test_check_protocol_version_accepts_host_version() {
+        let json = format!(
+            r#"{{"name":"aws","display_name":"AWS Provider","version":"1.0.0","protocol_version":{}}}"#,
+            carina_provider_protocol::PROTOCOL_VERSION
+        );
+
+        assert!(check_protocol_version(&json).is_ok());
+    }
+
+    #[test]
+    fn test_check_protocol_version_rejects_lower_version() {
+        let err = check_protocol_version(
+            r#"{"name":"aws","display_name":"AWS Provider","version":"1.0.0","protocol_version":0}"#,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("provider 'aws'"));
+        assert!(err.contains("protocol version 0"));
+        assert!(err.contains(&format!(
+            "requires version {}",
+            carina_provider_protocol::PROTOCOL_VERSION
+        )));
+    }
+
+    #[test]
+    fn test_check_protocol_version_rejects_old_style_info_without_protocol_version() {
+        let err = check_protocol_version(
+            r#"{"name":"old","display_name":"Old Provider","version":"1.0.0"}"#,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("provider 'old'"));
+        assert!(err.contains("protocol version 0"));
+        assert!(err.contains(&format!(
+            "requires version {}",
+            carina_provider_protocol::PROTOCOL_VERSION
+        )));
     }
 
     #[test]
