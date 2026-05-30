@@ -453,6 +453,10 @@ pub enum AttributeType {
     Custom {
         name: String,
         base: Box<AttributeType>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pattern: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        length: Option<(Option<u64>, Option<u64>)>,
     },
     /// Enum-shaped custom type: values are written as namespaced
     /// shorthand and expanded host-side via `expand_enum_shorthand`
@@ -571,6 +575,30 @@ mod tests {
         match back {
             AttributeType::Ref { name } => assert_eq!(name, "Statement"),
             other => panic!("expected Ref, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn custom_pattern_and_length_round_trip() {
+        let attr = AttributeType::Custom {
+            name: "awscc.wafv2.WebACL.EntityDescription".to_string(),
+            base: Box::new(AttributeType::String),
+            pattern: Some("^[a-z]+$".to_string()),
+            length: Some((Some(1), Some(9))),
+        };
+
+        let json = serde_json::to_string(&attr).unwrap();
+        assert!(json.contains("pattern"));
+        assert!(json.contains("length"));
+        let back: AttributeType = serde_json::from_str(&json).unwrap();
+        match back {
+            AttributeType::Custom {
+                pattern, length, ..
+            } => {
+                assert_eq!(pattern.as_deref(), Some("^[a-z]+$"));
+                assert_eq!(length, Some((Some(1), Some(9))));
+            }
+            other => panic!("expected Custom, got {:?}", other),
         }
     }
 

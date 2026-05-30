@@ -2139,8 +2139,14 @@ impl AttributeType {
         }
     }
 
-    /// Validate against a `Custom` variant by delegating to its
-    /// `validate` closure on the raw value.
+    /// Validate against a `Custom` variant.
+    ///
+    /// For String-shaped concrete values, this first enforces the schema
+    /// `pattern` constraint, then the `length` constraint using character
+    /// count. Patterns that Rust's regex engine cannot compile are skipped so
+    /// provider schema compatibility issues do not become user validation
+    /// errors (awscc#295). After those structural checks, validation delegates
+    /// to the Custom `validate` closure.
     ///
     /// Pre-carina#3222 this function also handled enum-shaped Customs
     /// (gated on `namespace.is_some()`); those are now
@@ -2152,9 +2158,54 @@ impl AttributeType {
     /// guard for `Value::Deferred(DeferredValue::ResourceRef)`/`Value::Deferred(DeferredValue::Interpolation)` is gone —
     /// the dispatcher filters them out in [`Self::validate`].
     fn validate_custom(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
-        let AttrTypeKind::Custom { validate, .. } = &self.kind else {
+        let AttrTypeKind::Custom {
+            identity,
+            base: _,
+            pattern,
+            length,
+            validate,
+            to_dsl: _,
+        } = &self.kind
+        else {
             unreachable!("validate_custom called on non-Custom");
         };
+        let type_name = identity.as_ref().map(|id| id.kind.clone());
+        // Pattern and length only apply to String-shaped concrete values.
+        // EnumIdentifier/StringList-shaped Custom values are not checked here;
+        // structural string Customs for awscc#295 arrive as String.
+        if let ConcreteValueRef::String(s) = value {
+            if let Some(pattern) = pattern
+                // awscc#295: CloudFormation patterns may contain constructs
+                // Rust's regex crate rejects; skip those provider constraints
+                // instead of reporting a schema-compatibility issue as a user error.
+                && let Ok(re) = regex::Regex::new(pattern)
+                // awscc#295: JSON Schema / CloudControl `pattern` is an
+                // unanchored substring match unless the pattern supplies ^/$.
+                && !re.is_match(s)
+            {
+                return Err(TypeError::PatternMismatch {
+                    value: s.to_string(),
+                    pattern: pattern.clone(),
+                    attribute: None,
+                    type_name,
+                });
+            }
+            if let Some((min, max)) = length {
+                let count = s.chars().count();
+                let count_u64 = count as u64;
+                if min.is_some_and(|min| count_u64 < min) || max.is_some_and(|max| count_u64 > max)
+                {
+                    return Err(TypeError::LengthOutOfRange {
+                        value: s.to_string(),
+                        length: count,
+                        min: *min,
+                        max: *max,
+                        attribute: None,
+                        type_name,
+                    });
+                }
+            }
+        }
         validate(&value.to_owned_value())
     }
 
@@ -2868,6 +2919,51 @@ fn format_invalid_enum(
     }
 }
 
+fn format_invalid_value_intro(
+    value: &str,
+    attribute: Option<&str>,
+    type_name: Option<&str>,
+) -> String {
+    match (attribute, type_name) {
+        (Some(a), Some(t)) => format!("Invalid value '{}' for '{}' ({})", value, a, t),
+        (Some(a), None) => format!("Invalid value '{}' for '{}'", value, a),
+        (None, Some(t)) => format!("Invalid {} value '{}'", t, value),
+        (None, None) => format!("Invalid value '{}'", value),
+    }
+}
+
+fn format_pattern_mismatch(
+    value: &str,
+    pattern: &str,
+    attribute: Option<&str>,
+    type_name: Option<&str>,
+) -> String {
+    format!(
+        "{}: does not match required pattern /{}/",
+        format_invalid_value_intro(value, attribute, type_name),
+        pattern
+    )
+}
+
+fn format_length_out_of_range(
+    value: &str,
+    length: usize,
+    min: Option<u64>,
+    max: Option<u64>,
+    attribute: Option<&str>,
+    type_name: Option<&str>,
+) -> String {
+    let min = min.map(|v| v.to_string()).unwrap_or_default();
+    let max = max.map(|v| v.to_string()).unwrap_or_default();
+    format!(
+        "{}: length {} is outside allowed range [{}, {}]",
+        format_invalid_value_intro(value, attribute, type_name),
+        length,
+        min,
+        max
+    )
+}
+
 /// One candidate variant carried by `TypeError::InvalidEnumVariant` and
 /// `TypeError::StringLiteralExpectedEnum`. Splits a fully-qualified enum
 /// identifier into structured pieces so IDE / LSP code actions can
@@ -2943,7 +3039,7 @@ impl fmt::Display for ExpectedEnumVariant {
 }
 
 /// Type error
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum TypeError {
     #[error("Type mismatch: expected {expected}, got {got}")]
     TypeMismatch { expected: String, got: String },
@@ -2969,6 +3065,30 @@ pub enum TypeError {
         /// programmatic consumers (LSP code actions, `carina explain-error`)
         /// can read the structured fields directly. See #2220.
         expected: Vec<ExpectedEnumVariant>,
+    },
+
+    #[error(
+        "{}",
+        format_pattern_mismatch(value, pattern, attribute.as_deref(), type_name.as_deref())
+    )]
+    PatternMismatch {
+        value: String,
+        pattern: String,
+        attribute: Option<String>,
+        type_name: Option<String>,
+    },
+
+    #[error(
+        "{}",
+        format_length_out_of_range(value, *length, *min, *max, attribute.as_deref(), type_name.as_deref())
+    )]
+    LengthOutOfRange {
+        value: String,
+        length: usize,
+        min: Option<u64>,
+        max: Option<u64>,
+        attribute: Option<String>,
+        type_name: Option<String>,
     },
 
     /// The value was written in the source as a quoted string literal
@@ -3052,8 +3172,8 @@ pub enum TypeError {
 }
 
 impl TypeError {
-    /// Attach an attribute name to the error. Currently only affects
-    /// `InvalidEnumVariant`; other variants return `self` unchanged.
+    /// Attach an attribute name to errors whose diagnostics include an
+    /// attribute context; other variants return `self` unchanged.
     ///
     /// Callers that know which attribute produced the error (e.g. the
     /// attribute loop in `ResourceSchema::validate`) wrap the primitive
@@ -3061,13 +3181,20 @@ impl TypeError {
     /// `AttrTypeKind::validate` unaware of attribute names while still
     /// letting the final message say `for 'target_id'`.
     ///
-    /// See #2098. `InvalidEnumVariant` is the only variant enriched for
-    /// now; adding the same slot to `ValidationFailed` / `TypeMismatch`
-    /// is tracked as future work.
+    /// See #2098. Adding the same slot to `ValidationFailed` /
+    /// `TypeMismatch` is tracked as future work.
     #[must_use]
     pub fn with_attribute(mut self, attribute: impl Into<String>) -> Self {
         match &mut self {
             TypeError::InvalidEnumVariant {
+                attribute: attr_slot,
+                ..
+            }
+            | TypeError::PatternMismatch {
+                attribute: attr_slot,
+                ..
+            }
+            | TypeError::LengthOutOfRange {
                 attribute: attr_slot,
                 ..
             }
