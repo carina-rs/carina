@@ -1,0 +1,12 @@
+# Destroy-path counterpart to `list_struct_child_gutter` for carina#3356.
+# Empty config (provider only) against a state holding a parent Role with
+# two dependent children. The RolePolicy carries a `List<Struct>`
+# `statement` attribute and sorts before the trailing Bucket, so on the
+# destroy plan it renders as a non-last child drawing the `│` gutter. Its
+# struck-through multi-line value must keep the gutter on every physical
+# row — the `strike_lines` + `reindent_with_gutter` Delete branch, which
+# must not bleed the strikethrough across the gutter (cf. #3115).
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}

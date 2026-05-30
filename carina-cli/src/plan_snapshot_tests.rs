@@ -261,6 +261,32 @@ fn snapshot_policy_pretty_nested() {
     insta::assert_snapshot!(output);
 }
 
+/// carina#3356: a `List<Struct>` attribute on a resource that is a
+/// *dependent child* in the plan tree. Its attribute rows carry the `│`
+/// tree gutter, and every physical row of the multi-line list value
+/// (each `* ...` element and its nested lines) must inherit that gutter
+/// and indent — not just the first row. Pre-fix the list body floated
+/// outside the tree at a shallower indent with no `│` until rendering
+/// snapped back to the gutter on the next scalar attribute. This is the
+/// CLI analogue of #2523 (which was TUI-only) for the list-expansion
+/// path.
+#[test]
+fn snapshot_list_struct_child_gutter() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("list_struct_child_gutter");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+        None,
+    ));
+    insta::assert_snapshot!(output);
+}
+
 #[test]
 fn snapshot_policy_pretty_dynamic_key_list() {
     // #2528 acceptance: an IAM trust-policy `condition.<op>.<context-key>:
@@ -569,6 +595,30 @@ fn snapshot_destroy_full() {
     use carina_core::resource::Value;
     let (plan, current_states, _schemas, _moved) =
         build_plan_and_states_from_fixture("destroy_full");
+    let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = current_states
+        .into_iter()
+        .filter(|(_, state)| state.exists)
+        .map(|(id, state)| (id, state.attributes))
+        .collect();
+    let output = strip_ansi(&format_destroy_plan(
+        &plan,
+        DetailLevel::Full,
+        &delete_attributes,
+    ));
+    insta::assert_snapshot!(output);
+}
+
+/// carina#3356 (destroy-path counterpart of `snapshot_list_struct_child_gutter`):
+/// a destroy plan whose non-last child carries a struck-through
+/// `List<Struct>` value. Every physical row of the struck value must keep
+/// the `│` tree gutter (the `strike_lines` + `reindent_with_gutter`
+/// branch), and the strikethrough must not bleed across the gutter
+/// (cf. #3115).
+#[test]
+fn snapshot_destroy_list_struct_child_gutter() {
+    use carina_core::resource::Value;
+    let (plan, current_states, _schemas, _moved) =
+        build_plan_and_states_from_fixture("destroy_list_struct_child_gutter");
     let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = current_states
         .into_iter()
         .filter(|(_, state)| state.exists)
@@ -1299,6 +1349,30 @@ fn snapshot_list_diff_added_struct() {
         "added struct element should not render as a single very wide line; got: {}",
         output
     );
+    insta::assert_snapshot!(output);
+}
+
+/// carina#3356 (diff-path counterpart of `snapshot_list_struct_child_gutter`):
+/// a `~` update that adds a struct element to a `List<Struct>` on a
+/// resource nested as a non-last child in the tree. The added-element
+/// `+ { ... }` block and every field row inside it must carry the `│`
+/// tree gutter, not bare-space indentation. Pre-fix
+/// `render_added_removed_block` laid the field rows out with plain
+/// spaces, so the diff block floated outside the tree under a gutter.
+#[test]
+fn snapshot_list_diff_added_struct_child_gutter() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("list_diff_added_struct_child_gutter");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+        None,
+    ));
     insta::assert_snapshot!(output);
 }
 

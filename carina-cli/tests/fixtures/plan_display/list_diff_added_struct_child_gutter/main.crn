@@ -1,0 +1,55 @@
+# Diff-path counterpart to `list_struct_child_gutter` for carina#3356.
+# A `~` update that *adds* a struct element to a `List<Struct>` attribute,
+# on a resource that is a non-last dependent child in the plan tree. The
+# added-element block (`+ { ... }`) and its fields must carry the `│` tree
+# gutter on every physical row — the same continuation-row gutter that the
+# create path (`PrettyAttribute`) needed. Before the fix the field rows
+# used bare-space indentation (`render_added_removed_block`) and floated
+# outside the tree.
+#
+# `role` is the parent; the RolePolicy (the diff target) and a trailing
+# Bucket both order after it, so the RolePolicy is a non-last child and
+# draws the gutter. State carries one statement; the DSL adds a second.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let role = awscc.iam.Role {
+  role_name                   = 'test-role'
+  assume_role_policy_document = '{}'
+}
+
+let policy = awscc.iam.RolePolicy {
+  policy_name = 'test-inline'
+  role_name   = 'test-role'
+  statement = [
+    {
+      sid      = 'AllowS3Read'
+      effect   = 'Allow'
+      action   = 's3:GetObject'
+      resource = 'arn:aws:s3:::example/*'
+    },
+    {
+      sid    = 'CloudControl'
+      effect = 'Allow'
+      action = [
+        'cloudformation:CancelResourceRequest',
+        'cloudformation:CreateResource',
+        'cloudformation:DeleteResource',
+        'cloudformation:GetResource',
+      ]
+      resource = ['*']
+    },
+  ]
+  directives { depends_on = [role] }
+}
+
+awscc.s3.Bucket {
+  bucket_name = 'zzz-trailing-sibling'
+  directives { depends_on = [role] }
+}
+
+exports {
+  policy_name = policy.policy_name
+}

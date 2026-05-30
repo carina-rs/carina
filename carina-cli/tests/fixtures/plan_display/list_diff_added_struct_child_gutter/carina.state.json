@@ -1,0 +1,46 @@
+{
+  "version": 7,
+  "serial": 1,
+  "lineage": "test-lineage-list-diff-added-struct-child-gutter",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "iam.RolePolicy",
+      "name": "policy",
+      "provider": "awscc",
+      "identifier": "test-role|test-inline",
+      "attributes": {
+        "policy_name": "test-inline",
+        "role_name": "test-role",
+        "statement": [
+          {
+            "sid": "AllowS3Read",
+            "effect": "Allow",
+            "action": "s3:GetObject",
+            "resource": "arn:aws:s3:::example/*"
+          }
+        ]
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "policy",
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "policy_name": {
+            "kind": "leaf"
+          },
+          "role_name": {
+            "kind": "leaf"
+          },
+          "statement": {
+            "kind": "leaf"
+          }
+        }
+      }
+    }
+  ]
+}

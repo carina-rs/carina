@@ -1,0 +1,46 @@
+# Plan-display fixture for carina#3356: a `List<Struct>` attribute on a
+# resource that is a *non-last dependent child* in the plan tree, so its
+# attribute rows carry the `│` tree gutter (a trailing sibling keeps the
+# vertical bar drawn). Every physical row of the multi-line list value
+# (each `* ...` element and its nested lines) must inherit the same `│`
+# gutter + indent as the first row. Before the fix the list body floated
+# outside the tree at a shallower indent with no `│` until rendering
+# snapped back on the next scalar attribute / sibling.
+#
+# `role` is the parent; both the RolePolicy and a trailing Bucket declare
+# an explicit ordering edge to it. The RolePolicy renders first (sorted
+# before the Bucket), so it is a non-last child and draws the `│` gutter.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let role = awscc.iam.Role {
+  role_name                   = 'test-role'
+  assume_role_policy_document = '{}'
+}
+
+awscc.iam.RolePolicy {
+  policy_name = 'test-inline'
+  role_name   = 'test-role'
+  statement = [
+    {
+      sid      = 'AllowS3Read'
+      effect   = 'Allow'
+      action   = 's3:GetObject'
+      resource = 'arn:aws:s3:::example/*'
+    },
+    {
+      sid      = 'DenyS3Write'
+      effect   = 'Deny'
+      action   = 's3:PutObject'
+      resource = 'arn:aws:s3:::example/*'
+    },
+  ]
+  directives { depends_on = [role] }
+}
+
+awscc.s3.Bucket {
+  bucket_name = 'zzz-trailing-sibling'
+  directives { depends_on = [role] }
+}

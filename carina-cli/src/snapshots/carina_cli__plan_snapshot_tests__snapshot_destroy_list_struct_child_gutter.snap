@@ -1,0 +1,26 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Destroy Plan:
+
+  - awscc.iam.Role role
+      assume_role_policy_document: "{}"
+      role_name: "test-role"
+        │
+        ├─ - awscc.iam.RolePolicy policy
+        │     policy_name: "test-inline"
+        │     role_name: "test-role"
+        │     statement: 
+        │       * action: "s3:GetObject"
+        │         effect: "Allow"
+        │         resource: "arn:aws:s3:::example/*"
+        │         sid: "AllowS3Read"
+        │
+        │       * action: "s3:PutObject"
+        │         effect: "Deny"
+        │         resource: "arn:aws:s3:::example/*"
+        │         sid: "DenyS3Write"
+        │
+        └─ - awscc.s3.Bucket zzz_bucket
+              bucket_name: "zzz-trailing-sibling"
