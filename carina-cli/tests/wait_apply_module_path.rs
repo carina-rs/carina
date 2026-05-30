@@ -400,12 +400,15 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     carina_core::value::canonicalize_states_with_schemas(&mut current_states, ctx.schemas());
 
     let provider = NoopProvider { cert_publishes_arn };
+    let mut wait_bindings = parsed.wait_bindings.clone();
     let preprocessor = PlanPreprocessor::new(&NoopNormalizer, &ctx);
     preprocessor
         .prepare(
             &mut resources_for_plan,
             &mut current_states,
             &parsed.providers,
+            &parsed.data_sources,
+            &mut wait_bindings,
         )
         .await;
 
@@ -418,7 +421,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
-        &parsed.wait_bindings,
+        &wait_bindings,
     );
 
     let has_wait = plan.effects().iter().any(|e| {

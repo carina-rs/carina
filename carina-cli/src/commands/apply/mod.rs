@@ -1189,12 +1189,18 @@ async fn run_apply_locked(
     carina_core::value::canonicalize_states_with_schemas(&mut current_states, ctx.schemas());
 
     // Run the normalization pipeline (same as plan path in wiring.rs).
+    // `prepare` also canonicalizes the wait `until` predicate enum
+    // aliases (carina#3358); the apply path is a separate pipeline that
+    // calls `create_plan` directly, so it relies on the same shared seam.
+    let mut wait_bindings = parsed.wait_bindings.clone();
     let preprocessor = crate::wiring::PlanPreprocessor::new(&provider, ctx);
     preprocessor
         .prepare(
             &mut resources_for_plan,
             &mut current_states,
             &parsed.providers,
+            &data_sources_for_plan,
+            &mut wait_bindings,
         )
         .await;
 
@@ -1212,7 +1218,7 @@ async fn run_apply_locked(
         &saved_attrs,
         &prev_explicit,
         &orphan_dependencies,
-        &parsed.wait_bindings,
+        &wait_bindings,
     );
 
     // Populate cascading updates for create_before_destroy Replace effects.
