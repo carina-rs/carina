@@ -192,9 +192,9 @@ impl DiagnosticEngine {
             // `Ref("LifecycleConfiguration")` whose def carries a
             // `List<Ref<Rule>>` field (same bug class as carina#3349).
             let is_list_struct = matches!(
-                attr_schema.attr_type.shape(&schema.defs),
+                schema.shape_of(&attr_schema.attr_type),
                 Shape::List { inner, .. } if matches!(
-                    inner.shape(&schema.defs),
+                    schema.shape_of(inner),
                     Shape::Struct { .. }
                 )
             );

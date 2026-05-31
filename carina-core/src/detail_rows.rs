@@ -12,7 +12,7 @@ use crate::diff_helpers::{compute_map_diff, compute_unchanged_count, schema_awar
 use crate::effect::Effect;
 use crate::non_empty::NonEmptyVec;
 use crate::resource::{ConcreteValue, DeferredValue, ResourceId, Value};
-use crate::schema::{AttributeType, ResourceSchema, SchemaRegistry, empty_defs};
+use crate::schema::{AttributeType, ResourceSchema, SchemaRegistry, empty_defs_for_schema_walks};
 use crate::value::{format_value, format_value_with_key, is_list_of_maps, map_similarity};
 
 /// Controls how much detail is shown in plan output.
@@ -345,7 +345,7 @@ fn map_entry_subtype<'a>(
         // silently drop a `Ref` because `Shape` has no `Ref`
         // variant. `shape(defs)` panics on a dangling `Ref` —
         // schema-construction bug, surfaced loudly.
-        match t.shape(defs) {
+        match t.shape_with_defs(defs) {
             crate::schema::Shape::List { inner, .. } => t = inner,
             crate::schema::Shape::Map { value, .. } => return Some(value),
             crate::schema::Shape::Struct { fields, .. } => {
@@ -601,7 +601,9 @@ fn build_update_rows(
     explicit: Option<&crate::explicit::ExplicitFields>,
 ) -> Vec<DetailRow> {
     let mut rows = Vec::new();
-    let defs = schema.map(|s| &s.defs).unwrap_or(empty_defs());
+    let defs = schema
+        .map(|s| &s.defs)
+        .unwrap_or(empty_defs_for_schema_walks());
 
     // Project `from.attributes` through the user-authoring tree so
     // server-side default fields the user never wrote don't inflate
@@ -764,7 +766,9 @@ fn build_replace_rows(
     explicit: Option<&crate::explicit::ExplicitFields>,
 ) -> Vec<DetailRow> {
     let mut rows = Vec::new();
-    let defs = schema.map(|s| &s.defs).unwrap_or(empty_defs());
+    let defs = schema
+        .map(|s| &s.defs)
+        .unwrap_or(empty_defs_for_schema_walks());
 
     // Show changed create-only attributes
     let mut keys: Vec<_> = changed_create_only
@@ -1210,7 +1214,7 @@ fn compute_list_of_maps_diff_parts(
     // Peel any leading `Ref` so a `Ref("…")` attribute whose def is
     // `List<Struct>` still drops into the List arm — same bug class
     // as carina#3349. `resolve_refs` is a no-op on non-Ref inputs.
-    let attr_type_peeled = attr_type.map(|t| t.resolve_refs(defs).as_attr());
+    let attr_type_peeled = attr_type.map(|t| t.resolve_refs_with_defs(defs).as_attr());
     let item_type = match attr_type_peeled.map(|t| (&t.kind, t)) {
         Some((crate::schema::AttrTypeKind::List { inner, .. }, _)) => Some(inner.as_ref()),
         // The attribute itself may already be the element type when
@@ -2803,7 +2807,7 @@ mod tests {
             Some(&old_value),
             &new_value,
             None,
-            crate::schema::empty_defs(),
+            crate::schema::empty_defs_for_schema_walks(),
             DetailLevel::Full,
         );
 
@@ -2867,7 +2871,7 @@ mod tests {
             Some(&old_value),
             &new_value,
             None,
-            crate::schema::empty_defs(),
+            crate::schema::empty_defs_for_schema_walks(),
             DetailLevel::Full,
         );
 
@@ -3037,7 +3041,7 @@ mod tests {
             Some(&old_value),
             &new_value,
             None,
-            crate::schema::empty_defs(),
+            crate::schema::empty_defs_for_schema_walks(),
             DetailLevel::Full,
         );
 
@@ -3081,7 +3085,7 @@ mod tests {
             Some(&old_value),
             &new_value,
             None,
-            crate::schema::empty_defs(),
+            crate::schema::empty_defs_for_schema_walks(),
             DetailLevel::Full,
         );
         assert!(
@@ -3143,7 +3147,7 @@ mod tests {
             Some(&old_value),
             &new_value,
             None,
-            crate::schema::empty_defs(),
+            crate::schema::empty_defs_for_schema_walks(),
             DetailLevel::Full,
         );
 

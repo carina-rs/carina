@@ -93,9 +93,9 @@ impl CompletionProvider {
                 // class as carina#3349.
                 if let Some(bn) = &attr.block_name
                     && matches!(
-                        attr.attr_type.shape(&schema.defs),
+                        schema.shape_of(&attr.attr_type),
                         Shape::List { inner, .. } if matches!(
-                            inner.shape(&schema.defs),
+                            schema.shape_of(inner),
                             Shape::Struct { .. }
                         )
                     )
@@ -286,11 +286,7 @@ impl CompletionProvider {
         let target_attr_type = target_schema
             .and_then(|s| s.attributes.get(attr_name))
             .map(|a| &a.attr_type);
-        let target_defs: &std::collections::BTreeMap<String, carina_core::schema::AttributeType> =
-            match target_schema {
-                Some(s) => &s.defs,
-                None => carina_core::schema::empty_defs(),
-            };
+        let target_defs = target_schema.map(|s| &s.defs);
 
         // In-scope bare identifiers: `let` bindings + `arguments {}`
         // parameters (#2624 / #2642). When the target attribute's
@@ -309,6 +305,8 @@ impl CompletionProvider {
         match target_attr_type {
             None => completions.extend(in_scope),
             Some(attr_type) => {
+                let target_defs =
+                    target_defs.expect("target_attr_type is only set when target_schema exists");
                 // Argument count is small (usually < 10), so a Vec
                 // walked linearly is cheaper than a HashMap.
                 let typed_arguments: Vec<(String, carina_core::parser::TypeExpr)> = self
@@ -346,6 +344,7 @@ impl CompletionProvider {
         let for_bindings = super::top_level::extract_for_bindings_in_scope(text, position);
         for binding in &for_bindings {
             if let Some(attr_type) = attr_type_for_for_filter
+                && let Some(target_defs) = target_defs
                 && let Some(element_type) = infer_for_binding_type(
                     binding,
                     &upstream_sources,
@@ -379,7 +378,7 @@ impl CompletionProvider {
             // (cyclic-CFN case) also gets the snippet (same bug class as
             // carina#3349).
             if matches!(
-                attr_schema.attr_type.shape(&schema.defs),
+                schema.shape_of(&attr_schema.attr_type),
                 Shape::Struct { .. }
             ) {
                 completions.push(CompletionItem {
@@ -548,12 +547,11 @@ impl CompletionProvider {
     /// Extract the Custom type's kind name from an AttributeType, if it
     /// is a Custom type with a structured identity.
     fn extract_custom_type_name(attr_type: &AttributeType) -> Option<&str> {
-        let defs = carina_core::schema::empty_defs();
-        match attr_type.shape(defs) {
-            Shape::Custom {
+        match attr_type.shape_ref_free() {
+            Ok(Shape::Custom {
                 identity: Some(id), ..
-            } => Some(&id.kind),
-            _ => None,
+            }) => Some(&id.kind),
+            Ok(_) | Err(_) => None,
         }
     }
 
@@ -562,8 +560,10 @@ impl CompletionProvider {
         attr_type: &AttributeType,
         resource_type: Option<&str>,
     ) -> Vec<CompletionItem> {
-        let defs = carina_core::schema::empty_defs();
-        match attr_type.shape(defs) {
+        let Ok(shape) = attr_type.shape_ref_free() else {
+            return Vec::new();
+        };
+        match shape {
             Shape::Bool => {
                 vec![
                     CompletionItem {
@@ -1267,12 +1267,11 @@ impl CompletionProvider {
             return Vec::new();
         };
         let effective = if in_nested {
-            let defs = carina_core::schema::empty_defs();
-            match annotation.shape(defs) {
-                Shape::List { inner, .. } | Shape::Map { value: inner, .. } => inner.clone(),
+            match annotation.shape_ref_free() {
+                Ok(Shape::List { inner, .. } | Shape::Map { value: inner, .. }) => inner.clone(),
                 // Inside `{ ... }` of a non-collection annotation we
                 // don't know what the user means — fall silent.
-                _ => return Vec::new(),
+                Ok(_) | Err(_) => return Vec::new(),
             }
         } else {
             annotation
@@ -1980,12 +1979,13 @@ fn return_type_fits(ret: builtins::BuiltinReturnType, attr_type: &AttributeType)
     // Shape's deliberate omission of a `Ref` variant lifts the
     // carina#3349 invariant (Ref must be peeled before a wildcard
     // arm sees it) into the type system: this match cannot leak Ref
-    // into the trailing wildcard. Pass `empty_defs` because this
-    // completion-time helper does not carry the schema's defs map —
-    // unresolved Ref attrs simply fall through to `false`, which is
-    // shape-consistent with the historical `Struct => false` arm.
-    let defs = carina_core::schema::empty_defs();
-    match attr_type.shape(defs) {
+    // into the trailing wildcard. Bare completion-time helpers use
+    // `shape_ref_free`; an unexpected Ref falls through to `false`,
+    // matching the existing silent fallback contract.
+    let Ok(shape) = attr_type.shape_ref_free() else {
+        return false;
+    };
+    match shape {
         Shape::Union(members) => members.iter().any(|m| return_type_fits(ret, m)),
         Shape::String => matches!(ret, R::String | R::Any),
         Shape::Int => matches!(ret, R::Int | R::Any),

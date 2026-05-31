@@ -610,7 +610,7 @@ fn walk_value_against_type(
     // would fall through the wildcard arms below and the
     // leaf-ref check would compare against the raw `Ref` instead
     // of its resolved target.
-    let expected_shape = expected.shape(defs);
+    let expected_shape = expected.shape_with_defs(defs);
     match value {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             check_resource_ref_at_position(path, expected, defs, exports, location, errors);

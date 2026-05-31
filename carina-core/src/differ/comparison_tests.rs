@@ -10,14 +10,14 @@ fn type_aware_int_float_coercion() {
         &Value::Concrete(ConcreteValue::Int(42)),
         &Value::Concrete(ConcreteValue::Float(42.0)),
         Some(&AttributeType::float()),
-        crate::schema::empty_defs(),
+        crate::schema::empty_defs_for_schema_walks(),
         None,
     ));
     assert!(type_aware_equal(
         &Value::Concrete(ConcreteValue::Float(42.0)),
         &Value::Concrete(ConcreteValue::Int(42)),
         Some(&AttributeType::float()),
-        crate::schema::empty_defs(),
+        crate::schema::empty_defs_for_schema_walks(),
         None,
     ));
     // Non-exact conversion should not be equal
@@ -25,7 +25,7 @@ fn type_aware_int_float_coercion() {
         &Value::Concrete(ConcreteValue::Int(42)),
         &Value::Concrete(ConcreteValue::Float(42.5)),
         Some(&AttributeType::float()),
-        crate::schema::empty_defs(),
+        crate::schema::empty_defs_for_schema_walks(),
         None,
     ));
     // Without type info, Int and Float are not equal
@@ -33,7 +33,7 @@ fn type_aware_int_float_coercion() {
         &Value::Concrete(ConcreteValue::Int(42)),
         &Value::Concrete(ConcreteValue::Float(42.0)),
         None,
-        crate::schema::empty_defs(),
+        crate::schema::empty_defs_for_schema_walks(),
         None,
     ));
 }
@@ -45,7 +45,7 @@ fn type_aware_int_float_coercion_for_int_type() {
         &Value::Concrete(ConcreteValue::Int(10)),
         &Value::Concrete(ConcreteValue::Float(10.0)),
         Some(&AttributeType::int()),
-        crate::schema::empty_defs(),
+        crate::schema::empty_defs_for_schema_walks(),
         None,
     ));
 }
@@ -64,7 +64,7 @@ fn type_aware_list_with_inner_type() {
             Value::Concrete(ConcreteValue::Float(1.0))
         ])),
         Some(&list_type),
-        crate::schema::empty_defs(),
+        crate::schema::empty_defs_for_schema_walks(),
         None,
     ));
 }
@@ -101,7 +101,7 @@ fn type_aware_struct_per_field() {
         &a,
         &b,
         Some(&struct_type),
-        crate::schema::empty_defs(),
+        crate::schema::empty_defs_for_schema_walks(),
         None
     ));
 }
@@ -113,7 +113,7 @@ fn type_aware_union_numeric() {
         &Value::Concrete(ConcreteValue::Int(7)),
         &Value::Concrete(ConcreteValue::Float(7.0)),
         Some(&union_type),
-        crate::schema::empty_defs(),
+        crate::schema::empty_defs_for_schema_walks(),
         None,
     ));
 }
@@ -132,7 +132,7 @@ fn type_aware_custom_delegates_to_base() {
         &Value::Concrete(ConcreteValue::Int(8080)),
         &Value::Concrete(ConcreteValue::Float(8080.0)),
         Some(&custom_type),
-        crate::schema::empty_defs(),
+        crate::schema::empty_defs_for_schema_walks(),
         None,
     ));
 }
@@ -210,7 +210,7 @@ fn type_aware_struct_ignores_default_bool_false() {
             &desired,
             &current,
             Some(&struct_type),
-            crate::schema::empty_defs(),
+            crate::schema::empty_defs_for_schema_walks(),
             None
         ),
         "Struct with extra default Bool(false) should be considered equal"
@@ -252,7 +252,7 @@ fn type_aware_struct_does_not_ignore_non_default_bool() {
             &desired,
             &current,
             Some(&struct_type),
-            crate::schema::empty_defs(),
+            crate::schema::empty_defs_for_schema_walks(),
             None
         ),
         "Struct with non-default Bool(true) should NOT be considered equal"
@@ -284,7 +284,7 @@ fn type_aware_string_enum_namespaced_vs_raw() {
             )),
             &Value::Concrete(ConcreteValue::String("AES256".to_string())),
             Some(&enum_type),
-            crate::schema::empty_defs(),
+            crate::schema::empty_defs_for_schema_walks(),
             None,
         ),
         "Namespaced enum and raw value should be considered equal"
@@ -300,7 +300,7 @@ fn type_aware_string_enum_namespaced_vs_raw() {
                 "awscc.s3.Bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256".to_string()
             )),
             Some(&enum_type),
-            crate::schema::empty_defs(),
+            crate::schema::empty_defs_for_schema_walks(),
             None,
         ),
         "Both namespaced should be equal"
@@ -314,7 +314,7 @@ fn type_aware_string_enum_namespaced_vs_raw() {
             )),
             &Value::Concrete(ConcreteValue::String("aws:kms".to_string())),
             Some(&enum_type),
-            crate::schema::empty_defs(),
+            crate::schema::empty_defs_for_schema_walks(),
             None,
         ),
         "Different enum values should not be equal"
@@ -349,7 +349,7 @@ fn type_aware_custom_enum_canonical_vs_namespaced_identifier() {
                 "aws.AvailabilityZone.ap_northeast_1a".to_string()
             )),
             Some(&az_type),
-            crate::schema::empty_defs(),
+            crate::schema::empty_defs_for_schema_walks(),
             None,
         ),
         "AWS-canonical hyphenated form must equal the fully-qualified DSL identifier"
@@ -361,7 +361,7 @@ fn type_aware_custom_enum_canonical_vs_namespaced_identifier() {
             )),
             &Value::Concrete(ConcreteValue::String("ap-northeast-1a".to_string())),
             Some(&az_type),
-            crate::schema::empty_defs(),
+            crate::schema::empty_defs_for_schema_walks(),
             None,
         ),
         "Equality must be symmetric"
@@ -377,7 +377,7 @@ fn type_aware_custom_enum_canonical_vs_namespaced_identifier() {
                 "aws.AvailabilityZone.ap_northeast_1a".to_string()
             )),
             Some(&az_type),
-            crate::schema::empty_defs(),
+            crate::schema::empty_defs_for_schema_walks(),
             None,
         ),
         "Identical fully-qualified forms must be equal"
@@ -389,7 +389,7 @@ fn type_aware_custom_enum_canonical_vs_namespaced_identifier() {
             &Value::Concrete(ConcreteValue::String("ap-northeast-1a".to_string())),
             &Value::Concrete(ConcreteValue::String("ap-northeast-1a".to_string())),
             Some(&az_type),
-            crate::schema::empty_defs(),
+            crate::schema::empty_defs_for_schema_walks(),
             None,
         ),
         "Identical AWS-canonical forms must be equal"
@@ -405,7 +405,7 @@ fn type_aware_custom_enum_canonical_vs_namespaced_identifier() {
                 "aws.AvailabilityZone.ap_northeast_1a".to_string()
             )),
             Some(&az_type),
-            crate::schema::empty_defs(),
+            crate::schema::empty_defs_for_schema_walks(),
             None,
         ),
         "AWS-canonical String must equal the matching EnumIdentifier shape"
@@ -419,7 +419,7 @@ fn type_aware_custom_enum_canonical_vs_namespaced_identifier() {
                 "aws.AvailabilityZone.ap_northeast_1c".to_string()
             )),
             Some(&az_type),
-            crate::schema::empty_defs(),
+            crate::schema::empty_defs_for_schema_walks(),
             None,
         ),
         "Different enum values must not be folded as equal"
@@ -469,7 +469,7 @@ fn type_aware_struct_ignores_default_string_enum_empty() {
             &desired,
             &current,
             Some(&struct_type),
-            crate::schema::empty_defs(),
+            crate::schema::empty_defs_for_schema_walks(),
             None
         ),
         "Struct with extra default StringEnum empty string should be considered equal"
@@ -518,7 +518,7 @@ fn type_aware_struct_ignores_default_custom_type() {
             &desired,
             &current,
             Some(&struct_type),
-            crate::schema::empty_defs(),
+            crate::schema::empty_defs_for_schema_walks(),
             None
         ),
         "Struct with extra default Custom(Int) zero should be considered equal"
@@ -566,7 +566,7 @@ fn type_aware_struct_ignores_default_nested_struct_empty() {
             &desired,
             &current,
             Some(&struct_type),
-            crate::schema::empty_defs(),
+            crate::schema::empty_defs_for_schema_walks(),
             None
         ),
         "Struct with extra default nested Struct empty map should be considered equal"
@@ -593,7 +593,7 @@ fn type_aware_ordered_list_detects_reorder() {
             &a,
             &b,
             Some(&ordered_list_type),
-            crate::schema::empty_defs(),
+            crate::schema::empty_defs_for_schema_walks(),
             None
         ),
         "Ordered list should detect reorder as NOT equal"
@@ -609,7 +609,7 @@ fn type_aware_ordered_list_detects_reorder() {
             &a,
             &c,
             Some(&ordered_list_type),
-            crate::schema::empty_defs(),
+            crate::schema::empty_defs_for_schema_walks(),
             None
         ),
         "Ordered list with same order should be equal"
@@ -635,7 +635,7 @@ fn type_aware_unordered_list_ignores_reorder() {
             &a,
             &b,
             Some(&unordered_list_type),
-            crate::schema::empty_defs(),
+            crate::schema::empty_defs_for_schema_walks(),
             None
         ),
         "Unordered list should treat reorder as equal"
@@ -795,7 +795,7 @@ fn secret_unchanged_same_hash() {
         &secret_value,
         &Value::Concrete(ConcreteValue::String(hash_str.clone())),
         None,
-        crate::schema::empty_defs(),
+        crate::schema::empty_defs_for_schema_walks(),
         None,
     ));
     // Reversed order should also work
@@ -803,7 +803,7 @@ fn secret_unchanged_same_hash() {
         &Value::Concrete(ConcreteValue::String(hash_str)),
         &secret_value,
         None,
-        crate::schema::empty_defs(),
+        crate::schema::empty_defs_for_schema_walks(),
         None,
     ));
 }
@@ -827,7 +827,7 @@ fn secret_changed_different_hash() {
         &new_secret,
         &Value::Concrete(ConcreteValue::String(old_hash_str)),
         None,
-        crate::schema::empty_defs(),
+        crate::schema::empty_defs_for_schema_walks(),
         None,
     ));
 }
@@ -1049,11 +1049,23 @@ fn secret_matches_plain_text_state_value() {
     ))));
     let plain = Value::Concrete(ConcreteValue::String("my-password".to_string()));
     assert!(
-        type_aware_equal(&secret, &plain, None, crate::schema::empty_defs(), None),
+        type_aware_equal(
+            &secret,
+            &plain,
+            None,
+            crate::schema::empty_defs_for_schema_walks(),
+            None
+        ),
         "Secret should match plain-text state when inner values are equal"
     );
     assert!(
-        type_aware_equal(&plain, &secret, None, crate::schema::empty_defs(), None),
+        type_aware_equal(
+            &plain,
+            &secret,
+            None,
+            crate::schema::empty_defs_for_schema_walks(),
+            None
+        ),
         "Plain-text state should match secret when inner values are equal"
     );
 }
@@ -1066,7 +1078,13 @@ fn secret_does_not_match_different_plain_text() {
     ))));
     let plain = Value::Concrete(ConcreteValue::String("other-password".to_string()));
     assert!(
-        !type_aware_equal(&secret, &plain, None, crate::schema::empty_defs(), None),
+        !type_aware_equal(
+            &secret,
+            &plain,
+            None,
+            crate::schema::empty_defs_for_schema_walks(),
+            None
+        ),
         "Secret should not match different plain-text state"
     );
 }
@@ -1156,7 +1174,7 @@ fn union_string_or_list_canonical_string_list_equal_to_self() {
         &a,
         &b,
         Some(&union),
-        crate::schema::empty_defs(),
+        crate::schema::empty_defs_for_schema_walks(),
         None
     ));
 }
@@ -1170,7 +1188,7 @@ fn union_string_or_list_canonical_string_list_diff_on_different_content() {
         &a,
         &b,
         Some(&union),
-        crate::schema::empty_defs(),
+        crate::schema::empty_defs_for_schema_walks(),
         None
     ));
 }
@@ -1190,7 +1208,7 @@ fn union_string_or_list_non_canonical_mixed_shapes_fail_to_equal() {
         &scalar,
         &canonical,
         Some(&union),
-        crate::schema::empty_defs(),
+        crate::schema::empty_defs_for_schema_walks(),
         None
     ));
 
@@ -1201,7 +1219,7 @@ fn union_string_or_list_non_canonical_mixed_shapes_fail_to_equal() {
         &legacy_list,
         &canonical,
         Some(&union),
-        crate::schema::empty_defs(),
+        crate::schema::empty_defs_for_schema_walks(),
         None
     ));
 }
@@ -1225,7 +1243,7 @@ fn union_string_or_list_through_custom_wrapper() {
         &a,
         &b,
         Some(&custom),
-        crate::schema::empty_defs(),
+        crate::schema::empty_defs_for_schema_walks(),
         None
     ));
 }

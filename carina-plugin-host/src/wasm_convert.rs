@@ -1556,16 +1556,21 @@ mod tests {
             .get("description")
             .expect("description attribute");
         assert_eq!(desc_attr.name, "description");
-        let defs = carina_core::schema::empty_defs();
         assert!(matches!(
-            desc_attr.attr_type.shape(defs),
+            desc_attr
+                .attr_type
+                .shape_ref_free()
+                .expect("test schema is Ref-free"),
             carina_core::schema::Shape::String
         ));
         assert!(desc_attr.required);
 
         let enabled_attr = schema.attributes.get("enabled").expect("enabled attribute");
         assert!(matches!(
-            enabled_attr.attr_type.shape(defs),
+            enabled_attr
+                .attr_type
+                .shape_ref_free()
+                .expect("test schema is Ref-free"),
             carina_core::schema::Shape::Bool
         ));
 
@@ -1574,7 +1579,10 @@ mod tests {
             .get("priority")
             .expect("priority attribute");
         assert!(matches!(
-            priority_attr.attr_type.shape(defs),
+            priority_attr
+                .attr_type
+                .shape_ref_free()
+                .expect("test schema is Ref-free"),
             carina_core::schema::Shape::Int
         ));
 
@@ -1585,17 +1593,24 @@ mod tests {
         assert_eq!(ingress_attr.removable, Some(false));
 
         // List with ordered: false
-        match ingress_attr.attr_type.shape(defs) {
+        match ingress_attr
+            .attr_type
+            .shape_ref_free()
+            .expect("test schema is Ref-free")
+        {
             carina_core::schema::Shape::List { inner, ordered } => {
                 assert!(!ordered, "list should be unordered");
 
                 // Union inside list
-                match inner.shape(defs) {
+                match inner.shape_ref_free().expect("test schema is Ref-free") {
                     carina_core::schema::Shape::Union(members) => {
                         assert_eq!(members.len(), 2);
 
                         // First member: struct with block_name and provider_name on fields
-                        match members[0].shape(defs) {
+                        match members[0]
+                            .shape_ref_free()
+                            .expect("test schema is Ref-free")
+                        {
                             carina_core::schema::Shape::Struct { name, fields } => {
                                 assert_eq!(name, "IngressRule");
                                 assert_eq!(fields.len(), 2);
@@ -1603,7 +1618,10 @@ mod tests {
                                 let from_port = &fields[0];
                                 assert_eq!(from_port.name, "from_port");
                                 assert!(matches!(
-                                    from_port.field_type.shape(defs),
+                                    from_port
+                                        .field_type
+                                        .shape_ref_free()
+                                        .expect("test schema is Ref-free"),
                                     carina_core::schema::Shape::Int
                                 ));
                                 assert!(from_port.required);
@@ -1620,7 +1638,10 @@ mod tests {
                                 let protocol = &fields[1];
                                 assert_eq!(protocol.name, "protocol");
                                 assert!(matches!(
-                                    protocol.field_type.shape(defs),
+                                    protocol
+                                        .field_type
+                                        .shape_ref_free()
+                                        .expect("test schema is Ref-free"),
                                     carina_core::schema::Shape::String
                                 ));
                                 assert!(protocol.block_name.is_none());
@@ -1631,7 +1652,9 @@ mod tests {
 
                         // Second member: String
                         assert!(matches!(
-                            members[1].shape(defs),
+                            members[1]
+                                .shape_ref_free()
+                                .expect("test schema is Ref-free"),
                             carina_core::schema::Shape::String
                         ));
                     }
@@ -1652,9 +1675,10 @@ mod tests {
         // accepts `duration = 30min` against that declaration.
         let json = r#"{"timeout":{"type":"Duration"}}"#;
         let types = json_to_attribute_types(json);
-        let defs = carina_core::schema::empty_defs();
         assert!(matches!(
-            types.get("timeout").map(|t| t.shape(defs)),
+            types
+                .get("timeout")
+                .map(|t| t.shape_ref_free().expect("test schema is Ref-free")),
             Some(carina_core::schema::Shape::Duration)
         ));
     }
@@ -1838,8 +1862,7 @@ mod tests {
             ],
         };
         let core_attr = proto_attr_type_to_core(&proto_attr);
-        let defs = carina_core::schema::empty_defs();
-        match core_attr.shape(defs) {
+        match core_attr.shape_ref_free().expect("test schema is Ref-free") {
             carina_core::schema::Shape::StringEnum { dsl_aliases, .. } => {
                 assert_eq!(dsl_aliases.len(), 2);
                 assert!(
@@ -1862,8 +1885,7 @@ mod tests {
         let json = r#"{"type":"string_enum","values":["A","B"],"name":"X"}"#;
         let proto_attr: proto::AttributeType = serde_json::from_str(json).unwrap();
         let core_attr = proto_attr_type_to_core(&proto_attr);
-        let defs = carina_core::schema::empty_defs();
-        match core_attr.shape(defs) {
+        match core_attr.shape_ref_free().expect("test schema is Ref-free") {
             carina_core::schema::Shape::StringEnum { dsl_aliases, .. } => {
                 assert!(dsl_aliases.is_empty());
             }
@@ -1880,8 +1902,7 @@ mod tests {
             length: Some((Some(1), Some(9))),
         };
         let core_attr = proto_attr_type_to_core(&proto_attr);
-        let defs = carina_core::schema::empty_defs();
-        match core_attr.shape(defs) {
+        match core_attr.shape_ref_free().expect("test schema is Ref-free") {
             carina_core::schema::Shape::Custom {
                 identity,
                 pattern,

@@ -695,7 +695,7 @@ pub fn resolve_enum_value(value: &Value, parts: &NamespacedEnumParts<'_>) -> Opt
 /// }
 /// ```
 pub fn resolve_enum_value_recursive(value: &Value, attr_type: &AttributeType) -> Option<Value> {
-    resolve_enum_value_recursive_with_defs(value, attr_type, crate::schema::empty_defs())
+    resolve_enum_value_recursive_projected(value, attr_type, None)
 }
 
 /// Same as [`resolve_enum_value_recursive`] but takes the enclosing
@@ -710,6 +710,14 @@ pub fn resolve_enum_value_recursive_with_defs(
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> Option<Value> {
+    resolve_enum_value_recursive_projected(value, attr_type, Some(defs))
+}
+
+fn resolve_enum_value_recursive_projected(
+    value: &Value,
+    attr_type: &AttributeType,
+    defs: Option<&std::collections::BTreeMap<String, AttributeType>>,
+) -> Option<Value> {
     // First, try the leaf case: this position is itself an enum.
     if let Some(parts) = attr_type.namespaced_enum_parts()
         && let Some(resolved) = resolve_enum_value(value, &parts)
@@ -717,10 +725,10 @@ pub fn resolve_enum_value_recursive_with_defs(
         return Some(resolved);
     }
 
-    // Project onto Shape so `Ref` is peeled at the type level
-    // (carina#3349). The wildcard arm cannot silently swallow a
-    // `Ref` because `Shape` has no `Ref` variant.
-    match attr_type.shape(defs) {
+    // Project onto Shape so `Ref` is either peeled through schema defs
+    // or rejected by the bare ref-free path. The wildcard arm cannot
+    // silently swallow a `Ref` because `Shape` has no `Ref` variant.
+    match shape_for_projection(attr_type, defs)? {
         crate::schema::Shape::Struct { fields, .. } => {
             let Value::Concrete(ConcreteValue::Map(map)) = value else {
                 return None;
@@ -730,7 +738,7 @@ pub fn resolve_enum_value_recursive_with_defs(
             for field in fields {
                 if let Some(field_value) = map.get(&field.name)
                     && let Some(new_field) =
-                        resolve_enum_value_recursive_with_defs(field_value, &field.field_type, defs)
+                        resolve_enum_value_recursive_projected(field_value, &field.field_type, defs)
                 {
                     rewritten.insert(field.name.clone(), new_field);
                     changed = true;
@@ -745,7 +753,7 @@ pub fn resolve_enum_value_recursive_with_defs(
             let mut rewritten = items.clone();
             let mut changed = false;
             for (i, item) in items.iter().enumerate() {
-                if let Some(new_item) = resolve_enum_value_recursive_with_defs(item, inner, defs) {
+                if let Some(new_item) = resolve_enum_value_recursive_projected(item, inner, defs) {
                     rewritten[i] = new_item;
                     changed = true;
                 }
@@ -759,7 +767,7 @@ pub fn resolve_enum_value_recursive_with_defs(
             let mut rewritten = map.clone();
             let mut changed = false;
             for (k, v) in map {
-                if let Some(new_v) = resolve_enum_value_recursive_with_defs(v, inner, defs) {
+                if let Some(new_v) = resolve_enum_value_recursive_projected(v, inner, defs) {
                     rewritten.insert(k.clone(), new_v);
                     changed = true;
                 }
@@ -769,6 +777,16 @@ pub fn resolve_enum_value_recursive_with_defs(
         // Scalars and Union: nothing to descend into. `Ref` is
         // already peeled by `shape(defs)` above.
         _ => None,
+    }
+}
+
+fn shape_for_projection<'a>(
+    attr_type: &'a AttributeType,
+    defs: Option<&'a std::collections::BTreeMap<String, AttributeType>>,
+) -> Option<crate::schema::Shape<'a>> {
+    match defs {
+        Some(defs) => Some(attr_type.shape_with_defs(defs)),
+        None => attr_type.shape_ref_free().ok(),
     }
 }
 
@@ -931,7 +949,7 @@ pub fn lift_current_state_string_enums_for_data_sources(
 /// [`resolve_enum_value_recursive`]'s "rewrite only on diff" contract so
 /// callers can skip cloning.
 pub fn lift_string_enum_leaves(value: &Value, attr_type: &AttributeType) -> Option<Value> {
-    lift_string_enum_leaves_with_defs(value, attr_type, crate::schema::empty_defs())
+    lift_string_enum_leaves_projected(value, attr_type, None)
 }
 
 /// Same as [`lift_string_enum_leaves`] but takes the enclosing
@@ -943,6 +961,14 @@ pub fn lift_string_enum_leaves_with_defs(
     value: &Value,
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> Option<Value> {
+    lift_string_enum_leaves_projected(value, attr_type, Some(defs))
+}
+
+fn lift_string_enum_leaves_projected(
+    value: &Value,
+    attr_type: &AttributeType,
+    defs: Option<&std::collections::BTreeMap<String, AttributeType>>,
 ) -> Option<Value> {
     // Leaf case: this position is itself a StringEnum.
     if let Some((_, values, _, dsl_map)) = attr_type.string_enum_parts() {
@@ -968,10 +994,10 @@ pub fn lift_string_enum_leaves_with_defs(
         return None;
     }
 
-    // Project onto Shape so `Ref` is peeled at the type level
-    // (carina#3349). The wildcard arm cannot silently swallow a
-    // `Ref` because `Shape` has no `Ref` variant.
-    match attr_type.shape(defs) {
+    // Project onto Shape so `Ref` is either peeled through schema defs
+    // or rejected by the bare ref-free path. The wildcard arm cannot
+    // silently swallow a `Ref` because `Shape` has no `Ref` variant.
+    match shape_for_projection(attr_type, defs)? {
         crate::schema::Shape::Struct { fields, .. } => {
             let Value::Concrete(ConcreteValue::Map(map)) = value else {
                 return None;
@@ -981,7 +1007,7 @@ pub fn lift_string_enum_leaves_with_defs(
             for field in fields {
                 if let Some(field_value) = map.get(&field.name)
                     && let Some(new_field) =
-                        lift_string_enum_leaves_with_defs(field_value, &field.field_type, defs)
+                        lift_string_enum_leaves_projected(field_value, &field.field_type, defs)
                 {
                     rewritten.insert(field.name.clone(), new_field);
                     changed = true;
@@ -996,7 +1022,7 @@ pub fn lift_string_enum_leaves_with_defs(
             let mut rewritten = items.clone();
             let mut changed = false;
             for (i, item) in items.iter().enumerate() {
-                if let Some(new_item) = lift_string_enum_leaves_with_defs(item, inner, defs) {
+                if let Some(new_item) = lift_string_enum_leaves_projected(item, inner, defs) {
                     rewritten[i] = new_item;
                     changed = true;
                 }
@@ -1010,7 +1036,7 @@ pub fn lift_string_enum_leaves_with_defs(
             let mut rewritten = map.clone();
             let mut changed = false;
             for (k, v) in map {
-                if let Some(new_v) = lift_string_enum_leaves_with_defs(v, inner, defs) {
+                if let Some(new_v) = lift_string_enum_leaves_projected(v, inner, defs) {
                     rewritten.insert(k.clone(), new_v);
                     changed = true;
                 }

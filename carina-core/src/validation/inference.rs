@@ -502,7 +502,7 @@ fn infer_resource_ref_with_visiting(
         // opaque `Ref` (carina#3340). `descend_struct_field` already
         // resolves internally for the Field arm; pre-resolving here
         // also keeps the Subscript arms shape-matched.
-        let resolved = current.resolve_refs(&schema.defs).as_attr();
+        let resolved = current.resolve_refs_with_defs(&schema.defs).as_attr();
         current = match (seg, &resolved.kind) {
             (PathSegment::Field { name }, _) => {
                 match descend_struct_field(resolved, name, &schema.defs) {
@@ -554,7 +554,7 @@ fn infer_resource_ref_with_visiting(
     // accessing, not for one buried inside a transferred value.
     // Resolve any trailing `Ref` so the Union check and the
     // TypeExpr projection see the underlying shape (carina#3340).
-    let current = current.resolve_refs(&schema.defs).as_attr();
+    let current = current.resolve_refs_with_defs(&schema.defs).as_attr();
     if matches!(&current.kind, AttrTypeKind::Union(_)) {
         return Err(InferenceError::UnknownType {
             reason: format!(
@@ -584,7 +584,7 @@ fn descend_struct_field<'a>(
     // Resolve any leading `Ref` chain so a reference path inside a
     // cyclic CFN struct (`WebACL.Statement -> AndStatement -> ...`)
     // can be followed across the cycle (carina#3340).
-    match attr_type.shape(defs) {
+    match attr_type.shape_with_defs(defs) {
         crate::schema::Shape::Struct { fields, .. } => fields
             .iter()
             .find(|f| f.name == field)

@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 use indexmap::IndexMap;
 
 use crate::resource::Value;
-use crate::schema::{AttributeType, ResourceSchema, empty_defs};
+use crate::schema::{AttributeType, ResourceSchema, empty_defs_for_schema_walks};
 
 /// Schema-aware value equality shared by the plan renderer
 /// (`detail_rows`) and the unchanged-count helper below (carina#3073).
@@ -57,7 +57,9 @@ pub fn compute_unchanged_count(
     exclude: Option<&std::collections::HashSet<&str>>,
     schema: Option<&ResourceSchema>,
 ) -> usize {
-    let defs: &BTreeMap<String, AttributeType> = schema.map(|s| &s.defs).unwrap_or(empty_defs());
+    let defs: &BTreeMap<String, AttributeType> = schema
+        .map(|s| &s.defs)
+        .unwrap_or(empty_defs_for_schema_walks());
     from_attrs
         .iter()
         .filter(|(k, v)| {

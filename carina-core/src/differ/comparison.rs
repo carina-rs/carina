@@ -6,7 +6,7 @@ use indexmap::IndexMap;
 
 use crate::explicit::{self, ExplicitFields};
 use crate::resource::{ConcreteValue, DeferredValue, ResourceId, Value, merge_with_saved};
-use crate::schema::{AttributeType, ResourceSchema, empty_defs};
+use crate::schema::{AttributeType, ResourceSchema, empty_defs_for_schema_walks};
 use crate::value::{SECRET_PREFIX, SecretHashContext, argon2id_hash, value_to_json_with_context};
 
 /// Type-aware semantic comparison of two Values.
@@ -71,7 +71,7 @@ pub(crate) fn type_aware_equal(
     // so the carina#3340 / carina#3349 invariant is moved from a
     // hand-written `resolve_refs` + `Ref(_) => unreachable!()` guard
     // into the type system.
-    let shape = attr_type.map(|t| t.shape(defs));
+    let shape = attr_type.map(|t| t.shape_with_defs(defs));
 
     match shape {
         None => {
@@ -440,7 +440,7 @@ fn is_type_default(
     // `Shape` enum has no `Ref` variant by construction, so the type
     // system rather than convention enforces that every default-value
     // classification has seen its target shape.
-    let shape = attr_type.map(|t| t.shape(defs));
+    let shape = attr_type.map(|t| t.shape_with_defs(defs));
     match (value, shape) {
         (Value::Concrete(ConcreteValue::Bool(false)), Some(crate::schema::Shape::Bool) | None) => {
             true
@@ -553,7 +553,9 @@ pub(super) fn find_changed_attributes(
     // Pull the cyclic-struct definition map (`Ref` targets) from the
     // resource schema if available, otherwise an empty map. Walk-sites
     // resolve `Ref` against this map (carina#3340).
-    let defs: &BTreeMap<String, AttributeType> = schema.map(|s| &s.defs).unwrap_or(empty_defs());
+    let defs: &BTreeMap<String, AttributeType> = schema
+        .map(|s| &s.defs)
+        .unwrap_or(empty_defs_for_schema_walks());
 
     // Project `current` through `prev_explicit` so server-side defaults
     // the user never authored disappear before any comparison runs.
