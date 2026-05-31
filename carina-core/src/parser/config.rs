@@ -42,13 +42,6 @@ pub struct ProviderContext {
     /// Factory-based custom type validator that calls through to provider factories
     /// (e.g., WASM plugins) for types not covered by `validators`.
     pub custom_type_validator: Option<CustomTypeValidatorFn>,
-    /// Schema types registered by providers, keyed by
-    /// `(provider, path, type_name)` (e.g., `("awscc", "ec2", "VpcId")`).
-    ///
-    /// This set is for explicit provider-defined schema aliases only. It is
-    /// not a resource-kind registry; use [`ProviderContext::resource_types`]
-    /// and [`ProviderContext::has_resource_type`] for resource refs.
-    pub schema_types: HashSet<(String, String, String)>,
     /// Resource kinds loaded from provider schemas, keyed by `(provider,
     /// resource_type)` such as `("aws", "iam.Role")`.
     pub resource_types: HashSet<(String, String)>,
@@ -71,29 +64,6 @@ pub struct ProviderContext {
 }
 
 impl ProviderContext {
-    /// Register `(provider, path, type_name)` as a schema type so the parser
-    /// classifies matching 3+ segment paths as `TypeExpr::SchemaType` rather
-    /// than `TypeExpr::Ref`. Provider crates call this during setup.
-    pub fn register_schema_type(
-        &mut self,
-        provider: impl Into<String>,
-        path: impl Into<String>,
-        type_name: impl Into<String>,
-    ) {
-        self.schema_types
-            .insert((provider.into(), path.into(), type_name.into()));
-    }
-
-    /// Return `true` iff `(provider, path, type_name)` has been registered via
-    /// [`register_schema_type`]. Used by the parser to route 3+ segment paths.
-    pub fn is_schema_type(&self, provider: &str, path: &str, type_name: &str) -> bool {
-        self.schema_types.contains(&(
-            provider.to_string(),
-            path.to_string(),
-            type_name.to_string(),
-        ))
-    }
-
     /// Return `true` iff `(provider, resource_type)` is a loaded managed
     /// resource or data source kind.
     pub fn has_resource_type(&self, provider: &str, resource_type: &str) -> bool {
@@ -123,7 +93,6 @@ impl std::fmt::Debug for ProviderContext {
                 "custom_type_validator",
                 &self.custom_type_validator.as_ref().map(|_| "..."),
             )
-            .field("schema_types", &self.schema_types)
             .field("resource_types", &self.resource_types)
             .field("customs_loaded", &self.customs_loaded)
             .finish()

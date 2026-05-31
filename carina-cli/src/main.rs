@@ -281,7 +281,6 @@ fn create_provider_context() -> carina_core::parser::ProviderContext {
         })),
         validators: std::collections::HashMap::new(),
         custom_type_validator: None,
-        schema_types: Default::default(),
         resource_types: Default::default(),
         // Schemas not yet loaded — early-parse runs before
         // `enrich_provider_context` populates the validator set, so the

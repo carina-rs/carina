@@ -141,7 +141,6 @@ fn enrich_provider_context(
                 Ok(())
             },
         )),
-        schema_types: Default::default(),
         resource_types: ProviderContext::resource_types_from_schema_registry(schemas),
         // carina#3239: schemas are loaded at this point, so the strict
         // "unknown custom type in type position" parser check applies.

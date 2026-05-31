@@ -105,7 +105,6 @@ impl DiagnosticEngine {
                     Ok(())
                 },
             )),
-            schema_types: Default::default(),
             resource_types:
                 carina_core::parser::ProviderContext::resource_types_from_schema_registry(&schemas),
             customs_loaded,

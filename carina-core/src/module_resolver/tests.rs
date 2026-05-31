@@ -3019,7 +3019,6 @@ fn test_argument_type_custom_validator() {
         decryptor: None,
         validators,
         custom_type_validator: None,
-        schema_types: Default::default(),
         resource_types: Default::default(),
         customs_loaded: false,
     };
@@ -3096,7 +3095,6 @@ fn test_argument_type_list_of_custom_type() {
         decryptor: None,
         validators,
         custom_type_validator: None,
-        schema_types: Default::default(),
         resource_types: Default::default(),
         customs_loaded: false,
     };
