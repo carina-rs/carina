@@ -230,8 +230,8 @@ pub(super) fn check_type_match(
                 }
             }
         }
-        // Resource type refs and schema types: accept strings (validated elsewhere)
-        TypeExpr::Ref(_) | TypeExpr::SchemaType { .. } => {
+        // Resource refs, unresolved dotted refs, and schema types are string-shaped.
+        TypeExpr::Ref(_) | TypeExpr::DottedUnresolved(_) | TypeExpr::SchemaType { .. } => {
             if matches!(
                 value,
                 Value::Concrete(ConcreteValue::String(_))
@@ -298,7 +298,7 @@ pub(super) fn check_type_match(
 /// Structural compatibility between two declared `TypeExpr`s. Used when
 /// both sides are known by their type tags rather than by a concrete
 /// `Value`. `String`-shaped types (`String`, `Simple`, `Ref`,
-/// `SchemaType`) are mutually compatible because the parser does not
+/// unresolved dotted refs, `SchemaType`) are mutually compatible because the parser does not
 /// distinguish their value shape — they all accept string-shaped values.
 fn type_expr_compatible(expected: &TypeExpr, actual: &TypeExpr) -> TypeCheckResult {
     fn is_string_shaped(t: &TypeExpr) -> bool {
@@ -307,60 +307,67 @@ fn type_expr_compatible(expected: &TypeExpr, actual: &TypeExpr) -> TypeCheckResu
             TypeExpr::String
                 | TypeExpr::Simple(_)
                 | TypeExpr::Ref(_)
+                | TypeExpr::DottedUnresolved(_)
                 | TypeExpr::SchemaType { .. }
                 | TypeExpr::StringLiteral(_)
         )
     }
 
-    match (expected, actual) {
-        (a, b) if is_string_shaped(a) && is_string_shaped(b) => TypeCheckResult::Ok,
+    if is_string_shaped(expected) && is_string_shaped(actual) {
+        return TypeCheckResult::Ok;
+    }
+    if matches!(
+        (expected, actual),
         (TypeExpr::Int, TypeExpr::Int)
-        | (TypeExpr::Float, TypeExpr::Float)
-        | (TypeExpr::Bool, TypeExpr::Bool)
-        | (TypeExpr::Duration, TypeExpr::Duration) => TypeCheckResult::Ok,
-        (TypeExpr::List(e), TypeExpr::List(a)) => type_expr_compatible(e, a),
-        (TypeExpr::Map(e), TypeExpr::Map(a)) => type_expr_compatible(e, a),
-        (TypeExpr::Struct { fields: ef }, TypeExpr::Struct { fields: af }) => {
-            if ef.len() != af.len() {
+            | (TypeExpr::Float, TypeExpr::Float)
+            | (TypeExpr::Bool, TypeExpr::Bool)
+            | (TypeExpr::Duration, TypeExpr::Duration)
+    ) {
+        return TypeCheckResult::Ok;
+    }
+    if let (TypeExpr::List(e), TypeExpr::List(a)) = (expected, actual) {
+        return type_expr_compatible(e, a);
+    }
+    if let (TypeExpr::Map(e), TypeExpr::Map(a)) = (expected, actual) {
+        return type_expr_compatible(e, a);
+    }
+    if let (TypeExpr::Struct { fields: ef }, TypeExpr::Struct { fields: af }) = (expected, actual) {
+        if ef.len() != af.len() {
+            return TypeCheckResult::Mismatch;
+        }
+        for ((en, et), (an, at)) in ef.iter().zip(af.iter()) {
+            if en != an {
                 return TypeCheckResult::Mismatch;
             }
-            for ((en, et), (an, at)) in ef.iter().zip(af.iter()) {
-                if en != an {
-                    return TypeCheckResult::Mismatch;
-                }
-                match type_expr_compatible(et, at) {
-                    TypeCheckResult::Ok => {}
-                    other => return other,
-                }
-            }
-            TypeCheckResult::Ok
-        }
-        // Union compatibility: actual must satisfy *some* member of
-        // expected when expected is a union; expected actual union
-        // must satisfy expected on at least one member when actual is
-        // a union. See carina-rs/carina#2611.
-        (TypeExpr::Union(members), other) => {
-            if members
-                .iter()
-                .any(|m| matches!(type_expr_compatible(m, other), TypeCheckResult::Ok))
-            {
-                TypeCheckResult::Ok
-            } else {
-                TypeCheckResult::Mismatch
+            match type_expr_compatible(et, at) {
+                TypeCheckResult::Ok => {}
+                other => return other,
             }
         }
-        (other, TypeExpr::Union(members)) => {
-            if members
-                .iter()
-                .any(|m| matches!(type_expr_compatible(other, m), TypeCheckResult::Ok))
-            {
-                TypeCheckResult::Ok
-            } else {
-                TypeCheckResult::Mismatch
-            }
-        }
-        // Unknown is the failed-inference sentinel; anything paired with
-        // it is a defensive mismatch.
-        _ => TypeCheckResult::Mismatch,
+        return TypeCheckResult::Ok;
     }
+    // Union compatibility: actual must satisfy *some* member of expected when
+    // expected is a union; an actual union must satisfy expected on at least
+    // one member. See carina-rs/carina#2611.
+    if let TypeExpr::Union(members) = expected
+        && members
+            .iter()
+            .any(|m| matches!(type_expr_compatible(m, actual), TypeCheckResult::Ok))
+    {
+        return TypeCheckResult::Ok;
+    }
+    if matches!(expected, TypeExpr::Union(_)) {
+        return TypeCheckResult::Mismatch;
+    }
+    if let TypeExpr::Union(members) = actual
+        && members
+            .iter()
+            .any(|m| matches!(type_expr_compatible(expected, m), TypeCheckResult::Ok))
+    {
+        return TypeCheckResult::Ok;
+    }
+
+    // Unknown is the failed-inference sentinel; all remaining concrete
+    // shape mismatches are rejected.
+    TypeCheckResult::Mismatch
 }

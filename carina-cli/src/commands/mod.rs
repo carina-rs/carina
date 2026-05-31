@@ -142,6 +142,7 @@ fn enrich_provider_context(
             },
         )),
         schema_types: Default::default(),
+        resource_types: ProviderContext::resource_types_from_schema_registry(schemas),
         // carina#3239: schemas are loaded at this point, so the strict
         // "unknown custom type in type position" parser check applies.
         customs_loaded: true,
@@ -268,6 +269,9 @@ pub fn validate_and_resolve_errors_with_factories(
     // removed type cannot ride into apply. Imported modules
     // re-parsed below by `resolve_modules_with_config` see the
     // enriched context directly and the parser gate covers them.
+    for finding in carina_core::validation::resolve_file_type_exprs(parsed, &enriched_context) {
+        errors.push(AppError::Validation(finding));
+    }
     for finding in
         carina_core::validation::validate_argument_custom_types(parsed, &enriched_context)
     {

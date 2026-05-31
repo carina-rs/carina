@@ -71,6 +71,27 @@ pub(super) fn test_engine_with_wait_target() -> DiagnosticEngine {
     DiagnosticEngine::new(Arc::new(schemas), vec!["aws".to_string()], Arc::new(vec![]))
 }
 
+pub(super) fn test_engine_with_iam_policy_arn_custom_type() -> DiagnosticEngine {
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, ResourceSchema, TypeIdentity, legacy_validator,
+    };
+
+    let iam_policy_arn = AttributeType::custom(
+        Some(TypeIdentity::new(Some("aws"), ["iam", "Policy"], "Arn")),
+        AttributeType::string(),
+        None,
+        None,
+        legacy_validator(|_| Ok(())),
+        None,
+    );
+    let schema = ResourceSchema::new("iam.Role")
+        .attribute(AttributeSchema::new("policy_arn", iam_policy_arn));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("aws", schema);
+
+    DiagnosticEngine::new(Arc::new(schemas), vec!["aws".to_string()], Arc::new(vec![]))
+}
+
 pub(super) fn test_engine_with_enum_attr() -> DiagnosticEngine {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 

@@ -32,6 +32,7 @@ impl TestClient {
                 validators: HashMap::new(),
                 custom_type_validator: None,
                 schema_types: Default::default(),
+                resource_types: Default::default(),
                 customs_loaded: false,
             };
             Backend::new(client, provider_context, None)

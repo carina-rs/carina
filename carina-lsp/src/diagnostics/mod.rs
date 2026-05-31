@@ -106,6 +106,8 @@ impl DiagnosticEngine {
                 },
             )),
             schema_types: Default::default(),
+            resource_types:
+                carina_core::parser::ProviderContext::resource_types_from_schema_registry(&schemas),
             customs_loaded,
         };
         Self {
@@ -225,17 +227,31 @@ impl DiagnosticEngine {
         // any known project root.
         if self.provider_context.customs_loaded {
             let custom_type_findings = match merged.as_ref() {
-                Some(m) => carina_core::validation::validate_argument_custom_types(
-                    m,
-                    &self.provider_context,
-                ),
+                Some(m) => {
+                    let mut parsed = m.clone();
+                    let mut findings = carina_core::validation::resolve_file_type_exprs(
+                        &mut parsed,
+                        &self.provider_context,
+                    );
+                    findings.extend(carina_core::validation::validate_argument_custom_types(
+                        &parsed,
+                        &self.provider_context,
+                    ));
+                    findings
+                }
                 None => doc
                     .parsed()
                     .map(|p| {
-                        carina_core::validation::validate_argument_custom_types(
-                            p,
+                        let mut parsed = p.clone();
+                        let mut findings = carina_core::validation::resolve_file_type_exprs(
+                            &mut parsed,
                             &self.provider_context,
-                        )
+                        );
+                        findings.extend(carina_core::validation::validate_argument_custom_types(
+                            &parsed,
+                            &self.provider_context,
+                        ));
+                        findings
                     })
                     .unwrap_or_default(),
             };

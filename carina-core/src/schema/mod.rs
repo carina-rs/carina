@@ -4624,10 +4624,10 @@ pub fn validate_email(email: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Compute Levenshtein edit distance between two strings
-fn levenshtein_distance(a: &str, b: &str) -> usize {
-    let a_len = a.len();
-    let b_len = b.len();
+/// Compute Levenshtein edit distance between two strings.
+pub(crate) fn levenshtein_distance(a: &str, b: &str) -> usize {
+    let a_len = a.chars().count();
+    let b_len = b.chars().count();
 
     if a_len == 0 {
         return b_len;

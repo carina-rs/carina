@@ -5,6 +5,8 @@
 
 use pest::Parser;
 
+use crate::schema::{TypeIdentity, levenshtein_distance};
+
 use super::ast::{ResourceTypePath, TypeExpr};
 use super::error::{ParseError, ParseWarning};
 use super::util::{pascal_to_snake, snake_to_pascal};
@@ -99,6 +101,71 @@ pub(crate) fn is_known_bare_custom_type(snake: &str, config: &ProviderContext) -
         .any(|id| id.provider.is_none() && id.segments.is_empty() && id.kind == pascal)
 }
 
+fn custom_type_suggestion_key(id: &TypeIdentity) -> String {
+    id.segments
+        .iter()
+        .chain(std::iter::once(&id.kind))
+        .map(|part| pascal_to_snake(part))
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+fn custom_type_input_key(input: &str) -> String {
+    if input.contains('.') {
+        let id = TypeIdentity::from_dotted(input);
+        custom_type_suggestion_key(&id)
+    } else {
+        pascal_to_snake(input)
+    }
+}
+
+pub(crate) fn suggest_registered_dotted_custom_type(
+    input: &str,
+    config: &ProviderContext,
+) -> Option<String> {
+    let input_key = custom_type_input_key(input);
+    let mut candidates: Vec<(&TypeIdentity, String)> = config
+        .validators
+        .keys()
+        .filter(|id| id.provider.is_some())
+        .map(|id| (id, custom_type_suggestion_key(id)))
+        .collect();
+    candidates.sort_by_key(|(id, _)| id.to_string());
+
+    candidates
+        .iter()
+        .find(|(_, key)| key == &input_key)
+        .map(|(id, _)| id.to_string())
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|(id, _)| input_key.ends_with(&pascal_to_snake(&id.kind)))
+                .map(|(id, _)| id.to_string())
+        })
+        .or_else(|| {
+            let max_distance = match input_key.len() {
+                0..=2 => 1,
+                3..=5 => 2,
+                _ => 3,
+            };
+            candidates
+                .iter()
+                .map(|(id, key)| (*id, levenshtein_distance(&input_key, key)))
+                .filter(|(_, distance)| *distance <= max_distance)
+                .min_by_key(|(_, distance)| *distance)
+                .map(|(id, _)| id.to_string())
+        })
+}
+
+pub(crate) fn unknown_custom_type_message(input: &str, config: &ProviderContext) -> String {
+    match suggest_registered_dotted_custom_type(input, config) {
+        Some(suggestion) => {
+            format!("unknown custom type '{input}'; suggestion: use '{suggestion}'")
+        }
+        None => format!("unknown custom type '{input}'"),
+    }
+}
+
 fn parse_type_expr_atom(
     pair: pest::iterators::Pair<Rule>,
     config: &ProviderContext,
@@ -155,17 +222,21 @@ fn parse_type_expr_atom(
                     if config.customs_loaded && !is_known_bare_custom_type(&snake, config) {
                         return Err(ParseError::InvalidExpression {
                             line,
-                            message: format!("unknown custom type '{other}'"),
+                            message: unknown_custom_type_message(other, config),
                         });
                     }
                     Ok(TypeExpr::Simple(snake))
                 }
                 other => Err(ParseError::InvalidExpression {
                     line,
-                    message: format!(
-                        "unknown type '{other}'; custom types are PascalCase — use '{}' instead",
-                        snake_to_pascal(other)
-                    ),
+                    message: match suggest_registered_dotted_custom_type(other, config) {
+                        Some(suggestion) => format!(
+                            "unknown type '{other}'; custom types must use a registered type name; suggestion: use '{suggestion}'"
+                        ),
+                        None => format!(
+                            "unknown type '{other}'; custom types must use a registered type name"
+                        ),
+                    },
                 }),
             }
         }
@@ -189,36 +260,16 @@ fn parse_type_expr_atom(
             }
         }
         Rule::type_ref => {
-            // Parse resource_type_path directly (e.g., aws.vpc or awscc.ec2.VpcId)
+            // Dotted type paths are deliberately left unresolved during parsing:
+            // bootstrap contexts do not yet know provider schemas or custom
+            // validators. Enriched validation resolves this to either Ref or
+            // SchemaType and rejects unknown dotted custom types.
             let mut ref_inner = inner.into_inner();
             let path_str = next_pair(&mut ref_inner, "resource type path", "type ref")?.as_str();
-            let parts: Vec<&str> = path_str.split('.').collect();
-
-            // A 3+ segment path with a PascalCase final segment is ambiguous:
-            // `aws.ec2.Vpc` is a resource kind (Ref), `awscc.ec2.VpcId` is a
-            // schema type. Disambiguate by asking the provider context:
-            // registered schema types become SchemaType, everything else
-            // falls back to Ref.
-            let has_pascal_tail = parts.len() >= 3
-                && parts
-                    .last()
-                    .is_some_and(|s| s.starts_with(|c: char| c.is_uppercase()));
-            if has_pascal_tail {
-                let provider = parts[0];
-                let path = parts[1..parts.len() - 1].join(".");
-                let type_name = parts.last().unwrap();
-                if config.is_schema_type(provider, &path, type_name) {
-                    return Ok(TypeExpr::SchemaType {
-                        provider: provider.to_string(),
-                        path,
-                        type_name: type_name.to_string(),
-                    });
-                }
-            }
             let path = ResourceTypePath::parse(path_str).ok_or_else(|| {
                 ParseError::InvalidResourceType(format!("Invalid resource type path: {}", path_str))
             })?;
-            Ok(TypeExpr::Ref(path))
+            Ok(TypeExpr::DottedUnresolved(path))
         }
         Rule::type_struct => {
             let mut fields: Vec<(String, TypeExpr)> = Vec::new();

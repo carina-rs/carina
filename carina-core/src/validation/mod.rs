@@ -9,10 +9,14 @@ use std::collections::{HashMap, HashSet};
 use indexmap::IndexMap;
 
 use crate::binding_index::BindingIndex;
-use crate::parser::{ModuleCall, ProviderContext, ResourceRef, TypeExpr, validate_custom_type};
+use crate::parser::{
+    ModuleCall, ProviderContext, ResourceRef, ResourceTypePath, TypeExpr, validate_custom_type,
+};
 use crate::provider::ProviderFactory;
 use crate::resource::{ConcreteValue, DeferredValue, Resource, Value};
-use crate::schema::{AttrTypeKind, AttributeType, SchemaRegistry, Shape, suggest_similar_name};
+use crate::schema::{
+    AttrTypeKind, AttributeType, SchemaRegistry, Shape, TypeIdentity, suggest_similar_name,
+};
 
 /// Render the trailing `" Did you mean 'X'?"` segment for an unknown
 /// name in a diagnostic, or an empty string when nothing close enough
@@ -605,11 +609,17 @@ pub fn is_type_expr_compatible_with_schema(
                 .all(|(_, ty)| is_type_expr_compatible_with_schema(ty, schema_inner, defs)),
             _ => false,
         },
+        // StringLiteral and Union remain conservatively accepted here,
+        // preserving pre-#3368 behavior. Tightening them is out of scope.
+        TypeExpr::Ref(_)
+        | TypeExpr::DottedUnresolved(_)
+        | TypeExpr::SchemaType { .. }
+        | TypeExpr::StringLiteral(_)
+        | TypeExpr::Union(_) => true,
         // Sentinel for failed inference (#2360 stage 2). Never matches a
         // concrete receiver — the inference_errors channel reports the
         // underlying "type annotation required" instead.
         TypeExpr::Unknown => false,
-        _ => true, // Ref, SchemaType — conservatively accept
     }
 }
 
@@ -785,6 +795,111 @@ pub fn validate_argument_custom_types<E: crate::parser::ExportParamLike>(
     errors
 }
 
+fn identity_from_dotted_path(path: &ResourceTypePath) -> TypeIdentity {
+    TypeIdentity::from_dotted(&path.to_string())
+}
+
+fn resolve_dotted_unresolved(
+    path: &ResourceTypePath,
+    config: &ProviderContext,
+) -> Result<TypeExpr, String> {
+    if config.has_resource_type(&path.provider, &path.resource_type) {
+        return Ok(TypeExpr::Ref(path.clone()));
+    }
+
+    let identity = identity_from_dotted_path(path);
+    // Resolution confirms the written annotation names a registered type.
+    // `same_type` allows wider-axis assignment, which would accept names
+    // that were never registered.
+    if config
+        .validators
+        .keys()
+        .any(|registered| registered == &identity)
+    {
+        let schema_path = identity.segments.join(".");
+        return Ok(TypeExpr::SchemaType {
+            provider: path.provider.clone(),
+            path: schema_path,
+            type_name: identity.kind,
+        });
+    }
+
+    Err(crate::parser::unknown_custom_type_message(
+        &path.to_string(),
+        config,
+    ))
+}
+
+/// Resolve parser-produced dotted type paths against an enriched provider
+/// context, recursing through every nested type-expression container.
+pub fn resolve_type_expr(ty: &TypeExpr, config: &ProviderContext) -> Result<TypeExpr, String> {
+    match ty {
+        TypeExpr::DottedUnresolved(path) => resolve_dotted_unresolved(path, config),
+        TypeExpr::List(inner) => {
+            resolve_type_expr(inner, config).map(|t| TypeExpr::List(Box::new(t)))
+        }
+        TypeExpr::Map(inner) => {
+            resolve_type_expr(inner, config).map(|t| TypeExpr::Map(Box::new(t)))
+        }
+        TypeExpr::Union(members) => members
+            .iter()
+            .map(|m| resolve_type_expr(m, config))
+            .collect::<Result<Vec<_>, _>>()
+            .map(TypeExpr::Union),
+        TypeExpr::Struct { fields } => fields
+            .iter()
+            .map(|(name, field_ty)| {
+                resolve_type_expr(field_ty, config).map(|resolved| (name.clone(), resolved))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|fields| TypeExpr::Struct { fields }),
+        TypeExpr::String
+        | TypeExpr::Bool
+        | TypeExpr::Int
+        | TypeExpr::Float
+        | TypeExpr::Duration
+        | TypeExpr::Simple(_)
+        | TypeExpr::Ref(_)
+        | TypeExpr::SchemaType { .. }
+        | TypeExpr::StringLiteral(_)
+        | TypeExpr::Unknown => Ok(ty.clone()),
+    }
+}
+
+/// Resolve every module-boundary type declaration in place. Diagnostics
+/// include the declaration kind/name so callers can report the same surface
+/// as [`validate_argument_custom_types`].
+pub fn resolve_file_type_exprs<E: crate::parser::ExportParamLike>(
+    parsed: &mut crate::parser::File<E>,
+    config: &ProviderContext,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for arg in &mut parsed.arguments {
+        match resolve_type_expr(&arg.type_expr, config) {
+            Ok(resolved) => arg.type_expr = resolved,
+            Err(e) => errors.push(format!("argument '{}': {e}", arg.name)),
+        }
+    }
+    for ap in &mut parsed.attribute_params {
+        if let Some(ty) = &ap.type_expr {
+            match resolve_type_expr(ty, config) {
+                Ok(resolved) => ap.type_expr = Some(resolved),
+                Err(e) => errors.push(format!("attribute '{}': {e}", ap.name)),
+            }
+        }
+    }
+    for ep in &mut parsed.export_params {
+        let export_name = ep.name().to_string();
+        if let Some(ty) = ep.type_expr_opt_mut() {
+            match resolve_type_expr(ty, config) {
+                Ok(resolved) => *ty = resolved,
+                Err(e) => errors.push(format!("export '{export_name}': {e}")),
+            }
+        }
+    }
+    errors
+}
+
 /// Recursively walk a [`TypeExpr`] and push one diagnostic per
 /// [`TypeExpr::Simple`] whose name is not a known bare custom type
 /// under `config`. Helper for [`validate_argument_custom_types`].
@@ -809,8 +924,14 @@ fn collect_unknown_simple_types_in(
             if !crate::parser::is_known_bare_custom_type(snake, config) {
                 let pascal = crate::parser::snake_to_pascal(snake);
                 errors.push(format!(
-                    "{decl_kind} '{decl_name}': unknown custom type '{pascal}'"
+                    "{decl_kind} '{decl_name}': {}",
+                    crate::parser::unknown_custom_type_message(&pascal, config)
                 ));
+            }
+        }
+        TypeExpr::DottedUnresolved(path) => {
+            if let Err(e) = resolve_dotted_unresolved(path, config) {
+                errors.push(format!("{decl_kind} '{decl_name}': {e}"));
             }
         }
         TypeExpr::List(inner) | TypeExpr::Map(inner) => {
@@ -1234,16 +1355,19 @@ pub fn validate_type_expr_value(
         // The reverse (Float -> Int) is rejected above. Mirrors the schema
         // validator's `(Float, Int) => Ok` rule in `schema/mod.rs`.
         (TypeExpr::Float, Value::Concrete(ConcreteValue::Int(_))) => None,
-        // Schema types are string subtypes — reject non-string values
-        (TypeExpr::SchemaType { .. }, Value::Concrete(ConcreteValue::Bool(b))) => {
-            Some(format!("expected {}, got bool ({}).", type_expr, b))
-        }
-        (TypeExpr::SchemaType { .. }, Value::Concrete(ConcreteValue::Int(n))) => {
-            Some(format!("expected {}, got int ({}).", type_expr, n))
-        }
-        (TypeExpr::SchemaType { .. }, Value::Concrete(ConcreteValue::Float(f))) => {
-            Some(format!("expected {}, got float ({}).", type_expr, f))
-        }
+        // Schema and unresolved dotted types are string subtypes — reject non-string values.
+        (
+            TypeExpr::SchemaType { .. } | TypeExpr::DottedUnresolved(_),
+            Value::Concrete(ConcreteValue::Bool(b)),
+        ) => Some(format!("expected {}, got bool ({}).", type_expr, b)),
+        (
+            TypeExpr::SchemaType { .. } | TypeExpr::DottedUnresolved(_),
+            Value::Concrete(ConcreteValue::Int(n)),
+        ) => Some(format!("expected {}, got int ({}).", type_expr, n)),
+        (
+            TypeExpr::SchemaType { .. } | TypeExpr::DottedUnresolved(_),
+            Value::Concrete(ConcreteValue::Float(f)),
+        ) => Some(format!("expected {}, got float ({}).", type_expr, f)),
         _ => None,
     }
 }

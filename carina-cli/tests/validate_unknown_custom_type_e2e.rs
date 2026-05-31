@@ -21,7 +21,9 @@ use carina_core::provider::{
     BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer, ProviderResult,
 };
 use carina_core::resource::{DataSource, Value};
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use carina_core::schema::{
+    AttributeSchema, AttributeType, ResourceSchema, TypeIdentity, legacy_validator,
+};
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use tempfile::TempDir;
@@ -72,10 +74,21 @@ impl ProviderFactory for AwsccTestFactory {
         Box::pin(async { Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer> })
     }
     fn schemas(&self) -> Vec<ResourceSchema> {
+        let iam_policy_arn = AttributeType::custom(
+            Some(TypeIdentity::new(Some("aws"), ["iam", "Policy"], "Arn")),
+            AttributeType::string(),
+            None,
+            None,
+            legacy_validator(|_| Ok(())),
+            None,
+        );
+
         vec![
             ResourceSchema::new("ec2.Vpc")
                 .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
                 .attribute(AttributeSchema::new("vpc_id", AttributeType::string())),
+            ResourceSchema::new("iam.Role")
+                .attribute(AttributeSchema::new("policy_arn", iam_policy_arn)),
         ]
     }
 }
@@ -221,6 +234,114 @@ fn validate_rejects_renamed_legacy_custom_type_name() {
             .any(|d| d.contains("unknown custom type") && d.contains("IamOidcProviderArn")),
         "validate must reject a renamed-then-removed custom-type name \
          (carina#3239 headline case); got diagnostics: {:#?}",
+        diags
+    );
+}
+
+/// Reproduces carina#3368: a dotted custom type that is not registered
+/// must be rejected instead of silently validating as an untyped string.
+#[test]
+fn validate_rejects_fake_dotted_custom_type() {
+    let fixture = write_fixture("list(aws.iam.TotallyFake.Arn)");
+    let caller = fixture.path().join("caller");
+
+    let diags = carina_cli::commands::validate::validate_with_factories(&caller, factories());
+
+    assert!(
+        diags.iter().any(|d| {
+            d.contains("unknown custom type")
+                && (d.contains("aws.iam.TotallyFake.Arn") || d.contains("TotallyFake"))
+        }),
+        "validate must reject an unregistered dotted custom type; got \
+         diagnostics: {:#?}",
+        diags
+    );
+}
+
+/// Far-away dotted names should fail plainly without a misleading custom-type
+/// suggestion.
+#[test]
+fn validate_rejects_fake_dotted_custom_type_without_bad_suggestion() {
+    let fixture = write_fixture("aws.foo.TotallyMadeUp.Xyz");
+    let caller = fixture.path().join("caller");
+
+    let diags = carina_cli::commands::validate::validate_with_factories(&caller, factories());
+
+    assert!(
+        diags.iter().any(|d| {
+            d.contains("unknown custom type") && d.contains("aws.foo.TotallyMadeUp.Xyz")
+        }),
+        "validate must reject the unregistered dotted custom type; got \
+         diagnostics: {:#?}",
+        diags
+    );
+    assert!(
+        !diags.iter().any(|d| d.contains("aws.iam.Policy.Arn")),
+        "far-away unknown custom types must not suggest unrelated registered \
+         identities; got diagnostics: {:#?}",
+        diags
+    );
+}
+
+/// A written dotted annotation must name an exact registered identity.
+/// `aws.Arn` is wider than the registered `aws.iam.Policy.Arn`, but it
+/// is not itself registered, so validation must reject it.
+#[test]
+fn validate_rejects_wider_bare_provider_dotted_type() {
+    let fixture = write_fixture("aws.Arn");
+    let caller = fixture.path().join("caller");
+
+    let diags = carina_cli::commands::validate::validate_with_factories(&caller, factories());
+
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.contains("unknown custom type") && d.contains("aws.Arn")),
+        "validate must reject the unregistered wider dotted custom type \
+         `aws.Arn`; got diagnostics: {:#?}",
+        diags
+    );
+}
+
+/// Registered dotted identities such as `aws.iam.Policy.Arn` remain valid;
+/// this guards the fix from rejecting provider-scoped custom types wholesale.
+#[test]
+fn validate_accepts_registered_dotted_custom_type() {
+    let fixture = write_fixture("list(aws.iam.Policy.Arn)");
+    let caller = fixture.path().join("caller");
+
+    let diags = carina_cli::commands::validate::validate_with_factories(&caller, factories());
+
+    assert!(
+        !diags.iter().any(|d| d.contains("unknown custom type")),
+        "validate must accept the registered dotted custom type \
+         `aws.iam.Policy.Arn`; got diagnostics: {:#?}",
+        diags
+    );
+}
+
+/// Reproduces carina#3368: snake_case custom-type spelling should point
+/// users at the registered dotted identity, not an unregistered bare name.
+#[test]
+fn validate_snake_case_suggests_dotted_registered_identity() {
+    let fixture = write_fixture("iam_policy_arn");
+    let caller = fixture.path().join("caller");
+
+    let diags = carina_cli::commands::validate::validate_with_factories(&caller, factories());
+
+    assert!(
+        diags.iter().any(|d| {
+            d.contains("aws.iam.Policy.Arn") && (d.contains("use") || d.contains("suggest"))
+        }),
+        "validate should suggest the registered dotted identity \
+         `aws.iam.Policy.Arn` for `iam_policy_arn`; got diagnostics: \
+         {:#?}",
+        diags
+    );
+    assert!(
+        !diags.iter().any(|d| d.contains("IamPolicyArn")),
+        "validate must not suggest the unregistered bare name \
+         `IamPolicyArn`; got diagnostics: {:#?}",
         diags
     );
 }

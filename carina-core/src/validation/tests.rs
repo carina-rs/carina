@@ -47,6 +47,7 @@ fn context_with_iam_policy_arn_validator() -> ProviderContext {
         validators,
         custom_type_validator: None,
         schema_types: Default::default(),
+        resource_types: Default::default(),
         customs_loaded: false,
     }
 }
@@ -3217,5 +3218,26 @@ fn validate_argument_custom_types_is_independent_of_customs_loaded_flag() {
         findings.len(),
         1,
         "walker always reports unknowns; gating is the caller's choice"
+    );
+}
+
+#[test]
+fn resolve_type_expr_accepts_registered_resource_ref() {
+    use crate::parser::{ResourceTypePath, TypeExpr};
+
+    let mut ctx = ProviderContext::default();
+    ctx.resource_types
+        .insert(("aws".to_string(), "vpc".to_string()));
+
+    let resolved = resolve_type_expr(
+        &TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "vpc")),
+        &ctx,
+    )
+    .expect("registered resource type must resolve");
+
+    assert_eq!(
+        resolved,
+        TypeExpr::Ref(ResourceTypePath::new("aws", "vpc")),
+        "registered resource refs such as aws.vpc must keep resolving as Ref"
     );
 }

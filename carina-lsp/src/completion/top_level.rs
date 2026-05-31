@@ -471,6 +471,9 @@ impl CompletionProvider {
             parser::TypeExpr::Ref(resource_path) => {
                 format!("{}.{}", resource_path.provider, resource_path.resource_type)
             }
+            parser::TypeExpr::DottedUnresolved(resource_path) => {
+                format!("{}.{}", resource_path.provider, resource_path.resource_type)
+            }
             schema_type @ parser::TypeExpr::SchemaType { .. } => schema_type.to_string(),
             struct_type @ parser::TypeExpr::Struct { .. } => struct_type.to_string(),
             literal @ parser::TypeExpr::StringLiteral(_) => literal.to_string(),
@@ -1025,6 +1028,7 @@ fn type_expr_to_attribute_type(
         }
         parser::TypeExpr::StringLiteral(_)
         | parser::TypeExpr::Ref(_)
+        | parser::TypeExpr::DottedUnresolved(_)
         | parser::TypeExpr::SchemaType { .. }
         | parser::TypeExpr::Struct { .. }
         | parser::TypeExpr::Unknown => None,

@@ -346,6 +346,15 @@ fn check_fn_arg_type(
             // If not found in bindings, skip validation (forward ref or dynamic)
             true
         }
+        // Unresolved dotted types should normally be classified before
+        // function type checking. If one reaches here through an early parse
+        // path, it still has string runtime shape.
+        TypeExpr::DottedUnresolved(_) => matches!(
+            value,
+            Value::Concrete(ConcreteValue::String(_))
+                | Value::Deferred(DeferredValue::Interpolation(_))
+                | Value::Deferred(DeferredValue::ResourceRef { .. })
+        ),
         // Schema types (awscc.ec2.VpcId, etc.) are string subtypes with provider validators
         TypeExpr::SchemaType {
             provider,
@@ -393,7 +402,19 @@ fn check_fn_arg_type(
                     | Value::Deferred(DeferredValue::Interpolation(_))
                     | Value::Deferred(DeferredValue::ResourceRef { .. })
             ),
-            _ => false,
+            TypeExpr::Simple(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::SchemaType { .. }
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Bool
+            | TypeExpr::Duration
+            | TypeExpr::List(_)
+            | TypeExpr::Map(_)
+            | TypeExpr::Struct { .. }
+            | TypeExpr::Union(_)
+            | TypeExpr::Unknown => false,
         }),
         // Inference sentinel: never matches a concrete value.
         TypeExpr::Unknown => false,
@@ -451,8 +472,13 @@ fn check_fn_return_type(
                 true
             }
         }
-        // Resource type refs: not applicable for value functions
-        TypeExpr::Ref(_) => true,
+        // Resource type refs are string-shaped for value functions.
+        TypeExpr::Ref(_) | TypeExpr::DottedUnresolved(_) => matches!(
+            value,
+            Value::Concrete(ConcreteValue::String(_))
+                | Value::Deferred(DeferredValue::Interpolation(_))
+                | Value::Deferred(DeferredValue::ResourceRef { .. })
+        ),
         // Schema types: validate returned value against the provider validator
         TypeExpr::SchemaType {
             provider,
@@ -495,7 +521,19 @@ fn check_fn_return_type(
                     | Value::Deferred(DeferredValue::Interpolation(_))
                     | Value::Deferred(DeferredValue::ResourceRef { .. })
             ),
-            _ => false,
+            TypeExpr::Simple(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::SchemaType { .. }
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Bool
+            | TypeExpr::Duration
+            | TypeExpr::List(_)
+            | TypeExpr::Map(_)
+            | TypeExpr::Struct { .. }
+            | TypeExpr::Union(_)
+            | TypeExpr::Unknown => false,
         }),
         // Inference sentinel: never matches a concrete value.
         TypeExpr::Unknown => false,

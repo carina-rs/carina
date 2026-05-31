@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::parser::{ArgumentParameter, ParsedFile, ProviderContext, UseStatement};
+use crate::parser::{ArgumentParameter, ParseError, ParsedFile, ProviderContext, UseStatement};
 
 use super::error::ModuleError;
 use super::expander::instance_prefix_for_call;
@@ -138,6 +138,13 @@ impl<'cfg> ModuleResolver<'cfg> {
         let mut merged = ParsedFile::default();
         for (_, parsed) in parsed_files {
             crate::config_loader::merge_parsed_file(&mut merged, parsed);
+        }
+        let type_errors = crate::validation::resolve_file_type_exprs(&mut merged, self.config);
+        if let Some(first) = type_errors.into_iter().next() {
+            return Err(ModuleError::Parse(ParseError::InvalidExpression {
+                line: 0,
+                message: first,
+            }));
         }
         Ok(merged)
     }
