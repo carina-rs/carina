@@ -133,44 +133,67 @@ identity's `segments`/`kind` directly. `TypeIdentity` already enforces
 this for `same_type`/`assignable_to`/etc.; this design extends it to the
 two remaining identity-less positional consumers.
 
-### The two identity-less consumers
+### The value-extraction situation, measured (decided 2026-05-31)
 
-`convert_enum_value(s: &str)` and `is_dsl_enum_format(s: &str)` are
-called **without an identity** on display / alias paths:
+There are **two** enum-value extractors in the tree, with very different
+segment-handling:
 
-- `value.rs:470` `format_value_into` — display; only has the resolved
-  string `s`, no schema/identity.
-- `value.rs:1599` `resolve_value_alias` — has `resource_type` + `attr_name`
-  + `factory`, so it *can* reach the schema/identity.
-- `plan_tree.rs:304` — display path; string only.
+1. **`extract_enum_value_with_values(s, valid_values)`** (`utils.rs:388`)
+   — the schema-aware extractor used by the **most correctness-critical
+   path**, the differ's `StringEnum` arm (`comparison.rs:191-192`) and
+   the plan renderer. It recovers the value by walking every
+   uppercase-led segment and checking the tail against the known
+   `valid_values` list, "earliest match wins". This is **already
+   segment-count agnostic and dotted-value safe** — a runtime probe
+   confirms it extracts `enabled` from
+   `aws.s3.BucketLifecycleConfiguration.Rules.Status.enabled` (6-part)
+   and `ipsec.1` from a 7-part `…TunnelOptions.Type.ipsec.1`. **No
+   change needed.**
+2. **`convert_enum_value(s: &str)`** (`utils.rs:477`) — the **positional**
+   extractor (`NamespacedId::parse(s).map_or(s, |id| id.value())`),
+   which inherits the index-3 pin and so mis-splits the 6-part form
+   (`"Status.enabled"`). Non-test callers, all on display / alias paths:
+   - `value.rs:471` `format_value_into` — display; string only.
+   - `plan_tree.rs:305` resource-summary — string only.
+   - `value.rs:1599` `resolve_value_alias` — has `resource_type` +
+     `attr_name` + `factory`, so the schema/`valid_values` is reachable.
 
-The display-path callers strip the value **tail** from an
-already-resolved fully-qualified string. The tail is the last segment
-*except when the value itself is dotted*. That is the same ambiguity,
-now on the extraction side.
+`is_dsl_enum_format(s: &str)` (`utils.rs:501`) is the same positional
+`NamespacedId::parse(s).is_some()` predicate, used as a gate before
+`convert_enum_value` at the same display sites.
 
-Two ways to make the extraction unambiguous; the design **must pick one
-and the implementation plan will measure both**:
+Two candidate fixes were measured by stubbing and
+`cargo check --workspace --all-targets`:
 
-1. **Carry the resolved value structurally** so the display path never
-   re-parses a flattened string — i.e. the resolved enum value retains
-   its `(identity, value)` split (e.g. a dedicated `ConcreteValue`
-   shape, or `EnumIdentifier` already being the bare value so the
-   `String`-tail-strip path is removed). This is the type-safe end state
-   (the broken positional re-parse becomes unwritable) but the larger
-   reshape.
-2. **Identity-driven parse**: change `NamespacedId::parse` so that the
-   5+-part split is no longer positional-index-3 but anchored on the
-   **value being the trailing run after the kind**, where the kind is
-   recognized structurally. Since a standalone string has no identity,
-   this still cannot fully disambiguate dotted values without the
-   identity — so the standalone callers (`is_dsl_enum_format`,
-   `convert_enum_value`) need an identity-aware variant, and the
-   display path must thread or look up the identity.
+- **Option 2 — thread a `TypeIdentity` into the extractor / predicate.**
+  Rejected. `format_value_into` is a **recursive value→string formatter
+  called from 6 sites with no schema anywhere in its tree**; the
+  arg-mismatch error count (7) understates the real cost — making the
+  identity available means plumbing schema through the entire
+  value-formatting subsystem (display, diff, plan-tree). Genuinely wide.
+- **Option 1 (schema-aware) — chosen.** Replace `convert_enum_value`'s
+  *positional* extraction with the same **`valid_values`-matching**
+  logic the differ already uses, and drop the index-3 positional 5+-part
+  branch in `NamespacedId::parse` (it is the single broken thing). This
+  **removes** the broken positional re-parse rather than guarding it, and
+  needs **no wire-format change**: because the schema-aware extractor is
+  already segment-count agnostic, the stored fully-qualified `String`
+  canonical form stays as-is — no `ConcreteValue` reshape, no state
+  migration. Radius is the 3 display/alias sites plus the parser branch.
 
-Either way, `validate_enum_namespace` (which *has* the identity) is the
-easy half: compare against `identity.segments` instead of relying on the
-positional parse. The hard half is the identity-less display extraction.
+The remaining implementation question is purely **how the display sites
+reach `valid_values`** (the differ/alias sites already do; the two pure
+display sites — `format_value_into`, `plan_tree` summary — may not). The
+fallback there is `extract_enum_value` (last-segment), which is correct
+for every non-dotted value; the only values that need the `valid_values`
+list to disambiguate are dotted ones (`ipsec.1`), and those reach the
+display path already resolved. The implementation plan pins this with a
+dotted-value-at-depth regression test before touching the parser.
+
+`validate_enum_namespace` (which *has* the identity) is the easy half:
+compare the fully-qualified input against `identity.segments` +
+`identity.kind` directly instead of routing the split through the
+positional parse.
 
 ## Proposed change set (cross-repo chain)
 
@@ -184,12 +207,16 @@ chain**, not a carina-only half-fix with the provider deferred.
    against `identity.segments` + `identity.kind` directly (identity is
    in hand), instead of routing the kind/value split through the
    positional `NamespacedId::parse` index-3 pin.
-2. Resolve the identity-less value-tail extraction
-   (`convert_enum_value` / `is_dsl_enum_format` on display + alias
-   paths) by one of the two options above — **decided by measuring
-   radius** (`cargo check --workspace --all-targets` after stubbing each)
-   before the implementation PR, per CLAUDE.md "measure radius before
-   deferring".
+2. **Drop the positional 5+-part branch in `NamespacedId::parse`** (the
+   single broken thing — the index-3 pin) and route `convert_enum_value`
+   through the schema-aware **`valid_values`-matching** extraction that
+   the differ already uses (Option 1, decided by radius measurement
+   2026-05-31; see "The value-extraction situation" above). This
+   *removes* the broken positional re-parse rather than guarding it and
+   needs **no** `ConcreteValue` reshape or state migration. Option 2
+   (threading `TypeIdentity` through the recursive `format_value_into`
+   formatter) was measured and rejected as a wide reshape of the
+   value-formatting subsystem.
 3. TDD: failing tests first — the probe table above becomes the
    regression suite. Add deeper-segment (5/6/7-part) cases to the
    `NamespacedId::parse`, `validate_enum_namespace`, `convert_enum_value`,
@@ -250,8 +277,11 @@ same response as PR-B.
 
 ## Open decisions to settle in the implementation plan
 
-1. PR-A value-extraction option (1 structural vs 2 identity-aware parse)
-   — pick by measured radius.
+1. ~~PR-A value-extraction option~~ — **DECIDED 2026-05-31: Option 1
+   (schema-aware `valid_values` matching), drop the positional 5+-part
+   branch.** Option 2 (thread `TypeIdentity` through `format_value_into`)
+   measured as a wide reshape and rejected. No `ConcreteValue` reshape,
+   no state migration. See "The value-extraction situation, measured".
 2. Whether the codegen segment-walk and the 11 hand-written rewrites
    land in one PR-B or split (likely one: same root, same regen).
 3. Whether PR-C is in-scope or a referenced follow-up.
