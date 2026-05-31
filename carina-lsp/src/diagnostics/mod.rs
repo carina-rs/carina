@@ -535,7 +535,7 @@ impl DiagnosticEngine {
                             // bare-struct attribute is still caught (same
                             // bug class as carina#3349).
                             if matches!(
-                                attr_schema.attr_type.shape(&schema.defs),
+                                schema.shape_of(&attr_schema.attr_type),
                                 carina_core::schema::Shape::Struct { .. }
                             ) && matches!(attr_value, Value::Concrete(ConcreteValue::List(_)))
                             {
@@ -566,7 +566,7 @@ impl DiagnosticEngine {
                             // else (and when the StringEnum branch can't locate a
                             // value range).
                             if let carina_core::schema::Shape::StringEnum { .. } =
-                                attr_schema.attr_type.shape(&schema.defs)
+                                schema.shape_of(&attr_schema.attr_type)
                                 && let Some(diag) = build_string_enum_diagnostic(
                                     &attr_schema.attr_type,
                                     attr_value,
@@ -586,7 +586,7 @@ impl DiagnosticEngine {
                             // wildcard arm cannot silently drop a Ref-typed
                             // attribute (carina#3349 invariant lifted into
                             // the type system).
-                            let attr_shape = attr_schema.attr_type.shape(&schema.defs);
+                            let attr_shape = schema.shape_of(&attr_schema.attr_type);
                             let type_error = match (attr_shape, attr_value) {
                                 // Bool type should not receive String
                                 (
@@ -765,7 +765,7 @@ impl DiagnosticEngine {
                                     carina_core::schema::Shape::List { inner, .. },
                                     Value::Concrete(ConcreteValue::List(_)),
                                 ) if !matches!(
-                                    inner.shape(&schema.defs),
+                                    schema.shape_of(inner),
                                     carina_core::schema::Shape::Struct { .. }
                                 ) =>
                                 {
@@ -836,10 +836,10 @@ impl DiagnosticEngine {
                             // struct-field validation. Same bug class as
                             // carina#3349 — a raw match arm would silently
                             // drop `Ref` and skip the entire pass.
-                            let is_struct_shape = match attr_schema.attr_type.shape(&schema.defs) {
+                            let is_struct_shape = match schema.shape_of(&attr_schema.attr_type) {
                                 carina_core::schema::Shape::Struct { .. } => true,
                                 carina_core::schema::Shape::List { inner, .. } => matches!(
-                                    inner.shape(&schema.defs),
+                                    schema.shape_of(inner),
                                     carina_core::schema::Shape::Struct { .. }
                                 ),
                                 _ => false,

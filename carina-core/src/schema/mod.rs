@@ -19,6 +19,23 @@ mod type_identity;
 pub use resolved_attr_type::ResolvedAttrType;
 pub use type_identity::TypeIdentity;
 
+/// Error returned when a bare projection reaches a schema-bound
+/// [`AttrTypeKind::Ref`] without a defs map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefEncountered {
+    pub name: String,
+}
+
+impl fmt::Display for RefEncountered {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "unresolved AttributeType::Ref(\"{}\") has no defs in scope",
+            self.name
+        )
+    }
+}
+
 /// Type alias for resource validator functions
 pub type ResourceValidator = fn(&HashMap<String, Value>) -> Result<(), Vec<TypeError>>;
 
@@ -919,6 +936,16 @@ impl Schema {
         self.defs.get(name)
     }
 
+    /// Resolve `ty` against this schema's definition map.
+    pub fn resolve_of<'a>(&'a self, ty: &'a AttributeType) -> ResolvedAttrType<'a> {
+        ty.resolve_refs_with_defs(&self.defs)
+    }
+
+    /// Project `ty` onto a [`Shape`] using this schema's definition map.
+    pub fn shape_of<'a>(&'a self, ty: &'a AttributeType) -> Shape<'a> {
+        ty.shape_with_defs(&self.defs)
+    }
+
     /// Validate a `Value` against this schema's `root`, resolving
     /// any `Ref` it encounters by looking it up in `defs`.
     pub fn validate(&self, value: &Value) -> Result<(), TypeError> {
@@ -1422,10 +1449,18 @@ pub(crate) fn lift_map_key(key_type: &AttributeType, key: &str) -> Value {
 /// to capture cyclic definitions; this constant is for sites that
 /// genuinely have no resource schema in scope (synthetic fixtures,
 /// validation helpers operating on a bare `AttributeType`).
-pub fn empty_defs() -> &'static std::collections::BTreeMap<String, AttributeType> {
+pub(crate) fn empty_defs_for_schema_walks()
+-> &'static std::collections::BTreeMap<String, AttributeType> {
     use std::sync::OnceLock;
     static EMPTY: OnceLock<std::collections::BTreeMap<String, AttributeType>> = OnceLock::new();
     EMPTY.get_or_init(std::collections::BTreeMap::new)
+}
+
+#[deprecated(
+    note = "use Schema::shape_of / ResourceSchema::shape_of, or AttributeType::shape_ref_free"
+)]
+pub fn empty_defs() -> &'static std::collections::BTreeMap<String, AttributeType> {
+    empty_defs_for_schema_walks()
 }
 
 impl AttributeType {
@@ -1439,7 +1474,7 @@ impl AttributeType {
     /// matching on the type, so the wildcard arm cannot silently
     /// accept a `Ref` and discard its schema information. The
     /// `defs` map is normally `&ResourceSchema::defs`; pass
-    /// [`empty_defs`] when no resource is in scope.
+    /// [`empty_defs_for_schema_walks`] when no resource is in scope.
     ///
     /// # Panics
     ///
@@ -1447,7 +1482,7 @@ impl AttributeType {
     /// is a schema invariant (a producer that emits `Ref` must also
     /// populate the matching def); a violation indicates a codegen
     /// or wire-format bug, not user input.
-    pub fn resolve_refs<'a>(
+    pub(crate) fn resolve_refs_with_defs<'a>(
         &'a self,
         defs: &'a std::collections::BTreeMap<String, AttributeType>,
     ) -> ResolvedAttrType<'a> {
@@ -1470,28 +1505,61 @@ impl AttributeType {
         panic!("AttributeType::Ref chain exceeded 256 hops; pathological self-cycle in defs")
     }
 
+    #[deprecated(
+        note = "use Schema::resolve_of / ResourceSchema::resolve_of, or AttributeType::shape_ref_free"
+    )]
+    pub fn resolve_refs<'a>(
+        &'a self,
+        defs: &'a std::collections::BTreeMap<String, AttributeType>,
+    ) -> ResolvedAttrType<'a> {
+        self.resolve_refs_with_defs(defs)
+    }
+
     /// Project this type onto a [`Shape`] view with every top-level
     /// `Ref` already peeled against `defs`.
     ///
     /// Callers that need to branch on the type's shape should `match`
     /// the returned [`Shape`] instead of `&AttributeType`. The
     /// `Shape` enum has no `Ref` variant, so a wildcard arm in
-    /// `match attr.shape(defs) { ... }` cannot silently swallow a
+    /// `match attr.shape_with_defs(defs) { ... }` cannot silently swallow a
     /// `Ref` — the carina#3349 bug class is unreachable at the type
     /// level.
     ///
     /// `defs` is normally `&ResourceSchema::defs` or `&Schema::defs`;
-    /// pass [`empty_defs`] when no resource is in scope.
+    /// pass [`empty_defs_for_schema_walks`] when no resource is in scope.
     ///
     /// # Panics
     ///
     /// Panics if a `Ref` points to a name not present in `defs` (same
     /// schema invariant as [`Self::resolve_refs`]).
+    pub(crate) fn shape_with_defs<'a>(
+        &'a self,
+        defs: &'a std::collections::BTreeMap<String, AttributeType>,
+    ) -> Shape<'a> {
+        let resolved = self.resolve_refs_with_defs(defs).as_attr();
+        Self::shape_from_resolved(resolved)
+    }
+
+    #[deprecated(
+        note = "use Schema::shape_of / ResourceSchema::shape_of, or AttributeType::shape_ref_free"
+    )]
     pub fn shape<'a>(
         &'a self,
         defs: &'a std::collections::BTreeMap<String, AttributeType>,
     ) -> Shape<'a> {
-        let resolved = self.resolve_refs(defs).as_attr();
+        self.shape_with_defs(defs)
+    }
+
+    /// Project this type without a defs map. Returns an error instead
+    /// of panicking if the top-level type is a schema-bound `Ref`.
+    pub fn shape_ref_free(&self) -> Result<Shape<'_>, RefEncountered> {
+        if let AttrTypeKind::Ref(name) = &self.kind {
+            return Err(RefEncountered { name: name.clone() });
+        }
+        Ok(Self::shape_from_resolved(self))
+    }
+
+    fn shape_from_resolved(resolved: &AttributeType) -> Shape<'_> {
         match &resolved.kind {
             AttrTypeKind::String => Shape::String,
             AttrTypeKind::Int => Shape::Int,
@@ -3655,6 +3723,17 @@ impl ResourceSchema {
         self
     }
 
+    /// Resolve `ty` against this resource schema's definition map.
+    pub fn resolve_of<'a>(&'a self, ty: &'a AttributeType) -> ResolvedAttrType<'a> {
+        ty.resolve_refs_with_defs(&self.defs)
+    }
+
+    /// Project `ty` onto a [`Shape`] using this resource schema's
+    /// definition map.
+    pub fn shape_of<'a>(&'a self, ty: &'a AttributeType) -> Shape<'a> {
+        ty.shape_with_defs(&self.defs)
+    }
+
     pub fn with_description(mut self, desc: impl Into<String>) -> Self {
         self.description = Some(desc.into());
         self
@@ -4100,7 +4179,7 @@ fn recurse_block_names_into_value(
     // (carina#3349). The `Shape` enum has no `Ref` variant, so the
     // wildcard arm below cannot silently swallow a `Ref` — the bug
     // class is structurally impossible.
-    match field_type.shape(defs) {
+    match field_type.shape_with_defs(defs) {
         Shape::Struct { fields: inner, .. } => {
             if let Value::Concrete(ConcreteValue::Map(inner_map)) = value {
                 resolve_block_names_in_map(inner_map, inner, defs, resource_id, errors);
@@ -4109,7 +4188,7 @@ fn recurse_block_names_into_value(
         Shape::List { inner, .. } => {
             // `List<Ref>`: peel the element type too via `shape(defs)`
             // so the walk reaches the underlying struct fields.
-            if let Shape::Struct { fields: inner, .. } = inner.shape(defs)
+            if let Shape::Struct { fields: inner, .. } = inner.shape_with_defs(defs)
                 && let Value::Concrete(ConcreteValue::List(items)) = value
             {
                 for item in items.iter_mut() {

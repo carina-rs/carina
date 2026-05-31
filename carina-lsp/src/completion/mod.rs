@@ -651,23 +651,23 @@ impl CompletionProvider {
 
     fn extract_struct_fields<'a>(
         &self,
+        schema: &'a ResourceSchema,
         attr_type: &'a AttributeType,
-        defs: &'a std::collections::BTreeMap<String, AttributeType>,
     ) -> Option<&'a [StructField]> {
         use carina_core::schema::Shape;
         // Project onto `Shape` so any `Ref` chain is peeled at the
         // type level (carina#3349). The cyclic-CFN case
         // (`Statement -> AndStatement -> List<Statement>`) descends
-        // because `shape(defs)` walks `Ref` against `defs`.
-        match attr_type.shape(defs) {
+        // because `shape_of` walks `Ref` against the schema's defs.
+        match schema.shape_of(attr_type) {
             Shape::Struct { fields, .. } => Some(fields),
-            Shape::List { inner, .. } => match inner.shape(defs) {
+            Shape::List { inner, .. } => match schema.shape_of(inner) {
                 Shape::Struct { fields, .. } => Some(fields),
                 _ => None,
             },
             Shape::Union(members) => members
                 .iter()
-                .find_map(|m| self.extract_struct_fields(m, defs)),
+                .find_map(|m| self.extract_struct_fields(schema, m)),
             _ => None,
         }
     }
@@ -707,7 +707,7 @@ impl CompletionProvider {
         let mut current_type = &attr_schema.attr_type;
 
         for name in &attr_path[1..] {
-            let fields = self.extract_struct_fields(current_type, &schema.defs)?;
+            let fields = self.extract_struct_fields(schema, current_type)?;
             let field = fields
                 .iter()
                 .find(|f| f.name == *name || f.block_name.as_deref() == Some(name))?;
@@ -723,7 +723,7 @@ impl CompletionProvider {
         attr_path: &[String],
     ) -> Option<&'a [StructField]> {
         let attr_type = self.resolve_type_for_path(schema, attr_path)?;
-        self.extract_struct_fields(attr_type, &schema.defs)
+        self.extract_struct_fields(schema, attr_type)
     }
 
     fn struct_field_completions(
@@ -784,8 +784,7 @@ impl CompletionProvider {
         attr_path: &[String],
     ) -> Option<&'a AttributeType> {
         let attr_type = self.resolve_type_for_path(schema, attr_path)?;
-        let defs = carina_core::schema::empty_defs();
-        if let Shape::Map { key, .. } = attr_type.shape(defs) {
+        if let Shape::Map { key, .. } = schema.shape_of(attr_type) {
             Some(key)
         } else {
             None
@@ -798,9 +797,8 @@ impl CompletionProvider {
         key_type: &AttributeType,
         trigger_suggest: &Command,
     ) -> Vec<CompletionItem> {
-        let defs = carina_core::schema::empty_defs();
-        match key_type.shape(defs) {
-            Shape::StringEnum { values, .. } => values
+        match key_type.shape_ref_free() {
+            Ok(Shape::StringEnum { values, .. }) => values
                 .iter()
                 .map(|v| CompletionItem {
                     label: v.clone(),
@@ -810,7 +808,7 @@ impl CompletionProvider {
                     ..Default::default()
                 })
                 .collect(),
-            _ => vec![],
+            Ok(_) | Err(_) => vec![],
         }
     }
 

@@ -2756,7 +2756,7 @@ fn resolved_attr_type_never_returns_ref_after_peel() {
     defs.insert("Hop3".to_string(), AttributeType::string());
 
     let ref_type = AttributeType::ref_("Hop1".to_string());
-    let resolved = ref_type.resolve_refs(&defs);
+    let resolved = ref_type.resolve_refs_with_defs(&defs);
     assert!(
         !matches!(resolved.as_attr().kind(), AttrTypeKind::Ref(_)),
         "resolve_refs must never return a Ref after peeling"
@@ -2765,7 +2765,7 @@ fn resolved_attr_type_never_returns_ref_after_peel() {
 
     // Non-Ref input is returned as-is (identity behavior).
     let plain = AttributeType::int();
-    let resolved = plain.resolve_refs(&defs);
+    let resolved = plain.resolve_refs_with_defs(&defs);
     assert!(matches!(resolved.as_attr().kind(), AttrTypeKind::Int));
 }
 
@@ -2779,7 +2779,72 @@ fn resolved_attr_type_panics_on_dangling_ref() {
     // unchanged" (which would re-open the carina#3349 hazard).
     let defs = std::collections::BTreeMap::new();
     let ref_type = AttributeType::ref_("Missing".to_string());
-    let _ = ref_type.resolve_refs(&defs);
+    let _ = ref_type.resolve_refs_with_defs(&defs);
+}
+
+#[test]
+fn shape_ref_free_returns_err_for_ref_without_panicking() {
+    let ref_type = AttributeType::ref_("CaptchaConfig".to_string());
+    let err = ref_type
+        .shape_ref_free()
+        .expect_err("bare Ref projection should return a typed error");
+
+    assert_eq!(err.name, "CaptchaConfig");
+    assert_eq!(
+        err.to_string(),
+        "unresolved AttributeType::Ref(\"CaptchaConfig\") has no defs in scope"
+    );
+}
+
+#[test]
+fn shape_ref_free_projects_non_ref_shape() {
+    let attr_type = AttributeType::list(AttributeType::string());
+
+    match attr_type
+        .shape_ref_free()
+        .expect("non-Ref shape is projectable")
+    {
+        Shape::List { inner, ordered } => {
+            assert!(ordered);
+            assert!(matches!(inner.kind(), AttrTypeKind::String));
+        }
+        other => panic!("expected list shape, got {other:?}"),
+    }
+}
+
+#[test]
+fn schema_shape_of_resolves_ref_against_defs() {
+    let mut defs = std::collections::BTreeMap::new();
+    defs.insert("Alias".to_string(), AttributeType::bool());
+    let schema = Schema {
+        root: AttributeType::ref_("Alias".to_string()),
+        defs,
+    };
+
+    assert!(matches!(schema.shape_of(&schema.root), Shape::Bool));
+    assert!(matches!(
+        schema.resolve_of(&schema.root).as_attr().kind(),
+        AttrTypeKind::Bool
+    ));
+}
+
+#[cfg(test)]
+mod deprecated_projection_guard {
+    #![deny(deprecated)]
+
+    use super::*;
+
+    #[test]
+    fn new_projection_apis_are_usable_with_deprecations_denied() {
+        let attr_type = AttributeType::string();
+        assert!(matches!(
+            attr_type.shape_ref_free().expect("string is Ref-free"),
+            Shape::String
+        ));
+
+        let schema = Schema::flat(AttributeType::int());
+        assert!(matches!(schema.shape_of(&schema.root), Shape::Int));
+    }
 }
 
 #[test]
@@ -4495,7 +4560,7 @@ fn walk_custom_lookup_skips_value_unknown() {
                 message: "should never be called".to_string(),
             })
         },
-        crate::schema::empty_defs(),
+        crate::schema::empty_defs_for_schema_walks(),
         &mut errors,
     );
     assert!(
@@ -4548,7 +4613,7 @@ fn union_walk_custom_lookup_succeeds_when_any_member_accepts() {
         &Value::Concrete(ConcreteValue::String("anything".to_string())),
         "attr",
         &lookup,
-        crate::schema::empty_defs(),
+        crate::schema::empty_defs_for_schema_walks(),
         &mut errors,
     );
     assert!(
@@ -4587,7 +4652,7 @@ fn union_walk_custom_lookup_emits_smallest_error_set_when_all_fail() {
         &Value::Concrete(ConcreteValue::String("anything".to_string())),
         "attr",
         &lookup,
-        crate::schema::empty_defs(),
+        crate::schema::empty_defs_for_schema_walks(),
         &mut errors,
     );
     assert_eq!(
@@ -4629,7 +4694,7 @@ fn union_walk_custom_lookup_cidr_accepts_ipv4_when_lookup_routes_correctly() {
         &Value::Concrete(ConcreteValue::String("10.0.0.0/8".to_string())),
         "cidr",
         &lookup,
-        crate::schema::empty_defs(),
+        crate::schema::empty_defs_for_schema_walks(),
         &mut errors,
     );
     assert!(

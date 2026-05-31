@@ -458,7 +458,7 @@ fn collect_ref_type_errors(
 ///
 /// `defs` carries the schema's named definitions, used to peel any
 /// `AttributeType::ref_(name)` receiver via [`AttributeType::shape`]
-/// before shape-based dispatch. Pass [`crate::schema::empty_defs()`]
+/// before shape-based dispatch. Pass [`crate::schema::empty_defs_for_schema_walks()`]
 /// when no resource schema is in scope.
 pub fn is_type_expr_compatible_with_schema(
     type_expr: &crate::parser::TypeExpr,
@@ -487,10 +487,10 @@ pub fn is_type_expr_compatible_with_schema(
             }
             is_string_compatible_type(attr_type, defs)
         }
-        TypeExpr::Bool => matches!(attr_type.shape(defs), Shape::Bool),
-        TypeExpr::Int => matches!(attr_type.shape(defs), Shape::Int),
-        TypeExpr::Float => matches!(attr_type.shape(defs), Shape::Float),
-        TypeExpr::Duration => matches!(attr_type.shape(defs), Shape::Duration),
+        TypeExpr::Bool => matches!(attr_type.shape_with_defs(defs), Shape::Bool),
+        TypeExpr::Int => matches!(attr_type.shape_with_defs(defs), Shape::Int),
+        TypeExpr::Float => matches!(attr_type.shape_with_defs(defs), Shape::Float),
+        TypeExpr::Duration => matches!(attr_type.shape_with_defs(defs), Shape::Duration),
         TypeExpr::Simple(name) => {
             // Two compatibility directions both succeed:
             //
@@ -514,7 +514,7 @@ pub fn is_type_expr_compatible_with_schema(
             // pointing at a `Custom` chain is followed correctly.
             let mut current: &AttributeType = attr_type;
             loop {
-                let resolved = current.resolve_refs(defs);
+                let resolved = current.resolve_refs_with_defs(defs);
                 let resolved_attr = resolved.as_attr();
                 let type_snake = crate::parser::pascal_to_snake(&resolved_attr.type_name());
                 if type_snake == *name {
@@ -539,13 +539,13 @@ pub fn is_type_expr_compatible_with_schema(
             // the existing `Simple → Union<String, Int>` rejection
             // (`type_compat_simple_rejected_by_mixed_string_int_union_receiver`)
             // is preserved.
-            if let Shape::Union(members) = attr_type.shape(defs) {
+            if let Shape::Union(members) = attr_type.shape_with_defs(defs) {
                 let has_plain_string = members
                     .iter()
-                    .any(|m| matches!(m.shape(defs), Shape::String));
+                    .any(|m| matches!(m.shape_with_defs(defs), Shape::String));
                 let others_shape_disjoint = members.iter().all(|m| {
                     matches!(
-                        m.shape(defs),
+                        m.shape_with_defs(defs),
                         Shape::String
                             | Shape::List { .. }
                             | Shape::Map { .. }
@@ -558,14 +558,14 @@ pub fn is_type_expr_compatible_with_schema(
             }
             false
         }
-        TypeExpr::List(inner) => match attr_type.shape(defs) {
+        TypeExpr::List(inner) => match attr_type.shape_with_defs(defs) {
             Shape::List {
                 inner: schema_inner,
                 ..
             } => is_type_expr_compatible_with_schema(inner, schema_inner, defs),
             _ => false,
         },
-        TypeExpr::Map(inner) => match attr_type.shape(defs) {
+        TypeExpr::Map(inner) => match attr_type.shape_with_defs(defs) {
             Shape::Map {
                 value: schema_inner,
                 ..
@@ -574,7 +574,7 @@ pub fn is_type_expr_compatible_with_schema(
         },
         TypeExpr::Struct {
             fields: expr_fields,
-        } => match attr_type.shape(defs) {
+        } => match attr_type.shape_with_defs(defs) {
             Shape::Struct {
                 fields: schema_fields,
                 ..
@@ -624,7 +624,7 @@ pub fn is_string_compatible_type(
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> bool {
-    match attr_type.shape(defs) {
+    match attr_type.shape_with_defs(defs) {
         Shape::String | Shape::Custom { .. } | Shape::StringEnum { .. } => true,
         Shape::Union(types) => types.iter().all(|t| is_string_compatible_type(t, defs)),
         Shape::Int
@@ -647,7 +647,7 @@ fn is_plain_string_or_string_union(
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> bool {
-    match attr_type.shape(defs) {
+    match attr_type.shape_with_defs(defs) {
         Shape::String => true,
         Shape::Union(types) => types
             .iter()
@@ -689,7 +689,7 @@ fn attr_type_demands_specific_custom(
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> bool {
-    match attr_type.shape(defs) {
+    match attr_type.shape_with_defs(defs) {
         Shape::Custom {
             identity: Some(_), ..
         } => true,
@@ -1392,7 +1392,7 @@ pub(crate) fn narrow_attribute_type<'a>(
         // attribute would fall into the wildcard arm below and
         // every nested narrowing step would mis-report a shape
         // mismatch.
-        let shape = current.shape(defs);
+        let shape = current.shape_with_defs(defs);
         current = match (seg, shape) {
             (PathSegment::Field { name }, Shape::Struct { fields, name: sn }) => {
                 let Some(field) = fields.iter().find(|f| f.name == *name) else {
