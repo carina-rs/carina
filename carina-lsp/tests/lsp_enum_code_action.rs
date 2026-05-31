@@ -81,8 +81,7 @@ fn bare_identifier_invalid_emits_payload_and_quick_fix() {
 
     let payload = EnumDiagnosticData::from_diagnostic(diag).expect("payload present");
     assert_eq!(payload.kind, EnumDiagnosticKind::BareInvalid);
-    // Canonical entries first; aliases (`enabled`, `suspended` from the
-    // `to_dsl` lowercase mapping) follow.
+    // 1:1 `to_dsl` mappings collapse to canonical DSL-spelled entries.
     let canonicals: Vec<_> = payload
         .expected
         .iter()
@@ -91,7 +90,7 @@ fn bare_identifier_invalid_emits_payload_and_quick_fix() {
         .collect();
     assert_eq!(
         canonicals,
-        vec!["Enabled".to_string(), "Suspended".to_string()]
+        vec!["enabled".to_string(), "suspended".to_string()]
     );
 
     let actions = code_actions_for_diagnostic(&dummy_uri(), diag);
@@ -99,8 +98,8 @@ fn bare_identifier_invalid_emits_payload_and_quick_fix() {
     assert_eq!(
         titles,
         vec![
-            "Replace with `aws.s3.Bucket.VersioningStatus.Enabled`".to_string(),
-            "Replace with `aws.s3.Bucket.VersioningStatus.Suspended`".to_string(),
+            "Replace with `aws.s3.Bucket.VersioningStatus.enabled`".to_string(),
+            "Replace with `aws.s3.Bucket.VersioningStatus.suspended`".to_string(),
         ],
     );
 }
@@ -146,8 +145,8 @@ fn string_literal_emits_string_literal_kind_and_replaces_quotes() {
     assert_eq!(edits.len(), 1);
     assert_eq!(edits[0].range, diag.range);
     assert_eq!(
-        edits[0].new_text, "aws.s3.Bucket.VersioningStatus.Enabled",
-        "first canonical candidate replaces the quoted literal"
+        edits[0].new_text, "aws.s3.Bucket.VersioningStatus.enabled",
+        "first canonical DSL candidate replaces the quoted literal"
     );
 
     // Sanity: applying that edit to the source line should yield a
@@ -162,8 +161,8 @@ fn string_literal_emits_string_literal_kind_and_replaces_quotes() {
         "applied edit must drop both quotes, got: {applied}"
     );
     assert!(
-        applied.contains("aws.s3.Bucket.VersioningStatus.Enabled"),
-        "applied edit must contain the canonical identifier, got: {applied}"
+        applied.contains("aws.s3.Bucket.VersioningStatus.enabled"),
+        "applied edit must contain the canonical DSL identifier, got: {applied}"
     );
 }
 

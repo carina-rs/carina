@@ -2041,22 +2041,8 @@ impl AttributeType {
         // "drop quotes / use identifier form" without re-deriving
         // candidates.
         if let ConcreteValueRef::String(s) = value {
-            let mut expected: Vec<ExpectedEnumVariant> = Vec::new();
-            let mut push = |variant_value: &str, is_alias: bool| {
-                let entry =
-                    ExpectedEnumVariant::from_namespaced(prefix_ref, name, variant_value, is_alias);
-                if !expected.contains(&entry) {
-                    expected.push(entry);
-                }
-            };
-            for v in values {
-                push(v, false);
-            }
-            for (api, dsl) in dsl_aliases {
-                if dsl != api {
-                    push(dsl, true);
-                }
-            }
+            let expected =
+                string_enum_expected_variants(prefix_ref, name, values, dsl_aliases.as_slice());
             return Err(TypeError::StringLiteralExpectedEnum {
                 user_typed: s.to_string(),
                 attribute: None,
@@ -2143,28 +2129,8 @@ impl AttributeType {
             if matches_alias || canonical_ok {
                 Ok(())
             } else {
-                // Aliases from `dsl_aliases` are tagged `is_alias = true`
-                // so LSP code actions can prefer the canonical form.
-                let mut expected: Vec<ExpectedEnumVariant> = Vec::new();
-                let mut push = |variant_value: &str, is_alias: bool| {
-                    let entry = ExpectedEnumVariant::from_namespaced(
-                        prefix_ref,
-                        name,
-                        variant_value,
-                        is_alias,
-                    );
-                    if !expected.contains(&entry) {
-                        expected.push(entry);
-                    }
-                };
-                for v in values {
-                    push(v, false);
-                }
-                for (api, dsl) in dsl_aliases {
-                    if dsl != api {
-                        push(dsl, true);
-                    }
-                }
+                let expected =
+                    string_enum_expected_variants(prefix_ref, name, values, dsl_aliases.as_slice());
                 Err(TypeError::InvalidEnumVariant {
                     value: user_input.unwrap_or(s.as_str()).to_string(),
                     attribute: None,
@@ -2845,6 +2811,38 @@ fn string_enum_value_matches(input: &str, expected: &str) -> bool {
         || input.replace('_', "-").eq_ignore_ascii_case(expected)
 }
 
+fn string_enum_expected_variants(
+    namespace: Option<&str>,
+    type_name: &str,
+    values: &[String],
+    dsl_aliases: &[(String, String)],
+) -> Vec<ExpectedEnumVariant> {
+    let dsl_map = DslMap::Aliases(dsl_aliases);
+    let mut expected = Vec::new();
+    let mut seen_values = HashSet::new();
+    let mut canonical_dsl_values = HashSet::new();
+
+    for value in values {
+        let dsl_value = dsl_map.dsl_for(value);
+        canonical_dsl_values.insert(dsl_value.clone());
+        if seen_values.insert(dsl_value.clone()) {
+            expected.push(ExpectedEnumVariant::from_namespaced(
+                namespace, type_name, &dsl_value, false,
+            ));
+        }
+    }
+
+    for (_api, dsl_value) in dsl_aliases {
+        if !canonical_dsl_values.contains(dsl_value) && seen_values.insert(dsl_value.clone()) {
+            expected.push(ExpectedEnumVariant::from_namespaced(
+                namespace, type_name, dsl_value, true,
+            ));
+        }
+    }
+
+    expected
+}
+
 /// Render the `InvalidEnumVariant` message with the richest available
 /// context. Presence of `attribute` and `type_name` is independent — both,
 /// either, or neither may be set. `expected` is rendered as-is; callers are
@@ -3005,6 +3003,59 @@ fn format_length_out_of_range(
     )
 }
 
+/// A DSL-spelled enum value that can be typed in a `.crn` file.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct DslSpelling(String);
+
+impl DslSpelling {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for DslSpelling {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl PartialEq<str> for DslSpelling {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for DslSpelling {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<String> for DslSpelling {
+    fn eq(&self, other: &String) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<DslSpelling> for str {
+    fn eq(&self, other: &DslSpelling) -> bool {
+        self == other.0
+    }
+}
+
+impl PartialEq<DslSpelling> for &str {
+    fn eq(&self, other: &DslSpelling) -> bool {
+        *self == other.0
+    }
+}
+
+impl PartialEq<DslSpelling> for String {
+    fn eq(&self, other: &DslSpelling) -> bool {
+        *self == other.0
+    }
+}
+
 /// One candidate variant carried by `TypeError::InvalidEnumVariant` and
 /// `TypeError::StringLiteralExpectedEnum`. Splits a fully-qualified enum
 /// identifier into structured pieces so IDE / LSP code actions can
@@ -3028,9 +3079,8 @@ pub struct ExpectedEnumVariant {
     pub segments: Vec<String>,
     /// Name of the enum type (`"TargetType"`).
     pub type_name: String,
-    /// The variant value as the provider declared it (`"AWS_ACCOUNT"`,
-    /// or `"Enabled"`).
-    pub value: String,
+    /// The variant value in the DSL spelling the user can type.
+    pub value: DslSpelling,
     /// `true` when this entry came from a `to_dsl` alias rather than the
     /// canonical provider-side variant. Code actions should prefer the
     /// canonical form (`is_alias = false`) when offering a fix.
@@ -3040,6 +3090,10 @@ pub struct ExpectedEnumVariant {
 impl ExpectedEnumVariant {
     /// `namespace` head becomes `provider`; the rest become `segments`.
     /// `None` produces a bare-form variant.
+    ///
+    /// Callers must pass a DSL-spelled value; the sole production
+    /// producer `string_enum_expected_variants` guarantees this via
+    /// `DslMap::dsl_for`.
     pub fn from_namespaced(
         namespace: Option<&str>,
         type_name: &str,
@@ -3058,7 +3112,7 @@ impl ExpectedEnumVariant {
             provider,
             segments,
             type_name: type_name.to_string(),
-            value: value.to_string(),
+            value: DslSpelling(value.to_string()),
             is_alias,
         }
     }
