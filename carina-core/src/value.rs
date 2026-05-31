@@ -1618,6 +1618,13 @@ pub fn resolve_value_alias_with_schemas(
         Value::Concrete(ConcreteValue::String(s)) if is_dsl_enum_format(s) => {
             let valid_values = enum_valid_values_for_alias(schemas, resource_type, attr_name, s);
             let raw = if valid_values.is_empty() {
+                // Schema-free fallback for attributes that are not known enum
+                // fields in the schema snapshot. This is fail-closed: unknown
+                // `(resource_type, attr_name)` pairs should not have reverse
+                // alias entries, so even a lossy extraction leaves `s`
+                // unchanged. Keep `convert_enum_value` here rather than
+                // last-segment extraction to preserve dotted enum values like
+                // `awscc.ec2.vpn_gateway.Type.ipsec.1`.
                 convert_enum_value(s)
             } else {
                 let valid_refs: Vec<&str> = valid_values.iter().map(String::as_str).collect();
@@ -1900,6 +1907,108 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct SchemaAliasFactory {
+        schemas: Vec<crate::schema::ResourceSchema>,
+        resource_type: &'static str,
+        attr_name: &'static str,
+        alias_value: &'static str,
+        canonical: Option<&'static str>,
+    }
+
+    impl crate::provider::ProviderFactory for SchemaAliasFactory {
+        fn name(&self) -> &str {
+            "aws"
+        }
+
+        fn display_name(&self) -> &str {
+            "AWS"
+        }
+
+        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+            HashMap::new()
+        }
+
+        fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+            String::new()
+        }
+
+        fn create_provider(
+            &self,
+            _binding: Option<&str>,
+            _attributes: &IndexMap<String, Value>,
+        ) -> futures::future::BoxFuture<
+            '_,
+            crate::provider::ProviderResult<Box<dyn crate::provider::Provider>>,
+        > {
+            unreachable!("SchemaAliasFactory::create_provider is not used in these tests")
+        }
+
+        fn schemas(&self) -> Vec<crate::schema::ResourceSchema> {
+            self.schemas.clone()
+        }
+
+        fn get_enum_alias_reverse(
+            &self,
+            resource_type: &str,
+            attr_name: &str,
+            value: &str,
+        ) -> Option<String> {
+            match (
+                resource_type == self.resource_type,
+                attr_name == self.attr_name,
+                value == self.alias_value,
+                self.canonical,
+            ) {
+                (true, true, true, Some(canonical)) => Some(canonical.to_string()),
+                _ => None,
+            }
+        }
+    }
+
+    fn status_enum(namespace: Option<&str>) -> AttributeType {
+        use crate::schema::string_enum_identity;
+
+        AttributeType::string_enum(
+            "Status",
+            vec!["enabled".to_string(), "disabled".to_string()],
+            namespace.map(|ns| string_enum_identity("Status", Some(ns))),
+            Vec::new(),
+        )
+    }
+
+    fn schema_with_attr(
+        resource_type: &'static str,
+        attr_name: &'static str,
+        attr_type: AttributeType,
+    ) -> crate::schema::ResourceSchema {
+        use crate::schema::{AttributeSchema, ResourceSchema};
+
+        ResourceSchema::new(resource_type).attribute(AttributeSchema::new(attr_name, attr_type))
+    }
+
+    fn resolve_with_schema_alias_factory(
+        schema: crate::schema::ResourceSchema,
+        resource_type: &'static str,
+        attr_name: &'static str,
+        input: &str,
+    ) -> Value {
+        let factory = SchemaAliasFactory {
+            schemas: vec![schema],
+            resource_type,
+            attr_name,
+            alias_value: "disabled",
+            canonical: Some("Disabled"),
+        };
+        let mut value = Value::Concrete(ConcreteValue::String(input.to_string()));
+        resolve_value_alias(&mut value, resource_type, attr_name, &factory);
+        value
+    }
+
     #[test]
     fn resolve_value_alias_extracts_deep_structural_enum_with_schema_values() {
         let mut value = Value::Concrete(ConcreteValue::String(
@@ -1916,6 +2025,126 @@ mod tests {
         assert_eq!(
             value,
             Value::Concrete(ConcreteValue::String("Disabled".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_value_alias_fail_closed_when_valid_values_empty() {
+        let schema = schema_with_attr(
+            "s3.BucketLifecycleConfiguration",
+            "known_status",
+            status_enum(Some("aws.s3.BucketLifecycleConfiguration.Rules")),
+        );
+        let factory = SchemaAliasFactory {
+            schemas: vec![schema],
+            resource_type: "s3.BucketLifecycleConfiguration",
+            attr_name: "missing_status",
+            alias_value: "disabled",
+            canonical: None,
+        };
+        let original = "aws.s3.BucketLifecycleConfiguration.Rules.Status.disabled";
+        let mut value = Value::Concrete(ConcreteValue::String(original.to_string()));
+
+        resolve_value_alias(
+            &mut value,
+            "s3.BucketLifecycleConfiguration",
+            "missing_status",
+            &factory,
+        );
+
+        assert_eq!(
+            value,
+            Value::Concrete(ConcreteValue::String(original.to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_value_alias_extracts_top_level_list_string_enum() {
+        let schema = schema_with_attr(
+            "svc.Resource",
+            "statuses",
+            AttributeType::list(status_enum(Some("aws.svc.Resource.Status"))),
+        );
+
+        assert_eq!(
+            resolve_with_schema_alias_factory(
+                schema,
+                "svc.Resource",
+                "statuses",
+                "aws.svc.Resource.Status.disabled",
+            ),
+            Value::Concrete(ConcreteValue::String("Disabled".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_value_alias_extracts_map_value_string_enum() {
+        let schema = schema_with_attr(
+            "svc.Resource",
+            "status_by_name",
+            AttributeType::map(status_enum(Some("aws.svc.Resource.Status"))),
+        );
+
+        assert_eq!(
+            resolve_with_schema_alias_factory(
+                schema,
+                "svc.Resource",
+                "status_by_name",
+                "aws.svc.Resource.Status.disabled",
+            ),
+            Value::Concrete(ConcreteValue::String("Disabled".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_value_alias_extracts_union_string_enum_member() {
+        let schema = schema_with_attr(
+            "svc.Resource",
+            "status",
+            AttributeType::union(vec![
+                AttributeType::string(),
+                status_enum(Some("aws.svc.Resource.Status")),
+            ]),
+        );
+
+        assert_eq!(
+            resolve_with_schema_alias_factory(
+                schema,
+                "svc.Resource",
+                "status",
+                "aws.svc.Resource.Status.disabled",
+            ),
+            Value::Concrete(ConcreteValue::String("Disabled".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_value_alias_extracts_bare_string_enum_by_name() {
+        let schema = schema_with_attr("svc.Resource", "status", status_enum(None));
+
+        assert_eq!(
+            resolve_with_schema_alias_factory(schema, "svc.Resource", "status", "Status.disabled"),
+            Value::Concrete(ConcreteValue::String("Disabled".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_value_alias_does_not_collect_values_for_mismatched_identity() {
+        let schema = schema_with_attr(
+            "s3.BucketLifecycleConfiguration",
+            "status",
+            status_enum(Some("aws.s3.OtherStruct.Status")),
+        );
+        let original = "aws.s3.BucketLifecycleConfiguration.Rules.Status.disabled";
+
+        assert_eq!(
+            resolve_with_schema_alias_factory(
+                schema,
+                "s3.BucketLifecycleConfiguration",
+                "status",
+                original,
+            ),
+            Value::Concrete(ConcreteValue::String(original.to_string()))
         );
     }
 
