@@ -569,10 +569,19 @@ pub fn validate_enum_namespace(
         ));
     }
 
-    if let Some(id) = NamespacedId::parse(s)
-        && id.matches_identity(identity)
-    {
-        return Ok(());
+    if is_two_part {
+        if let Some(id) = NamespacedId::parse(s)
+            && id.matches_identity(identity)
+        {
+            return Ok(());
+        }
+    } else if is_full_form {
+        let Some(value) = s.strip_prefix(&format!("{prefix}.")) else {
+            return Err(format!("expected format {}.value", prefix));
+        };
+        if !value.is_empty() && !value.contains('.') {
+            return Ok(());
+        }
     }
     // Mirror the original error-message shape: 2-part inputs get the
     // "or full form" hint, full-form inputs get only the full form.
@@ -1262,7 +1271,7 @@ pub fn pretty_with_newline_bytes<T: serde::Serialize>(value: &T) -> serde_json::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::TypeIdentity;
+    use crate::schema::{TypeIdentity, string_enum_identity};
 
     /// Build a `TypeIdentity` from the legacy `(name, namespace)` pair
     /// the pre-S2.5b test corpus used. Provider is the first segment of
@@ -1537,6 +1546,20 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_namespace_deep_structural_full_path_valid() {
+        let identity =
+            string_enum_identity("Status", Some("aws.s3.BucketLifecycleConfiguration.Rules"));
+
+        assert!(
+            validate_enum_namespace(
+                "aws.s3.BucketLifecycleConfiguration.Rules.Status.enabled",
+                &identity,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn test_namespaced_id_parse_numeric_tail() {
         // Digit-led tail with underscores parses through the 5-part shape
         // and flows into `value` verbatim (carina#3051).
@@ -1639,6 +1662,13 @@ mod tests {
     }
 
     #[test]
+    fn test_is_dsl_enum_format_deep_structural_plain_value() {
+        assert!(is_dsl_enum_format(
+            "aws.s3.BucketLifecycleConfiguration.Rules.Status.enabled"
+        ));
+    }
+
+    #[test]
     fn test_is_dsl_enum_format_non_matching() {
         assert!(!is_dsl_enum_format("my-bucket"));
         assert!(!is_dsl_enum_format("ap-northeast-1"));
@@ -1653,6 +1683,27 @@ mod tests {
         let values = &["ipsec.1"];
         assert_eq!(
             extract_enum_value_with_values("awscc.ec2.vpn_gateway.Type.ipsec.1", values),
+            "ipsec.1"
+        );
+    }
+
+    #[test]
+    fn test_extract_enum_value_with_values_deep_structural_plain_value() {
+        let values = &["enabled", "disabled"];
+        assert_eq!(
+            extract_enum_value_with_values(
+                "aws.s3.BucketLifecycleConfiguration.Rules.Status.enabled",
+                values,
+            ),
+            "enabled"
+        );
+    }
+
+    #[test]
+    fn test_extract_enum_value_with_values_deep_structural_dotted_value() {
+        let values = &["ipsec.1"];
+        assert_eq!(
+            extract_enum_value_with_values("aws.x.Y.Z.Type.ipsec.1", values),
             "ipsec.1"
         );
     }
