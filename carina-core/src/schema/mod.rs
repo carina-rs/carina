@@ -1456,13 +1456,6 @@ pub(crate) fn empty_defs_for_schema_walks()
     EMPTY.get_or_init(std::collections::BTreeMap::new)
 }
 
-#[deprecated(
-    note = "use Schema::shape_of / ResourceSchema::shape_of, or AttributeType::shape_ref_free"
-)]
-pub fn empty_defs() -> &'static std::collections::BTreeMap<String, AttributeType> {
-    empty_defs_for_schema_walks()
-}
-
 impl AttributeType {
     /// Walk through any [`AttrTypeKind::Ref`] chain at the top of this
     /// type, returning the first non-`Ref` target wrapped in
@@ -1505,16 +1498,6 @@ impl AttributeType {
         panic!("AttributeType::Ref chain exceeded 256 hops; pathological self-cycle in defs")
     }
 
-    #[deprecated(
-        note = "use Schema::resolve_of / ResourceSchema::resolve_of, or AttributeType::shape_ref_free"
-    )]
-    pub fn resolve_refs<'a>(
-        &'a self,
-        defs: &'a std::collections::BTreeMap<String, AttributeType>,
-    ) -> ResolvedAttrType<'a> {
-        self.resolve_refs_with_defs(defs)
-    }
-
     /// Project this type onto a [`Shape`] view with every top-level
     /// `Ref` already peeled against `defs`.
     ///
@@ -1531,23 +1514,13 @@ impl AttributeType {
     /// # Panics
     ///
     /// Panics if a `Ref` points to a name not present in `defs` (same
-    /// schema invariant as [`Self::resolve_refs`]).
+    /// schema invariant as [`Self::resolve_refs_with_defs`]).
     pub(crate) fn shape_with_defs<'a>(
         &'a self,
         defs: &'a std::collections::BTreeMap<String, AttributeType>,
     ) -> Shape<'a> {
         let resolved = self.resolve_refs_with_defs(defs).as_attr();
         Self::shape_from_resolved(resolved)
-    }
-
-    #[deprecated(
-        note = "use Schema::shape_of / ResourceSchema::shape_of, or AttributeType::shape_ref_free"
-    )]
-    pub fn shape<'a>(
-        &'a self,
-        defs: &'a std::collections::BTreeMap<String, AttributeType>,
-    ) -> Shape<'a> {
-        self.shape_with_defs(defs)
     }
 
     /// Project this type without a defs map. Returns an error instead

@@ -2829,13 +2829,11 @@ fn schema_shape_of_resolves_ref_against_defs() {
 }
 
 #[cfg(test)]
-mod deprecated_projection_guard {
-    #![deny(deprecated)]
-
+mod projection_api_guard {
     use super::*;
 
     #[test]
-    fn new_projection_apis_are_usable_with_deprecations_denied() {
+    fn new_projection_apis_are_usable() {
         let attr_type = AttributeType::string();
         assert!(matches!(
             attr_type.shape_ref_free().expect("string is Ref-free"),
