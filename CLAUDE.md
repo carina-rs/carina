@@ -493,14 +493,15 @@ Enum values use namespaced identifiers like `aws.s3.Bucket.VersioningStatus.enab
    resource.chars().all(|c| c.is_lowercase() || c.is_ascii_digit() || c == '_')
    ```
 
-2. **Update `NamespacedId::parse` in `carina-core/src/utils.rs`** for new
-   patterns. It is the single source of truth for the 2/3/4/5-part shapes
-   and the four sibling utilities (`is_dsl_enum_format`,
-   `convert_enum_value`, `extract_enum_value_with_values`,
-   `validate_enum_namespace`) all delegate to it. **TypeName is pinned at
-   index 3 for 5+ part inputs** so PascalCase resource segments (`Vpc`)
-   parse correctly and dotted values (`ipsec.1`) flow into the trailing
-   slice — preserve this invariant when adding shapes.
+2. **Treat `TypeIdentity` as the source of truth when one is available.**
+   `NamespacedId::parse` in `carina-core/src/utils.rs` remains the
+   schema-free syntactic gate for namespaced-looking values, and its 5+
+   part branch still pins `TypeName` at index 3 so dotted values
+   (`ipsec.1`) flow into the trailing slice. Validation paths that have
+   an identity, such as `validate_enum_namespace`, must compare against
+   the identity's provider, structural segments, and kind rather than
+   re-deriving those axes from the dotted display string. Deep
+   multi-segment full paths validate by this structural identity match.
 
 3. **Plan display should not quote namespaced identifiers** - They are identifiers, not strings
 
