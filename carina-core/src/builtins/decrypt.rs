@@ -93,7 +93,6 @@ mod tests {
             decryptor: Some(decrypt_fn),
             validators: HashMap::new(),
             custom_type_validator: None,
-            schema_types: Default::default(),
             resource_types: Default::default(),
             customs_loaded: false,
         }

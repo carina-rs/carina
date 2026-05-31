@@ -5099,7 +5099,7 @@ fn parse_three_segment_resource_path_is_ref() {
 }
 
 #[test]
-fn parse_four_segment_path_with_pascal_tail_is_schema_type() {
+fn parse_four_segment_path_with_pascal_tail_is_dotted_unresolved() {
     let input = r#"
         arguments {
             vpc_id: awscc.ec2.VpcId
@@ -6424,7 +6424,6 @@ fn parse_decrypt_uses_config_decryptor() {
         })),
         validators: HashMap::new(),
         custom_type_validator: None,
-        schema_types: Default::default(),
         resource_types: Default::default(),
         customs_loaded: false,
     };
@@ -6488,7 +6487,6 @@ fn parse_custom_validator_accepts_valid() {
         decryptor: None,
         validators,
         custom_type_validator: None,
-        schema_types: Default::default(),
         resource_types: Default::default(),
         customs_loaded: false,
     };
@@ -6531,7 +6529,6 @@ fn parse_custom_validator_rejects_invalid() {
         decryptor: None,
         validators,
         custom_type_validator: None,
-        schema_types: Default::default(),
         resource_types: Default::default(),
         customs_loaded: false,
     };
@@ -6591,15 +6588,13 @@ fn snake_to_pascal_conversion() {
 }
 
 #[test]
-fn parse_schema_type_in_arguments() {
+fn parse_dotted_type_in_arguments_as_unresolved() {
     let input = r#"
 arguments {
   vpc_id: awscc.ec2.VpcId
 }
 "#;
-    let mut ctx = ProviderContext::default();
-    ctx.register_schema_type("awscc", "ec2", "VpcId");
-    let parsed = parse(input, &ctx).unwrap();
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(parsed.arguments.len(), 1);
     let arg = &parsed.arguments[0];
     assert_eq!(arg.name, "vpc_id");
@@ -6614,24 +6609,38 @@ arguments {
 
 #[test]
 fn parse_schema_type_display() {
+    let ctx = ProviderContext::default();
     let t = TypeExpr::SchemaType {
         provider: "awscc".to_string(),
         path: "ec2".to_string(),
         type_name: "VpcId".to_string(),
     };
     assert_eq!(t.to_string(), "awscc.ec2.VpcId");
+
+    let input = r#"
+        let subnet = awscc.ec2.Subnet {
+            vpc_id = awscc.ec2.Vpc.VpcId
+        }
+    "#;
+    let parsed = parse(input, &ctx).unwrap();
+    let resource = &parsed.resources[0];
+    let attr = resource
+        .attributes
+        .get("vpc_id")
+        .expect("vpc_id attribute present");
+    // SchemaType-style identifier values must render as unquoted dotted identifiers.
+    let formatted = crate::value::format_value(attr);
+    assert_eq!(formatted, "awscc.ec2.Vpc.VpcId");
 }
 
 #[test]
-fn parse_schema_type_list() {
+fn parse_dotted_type_list_as_unresolved() {
     let input = r#"
 arguments {
   subnet_ids: list(awscc.ec2.SubnetId)
 }
 "#;
-    let mut ctx = ProviderContext::default();
-    ctx.register_schema_type("awscc", "ec2", "SubnetId");
-    let parsed = parse(input, &ctx).unwrap();
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(parsed.arguments.len(), 1);
     let arg = &parsed.arguments[0];
     match &arg.type_expr {

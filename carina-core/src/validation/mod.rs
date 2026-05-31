@@ -771,9 +771,8 @@ pub fn validate_no_arguments_in_root<E>(parsed: &crate::parser::File<E>) -> Resu
 /// silent-accept bug.
 ///
 /// The check is restricted to bare PascalCase names that parsed as
-/// `TypeExpr::Simple`. Provider-scoped customs (`aws.iam.Role.Arn`)
-/// travel through `TypeExpr::SchemaType` and have their own
-/// `schema_types`-based validation; they are out of scope here.
+/// `TypeExpr::Simple`. Dotted type expressions (`aws.iam.Role.Arn`)
+/// are resolved separately by the dotted-type validation pass.
 pub fn validate_argument_custom_types<E: crate::parser::ExportParamLike>(
     parsed: &crate::parser::File<E>,
     config: &ProviderContext,

@@ -141,7 +141,6 @@ async fn main() {
             decryptor: None,
             validators: HashMap::new(),
             custom_type_validator: None,
-            schema_types: Default::default(),
             resource_types: Default::default(),
             // Schemas load asynchronously after LSP initialize; the
             // strict carina#3239 parser check is enabled inside

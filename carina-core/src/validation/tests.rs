@@ -46,7 +46,6 @@ fn context_with_iam_policy_arn_validator() -> ProviderContext {
         decryptor: None,
         validators,
         custom_type_validator: None,
-        schema_types: Default::default(),
         resource_types: Default::default(),
         customs_loaded: false,
     }

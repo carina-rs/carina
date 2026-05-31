@@ -81,9 +81,8 @@ const BUILTIN_BARE_CUSTOM_TYPES: &[&str] =
 /// [`ProviderContext::customs_loaded`] is `true`.
 ///
 /// `TypeExpr::Simple` only carries the bare axis, so this check is
-/// deliberately scoped to bare identities — provider-scoped types like
-/// `aws.iam.Role.Arn` arrive through the `TypeExpr::SchemaType` path
-/// instead and are validated by `schema_types`.
+/// deliberately scoped to bare identities — dotted type expressions are
+/// parsed as unresolved paths and classified during validation.
 ///
 /// Exposed at the crate root so the validation layer
 /// (`crate::validation`) can apply the same predicate to argument
@@ -263,7 +262,7 @@ fn parse_type_expr_atom(
             // Dotted type paths are deliberately left unresolved during parsing:
             // bootstrap contexts do not yet know provider schemas or custom
             // validators. Enriched validation resolves this to either Ref or
-            // SchemaType and rejects unknown dotted custom types.
+            // SchemaType and rejects unknown dotted paths.
             let mut ref_inner = inner.into_inner();
             let path_str = next_pair(&mut ref_inner, "resource type path", "type ref")?.as_str();
             let path = ResourceTypePath::parse(path_str).ok_or_else(|| {
@@ -416,9 +415,9 @@ mod tests {
 
     /// A bare custom-type identity registered in `ProviderContext.validators`
     /// makes the corresponding PascalCase name acceptable in a type
-    /// position. Provider-scoped identities (`aws.iam.Role.Arn`) live on
-    /// the `TypeExpr::SchemaType` path, not here — `TypeExpr::Simple`
-    /// only carries the *bare* axis.
+    /// position. Dotted identities (`aws.iam.Role.Arn`) are parsed as
+    /// unresolved paths, not here — `TypeExpr::Simple` only carries the
+    /// *bare* axis.
     #[test]
     fn parse_type_expr_str_accepts_registered_bare_custom_when_customs_loaded() {
         use crate::schema::TypeIdentity;
