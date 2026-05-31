@@ -136,12 +136,6 @@ pub(crate) fn suggest_registered_dotted_custom_type(
         .find(|(_, key)| key == &input_key)
         .map(|(id, _)| id.to_string())
         .or_else(|| {
-            candidates
-                .iter()
-                .find(|(id, _)| input_key.ends_with(&pascal_to_snake(&id.kind)))
-                .map(|(id, _)| id.to_string())
-        })
-        .or_else(|| {
             let max_distance = match input_key.len() {
                 0..=2 => 1,
                 3..=5 => 2,

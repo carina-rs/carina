@@ -885,7 +885,7 @@ fn arguments_unknown_custom_type_surfaces_lsp_diagnostic() {
 }
 
 #[test]
-fn arguments_unknown_dotted_custom_type_surfaces_lsp_diagnostic_with_dotted_suggestion() {
+fn arguments_unknown_dotted_custom_type_surfaces_lsp_diagnostic_without_misleading_suggestion() {
     let engine = test_engine_with_iam_policy_arn_custom_type();
     let doc = create_document("arguments {\n  fake: aws.iam.TotallyFake.Arn\n}\n");
     let diagnostics = engine.analyze(&doc, None);
@@ -900,10 +900,34 @@ fn arguments_unknown_dotted_custom_type_surfaces_lsp_diagnostic_with_dotted_sugg
         messages
     );
     assert!(
+        !diagnostics
+            .iter()
+            .any(|d| d.message.contains("suggestion: use 'aws.iam.Policy.Arn'")),
+        "LSP must not collapse a far dotted typo to an unrelated registered identity; got: {:?}",
+        messages
+    );
+}
+
+#[test]
+fn arguments_dotted_custom_type_suggests_nearest_identity_for_distance1_typo() {
+    let engine = test_engine_with_iam_policy_arn_custom_type();
+    let doc = create_document("arguments {\n  policy: aws.iam.Plicy.Arn\n}\n");
+    let diagnostics = engine.analyze(&doc, None);
+    let messages = diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>();
+
+    assert!(
         diagnostics.iter().any(|d| {
-            d.message.contains("aws.iam.Policy.Arn") && !d.message.contains("IamPolicyArn")
+            d.message.contains("unknown custom type") && d.message.contains("aws.iam.Plicy.Arn")
         }),
-        "LSP must suggest the registered dotted identity, not the bare name; got: {:?}",
+        "LSP must reject the misspelled dotted custom type; got: {:?}",
+        messages
+    );
+    assert!(
+        diagnostics.iter().any(|d| {
+            d.message.contains("suggestion: use 'aws.iam.Policy.Arn'")
+                && !d.message.contains("IamPolicyArn")
+        }),
+        "LSP must suggest the nearest dotted identity, not the bare name; got: {:?}",
         messages
     );
 }

@@ -34,7 +34,9 @@ use tempfile::TempDir;
 // check itself, not an unrelated "unknown provider" diagnostic.
 // ---------------------------------------------------------------------------
 
-struct AwsccTestFactory;
+struct AwsccTestFactory {
+    include_generic_arn: bool,
+}
 
 impl ProviderFactory for AwsccTestFactory {
     fn name(&self) -> &str {
@@ -83,12 +85,26 @@ impl ProviderFactory for AwsccTestFactory {
             None,
         );
 
+        let generic_arn = AttributeType::custom(
+            Some(TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Arn")),
+            AttributeType::string(),
+            None,
+            None,
+            legacy_validator(|_| Ok(())),
+            None,
+        );
+
+        let mut iam_role = ResourceSchema::new("iam.Role")
+            .attribute(AttributeSchema::new("policy_arn", iam_policy_arn));
+        if self.include_generic_arn {
+            iam_role = iam_role.attribute(AttributeSchema::new("role_arn", generic_arn));
+        }
+
         vec![
             ResourceSchema::new("ec2.Vpc")
                 .attribute(AttributeSchema::new("cidr_block", AttributeType::string()))
                 .attribute(AttributeSchema::new("vpc_id", AttributeType::string())),
-            ResourceSchema::new("iam.Role")
-                .attribute(AttributeSchema::new("policy_arn", iam_policy_arn)),
+            iam_role,
         ]
     }
 }
@@ -143,7 +159,15 @@ impl Provider for NoopProvider {
 }
 
 fn factories() -> Vec<Box<dyn ProviderFactory>> {
-    vec![Box::new(AwsccTestFactory) as Box<dyn ProviderFactory>]
+    vec![Box::new(AwsccTestFactory {
+        include_generic_arn: false,
+    }) as Box<dyn ProviderFactory>]
+}
+
+fn factories_with_generic_arn() -> Vec<Box<dyn ProviderFactory>> {
+    vec![Box::new(AwsccTestFactory {
+        include_generic_arn: true,
+    }) as Box<dyn ProviderFactory>]
 }
 
 /// Two-directory fixture: a module that *declares* an unknown
@@ -342,6 +366,94 @@ fn validate_snake_case_suggests_dotted_registered_identity() {
         !diags.iter().any(|d| d.contains("IamPolicyArn")),
         "validate must not suggest the unregistered bare name \
          `IamPolicyArn`; got diagnostics: {:#?}",
+        diags
+    );
+}
+
+/// Reproduces carina#3377: a typo in a non-final dotted segment must
+/// prefer the nearest full registered identity over the generic
+/// same-kind identity.
+#[test]
+fn validate_suggests_full_identity_for_non_final_segment_typo() {
+    let fixture = write_fixture("list(aws.iam.Plicy.Arn)");
+    let caller = fixture.path().join("caller");
+
+    let diags = carina_cli::commands::validate::validate_with_factories(
+        &caller,
+        factories_with_generic_arn(),
+    );
+
+    assert!(
+        diags.iter().any(|d| {
+            d.contains("unknown custom type")
+                && d.contains("aws.iam.Plicy.Arn")
+                && d.contains("suggestion: use 'aws.iam.Policy.Arn'")
+        }),
+        "validate should suggest the nearest full dotted identity \
+         `aws.iam.Policy.Arn`; got diagnostics: {:#?}",
+        diags
+    );
+    assert!(
+        !diags
+            .iter()
+            .any(|d| d.contains("suggestion: use 'aws.Arn'")),
+        "validate must not collapse non-final dotted typos to the generic \
+         same-kind identity `aws.Arn`; got diagnostics: {:#?}",
+        diags
+    );
+}
+
+/// Far dotted typos should remain unknown without falling back to a
+/// generic same-kind identity.
+#[test]
+fn validate_no_suggestion_for_far_dotted_typo() {
+    let fixture = write_fixture("list(aws.iam.TotallyFake.Arn)");
+    let caller = fixture.path().join("caller");
+
+    let diags = carina_cli::commands::validate::validate_with_factories(
+        &caller,
+        factories_with_generic_arn(),
+    );
+
+    assert!(
+        diags.iter().any(|d| {
+            d.contains("unknown custom type") && d.contains("aws.iam.TotallyFake.Arn")
+        }),
+        "validate must reject the unregistered dotted custom type; got \
+         diagnostics: {:#?}",
+        diags
+    );
+    assert!(
+        !diags
+            .iter()
+            .any(|d| d.contains("suggestion: use 'aws.Arn'")),
+        "validate must not suggest the generic same-kind identity \
+         `aws.Arn`; got diagnostics: {:#?}",
+        diags
+    );
+}
+
+/// A distance-1 typo in the final segment should still be corrected by
+/// the full-identity edit-distance matcher.
+#[test]
+fn validate_suggests_for_distance1_final_segment_typo() {
+    let fixture = write_fixture("list(aws.iam.Policy.Arnn)");
+    let caller = fixture.path().join("caller");
+
+    let diags = carina_cli::commands::validate::validate_with_factories(
+        &caller,
+        factories_with_generic_arn(),
+    );
+
+    assert!(
+        diags.iter().any(|d| {
+            d.contains("unknown custom type")
+                && d.contains("aws.iam.Policy.Arnn")
+                && d.contains("suggestion: use 'aws.iam.Policy.Arn'")
+        }),
+        "validate should suggest the registered dotted identity \
+         `aws.iam.Policy.Arn` for a distance-1 final-segment typo; got \
+         diagnostics: {:#?}",
         diags
     );
 }
