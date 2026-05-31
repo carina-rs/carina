@@ -834,12 +834,19 @@ pub fn resolve_enum_aliases_in_states(
             Some(f) => f,
             None => continue,
         };
+        let schemas = factory.schemas();
         // Reuse the core per-value alias resolver (single source of
         // truth shared with the resource path, carina#3063).
         let keys: Vec<String> = state.attributes.keys().cloned().collect();
         for key in keys {
             if let Some(value) = state.attributes.get_mut(&key) {
-                carina_core::value::resolve_value_alias(value, &id.resource_type, &key, factory);
+                carina_core::value::resolve_value_alias_with_schemas(
+                    value,
+                    &id.resource_type,
+                    &key,
+                    factory,
+                    &schemas,
+                );
             }
         }
     }
@@ -903,11 +910,15 @@ pub(crate) fn resolve_enum_aliases_in_wait_bindings(
         let Some(factory) = provider_mod::find_factory(ctx.factories(), &id.provider) else {
             continue;
         };
-        carina_core::value::resolve_value_alias(
+        // One schema snapshot per wait binding is acceptable: this path is
+        // bounded by wait-binding count, not resource attribute fanout.
+        let schemas = factory.schemas();
+        carina_core::value::resolve_value_alias_with_schemas(
             &mut wb.until_predicate.rhs,
             &id.resource_type,
             &attr_name,
             factory,
+            &schemas,
         );
     }
 }

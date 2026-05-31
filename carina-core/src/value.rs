@@ -8,7 +8,7 @@ use thiserror::Error;
 
 use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value};
 use crate::schema::{AttrTypeKind, AttributeType};
-use crate::utils::{convert_enum_value, is_dsl_enum_format};
+use crate::utils::{convert_enum_value, extract_enum_value_with_values, is_dsl_enum_format};
 
 /// Where in the pipeline a `Value` is being serialized. Used so the
 /// caller of a failing serialization (e.g. `--out plan.json`) can
@@ -1588,34 +1588,210 @@ pub fn canonicalize_states_with_schemas(
 /// Public so the carina-cli state-side alias pass
 /// (`resolve_enum_aliases_in_states`) reuses this exact implementation
 /// rather than keeping a divergent copy.
+///
+/// Single-shot convenience wrapper. Callers resolving multiple values for
+/// the same factory should fetch [`crate::provider::ProviderFactory::schemas`]
+/// once and call [`resolve_value_alias_with_schemas`] to avoid cloning the
+/// provider's full schema list per attribute.
 pub fn resolve_value_alias(
     value: &mut Value,
     resource_type: &str,
     attr_name: &str,
     factory: &dyn crate::provider::ProviderFactory,
 ) {
+    let schemas = factory.schemas();
+    resolve_value_alias_with_schemas(value, resource_type, attr_name, factory, &schemas);
+}
+
+/// Resolve a single value's enum alias using a caller-provided schema snapshot.
+///
+/// This is the hot-loop variant of [`resolve_value_alias`]. `schemas` must be
+/// the result of [`crate::provider::ProviderFactory::schemas`] for `factory`.
+pub fn resolve_value_alias_with_schemas(
+    value: &mut Value,
+    resource_type: &str,
+    attr_name: &str,
+    factory: &dyn crate::provider::ProviderFactory,
+    schemas: &[crate::schema::ResourceSchema],
+) {
     match value {
         Value::Concrete(ConcreteValue::String(s)) if is_dsl_enum_format(s) => {
-            let raw = convert_enum_value(s);
+            let valid_values = enum_valid_values_for_alias(schemas, resource_type, attr_name, s);
+            let raw = if valid_values.is_empty() {
+                convert_enum_value(s)
+            } else {
+                let valid_refs: Vec<&str> = valid_values.iter().map(String::as_str).collect();
+                extract_enum_value_with_values(s, &valid_refs)
+            };
             if let Some(canonical) = factory.get_enum_alias_reverse(resource_type, attr_name, raw) {
                 *s = canonical;
             }
         }
         Value::Concrete(ConcreteValue::List(items)) => {
             for item in items.iter_mut() {
-                resolve_value_alias(item, resource_type, attr_name, factory);
+                resolve_value_alias_with_schemas(item, resource_type, attr_name, factory, schemas);
             }
         }
         Value::Concrete(ConcreteValue::Map(map)) => {
             let map_keys: Vec<String> = map.keys().cloned().collect();
             for map_key in map_keys {
                 if let Some(v) = map.get_mut(&map_key) {
-                    resolve_value_alias(v, resource_type, &map_key, factory);
+                    resolve_value_alias_with_schemas(v, resource_type, &map_key, factory, schemas);
                 }
             }
         }
         _ => {}
     }
+}
+
+fn enum_valid_values_for_alias(
+    schemas: &[crate::schema::ResourceSchema],
+    resource_type: &str,
+    attr_name: &str,
+    input: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for schema in schemas
+        .iter()
+        .filter(|schema| schema.resource_type == resource_type)
+    {
+        for attr_schema in schema.attributes.values() {
+            collect_enum_valid_values_for_attr_name(
+                schema,
+                attr_name,
+                input,
+                &attr_schema.name,
+                &attr_schema.attr_type,
+                0,
+                &mut out,
+            );
+        }
+    }
+    out
+}
+
+fn collect_enum_valid_values_for_attr_name(
+    schema: &crate::schema::ResourceSchema,
+    target_attr_name: &str,
+    input: &str,
+    current_attr_name: &str,
+    attr_type: &AttributeType,
+    depth: usize,
+    out: &mut Vec<String>,
+) {
+    if depth > 64 {
+        return;
+    }
+
+    match schema.shape_of(attr_type) {
+        crate::schema::Shape::StringEnum { values, .. }
+            if current_attr_name == target_attr_name =>
+        {
+            collect_string_enum_values_if_input_matches(schema, input, attr_type, values, out);
+        }
+        crate::schema::Shape::StringEnum { .. }
+        | crate::schema::Shape::String
+        | crate::schema::Shape::Int
+        | crate::schema::Shape::Float
+        | crate::schema::Shape::Bool
+        | crate::schema::Shape::Duration => {}
+        crate::schema::Shape::Custom { base, .. }
+        | crate::schema::Shape::CustomEnum { base, .. } => {
+            collect_enum_valid_values_for_attr_name(
+                schema,
+                target_attr_name,
+                input,
+                current_attr_name,
+                base,
+                depth + 1,
+                out,
+            );
+        }
+        crate::schema::Shape::List { inner, .. } => {
+            collect_enum_valid_values_for_attr_name(
+                schema,
+                target_attr_name,
+                input,
+                current_attr_name,
+                inner,
+                depth + 1,
+                out,
+            );
+        }
+        crate::schema::Shape::Map { value, .. } => {
+            collect_enum_valid_values_for_attr_name(
+                schema,
+                target_attr_name,
+                input,
+                current_attr_name,
+                value,
+                depth + 1,
+                out,
+            );
+        }
+        crate::schema::Shape::Struct { fields, .. } => {
+            for field in fields {
+                collect_enum_valid_values_for_attr_name(
+                    schema,
+                    target_attr_name,
+                    input,
+                    &field.name,
+                    &field.field_type,
+                    depth + 1,
+                    out,
+                );
+            }
+        }
+        crate::schema::Shape::Union(members) => {
+            for member in members {
+                collect_enum_valid_values_for_attr_name(
+                    schema,
+                    target_attr_name,
+                    input,
+                    current_attr_name,
+                    member,
+                    depth + 1,
+                    out,
+                );
+            }
+        }
+    }
+}
+
+fn collect_string_enum_values_if_input_matches(
+    schema: &crate::schema::ResourceSchema,
+    input: &str,
+    attr_type: &AttributeType,
+    values: &[String],
+    out: &mut Vec<String>,
+) {
+    let crate::schema::Shape::StringEnum { name, identity, .. } = schema.shape_of(attr_type) else {
+        return;
+    };
+    if !string_enum_identity_matches_input(input, name, identity) {
+        return;
+    }
+    for value in values {
+        if !out.contains(value) {
+            out.push(value.clone());
+        }
+    }
+}
+
+fn string_enum_identity_matches_input(
+    input: &str,
+    enum_name: &str,
+    identity: Option<&crate::schema::TypeIdentity>,
+) -> bool {
+    if input.strip_prefix(&format!("{enum_name}.")).is_some() {
+        return true;
+    }
+    if let Some(identity) = identity {
+        return input
+            .strip_prefix(&format!("{identity}."))
+            .is_some_and(|value| !value.is_empty());
+    }
+    false
 }
 
 /// Re-apply enum-alias resolution to every resource, looking up the
@@ -1637,9 +1813,10 @@ pub fn resolve_enum_aliases_for_resources(
         };
         let resource_type = resource.id.resource_type.clone();
         let keys: Vec<String> = resource.attributes.keys().cloned().collect();
+        let schemas = factory.schemas();
         for key in keys {
             if let Some(value) = resource.attributes.get_mut(&key) {
-                resolve_value_alias(value, &resource_type, &key, factory);
+                resolve_value_alias_with_schemas(value, &resource_type, &key, factory, &schemas);
             }
         }
     }
@@ -1648,6 +1825,99 @@ pub fn resolve_enum_aliases_for_resources(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DeepEnumAliasFactory;
+
+    impl crate::provider::ProviderFactory for DeepEnumAliasFactory {
+        fn name(&self) -> &str {
+            "aws"
+        }
+
+        fn display_name(&self) -> &str {
+            "AWS"
+        }
+
+        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+            HashMap::new()
+        }
+
+        fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+            String::new()
+        }
+
+        fn create_provider(
+            &self,
+            _binding: Option<&str>,
+            _attributes: &IndexMap<String, Value>,
+        ) -> futures::future::BoxFuture<
+            '_,
+            crate::provider::ProviderResult<Box<dyn crate::provider::Provider>>,
+        > {
+            unreachable!("DeepEnumAliasFactory::create_provider is not used in these tests")
+        }
+
+        fn schemas(&self) -> Vec<crate::schema::ResourceSchema> {
+            use crate::schema::{
+                AttributeSchema, ResourceSchema, StructField, string_enum_identity,
+            };
+
+            let status = AttributeType::string_enum(
+                "Status",
+                vec!["enabled".to_string(), "disabled".to_string()],
+                Some(string_enum_identity(
+                    "Status",
+                    Some("aws.s3.BucketLifecycleConfiguration.Rules"),
+                )),
+                Vec::new(),
+            );
+            let rules = AttributeType::list(AttributeType::struct_(
+                "Rules",
+                vec![StructField::new("status", status)],
+            ));
+
+            vec![
+                ResourceSchema::new("s3.BucketLifecycleConfiguration")
+                    .attribute(AttributeSchema::new("rules", rules)),
+            ]
+        }
+
+        fn get_enum_alias_reverse(
+            &self,
+            resource_type: &str,
+            attr_name: &str,
+            value: &str,
+        ) -> Option<String> {
+            match (resource_type, attr_name, value) {
+                ("s3.BucketLifecycleConfiguration", "status", "disabled") => {
+                    Some("Disabled".to_string())
+                }
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_value_alias_extracts_deep_structural_enum_with_schema_values() {
+        let mut value = Value::Concrete(ConcreteValue::String(
+            "aws.s3.BucketLifecycleConfiguration.Rules.Status.disabled".to_string(),
+        ));
+
+        resolve_value_alias(
+            &mut value,
+            "s3.BucketLifecycleConfiguration",
+            "status",
+            &DeepEnumAliasFactory,
+        );
+
+        assert_eq!(
+            value,
+            Value::Concrete(ConcreteValue::String("Disabled".to_string()))
+        );
+    }
 
     #[test]
     fn render_duration_picks_largest_clean_unit() {

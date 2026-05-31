@@ -1560,6 +1560,36 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_namespace_deep_structural_wrong_middle_segment_invalid() {
+        let identity =
+            string_enum_identity("Status", Some("aws.s3.BucketLifecycleConfiguration.Rules"));
+
+        assert!(
+            validate_enum_namespace("aws.s3.WrongStruct.Rules.Status.enabled", &identity).is_err()
+        );
+    }
+
+    #[test]
+    fn test_validate_namespace_deep_structural_dotted_value_invalid() {
+        let identity = string_enum_identity("Type", Some("aws.x.Y.Z"));
+
+        assert!(validate_enum_namespace("aws.x.Y.Z.Type.ipsec.1", &identity).is_err());
+    }
+
+    #[test]
+    fn test_validate_namespace_deep_structural_wrong_identity_invalid() {
+        let identity = string_enum_identity("Status", Some("aws.ec2.SecurityGroup.Rules"));
+
+        assert!(
+            validate_enum_namespace(
+                "aws.s3.BucketLifecycleConfiguration.Rules.Status.enabled",
+                &identity,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn test_namespaced_id_parse_numeric_tail() {
         // Digit-led tail with underscores parses through the 5-part shape
         // and flows into `value` verbatim (carina#3051).
