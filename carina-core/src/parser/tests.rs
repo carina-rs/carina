@@ -902,7 +902,7 @@ fn parse_ref_type_expression() {
     assert_eq!(result.arguments[0].name, "vpc");
     assert_eq!(
         result.arguments[0].type_expr,
-        TypeExpr::Ref(ResourceTypePath::new("aws", "vpc"))
+        TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "vpc"))
     );
     assert!(result.arguments[0].default.is_none());
 
@@ -910,7 +910,7 @@ fn parse_ref_type_expression() {
     assert_eq!(result.attribute_params[0].name, "security_group_id");
     assert_eq!(
         result.attribute_params[0].type_expr,
-        Some(TypeExpr::Ref(ResourceTypePath::new(
+        Some(TypeExpr::DottedUnresolved(ResourceTypePath::new(
             "aws",
             "security_group"
         )))
@@ -935,13 +935,13 @@ fn parse_ref_type_with_nested_resource_type() {
     // Single-level resource type
     assert_eq!(
         result.arguments[0].type_expr,
-        TypeExpr::Ref(ResourceTypePath::new("aws", "security_group"))
+        TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "security_group"))
     );
 
     // Nested resource type (security_group.ingress_rule)
     assert_eq!(
         result.arguments[1].type_expr,
-        TypeExpr::Ref(ResourceTypePath::new("aws", "security_group.ingress_rule"))
+        TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "security_group.ingress_rule"))
     );
 }
 
@@ -4912,7 +4912,7 @@ fn parse_arguments_block_form_description_only() {
     assert_eq!(result.arguments[0].name, "vpc");
     assert_eq!(
         result.arguments[0].type_expr,
-        TypeExpr::Ref(ResourceTypePath::new("awscc", "ec2.Vpc"))
+        TypeExpr::DottedUnresolved(ResourceTypePath::new("awscc", "ec2.Vpc"))
     );
     assert!(result.arguments[0].default.is_none());
     assert_eq!(
@@ -4979,7 +4979,7 @@ fn parse_arguments_mixed_simple_and_block_form() {
     assert_eq!(result.arguments[1].name, "vpc");
     assert_eq!(
         result.arguments[1].type_expr,
-        TypeExpr::Ref(ResourceTypePath::new("awscc", "ec2.Vpc"))
+        TypeExpr::DottedUnresolved(ResourceTypePath::new("awscc", "ec2.Vpc"))
     );
     assert!(result.arguments[1].default.is_none());
     assert_eq!(
@@ -5083,18 +5083,18 @@ fn parse_three_segment_resource_path_is_ref() {
     "#;
     let result = parse(input, &ProviderContext::default()).unwrap();
     match &result.arguments[0].type_expr {
-        TypeExpr::Ref(path) => {
+        TypeExpr::DottedUnresolved(path) => {
             assert_eq!(path.provider, "aws");
             assert_eq!(path.resource_type, "ec2.Vpc");
         }
-        other => panic!("expected Ref, got {other:?}"),
+        other => panic!("expected DottedUnresolved, got {other:?}"),
     }
     match &result.arguments[1].type_expr {
-        TypeExpr::Ref(path) => {
+        TypeExpr::DottedUnresolved(path) => {
             assert_eq!(path.provider, "aws");
             assert_eq!(path.resource_type, "s3.Bucket");
         }
-        other => panic!("expected Ref, got {other:?}"),
+        other => panic!("expected DottedUnresolved, got {other:?}"),
     }
 }
 
@@ -5105,12 +5105,10 @@ fn parse_four_segment_path_with_pascal_tail_is_schema_type() {
             vpc_id: awscc.ec2.VpcId
         }
     "#;
-    let mut ctx = ProviderContext::default();
-    ctx.register_schema_type("awscc", "ec2", "VpcId");
-    let result = parse(input, &ctx).unwrap();
+    let result = parse(input, &ProviderContext::default()).unwrap();
     assert!(matches!(
         result.arguments[0].type_expr,
-        TypeExpr::SchemaType { .. }
+        TypeExpr::DottedUnresolved(_)
     ));
 }
 
@@ -5121,7 +5119,10 @@ fn type_expr_ref_display_roundtrips_three_segment_path() {
 
     let input = format!(r#"arguments {{ v: {} }}"#, ty);
     let parsed = parse(&input, &ProviderContext::default()).unwrap();
-    assert_eq!(parsed.arguments[0].type_expr, ty);
+    assert_eq!(
+        parsed.arguments[0].type_expr,
+        TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "ec2.Vpc"))
+    );
 }
 
 #[test]
@@ -5144,8 +5145,8 @@ fn parser_rejects_snake_case_custom_type_after_phase_c() {
     let err = parse(input, &ProviderContext::default()).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("unknown type 'aws_account_id'") && msg.contains("'AwsAccountId'"),
-        "expected rejection with hint pointing at 'AwsAccountId', got: {msg}"
+        msg.contains("unknown type 'aws_account_id'") && !msg.contains("'AwsAccountId'"),
+        "expected rejection without an invented bare-name hint, got: {msg}"
     );
 }
 
@@ -6424,6 +6425,7 @@ fn parse_decrypt_uses_config_decryptor() {
         validators: HashMap::new(),
         custom_type_validator: None,
         schema_types: Default::default(),
+        resource_types: Default::default(),
         customs_loaded: false,
     };
 
@@ -6487,6 +6489,7 @@ fn parse_custom_validator_accepts_valid() {
         validators,
         custom_type_validator: None,
         schema_types: Default::default(),
+        resource_types: Default::default(),
         customs_loaded: false,
     };
 
@@ -6529,6 +6532,7 @@ fn parse_custom_validator_rejects_invalid() {
         validators,
         custom_type_validator: None,
         schema_types: Default::default(),
+        resource_types: Default::default(),
         customs_loaded: false,
     };
 
@@ -6600,16 +6604,11 @@ arguments {
     let arg = &parsed.arguments[0];
     assert_eq!(arg.name, "vpc_id");
     match &arg.type_expr {
-        TypeExpr::SchemaType {
-            provider,
-            path,
-            type_name,
-        } => {
-            assert_eq!(provider, "awscc");
-            assert_eq!(path, "ec2");
-            assert_eq!(type_name, "VpcId");
+        TypeExpr::DottedUnresolved(path) => {
+            assert_eq!(path.provider, "awscc");
+            assert_eq!(path.resource_type, "ec2.VpcId");
         }
-        other => panic!("Expected SchemaType, got {:?}", other),
+        other => panic!("Expected DottedUnresolved, got {:?}", other),
     }
 }
 
@@ -6637,10 +6636,11 @@ arguments {
     let arg = &parsed.arguments[0];
     match &arg.type_expr {
         TypeExpr::List(inner) => match inner.as_ref() {
-            TypeExpr::SchemaType { type_name, .. } => {
-                assert_eq!(type_name, "SubnetId");
+            TypeExpr::DottedUnresolved(path) => {
+                assert_eq!(path.provider, "awscc");
+                assert_eq!(path.resource_type, "ec2.SubnetId");
             }
-            other => panic!("Expected SchemaType inside list, got {:?}", other),
+            other => panic!("Expected DottedUnresolved inside list, got {:?}", other),
         },
         other => panic!("Expected List, got {:?}", other),
     }

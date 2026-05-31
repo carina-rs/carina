@@ -884,6 +884,30 @@ fn arguments_unknown_custom_type_surfaces_lsp_diagnostic() {
     );
 }
 
+#[test]
+fn arguments_unknown_dotted_custom_type_surfaces_lsp_diagnostic_with_dotted_suggestion() {
+    let engine = test_engine_with_iam_policy_arn_custom_type();
+    let doc = create_document("arguments {\n  fake: aws.iam.TotallyFake.Arn\n}\n");
+    let diagnostics = engine.analyze(&doc, None);
+    let messages = diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>();
+
+    assert!(
+        diagnostics.iter().any(|d| {
+            d.message.contains("unknown custom type")
+                && d.message.contains("aws.iam.TotallyFake.Arn")
+        }),
+        "LSP must reject unregistered dotted custom types; got: {:?}",
+        messages
+    );
+    assert!(
+        diagnostics.iter().any(|d| {
+            d.message.contains("aws.iam.Policy.Arn") && !d.message.contains("IamPolicyArn")
+        }),
+        "LSP must suggest the registered dotted identity, not the bare name; got: {:?}",
+        messages
+    );
+}
+
 /// Companion to the test above: when no provider is registered
 /// (`provider_names` empty — the LSP's orphaned-file fallback), the
 /// strict check must *not* fire, otherwise every user-defined custom

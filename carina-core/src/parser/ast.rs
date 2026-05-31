@@ -244,6 +244,10 @@ pub enum TypeExpr {
     Map(Box<TypeExpr>),
     /// Reference to a resource type (e.g., aws.vpc)
     Ref(ResourceTypePath),
+    /// Dotted type path produced by the parser before provider schemas
+    /// have been loaded enough to classify it as a resource ref or
+    /// provider custom type.
+    DottedUnresolved(ResourceTypePath),
     /// Provider-defined schema type (e.g., awscc.ec2.VpcId, awscc.ec2.SubnetId)
     /// Distinguished from Ref by having a PascalCase final segment.
     SchemaType {
@@ -296,7 +300,20 @@ impl TypeExpr {
     pub fn into_known(self) -> Option<TypeExpr> {
         match self {
             TypeExpr::Unknown => None,
-            other => Some(other),
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::List(_)
+            | TypeExpr::Map(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::SchemaType { .. }
+            | TypeExpr::Struct { .. }
+            | TypeExpr::StringLiteral(_)
+            | TypeExpr::Union(_) => Some(self),
         }
     }
 
@@ -312,7 +329,10 @@ impl TypeExpr {
     pub fn is_string_shaped(&self) -> bool {
         matches!(
             self,
-            TypeExpr::String | TypeExpr::Simple(_) | TypeExpr::SchemaType { .. }
+            TypeExpr::String
+                | TypeExpr::Simple(_)
+                | TypeExpr::DottedUnresolved(_)
+                | TypeExpr::SchemaType { .. }
         )
     }
 }
@@ -329,6 +349,7 @@ impl std::fmt::Display for TypeExpr {
             TypeExpr::List(inner) => write!(f, "list({})", inner),
             TypeExpr::Map(inner) => write!(f, "map({})", inner),
             TypeExpr::Ref(path) => write!(f, "{}", path),
+            TypeExpr::DottedUnresolved(path) => write!(f, "{}", path),
             TypeExpr::SchemaType {
                 provider,
                 path,
@@ -472,6 +493,7 @@ pub trait ExportParamLike {
     /// custom-type walk uses this so it can validate both phases through
     /// the same trait.
     fn type_expr_opt(&self) -> Option<&TypeExpr>;
+    fn type_expr_opt_mut(&mut self) -> Option<&mut TypeExpr>;
 }
 
 impl ExportParamLike for ParsedExportParam {
@@ -483,6 +505,9 @@ impl ExportParamLike for ParsedExportParam {
     }
     fn type_expr_opt(&self) -> Option<&TypeExpr> {
         self.type_expr.as_ref()
+    }
+    fn type_expr_opt_mut(&mut self) -> Option<&mut TypeExpr> {
+        self.type_expr.as_mut()
     }
 }
 
@@ -941,6 +966,9 @@ impl ExportParamLike for InferredExportParam {
     }
     fn type_expr_opt(&self) -> Option<&TypeExpr> {
         Some(&self.type_expr)
+    }
+    fn type_expr_opt_mut(&mut self) -> Option<&mut TypeExpr> {
+        Some(&mut self.type_expr)
     }
 }
 

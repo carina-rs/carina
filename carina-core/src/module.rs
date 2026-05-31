@@ -755,6 +755,49 @@ pub struct ModuleSignature {
 }
 
 impl ModuleSignature {
+    /// Normalize parsed type expressions for module-signature display and
+    /// dependency-graph construction. Lowercase-tail dotted paths are treated
+    /// as resource refs here so argument references can create dependency
+    /// edges; PascalCase-tail dotted custom types are kept unresolved because
+    /// they are string-valued, not resource targets. Authoritative resolution
+    /// and unknown-type rejection happens in `validation::resolve_file_type_exprs`.
+    fn signature_type_expr(type_expr: &TypeExpr) -> TypeExpr {
+        match type_expr {
+            TypeExpr::DottedUnresolved(path)
+                if path.resource_type.chars().all(|c| {
+                    c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.'
+                }) =>
+            {
+                TypeExpr::Ref(path.clone())
+            }
+            TypeExpr::List(inner) => TypeExpr::List(Box::new(Self::signature_type_expr(inner))),
+            TypeExpr::Map(inner) => TypeExpr::Map(Box::new(Self::signature_type_expr(inner))),
+            TypeExpr::Union(members) => TypeExpr::Union(
+                members
+                    .iter()
+                    .map(Self::signature_type_expr)
+                    .collect::<Vec<_>>(),
+            ),
+            TypeExpr::Struct { fields } => TypeExpr::Struct {
+                fields: fields
+                    .iter()
+                    .map(|(name, ty)| (name.clone(), Self::signature_type_expr(ty)))
+                    .collect(),
+            },
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::SchemaType { .. }
+            | TypeExpr::StringLiteral(_)
+            | TypeExpr::Unknown => type_expr.clone(),
+        }
+    }
+
     /// Build a module signature from a directory-based module (ParsedFile with top-level arguments/attributes)
     pub fn from_directory_module<E>(parsed: &crate::parser::File<E>, module_name: &str) -> Self {
         // Build requires (typed inputs)
@@ -763,7 +806,7 @@ impl ModuleSignature {
             .iter()
             .map(|input| TypedArgument {
                 name: input.name.clone(),
-                type_expr: input.type_expr.clone(),
+                type_expr: Self::signature_type_expr(&input.type_expr),
                 required: input.default.is_none(),
                 default: input.default.as_ref().map(format_value),
                 description: input.description.clone(),
@@ -774,7 +817,7 @@ impl ModuleSignature {
         let argument_types: HashMap<String, TypeExpr> = parsed
             .arguments
             .iter()
-            .map(|i| (i.name.clone(), i.type_expr.clone()))
+            .map(|i| (i.name.clone(), Self::signature_type_expr(&i.type_expr)))
             .collect();
 
         // Build creates (resource creations with dependencies)
@@ -856,7 +899,7 @@ impl ModuleSignature {
 
                 TypedAttributeParam {
                     name: attr_param.name.clone(),
-                    type_expr: attr_param.type_expr.clone(),
+                    type_expr: attr_param.type_expr.as_ref().map(Self::signature_type_expr),
                     source_binding,
                 }
             })
@@ -1083,6 +1126,9 @@ impl ModuleSignature {
             TypeExpr::Ref(path) => {
                 format!("{}{}{}", c.yellow, path, c.reset)
             }
+            TypeExpr::DottedUnresolved(path) => {
+                format!("{}{}{}", c.green, path, c.reset)
+            }
             TypeExpr::List(inner) => {
                 format!(
                     "{}list({}{})",
@@ -1118,7 +1164,16 @@ impl ModuleSignature {
                     out
                 }
             }
-            _ => format!("{}{}{}", c.green, type_expr, c.reset),
+            TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::SchemaType { .. }
+            | TypeExpr::StringLiteral(_)
+            | TypeExpr::Union(_)
+            | TypeExpr::Unknown => format!("{}{}{}", c.green, type_expr, c.reset),
         }
     }
 

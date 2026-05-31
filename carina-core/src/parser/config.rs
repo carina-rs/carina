@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::schema::TypeIdentity;
+use crate::schema::{SchemaRegistry, TypeIdentity};
 
 /// Signature for a custom type validator function.
 ///
@@ -45,12 +45,13 @@ pub struct ProviderContext {
     /// Schema types registered by providers, keyed by
     /// `(provider, path, type_name)` (e.g., `("awscc", "ec2", "VpcId")`).
     ///
-    /// Used by the parser to disambiguate 3+ segment paths: without this set,
-    /// both `aws.ec2.Vpc` (resource kind) and `awscc.ec2.VpcId` (schema type)
-    /// look identical. When a triple is present, the parser classifies the
-    /// path as `TypeExpr::SchemaType`; otherwise it falls back to
-    /// `TypeExpr::Ref`.
+    /// This set is for explicit provider-defined schema aliases only. It is
+    /// not a resource-kind registry; use [`ProviderContext::resource_types`]
+    /// and [`ProviderContext::has_resource_type`] for resource refs.
     pub schema_types: HashSet<(String, String, String)>,
+    /// Resource kinds loaded from provider schemas, keyed by `(provider,
+    /// resource_type)` such as `("aws", "iam.Role")`.
+    pub resource_types: HashSet<(String, String)>,
     /// Whether the provider-registration phase has populated this
     /// context with the full custom-type set. When `true`, the parser
     /// rejects any bare PascalCase type name that is not a built-in DSL
@@ -92,6 +93,25 @@ impl ProviderContext {
             type_name.to_string(),
         ))
     }
+
+    /// Return `true` iff `(provider, resource_type)` is a loaded managed
+    /// resource or data source kind.
+    pub fn has_resource_type(&self, provider: &str, resource_type: &str) -> bool {
+        self.resource_types
+            .contains(&(provider.to_string(), resource_type.to_string()))
+    }
+
+    /// Build the resource-kind registry used to resolve dotted type refs.
+    pub fn resource_types_from_schema_registry(
+        schemas: &SchemaRegistry,
+    ) -> HashSet<(String, String)> {
+        schemas
+            .iter()
+            .map(|(provider, resource_type, _, _)| {
+                (provider.to_string(), resource_type.to_string())
+            })
+            .collect()
+    }
 }
 
 impl std::fmt::Debug for ProviderContext {
@@ -104,6 +124,7 @@ impl std::fmt::Debug for ProviderContext {
                 &self.custom_type_validator.as_ref().map(|_| "..."),
             )
             .field("schema_types", &self.schema_types)
+            .field("resource_types", &self.resource_types)
             .field("customs_loaded", &self.customs_loaded)
             .finish()
     }
