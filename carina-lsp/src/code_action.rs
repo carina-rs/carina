@@ -125,6 +125,11 @@ pub fn code_actions_for_diagnostic(uri: &Url, diag: &Diagnostic) -> Vec<CodeActi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carina_core::resource::{ConcreteValue, Value};
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, ResourceSchema, TypeError, string_enum_identity,
+    };
+    use std::collections::HashMap;
     use tower_lsp::lsp_types::{Position, Range};
 
     /// Build a versioning-bucket fixture variant — keep the `aws.s3.Bucket
@@ -136,15 +141,13 @@ mod tests {
         value: &str,
         is_alias: bool,
     ) -> ExpectedEnumVariant {
-        ExpectedEnumVariant {
-            provider: provider.map(String::from),
-            segments: provider
-                .map(|_| vec!["s3".to_string(), "Bucket".to_string()])
-                .unwrap_or_default(),
-            type_name: "VersioningStatus".to_string(),
-            value: value.to_string(),
+        let namespace = provider.map(|provider| format!("{provider}.s3.Bucket"));
+        ExpectedEnumVariant::from_namespaced(
+            namespace.as_deref(),
+            "VersioningStatus",
+            value,
             is_alias,
-        }
+        )
     }
 
     fn diag_with_payload(payload: EnumDiagnosticData) -> Diagnostic {
@@ -262,13 +265,9 @@ mod tests {
     fn non_namespaced_variant_renders_bare_value() {
         let payload = EnumDiagnosticData::new(
             EnumDiagnosticKind::BareInvalid,
-            vec![ExpectedEnumVariant {
-                provider: None,
-                segments: Vec::new(),
-                type_name: "Mode".to_string(),
-                value: "fast".to_string(),
-                is_alias: false,
-            }],
+            vec![ExpectedEnumVariant::from_namespaced(
+                None, "Mode", "fast", false,
+            )],
         );
         let diag = diag_with_payload(payload);
         let actions = code_actions_for_diagnostic(&dummy_uri(), &diag);
@@ -284,5 +283,69 @@ mod tests {
         let diag = diag_with_payload(payload);
         let actions = code_actions_for_diagnostic(&dummy_uri(), &diag);
         assert_eq!(actions[0].is_preferred, Some(true));
+    }
+
+    #[test]
+    fn version_quickfix_uses_dsl_spelling_from_core_candidates() {
+        let schema = ResourceSchema::new("aws.iam.PolicyDocument").attribute(
+            AttributeSchema::new(
+                "Version",
+                AttributeType::string_enum(
+                    "Version".to_string(),
+                    vec!["2012-10-17".to_string(), "2008-10-17".to_string()],
+                    Some(string_enum_identity(
+                        "Version",
+                        Some("aws.iam.PolicyDocument"),
+                    )),
+                    vec![
+                        ("2012-10-17".to_string(), "2012_10_17".to_string()),
+                        ("2008-10-17".to_string(), "2008_10_17".to_string()),
+                    ],
+                ),
+            )
+            .required(),
+        );
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "Version".to_string(),
+            Value::Concrete(ConcreteValue::EnumIdentifier("bad_version".to_string())),
+        );
+        let mut errs = schema.validate(&attrs).unwrap_err();
+        let err = errs.remove(0);
+        let TypeError::InvalidEnumVariant { expected, .. } = err else {
+            panic!("expected InvalidEnumVariant, got {err:?}");
+        };
+        let payload = EnumDiagnosticData::new(EnumDiagnosticKind::BareInvalid, expected);
+        let diag = diag_with_payload(payload);
+        let actions = code_actions_for_diagnostic(&dummy_uri(), &diag);
+        let replacements: Vec<String> = actions
+            .iter()
+            .flat_map(|action| {
+                action
+                    .edit
+                    .as_ref()
+                    .and_then(|edit| edit.changes.as_ref())
+                    .and_then(|changes| changes.get(&dummy_uri()))
+                    .into_iter()
+                    .flatten()
+                    .map(|edit| edit.new_text.clone())
+            })
+            .collect();
+
+        assert!(
+            replacements.contains(&"aws.iam.PolicyDocument.Version.2012_10_17".to_string()),
+            "quickfixes must include DSL spelling, got: {replacements:?}"
+        );
+        assert!(
+            replacements
+                .iter()
+                .all(|replacement| !replacement.contains('-')),
+            "quickfixes must not offer API hyphen spelling, got: {replacements:?}"
+        );
+        let preferred = actions
+            .iter()
+            .find(|action| action.title.contains("2012_10_17"))
+            .expect("2012_10_17 quickfix");
+        assert_eq!(preferred.is_preferred, Some(true));
     }
 }

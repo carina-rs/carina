@@ -170,6 +170,132 @@ fn validate_string_enum_accepts_dsl_alias() {
     );
 }
 
+fn iam_policy_version_enum() -> AttributeType {
+    AttributeType::string_enum(
+        "Version".to_string(),
+        vec!["2012-10-17".to_string(), "2008-10-17".to_string()],
+        Some(crate::schema::string_enum_identity(
+            "Version",
+            Some("aws.iam.PolicyDocument"),
+        )),
+        vec![
+            ("2012-10-17".to_string(), "2012_10_17".to_string()),
+            ("2008-10-17".to_string(), "2008_10_17".to_string()),
+        ],
+    )
+}
+
+fn assert_iam_policy_version_candidates(expected: &[ExpectedEnumVariant]) {
+    let rendered: Vec<String> = expected.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        rendered,
+        vec![
+            "aws.iam.PolicyDocument.Version.2012_10_17",
+            "aws.iam.PolicyDocument.Version.2008_10_17",
+        ]
+    );
+    assert!(
+        rendered.iter().all(|candidate| !candidate.contains('-')),
+        "Version candidates must use DSL spellings only, got: {rendered:?}"
+    );
+    assert!(
+        expected.iter().all(|candidate| !candidate.is_alias),
+        "1:1 API-to-DSL alias tables must collapse to canonical DSL candidates: {expected:?}"
+    );
+}
+
+#[test]
+fn invalid_enum_variant_candidates_use_dsl_spelling_for_string_enum_aliases() {
+    let err = iam_policy_version_enum()
+        .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+            "bad_version".to_string(),
+        )))
+        .unwrap_err();
+    let TypeError::InvalidEnumVariant { expected, .. } = err else {
+        panic!("expected InvalidEnumVariant, got {err:?}");
+    };
+
+    assert_iam_policy_version_candidates(&expected);
+    let msg = TypeError::InvalidEnumVariant {
+        value: "bad_version".to_string(),
+        attribute: None,
+        type_name: Some("Version".to_string()),
+        expected,
+    }
+    .to_string();
+    assert!(msg.contains("aws.iam.PolicyDocument.Version.2012_10_17"));
+    assert!(
+        !msg.contains("2012-10-17"),
+        "message leaked API spelling: {msg}"
+    );
+    assert!(
+        !msg.contains("2008-10-17"),
+        "message leaked API spelling: {msg}"
+    );
+}
+
+#[test]
+fn string_literal_expected_enum_candidates_use_dsl_spelling_for_string_enum_aliases() {
+    let err = iam_policy_version_enum()
+        .validate(&Value::Concrete(ConcreteValue::String(
+            "2012-10-17".to_string(),
+        )))
+        .unwrap_err();
+    let TypeError::StringLiteralExpectedEnum { expected, .. } = err else {
+        panic!("expected StringLiteralExpectedEnum, got {err:?}");
+    };
+
+    assert_iam_policy_version_candidates(&expected);
+    let msg = TypeError::StringLiteralExpectedEnum {
+        user_typed: "2012-10-17".to_string(),
+        attribute: None,
+        type_name: "Version".to_string(),
+        expected,
+        extra_message: None,
+    }
+    .to_string();
+    assert!(msg.contains("aws.iam.PolicyDocument.Version.2012_10_17"));
+    assert!(
+        !msg.contains("2008-10-17"),
+        "message leaked API spelling: {msg}"
+    );
+}
+
+#[test]
+fn string_enum_candidates_preserve_genuine_extra_aliases() {
+    let t = AttributeType::string_enum(
+        "Mode".to_string(),
+        vec!["ALL".to_string()],
+        Some(crate::schema::string_enum_identity(
+            "Mode",
+            Some("test.service.Resource"),
+        )),
+        vec![
+            ("ALL".to_string(), "all".to_string()),
+            ("LEGACY_ALL".to_string(), "legacy_all".to_string()),
+        ],
+    );
+    let err = t
+        .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+            "bad_mode".to_string(),
+        )))
+        .unwrap_err();
+    let TypeError::InvalidEnumVariant { expected, .. } = err else {
+        panic!("expected InvalidEnumVariant, got {err:?}");
+    };
+
+    let rendered: Vec<String> = expected.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        rendered,
+        vec![
+            "test.service.Resource.Mode.all",
+            "test.service.Resource.Mode.legacy_all",
+        ]
+    );
+    assert!(!expected[0].is_alias);
+    assert!(expected[1].is_alias);
+}
+
 #[test]
 fn validate_string_enum_all_without_dsl_aliases_requires_explicit_variant() {
     // Without "all" as a direct variant or in `dsl_aliases`, the bare
@@ -464,13 +590,12 @@ fn string_literal_expected_enum_formats_shape_message() {
         user_typed: "aaa".to_string(),
         attribute: Some("target_type".to_string()),
         type_name: "TargetType".to_string(),
-        expected: vec![ExpectedEnumVariant {
-            provider: Some("awscc".to_string()),
-            segments: vec!["sso".to_string(), "Assignment".to_string()],
-            type_name: "TargetType".to_string(),
-            value: "AWS_ACCOUNT".to_string(),
-            is_alias: false,
-        }],
+        expected: vec![ExpectedEnumVariant::from_namespaced(
+            Some("awscc.sso.Assignment"),
+            "TargetType",
+            "AWS_ACCOUNT",
+            false,
+        )],
         extra_message: None,
     };
     let msg = err.to_string();
@@ -501,13 +626,12 @@ fn into_string_literal_diagnostic_reshapes_invalid_enum_variant() {
         value: "aaa".to_string(),
         attribute: Some("target_type".to_string()),
         type_name: Some("TargetType".to_string()),
-        expected: vec![ExpectedEnumVariant {
-            provider: Some("awscc".to_string()),
-            segments: vec!["sso".to_string(), "Assignment".to_string()],
-            type_name: "TargetType".to_string(),
-            value: "AWS_ACCOUNT".to_string(),
-            is_alias: false,
-        }],
+        expected: vec![ExpectedEnumVariant::from_namespaced(
+            Some("awscc.sso.Assignment"),
+            "TargetType",
+            "AWS_ACCOUNT",
+            false,
+        )],
     };
     let reshaped = original.into_string_literal_diagnostic();
     match reshaped {
@@ -3928,13 +4052,12 @@ mod validate_collect_tests {
 fn expected_enum_variant_display_namespaced_matches_legacy_format() {
     // The Display impl must reproduce the pre-#2220 rendered string
     // byte-for-byte so existing CLI / LSP messages stay stable.
-    let v = ExpectedEnumVariant {
-        provider: Some("awscc".to_string()),
-        segments: vec!["sso".to_string(), "Assignment".to_string()],
-        type_name: "TargetType".to_string(),
-        value: "AWS_ACCOUNT".to_string(),
-        is_alias: false,
-    };
+    let v = ExpectedEnumVariant::from_namespaced(
+        Some("awscc.sso.Assignment"),
+        "TargetType",
+        "AWS_ACCOUNT",
+        false,
+    );
     assert_eq!(v.to_string(), "awscc.sso.Assignment.TargetType.AWS_ACCOUNT");
 }
 
@@ -3943,13 +4066,7 @@ fn expected_enum_variant_display_bare_when_no_provider() {
     // Non-namespaced enums (`provider = None`) must render only the
     // bare value — matching how the legacy formatter pushed `v.to_string()`
     // when `namespace` was `None`.
-    let v = ExpectedEnumVariant {
-        provider: None,
-        segments: Vec::new(),
-        type_name: "Mode".to_string(),
-        value: "fast".to_string(),
-        is_alias: false,
-    };
+    let v = ExpectedEnumVariant::from_namespaced(None, "Mode", "fast", false);
     assert_eq!(v.to_string(), "fast");
 }
 
@@ -3971,10 +4088,10 @@ fn expected_enum_variant_construction_splits_namespace() {
 
 #[test]
 fn expected_includes_to_dsl_aliases_with_alias_flag() {
-    // When the schema declares a `to_dsl` mapping, both the canonical
-    // value and the alias appear in `expected`. The alias must be
-    // marked `is_alias = true` so consumers (LSP code action) can
-    // prefer the canonical form.
+    // When the schema declares a 1:1 `to_dsl` mapping for canonical
+    // values, `expected` stores only the DSL spelling. These entries are
+    // still canonical suggestions (`is_alias = false`) because they are
+    // the only spellings users can type.
     let t = AttributeType::string_enum(
         "VersioningStatus".to_string(),
         vec!["Enabled".to_string(), "Suspended".to_string()],
@@ -4006,13 +4123,9 @@ fn expected_includes_to_dsl_aliases_with_alias_flag() {
             .iter()
             .map(|e| e.value.as_str())
             .collect::<Vec<_>>(),
-        vec!["Enabled", "Suspended"]
-    );
-    assert_eq!(
-        aliases.iter().map(|e| e.value.as_str()).collect::<Vec<_>>(),
         vec!["enabled", "suspended"],
-        "to_dsl aliases must be present and tagged is_alias=true"
     );
+    assert!(aliases.is_empty(), "1:1 to_dsl aliases must collapse");
     // Every entry round-trips through Display in the legacy form.
     assert!(
         canonical
@@ -4099,14 +4212,17 @@ fn expected_enum_variant_serde_round_trip() {
     // `textDocument/codeAction` requests. Lock the serde shape so a
     // refactor that renames a field cannot silently break the LSP
     // payload contract. See #2309.
-    let original = ExpectedEnumVariant {
-        provider: Some("awscc".to_string()),
-        segments: vec!["sso".to_string(), "Assignment".to_string()],
-        type_name: "TargetType".to_string(),
-        value: "AWS_ACCOUNT".to_string(),
-        is_alias: false,
-    };
+    let original = ExpectedEnumVariant::from_namespaced(
+        Some("awscc.sso.Assignment"),
+        "TargetType",
+        "AWS_ACCOUNT",
+        false,
+    );
     let json = serde_json::to_value(&original).expect("serialize");
+    assert!(
+        json.get("value").is_some_and(serde_json::Value::is_string),
+        "DslSpelling must serialize as a bare string inside ExpectedEnumVariant"
+    );
     assert_eq!(
         json,
         serde_json::json!({
@@ -4704,10 +4820,10 @@ fn union_walk_custom_lookup_cidr_accepts_ipv4_when_lookup_routes_correctly() {
 // =====================================================================
 // carina#2831: `StringEnum.dsl_aliases` is the data form that survives
 // the WASM-component boundary, replacing the closure-based `to_dsl`
-// pointer that could not. The validator must accept both the API
-// spelling and every DSL alias, including in fully-qualified form
-// (`awscc.<service>.<TypeName>.<dsl_spelling>`), and must list both
-// in the diagnostic for an unknown value.
+// pointer that could not. Once aliases are populated, the validator
+// must accept the DSL spellings, including in fully-qualified form
+// (`awscc.<service>.<TypeName>.<dsl_spelling>`), and diagnostics must
+// list the writable DSL spelling.
 // =====================================================================
 
 #[test]
@@ -4785,9 +4901,8 @@ fn dsl_aliases_validator_accepts_dsl_spellings_only() {
         .is_ok()
     );
 
-    // An unrelated value: rejected, with both spellings still
-    // listed for context (the API spelling is what the AWS docs show,
-    // the DSL spelling is what `validate` accepts).
+    // An unrelated value: rejected, listing only the DSL spellings
+    // that `validate` accepts and users can type.
     let err = t
         .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "garbage".to_string(),
@@ -4795,12 +4910,12 @@ fn dsl_aliases_validator_accepts_dsl_spellings_only() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("BucketOwnerEnforced"),
-        "diagnostic must list the API spelling, got: {msg}"
-    );
-    assert!(
         msg.contains("bucket_owner_enforced"),
         "diagnostic must list the DSL spelling, got: {msg}"
+    );
+    assert!(
+        !msg.contains("BucketOwnerEnforced"),
+        "diagnostic must not list the API spelling, got: {msg}"
     );
 }
 
@@ -4837,8 +4952,8 @@ fn enum_without_dsl_aliases_accepts_api_spelling_as_before() {
 #[test]
 fn dsl_aliases_diagnostic_tags_alias_entries_distinct_from_canonical() {
     // The `expected` list carried by `TypeError::InvalidEnumVariant`
-    // tags each entry with `is_alias`, so an LSP code action can
-    // suggest the canonical form. Pin the tagging.
+    // stores DSL spellings as canonical candidates for 1:1 alias
+    // tables, so LSP code actions suggest writable identifiers.
     let t = AttributeType::string_enum(
         "VersioningStatus".to_string(),
         vec!["Enabled".to_string(), "Suspended".to_string()],
@@ -4873,8 +4988,8 @@ fn dsl_aliases_diagnostic_tags_alias_entries_distinct_from_canonical() {
         .filter(|e| e.is_alias)
         .map(|e| e.value.as_str())
         .collect();
-    assert_eq!(canonical, vec!["Enabled", "Suspended"]);
-    assert_eq!(aliases, vec!["enabled", "suspended"]);
+    assert_eq!(canonical, vec!["enabled", "suspended"]);
+    assert!(aliases.is_empty(), "1:1 aliases must collapse");
 }
 
 #[test]
