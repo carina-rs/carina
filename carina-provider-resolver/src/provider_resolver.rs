@@ -228,6 +228,23 @@ struct HttpResponse {
 
 trait RegistryHttp {
     fn get(&self, url: &str) -> Result<HttpResponse, String>;
+
+    fn download_to_file(&self, url: &str, dest: &Path) -> Result<(), String> {
+        let response = self.get(url)?;
+        if response.status != 200 {
+            return Err(format!(
+                "Download failed with status {}: {url}",
+                response.status
+            ));
+        }
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create directory {}: {e}", parent.display()))?;
+        }
+        fs::write(dest, response.body)
+            .map_err(|e| format!("Failed to write file {}: {e}", dest.display()))?;
+        Ok(())
+    }
 }
 
 struct UreqRegistryHttp;
@@ -250,6 +267,32 @@ impl RegistryHttp for UreqRegistryHttp {
             .read_to_vec()
             .map_err(|e| format!("Failed to read response body from {url}: {e}"))?;
         Ok(HttpResponse { status, body })
+    }
+
+    fn download_to_file(&self, url: &str, dest: &Path) -> Result<(), String> {
+        let response = ureq::get(url)
+            .call()
+            .map_err(|e| format!("Failed to download {url}: {e}"))?;
+
+        if response.status() != 200 {
+            return Err(format!(
+                "Download failed with status {}: {url}",
+                response.status()
+            ));
+        }
+
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create directory {}: {e}", parent.display()))?;
+        }
+
+        let mut reader = response.into_body().into_reader();
+        let mut file = fs::File::create(dest)
+            .map_err(|e| format!("Failed to create file {}: {e}", dest.display()))?;
+        io::copy(&mut reader, &mut file)
+            .map_err(|e| format!("Failed to write file {}: {e}", dest.display()))?;
+
+        Ok(())
     }
 }
 
@@ -296,9 +339,10 @@ fn parse_provider_source(source: &str) -> Result<ProviderSource, String> {
         [hostname, namespace, name]
             if !hostname.is_empty() && !namespace.is_empty() && !name.is_empty() =>
         {
+            let hostname = hostname.to_ascii_lowercase();
             Ok(ProviderSource::Registry(RegistrySource {
-                source: source.to_string(),
-                hostname: (*hostname).to_string(),
+                source: format!("{hostname}/{namespace}/{name}"),
+                hostname,
                 namespace: (*namespace).to_string(),
                 name: (*name).to_string(),
             }))
@@ -682,16 +726,16 @@ fn verify_registry_lock_pin(
     signature_present: bool,
     transparency_log_present: bool,
 ) -> Result<Option<String>, String> {
-    let Some(entry) = lock_file.find(&source.source_key(), version) else {
+    let source_key = source.source_key();
+    let Some(entry) = lock_file.find_by_source(&source_key) else {
         return Ok(None);
     };
-    if entry.sha256 != expected_shasum {
+    if matches!(&entry.kind, LockEntryKind::Version { version: locked, .. } if locked == version)
+        && entry.sha256 != expected_shasum
+    {
         return Err(format!(
             "registry shasum pin mismatch for {}@{}: lock has {}, registry returned {}",
-            source.source_key(),
-            version,
-            entry.sha256,
-            expected_shasum
+            source_key, version, entry.sha256, expected_shasum
         ));
     }
     let Some(locked_registry) = &entry.registry else {
@@ -703,33 +747,25 @@ fn verify_registry_lock_pin(
     if locked_registry.resolved_hostname != registry.hostname {
         return Err(format!(
             "registry hostname pin mismatch for {}: lock has {}, resolved {}",
-            source.source_key(),
-            locked_registry.resolved_hostname,
-            registry.hostname
+            source_key, locked_registry.resolved_hostname, registry.hostname
         ));
     }
     if locked_registry.api_base_url != registry.api_base_url {
-        return Err(format!(
-            "registry API base pin mismatch for {}",
-            source.source_key()
-        ));
+        return Err(format!("registry API base pin mismatch for {source_key}"));
     }
     if locked_registry.discovery_sha256 != registry.discovery_sha256 {
         return Err(format!(
-            "registry discovery document pin mismatch for {}",
-            source.source_key()
+            "registry discovery document pin mismatch for {source_key}"
         ));
     }
     if locked_registry.signature_present && !signature_present {
         return Err(format!(
-            "registry signature field disappeared for {}",
-            source.source_key()
+            "registry signature field disappeared for {source_key}"
         ));
     }
     if locked_registry.transparency_log_present && !transparency_log_present {
         return Err(format!(
-            "registry transparency_log field disappeared for {}",
-            source.source_key()
+            "registry transparency_log field disappeared for {source_key}"
         ));
     }
     Ok(match &entry.kind {
@@ -787,15 +823,11 @@ fn resolve_registry_provider_with_http<H: RegistryHttp>(
             ));
         }
     } else {
-        let response = http.get(&download.download_url)?;
-        if response.status != 200 {
-            return Err(format!(
-                "Download failed with status {}: {}",
-                response.status, download.download_url
-            ));
-        }
-        let actual_hash = sha256_bytes(&response.body);
+        http.download_to_file(&download.download_url, &wasm_path)?;
+        let actual_hash =
+            sha256_file(&wasm_path).map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
         if actual_hash != download.shasum {
+            let _ = fs::remove_file(&wasm_path);
             return Err(format!(
                 "SHA256 mismatch for registry provider '{}' ({}@{}). Expected registry shasum {}, got {}.",
                 name,
@@ -805,12 +837,6 @@ fn resolve_registry_provider_with_http<H: RegistryHttp>(
                 actual_hash
             ));
         }
-        if let Some(parent) = wasm_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create directory {}: {e}", parent.display()))?;
-        }
-        fs::write(&wasm_path, response.body)
-            .map_err(|e| format!("Failed to write file {}: {e}", wasm_path.display()))?;
     }
 
     lock_file.upsert(LockEntry {
@@ -1974,6 +2000,7 @@ sha256 = "abc"
     #[derive(Default)]
     struct FakeRegistryHttp {
         responses: HashMap<String, HttpResponse>,
+        downloads: HashMap<String, Vec<u8>>,
         requested: std::sync::Mutex<Vec<String>>,
     }
 
@@ -2000,6 +2027,11 @@ sha256 = "abc"
             self
         }
 
+        fn downloadable_bytes(mut self, url: &str, body: &[u8]) -> Self {
+            self.downloads.insert(url.to_string(), body.to_vec());
+            self
+        }
+
         fn was_requested(&self, needle: &str) -> bool {
             self.requested
                 .lock()
@@ -2016,6 +2048,21 @@ sha256 = "abc"
                 .get(url)
                 .cloned()
                 .ok_or_else(|| format!("unexpected test URL: {url}"))
+        }
+
+        fn download_to_file(&self, url: &str, dest: &Path) -> Result<(), String> {
+            self.requested.lock().unwrap().push(url.to_string());
+            let body = self
+                .downloads
+                .get(url)
+                .ok_or_else(|| format!("unexpected test download URL: {url}"))?;
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create directory {}: {e}", parent.display()))?;
+            }
+            fs::write(dest, body)
+                .map_err(|e| format!("Failed to write file {}: {e}", dest.display()))?;
+            Ok(())
         }
     }
 
@@ -2049,6 +2096,7 @@ sha256 = "abc"
                 ),
             )
             .bytes("https://downloads.example.test/aws.wasm", download_body)
+            .downloadable_bytes("https://downloads.example.test/aws.wasm", download_body)
     }
 
     #[test]
@@ -2344,6 +2392,62 @@ sha256 = "abc"
     }
 
     #[test]
+    fn registry_source_rejects_signature_downgrade_across_version_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_body = b"old registry wasm bytes";
+        let old_shasum = sha256_bytes(old_body);
+        let new_body = b"new registry wasm bytes";
+        let new_shasum = sha256_bytes(new_body);
+        let http = FakeRegistryHttp::default()
+            .json(
+                "https://registry.carina-rs.dev/.well-known/carina.json",
+                r#"{"providers.v1":"/v1/providers/"}"#,
+            )
+            .json(
+                "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/versions",
+                r#"{"sequence":7,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]},{"version":"0.6.0","protocols":["1"]}]}"#,
+            )
+            .json(
+                "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.6.0/download",
+                &format!(
+                    r#"{{"protocols":["1"],"filename":"aws.wasm","download_url":"https://downloads.example.test/aws-0.6.0.wasm","shasum":"{new_shasum}","shasum_authored_by":"registry"}}"#
+                ),
+            )
+            .bytes("https://downloads.example.test/aws-0.6.0.wasm", new_body);
+        let mut lock_file = LockFile::default();
+        lock_file.upsert(LockEntry {
+            name: "aws".into(),
+            source: "carina-rs/aws".into(),
+            kind: LockEntryKind::Version {
+                version: "0.5.0".into(),
+                constraint: None,
+            },
+            sha256: old_shasum,
+            registry: Some(RegistryLock {
+                resolved_hostname: "registry.carina-rs.dev".into(),
+                api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
+                discovery_sha256: sha256_bytes(r#"{"providers.v1":"/v1/providers/"}"#.as_bytes()),
+                sequence_present: true,
+                sequence: Some(7),
+                valid_until_present: true,
+                signature_present: true,
+                transparency_log_present: false,
+            }),
+        });
+
+        let err = resolve_provider_with_http(
+            dir.path(),
+            "carina-rs/aws",
+            "0.6.0",
+            "aws",
+            &mut lock_file,
+            &http,
+        )
+        .unwrap_err();
+        assert!(err.contains("signature"), "{err}");
+    }
+
+    #[test]
     fn registry_source_rejects_missing_previously_present_transparency_log() {
         let dir = tempfile::tempdir().unwrap();
         let body = b"registry wasm bytes";
@@ -2429,6 +2533,64 @@ sha256 = "abc"
         )
         .unwrap_err();
         assert!(err.contains("cross-origin"), "{err}");
+    }
+
+    #[test]
+    fn registry_source_treats_hostname_case_insensitively() {
+        let dir = tempfile::tempdir().unwrap();
+        let http = FakeRegistryHttp::default().json(
+            "https://registry.carina-rs.dev/.well-known/carina.json",
+            r#"{"providers.v1":"https://evil.example.test/v1/providers/"}"#,
+        );
+        let mut lock_file = LockFile::default();
+
+        let err = resolve_provider_with_http(
+            dir.path(),
+            "Registry.Carina-RS.dev/carina-rs/aws",
+            "0.5.0",
+            "aws",
+            &mut lock_file,
+            &http,
+        )
+        .unwrap_err();
+        assert!(err.contains("cross-origin"), "{err}");
+    }
+
+    #[test]
+    fn registry_source_streams_large_wasm_instead_of_using_capped_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = vec![b'w'; 10 * 1024 * 1024 + 1];
+        let shasum = sha256_bytes(&body);
+        let http = FakeRegistryHttp::default()
+            .json(
+                "https://registry.carina-rs.dev/.well-known/carina.json",
+                r#"{"providers.v1":"/v1/providers/"}"#,
+            )
+            .json(
+                "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/versions",
+                r#"{"sequence":7,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
+            )
+            .json(
+                "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download",
+                &format!(
+                    r#"{{"protocols":["1"],"filename":"aws.wasm","download_url":"https://downloads.example.test/large-aws.wasm","shasum":"{shasum}","shasum_authored_by":"registry"}}"#
+                ),
+            )
+            .downloadable_bytes("https://downloads.example.test/large-aws.wasm", &body);
+        let mut lock_file = LockFile::default();
+
+        let path = resolve_provider_with_http(
+            dir.path(),
+            "carina-rs/aws",
+            "0.5.0",
+            "aws",
+            &mut lock_file,
+            &http,
+        )
+        .expect("registry WASM download should stream to disk instead of using capped get");
+
+        assert_eq!(sha256_file(&path).unwrap(), shasum);
+        assert_eq!(fs::metadata(&path).unwrap().len(), body.len() as u64);
     }
 
     /// Serialize env-var tests in this module. `CARINA_PLUGIN_CACHE_DIR` is
