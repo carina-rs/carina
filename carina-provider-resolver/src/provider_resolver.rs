@@ -31,7 +31,7 @@ use carina_core::parser::ProviderConfig;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "mode", rename_all = "lowercase")]
 pub enum LockEntryKind {
-    /// Released provider pinned to a semver tag.
+    /// Released provider pinned to a semver tag (or registry version).
     Version {
         version: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -42,8 +42,21 @@ pub enum LockEntryKind {
         revision: String,
         resolved_sha: String,
     },
+    /// Registry-hosted provider resolved by following a branch revision.
+    RegistryRevision { revision: String, version: String },
     /// Local `file://` provider — identified entirely by `source`.
     File,
+}
+
+impl LockEntryKind {
+    /// The concrete published version this entry pins, for modes that have one.
+    fn resolved_version(&self) -> Option<&str> {
+        match self {
+            LockEntryKind::Version { version, .. }
+            | LockEntryKind::RegistryRevision { version, .. } => Some(version),
+            LockEntryKind::Revision { .. } | LockEntryKind::File => None,
+        }
+    }
 }
 
 /// A single provider entry in carina-providers.lock.
@@ -117,12 +130,11 @@ impl LockFile {
         fs::write(path, content)
     }
 
-    /// Find a version-mode entry matching `(source, version)`. Revision and
-    /// file entries never match — by construction they don't carry a version.
+    /// Find an entry matching `(source, version)` for modes with a published
+    /// version pin. Git revision and file entries never match.
     pub fn find(&self, source: &str, version: &str) -> Option<&LockEntry> {
         self.provider.iter().find(|e| {
-            Self::sources_match(&e.source, source)
-                && matches!(&e.kind, LockEntryKind::Version { version: v, .. } if v == version)
+            Self::sources_match(&e.source, source) && e.kind.resolved_version() == Some(version)
         })
     }
 
@@ -394,6 +406,19 @@ fn canonical_lock_source(source: &str) -> String {
     }
 }
 
+fn registry_revision<'a>(
+    source: &str,
+    config: &'a ProviderConfig,
+) -> Result<Option<&'a str>, String> {
+    let Some(revision) = config.revision.as_deref() else {
+        return Ok(None);
+    };
+    match parse_provider_source(source)? {
+        ProviderSource::Registry(_) => Ok(Some(revision)),
+        ProviderSource::GithubDirect { .. } => Ok(None),
+    }
+}
+
 fn sha256_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -552,6 +577,21 @@ fn select_registry_version(
     versions: &[RegistryVersion],
     config: &ProviderConfig,
 ) -> Result<String, String> {
+    if let Some(revision) = &config.revision {
+        return versions
+            .iter()
+            .filter_map(|entry| Version::parse(&entry.version).ok())
+            .filter(|version| registry_revision_matches(version, revision))
+            .max()
+            .map(|version| version.to_string())
+            .ok_or_else(|| {
+                format!(
+                    "No registry version of '{}' matches revision '{}'",
+                    config.name, revision
+                )
+            });
+    }
+
     match &config.version {
         Some(constraint) => {
             let mut candidates: Vec<Version> = versions
@@ -578,6 +618,16 @@ fn select_registry_version(
             .map(|version| version.to_string())
             .ok_or_else(|| format!("No versions found for provider '{}'", config.name)),
     }
+}
+
+fn registry_revision_matches(version: &Version, revision: &str) -> bool {
+    if version.major != 0 || version.minor != 0 || version.patch != 0 {
+        return false;
+    }
+
+    let mut identifiers = version.pre.as_str().split('.');
+    matches!(identifiers.next(), Some(first) if first == revision)
+        && matches!(identifiers.next(), Some(run) if !run.is_empty() && run.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn fetch_registry_download<H: RegistryHttp>(
@@ -912,6 +962,22 @@ fn resolve_registry_provider_with_http<H: RegistryHttp>(
     Ok(wasm_path)
 }
 
+fn annotate_version_lock_entry(source: &str, config: &ProviderConfig, lock_file: &mut LockFile) {
+    if let Some(entry) = lock_file.provider.iter_mut().find(|e| e.source == source)
+        && let LockEntryKind::Version { version, .. } = &entry.kind
+    {
+        let version = version.clone();
+        if let Some(revision) = &config.revision {
+            entry.kind = LockEntryKind::RegistryRevision {
+                revision: revision.clone(),
+                version,
+            };
+        } else if let LockEntryKind::Version { constraint, .. } = &mut entry.kind {
+            *constraint = config.version.as_ref().map(|c| c.raw.clone());
+        }
+    }
+}
+
 /// Resolve a single provider: download if missing, verify if cached.
 ///
 /// Resolution order:
@@ -1107,7 +1173,19 @@ fn resolve_single_config_with_http<H: RegistryHttp>(
     let lock_path = base_dir.join("carina-providers.lock");
     let mut lock_file = LockFile::load(&lock_path)?.unwrap_or_default();
 
-    let binary_path = if let Some(revision) = &config.revision {
+    let binary_path = if registry_revision(&source, config)?.is_some() {
+        let version = resolve_version(&source, config, &mut lock_file, false, http)?;
+        let path = resolve_provider_with_http(
+            base_dir,
+            &source,
+            &version,
+            &config.name,
+            &mut lock_file,
+            http,
+        )?;
+        annotate_version_lock_entry(&source, config, &mut lock_file);
+        path
+    } else if let Some(revision) = &config.revision {
         let (path, _sha) = crate::revision_resolver::resolve_provider_by_revision(
             base_dir,
             &source,
@@ -1118,7 +1196,7 @@ fn resolve_single_config_with_http<H: RegistryHttp>(
         )?;
         path
     } else {
-        let version = resolve_version(&source, config, &mut lock_file, false)?;
+        let version = resolve_version(&source, config, &mut lock_file, false, http)?;
         let path = resolve_provider_with_http(
             base_dir,
             &source,
@@ -1128,11 +1206,7 @@ fn resolve_single_config_with_http<H: RegistryHttp>(
             http,
         )?;
 
-        if let Some(entry) = lock_file.provider.iter_mut().find(|e| e.source == source)
-            && let LockEntryKind::Version { constraint, .. } = &mut entry.kind
-        {
-            *constraint = config.version.as_ref().map(|c| c.raw.clone());
-        }
+        annotate_version_lock_entry(&source, config, &mut lock_file);
         path
     };
 
@@ -1195,13 +1269,32 @@ pub fn find_installed_provider(
     // project already pulled this provider and the current project has no
     // local install yet (issue #2018).
     if let Some(revision) = &config.revision {
-        if let Some(lock_entry) = lock_file.find_by_source(&source)
-            && let LockEntryKind::Revision { resolved_sha, .. } = &lock_entry.kind
-        {
-            let wasm_path =
-                crate::revision_resolver::cache_path_revision(base_dir, &source, resolved_sha);
-            if wasm_path.exists() {
-                return Ok(wasm_path);
+        if registry_revision(&source, config)?.is_some() {
+            if let Some(lock_entry) = lock_file.find_by_source(&source)
+                && let LockEntryKind::RegistryRevision {
+                    version,
+                    revision: locked_revision,
+                } = &lock_entry.kind
+                && locked_revision == revision
+            {
+                let wasm_path = cache_path_wasm(base_dir, &source, version);
+                if wasm_path.exists() {
+                    return Ok(wasm_path);
+                }
+                let binary_path = cache_path(base_dir, &source, version);
+                if binary_path.exists() {
+                    return Ok(binary_path);
+                }
+            }
+        } else {
+            if let Some(lock_entry) = lock_file.find_by_source(&source)
+                && let LockEntryKind::Revision { resolved_sha, .. } = &lock_entry.kind
+            {
+                let wasm_path =
+                    crate::revision_resolver::cache_path_revision(base_dir, &source, resolved_sha);
+                if wasm_path.exists() {
+                    return Ok(wasm_path);
+                }
             }
         }
         return Err(format!(
@@ -1248,35 +1341,51 @@ fn try_reuse_locked_version(
     lock_file: &LockFile,
 ) -> Option<String> {
     let entry = lock_file.find_by_source(source)?;
-    let LockEntryKind::Version { version, .. } = &entry.kind else {
-        return None;
-    };
+    if let Some(config_revision) = &config.revision {
+        return match &entry.kind {
+            LockEntryKind::RegistryRevision { revision, version }
+                if revision == config_revision =>
+            {
+                Some(version.clone())
+            }
+            LockEntryKind::Version { .. }
+            | LockEntryKind::Revision { .. }
+            | LockEntryKind::RegistryRevision { .. }
+            | LockEntryKind::File => None,
+        };
+    }
 
-    match &config.version {
-        Some(constraint) if constraint.matches(version).unwrap_or(false) => Some(version.clone()),
-        None => Some(version.clone()),
-        _ => None,
+    match &entry.kind {
+        LockEntryKind::Version {
+            version,
+            constraint: _,
+        } => match &config.version {
+            Some(constraint) if constraint.matches(version).unwrap_or(false) => {
+                Some(version.clone())
+            }
+            None => Some(version.clone()),
+            _ => None,
+        },
+        LockEntryKind::Revision { .. }
+        | LockEntryKind::RegistryRevision { .. }
+        | LockEntryKind::File => None,
     }
 }
 
 /// Resolve the exact version to use for a provider.
-fn resolve_version(
+fn resolve_version<H: RegistryHttp>(
     source: &str,
     config: &ProviderConfig,
     lock_file: &mut LockFile,
     upgrade: bool,
+    http: &H,
 ) -> Result<String, String> {
     if !upgrade && let Some(version) = try_reuse_locked_version(source, config, lock_file) {
         return Ok(version);
     }
 
     if let ProviderSource::Registry(registry_source) = parse_provider_source(source)? {
-        return resolve_registry_version_with_http(
-            &registry_source,
-            config,
-            lock_file,
-            &UreqRegistryHttp,
-        );
+        return resolve_registry_version_with_http(&registry_source, config, lock_file, http);
     }
 
     match &config.version {
@@ -1375,13 +1484,40 @@ pub fn check_lock_mismatch(
         };
 
         match (&config.revision, &config.version, &lock_entry.kind) {
+            // .crn has both revision and version (parser should reject this);
+            // treat as accept and let the resolver surface its own error.
+            (
+                Some(_),
+                Some(_),
+                LockEntryKind::Version {
+                    version: _,
+                    constraint: _,
+                },
+            )
+            | (
+                Some(_),
+                Some(_),
+                LockEntryKind::Revision {
+                    revision: _,
+                    resolved_sha: _,
+                },
+            )
+            | (
+                Some(_),
+                Some(_),
+                LockEntryKind::RegistryRevision {
+                    revision: _,
+                    version: _,
+                },
+            )
+            | (Some(_), Some(_), LockEntryKind::File) => {}
             // .crn revision — lock revision: must match literally.
             (
                 Some(crn_rev),
                 _,
                 LockEntryKind::Revision {
                     revision: locked_rev,
-                    ..
+                    resolved_sha: _,
                 },
             ) => {
                 if crn_rev != locked_rev {
@@ -1392,13 +1528,30 @@ pub fn check_lock_mismatch(
                     ));
                 }
             }
-            // .crn revision — lock version (mode switched).
+            // .crn revision — lock registry-revision: the locked branch must match.
+            (
+                Some(crn_rev),
+                _,
+                LockEntryKind::RegistryRevision {
+                    revision: locked_rev,
+                    version: _,
+                },
+            ) => {
+                if crn_rev != locked_rev {
+                    return Err(mismatch_error(
+                        &config.name,
+                        &format!("revision = '{locked_rev}'"),
+                        &format!("revision = '{crn_rev}'"),
+                    ));
+                }
+            }
+            // .crn revision — lock plain version (mode switched).
             (
                 Some(crn_rev),
                 _,
                 LockEntryKind::Version {
                     version: locked_ver,
-                    ..
+                    constraint: _,
                 },
             ) => {
                 return Err(mismatch_error(
@@ -1413,7 +1566,7 @@ pub fn check_lock_mismatch(
                 Some(constraint),
                 LockEntryKind::Version {
                     version: locked_ver,
-                    ..
+                    constraint: _,
                 },
             ) => {
                 if !constraint.matches(locked_ver).unwrap_or(false) {
@@ -1430,7 +1583,7 @@ pub fn check_lock_mismatch(
                 Some(constraint),
                 LockEntryKind::Revision {
                     revision: locked_rev,
-                    ..
+                    resolved_sha: _,
                 },
             ) => {
                 return Err(mismatch_error(
@@ -1439,18 +1592,32 @@ pub fn check_lock_mismatch(
                     &format!("version constraint = '{}'", constraint.raw),
                 ));
             }
+            // .crn version — lock registry revision (mode switched).
+            (
+                None,
+                Some(constraint),
+                LockEntryKind::RegistryRevision {
+                    revision: locked_rev,
+                    version: _,
+                },
+            ) => {
+                return Err(mismatch_error(
+                    &config.name,
+                    &format!("revision = '{locked_rev}'"),
+                    &format!("constraint = '{}'", constraint.raw),
+                ));
+            }
             // No constraint and no revision in .crn: the user didn't pin
             // anything explicitly. That implies version mode (latest tag).
             // Any pre-existing lock entry must also be version mode — a
             // revision-mode entry was written under a `.crn` that had
             // `revision = '...'` and is now gone, which is still a mismatch.
-            (None, None, LockEntryKind::Version { .. }) => {}
             (
                 None,
                 None,
-                LockEntryKind::Revision {
+                LockEntryKind::RegistryRevision {
                     revision: locked_rev,
-                    ..
+                    version: _,
                 },
             ) => {
                 return Err(mismatch_error(
@@ -1459,9 +1626,28 @@ pub fn check_lock_mismatch(
                     "(no revision, no version constraint — version mode)",
                 ));
             }
-            // .crn has both revision and version (parser should reject this);
-            // treat as accept and let the resolver surface its own error.
-            (Some(_), Some(_), _) => {}
+            (
+                None,
+                None,
+                LockEntryKind::Version {
+                    version: _,
+                    constraint: _,
+                },
+            ) => {}
+            (
+                None,
+                None,
+                LockEntryKind::Revision {
+                    revision: locked_rev,
+                    resolved_sha: _,
+                },
+            ) => {
+                return Err(mismatch_error(
+                    &config.name,
+                    &format!("revision = '{locked_rev}'"),
+                    "(no revision, no version constraint — version mode)",
+                ));
+            }
             // .crn provider vs a file-mode lock entry: sources shouldn't match,
             // so this arm is effectively unreachable, but bail safely.
             (_, _, LockEntryKind::File) => {}
@@ -1567,7 +1753,19 @@ fn resolve_all_with_http<H: RegistryHttp>(
         }
         let source = canonical_provider_source(source)?;
 
-        let binary_path = if let Some(revision) = &config.revision {
+        let binary_path = if registry_revision(&source, config)?.is_some() {
+            let version = resolve_version(&source, config, &mut lock_file, upgrade, http)?;
+            let path = resolve_provider_with_http(
+                base_dir,
+                &source,
+                &version,
+                &config.name,
+                &mut lock_file,
+                http,
+            )?;
+            annotate_version_lock_entry(&source, config, &mut lock_file);
+            path
+        } else if let Some(revision) = &config.revision {
             let (path, _sha) = crate::revision_resolver::resolve_provider_by_revision(
                 base_dir,
                 &source,
@@ -1578,7 +1776,7 @@ fn resolve_all_with_http<H: RegistryHttp>(
             )?;
             path
         } else {
-            let version = resolve_version(&source, config, &mut lock_file, upgrade)?;
+            let version = resolve_version(&source, config, &mut lock_file, upgrade, http)?;
             let path = resolve_provider_with_http(
                 base_dir,
                 &source,
@@ -1588,11 +1786,7 @@ fn resolve_all_with_http<H: RegistryHttp>(
                 http,
             )?;
 
-            if let Some(entry) = lock_file.provider.iter_mut().find(|e| e.source == source)
-                && let LockEntryKind::Version { constraint, .. } = &mut entry.kind
-            {
-                *constraint = config.version.as_ref().map(|c| c.raw.clone());
-            }
+            annotate_version_lock_entry(&source, config, &mut lock_file);
             path
         };
 
@@ -1696,6 +1890,68 @@ mod tests {
             binding: None,
             is_default: true,
         }
+    }
+
+    #[test]
+    fn registry_revision_selects_highest_matching_branch_prerelease() {
+        let config = provider_config("carina-rs/aws", Some("main"));
+        let versions = [
+            RegistryVersion {
+                version: "0.0.0-main.1.aaa".into(),
+            },
+            RegistryVersion {
+                version: "0.0.0-main.10.bbb".into(),
+            },
+            RegistryVersion {
+                version: "0.5.0".into(),
+            },
+            RegistryVersion {
+                version: "0.0.0-dev.2.ccc".into(),
+            },
+        ];
+
+        assert_eq!(
+            select_registry_version(&versions, &config).unwrap(),
+            "0.0.0-main.10.bbb"
+        );
+
+        let versions_with_malformed_high_precedence = [
+            RegistryVersion {
+                version: "0.0.0-main.5.aaa".into(),
+            },
+            RegistryVersion {
+                version: "0.0.0-main.x".into(),
+            },
+        ];
+        assert_eq!(
+            select_registry_version(&versions_with_malformed_high_precedence, &config).unwrap(),
+            "0.0.0-main.5.aaa"
+        );
+
+        let malformed_only = [RegistryVersion {
+            version: "0.0.0-main.zzz".into(),
+        }];
+        let err = select_registry_version(&malformed_only, &config).unwrap_err();
+        assert_eq!(
+            err,
+            "No registry version of 'awscc' matches revision 'main'"
+        );
+
+        let single_identifier = [RegistryVersion {
+            version: "0.0.0-main".into(),
+        }];
+        let err = select_registry_version(&single_identifier, &config).unwrap_err();
+        assert_eq!(
+            err,
+            "No registry version of 'awscc' matches revision 'main'"
+        );
+
+        let config = provider_config("carina-rs/aws", Some("feature"));
+        let err = select_registry_version(&versions, &config).unwrap_err();
+        assert_eq!(
+            err,
+            "No registry version of 'awscc' matches revision 'feature'"
+        );
     }
 
     #[test]
@@ -1858,6 +2114,37 @@ mod tests {
         assert!(
             toml_str.contains("mode = \"version\""),
             "serialized form should tag the variant: {toml_str}"
+        );
+
+        let loaded: LockFile = toml::from_str(&toml_str).unwrap();
+        assert_eq!(loaded.provider[0].kind, lock.provider[0].kind);
+    }
+
+    /// Registry-revision mode records both the originating branch and resolved
+    /// published version under its own lock variant.
+    #[test]
+    fn registry_revision_mode_toml_roundtrip() {
+        let lock = LockFile {
+            provider: vec![LockEntry {
+                name: "aws".into(),
+                source: "carina-rs/aws".into(),
+                kind: LockEntryKind::RegistryRevision {
+                    revision: "main".into(),
+                    version: "0.0.0-main.10.bbb".into(),
+                },
+                sha256: "abc123".into(),
+                registry: None,
+            }],
+        };
+        let toml_str = toml::to_string_pretty(&lock).unwrap();
+        assert!(
+            toml_str.contains("mode = \"registryrevision\""),
+            "serialized form should tag the variant: {toml_str}"
+        );
+        assert!(toml_str.contains("revision = \"main\""), "{toml_str}");
+        assert!(
+            toml_str.contains("version = \"0.0.0-main.10.bbb\""),
+            "{toml_str}"
         );
 
         let loaded: LockFile = toml::from_str(&toml_str).unwrap();
@@ -2029,6 +2316,70 @@ sha256 = "abc"
         assert_eq!(
             try_reuse_locked_version(source, &config, &lock),
             Some("0.5.2".to_string())
+        );
+    }
+
+    #[test]
+    fn try_reuse_registry_revision_requires_matching_revision_metadata() {
+        let source = "carina-rs/aws";
+        let config = provider_config(source, Some("main"));
+
+        let mut matching_lock = LockFile::default();
+        matching_lock.upsert(LockEntry {
+            name: "aws".into(),
+            source: source.into(),
+            kind: LockEntryKind::RegistryRevision {
+                revision: "main".into(),
+                version: "0.0.0-main.1.aaa".into(),
+            },
+            sha256: "abc".into(),
+            registry: None,
+        });
+        assert_eq!(
+            try_reuse_locked_version(source, &config, &matching_lock),
+            Some("0.0.0-main.1.aaa".into())
+        );
+
+        let mut plain_version_lock = LockFile::default();
+        plain_version_lock.upsert(version_entry(source, "0.5.0"));
+        assert!(
+            try_reuse_locked_version(source, &config, &plain_version_lock).is_none(),
+            "registry revision must not reuse a plain version lock"
+        );
+    }
+
+    #[test]
+    fn try_reuse_rejects_registry_revision_lock_when_config_has_no_revision_or_version() {
+        let source = "carina-rs/aws";
+        let config = provider_config(source, None);
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "aws".into(),
+            source: source.into(),
+            kind: LockEntryKind::RegistryRevision {
+                revision: "main".into(),
+                version: "0.0.0-main.10.bbb".into(),
+            },
+            sha256: "abc".into(),
+            registry: None,
+        });
+
+        assert!(
+            try_reuse_locked_version(source, &config, &lock).is_none(),
+            "unconstrained version-mode configs must not reuse registry-revision locks"
+        );
+    }
+
+    #[test]
+    fn try_reuse_accepts_plain_version_lock_when_config_has_no_revision_or_version() {
+        let source = "carina-rs/aws";
+        let config = provider_config(source, None);
+        let mut lock = LockFile::default();
+        lock.upsert(version_entry(source, "0.5.0"));
+
+        assert_eq!(
+            try_reuse_locked_version(source, &config, &lock),
+            Some("0.5.0".into())
         );
     }
 
@@ -2221,6 +2572,235 @@ sha256 = "abc"
         assert!(registry.sequence_present);
         assert_eq!(registry.sequence, Some(7));
         assert!(registry.signature_present);
+    }
+
+    #[test]
+    fn registry_revision_resolves_to_version_download_and_records_revision_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = b"registry revision wasm bytes";
+        let shasum = sha256_bytes(body);
+        let http = FakeRegistryHttp::default()
+            .json(
+                "https://registry.carina-rs.dev/.well-known/carina.json",
+                r#"{"providers.v1":"/v1/providers/"}"#,
+            )
+            .json(
+                "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/versions",
+                r#"{"sequence":7,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.0.0-main.1.aaa","protocols":["1"]},{"version":"0.0.0-main.10.bbb","protocols":["1"]},{"version":"0.5.0","protocols":["1"]},{"version":"0.0.0-dev.2.ccc","protocols":["1"]}]}"#,
+            )
+            .json(
+                "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.0.0-main.10.bbb/download",
+                &format!(
+                    r#"{{
+                        "protocols":["1"],
+                        "filename":"carina-provider-aws-v0.0.0-main.10.bbb.wasm",
+                        "download_url":"https://downloads.example.test/aws-main.wasm",
+                        "shasum":"{shasum}",
+                        "shasum_authored_by":"registry"
+                    }}"#
+                ),
+            )
+            .bytes("https://downloads.example.test/aws-main.wasm", body)
+            .downloadable_bytes("https://downloads.example.test/aws-main.wasm", body);
+        let config = ProviderConfig {
+            name: "aws".into(),
+            source: Some("carina-rs/aws".into()),
+            version: None,
+            revision: Some("main".into()),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+            is_default: true,
+        };
+
+        let path = resolve_single_config_with_http(dir.path(), &config, &http).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), body);
+        assert!(http.was_requested("/.well-known/carina.json"));
+        assert!(http.was_requested("/v1/providers/carina-rs/aws/versions"));
+        assert!(http.was_requested("/v1/providers/carina-rs/aws/0.0.0-main.10.bbb/download"));
+        assert!(!http.was_requested("/revisions/main/download"));
+
+        let lock = LockFile::load(&dir.path().join("carina-providers.lock"))
+            .unwrap()
+            .unwrap();
+        let entry = lock.find_by_source("carina-rs/aws").unwrap();
+        assert_eq!(entry.sha256, shasum);
+        assert!(entry.registry.is_some());
+        assert_eq!(
+            entry.kind,
+            LockEntryKind::RegistryRevision {
+                revision: "main".into(),
+                version: "0.0.0-main.10.bbb".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn registry_revision_upgrade_re_resolves_newer_branch_prerelease() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_body = b"old registry revision wasm bytes";
+        let old_shasum = sha256_bytes(old_body);
+        let new_body = b"new registry revision wasm bytes";
+        let new_shasum = sha256_bytes(new_body);
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "aws".into(),
+            source: "carina-rs/aws".into(),
+            kind: LockEntryKind::RegistryRevision {
+                revision: "main".into(),
+                version: "0.0.0-main.1.aaa".into(),
+            },
+            sha256: old_shasum,
+            registry: Some(RegistryLock {
+                resolved_hostname: "registry.carina-rs.dev".into(),
+                api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
+                discovery_sha256: sha256_bytes(r#"{"providers.v1":"/v1/providers/"}"#.as_bytes()),
+                sequence_present: true,
+                sequence: Some(7),
+                valid_until_present: true,
+                signature_present: false,
+                transparency_log_present: false,
+            }),
+        });
+        lock.save(&dir.path().join("carina-providers.lock"))
+            .unwrap();
+        let http = FakeRegistryHttp::default()
+            .json(
+                "https://registry.carina-rs.dev/.well-known/carina.json",
+                r#"{"providers.v1":"/v1/providers/"}"#,
+            )
+            .json(
+                "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/versions",
+                r#"{"sequence":8,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.0.0-main.1.aaa","protocols":["1"]},{"version":"0.0.0-main.10.bbb","protocols":["1"]}]}"#,
+            )
+            .json(
+                "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.0.0-main.10.bbb/download",
+                &format!(
+                    r#"{{"protocols":["1"],"filename":"aws.wasm","download_url":"https://downloads.example.test/aws-main-10.wasm","shasum":"{new_shasum}","shasum_authored_by":"registry"}}"#
+                ),
+            )
+            .bytes("https://downloads.example.test/aws-main-10.wasm", new_body)
+            .downloadable_bytes("https://downloads.example.test/aws-main-10.wasm", new_body);
+        let config = ProviderConfig {
+            name: "aws".into(),
+            source: Some("carina-rs/aws".into()),
+            version: None,
+            revision: Some("main".into()),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+            is_default: true,
+        };
+
+        let resolved =
+            resolve_all_with_http(dir.path(), &[config], LockMode::Upgrade, &http).unwrap();
+
+        assert_eq!(fs::read(resolved.get("aws").unwrap()).unwrap(), new_body);
+        assert!(http.was_requested("/v1/providers/carina-rs/aws/versions"));
+        assert!(http.was_requested("/v1/providers/carina-rs/aws/0.0.0-main.10.bbb/download"));
+        let lock = LockFile::load(&dir.path().join("carina-providers.lock"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            lock.find_by_source("carina-rs/aws").unwrap().kind,
+            LockEntryKind::RegistryRevision {
+                revision: "main".into(),
+                version: "0.0.0-main.10.bbb".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn registry_revision_reinit_reuses_locked_version_without_reselecting() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = b"locked registry revision wasm bytes";
+        let shasum = sha256_bytes(body);
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "aws".into(),
+            source: "carina-rs/aws".into(),
+            kind: LockEntryKind::RegistryRevision {
+                revision: "main".into(),
+                version: "0.0.0-main.1.aaa".into(),
+            },
+            sha256: shasum.clone(),
+            registry: Some(RegistryLock {
+                resolved_hostname: "registry.carina-rs.dev".into(),
+                api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
+                discovery_sha256: sha256_bytes(r#"{"providers.v1":"/v1/providers/"}"#.as_bytes()),
+                sequence_present: true,
+                sequence: Some(7),
+                valid_until_present: true,
+                signature_present: false,
+                transparency_log_present: false,
+            }),
+        });
+        lock.save(&dir.path().join("carina-providers.lock"))
+            .unwrap();
+        let http = FakeRegistryHttp::default()
+            .json(
+                "https://registry.carina-rs.dev/.well-known/carina.json",
+                r#"{"providers.v1":"/v1/providers/"}"#,
+            )
+            .json(
+                "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/versions",
+                r#"{"sequence":8,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.0.0-main.1.aaa","protocols":["1"]},{"version":"0.0.0-main.10.bbb","protocols":["1"]}]}"#,
+            )
+            .json(
+                "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.0.0-main.1.aaa/download",
+                &format!(
+                    r#"{{"protocols":["1"],"filename":"aws.wasm","download_url":"https://downloads.example.test/aws-main-1.wasm","shasum":"{shasum}","shasum_authored_by":"registry"}}"#
+                ),
+            )
+            .bytes("https://downloads.example.test/aws-main-1.wasm", body)
+            .downloadable_bytes("https://downloads.example.test/aws-main-1.wasm", body);
+        let config = ProviderConfig {
+            name: "aws".into(),
+            source: Some("carina-rs/aws".into()),
+            version: None,
+            revision: Some("main".into()),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+            is_default: true,
+        };
+
+        let resolved =
+            resolve_all_with_http(dir.path(), &[config], LockMode::Normal, &http).unwrap();
+
+        assert_eq!(fs::read(resolved.get("aws").unwrap()).unwrap(), body);
+        assert!(http.was_requested("/v1/providers/carina-rs/aws/0.0.0-main.1.aaa/download"));
+        assert!(!http.was_requested("/v1/providers/carina-rs/aws/0.0.0-main.10.bbb/download"));
+    }
+
+    #[test]
+    fn github_direct_revision_does_not_use_registry_resolution() {
+        let config = ProviderConfig {
+            name: "aws".into(),
+            source: None,
+            version: None,
+            revision: Some("main".into()),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+            is_default: true,
+        };
+
+        assert_eq!(
+            registry_revision("github.com/carina-rs/carina-provider-aws", &config),
+            Ok(None),
+            "github-direct revisions must not route through registry resolution"
+        );
+        assert_eq!(
+            registry_revision("carina-rs/aws", &config),
+            Ok(Some("main")),
+            "registry source revisions must route through registry resolution"
+        );
     }
 
     #[test]
@@ -3013,6 +3593,33 @@ sha256 = "abc"
         unsafe { std::env::remove_var("CARINA_PLUGIN_CACHE_DIR") };
     }
 
+    #[test]
+    fn find_installed_provider_registry_revision_uses_version_cache_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let source = "carina-rs/aws";
+        let version = "0.0.0-main.10.bbb";
+        let wasm_path = cache_path_wasm(base, source, version);
+        fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
+        fs::write(&wasm_path, b"registry revision wasm").unwrap();
+
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "aws".into(),
+            source: source.into(),
+            kind: LockEntryKind::RegistryRevision {
+                revision: "main".into(),
+                version: version.into(),
+            },
+            sha256: "abc".into(),
+            registry: None,
+        });
+        lock.save(&base.join("carina-providers.lock")).unwrap();
+        let config = provider_config(source, Some("main"));
+
+        assert_eq!(find_installed_provider(base, &config).unwrap(), wasm_path);
+    }
+
     // --- Issue #2026: lock vs .crn mismatch must error without --upgrade ---
 
     fn versioned_config(source: &str, constraint: &str) -> ProviderConfig {
@@ -3059,6 +3666,81 @@ sha256 = "abc"
         assert!(err.contains("revision"), "{err}");
         assert!(err.contains("version"), "{err}");
         assert!(err.contains("--upgrade"), "{err}");
+    }
+
+    #[test]
+    fn check_mismatch_accepts_matching_registry_revision_version_lock() {
+        let source = "carina-rs/aws";
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "aws".into(),
+            source: source.into(),
+            kind: LockEntryKind::RegistryRevision {
+                revision: "main".into(),
+                version: "0.0.0-main.1.aaa".into(),
+            },
+            sha256: "abc".into(),
+            registry: None,
+        });
+        let cfg = provider_config(source, Some("main"));
+
+        assert!(check_lock_mismatch(&[cfg], &lock, LockMode::Normal).is_ok());
+    }
+
+    #[test]
+    fn check_mismatch_detects_registry_revision_change_in_version_lock() {
+        let source = "carina-rs/aws";
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "aws".into(),
+            source: source.into(),
+            kind: LockEntryKind::RegistryRevision {
+                revision: "dev".into(),
+                version: "0.0.0-dev.1.aaa".into(),
+            },
+            sha256: "abc".into(),
+            registry: None,
+        });
+        let cfg = provider_config(source, Some("main"));
+
+        let err = check_lock_mismatch(&[cfg], &lock, LockMode::Normal)
+            .expect_err(".crn registry revision changed vs lock — must error");
+        assert!(err.contains("revision = 'dev'"), "{err}");
+        assert!(err.contains("revision = 'main'"), "{err}");
+    }
+
+    #[test]
+    fn check_mismatch_detects_registry_revision_lock_when_revision_dropped_from_crn() {
+        let source = "carina-rs/aws";
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "aws".into(),
+            source: source.into(),
+            kind: LockEntryKind::RegistryRevision {
+                revision: "main".into(),
+                version: "0.0.0-main.10.bbb".into(),
+            },
+            sha256: "abc".into(),
+            registry: None,
+        });
+        let cfg = provider_config(source, None);
+
+        let err = check_lock_mismatch(&[cfg], &lock, LockMode::Normal)
+            .expect_err(".crn dropped registry revision but lock still has one - must error");
+        assert!(err.contains("aws"), "{err}");
+        assert!(err.contains("revision = 'main'"), "{err}");
+        assert!(err.contains("(no revision, no version constraint"), "{err}");
+        assert!(err.contains("--upgrade"), "{err}");
+    }
+
+    #[test]
+    fn check_mismatch_accepts_plain_version_lock_when_crn_has_no_revision_or_version() {
+        let source = "carina-rs/aws";
+        let mut lock = LockFile::default();
+        lock.upsert(version_entry(source, "0.5.0"));
+        let cfg = provider_config(source, None);
+
+        assert!(check_lock_mismatch(&[cfg], &lock, LockMode::Normal).is_ok());
     }
 
     #[test]
