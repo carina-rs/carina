@@ -397,6 +397,7 @@ pub fn resolve_provider_by_revision(
                 resolved_sha: sha.clone(),
             },
             sha256: actual_hash,
+            registry: None,
         });
         return Ok((wasm_path, sha));
     }
@@ -421,6 +422,7 @@ pub fn resolve_provider_by_revision(
                 resolved_sha: sha.clone(),
             },
             sha256: hash,
+            registry: None,
         });
         eprintln!(
             "Installed provider '{}' from global cache ({}@{})",
@@ -469,6 +471,7 @@ pub fn resolve_provider_by_revision(
             resolved_sha: sha.clone(),
         },
         sha256: hash,
+        registry: None,
     });
 
     eprintln!(
