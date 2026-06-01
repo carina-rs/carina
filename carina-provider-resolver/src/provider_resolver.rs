@@ -2413,7 +2413,8 @@ sha256 = "abc"
                     r#"{{"protocols":["1"],"filename":"aws.wasm","download_url":"https://downloads.example.test/aws-0.6.0.wasm","shasum":"{new_shasum}","shasum_authored_by":"registry"}}"#
                 ),
             )
-            .bytes("https://downloads.example.test/aws-0.6.0.wasm", new_body);
+            .bytes("https://downloads.example.test/aws-0.6.0.wasm", new_body)
+            .downloadable_bytes("https://downloads.example.test/aws-0.6.0.wasm", new_body);
         let mut lock_file = LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
