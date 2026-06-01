@@ -210,7 +210,7 @@ const MAX_SEQUENCE_FAST_FORWARD: u64 = 1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProviderSource {
-    GithubDirect,
+    GithubDirect { source: String },
     Registry(RegistrySource),
 }
 
@@ -337,7 +337,9 @@ struct RegistryDownload {
 fn parse_provider_source(source: &str) -> Result<ProviderSource, String> {
     let parts: Vec<&str> = source.split('/').collect();
     match parts.as_slice() {
-        ["github.com", _owner, _repo] => Ok(ProviderSource::GithubDirect),
+        ["github.com", _owner, _repo] => Ok(ProviderSource::GithubDirect {
+            source: source.to_string(),
+        }),
         [namespace, name] if !namespace.is_empty() && !name.is_empty() => {
             Ok(ProviderSource::Registry(RegistrySource {
                 source: format!("{namespace}/{name}"),
@@ -362,6 +364,10 @@ fn parse_provider_source(source: &str) -> Result<ProviderSource, String> {
             "Invalid source format: {source}. Expected: github.com/{{owner}}/{{repo}} or [hostname/]namespace/name"
         )),
     }
+}
+
+fn canonical_provider_source(source: &str) -> Result<String, String> {
+    Ok(parse_provider_source(source)?.source_key())
 }
 
 fn canonical_registry_source(hostname: &str, namespace: &str, name: &str) -> String {
@@ -530,6 +536,15 @@ fn enforce_registry_freshness(
 impl RegistrySource {
     fn source_key(&self) -> String {
         self.source.clone()
+    }
+}
+
+impl ProviderSource {
+    fn source_key(&self) -> String {
+        match self {
+            ProviderSource::GithubDirect { source } => source.clone(),
+            ProviderSource::Registry(source) => source.source_key(),
+        }
     }
 }
 
@@ -1075,10 +1090,19 @@ fn resolve_provider_with_http<H: RegistryHttp>(
 ///
 /// Handles version validation, lock file load/save, and delegation to `resolve_provider`.
 pub fn resolve_single_config(base_dir: &Path, config: &ProviderConfig) -> Result<PathBuf, String> {
+    resolve_single_config_with_http(base_dir, config, &UreqRegistryHttp)
+}
+
+fn resolve_single_config_with_http<H: RegistryHttp>(
+    base_dir: &Path,
+    config: &ProviderConfig,
+    http: &H,
+) -> Result<PathBuf, String> {
     let source = config
         .source
         .as_deref()
         .ok_or_else(|| format!("Provider '{}' has no source", config.name))?;
+    let source = canonical_provider_source(source)?;
 
     let lock_path = base_dir.join("carina-providers.lock");
     let mut lock_file = LockFile::load(&lock_path)?.unwrap_or_default();
@@ -1086,7 +1110,7 @@ pub fn resolve_single_config(base_dir: &Path, config: &ProviderConfig) -> Result
     let binary_path = if let Some(revision) = &config.revision {
         let (path, _sha) = crate::revision_resolver::resolve_provider_by_revision(
             base_dir,
-            source,
+            &source,
             revision,
             &config.name,
             &mut lock_file,
@@ -1094,8 +1118,15 @@ pub fn resolve_single_config(base_dir: &Path, config: &ProviderConfig) -> Result
         )?;
         path
     } else {
-        let version = resolve_version(source, config, &mut lock_file, false)?;
-        let path = resolve_provider(base_dir, source, &version, &config.name, &mut lock_file)?;
+        let version = resolve_version(&source, config, &mut lock_file, false)?;
+        let path = resolve_provider_with_http(
+            base_dir,
+            &source,
+            &version,
+            &config.name,
+            &mut lock_file,
+            http,
+        )?;
 
         if let Some(entry) = lock_file.provider.iter_mut().find(|e| e.source == source)
             && let LockEntryKind::Version { constraint, .. } = &mut entry.kind
@@ -1153,6 +1184,7 @@ pub fn find_installed_provider(
             base_dir.display()
         ));
     }
+    let source = canonical_provider_source(source)?;
 
     let lock_path = base_dir.join("carina-providers.lock");
     let lock_file = LockFile::load(&lock_path)?.unwrap_or_default();
@@ -1163,11 +1195,11 @@ pub fn find_installed_provider(
     // project already pulled this provider and the current project has no
     // local install yet (issue #2018).
     if let Some(revision) = &config.revision {
-        if let Some(lock_entry) = lock_file.find_by_source(source)
+        if let Some(lock_entry) = lock_file.find_by_source(&source)
             && let LockEntryKind::Revision { resolved_sha, .. } = &lock_entry.kind
         {
             let wasm_path =
-                crate::revision_resolver::cache_path_revision(base_dir, source, resolved_sha);
+                crate::revision_resolver::cache_path_revision(base_dir, &source, resolved_sha);
             if wasm_path.exists() {
                 return Ok(wasm_path);
             }
@@ -1179,14 +1211,14 @@ pub fn find_installed_provider(
         ));
     }
 
-    if let Some(lock_entry) = lock_file.find_by_source(source)
+    if let Some(lock_entry) = lock_file.find_by_source(&source)
         && let LockEntryKind::Version { version, .. } = &lock_entry.kind
     {
-        let wasm_path = cache_path_wasm(base_dir, source, version);
+        let wasm_path = cache_path_wasm(base_dir, &source, version);
         if wasm_path.exists() {
             return Ok(wasm_path);
         }
-        let binary_path = cache_path(base_dir, source, version);
+        let binary_path = cache_path(base_dir, &source, version);
         if binary_path.exists() {
             return Ok(binary_path);
         }
@@ -1456,6 +1488,15 @@ pub fn resolve_all(
     providers: &[ProviderConfig],
     mode: LockMode,
 ) -> Result<HashMap<String, PathBuf>, String> {
+    resolve_all_with_http(base_dir, providers, mode, &UreqRegistryHttp)
+}
+
+fn resolve_all_with_http<H: RegistryHttp>(
+    base_dir: &Path,
+    providers: &[ProviderConfig],
+    mode: LockMode,
+    http: &H,
+) -> Result<HashMap<String, PathBuf>, String> {
     let lock_path = base_dir.join("carina-providers.lock");
     let mut lock_file = LockFile::load(&lock_path)?.unwrap_or_default();
 
@@ -1524,11 +1565,12 @@ pub fn resolve_all(
             resolved.insert(config.name.clone(), dest);
             continue;
         }
+        let source = canonical_provider_source(source)?;
 
         let binary_path = if let Some(revision) = &config.revision {
             let (path, _sha) = crate::revision_resolver::resolve_provider_by_revision(
                 base_dir,
-                source,
+                &source,
                 revision,
                 &config.name,
                 &mut lock_file,
@@ -1536,8 +1578,15 @@ pub fn resolve_all(
             )?;
             path
         } else {
-            let version = resolve_version(source, config, &mut lock_file, upgrade)?;
-            let path = resolve_provider(base_dir, source, &version, &config.name, &mut lock_file)?;
+            let version = resolve_version(&source, config, &mut lock_file, upgrade)?;
+            let path = resolve_provider_with_http(
+                base_dir,
+                &source,
+                &version,
+                &config.name,
+                &mut lock_file,
+                http,
+            )?;
 
             if let Some(entry) = lock_file.provider.iter_mut().find(|e| e.source == source)
                 && let LockEntryKind::Version { constraint, .. } = &mut entry.kind
@@ -2598,6 +2647,144 @@ sha256 = "abc"
 
         assert_eq!(lock_file.provider.len(), 1);
         assert_eq!(lock_file.provider[0].source, "carina-rs/aws");
+    }
+
+    #[test]
+    fn registry_default_host_install_and_find_share_canonical_cache_path() {
+        for (installed_source, requested_source) in [
+            ("registry.carina-rs.dev/carina-rs/aws", "carina-rs/aws"),
+            ("carina-rs/aws", "registry.carina-rs.dev/carina-rs/aws"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let body = format!("registry wasm bytes for {installed_source}");
+            let shasum = sha256_bytes(body.as_bytes());
+            let http = registry_http(body.as_bytes(), &shasum);
+            let mut lock_file = LockFile::default();
+
+            let installed_path = resolve_provider_with_http(
+                dir.path(),
+                installed_source,
+                "0.5.0",
+                "aws",
+                &mut lock_file,
+                &http,
+            )
+            .unwrap();
+            lock_file
+                .save(&dir.path().join("carina-providers.lock"))
+                .unwrap();
+
+            let found_path =
+                find_installed_provider(dir.path(), &provider_config(requested_source, None))
+                    .unwrap();
+
+            assert_eq!(found_path, installed_path);
+            assert_eq!(
+                installed_path,
+                cache_path_wasm(dir.path(), "carina-rs/aws", "0.5.0")
+            );
+            assert_eq!(lock_file.provider.len(), 1);
+            assert_eq!(lock_file.provider[0].source, "carina-rs/aws");
+        }
+    }
+
+    #[test]
+    fn registry_default_host_resolve_single_writes_constraint_to_canonical_entry() {
+        for (installed_source, requested_source) in [
+            ("registry.carina-rs.dev/carina-rs/aws", "carina-rs/aws"),
+            ("carina-rs/aws", "registry.carina-rs.dev/carina-rs/aws"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let body = format!("registry wasm bytes for {installed_source}");
+            let shasum = sha256_bytes(body.as_bytes());
+            let http = registry_http(body.as_bytes(), &shasum);
+            let mut lock_file = LockFile::default();
+
+            let installed_path = resolve_provider_with_http(
+                dir.path(),
+                installed_source,
+                "0.5.0",
+                "aws",
+                &mut lock_file,
+                &http,
+            )
+            .unwrap();
+            lock_file
+                .save(&dir.path().join("carina-providers.lock"))
+                .unwrap();
+
+            let resolved_path = resolve_single_config_with_http(
+                dir.path(),
+                &versioned_config(requested_source, "~0.5.0"),
+                &http,
+            )
+            .unwrap();
+            let saved_lock = LockFile::load(&dir.path().join("carina-providers.lock"))
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(resolved_path, installed_path);
+            assert_eq!(saved_lock.provider.len(), 1);
+            assert_eq!(saved_lock.provider[0].source, "carina-rs/aws");
+            assert!(
+                matches!(
+                    &saved_lock.provider[0].kind,
+                    LockEntryKind::Version { constraint: Some(constraint), .. }
+                        if constraint == "~0.5.0"
+                ),
+                "constraint must be written back through the canonical source"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_default_host_resolve_all_writes_constraint_to_canonical_entry() {
+        for (installed_source, requested_source) in [
+            ("registry.carina-rs.dev/carina-rs/aws", "carina-rs/aws"),
+            ("carina-rs/aws", "registry.carina-rs.dev/carina-rs/aws"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let body = format!("registry wasm bytes for {installed_source}");
+            let shasum = sha256_bytes(body.as_bytes());
+            let http = registry_http(body.as_bytes(), &shasum);
+            let mut lock_file = LockFile::default();
+
+            let installed_path = resolve_provider_with_http(
+                dir.path(),
+                installed_source,
+                "0.5.0",
+                "aws",
+                &mut lock_file,
+                &http,
+            )
+            .unwrap();
+            lock_file
+                .save(&dir.path().join("carina-providers.lock"))
+                .unwrap();
+
+            let resolved = resolve_all_with_http(
+                dir.path(),
+                &[versioned_config(requested_source, "~0.5.0")],
+                LockMode::Normal,
+                &http,
+            )
+            .unwrap();
+            let saved_lock = LockFile::load(&dir.path().join("carina-providers.lock"))
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(resolved.get("awscc"), Some(&installed_path));
+            assert_eq!(saved_lock.provider.len(), 1);
+            assert_eq!(saved_lock.provider[0].source, "carina-rs/aws");
+            assert!(
+                matches!(
+                    &saved_lock.provider[0].kind,
+                    LockEntryKind::Version { constraint: Some(constraint), .. }
+                        if constraint == "~0.5.0"
+                ),
+                "constraint must be written back through the canonical source"
+            );
+        }
     }
 
     #[test]
