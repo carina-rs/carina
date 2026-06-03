@@ -533,16 +533,26 @@ Enum values use namespaced identifiers like `aws.s3.Bucket.VersioningStatus.enab
 
 3. **Plan display should not quote namespaced identifiers** - They are identifiers, not strings
 
-4. **LSP diagnostics must validate Custom types** - When adding `AttributeType::Custom` with a validate function, ensure `carina-lsp/src/diagnostics/mod.rs` calls the validate function for editor warnings
+4. **LSP diagnostics must validate Custom types** - When adding a custom type (built via `AttributeType::custom(...)`; internally the `AttrTypeKind::Custom` variant) with a validate function, ensure `carina-lsp/src/diagnostics/mod.rs` calls the validate function for editor warnings
 
 5. **Always test with actual values** - Don't assume pattern matching works; write a quick test to verify
 
 ## Struct Types
 
-`AttributeType::Struct` represents nested objects with typed fields.
+A struct type represents a nested object with typed fields.
 
-- Defined in `carina-core/src/schema.rs` as `Struct { name, fields: Vec<StructField> }`
-- Each `StructField` has: `name`, `field_type` (recursive AttributeType), `required`, `description`
+- `AttributeType` is an opaque newtype (`pub struct AttributeType { pub(crate)
+  kind: AttrTypeKind }`) defined in `carina-core/src/schema/mod.rs`. Its
+  variant enum `AttrTypeKind` is `pub(crate)`, so downstream crates cannot
+  pattern-match a raw `&AttributeType` — they construct one via the
+  constructor methods (`AttributeType::struct_(name, fields)`,
+  `AttributeType::custom(...)`, etc.) and read it through the `Ref`-peeled
+  `Shape` view. The struct case is the `AttrTypeKind::Struct { name, fields:
+  Vec<StructField> }` variant (carina#3349 made this unrepresentable from
+  outside `carina-core`).
+- Each `StructField` (`carina-core/src/schema/mod.rs`) has `name`,
+  `field_type` (recursive `AttributeType`), `required`, `description`, plus
+  `provider_name`, `block_name`, and `deferred_populate`.
 - **LSP integration**: when adding Struct validation, update
   `carina-lsp/src/diagnostics/validation.rs` to validate nested fields;
   completion should work recursively for struct fields.
