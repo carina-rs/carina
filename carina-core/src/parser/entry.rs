@@ -31,6 +31,42 @@ use crate::resource::{DataSource, DeferredValue, Resource, Value};
 use indexmap::IndexMap;
 use pest::Parser;
 
+#[derive(Clone, Copy)]
+pub(crate) struct BindingSeed<'a> {
+    name: &'a str,
+    kind: SeedKind<'a>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum SeedKind<'a> {
+    Value(&'a Value),
+    Structural,
+}
+
+impl<'a> BindingSeed<'a> {
+    pub(crate) fn value(name: &'a str, value: &'a Value) -> Self {
+        Self {
+            name,
+            kind: SeedKind::Value(value),
+        }
+    }
+
+    pub(crate) fn structural(name: &'a str) -> Self {
+        Self {
+            name,
+            kind: SeedKind::Structural,
+        }
+    }
+
+    pub(crate) fn name(&self) -> &'a str {
+        self.name
+    }
+
+    pub(crate) fn kind(&self) -> SeedKind<'a> {
+        self.kind
+    }
+}
+
 /// Parse a .crn file with the given configuration.
 ///
 /// The config allows injecting a decryptor function for `decrypt()` calls
@@ -50,14 +86,16 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
 
 /// Parse a .crn file with `seeds` pre-registered as lexical bindings.
 ///
-/// Each name in `seeds` is registered in the per-file [`ParseContext`]
-/// the same way `register_argument_binding` does: a placeholder
-/// `Value::Deferred(DeferredValue::ResourceRef{ binding: <name>, attribute: "", … })` is
-/// installed in `ctx.variables`, and a placeholder `Resource` is
-/// installed in `ctx.resource_bindings`. This means subsequent
-/// expressions resolve the name via the normal `ctx.get_variable` /
-/// `ctx.is_resource_binding` paths instead of degrading to the literal-
-/// string fallback in `primary.rs::variable_ref` / `parse_namespaced_id_value`.
+/// Each seed carries the directory-wide binding name and, for plain
+/// value-shaped `let` bindings, the pass-1 value from the merged file.
+/// Value seeds are installed directly in `ctx.variables`; all other
+/// binding kinds use the existing [`Value::Deferred(DeferredValue::BindingRef)`]
+/// placeholder and a placeholder `Resource` in `ctx.resource_bindings`.
+/// This keeps value lets value-shaped while structural sibling names
+/// still resolve through the normal `ctx.get_variable` /
+/// `ctx.is_resource_binding` paths instead of degrading to the
+/// literal-string fallback in `primary.rs::variable_ref` /
+/// `parse_namespaced_id_value`.
 ///
 /// The seed list is the directory aggregate: every binding declared in
 /// any sibling `.crn` (resource bindings, argument names, attribute
@@ -72,7 +110,7 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
 pub fn parse_with_seeded_bindings(
     input: &str,
     config: &ProviderContext,
-    seeds: &[&str],
+    seeds: &[BindingSeed<'_>],
 ) -> Result<ParsedFile, ParseError> {
     let preprocess_result =
         crate::heredoc::preprocess_heredocs(input).map_err(|e| ParseError::InvalidExpression {
@@ -426,31 +464,44 @@ pub fn parse_with_seeded_bindings(
     })
 }
 
-/// Pre-register `seeds` as lexical bindings in `ctx`. Mirrors the
-/// shape of `register_argument_binding` so seeded names resolve through
-/// the same `ctx.get_variable` / `ctx.is_resource_binding` paths that
-/// locally-declared `let` / `arguments` names use after parsing.
+/// Pre-register `seeds` as lexical bindings in `ctx`.
 ///
-/// Each seed is installed as a [`Value::Deferred(DeferredValue::BindingRef)`] — a bare-binding
-/// reference with no attribute slot. This is intentional: a seed
-/// represents "a name exists in scope; we know nothing more about it".
-/// When a downstream expression accesses `name.attr`, the parser
-/// composes a fresh [`Value::Deferred(DeferredValue::ResourceRef)`] with the real attribute
-/// instead of mutating the seed. Storing the seed as `ResourceRef`
-/// with an empty `attribute` field would be a type-level lie and
-/// previously surfaced as the empty-field diagnostic in #2847.
+/// Plain value seeds mirror a local `let name = <value>`: only
+/// `ctx.variables` is populated. Structural seeds mirror the
+/// placeholder shape used for resource/module/data/upstream bindings:
+/// `ctx.variables` receives a [`Value::Deferred(DeferredValue::BindingRef)`]
+/// and `ctx.resource_bindings` receives a `_seeded` resource marker.
+/// Storing the structural seed as `ResourceRef` with an empty
+/// `attribute` field would be a type-level lie and previously surfaced
+/// as the empty-field diagnostic in #2847.
 ///
 /// Empty seed list is a no-op — single-file callers (the legacy
 /// `parse(input, config)` wrapper, parser tests) pay no cost.
-fn seed_bindings(ctx: &mut ParseContext<'_>, seeds: &[&str]) {
-    for &name in seeds {
-        let placeholder_ref = Value::Deferred(DeferredValue::BindingRef {
-            binding: name.to_string(),
-        });
-        ctx.set_variable(name.to_string(), placeholder_ref);
-        let placeholder = Resource::new("_seeded", name);
-        ctx.set_resource_binding(name.to_string(), placeholder);
-        ctx.seeded_bindings.insert(name.to_string());
+fn seed_bindings(ctx: &mut ParseContext<'_>, seeds: &[BindingSeed<'_>]) {
+    for seed in seeds {
+        match seed.kind() {
+            SeedKind::Value(value) => {
+                ctx.set_variable(seed.name().to_string(), value.clone());
+            }
+            SeedKind::Structural => {
+                // Asymmetry: a local resource `let cluster = ...` registers
+                // `Concrete(String("${cluster}"))` in `ctx.variables`; a
+                // seeded structural binding registers `Deferred(BindingRef)`.
+                // Dotted refs (`cluster.attr`) go through `is_resource_binding`
+                // first and never observe the difference; bare refs read
+                // `ctx.variables`, but every current consumer (e.g.
+                // `value_as_binding_name`, the eval pipeline) handles both
+                // shapes identically. A new consumer that pattern-matches on
+                // only one shape would surface this: converge the two then.
+                let placeholder_ref = Value::Deferred(DeferredValue::BindingRef {
+                    binding: seed.name().to_string(),
+                });
+                ctx.set_variable(seed.name().to_string(), placeholder_ref);
+                let placeholder = Resource::new("_seeded", seed.name());
+                ctx.set_resource_binding(seed.name().to_string(), placeholder);
+            }
+        }
+        ctx.seeded_bindings.insert(seed.name().to_string());
     }
 }
 

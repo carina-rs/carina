@@ -1,0 +1,15 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  + mock.compute.Instance inst.cluster
+      cluster_name: "literal-via-resource-attr"
+
+Exports:
+
+  + bad_name = 'literal-via-let-chain'
+  + good_name = 'literal-via-resource-attr'
+
+Plan: 1 to add, 0 to change, 0 to destroy, 2 export change(s).

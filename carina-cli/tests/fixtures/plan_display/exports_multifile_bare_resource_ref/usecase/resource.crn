@@ -1,0 +1,3 @@
+let resource_binding = mock.compute.Instance {
+  name = 'fixture-instance'
+}

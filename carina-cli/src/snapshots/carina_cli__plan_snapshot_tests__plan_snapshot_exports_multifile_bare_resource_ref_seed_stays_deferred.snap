@@ -1,0 +1,14 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  + mock.compute.Instance inst.resource_binding
+      name: "fixture-instance"
+
+Exports:
+
+  + x = (known after apply)
+
+Plan: 1 to add, 0 to change, 0 to destroy, 1 export change(s).
