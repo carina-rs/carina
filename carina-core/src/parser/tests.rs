@@ -3,7 +3,7 @@ use crate::binding_index::IterableBindings;
 use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Resource, Value};
 use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[test]
 fn parse_and_resolve_returns_value_only_no_closure() {
@@ -8676,6 +8676,326 @@ fn inferred_file_holds_inferred_export_param() {
         ..Default::default()
     };
     assert_eq!(f.export_params[0].type_expr, TypeExpr::String);
+}
+
+#[test]
+fn parse_rejects_self_referential_let_binding() {
+    let err = parse("let X = X", &ProviderContext::default())
+        .expect_err("single-file self-referential let must fail");
+    let message = err.to_string();
+
+    match err {
+        ParseError::CyclicLetBinding { chain } => {
+            assert_eq!(chain, vec!["X", "X"]);
+        }
+        other => panic!("expected CyclicLetBinding, got {other:?}"),
+    }
+
+    assert!(
+        message.contains("a `let` binding cannot reference itself"),
+        "self-reference error must explain the fix, got: {message}"
+    );
+}
+
+#[test]
+fn parse_directory_files_rejects_self_referential_let_binding() {
+    let files = vec![(
+        std::path::PathBuf::from("main.crn"),
+        "let X = X".to_string(),
+    )];
+
+    let err = crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
+        .expect_err("directory self-referential let must fail");
+
+    match err {
+        ParseError::CyclicLetBinding { chain } => {
+            assert_eq!(chain, vec!["X", "X"]);
+        }
+        other => panic!("expected CyclicLetBinding, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_directory_files_resolves_two_hop_sibling_let_chain() {
+    assert_directory_let_chain_resolves(2);
+}
+
+#[test]
+fn parse_directory_files_resolves_three_hop_sibling_let_chain() {
+    assert_directory_let_chain_resolves(3);
+}
+
+#[test]
+fn parse_directory_files_resolves_five_hop_sibling_let_chain() {
+    assert_directory_let_chain_resolves(5);
+}
+
+#[test]
+fn parse_directory_files_resolves_long_linear_chain_before_iteration_cap() {
+    assert_directory_let_chain_resolves(8);
+}
+
+fn assert_directory_let_chain_resolves(hops: usize) {
+    let files = sibling_let_chain_files(hops);
+    let final_name = chain_binding_name(hops);
+
+    let parsed = crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
+        .expect("sibling let chain must parse");
+    let final_file = parsed
+        .iter()
+        .find(|(path, _)| path == &std::path::PathBuf::from(format!("{final_name}.crn")))
+        .expect("final chain file parsed");
+
+    assert_eq!(
+        final_file.1.parsed().variables.get(&final_name),
+        Some(&Value::Concrete(ConcreteValue::String("x".to_string())))
+    );
+}
+
+fn sibling_let_chain_files(hops: usize) -> Vec<(std::path::PathBuf, String)> {
+    let mut files = Vec::new();
+    files.push((std::path::PathBuf::from("A.crn"), "let A = 'x'".to_string()));
+
+    for index in 1..=hops {
+        let name = chain_binding_name(index);
+        let previous = chain_binding_name(index - 1);
+        files.push((
+            std::path::PathBuf::from(format!("{name}.crn")),
+            format!("let {name} = {previous}"),
+        ));
+    }
+
+    files
+}
+
+fn chain_binding_name(index: usize) -> String {
+    let letter = b'A' + u8::try_from(index).expect("test chain index fits in ASCII");
+    char::from(letter).to_string()
+}
+
+#[test]
+fn parse_directory_files_rejects_cyclic_sibling_let_chain() {
+    let files = vec![
+        (std::path::PathBuf::from("a.crn"), "let A = B".to_string()),
+        (std::path::PathBuf::from("b.crn"), "let B = A".to_string()),
+    ];
+
+    let err = crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
+        .expect_err("cyclic sibling lets must fail");
+
+    match err {
+        ParseError::CyclicLetBinding { chain } => {
+            assert_eq!(chain, vec!["A", "B", "A"]);
+        }
+        other => panic!("expected CyclicLetBinding, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_directory_files_rejects_resource_ref_let_cycle() {
+    let files = vec![
+        (
+            std::path::PathBuf::from("a.crn"),
+            "let A = B.attr".to_string(),
+        ),
+        (
+            std::path::PathBuf::from("b.crn"),
+            "let B = A.attr".to_string(),
+        ),
+    ];
+
+    let err = crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
+        .expect_err("ResourceRef let cycle must fail");
+
+    match err {
+        ParseError::CyclicLetBinding { chain } => {
+            assert_eq!(chain, vec!["A", "B", "A"]);
+        }
+        other => panic!("expected CyclicLetBinding, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_directory_files_rejects_function_call_let_cycle() {
+    let files = vec![
+        (
+            std::path::PathBuf::from("a.crn"),
+            "let A = upper(B)".to_string(),
+        ),
+        (
+            std::path::PathBuf::from("b.crn"),
+            "let B = upper(A)".to_string(),
+        ),
+    ];
+
+    let err = crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
+        .expect_err("FunctionCall let cycle must fail");
+
+    match err {
+        ParseError::CyclicLetBinding { chain } => {
+            assert_eq!(chain, vec!["A", "B", "A"]);
+        }
+        other => panic!("expected CyclicLetBinding, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_directory_files_rejects_interpolation_let_cycle() {
+    let files = vec![
+        (
+            std::path::PathBuf::from("a.crn"),
+            r#"let A = "prefix-${B}""#.to_string(),
+        ),
+        (
+            std::path::PathBuf::from("b.crn"),
+            r#"let B = "prefix-${A}""#.to_string(),
+        ),
+    ];
+
+    let err = crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
+        .expect_err("Interpolation let cycle must fail");
+
+    match err {
+        ParseError::CyclicLetBinding { chain } => {
+            assert_eq!(chain, vec!["A", "B", "A"]);
+        }
+        other => panic!("expected CyclicLetBinding, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_directory_files_rejects_list_let_cycle() {
+    let files = vec![
+        (std::path::PathBuf::from("a.crn"), "let A = [B]".to_string()),
+        (std::path::PathBuf::from("b.crn"), "let B = [A]".to_string()),
+    ];
+
+    let err = crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
+        .expect_err("List let cycle must fail");
+
+    match err {
+        ParseError::CyclicLetBinding { chain } => {
+            assert_eq!(chain, vec!["A", "B", "A"]);
+        }
+        other => panic!("expected CyclicLetBinding, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_directory_files_rejects_map_let_cycle() {
+    let files = vec![
+        (
+            std::path::PathBuf::from("a.crn"),
+            "let A = { key = B }".to_string(),
+        ),
+        (
+            std::path::PathBuf::from("b.crn"),
+            "let B = { key = A }".to_string(),
+        ),
+    ];
+
+    let err = crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
+        .expect_err("Map let cycle must fail");
+
+    match err {
+        ParseError::CyclicLetBinding { chain } => {
+            assert_eq!(chain, vec!["A", "B", "A"]);
+        }
+        other => panic!("expected CyclicLetBinding, got {other:?}"),
+    }
+}
+
+#[test]
+fn reject_cyclic_let_bindings_detects_secret_value_cycle() {
+    let mut variables = IndexMap::new();
+    variables.insert(
+        "A".to_string(),
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
+            DeferredValue::BindingRef {
+                binding: "B".to_string(),
+            },
+        )))),
+    );
+    variables.insert(
+        "B".to_string(),
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
+            DeferredValue::BindingRef {
+                binding: "A".to_string(),
+            },
+        )))),
+    );
+    let structural: HashSet<&str> = HashSet::new();
+
+    let err = reject_cyclic_let_bindings_in_variables(&variables, &structural)
+        .expect_err("Secret let cycle must fail");
+
+    match err {
+        ParseError::CyclicLetBinding { chain } => {
+            assert_eq!(chain, vec!["A", "B", "A"]);
+        }
+        other => panic!("expected CyclicLetBinding, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_directory_files_does_not_treat_dotted_string_literal_as_let_reference() {
+    let files = vec![
+        (std::path::PathBuf::from("a.crn"), "let A = B".to_string()),
+        (
+            std::path::PathBuf::from("b.crn"),
+            r#"let B = "A.something""#.to_string(),
+        ),
+    ];
+
+    let parsed = crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
+        .expect("quoted dotted strings must stay literal, not dependency edges");
+    let a_file = parsed
+        .iter()
+        .find(|(path, _)| path == &std::path::PathBuf::from("a.crn"))
+        .expect("a.crn parsed");
+
+    assert_eq!(
+        a_file.1.parsed().variables.get("A"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "A.something".to_string()
+        )))
+    );
+}
+
+#[test]
+fn parse_directory_files_preserves_sibling_resource_ref_rhs() {
+    let files = vec![
+        (
+            std::path::PathBuf::from("resource.crn"),
+            r#"
+                let R = mock.compute.Instance {
+                    name = 'web'
+                }
+            "#
+            .to_string(),
+        ),
+        (
+            std::path::PathBuf::from("bridge.crn"),
+            "let B = R.arn".to_string(),
+        ),
+    ];
+
+    let parsed = crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
+        .expect("resource-ref let must parse");
+    let bridge_file = parsed
+        .iter()
+        .find(|(path, _)| path == &std::path::PathBuf::from("bridge.crn"))
+        .expect("bridge.crn parsed");
+
+    match bridge_file.1.parsed().variables.get("B") {
+        Some(Value::Deferred(DeferredValue::ResourceRef { path })) => {
+            assert_eq!(path.binding(), "R");
+            assert_eq!(path.attribute(), "arn");
+            assert!(path.leading_field_path().is_empty());
+            assert!(path.trailing_subscripts().is_empty());
+        }
+        other => panic!("expected B to stay ResourceRef(R.arn), got {other:?}"),
+    }
 }
 
 // ================================================================

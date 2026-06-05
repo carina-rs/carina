@@ -1586,6 +1586,9 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
             DiagnosticSeverity::ERROR,
             format!("Recursive function call detected: {}", name),
         ),
+        err @ ParseError::CyclicLetBinding { .. } => {
+            carina_diagnostic_range(Range::default(), DiagnosticSeverity::ERROR, err.to_string())
+        }
         ParseError::UserFunctionError(msg) => {
             carina_diagnostic_range(Range::default(), DiagnosticSeverity::ERROR, msg.to_string())
         }

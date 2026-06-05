@@ -77,11 +77,14 @@ impl<'a> BindingSeed<'a> {
 /// sibling) are *not* in scope. Production code paths that read a
 /// directory of `.crn` files must go through
 /// [`crate::config_loader::parse_directory_files`], which collects the
-/// sibling binding-name union in Pass 1 and re-parses every file with
-/// the union seeded into `ParseContext` in Pass 2. See #2817
-/// (directory-aware parse) for the broader contract.
+/// sibling binding-name union, re-parses to compute sibling-aware `let`
+/// values, and then re-parses again with the resolved directory scope.
+/// See #2817 (directory-aware parse) and #3394 (pass-1 sibling-aware
+/// value seeds) for the broader contract.
 pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseError> {
-    parse_with_seeded_bindings(input, config, &[])
+    let parsed = parse_with_seeded_bindings(input, config, &[])?;
+    super::resolve::reject_cyclic_let_bindings(&parsed)?;
+    Ok(parsed)
 }
 
 /// Parse a .crn file with `seeds` pre-registered as lexical bindings.
@@ -101,7 +104,7 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
 /// any sibling `.crn` (resource bindings, argument names, attribute
 /// names, export names, user-function names, `use` aliases,
 /// `upstream_state` bindings). The caller is responsible for collecting
-/// it via a Phase-1 unseeded parse and passing the union here.
+/// it from a directory-wide parse pass and passing the union here.
 ///
 /// Names already declared inside `input` itself (re-introduced by the
 /// regular parse) win over the seeded placeholder — the parser overwrites

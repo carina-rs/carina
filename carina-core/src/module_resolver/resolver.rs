@@ -137,7 +137,7 @@ impl<'cfg> ModuleResolver<'cfg> {
 
         let mut merged = ParsedFile::default();
         for (_, parsed) in parsed_files {
-            crate::config_loader::merge_parsed_file(&mut merged, parsed);
+            crate::config_loader::merge_parsed_file(&mut merged, parsed.into_inner());
         }
         let type_errors = crate::validation::resolve_file_type_exprs(&mut merged, self.config);
         if let Some(first) = type_errors.into_iter().next() {

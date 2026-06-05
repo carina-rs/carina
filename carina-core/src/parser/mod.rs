@@ -24,18 +24,20 @@ pub use ast::{
     UseStatement, UserFunction, UserFunctionBody, ValidateExpr, ValidationBlock, WaitBinding,
 };
 pub use config::{DecryptorFn, ProviderContext, ValidatorFn};
-pub(crate) use entry::parse_with_seeded_bindings;
+pub(crate) use entry::{BindingSeed, parse_with_seeded_bindings};
 pub use entry::{parse, parse_and_resolve};
 pub(crate) use entry::{parse_expression, parse_expression_eval};
 pub use error::{ParseError, ParseWarning};
 pub(crate) use functions::evaluate_user_function;
 pub use functions::{provider_context_lookup, validate_custom_type};
-pub(crate) use resolve::collect_seed_bindings_merged;
 pub use resolve::{
     check_identifier_scope, check_provider_instance_routing, collect_known_bindings_merged,
     finalize_provider_configs, resolve_provider_attributes_with_remote,
     resolve_provider_unresolved_attributes, resolve_resource_refs,
     resolve_resource_refs_with_config,
+};
+pub(crate) use resolve::{
+    collect_seed_bindings_from_parts, reject_cyclic_let_bindings_in_variables,
 };
 pub use types::parse_type_expr_str;
 pub(crate) use types::{is_known_bare_custom_type, unknown_custom_type_message};

@@ -48,8 +48,23 @@ pub enum ParseError {
     #[error("Recursive function call detected: {0}")]
     RecursiveFunction(String),
 
+    #[error("{}", format_cyclic_let_binding(chain))]
+    CyclicLetBinding { chain: Vec<String> },
+
     #[error("User-defined function error: {0}")]
     UserFunctionError(String),
+}
+
+fn format_cyclic_let_binding(chain: &[String]) -> String {
+    let rendered = chain.join(" -> ");
+    if chain.len() == 2 && chain[0] == chain[1] {
+        format!(
+            "Cyclic let binding detected: {rendered}; a `let` binding cannot reference itself; \
+             remove this line or replace the RHS with a real value"
+        )
+    } else {
+        format!("Cyclic let binding detected: {rendered}")
+    }
 }
 
 /// Render the `UndefinedIdentifier` message. When a close match exists

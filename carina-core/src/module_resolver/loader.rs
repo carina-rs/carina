@@ -68,7 +68,7 @@ pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
 
     let mut merged = ParsedFile::default();
     for (_, parsed) in parsed_files {
-        crate::config_loader::merge_parsed_file(&mut merged, parsed);
+        crate::config_loader::merge_parsed_file(&mut merged, parsed.into_inner());
     }
 
     if merged.arguments.is_empty() && merged.attribute_params.is_empty() {
@@ -135,7 +135,7 @@ pub fn load_module_from_directory(dir: &Path) -> Result<ParsedFile, String> {
 
     let mut merged = ParsedFile::default();
     for (_, parsed) in parsed_files {
-        crate::config_loader::merge_parsed_file(&mut merged, parsed);
+        crate::config_loader::merge_parsed_file(&mut merged, parsed.into_inner());
     }
 
     Ok(merged)
