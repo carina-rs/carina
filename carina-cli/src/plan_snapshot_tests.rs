@@ -1314,6 +1314,72 @@ fn plan_snapshot_exports_multifile_let_literal() {
 }
 
 #[test]
+fn plan_snapshot_exports_multifile_let_chain() {
+    use crate::commands::plan::compute_export_diffs;
+
+    let fp = build_plan_from_fixture_name("exports_multifile_let_chain");
+
+    let export_changes = compute_export_diffs(&fp.resolved_export_params, &HashMap::new());
+    let output = strip_ansi(&format_plan(
+        &fp.plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&fp.schemas),
+        &fp.moved_origins,
+        &export_changes,
+        &[],
+        None,
+        None,
+    ));
+
+    assert!(
+        output.contains("z = 'foo'"),
+        "chained sibling let must resolve to the literal, got:\n{}",
+        output
+    );
+    assert!(
+        !output.contains("(known after apply)"),
+        "no export should be deferred for the let-chain case, got:\n{}",
+        output
+    );
+
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn plan_snapshot_exports_multifile_let_chain_5hop() {
+    use crate::commands::plan::compute_export_diffs;
+
+    let fp = build_plan_from_fixture_name("exports_multifile_let_chain_5hop");
+
+    let export_changes = compute_export_diffs(&fp.resolved_export_params, &HashMap::new());
+    let output = strip_ansi(&format_plan(
+        &fp.plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&fp.schemas),
+        &fp.moved_origins,
+        &export_changes,
+        &[],
+        None,
+        None,
+    ));
+
+    assert!(
+        output.contains("z = 'x'"),
+        "5-hop sibling let chain must resolve to the literal, got:\n{}",
+        output
+    );
+    assert!(
+        !output.contains("(known after apply)"),
+        "no export should be deferred for the 5-hop let-chain case, got:\n{}",
+        output
+    );
+
+    insta::assert_snapshot!(output);
+}
+
+#[test]
 fn plan_snapshot_exports_multifile_bare_resource_ref_seed_stays_deferred() {
     use crate::commands::plan::compute_export_diffs;
 

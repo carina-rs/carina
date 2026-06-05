@@ -8,7 +8,9 @@ use super::entry::BindingSeed;
 use super::error::{ParseError, undefined_identifier_error};
 use super::static_eval::is_static_value;
 use crate::eval_value::EvalValue;
-use crate::resource::{ConcreteValue, DataSource, DeferredValue, Resource, Value};
+use crate::resource::{
+    ConcreteValue, DataSource, DeferredValue, InterpolationPart, Resource, Value,
+};
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -374,23 +376,187 @@ pub fn collect_known_bindings_merged(parsed: &ParsedFile) -> std::collections::H
 /// entries in `parsed.variables` (`"${binding}"`); those must not become
 /// value seeds, so structural names continue to use the placeholder
 /// installed by `seed_bindings`.
+#[cfg(test)]
 pub(crate) fn collect_seed_bindings_merged(parsed: &ParsedFile) -> Vec<BindingSeed<'_>> {
     let structural = parsed.structural_binding_names();
 
-    collect_known_bindings_merged(parsed)
+    collect_seed_bindings_from_parts(&structural, &parsed.variables)
+}
+
+pub(crate) fn collect_seed_bindings_from_parts<'a>(
+    structural: &HashSet<&'a str>,
+    variables: &'a IndexMap<String, Value>,
+) -> Vec<BindingSeed<'a>> {
+    let mut names: Vec<&'a str> = structural.iter().copied().collect();
+    names.extend(variables.keys().map(String::as_str));
+    names.sort_unstable();
+    names.dedup();
+
+    names
         .into_iter()
         .map(|name| {
             if structural.contains(name) {
                 BindingSeed::structural(name)
-            } else if let Some(value) = parsed.variables.get(name) {
+            } else if let Some(value) = variables.get(name) {
                 BindingSeed::value(name, value)
             } else {
                 unreachable!(
-                    "collect_known_bindings_merged names are either structural or in variables"
+                    "collect_seed_bindings_from_parts names are either structural or in variables"
                 )
             }
         })
         .collect()
+}
+
+pub(crate) fn reject_cyclic_let_bindings(parsed: &ParsedFile) -> Result<(), ParseError> {
+    let structural = parsed.structural_binding_names();
+    reject_cyclic_let_bindings_in_variables(&parsed.variables, &structural)
+}
+
+pub(crate) fn reject_cyclic_let_bindings_in_variables(
+    variables: &IndexMap<String, Value>,
+    structural: &HashSet<&str>,
+) -> Result<(), ParseError> {
+    if let Some(chain) = find_let_binding_cycle(variables, structural) {
+        return Err(ParseError::CyclicLetBinding { chain });
+    }
+
+    Ok(())
+}
+
+fn find_let_binding_cycle(
+    variables: &IndexMap<String, Value>,
+    structural: &HashSet<&str>,
+) -> Option<Vec<String>> {
+    let mut visited = HashSet::new();
+    let mut visiting = Vec::new();
+
+    for name in variables.keys() {
+        if structural.contains(name.as_str()) {
+            continue;
+        }
+        if let Some(chain) =
+            visit_let_binding(name, variables, structural, &mut visited, &mut visiting)
+        {
+            return Some(chain);
+        }
+    }
+
+    None
+}
+
+fn visit_let_binding(
+    name: &str,
+    variables: &IndexMap<String, Value>,
+    structural: &HashSet<&str>,
+    visited: &mut HashSet<String>,
+    visiting: &mut Vec<String>,
+) -> Option<Vec<String>> {
+    if visited.contains(name) {
+        return None;
+    }
+    if let Some(pos) = visiting.iter().position(|candidate| candidate == name) {
+        let mut cycle = visiting[pos..].to_vec();
+        cycle.push(name.to_string());
+        return Some(cycle);
+    }
+
+    let value = variables.get(name)?;
+    visiting.push(name.to_string());
+
+    let roots = reference_roots_in_value(value, variables, structural);
+    for root in roots {
+        if let Some(chain) = visit_let_binding(&root, variables, structural, visited, visiting) {
+            return Some(chain);
+        }
+    }
+
+    visiting.pop();
+    visited.insert(name.to_string());
+    None
+}
+
+fn reference_roots_in_value(
+    value: &Value,
+    variables: &IndexMap<String, Value>,
+    structural: &HashSet<&str>,
+) -> Vec<String> {
+    let mut roots = Vec::new();
+    collect_reference_roots(value, variables, structural, &mut roots);
+    roots
+}
+
+fn collect_reference_roots(
+    value: &Value,
+    variables: &IndexMap<String, Value>,
+    structural: &HashSet<&str>,
+    roots: &mut Vec<String>,
+) {
+    match value {
+        Value::Concrete(ConcreteValue::EnumIdentifier(name)) => {
+            // Bare-identifier fallback (`EnumIdentifier("B")`) and dotted-access
+            // fallback (`EnumIdentifier("B.attr")`) both appear before the parser
+            // classifies the RHS as a binding ref or resource ref.
+            push_root(name, variables, structural, roots);
+            if let Some((root, _)) = name.split_once('.') {
+                push_root(root, variables, structural, roots);
+            }
+        }
+        Value::Concrete(ConcreteValue::List(items)) => {
+            for item in items {
+                collect_reference_roots(item, variables, structural, roots);
+            }
+        }
+        Value::Concrete(ConcreteValue::Map(map)) => {
+            for item in map.values() {
+                collect_reference_roots(item, variables, structural, roots);
+            }
+        }
+        Value::Deferred(DeferredValue::BindingRef { binding }) => {
+            push_root(binding, variables, structural, roots);
+        }
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+            push_root(path.binding(), variables, structural, roots);
+        }
+        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+            for arg in args {
+                collect_reference_roots(arg, variables, structural, roots);
+            }
+        }
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+            for part in parts {
+                if let InterpolationPart::Expr(expr) = part {
+                    collect_reference_roots(expr, variables, structural, roots);
+                }
+            }
+        }
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            collect_reference_roots(inner, variables, structural, roots);
+        }
+        Value::Concrete(
+            ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::String(_)
+            | ConcreteValue::StringList(_),
+        )
+        | Value::Deferred(DeferredValue::Unknown(_)) => {}
+    }
+}
+
+fn push_root(
+    root: &str,
+    variables: &IndexMap<String, Value>,
+    structural: &HashSet<&str>,
+    roots: &mut Vec<String>,
+) {
+    if variables.contains_key(root)
+        && !structural.contains(root)
+        && !roots.iter().any(|existing| existing == root)
+    {
+        roots.push(root.to_string());
+    }
 }
 
 /// Directory-wide identifier-scope validation for a merged [`ParsedFile`].

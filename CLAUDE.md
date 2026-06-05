@@ -649,6 +649,15 @@ When implementing or modifying such a feature:
 > prematurely) where the formatter fix passed unit tests but never ran
 > against the real infra fixture.
 
+> Past breakage: PR #3393 made directory parser Pass 2 value-aware for
+> sibling `.crn` let bindings but left Pass 1 single-file, so a
+> sibling-`let` chain (`let B = A` referencing a sibling `let A = '...'`)
+> degraded to `(known after apply)` past one hop. PR #3394 replaced the
+> fixed-pass scaffolding with a fixed-point loop seeded from sibling
+> `let` values: every pass that consumes the directory binding scope
+> must consume it from a representation that has converged, not from a
+> per-file snapshot.
+
 ---
 
 # Part 4 — Git & Worktree Workflow

@@ -1,0 +1,12 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+
+Exports:
+
+  + z = 'x'
+
+Plan: 0 to add, 0 to change, 0 to destroy, 1 export change(s).

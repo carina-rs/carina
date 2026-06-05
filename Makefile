@@ -228,6 +228,10 @@ plan-exports-multifile:
 	$(PLAN_FIXTURE) exports_multifile
 plan-exports-multifile-let-literal:
 	$(PLAN_FIXTURE) exports_multifile_let_literal
+plan-exports-multifile-let-chain:
+	$(PLAN_FIXTURE) exports_multifile_let_chain
+plan-exports-multifile-let-chain-5hop:
+	$(PLAN_FIXTURE) exports_multifile_let_chain_5hop
 plan-exports-multifile-bare-resource-ref:
 	$(PLAN_FIXTURE) exports_multifile_bare_resource_ref
 plan-exports-multifile-use-alias-seed:
@@ -270,7 +274,9 @@ plan-multi-instance-module:
         plan-upstream-state plan-upstream-state-unresolved plan-upstream-state-empty-exports \
         plan-upstream-state-map-subscript plan-upstream-state-map-dot-notation \
         plan-deferred-for plan-exports plan-exports-multifile \
-        plan-exports-multifile-let-literal plan-exports-multifile-bare-resource-ref \
+        plan-exports-multifile-let-literal plan-exports-multifile-let-chain \
+        plan-exports-multifile-let-chain-5hop \
+        plan-exports-multifile-bare-resource-ref \
         plan-exports-multifile-use-alias-seed \
         plan-exports-multifile-string-let-attr-rejected \
         plan-policy-pretty \
