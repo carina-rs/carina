@@ -4,6 +4,7 @@
 
 use super::ProviderContext;
 use super::ast::{AttributeParameter, ExportParameter, ModuleCall, ParsedFile};
+use super::entry::BindingSeed;
 use super::error::{ParseError, undefined_identifier_error};
 use super::static_eval::is_static_value;
 use crate::eval_value::EvalValue;
@@ -360,28 +361,36 @@ pub fn resolve_resource_refs_with_config(
 /// borrowed view (changing that signature would force `undefined_identifier_error`
 /// to rebuild a borrowed view per call).
 pub fn collect_known_bindings_merged(parsed: &ParsedFile) -> std::collections::HashSet<&str> {
-    let mut known: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    // carina#3181: walk the typed top-level slices — managed resources,
-    // data sources, and compositions all contribute a binding name in scope.
-    known.extend(
-        parsed
-            .iter_top_level_resources()
-            .filter_map(|r| r.binding()),
-    );
-    known.extend(parsed.arguments.iter().map(|a| a.name.as_str()));
-    known.extend(
-        parsed
-            .module_calls
-            .iter()
-            .filter_map(|c| c.binding_name.as_deref()),
-    );
-    known.extend(parsed.upstream_states.iter().map(|u| u.binding.as_str()));
-    known.extend(parsed.wait_bindings.iter().map(|w| w.binding.as_str()));
-    known.extend(parsed.uses.iter().map(|i| i.alias.as_str()));
-    known.extend(parsed.user_functions.keys().map(String::as_str));
+    let mut known = parsed.structural_binding_names();
     known.extend(parsed.variables.keys().map(String::as_str));
-    known.extend(parsed.structural_bindings.iter().map(String::as_str));
     known
+}
+
+/// Directory-wide parse seeds for Pass 2.
+///
+/// Plain value-shaped `let` bindings carry their pass-1 value so bare
+/// sibling identifiers parse to that value instead of a deferred
+/// placeholder. Structural bindings may also have parser placeholder
+/// entries in `parsed.variables` (`"${binding}"`); those must not become
+/// value seeds, so structural names continue to use the placeholder
+/// installed by `seed_bindings`.
+pub(crate) fn collect_seed_bindings_merged(parsed: &ParsedFile) -> Vec<BindingSeed<'_>> {
+    let structural = parsed.structural_binding_names();
+
+    collect_known_bindings_merged(parsed)
+        .into_iter()
+        .map(|name| {
+            if structural.contains(name) {
+                BindingSeed::structural(name)
+            } else if let Some(value) = parsed.variables.get(name) {
+                BindingSeed::value(name, value)
+            } else {
+                unreachable!(
+                    "collect_known_bindings_merged names are either structural or in variables"
+                )
+            }
+        })
+        .collect()
 }
 
 /// Directory-wide identifier-scope validation for a merged [`ParsedFile`].
@@ -881,4 +890,74 @@ pub fn finalize_provider_configs<E>(parsed: &mut super::File<E>) -> Result<(), P
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod seed_precedence_tests {
+    use super::*;
+    use crate::parser::entry::SeedKind;
+
+    #[test]
+    fn structural_let_with_placeholder_in_variables_seeds_as_structural() {
+        // A `let cluster = mock.compute.Instance {}` shape: `cluster` appears
+        // in `parsed.resources` and in `parsed.variables`, where let_binding.rs
+        // stores the parser placeholder string "${cluster}".
+        let mut parsed = ParsedFile::default();
+
+        let mut resource = Resource::new("mock.compute.Instance", "instance");
+        resource.binding = Some("cluster".to_string());
+        parsed.resources.push(resource); // allow: direct — fixture test inspection
+
+        parsed.variables.insert(
+            "cluster".to_string(),
+            Value::Concrete(ConcreteValue::String("${cluster}".to_string())),
+        );
+
+        let seeds = collect_seed_bindings_merged(&parsed);
+        let cluster_seed = seeds
+            .iter()
+            .find(|seed| seed.name() == "cluster")
+            .expect("cluster seed missing");
+
+        match cluster_seed.kind() {
+            SeedKind::Structural => {}
+            SeedKind::Value(value) => panic!(
+                "structural binding `cluster` with placeholder in variables \
+                 must seed as Structural, not Value({value:?}). The structural-first \
+                 precedence in collect_seed_bindings_merged is load-bearing for \
+                 carina#3391's fix: if Value wins, the parser placeholder \
+                 \"${{cluster}}\" leaks as the seed value and sibling-file `cluster.attr` \
+                 references can resolve to the placeholder string instead of \
+                 going through the resource-binding path."
+            ),
+        }
+    }
+
+    #[test]
+    fn plain_let_literal_seeds_as_value() {
+        // A `let bad_name = 'literal'` shape: `bad_name` appears in
+        // `parsed.variables` only, not in any structural source.
+        let mut parsed = ParsedFile::default();
+        parsed.variables.insert(
+            "bad_name".to_string(),
+            Value::Concrete(ConcreteValue::String("literal".to_string())),
+        );
+
+        let seeds = collect_seed_bindings_merged(&parsed);
+        let bad_seed = seeds
+            .iter()
+            .find(|seed| seed.name() == "bad_name")
+            .expect("bad_name seed missing");
+
+        match bad_seed.kind() {
+            SeedKind::Value(value) => {
+                assert_eq!(
+                    value,
+                    &Value::Concrete(ConcreteValue::String("literal".to_string())),
+                    "Value seed must carry the actual literal"
+                );
+            }
+            SeedKind::Structural => panic!("plain value let must seed as Value, not Structural"),
+        }
+    }
 }

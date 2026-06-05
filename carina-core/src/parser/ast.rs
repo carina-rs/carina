@@ -1178,6 +1178,31 @@ impl<E> File<E> {
             .chain(self.data_sources.iter().map(ResourceRef::DataSource))
     }
 
+    /// Every non-variable binding name declared in the file.
+    ///
+    /// This intentionally excludes `variables`: parser-side variables
+    /// include both plain value `let`s and placeholder entries for
+    /// structural `let`s. Callers that need the complete in-scope set
+    /// should union this with `variables`; callers that need to classify
+    /// plain value lets can use this as the exclusion set.
+    pub(crate) fn structural_binding_names(&self) -> HashSet<&str> {
+        let mut names = HashSet::new();
+        names.extend(self.iter_top_level_resources().filter_map(|r| r.binding()));
+        names.extend(self.arguments.iter().map(|a| a.name.as_str()));
+        names.extend(
+            self.module_calls
+                .iter()
+                .filter_map(|c| c.binding_name.as_deref()),
+        );
+        names.extend(self.upstream_states.iter().map(|u| u.binding.as_str()));
+        names.extend(self.wait_bindings.iter().map(|w| w.binding.as_str()));
+        names.extend(self.uses.iter().map(|u| u.alias.as_str()));
+        names.extend(self.user_functions.keys().map(String::as_str));
+        names.extend(self.providers.iter().filter_map(|p| p.binding.as_deref()));
+        names.extend(self.structural_bindings.iter().map(String::as_str));
+        names
+    }
+
     /// Consume `self` and yield the top-level nodes as owned
     /// [`GraphNode`]s.
     ///
@@ -1483,8 +1508,121 @@ pub(super) fn substitute_placeholder(
 mod substitute_placeholder_tests {
     use super::*;
     use crate::resource::{
-        AccessPath, ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value,
+        AccessPath, ConcreteValue, DeferredValue, InterpolationPart, ResourceId, Signature,
+        UnknownReason, Value,
     };
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn structural_binding_names_covers_every_non_variable_kind() {
+        let mut parsed = ParsedFile::default();
+
+        let mut resource = Resource::new("mock.compute.Instance", "resource_node");
+        resource.binding = Some("resource_name".to_string());
+        parsed.resources.push(resource); // allow: direct — fixture test inspection
+
+        let mut data_source = DataSource::new("mock.compute.Instance", "data_node");
+        data_source.binding = Some("data_source_name".to_string());
+        parsed.data_sources.push(data_source);
+
+        parsed.compositions.push(Composition {
+            id: ResourceId::new("_virtual", "composition_node"),
+            signature: Signature {
+                arguments: IndexMap::new(),
+                attributes: IndexMap::new(),
+            },
+            binding: Some("composition_name".to_string()),
+            dependency_bindings: BTreeSet::new(),
+            module_name: "module_name".to_string(),
+            instance: "composition_name".to_string(),
+            quoted_string_attrs: HashSet::new(),
+        });
+
+        parsed.arguments.push(ArgumentParameter {
+            name: "argument_name".to_string(),
+            type_expr: TypeExpr::String,
+            default: None,
+            description: None,
+            validations: Vec::new(),
+        });
+        parsed.module_calls.push(ModuleCall {
+            module_name: "module".to_string(),
+            binding_name: Some("module_call_name".to_string()),
+            arguments: HashMap::new(),
+        });
+        parsed.upstream_states.push(UpstreamState {
+            binding: "upstream_name".to_string(),
+            source: "upstream".into(),
+        });
+        parsed.wait_bindings.push(WaitBinding {
+            binding: BindingName::from("wait_name"),
+            target: BindingName::from("resource_name"),
+            until_raw: "resource_name.status == 'ready'".to_string(),
+            until_predicate: UntilPredicateAst {
+                lhs_segments: vec!["resource_name".to_string(), "status".to_string()],
+                rhs: Value::Concrete(ConcreteValue::String("ready".to_string())),
+            },
+            timeout_secs: None,
+            depends_on: Vec::new(),
+            line: 1,
+        });
+        parsed.uses.push(UseStatement {
+            path: "./module".to_string(),
+            alias: "use_alias".to_string(),
+        });
+        parsed.user_functions.insert(
+            "function_name".to_string(),
+            UserFunction {
+                name: "function_name".to_string(),
+                params: Vec::new(),
+                return_type: None,
+                local_lets: Vec::new(),
+                body: UserFunctionBody(Value::Concrete(ConcreteValue::Int(1))),
+            },
+        );
+        parsed.providers.push(ProviderConfig {
+            name: "mock".to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: Some("provider_name".to_string()),
+            is_default: false,
+        });
+        parsed
+            .structural_bindings
+            .insert("structural_name".to_string());
+        parsed.variables.insert(
+            "plain_value_name".to_string(),
+            Value::Concrete(ConcreteValue::String("literal".to_string())),
+        );
+
+        let names = parsed.structural_binding_names();
+        for expected in [
+            "resource_name",
+            "data_source_name",
+            "composition_name",
+            "argument_name",
+            "module_call_name",
+            "upstream_name",
+            "wait_name",
+            "use_alias",
+            "function_name",
+            "provider_name",
+            "structural_name",
+        ] {
+            assert!(
+                names.contains(expected),
+                "structural_binding_names should include {expected}; got {names:?}"
+            );
+        }
+        assert!(
+            !names.contains("plain_value_name"),
+            "plain value lets must be excluded from structural binding names"
+        );
+    }
 
     #[test]
     fn replaces_for_value_with_bound_value() {

@@ -1,0 +1,5 @@
+let bad_name = 'literal-via-let-chain'
+
+let cluster = mock.compute.Instance {
+  cluster_name = 'literal-via-resource-attr'
+}

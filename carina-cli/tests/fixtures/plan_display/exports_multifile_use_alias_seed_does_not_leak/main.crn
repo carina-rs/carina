@@ -1,0 +1,7 @@
+backend local { path = "carina.state.json" }
+
+let inst = foo { }
+
+exports {
+  z = foo
+}

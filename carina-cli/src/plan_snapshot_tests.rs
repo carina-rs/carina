@@ -1271,6 +1271,137 @@ fn plan_snapshot_exports_multifile() {
 }
 
 #[test]
+fn plan_snapshot_exports_multifile_let_literal() {
+    use crate::commands::plan::compute_export_diffs;
+
+    let fp = build_plan_from_fixture_name("exports_multifile_let_literal");
+
+    let export_changes = compute_export_diffs(&fp.resolved_export_params, &HashMap::new());
+    let output = strip_ansi(&format_plan(
+        &fp.plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&fp.schemas),
+        &fp.moved_origins,
+        &export_changes,
+        &[],
+        None,
+        None,
+    ));
+
+    assert!(
+        output.contains("bad_name = 'literal-via-let-chain'"),
+        "bad_name export should render the sibling let literal, got:\n{}",
+        output
+    );
+    assert!(
+        output.contains("good_name = 'literal-via-resource-attr'"),
+        "good_name export should render the sibling resource attribute, got:\n{}",
+        output
+    );
+    for line in output
+        .lines()
+        .filter(|line| line.contains("bad_name =") || line.contains("good_name ="))
+    {
+        assert!(
+            !line.contains("(known after apply)"),
+            "literal exports must not be deferred placeholders, got line: {}",
+            line
+        );
+    }
+
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn plan_snapshot_exports_multifile_bare_resource_ref_seed_stays_deferred() {
+    use crate::commands::plan::compute_export_diffs;
+
+    let fp = build_plan_from_fixture_name("exports_multifile_bare_resource_ref");
+
+    let export_changes = compute_export_diffs(&fp.resolved_export_params, &HashMap::new());
+    let output = strip_ansi(&format_plan(
+        &fp.plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&fp.schemas),
+        &fp.moved_origins,
+        &export_changes,
+        &[],
+        None,
+        None,
+    ));
+
+    assert!(
+        !output.contains("\"${resource_binding}\"")
+            && !output.contains("'${resource_binding}'")
+            && !output.contains("${resource_binding}"),
+        "bare structural let seed must not render as the parser placeholder string, got:\n{}",
+        output
+    );
+
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn plan_snapshot_exports_multifile_use_alias_seed_does_not_leak() {
+    use crate::commands::plan::compute_export_diffs;
+
+    let fp = build_plan_from_fixture_name("exports_multifile_use_alias_seed_does_not_leak");
+
+    let export_changes = compute_export_diffs(&fp.resolved_export_params, &HashMap::new());
+    let output = strip_ansi(&format_plan(
+        &fp.plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&fp.schemas),
+        &fp.moved_origins,
+        &export_changes,
+        &[],
+        None,
+        None,
+    ));
+
+    assert!(
+        !output.contains("${use:"),
+        "use-alias seed must not render the parser placeholder string, got:\n{}",
+        output
+    );
+
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn plan_snapshot_exports_multifile_string_let_attr_access_rejected() {
+    let fixture_path = PathBuf::from(format!(
+        "{}/tests/fixtures/plan_display/exports_multifile_string_let_attr_access_rejected",
+        env!("CARGO_MANIFEST_DIR")
+    ));
+    let mut parsed = load_configuration(&fixture_path).unwrap().parsed;
+    let errors = crate::commands::validate_and_resolve_errors(&mut parsed, &fixture_path, true);
+    let message = errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        !errors.is_empty(),
+        "field access on a sibling string let must be rejected"
+    );
+    assert!(
+        message.contains("'X' is not a resource, cannot access attribute 'foo'"),
+        "expected scalar field-access diagnostic naming X.foo, got:\n{}",
+        message
+    );
+    assert!(
+        !message.contains("(known after apply)"),
+        "scalar field-access rejection must not degrade to deferred output, got:\n{}",
+        message
+    );
+}
+
+#[test]
 fn plan_snapshot_export_changes_mixed() {
     use crate::commands::plan::ExportChange;
     use carina_core::parser::TypeExpr;

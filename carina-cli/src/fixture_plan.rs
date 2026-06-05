@@ -34,6 +34,7 @@ pub struct FixturePlan {
     pub moved_origins: HashMap<ResourceId, ResourceId>,
     pub deferred_for_expressions: Vec<carina_core::parser::DeferredForExpression>,
     pub export_params: Vec<carina_core::parser::InferredExportParam>,
+    pub resolved_export_params: Vec<carina_core::parser::InferredExportParam>,
     /// Per-resource user-authoring trees lifted from the fixture's
     /// `carina.state.json`. Forwarded to `format_plan` so server-side
     /// default fields the user never wrote do not surface in plan
@@ -301,6 +302,19 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         .iter()
         .map(|(from, to)| (to.clone(), from.clone()))
         .collect();
+    let export_wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
+        .wait_bindings
+        .iter()
+        .map(carina_core::binding_index::WaitAliasSpec::from)
+        .collect();
+    let resolved_export_params = crate::commands::plan::resolve_export_values_for_display(
+        &parsed.export_params,
+        &resources,
+        &parsed.compositions,
+        &data_sources_for_plan,
+        &current_states,
+        &export_wait_aliases,
+    );
 
     FixturePlan {
         plan,
@@ -309,6 +323,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         moved_origins,
         deferred_for_expressions: parsed.deferred_for_expressions,
         export_params: parsed.export_params,
+        resolved_export_params,
         prev_explicit,
         expansion_trace: parsed.expansion_trace,
     }

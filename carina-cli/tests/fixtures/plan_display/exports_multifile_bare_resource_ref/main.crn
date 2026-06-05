@@ -1,0 +1,10 @@
+provider mock {
+  region = 'test'
+}
+
+let foo = use { source = './usecase' }
+let inst = foo { }
+
+exports {
+  x = inst.x
+}

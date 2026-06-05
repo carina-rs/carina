@@ -1,0 +1,4 @@
+attributes {
+  bad_name  = bad_name
+  good_name = cluster.cluster_name
+}

@@ -226,6 +226,14 @@ plan-exports:
 	$(PLAN_FIXTURE) exports
 plan-exports-multifile:
 	$(PLAN_FIXTURE) exports_multifile
+plan-exports-multifile-let-literal:
+	$(PLAN_FIXTURE) exports_multifile_let_literal
+plan-exports-multifile-bare-resource-ref:
+	$(PLAN_FIXTURE) exports_multifile_bare_resource_ref
+plan-exports-multifile-use-alias-seed:
+	$(PLAN_FIXTURE) exports_multifile_use_alias_seed_does_not_leak
+plan-exports-multifile-string-let-attr-rejected:
+	$(PLAN_FIXTURE) exports_multifile_string_let_attr_access_rejected
 plan-policy-pretty:
 	$(PLAN_FIXTURE) policy_pretty
 plan-policy-pretty-nested:
@@ -261,7 +269,11 @@ plan-multi-instance-module:
         plan-state-blocks plan-secret-values plan-moved-with-changes plan-moved-prev-keys plan-moved-pure \
         plan-upstream-state plan-upstream-state-unresolved plan-upstream-state-empty-exports \
         plan-upstream-state-map-subscript plan-upstream-state-map-dot-notation \
-        plan-deferred-for plan-exports plan-exports-multifile plan-policy-pretty \
+        plan-deferred-for plan-exports plan-exports-multifile \
+        plan-exports-multifile-let-literal plan-exports-multifile-bare-resource-ref \
+        plan-exports-multifile-use-alias-seed \
+        plan-exports-multifile-string-let-attr-rejected \
+        plan-policy-pretty \
         plan-policy-pretty-nested plan-policy-pretty-dynamic-key-list \
         plan-list-struct-child-gutter plan-list-diff-added-struct-child-gutter \
         plan-destroy-list-struct-child-gutter \

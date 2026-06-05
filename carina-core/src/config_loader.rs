@@ -390,14 +390,17 @@ pub(crate) fn merge_parsed_file<E>(target: &mut File<E>, source: File<E>) {
 ///   legacy per-file parse — sibling-defined names are not in scope, so
 ///   ResourceRef / String fallback paths fire as before. The Pass-1
 ///   `ParsedFile`s are merged only to collect the *binding-name union*
-///   from sibling files; the merged result itself is discarded.
+///   from sibling files and the actual values for plain value-shaped
+///   `let` bindings; the merged result itself is discarded after Pass 2
+///   seeds are built.
 /// - **Pass 2** parses every input again, this time seeding the per-file
-///   `ParseContext` with the binding-name union from Pass 1. Names that
-///   originate in *sibling* files now resolve through the normal
-///   `ctx.get_variable` / `ctx.is_resource_binding` paths, so an
-///   `arguments {}` block in `main.crn` is visible from `role.crn`,
-///   a `let` declared in `helpers.crn` is visible from `main.crn`,
-///   etc.
+///   `ParseContext` with the binding-name union from Pass 1. Plain
+///   value-shaped `let` seeds use their actual Pass-1 value; structural
+///   bindings use placeholders. Names that originate in *sibling* files
+///   now resolve through the normal `ctx.get_variable` /
+///   `ctx.is_resource_binding` paths, so an `arguments {}` block in
+///   `main.crn` is visible from `role.crn`, a `let` declared in
+///   `helpers.crn` is visible from `main.crn`, etc.
 ///
 /// The returned vector preserves the input order. Any per-file parse
 /// error from Pass 2 short-circuits and is returned to the caller; Pass
@@ -420,9 +423,7 @@ pub fn parse_directory_files(
         let parsed = parser::parse(content, config)?;
         merge_parsed_file(&mut union, parsed);
     }
-    let seeds: Vec<&str> = parser::collect_known_bindings_merged(&union)
-        .into_iter()
-        .collect();
+    let seeds = parser::collect_seed_bindings_merged(&union);
 
     // Pass 2: re-parse each file with the union seeded into `ctx`.
     let mut out = Vec::with_capacity(files.len());

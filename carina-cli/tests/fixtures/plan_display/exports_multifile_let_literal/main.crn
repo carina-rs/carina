@@ -1,0 +1,13 @@
+backend local { path = "carina.state.json" }
+
+provider mock {
+  region = 'test'
+}
+
+let foo = use { source = './usecase' }
+let inst = foo { }
+
+exports {
+  bad_name = inst.bad_name
+  good_name = inst.good_name
+}
