@@ -13,6 +13,10 @@ pub mod wasm_guest;
 #[cfg(target_arch = "wasm32")]
 pub mod wasi_http;
 
+#[cfg(target_arch = "wasm32")]
+#[doc(hidden)]
+pub use futures_util;
+
 // `wasi_http_body` is compiled for every target so its pure-Rust
 // classification helpers can be unit-tested on the host. The only
 // non-test caller (`wasi_http::make_request`) is wasm32-only, so on
@@ -57,7 +61,11 @@ use carina_provider_protocol::jsonrpc::{Notification, Request, Response};
 use carina_provider_protocol::methods;
 use carina_provider_protocol::types::*;
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::{self, BufRead, Write};
+use std::pin::Pin;
+
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 /// Trait that provider authors implement.
 #[allow(clippy::result_large_err)]
@@ -89,9 +97,12 @@ pub trait CarinaProvider {
 
     /// Initialize the provider with configuration.
     /// Called once before any CRUD operations.
-    fn initialize(&mut self, attrs: &HashMap<String, Value>) -> Result<(), String> {
+    fn initialize<'a>(
+        &'a mut self,
+        attrs: &'a HashMap<String, Value>,
+    ) -> BoxFuture<'a, Result<(), String>> {
         let _ = attrs;
-        Ok(())
+        Box::pin(async { Ok(()) })
     }
 
     /// Read current state of a resource.
@@ -103,12 +114,12 @@ pub trait CarinaProvider {
     /// Encoding presence in the type — instead of using `""` as a
     /// sentinel — makes that contract enforceable at compile time
     /// (carina-rs/carina#2594 / #2596).
-    fn read(
-        &self,
-        id: &ResourceId,
-        identifier: Option<&str>,
+    fn read<'a>(
+        &'a self,
+        id: &'a ResourceId,
+        identifier: Option<&'a str>,
         request: ReadRequest,
-    ) -> Result<State, ProviderError>;
+    ) -> BoxFuture<'a, Result<State, ProviderError>>;
 
     /// Read a data source resource.
     ///
@@ -119,30 +130,37 @@ pub trait CarinaProvider {
     /// Each provider must implement this explicitly. For zero-input data
     /// sources (e.g. `aws.sts.caller_identity`), the implementation can
     /// delegate to a state-only read against `resource.id`.
-    fn read_data_source(&self, resource: &Resource) -> Result<State, ProviderError>;
+    fn read_data_source<'a>(
+        &'a self,
+        resource: &'a Resource,
+    ) -> BoxFuture<'a, Result<State, ProviderError>>;
 
     /// Create a new resource.
-    fn create(&self, id: &ResourceId, request: CreateRequest) -> Result<State, ProviderError>;
+    fn create<'a>(
+        &'a self,
+        id: &'a ResourceId,
+        request: CreateRequest,
+    ) -> BoxFuture<'a, Result<State, ProviderError>>;
 
     /// Update an existing resource.
     ///
     /// Providers MUST NOT modify any attribute that is not represented in
     /// `request.patch.ops`. The patch is the sole source of truth for the
     /// update payload.
-    fn update(
-        &self,
-        id: &ResourceId,
-        identifier: &str,
+    fn update<'a>(
+        &'a self,
+        id: &'a ResourceId,
+        identifier: &'a str,
         request: UpdateRequest,
-    ) -> Result<State, ProviderError>;
+    ) -> BoxFuture<'a, Result<State, ProviderError>>;
 
     /// Delete an existing resource.
-    fn delete(
-        &self,
-        id: &ResourceId,
-        identifier: &str,
+    fn delete<'a>(
+        &'a self,
+        id: &'a ResourceId,
+        identifier: &'a str,
         request: DeleteRequest,
-    ) -> Result<(), ProviderError>;
+    ) -> BoxFuture<'a, Result<(), ProviderError>>;
 
     /// Return provider config attribute completions.
     /// Key is attribute name (e.g., "region"), value is list of completion candidates.
@@ -291,7 +309,7 @@ fn dispatch(provider: &mut impl CarinaProvider, request: &Request) -> Response {
                 Ok(p) => p,
                 Err(e) => return Response::error(id, -32602, e),
             };
-            match provider.initialize(&params.attributes) {
+            match futures_executor::block_on(provider.initialize(&params.attributes)) {
                 Ok(()) => Response::success(id, methods::InitializeResult { ok: true }),
                 Err(e) => Response::error(id, -1, e),
             }
@@ -302,7 +320,11 @@ fn dispatch(provider: &mut impl CarinaProvider, request: &Request) -> Response {
                 Ok(p) => p,
                 Err(e) => return Response::error(id, -32602, e),
             };
-            match provider.read(&params.id, params.identifier.as_deref(), params.request) {
+            match futures_executor::block_on(provider.read(
+                &params.id,
+                params.identifier.as_deref(),
+                params.request,
+            )) {
                 Ok(state) => Response::success(id, methods::ReadResult { state }),
                 Err(e) => Response::error(id, -1, e.message),
             }
@@ -313,7 +335,7 @@ fn dispatch(provider: &mut impl CarinaProvider, request: &Request) -> Response {
                 Ok(p) => p,
                 Err(e) => return Response::error(id, -32602, e),
             };
-            match provider.create(&params.id, params.request) {
+            match futures_executor::block_on(provider.create(&params.id, params.request)) {
                 Ok(state) => Response::success(id, methods::CreateResult { state }),
                 Err(e) => Response::error(id, -1, e.message),
             }
@@ -324,7 +346,11 @@ fn dispatch(provider: &mut impl CarinaProvider, request: &Request) -> Response {
                 Ok(p) => p,
                 Err(e) => return Response::error(id, -32602, e),
             };
-            match provider.update(&params.id, &params.identifier, params.request) {
+            match futures_executor::block_on(provider.update(
+                &params.id,
+                &params.identifier,
+                params.request,
+            )) {
                 Ok(state) => Response::success(id, methods::UpdateResult { state }),
                 Err(e) => Response::error(id, -1, e.message),
             }
@@ -335,7 +361,11 @@ fn dispatch(provider: &mut impl CarinaProvider, request: &Request) -> Response {
                 Ok(p) => p,
                 Err(e) => return Response::error(id, -32602, e),
             };
-            match provider.delete(&params.id, &params.identifier, params.request) {
+            match futures_executor::block_on(provider.delete(
+                &params.id,
+                &params.identifier,
+                params.request,
+            )) {
                 Ok(()) => Response::success(id, methods::DeleteResult { ok: true }),
                 Err(e) => Response::error(id, -1, e.message),
             }

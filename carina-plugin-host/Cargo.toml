@@ -14,9 +14,9 @@ semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"
-wasmtime = { version = "43", features = ["component-model"] }
-wasmtime-wasi = "43"
-wasmtime-wasi-http = "43"
+wasmtime = { version = "45", features = ["component-model"] }
+wasmtime-wasi = "45"
+wasmtime-wasi-http = "45"
 hyper = "1"
 tokio = { version = "1", features = ["rt"] }
 # Used by the local phase-instrumented copy of `default_send_request_handler`.
@@ -25,6 +25,7 @@ tokio = { version = "1", features = ["rt"] }
 http-body-util = "0.1"
 hyper-util = { version = "0.1", features = ["tokio"] }
 rustls = "0.22"
+rustls_0_23 = { package = "rustls", version = "0.23", features = ["aws_lc_rs"] }
 tokio-rustls = "0.25"
 webpki-roots = "0.26"
 dirs = "6"
@@ -32,5 +33,7 @@ sha2 = "0.10"
 indexmap = "2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["http1", "server", "tokio"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
 tempfile = "3"
