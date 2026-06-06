@@ -585,10 +585,13 @@ fn descend_struct_field<'a>(
     // cyclic CFN struct (`WebACL.Statement -> AndStatement -> ...`)
     // can be followed across the cycle (carina#3340).
     match attr_type.shape_with_defs(defs) {
-        crate::schema::Shape::Struct { fields, .. } => fields
-            .iter()
-            .find(|f| f.name == field)
-            .map(|f| &f.field_type),
+        crate::schema::Shape::Struct { .. } => {
+            crate::schema::struct_fields_with_defs(attr_type, defs)
+                .expect("Shape::Struct must expose struct fields internally")
+                .iter()
+                .find(|f| f.name == field)
+                .map(|f| &f.field_type)
+        }
         _ => None,
     }
 }

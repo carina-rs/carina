@@ -543,7 +543,9 @@ pub fn is_type_expr_compatible_with_schema(
             // the existing `Simple → Union<String, Int>` rejection
             // (`type_compat_simple_rejected_by_mixed_string_int_union_receiver`)
             // is preserved.
-            if let Shape::Union(members) = attr_type.shape_with_defs(defs) {
+            if let Shape::Union = attr_type.shape_with_defs(defs) {
+                let members = crate::schema::union_members_with_defs(attr_type, defs)
+                    .expect("Shape::Union must expose union members internally");
                 let has_plain_string = members
                     .iter()
                     .any(|m| matches!(m.shape_with_defs(defs), Shape::String));
@@ -579,10 +581,9 @@ pub fn is_type_expr_compatible_with_schema(
         TypeExpr::Struct {
             fields: expr_fields,
         } => match attr_type.shape_with_defs(defs) {
-            Shape::Struct {
-                fields: schema_fields,
-                ..
-            } => {
+            Shape::Struct { .. } => {
+                let schema_fields = crate::schema::struct_fields_with_defs(attr_type, defs)
+                    .expect("Shape::Struct must expose struct fields internally");
                 // Bijection: every schema field must match exactly one expr
                 // field. We check schema ⇒ expr membership with equal
                 // lengths; the parser's duplicate-name rejection keeps
@@ -636,7 +637,10 @@ pub fn is_string_compatible_type(
 ) -> bool {
     match attr_type.shape_with_defs(defs) {
         Shape::String | Shape::Custom { .. } | Shape::StringEnum { .. } => true,
-        Shape::Union(types) => types.iter().all(|t| is_string_compatible_type(t, defs)),
+        Shape::Union => crate::schema::union_members_with_defs(attr_type, defs)
+            .expect("Shape::Union must expose union members internally")
+            .iter()
+            .all(|t| is_string_compatible_type(t, defs)),
         Shape::Int
         | Shape::Float
         | Shape::Bool
@@ -659,7 +663,8 @@ fn is_plain_string_or_string_union(
 ) -> bool {
     match attr_type.shape_with_defs(defs) {
         Shape::String => true,
-        Shape::Union(types) => types
+        Shape::Union => crate::schema::union_members_with_defs(attr_type, defs)
+            .expect("Shape::Union must expose union members internally")
             .iter()
             .all(|t| is_plain_string_or_string_union(t, defs)),
         Shape::Int
@@ -704,7 +709,8 @@ fn attr_type_demands_specific_custom(
             identity: Some(_), ..
         } => true,
         Shape::Custom { identity: None, .. } => false,
-        Shape::Union(types) => types
+        Shape::Union => crate::schema::union_members_with_defs(attr_type, defs)
+            .expect("Shape::Union must expose union members internally")
             .iter()
             .any(|t| attr_type_demands_specific_custom(t, defs)),
         Shape::String
@@ -1517,7 +1523,9 @@ pub(crate) fn narrow_attribute_type<'a>(
         // mismatch.
         let shape = current.shape_with_defs(defs);
         current = match (seg, shape) {
-            (PathSegment::Field { name }, Shape::Struct { fields, name: sn }) => {
+            (PathSegment::Field { name }, Shape::Struct { name: sn }) => {
+                let fields = crate::schema::struct_fields_with_defs(current, defs)
+                    .expect("Shape::Struct must expose struct fields internally");
                 let Some(field) = fields.iter().find(|f| f.name == *name) else {
                     return Err(NarrowError::UnknownStructField {
                         field: name.clone(),

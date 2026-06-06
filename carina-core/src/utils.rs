@@ -738,7 +738,14 @@ fn resolve_enum_value_recursive_projected(
     // or rejected by the bare ref-free path. The wildcard arm cannot
     // silently swallow a `Ref` because `Shape` has no `Ref` variant.
     match shape_for_projection(attr_type, defs)? {
-        crate::schema::Shape::Struct { fields, .. } => {
+        crate::schema::Shape::Struct { .. } => {
+            let fields = match defs {
+                Some(defs) => crate::schema::struct_fields_with_defs(attr_type, defs)?,
+                None => match attr_type.raw_shape() {
+                    crate::schema::RawShape::Struct { fields, .. } => fields,
+                    _ => return None,
+                },
+            };
             let Value::Concrete(ConcreteValue::Map(map)) = value else {
                 return None;
             };
@@ -1007,7 +1014,14 @@ fn lift_string_enum_leaves_projected(
     // or rejected by the bare ref-free path. The wildcard arm cannot
     // silently swallow a `Ref` because `Shape` has no `Ref` variant.
     match shape_for_projection(attr_type, defs)? {
-        crate::schema::Shape::Struct { fields, .. } => {
+        crate::schema::Shape::Struct { .. } => {
+            let fields = match defs {
+                Some(defs) => crate::schema::struct_fields_with_defs(attr_type, defs)?,
+                None => match attr_type.raw_shape() {
+                    crate::schema::RawShape::Struct { fields, .. } => fields,
+                    _ => return None,
+                },
+            };
             let Value::Concrete(ConcreteValue::Map(map)) = value else {
                 return None;
             };

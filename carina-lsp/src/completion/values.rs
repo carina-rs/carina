@@ -560,6 +560,16 @@ impl CompletionProvider {
         attr_type: &AttributeType,
         resource_type: Option<&str>,
     ) -> Vec<CompletionItem> {
+        let mut budget = carina_core::schema::ShapeWalkBudget::new(64);
+        self.completions_for_type_with_budget(attr_type, resource_type, &mut budget)
+    }
+
+    fn completions_for_type_with_budget(
+        &self,
+        attr_type: &AttributeType,
+        resource_type: Option<&str>,
+        budget: &mut carina_core::schema::ShapeWalkBudget,
+    ) -> Vec<CompletionItem> {
         let Ok(shape) = attr_type.shape_ref_free() else {
             return Vec::new();
         };
@@ -669,15 +679,23 @@ impl CompletionProvider {
                 self.availability_zone_completions(id)
             }
             // List(non-Struct): delegate to inner type completions
-            Shape::List { inner, .. } => self.completions_for_type(inner, resource_type),
+            Shape::List { inner, .. } => {
+                self.completions_for_type_with_budget(inner, resource_type, budget)
+            }
             // Map: delegate to inner value type completions
-            Shape::Map { value: inner, .. } => self.completions_for_type(inner, resource_type),
+            Shape::Map { value: inner, .. } => {
+                self.completions_for_type_with_budget(inner, resource_type, budget)
+            }
             // Union: collect completions from all member types
-            Shape::Union(members) => {
+            Shape::Union => {
+                let Ok(Some(members)) = attr_type.union_members_ref_free_with_budget(budget) else {
+                    return Vec::new();
+                };
                 let mut completions = Vec::new();
                 let mut seen_labels = std::collections::HashSet::new();
                 for member in members {
-                    for item in self.completions_for_type(member, resource_type) {
+                    for item in self.completions_for_type_with_budget(member, resource_type, budget)
+                    {
                         if seen_labels.insert(item.label.clone()) {
                             completions.push(item);
                         }
@@ -1498,7 +1516,10 @@ impl CompletionProvider {
     pub(super) fn builtin_function_completions_for_type(
         attr_type: &AttributeType,
     ) -> Vec<CompletionItem> {
-        Self::builtin_completions_matching(|ret| return_type_fits(ret, attr_type))
+        Self::builtin_completions_matching(|ret| {
+            let mut budget = carina_core::schema::ShapeWalkBudget::new(64);
+            return_type_fits(ret, attr_type, &mut budget)
+        })
     }
 
     fn builtin_completions_matching(
@@ -1974,7 +1995,11 @@ fn infer_for_binding_type(
 ///   `AttributeType` constructor. For `List` / `Map` the inner type
 ///   doesn't participate in the check — the built-in's declared element
 ///   type is unknown at this layer.
-fn return_type_fits(ret: builtins::BuiltinReturnType, attr_type: &AttributeType) -> bool {
+fn return_type_fits(
+    ret: builtins::BuiltinReturnType,
+    attr_type: &AttributeType,
+    budget: &mut carina_core::schema::ShapeWalkBudget,
+) -> bool {
     use builtins::BuiltinReturnType as R;
     // Shape's deliberate omission of a `Ref` variant lifts the
     // carina#3349 invariant (Ref must be peeled before a wildcard
@@ -1986,7 +2011,11 @@ fn return_type_fits(ret: builtins::BuiltinReturnType, attr_type: &AttributeType)
         return false;
     };
     match shape {
-        Shape::Union(members) => members.iter().any(|m| return_type_fits(ret, m)),
+        Shape::Union => attr_type
+            .union_members_ref_free_with_budget(budget)
+            .ok()
+            .flatten()
+            .is_some_and(|members| members.iter().any(|m| return_type_fits(ret, m, budget))),
         Shape::String => matches!(ret, R::String | R::Any),
         Shape::Int => matches!(ret, R::Int | R::Any),
         // No built-in currently returns a Bool; leave as unfit.

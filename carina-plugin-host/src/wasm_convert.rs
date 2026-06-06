@@ -1602,16 +1602,13 @@ mod tests {
                 assert!(!ordered, "list should be unordered");
 
                 // Union inside list
-                match inner.shape_ref_free().expect("test schema is Ref-free") {
-                    carina_core::schema::Shape::Union(members) => {
+                match inner.raw_shape() {
+                    carina_core::schema::RawShape::Union(members) => {
                         assert_eq!(members.len(), 2);
 
                         // First member: struct with block_name and provider_name on fields
-                        match members[0]
-                            .shape_ref_free()
-                            .expect("test schema is Ref-free")
-                        {
-                            carina_core::schema::Shape::Struct { name, fields } => {
+                        match members[0].raw_shape() {
+                            carina_core::schema::RawShape::Struct { name, fields } => {
                                 assert_eq!(name, "IngressRule");
                                 assert_eq!(fields.len(), 2);
 

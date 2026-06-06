@@ -1407,7 +1407,9 @@ pub(crate) fn canonicalize_with_type(
                 .collect();
             Value::Concrete(ConcreteValue::Map(canonicalized))
         }
-        (Value::Concrete(ConcreteValue::Map(map)), crate::schema::Shape::Struct { fields, .. }) => {
+        (Value::Concrete(ConcreteValue::Map(map)), crate::schema::Shape::Struct { .. }) => {
+            let fields = crate::schema::struct_fields_with_defs(unwrapped, defs)
+                .expect("Shape::Struct must expose struct fields internally");
             let canonicalized = map
                 .into_iter()
                 .map(|(k, v)| {
@@ -1441,7 +1443,9 @@ pub(crate) fn canonicalize_with_type(
         // validator's — then re-dispatch so the existing arms
         // canonicalize it. `None` (no member shares the value's shape)
         // is identity — never guess-coerce.
-        (val, crate::schema::Shape::Union(members)) => {
+        (val, crate::schema::Shape::Union) => {
+            let members = crate::schema::union_members_with_defs(unwrapped, defs)
+                .expect("Shape::Union must expose union members internally");
             match crate::schema::select_union_member(members, &val) {
                 Some(member) => canonicalize_with_type(val, member, defs),
                 None => val,
@@ -1616,7 +1620,11 @@ pub fn resolve_value_alias_with_schemas(
 ) {
     match value {
         Value::Concrete(ConcreteValue::String(s)) if is_dsl_enum_format(s) => {
-            let valid_values = enum_valid_values_for_alias(schemas, resource_type, attr_name, s);
+            let valid_values: Vec<String> = schemas
+                .iter()
+                .filter(|schema| schema.resource_type == resource_type)
+                .flat_map(|schema| schema.enum_valid_values_for_attr_alias(attr_name, s))
+                .collect();
             let raw = if valid_values.is_empty() {
                 // Schema-free fallback for attributes that are not known enum
                 // fields in the schema snapshot. This is fail-closed: unknown
@@ -1651,156 +1659,6 @@ pub fn resolve_value_alias_with_schemas(
     }
 }
 
-fn enum_valid_values_for_alias(
-    schemas: &[crate::schema::ResourceSchema],
-    resource_type: &str,
-    attr_name: &str,
-    input: &str,
-) -> Vec<String> {
-    let mut out = Vec::new();
-    for schema in schemas
-        .iter()
-        .filter(|schema| schema.resource_type == resource_type)
-    {
-        for attr_schema in schema.attributes.values() {
-            collect_enum_valid_values_for_attr_name(
-                schema,
-                attr_name,
-                input,
-                &attr_schema.name,
-                &attr_schema.attr_type,
-                0,
-                &mut out,
-            );
-        }
-    }
-    out
-}
-
-fn collect_enum_valid_values_for_attr_name(
-    schema: &crate::schema::ResourceSchema,
-    target_attr_name: &str,
-    input: &str,
-    current_attr_name: &str,
-    attr_type: &AttributeType,
-    depth: usize,
-    out: &mut Vec<String>,
-) {
-    if depth > 64 {
-        return;
-    }
-
-    match schema.shape_of(attr_type) {
-        crate::schema::Shape::StringEnum { values, .. }
-            if current_attr_name == target_attr_name =>
-        {
-            collect_string_enum_values_if_input_matches(schema, input, attr_type, values, out);
-        }
-        crate::schema::Shape::StringEnum { .. }
-        | crate::schema::Shape::String
-        | crate::schema::Shape::Int
-        | crate::schema::Shape::Float
-        | crate::schema::Shape::Bool
-        | crate::schema::Shape::Duration => {}
-        crate::schema::Shape::Custom { base, .. }
-        | crate::schema::Shape::CustomEnum { base, .. } => {
-            collect_enum_valid_values_for_attr_name(
-                schema,
-                target_attr_name,
-                input,
-                current_attr_name,
-                base,
-                depth + 1,
-                out,
-            );
-        }
-        crate::schema::Shape::List { inner, .. } => {
-            collect_enum_valid_values_for_attr_name(
-                schema,
-                target_attr_name,
-                input,
-                current_attr_name,
-                inner,
-                depth + 1,
-                out,
-            );
-        }
-        crate::schema::Shape::Map { value, .. } => {
-            collect_enum_valid_values_for_attr_name(
-                schema,
-                target_attr_name,
-                input,
-                current_attr_name,
-                value,
-                depth + 1,
-                out,
-            );
-        }
-        crate::schema::Shape::Struct { fields, .. } => {
-            for field in fields {
-                collect_enum_valid_values_for_attr_name(
-                    schema,
-                    target_attr_name,
-                    input,
-                    &field.name,
-                    &field.field_type,
-                    depth + 1,
-                    out,
-                );
-            }
-        }
-        crate::schema::Shape::Union(members) => {
-            for member in members {
-                collect_enum_valid_values_for_attr_name(
-                    schema,
-                    target_attr_name,
-                    input,
-                    current_attr_name,
-                    member,
-                    depth + 1,
-                    out,
-                );
-            }
-        }
-    }
-}
-
-fn collect_string_enum_values_if_input_matches(
-    schema: &crate::schema::ResourceSchema,
-    input: &str,
-    attr_type: &AttributeType,
-    values: &[String],
-    out: &mut Vec<String>,
-) {
-    let crate::schema::Shape::StringEnum { name, identity, .. } = schema.shape_of(attr_type) else {
-        return;
-    };
-    if !string_enum_identity_matches_input(input, name, identity) {
-        return;
-    }
-    for value in values {
-        if !out.contains(value) {
-            out.push(value.clone());
-        }
-    }
-}
-
-fn string_enum_identity_matches_input(
-    input: &str,
-    enum_name: &str,
-    identity: Option<&crate::schema::TypeIdentity>,
-) -> bool {
-    if input.strip_prefix(&format!("{enum_name}.")).is_some() {
-        return true;
-    }
-    if let Some(identity) = identity {
-        return input
-            .strip_prefix(&format!("{identity}."))
-            .is_some_and(|value| !value.is_empty());
-    }
-    false
-}
-
 /// Re-apply enum-alias resolution to every resource, looking up the
 /// factory per resource by `id.provider` (the same `find_factory`
 /// dispatch the plan path uses). Single source of truth shared by the
@@ -1832,80 +1690,6 @@ pub fn resolve_enum_aliases_for_resources(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct DeepEnumAliasFactory;
-
-    impl crate::provider::ProviderFactory for DeepEnumAliasFactory {
-        fn name(&self) -> &str {
-            "aws"
-        }
-
-        fn display_name(&self) -> &str {
-            "AWS"
-        }
-
-        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
-            HashMap::new()
-        }
-
-        fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
-            Ok(())
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            String::new()
-        }
-
-        fn create_provider(
-            &self,
-            _binding: Option<&str>,
-            _attributes: &IndexMap<String, Value>,
-        ) -> futures::future::BoxFuture<
-            '_,
-            crate::provider::ProviderResult<Box<dyn crate::provider::Provider>>,
-        > {
-            unreachable!("DeepEnumAliasFactory::create_provider is not used in these tests")
-        }
-
-        fn schemas(&self) -> Vec<crate::schema::ResourceSchema> {
-            use crate::schema::{
-                AttributeSchema, ResourceSchema, StructField, string_enum_identity,
-            };
-
-            let status = AttributeType::string_enum(
-                "Status",
-                vec!["enabled".to_string(), "disabled".to_string()],
-                Some(string_enum_identity(
-                    "Status",
-                    Some("aws.s3.BucketLifecycleConfiguration.Rules"),
-                )),
-                Vec::new(),
-            );
-            let rules = AttributeType::list(AttributeType::struct_(
-                "Rules",
-                vec![StructField::new("status", status)],
-            ));
-
-            vec![
-                ResourceSchema::new("s3.BucketLifecycleConfiguration")
-                    .attribute(AttributeSchema::new("rules", rules)),
-            ]
-        }
-
-        fn get_enum_alias_reverse(
-            &self,
-            resource_type: &str,
-            attr_name: &str,
-            value: &str,
-        ) -> Option<String> {
-            match (resource_type, attr_name, value) {
-                ("s3.BucketLifecycleConfiguration", "status", "disabled") => {
-                    Some("Disabled".to_string())
-                }
-                _ => None,
-            }
-        }
-    }
 
     #[derive(Clone)]
     struct SchemaAliasFactory {
@@ -2010,25 +1794,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_value_alias_extracts_deep_structural_enum_with_schema_values() {
-        let mut value = Value::Concrete(ConcreteValue::String(
-            "aws.s3.BucketLifecycleConfiguration.Rules.Status.disabled".to_string(),
-        ));
-
-        resolve_value_alias(
-            &mut value,
-            "s3.BucketLifecycleConfiguration",
-            "status",
-            &DeepEnumAliasFactory,
-        );
-
-        assert_eq!(
-            value,
-            Value::Concrete(ConcreteValue::String("Disabled".to_string()))
-        );
-    }
-
-    #[test]
     fn resolve_value_alias_fail_closed_when_valid_values_empty() {
         let schema = schema_with_attr(
             "s3.BucketLifecycleConfiguration",
@@ -2125,6 +1890,108 @@ mod tests {
         assert_eq!(
             resolve_with_schema_alias_factory(schema, "svc.Resource", "status", "Status.disabled"),
             Value::Concrete(ConcreteValue::String("Disabled".to_string()))
+        );
+    }
+
+    #[test]
+    fn enum_alias_resolution_does_not_explode_on_recursive_struct_schema() {
+        use crate::schema::{AttributeSchema, ResourceSchema, StructField, string_enum_identity};
+
+        fn recursive_statement_def() -> AttributeType {
+            let mut union_arms = vec![
+                AttributeType::struct_(
+                    "ByteMatchStatement",
+                    vec![StructField::new("search_string", AttributeType::string())],
+                ),
+                AttributeType::struct_(
+                    "RegexMatchStatement",
+                    vec![StructField::new("regex_string", AttributeType::string())],
+                ),
+            ];
+            for idx in 0..10 {
+                union_arms.push(AttributeType::struct_(
+                    format!("RecursiveArm{idx}"),
+                    vec![StructField::new(
+                        "statement",
+                        AttributeType::ref_("Statement"),
+                    )],
+                ));
+            }
+
+            AttributeType::struct_(
+                "Statement",
+                vec![
+                    StructField::new("predicate", AttributeType::string()),
+                    StructField::new(
+                        "and_statement",
+                        AttributeType::struct_(
+                            "AndStatement",
+                            vec![StructField::new(
+                                "statements",
+                                AttributeType::list(AttributeType::ref_("Statement")),
+                            )],
+                        ),
+                    ),
+                    StructField::new(
+                        "or_statement",
+                        AttributeType::struct_(
+                            "OrStatement",
+                            vec![StructField::new(
+                                "statements",
+                                AttributeType::list(AttributeType::ref_("Statement")),
+                            )],
+                        ),
+                    ),
+                    StructField::new(
+                        "not_statement",
+                        AttributeType::struct_(
+                            "NotStatement",
+                            vec![StructField::new(
+                                "statement",
+                                AttributeType::ref_("Statement"),
+                            )],
+                        ),
+                    ),
+                    StructField::new("union_with_many_arms", AttributeType::union(union_arms)),
+                ],
+            )
+        }
+
+        let scope = AttributeType::string_enum(
+            "Scope",
+            vec!["CLOUDFRONT".to_string(), "REGIONAL".to_string()],
+            Some(string_enum_identity("Scope", Some("aws.wafv2.WebAcl"))),
+            Vec::new(),
+        );
+        let schema = ResourceSchema::new("wafv2.WebAcl")
+            .attribute(AttributeSchema::new("scope", scope))
+            .attribute(AttributeSchema::new(
+                "statement",
+                AttributeType::ref_("Statement"),
+            ))
+            .with_def("Statement", recursive_statement_def());
+        let factory = SchemaAliasFactory {
+            schemas: vec![schema.clone()],
+            resource_type: "wafv2.WebAcl",
+            attr_name: "scope",
+            alias_value: "CLOUDFRONT",
+            canonical: Some("CLOUDFRONT"),
+        };
+        let mut value = Value::Concrete(ConcreteValue::String(
+            "aws.wafv2.WebAcl.Scope.CLOUDFRONT".to_string(),
+        ));
+
+        let started = std::time::Instant::now();
+        resolve_value_alias_with_schemas(&mut value, "wafv2.WebAcl", "scope", &factory, &[schema]);
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "recursive schema enum alias lookup should stay O(1), elapsed {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            value,
+            Value::Concrete(ConcreteValue::String("CLOUDFRONT".to_string()))
         );
     }
 

@@ -635,7 +635,9 @@ fn walk_value_against_type(
                     walk_value_against_type(v, inner, defs, exports, location, errors);
                 }
             }
-            crate::schema::Shape::Struct { fields, .. } => {
+            crate::schema::Shape::Struct { .. } => {
+                let fields = crate::schema::struct_fields_with_defs(expected, defs)
+                    .expect("Shape::Struct must expose struct fields internally");
                 // Resolve via `build_accepted_field_map` so `block_name`
                 // aliases (`field { ... }` block syntax) reach the
                 // same field as the canonical name. Without this a
