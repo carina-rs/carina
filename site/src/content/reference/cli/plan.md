@@ -37,6 +37,12 @@ carina plan --out plan.json
 carina apply plan.json
 ```
 
+If the configured backend differs from `carina-backend.lock`, `plan`
+prints a backend-drift warning, reads state from the locked old backend,
+and includes a migration-pending note before the plan summary. A saved
+plan produced in this state records the locked backend that supplied the
+state; run `carina init --migrate-state .` before applying.
+
 ### `--detailed-exitcode`
 
 Change the exit code behavior:

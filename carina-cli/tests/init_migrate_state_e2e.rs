@@ -82,24 +82,32 @@ fn init_then_backend_change_blocks_without_flag_and_migrates_with_it() {
     // 2. Refactor: the backend address changes (the issue's core case).
     write_project(project, "new.state.json");
 
-    // Bare `carina init` must REFUSE and point at --migrate-state.
+    // Bare `carina init` warns but does not migrate or rewrite the lock.
+    let lock_before = fs::read_to_string(project.join("carina-backend.lock")).unwrap();
     let out = carina(&["init", project_str]);
     assert!(
-        !out.status.success(),
-        "init must fail on backend drift without --migrate-state",
+        out.status.success(),
+        "init must warn and exit 0 on backend drift without --migrate-state.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("Backend configuration changed") && stderr.contains("--migrate-state"),
-        "drift error must name --migrate-state, got:\n{stderr}",
+        "drift warning must name --migrate-state, got:\n{stderr}",
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("carina-backend.lock")).unwrap(),
+        lock_before,
+        "init without --migrate-state must not rewrite the backend lock",
     );
     assert!(
         !project.join("new.state.json").exists(),
-        "a refused init must not create the new state file",
+        "init without --migrate-state must not create the new state file",
     );
     assert!(
         project.join("old.state.json").exists(),
-        "a refused init must not touch the old state file",
+        "init without --migrate-state must not touch the old state file",
     );
 
     // 3. `--migrate-state` moves the state and re-locks.

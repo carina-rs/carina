@@ -15,10 +15,14 @@ use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 use carina_core::value::{format_value, json_to_dsl_value};
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, LockInfo, ResourceState, StateBackend,
-    StateFile, StateUrl, create_backend, load_state_from_url, resolve_backend,
+    StateFile, StateUrl, create_backend, load_state_from_url, resolve_backend_anchored,
+    resolve_backend_for_read,
 };
 
-use super::validate_and_resolve_with_config;
+use super::{
+    BackendDriftStatus, DriftCommand, inspect_backend_drift, validate_and_resolve_with_config,
+    verify_for_mutation,
+};
 use crate::commands::shared::state_writeback::apply_name_overrides;
 use crate::error::AppError;
 use crate::wiring::{
@@ -281,10 +285,20 @@ pub async fn run_force_unlock(
         &carina_core::schema::SchemaRegistry::new(),
     )?
     .parsed;
+    let base_dir = get_base_dir(path);
 
-    let backend: Box<dyn StateBackend> = resolve_backend(parsed.backend.as_ref())
-        .await
-        .map_err(AppError::Backend)?;
+    let backend_config = match inspect_backend_drift(base_dir, parsed.backend.as_ref())? {
+        BackendDriftStatus::Drifted { existing, .. } => Some(existing.to_state_config()),
+        BackendDriftStatus::Fresh | BackendDriftStatus::Unchanged => {
+            parsed.backend.as_ref().map(StateBackendConfig::from)
+        }
+    };
+
+    // Bypasses verify_for_mutation by design. On drift, targets the OLD locked backend so users can unlock a stale migration.
+    let backend: Box<dyn StateBackend> =
+        resolve_backend_anchored(backend_config.as_ref(), base_dir)
+            .await
+            .map_err(AppError::Backend)?;
 
     println!("{}", "Force unlocking state...".yellow().bold());
     println!("Lock ID: {}", lock_id);
@@ -333,7 +347,7 @@ async fn load_state_file(
     )?;
     let parsed = loaded.parsed;
 
-    let backend: Box<dyn StateBackend> = resolve_backend(parsed.backend.as_ref())
+    let backend: Box<dyn StateBackend> = resolve_backend_for_read(parsed.backend.as_ref())
         .await
         .map_err(AppError::Backend)?;
 
@@ -735,6 +749,7 @@ async fn run_state_bucket_delete(
         }
     }
 
+    // Bypasses verify_for_mutation by design. The configured-bucket-name guard pins this to the NEW backend; for an orphaned OLD bucket, delete manually via the cloud console.
     // Create backend to get provider metadata
     let state_config = StateBackendConfig::from(backend_config);
     let backend = create_backend(&state_config)
@@ -815,8 +830,15 @@ pub async fn run_state_refresh(
     let base_dir = get_base_dir(path);
     validate_and_resolve_with_config(&mut parsed, base_dir, true)?;
 
+    let verified_backend = verify_for_mutation(
+        base_dir,
+        parsed.backend.as_ref(),
+        DriftCommand::RefreshState,
+    )?;
+
     // Create backend
-    let backend: Box<dyn StateBackend> = resolve_backend(parsed.backend.as_ref())
+    let backend: Box<dyn StateBackend> = verified_backend
+        .resolve()
         .await
         .map_err(AppError::Backend)?;
 

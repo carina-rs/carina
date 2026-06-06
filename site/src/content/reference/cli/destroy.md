@@ -30,9 +30,13 @@ Refresh state from the cloud provider before computing the destroy plan. Default
 
 Destroy even resources that have `prevent_destroy = true` in their `directives` block.
 
-### `--reconfigure`
+## Backend Drift
 
-Accept a changed backend configuration and overwrite the local backend lock. Use when the backend block in your configuration has changed since the last apply.
+Before destroying resources, Carina checks the current project backend
+against `carina-backend.lock`. If the backend changed, destroy refuses
+and points at `carina init --migrate-state .`; this prevents silently
+reading or writing state from the new backend before migration is
+explicit.
 
 ## Examples
 

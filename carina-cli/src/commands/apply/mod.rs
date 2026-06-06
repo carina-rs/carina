@@ -15,13 +15,15 @@ use carina_core::executor::{ExecutionInput, ExecutionResult};
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ReadRequest};
 use carina_core::resolver::resolve_refs_with_state_and_remote;
-use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
+#[cfg(test)]
+use carina_core::resource::ConcreteValue;
+use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::value::format_value;
-use carina_state::{LockInfo, StateBackend, StateFile, resolve_backend};
+use carina_state::{BackendLock, LockInfo, StateBackend, StateFile};
 
 use carina_core::parser::ProviderContext;
 
-use super::validate_and_resolve_with_config;
+use super::{DriftCommand, validate_and_resolve_with_config, verify_for_mutation};
 use crate::DetailLevel;
 use crate::commands::plan::PlanFile;
 use crate::commands::shared::effect_execution::{
@@ -538,7 +540,6 @@ pub async fn run_apply(
     path: &Path,
     auto_approve: bool,
     lock: bool,
-    reconfigure: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
     let loaded = load_configuration_with_config(
@@ -554,12 +555,12 @@ pub async fn run_apply(
     let ctx = WiringContext::new(factories);
     validate_and_resolve_with_config(&mut parsed, base_dir, false)?;
 
-    // Detect backend reconfiguration before touching any state
-    crate::commands::check_backend_lock(base_dir, parsed.backend.as_ref(), reconfigure)?;
+    let verified_backend =
+        verify_for_mutation(base_dir, parsed.backend.as_ref(), DriftCommand::Apply)?;
 
     // Check for backend configuration - use local backend by default
-    let backend_config = parsed.backend.as_ref();
-    let backend: Box<dyn StateBackend> = resolve_backend(backend_config)
+    let backend: Box<dyn StateBackend> = verified_backend
+        .resolve()
         .await
         .map_err(AppError::Backend)?;
 
@@ -567,7 +568,7 @@ pub async fn run_apply(
     #[allow(unused_assignments)]
     let mut lock_info: Option<LockInfo> = None;
 
-    if let Some(config) = backend_config {
+    if verified_backend.is_configured() {
         // Check if bucket exists (bootstrap detection)
         let bucket_exists = backend.bucket_exists().await.map_err(AppError::Backend)?;
 
@@ -580,13 +581,9 @@ pub async fn run_apply(
             );
 
             // Get bucket name from config
-            let bucket_name = config
-                .attributes
-                .get("bucket")
-                .and_then(|v| match v {
-                    Value::Concrete(ConcreteValue::String(s)) => Some(s.clone()),
-                    _ => None,
-                })
+            let bucket_name = verified_backend
+                .string_attribute("bucket")
+                .map(str::to_owned)
                 .ok_or("Missing bucket name in backend configuration")?;
 
             // Check if there's a bucket resource defined with matching name
@@ -641,13 +638,8 @@ pub async fn run_apply(
                 }
             } else {
                 // Auto-create the bucket if auto_create is enabled
-                let auto_create = config
-                    .attributes
-                    .get("auto_create")
-                    .and_then(|v| match v {
-                        Value::Concrete(ConcreteValue::Bool(b)) => Some(*b),
-                        _ => None,
-                    })
+                let auto_create = verified_backend
+                    .bool_attribute("auto_create")
                     .unwrap_or(true);
 
                 if auto_create {
@@ -1470,10 +1462,32 @@ async fn run_apply_locked(
     }
 }
 
+fn ensure_saved_plan_backend_matches_current(
+    plan_backend_config: Option<&carina_core::parser::BackendConfig>,
+    current_backend_config: Option<&carina_core::parser::BackendConfig>,
+) -> Result<(), AppError> {
+    let planned = BackendLock::for_config(plan_backend_config)
+        .map_err(|e| AppError::Config(format!("Failed to inspect saved plan backend: {e}")))?;
+    let current = BackendLock::for_config(current_backend_config)
+        .map_err(|e| AppError::Config(format!("Failed to inspect current backend: {e}")))?;
+
+    if planned == current {
+        Ok(())
+    } else {
+        Err(AppError::Config(format!(
+            "Saved plan backend does not match the current `backend.crn`.\n\
+             The plan file recorded one backend, but the project now declares another.\n\
+             Re-run `carina plan` to produce a fresh saved plan before applying.\n{}",
+            planned.describe_diff(&current)
+        )))
+    }
+}
+
 pub async fn run_apply_from_plan(
     plan_path: &PathBuf,
     auto_approve: bool,
     lock: bool,
+    provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
     // Read and deserialize the plan file
     let content =
@@ -1525,8 +1539,26 @@ pub async fn run_apply_from_plan(
         .cyan()
     );
 
+    let source_path = std::path::PathBuf::from(&plan_file.source_path);
+    let base_dir = get_base_dir(&source_path);
+    let current_config = load_configuration_with_config(
+        &source_path,
+        provider_context,
+        &carina_core::schema::SchemaRegistry::new(),
+    )?;
+    let verified_backend = verify_for_mutation(
+        base_dir,
+        current_config.parsed.backend.as_ref(),
+        DriftCommand::Apply,
+    )?;
+    ensure_saved_plan_backend_matches_current(
+        plan_file.backend_config.as_ref(),
+        current_config.parsed.backend.as_ref(),
+    )?;
+
     // Set up backend
-    let backend: Box<dyn StateBackend> = resolve_backend(plan_file.backend_config.as_ref())
+    let backend: Box<dyn StateBackend> = verified_backend
+        .resolve()
         .await
         .map_err(AppError::Backend)?;
 
@@ -1549,8 +1581,6 @@ pub async fn run_apply_from_plan(
         None
     };
 
-    let source_path = std::path::PathBuf::from(&plan_file.source_path);
-    let base_dir = get_base_dir(&source_path);
     let op_result = crate::signal::run_with_ctrl_c(run_apply_from_plan_locked(
         plan_file,
         auto_approve,

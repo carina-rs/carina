@@ -43,6 +43,17 @@ carina apply plan.json
 
 When applying a saved plan, Carina checks the state lineage and serial number against the current state to detect drift since the plan was created.
 
+Before applying either a live configuration or a saved plan, Carina also
+checks the current project backend against `carina-backend.lock`. If the
+backend changed, apply refuses and points at
+`carina init --migrate-state .`; this prevents silently writing state to
+the new backend before migration is explicit. Saved-plan apply re-loads
+the project's current `.crn` files from the plan's recorded source path
+before running the same gate.
+Carina also rejects a saved plan whose backend configuration differs
+from the project's current `backend.crn`; re-run `carina plan` to
+produce a fresh saved plan.
+
 ## Confirmation Flow
 
 When `--auto-approve` is not set, Carina follows this flow:

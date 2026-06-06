@@ -18,7 +18,9 @@ use carina_state::{
     create_local_backend, resolve_backend_anchored,
 };
 
-use super::validate_and_resolve_with_config;
+use super::{
+    BackendDriftStatus, drift_warning, inspect_backend_drift, validate_and_resolve_with_config,
+};
 use crate::DetailLevel;
 use crate::commands::shared::state_writeback::apply_name_overrides;
 use crate::display::{print_plan, refresh_plan_separator};
@@ -155,9 +157,16 @@ pub struct CurrentStateEntry {
 fn build_plan_file<E>(
     path: &Path,
     parsed: &carina_core::parser::File<E>,
+    backend_config: Option<BackendConfig>,
     state_file: &Option<StateFile>,
     ctx: &crate::wiring::PlanContext,
 ) -> Result<PlanFile, carina_core::value::SerializationError> {
+    let source_path = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string();
+
     Ok(PlanFile {
         // carina#3329: bumped 4→5 — `Effect::Import.identifier` is now
         // a tagged `Value`, not a plain string, so a pre-#3329 v4 plan
@@ -173,11 +182,11 @@ fn build_plan_file<E>(
         version: 5,
         carina_version: env!("CARGO_PKG_VERSION").to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
-        source_path: path.display().to_string(),
+        source_path,
         state_lineage: state_file.as_ref().map(|s| s.lineage.clone()),
         state_serial: state_file.as_ref().map(|s| s.serial),
         provider_configs: parsed.providers.clone(),
-        backend_config: parsed.backend.clone(),
+        backend_config,
         plan: redact_secrets_in_plan(&ctx.plan)?,
         sorted_resources: ctx
             .sorted_resources
@@ -222,6 +231,21 @@ fn build_plan_file<E>(
             })
             .collect(),
     })
+}
+
+/// Convert a state-layer backend config back into the parser-layer shape saved in `PlanFile`.
+///
+/// This is used only for drifted `plan --out`, where the saved plan must record
+/// the locked backend that supplied state. The input usually comes from
+/// `BackendLock::to_state_config`, whose lock-value round trip has lossy
+/// fallbacks: unsigned numbers may downcast to `i64`, null becomes `Bool(false)`,
+/// and structured values become debug strings. Current backend configs use only
+/// scalar attributes, so this is inert until a future backend adds richer attrs.
+fn parser_backend_config_from_state(config: &StateBackendConfig) -> BackendConfig {
+    BackendConfig {
+        backend_type: config.backend_type.clone(),
+        attributes: config.attributes.clone(),
+    }
 }
 
 /// Format a `SerializationError` from `build_plan_file` into the
@@ -371,7 +395,6 @@ pub async fn run_plan(
     tui: bool,
     refresh: bool,
     json: bool,
-    reconfigure: bool,
     provider_context: &ProviderContext,
 ) -> Result<bool, AppError> {
     let mut parsed = load_configuration_with_config(
@@ -384,8 +407,34 @@ pub async fn run_plan(
     let base_dir = get_base_dir(path);
     validate_and_resolve_with_config(&mut parsed, base_dir, false)?;
 
-    // Detect backend reconfiguration before touching any state
-    crate::commands::check_backend_lock(base_dir, parsed.backend.as_ref(), reconfigure)?;
+    let mut plan_backend_config = parsed.backend.as_ref().map(StateBackendConfig::from);
+    let mut plan_file_backend_config = parsed.backend.clone();
+    let mut use_locked_backend = false;
+    let drift_note = match inspect_backend_drift(base_dir, parsed.backend.as_ref())? {
+        BackendDriftStatus::Fresh => {
+            return Err(AppError::Config(
+                "Backend lock file not found. Run 'carina init' to initialize the project."
+                    .to_string(),
+            ));
+        }
+        BackendDriftStatus::Unchanged => None,
+        BackendDriftStatus::Drifted {
+            existing,
+            configured,
+        } => {
+            let warning = drift_warning(&existing, &configured);
+            eprintln!("{}", warning.yellow());
+            let locked_config = existing.to_state_config();
+            plan_file_backend_config = Some(parser_backend_config_from_state(&locked_config));
+            plan_backend_config = Some(locked_config);
+            use_locked_backend = true;
+            Some(
+                "Backend migration pending: plan read state from the OLD backend recorded in \
+                 carina-backend.lock. Run `carina init --migrate-state .` before apply."
+                    .to_string(),
+            )
+        }
+    };
 
     // Check for backend configuration and load state
     // Use local backend by default if no backend is configured
@@ -393,11 +442,14 @@ pub async fn run_plan(
     let mut state_bucket_name = String::new();
     let mut state_file: Option<StateFile> = None;
 
-    let plan_backend: Box<dyn StateBackend> = if let Some(config) = parsed.backend.as_ref() {
-        let state_config = StateBackendConfig::from(config);
-        let backend = create_backend(&state_config)
-            .await
-            .map_err(AppError::Backend)?;
+    let plan_backend: Box<dyn StateBackend> = if let Some(config) = plan_backend_config.as_ref() {
+        let backend = if use_locked_backend {
+            resolve_backend_anchored(Some(config), base_dir)
+                .await
+                .map_err(AppError::Backend)?
+        } else {
+            create_backend(config).await.map_err(AppError::Backend)?
+        };
 
         let bucket_exists = backend.bucket_exists().await.map_err(AppError::Backend)?;
 
@@ -412,6 +464,13 @@ pub async fn run_plan(
                 .await
                 .map_err(AppError::Backend)?
                 .map(|loaded| loaded.into_state());
+        } else if use_locked_backend {
+            return Err(AppError::Config(
+                "Locked backend recorded in carina-backend.lock no longer exists. \
+                 Restore the old state backend or revert backend.crn to match the lock before \
+                 planning this migration."
+                    .to_string(),
+            ));
         } else {
             // Check if there's a matching s3_bucket resource defined
             let bucket_name = config
@@ -623,11 +682,20 @@ pub async fn run_plan(
         .collect();
 
     if json {
+        if let Some(note) = drift_note.as_ref() {
+            eprintln!("{}", note.yellow());
+        }
         // `build_plan_file` propagates `SerializationError` so the user
         // sees an actionable diagnostic (which upstream / for-binding
         // is unresolved) instead of a panic backtrace.
-        let plan_file = build_plan_file(path, &parsed, &state_file, &ctx)
-            .map_err(|e| format_plan_save_error(&e, "--json"))?;
+        let plan_file = build_plan_file(
+            path,
+            &parsed,
+            plan_file_backend_config.clone(),
+            &state_file,
+            &ctx,
+        )
+        .map_err(|e| format_plan_save_error(&e, "--json"))?;
         let json_str = serde_json::to_string_pretty(&plan_file)
             .map_err(|e| format!("Failed to serialize plan: {}", e))?;
         println!("{}", json_str);
@@ -658,6 +726,10 @@ pub async fn run_plan(
         // from the plan's terminal section so they don't read as a run-on
         // (#3148).
         print!("{}", refresh_plan_separator(refresh));
+        if let Some(note) = drift_note.as_ref() {
+            println!("{}", note.yellow());
+            println!();
+        }
         print_plan(
             &ctx.plan,
             detail,
@@ -673,8 +745,14 @@ pub async fn run_plan(
 
     // Save plan to file if --out was specified
     if let Some(out_path) = out {
-        let plan_file = build_plan_file(path, &parsed, &state_file, &ctx)
-            .map_err(|e| format_plan_save_error(&e, "--out"))?;
+        let plan_file = build_plan_file(
+            path,
+            &parsed,
+            plan_file_backend_config.clone(),
+            &state_file,
+            &ctx,
+        )
+        .map_err(|e| format_plan_save_error(&e, "--out"))?;
         let json_out = carina_core::utils::pretty_with_newline(&plan_file)
             .map_err(|e| format!("Failed to serialize plan: {}", e))?;
         fs::write(out_path, json_out).map_err(|e| format!("Failed to write plan file: {}", e))?;
@@ -1463,7 +1541,6 @@ exports { region: String = "ap-northeast-1" }"#,
             false,
             false,
             true,
-            false,
             &ProviderContext::default(),
         )
         .await
@@ -1524,7 +1601,6 @@ mod run_plan_out_tests {
             false,
             false,
             true,
-            false,
             &ProviderContext::default(),
         )
         .await
