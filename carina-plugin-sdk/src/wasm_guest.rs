@@ -101,10 +101,10 @@ macro_rules! export_provider {
 
             use carina::provider::types as wit_types;
 
-            fn get_provider() -> &'static ::std::sync::Mutex<$provider_type> {
-                static PROVIDER: ::std::sync::OnceLock<::std::sync::Mutex<$provider_type>> =
+            fn get_provider() -> &'static $crate::futures_util::lock::Mutex<$provider_type> {
+                static PROVIDER: ::std::sync::OnceLock<$crate::futures_util::lock::Mutex<$provider_type>> =
                     ::std::sync::OnceLock::new();
-                PROVIDER.get_or_init(|| ::std::sync::Mutex::new(<$provider_type>::default()))
+                PROVIDER.get_or_init(|| $crate::futures_util::lock::Mutex::new(<$provider_type>::default()))
             }
 
             fn wit_to_proto_resource_id(id: &wit_types::ResourceId) -> proto::ResourceId {
@@ -342,7 +342,9 @@ macro_rules! export_provider {
 
             impl exports::carina::provider::provider::Guest for WasmGuest {
                 fn info() -> String {
-                    let provider = get_provider().lock().unwrap();
+                    let provider = get_provider()
+                        .try_lock()
+                        .expect("provider state is already borrowed by an async export");
                     let info = $crate::CarinaProvider::info(&*provider);
                     let envelope = $crate::protocol::types::ProviderInfoEnvelope {
                         info,
@@ -352,13 +354,17 @@ macro_rules! export_provider {
                 }
 
                 fn schemas() -> String {
-                    let provider = get_provider().lock().unwrap();
+                    let provider = get_provider()
+                        .try_lock()
+                        .expect("provider state is already borrowed by an async export");
                     let schemas = $crate::CarinaProvider::schemas(&*provider);
                     serde_json::to_string(&schemas).unwrap_or_else(|_| "[]".to_string())
                 }
 
                 fn provider_config_attribute_types() -> String {
-                    let provider = get_provider().lock().unwrap();
+                    let provider = get_provider()
+                        .try_lock()
+                        .expect("provider state is already borrowed by an async export");
                     let types = $crate::CarinaProvider::provider_config_attribute_types(
                         &*provider,
                     );
@@ -368,109 +374,122 @@ macro_rules! export_provider {
                 fn validate_config(
                     attrs: Vec<(String, wit_types::Value)>,
                 ) -> Result<(), wit_types::ProviderError> {
-                    let provider = get_provider().lock().unwrap();
+                    let provider = get_provider()
+                        .try_lock()
+                        .expect("provider state is already borrowed by an async export");
                     let map = wit_to_proto_value_map(&attrs);
                     $crate::CarinaProvider::validate_config(&*provider, &map)
                         .map_err(validate_string_to_provider_error)
                 }
 
-                fn initialize(
+                async fn initialize(
                     attrs: Vec<(String, wit_types::Value)>,
                 ) -> Result<(), wit_types::ProviderError> {
-                    let mut provider = get_provider().lock().unwrap();
                     let map = wit_to_proto_value_map(&attrs);
+                    let mut provider = get_provider().lock().await;
                     $crate::CarinaProvider::initialize(&mut *provider, &map)
+                        .await
                         .map_err(validate_string_to_provider_error)
                 }
 
-                fn read(
+                async fn read(
                     id: wit_types::ResourceId,
                     identifier: Option<String>,
                     _request: wit_types::ReadRequest,
                 ) -> Result<wit_types::State, wit_types::ProviderError> {
-                    let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
+                    let provider = get_provider().lock().await;
                     match $crate::CarinaProvider::read(
                         &*provider,
                         &proto_id,
                         identifier.as_deref(),
                         proto::ReadRequest,
-                    ) {
+                    )
+                    .await
+                    {
                         Ok(state) => Ok(proto_to_wit_state(&state)),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
 
-                fn read_data_source(
+                async fn read_data_source(
                     res: wit_types::ResourceDef,
                 ) -> Result<wit_types::State, wit_types::ProviderError> {
-                    let provider = get_provider().lock().unwrap();
                     let proto_res = wit_to_proto_resource(&res);
-                    match $crate::CarinaProvider::read_data_source(&*provider, &proto_res) {
+                    let provider = get_provider().lock().await;
+                    match $crate::CarinaProvider::read_data_source(&*provider, &proto_res).await {
                         Ok(state) => Ok(proto_to_wit_state(&state)),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
 
-                fn create(
+                async fn create(
                     id: wit_types::ResourceId,
                     request: wit_types::CreateRequest,
                 ) -> Result<wit_types::State, wit_types::ProviderError> {
-                    let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
                     let proto_request = wit_to_proto_create_request(request);
-                    match $crate::CarinaProvider::create(&*provider, &proto_id, proto_request) {
+                    let provider = get_provider().lock().await;
+                    match $crate::CarinaProvider::create(&*provider, &proto_id, proto_request).await {
                         Ok(state) => Ok(proto_to_wit_state(&state)),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
 
-                fn update(
+                async fn update(
                     id: wit_types::ResourceId,
                     identifier: String,
                     request: wit_types::UpdateRequest,
                 ) -> Result<wit_types::State, wit_types::ProviderError> {
-                    let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
                     let proto_request = wit_to_proto_update_request(request, &proto_id);
+                    let provider = get_provider().lock().await;
                     match $crate::CarinaProvider::update(
                         &*provider,
                         &proto_id,
                         &identifier,
                         proto_request,
-                    ) {
+                    )
+                    .await
+                    {
                         Ok(state) => Ok(proto_to_wit_state(&state)),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
 
-                fn delete(
+                async fn delete(
                     id: wit_types::ResourceId,
                     identifier: String,
                     request: wit_types::DeleteRequest,
                 ) -> Result<(), wit_types::ProviderError> {
-                    let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
                     let proto_request = wit_to_proto_delete_request(request);
+                    let provider = get_provider().lock().await;
                     match $crate::CarinaProvider::delete(
                         &*provider,
                         &proto_id,
                         &identifier,
                         proto_request,
-                    ) {
+                    )
+                    .await
+                    {
                         Ok(()) => Ok(()),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
 
                 fn provider_config_completions() -> String {
-                    let provider = get_provider().lock().unwrap();
+                    let provider = get_provider()
+                        .try_lock()
+                        .expect("provider state is already borrowed by an async export");
                     let completions = $crate::CarinaProvider::config_completions(&*provider);
                     serde_json::to_string(&completions).unwrap_or_else(|_| "{}".to_string())
                 }
 
                 fn identity_attributes() -> Vec<String> {
-                    let provider = get_provider().lock().unwrap();
+                    let provider = get_provider()
+                        .try_lock()
+                        .expect("provider state is already borrowed by an async export");
                     $crate::CarinaProvider::identity_attributes(&*provider)
                 }
 
@@ -478,7 +497,9 @@ macro_rules! export_provider {
                     ty: wit_types::TypeIdentity,
                     value: String,
                 ) -> Result<(), wit_types::ProviderError> {
-                    let provider = get_provider().lock().unwrap();
+                    let provider = get_provider()
+                        .try_lock()
+                        .expect("provider state is already borrowed by an async export");
                     $crate::CarinaProvider::validate_custom_type(
                         &*provider,
                         &wit_to_proto_type_identity(&ty),
@@ -488,7 +509,9 @@ macro_rules! export_provider {
                 }
 
                 fn get_enum_aliases() -> String {
-                    let provider = get_provider().lock().unwrap();
+                    let provider = get_provider()
+                        .try_lock()
+                        .expect("provider state is already borrowed by an async export");
                     let aliases = $crate::CarinaProvider::enum_aliases(&*provider);
                     serde_json::to_string(&aliases).unwrap_or_else(|_| "{}".to_string())
                 }
@@ -496,7 +519,9 @@ macro_rules! export_provider {
                 fn normalize_desired(
                     resources: Vec<wit_types::ResourceDef>,
                 ) -> Vec<wit_types::ResourceDef> {
-                    let provider = get_provider().lock().unwrap();
+                    let provider = get_provider()
+                        .try_lock()
+                        .expect("provider state is already borrowed by an async export");
                     let proto_resources: Vec<_> =
                         resources.iter().map(wit_to_proto_resource).collect();
                     let result =
@@ -507,7 +532,9 @@ macro_rules! export_provider {
                 fn normalize_state(
                     states: Vec<(String, wit_types::State)>,
                 ) -> Vec<(String, wit_types::State)> {
-                    let provider = get_provider().lock().unwrap();
+                    let provider = get_provider()
+                        .try_lock()
+                        .expect("provider state is already borrowed by an async export");
                     let proto_states: HashMap<_, _> = states
                         .iter()
                         .map(|(k, s)| {
@@ -527,7 +554,9 @@ macro_rules! export_provider {
                     states: Vec<(String, wit_types::State)>,
                     saved_attrs: Vec<(String, Vec<(String, wit_types::Value)>)>,
                 ) -> Vec<(String, wit_types::State)> {
-                    let provider = get_provider().lock().unwrap();
+                    let provider = get_provider()
+                        .try_lock()
+                        .expect("provider state is already borrowed by an async export");
                     let mut proto_states: HashMap<String, proto::State> = states
                         .iter()
                         .map(|(k, s)| {
@@ -554,7 +583,9 @@ macro_rules! export_provider {
                     resources: Vec<wit_types::ResourceDef>,
                     default_tags: Vec<(String, wit_types::Value)>,
                 ) -> Vec<wit_types::ResourceDef> {
-                    let provider = get_provider().lock().unwrap();
+                    let provider = get_provider()
+                        .try_lock()
+                        .expect("provider state is already borrowed by an async export");
                     let mut proto_resources: Vec<_> =
                         resources.iter().map(wit_to_proto_resource).collect();
                     let proto_tags: HashMap<String, proto::Value> = default_tags
@@ -590,10 +621,10 @@ macro_rules! export_provider {
             // Type aliases for the generated types
             use carina::provider::types as wit_types;
 
-            fn get_provider() -> &'static ::std::sync::Mutex<$provider_type> {
-                static PROVIDER: ::std::sync::OnceLock<::std::sync::Mutex<$provider_type>> =
+            fn get_provider() -> &'static $crate::futures_util::lock::Mutex<$provider_type> {
+                static PROVIDER: ::std::sync::OnceLock<$crate::futures_util::lock::Mutex<$provider_type>> =
                     ::std::sync::OnceLock::new();
-                PROVIDER.get_or_init(|| ::std::sync::Mutex::new(<$provider_type>::default()))
+                PROVIDER.get_or_init(|| $crate::futures_util::lock::Mutex::new(<$provider_type>::default()))
             }
 
             // -- WIT <-> proto conversion functions --
@@ -837,7 +868,9 @@ macro_rules! export_provider {
 
             impl exports::carina::provider::provider::Guest for WasmGuest {
                 fn info() -> String {
-                    let provider = get_provider().lock().unwrap();
+                    let provider = get_provider()
+                        .try_lock()
+                        .expect("provider state is already borrowed by an async export");
                     let info = $crate::CarinaProvider::info(&*provider);
                     let envelope = $crate::protocol::types::ProviderInfoEnvelope {
                         info,
@@ -847,13 +880,17 @@ macro_rules! export_provider {
                 }
 
                 fn schemas() -> String {
-                    let provider = get_provider().lock().unwrap();
+                    let provider = get_provider()
+                        .try_lock()
+                        .expect("provider state is already borrowed by an async export");
                     let schemas = $crate::CarinaProvider::schemas(&*provider);
                     serde_json::to_string(&schemas).unwrap_or_else(|_| "[]".to_string())
                 }
 
                 fn provider_config_attribute_types() -> String {
-                    let provider = get_provider().lock().unwrap();
+                    let provider = get_provider()
+                        .try_lock()
+                        .expect("provider state is already borrowed by an async export");
                     let types = $crate::CarinaProvider::provider_config_attribute_types(
                         &*provider,
                     );
@@ -863,109 +900,122 @@ macro_rules! export_provider {
                 fn validate_config(
                     attrs: Vec<(String, wit_types::Value)>,
                 ) -> Result<(), wit_types::ProviderError> {
-                    let provider = get_provider().lock().unwrap();
+                    let provider = get_provider()
+                        .try_lock()
+                        .expect("provider state is already borrowed by an async export");
                     let map = wit_to_proto_value_map(&attrs);
                     $crate::CarinaProvider::validate_config(&*provider, &map)
                         .map_err(validate_string_to_provider_error)
                 }
 
-                fn initialize(
+                async fn initialize(
                     attrs: Vec<(String, wit_types::Value)>,
                 ) -> Result<(), wit_types::ProviderError> {
-                    let mut provider = get_provider().lock().unwrap();
                     let map = wit_to_proto_value_map(&attrs);
+                    let mut provider = get_provider().lock().await;
                     $crate::CarinaProvider::initialize(&mut *provider, &map)
+                        .await
                         .map_err(validate_string_to_provider_error)
                 }
 
-                fn read(
+                async fn read(
                     id: wit_types::ResourceId,
                     identifier: Option<String>,
                     _request: wit_types::ReadRequest,
                 ) -> Result<wit_types::State, wit_types::ProviderError> {
-                    let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
+                    let provider = get_provider().lock().await;
                     match $crate::CarinaProvider::read(
                         &*provider,
                         &proto_id,
                         identifier.as_deref(),
                         proto::ReadRequest,
-                    ) {
+                    )
+                    .await
+                    {
                         Ok(state) => Ok(proto_to_wit_state(&state)),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
 
-                fn read_data_source(
+                async fn read_data_source(
                     res: wit_types::ResourceDef,
                 ) -> Result<wit_types::State, wit_types::ProviderError> {
-                    let provider = get_provider().lock().unwrap();
                     let proto_res = wit_to_proto_resource(&res);
-                    match $crate::CarinaProvider::read_data_source(&*provider, &proto_res) {
+                    let provider = get_provider().lock().await;
+                    match $crate::CarinaProvider::read_data_source(&*provider, &proto_res).await {
                         Ok(state) => Ok(proto_to_wit_state(&state)),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
 
-                fn create(
+                async fn create(
                     id: wit_types::ResourceId,
                     request: wit_types::CreateRequest,
                 ) -> Result<wit_types::State, wit_types::ProviderError> {
-                    let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
                     let proto_request = wit_to_proto_create_request(request);
-                    match $crate::CarinaProvider::create(&*provider, &proto_id, proto_request) {
+                    let provider = get_provider().lock().await;
+                    match $crate::CarinaProvider::create(&*provider, &proto_id, proto_request).await {
                         Ok(state) => Ok(proto_to_wit_state(&state)),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
 
-                fn update(
+                async fn update(
                     id: wit_types::ResourceId,
                     identifier: String,
                     request: wit_types::UpdateRequest,
                 ) -> Result<wit_types::State, wit_types::ProviderError> {
-                    let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
                     let proto_request = wit_to_proto_update_request(request, &proto_id);
+                    let provider = get_provider().lock().await;
                     match $crate::CarinaProvider::update(
                         &*provider,
                         &proto_id,
                         &identifier,
                         proto_request,
-                    ) {
+                    )
+                    .await
+                    {
                         Ok(state) => Ok(proto_to_wit_state(&state)),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
 
-                fn delete(
+                async fn delete(
                     id: wit_types::ResourceId,
                     identifier: String,
                     request: wit_types::DeleteRequest,
                 ) -> Result<(), wit_types::ProviderError> {
-                    let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
                     let proto_request = wit_to_proto_delete_request(request);
+                    let provider = get_provider().lock().await;
                     match $crate::CarinaProvider::delete(
                         &*provider,
                         &proto_id,
                         &identifier,
                         proto_request,
-                    ) {
+                    )
+                    .await
+                    {
                         Ok(()) => Ok(()),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
 
                 fn provider_config_completions() -> String {
-                    let provider = get_provider().lock().unwrap();
+                    let provider = get_provider()
+                        .try_lock()
+                        .expect("provider state is already borrowed by an async export");
                     let completions = $crate::CarinaProvider::config_completions(&*provider);
                     serde_json::to_string(&completions).unwrap_or_else(|_| "{}".to_string())
                 }
 
                 fn identity_attributes() -> Vec<String> {
-                    let provider = get_provider().lock().unwrap();
+                    let provider = get_provider()
+                        .try_lock()
+                        .expect("provider state is already borrowed by an async export");
                     $crate::CarinaProvider::identity_attributes(&*provider)
                 }
 
@@ -973,7 +1023,9 @@ macro_rules! export_provider {
                     ty: wit_types::TypeIdentity,
                     value: String,
                 ) -> Result<(), wit_types::ProviderError> {
-                    let provider = get_provider().lock().unwrap();
+                    let provider = get_provider()
+                        .try_lock()
+                        .expect("provider state is already borrowed by an async export");
                     $crate::CarinaProvider::validate_custom_type(
                         &*provider,
                         &wit_to_proto_type_identity(&ty),
@@ -983,7 +1035,9 @@ macro_rules! export_provider {
                 }
 
                 fn get_enum_aliases() -> String {
-                    let provider = get_provider().lock().unwrap();
+                    let provider = get_provider()
+                        .try_lock()
+                        .expect("provider state is already borrowed by an async export");
                     let aliases = $crate::CarinaProvider::enum_aliases(&*provider);
                     serde_json::to_string(&aliases).unwrap_or_else(|_| "{}".to_string())
                 }
@@ -991,7 +1045,9 @@ macro_rules! export_provider {
                 fn normalize_desired(
                     resources: Vec<wit_types::ResourceDef>,
                 ) -> Vec<wit_types::ResourceDef> {
-                    let provider = get_provider().lock().unwrap();
+                    let provider = get_provider()
+                        .try_lock()
+                        .expect("provider state is already borrowed by an async export");
                     let proto_resources: Vec<_> =
                         resources.iter().map(wit_to_proto_resource).collect();
                     let result =
@@ -1002,7 +1058,9 @@ macro_rules! export_provider {
                 fn normalize_state(
                     states: Vec<(String, wit_types::State)>,
                 ) -> Vec<(String, wit_types::State)> {
-                    let provider = get_provider().lock().unwrap();
+                    let provider = get_provider()
+                        .try_lock()
+                        .expect("provider state is already borrowed by an async export");
                     let proto_states: HashMap<_, _> = states
                         .iter()
                         .map(|(k, s)| {
@@ -1022,7 +1080,9 @@ macro_rules! export_provider {
                     states: Vec<(String, wit_types::State)>,
                     saved_attrs: Vec<(String, Vec<(String, wit_types::Value)>)>,
                 ) -> Vec<(String, wit_types::State)> {
-                    let provider = get_provider().lock().unwrap();
+                    let provider = get_provider()
+                        .try_lock()
+                        .expect("provider state is already borrowed by an async export");
                     let mut proto_states: HashMap<String, proto::State> = states
                         .iter()
                         .map(|(k, s)| {
@@ -1049,7 +1109,9 @@ macro_rules! export_provider {
                     resources: Vec<wit_types::ResourceDef>,
                     default_tags: Vec<(String, wit_types::Value)>,
                 ) -> Vec<wit_types::ResourceDef> {
-                    let provider = get_provider().lock().unwrap();
+                    let provider = get_provider()
+                        .try_lock()
+                        .expect("provider state is already borrowed by an async export");
                     let mut proto_resources: Vec<_> =
                         resources.iter().map(wit_to_proto_resource).collect();
                     let proto_tags: HashMap<String, proto::Value> = default_tags

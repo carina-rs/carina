@@ -1,7 +1,11 @@
 //! Integration tests: load MockProvider .wasm via WasmProviderFactory and perform CRUD.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use carina_core::provider::{
     CreateRequest, DeleteRequest, PatchOp, PatchOpKind, Provider, ProviderFactory, ReadRequest,
@@ -9,6 +13,11 @@ use carina_core::provider::{
 };
 use carina_core::resource::{ConcreteValue, DataSource, Resource, ResourceId, Value};
 use carina_plugin_host::WasmProviderFactory;
+use http_body_util::Full;
+use hyper::body::{Bytes, Incoming};
+use hyper::service::service_fn;
+use hyper::{Request, Response};
+use hyper_util::rt::TokioIo;
 
 fn wasm_path() -> Option<PathBuf> {
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
@@ -20,6 +29,30 @@ fn wasm_path() -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn wasm_path_or_build() -> PathBuf {
+    if let Some(path) = wasm_path() {
+        return path;
+    }
+
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let status = std::process::Command::new(env!("CARGO"))
+        .current_dir(&workspace_root)
+        .env("RUSTC_WRAPPER", "")
+        .env("RUSTC_WORKSPACE_WRAPPER", "")
+        .args([
+            "build",
+            "-p",
+            "carina-provider-mock",
+            "--target",
+            "wasm32-wasip2",
+        ])
+        .status()
+        .expect("failed to build mock WASM provider");
+    assert!(status.success(), "mock WASM provider build failed");
+
+    wasm_path().expect("mock WASM provider build did not produce a .wasm fixture")
 }
 
 macro_rules! skip_if_no_wasm {
@@ -50,6 +83,107 @@ async fn load_factory(wasm: &std::path::Path) -> (WasmProviderFactory, tempfile:
         .await
         .expect("Failed to load WASM provider");
     (factory, cache)
+}
+
+async fn start_http_server_with_delay(
+    response_delay: std::time::Duration,
+) -> std::io::Result<(SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>)> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+    let addr = listener.local_addr().expect("read test server address");
+    let requests = Arc::new(AtomicUsize::new(0));
+    let request_counter = Arc::clone(&requests);
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _peer)) = listener.accept().await else {
+                break;
+            };
+            let request_counter = Arc::clone(&request_counter);
+            tokio::spawn(async move {
+                let service = service_fn(move |_req: Request<Incoming>| {
+                    let request_counter = Arc::clone(&request_counter);
+                    let response_delay = response_delay;
+                    async move {
+                        request_counter.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(response_delay).await;
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                    }
+                });
+                let io = TokioIo::new(stream);
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, service)
+                    .await;
+            });
+        }
+    });
+
+    Ok((addr, requests, handle))
+}
+
+async fn run_multi_instance_wasi_http_initialize(
+    shape: &str,
+    instances: usize,
+    requests_each: usize,
+    concurrency: usize,
+    timeout: std::time::Duration,
+) {
+    let path = wasm_path_or_build();
+    let (server_addr, requests, server_handle) =
+        match start_http_server_with_delay(std::time::Duration::from_millis(100)).await {
+            Ok(server) => server,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("SKIP: sandbox does not permit binding localhost HTTP test server: {e}");
+                return;
+            }
+            Err(e) => panic!("bind localhost HTTP test server: {e}"),
+        };
+
+    // The production allow-list stays closed to localhost. These tests opt in
+    // so the mock guest can exercise wasi:http against a loopback server.
+    unsafe {
+        std::env::set_var("CARINA_WASI_HTTP_ALLOW_LOCALHOST", "1");
+    }
+
+    let (factory, _cache) = load_factory(&path).await;
+    let attrs = indexmap::IndexMap::from([
+        (
+            "__mock_initialize_http_url".to_string(),
+            Value::Concrete(ConcreteValue::String(format!("http://{server_addr}/init"))),
+        ),
+        (
+            "__mock_initialize_http_requests".to_string(),
+            Value::Concrete(ConcreteValue::Int(requests_each as i64)),
+        ),
+        (
+            "__mock_initialize_http_concurrency".to_string(),
+            Value::Concrete(ConcreteValue::Int(concurrency as i64)),
+        ),
+        (
+            "__mock_initialize_http_shape".to_string(),
+            Value::Concrete(ConcreteValue::String(shape.to_string())),
+        ),
+    ]);
+
+    let bindings = ["default", "us", "management", "awscc", "awscc_us"];
+    for binding in bindings.iter().copied().take(instances) {
+        tokio::time::timeout(timeout, factory.create_provider(Some(binding), &attrs))
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "provider binding {binding} did not initialize within {}s \
+                     (shape={shape}, instances={instances}, requests_each={requests_each}, concurrency={concurrency})",
+                    timeout.as_secs()
+                )
+            })
+            .unwrap_or_else(|e| panic!("provider binding {binding} failed to initialize: {e}"));
+    }
+
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        instances * requests_each,
+        "{instances} initialized instances should each issue {requests_each} HTTP requests"
+    );
+    server_handle.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -144,6 +278,70 @@ async fn test_wasm_mock_provider_create_and_read() {
         read_state.attributes.get("count"),
         Some(&Value::Concrete(ConcreteValue::Int(42)))
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_instance_wasi_http_initialize_sequential_completes_bounded() {
+    run_multi_instance_wasi_http_initialize(
+        "sequential",
+        5,
+        16,
+        1,
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "carina#3400 repro candidate: run explicitly to confirm whether concurrent guest wasi:http initialize livelocks"]
+async fn multi_instance_wasi_http_initialize_concurrent_repro_candidate_times_out() {
+    run_multi_instance_wasi_http_initialize(
+        "poll-batch",
+        5,
+        16,
+        16,
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "carina#3400 Stage C AWS-SDK-shape candidate: run explicitly"]
+async fn multi_instance_wasi_http_initialize_tokio_join_shape_times_out() {
+    run_multi_instance_wasi_http_initialize(
+        "tokio-join",
+        5,
+        16,
+        4,
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "carina#3400 Stage C AWS-SDK-shape candidate: run explicitly"]
+async fn multi_instance_wasi_http_initialize_spawn_await_shape_times_out() {
+    run_multi_instance_wasi_http_initialize(
+        "spawn-await",
+        5,
+        8,
+        2,
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "carina#3400 Stage C AWS-SDK-shape candidate: run explicitly"]
+async fn multi_instance_wasi_http_initialize_sleep_interleave_shape_times_out() {
+    run_multi_instance_wasi_http_initialize(
+        "sleep-interleave",
+        5,
+        16,
+        4,
+        std::time::Duration::from_secs(30),
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
