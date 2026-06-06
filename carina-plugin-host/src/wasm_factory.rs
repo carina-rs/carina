@@ -90,17 +90,8 @@ const HTTP_API_REQUEST_TIMEOUT: std::time::Duration =
 fn build_engine_config() -> wasmtime::Config {
     let mut config = wasmtime::Config::new();
     config.wasm_component_model(true);
-    config.wasm_component_model_async(true);
     config.epoch_interruption(true);
     config
-}
-
-/// Install the rustls 0.23 process-wide provider required by wasmtime-wasi-http 45.
-fn install_default_rustls_crypto_provider() {
-    static INSTALL: OnceLock<()> = OnceLock::new();
-    INSTALL.get_or_init(|| {
-        let _ = rustls_0_23::crypto::aws_lc_rs::default_provider().install_default();
-    });
 }
 
 /// Background thread that increments a wasmtime Engine's epoch once per second.
@@ -307,16 +298,6 @@ fn is_host_allowed(host: &str) -> bool {
         || HTTP_ALLOWED_HOST_SUFFIXES
             .iter()
             .any(|suffix| h.ends_with(suffix))
-        || (localhost_http_allowed_for_tests() && matches!(h, "localhost" | "127.0.0.1" | "::1"))
-}
-
-fn localhost_http_allowed_for_tests() -> bool {
-    static RESULT: OnceLock<bool> = OnceLock::new();
-    *RESULT.get_or_init(|| {
-        std::env::var("CARINA_WASI_HTTP_ALLOW_LOCALHOST")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    })
 }
 
 /// Returns `true` if the host is a metadata service endpoint (EC2 IMDS or ECS).
@@ -761,20 +742,18 @@ impl WasmBindings {
         store: &mut Store<HostState>,
         attrs: &[(String, wit_types::Value)],
     ) -> wasmtime::Result<Result<(), wit_types::ProviderError>> {
-        store
-            .run_concurrent(async |accessor| match self {
-                WasmBindings::Basic(b) => {
-                    b.carina_provider_provider()
-                        .call_initialize(accessor, attrs.to_vec())
-                        .await
-                }
-                WasmBindings::Http(b) => {
-                    b.carina_provider_provider()
-                        .call_initialize(accessor, attrs.to_vec())
-                        .await
-                }
-            })
-            .await?
+        match self {
+            WasmBindings::Basic(b) => {
+                b.carina_provider_provider()
+                    .call_initialize(store, attrs)
+                    .await
+            }
+            WasmBindings::Http(b) => {
+                b.carina_provider_provider()
+                    .call_initialize(store, attrs)
+                    .await
+            }
+        }
     }
 
     async fn call_read(
@@ -784,30 +763,18 @@ impl WasmBindings {
         identifier: Option<&str>,
         request: wit_types::ReadRequest,
     ) -> wasmtime::Result<Result<wit_types::State, wit_types::ProviderError>> {
-        store
-            .run_concurrent(async |accessor| match self {
-                WasmBindings::Basic(b) => {
-                    b.carina_provider_provider()
-                        .call_read(
-                            accessor,
-                            id.clone(),
-                            identifier.map(str::to_string),
-                            request,
-                        )
-                        .await
-                }
-                WasmBindings::Http(b) => {
-                    b.carina_provider_provider()
-                        .call_read(
-                            accessor,
-                            id.clone(),
-                            identifier.map(str::to_string),
-                            request,
-                        )
-                        .await
-                }
-            })
-            .await?
+        match self {
+            WasmBindings::Basic(b) => {
+                b.carina_provider_provider()
+                    .call_read(store, id, identifier, request)
+                    .await
+            }
+            WasmBindings::Http(b) => {
+                b.carina_provider_provider()
+                    .call_read(store, id, identifier, request)
+                    .await
+            }
+        }
     }
 
     async fn call_read_data_source(
@@ -815,20 +782,18 @@ impl WasmBindings {
         store: &mut Store<HostState>,
         resource: &wit_types::ResourceDef,
     ) -> wasmtime::Result<Result<wit_types::State, wit_types::ProviderError>> {
-        store
-            .run_concurrent(async |accessor| match self {
-                WasmBindings::Basic(b) => {
-                    b.carina_provider_provider()
-                        .call_read_data_source(accessor, resource.clone())
-                        .await
-                }
-                WasmBindings::Http(b) => {
-                    b.carina_provider_provider()
-                        .call_read_data_source(accessor, resource.clone())
-                        .await
-                }
-            })
-            .await?
+        match self {
+            WasmBindings::Basic(b) => {
+                b.carina_provider_provider()
+                    .call_read_data_source(store, resource)
+                    .await
+            }
+            WasmBindings::Http(b) => {
+                b.carina_provider_provider()
+                    .call_read_data_source(store, resource)
+                    .await
+            }
+        }
     }
 
     async fn call_create(
@@ -837,20 +802,18 @@ impl WasmBindings {
         id: &wit_types::ResourceId,
         request: &wit_types::CreateRequest,
     ) -> wasmtime::Result<Result<wit_types::State, wit_types::ProviderError>> {
-        store
-            .run_concurrent(async |accessor| match self {
-                WasmBindings::Basic(b) => {
-                    b.carina_provider_provider()
-                        .call_create(accessor, id.clone(), request.clone())
-                        .await
-                }
-                WasmBindings::Http(b) => {
-                    b.carina_provider_provider()
-                        .call_create(accessor, id.clone(), request.clone())
-                        .await
-                }
-            })
-            .await?
+        match self {
+            WasmBindings::Basic(b) => {
+                b.carina_provider_provider()
+                    .call_create(store, id, request)
+                    .await
+            }
+            WasmBindings::Http(b) => {
+                b.carina_provider_provider()
+                    .call_create(store, id, request)
+                    .await
+            }
+        }
     }
 
     async fn call_update(
@@ -860,30 +823,18 @@ impl WasmBindings {
         identifier: &str,
         request: &wit_types::UpdateRequest,
     ) -> wasmtime::Result<Result<wit_types::State, wit_types::ProviderError>> {
-        store
-            .run_concurrent(async |accessor| match self {
-                WasmBindings::Basic(b) => {
-                    b.carina_provider_provider()
-                        .call_update(
-                            accessor,
-                            id.clone(),
-                            identifier.to_string(),
-                            request.clone(),
-                        )
-                        .await
-                }
-                WasmBindings::Http(b) => {
-                    b.carina_provider_provider()
-                        .call_update(
-                            accessor,
-                            id.clone(),
-                            identifier.to_string(),
-                            request.clone(),
-                        )
-                        .await
-                }
-            })
-            .await?
+        match self {
+            WasmBindings::Basic(b) => {
+                b.carina_provider_provider()
+                    .call_update(store, id, identifier, request)
+                    .await
+            }
+            WasmBindings::Http(b) => {
+                b.carina_provider_provider()
+                    .call_update(store, id, identifier, request)
+                    .await
+            }
+        }
     }
 
     async fn call_delete(
@@ -893,20 +844,18 @@ impl WasmBindings {
         identifier: &str,
         request: wit_types::DeleteRequest,
     ) -> wasmtime::Result<Result<(), wit_types::ProviderError>> {
-        store
-            .run_concurrent(async |accessor| match self {
-                WasmBindings::Basic(b) => {
-                    b.carina_provider_provider()
-                        .call_delete(accessor, id.clone(), identifier.to_string(), request)
-                        .await
-                }
-                WasmBindings::Http(b) => {
-                    b.carina_provider_provider()
-                        .call_delete(accessor, id.clone(), identifier.to_string(), request)
-                        .await
-                }
-            })
-            .await?
+        match self {
+            WasmBindings::Basic(b) => {
+                b.carina_provider_provider()
+                    .call_delete(store, id, identifier, request)
+                    .await
+            }
+            WasmBindings::Http(b) => {
+                b.carina_provider_provider()
+                    .call_delete(store, id, identifier, request)
+                    .await
+            }
+        }
     }
 
     async fn call_normalize_desired(
@@ -1414,7 +1363,6 @@ impl WasmProviderFactory {
     ///
     /// If the cache directory cannot be created, falls back to compiling without caching.
     pub async fn new(wasm_path: PathBuf) -> Result<Self, String> {
-        install_default_rustls_crypto_provider();
         match Self::default_cache_dir() {
             Some(cache_dir) => Self::new_with_cache_dir(wasm_path, &cache_dir).await,
             None => Self::new_uncached(wasm_path).await,
@@ -1423,7 +1371,6 @@ impl WasmProviderFactory {
 
     /// Load a WASM provider with an explicit cache directory.
     pub async fn new_with_cache_dir(wasm_path: PathBuf, cache_dir: &Path) -> Result<Self, String> {
-        install_default_rustls_crypto_provider();
         let cwasm_name = Self::cache_key(&wasm_path);
         let cwasm_path = cache_dir.join(&cwasm_name);
 
@@ -1471,7 +1418,6 @@ impl WasmProviderFactory {
 
     /// Load a WASM provider without any precompile caching.
     async fn new_uncached(wasm_path: PathBuf) -> Result<Self, String> {
-        install_default_rustls_crypto_provider();
         let config = build_engine_config();
         let engine =
             Engine::new(&config).map_err(|e| format!("Failed to create WASM engine: {e}"))?;
@@ -1579,7 +1525,6 @@ impl WasmProviderFactory {
     /// The .cwasm file must have been produced by `precompile()` using the same
     /// Wasmtime version. Deserializing an untrusted or corrupted file is unsafe.
     pub async fn from_precompiled(cwasm_path: &Path) -> Result<Self, String> {
-        install_default_rustls_crypto_provider();
         let config = build_engine_config();
         let engine =
             Engine::new(&config).map_err(|e| format!("Failed to create WASM engine: {e}"))?;
@@ -1645,7 +1590,6 @@ impl WasmProviderFactory {
     /// **Deprecated**: Use `new()` or `new_with_cache_dir()` instead, which
     /// handle caching automatically.
     pub async fn from_file_cached(wasm_path: &Path, cache_dir: &Path) -> Result<Self, String> {
-        install_default_rustls_crypto_provider();
         Self::new_with_cache_dir(wasm_path.to_path_buf(), cache_dir).await
     }
 
@@ -1692,24 +1636,16 @@ impl WasmProviderFactory {
         attributes: &IndexMap<String, Value>,
     ) -> Result<Arc<SharedWasmInstance>, String> {
         let key: Option<String> = binding.map(|s| s.to_string());
-        {
-            let guard = self.shared_instances.lock().await;
-            if let Some(instance) = guard.get(&key) {
-                return Ok(Arc::clone(instance));
-            }
+        let mut guard = self.shared_instances.lock().await;
+        if let Some(instance) = guard.get(&key) {
+            return Ok(Arc::clone(instance));
         }
-
         let (store, bindings) = self.create_initialized_instance(attributes).await?;
         let instance = Arc::new(SharedWasmInstance {
             store: Mutex::new(store),
             bindings,
             poisoned: AtomicBool::new(false),
         });
-
-        let mut guard = self.shared_instances.lock().await;
-        if let Some(existing) = guard.get(&key) {
-            return Ok(Arc::clone(existing));
-        }
         guard.insert(key, Arc::clone(&instance));
         Ok(instance)
     }
