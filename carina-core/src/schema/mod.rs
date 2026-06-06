@@ -3887,11 +3887,11 @@ impl ResourceSchema {
         };
 
         let mut out = Vec::new();
-        self.collect_enum_valid_values_for_alias(&attr_schema.attr_type, input, &mut out);
+        self.append_enum_values_from_top_level_attr_type(&attr_schema.attr_type, input, &mut out);
         out
     }
 
-    fn collect_enum_valid_values_for_alias(
+    fn append_enum_values_from_top_level_attr_type(
         &self,
         attr_type: &AttributeType,
         input: &str,
@@ -3913,18 +3913,18 @@ impl ResourceSchema {
                 }
             }
             Shape::Custom { base, .. } | Shape::CustomEnum { base, .. } => {
-                self.collect_enum_valid_values_for_alias(base, input, out);
+                self.append_enum_values_from_top_level_attr_type(base, input, out);
             }
             Shape::List { inner, .. } => {
-                self.collect_enum_valid_values_for_alias(inner, input, out);
+                self.append_enum_values_from_top_level_attr_type(inner, input, out);
             }
             Shape::Map { value, .. } => {
-                self.collect_enum_valid_values_for_alias(value, input, out);
+                self.append_enum_values_from_top_level_attr_type(value, input, out);
             }
             Shape::Union => {
                 if let Some(members) = self.union_members_of(attr_type) {
                     for member in members {
-                        self.collect_enum_valid_values_for_alias(member, input, out);
+                        self.append_enum_values_from_top_level_attr_type(member, input, out);
                     }
                 }
             }
