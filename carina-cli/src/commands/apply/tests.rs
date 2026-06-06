@@ -2,6 +2,44 @@ use super::*;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 use std::time::Duration;
 
+fn s3_backend_config_with_encrypt(encrypt: bool) -> carina_core::parser::BackendConfig {
+    let mut attributes = HashMap::new();
+    attributes.insert(
+        "bucket".to_string(),
+        Value::Concrete(ConcreteValue::String("state-bucket".to_string())),
+    );
+    attributes.insert(
+        "key".to_string(),
+        Value::Concrete(ConcreteValue::String("project/state.json".to_string())),
+    );
+    attributes.insert(
+        "region".to_string(),
+        Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
+    );
+    attributes.insert(
+        "encrypt".to_string(),
+        Value::Concrete(ConcreteValue::Bool(encrypt)),
+    );
+    carina_core::parser::BackendConfig {
+        backend_type: "s3".to_string(),
+        attributes,
+    }
+}
+
+#[test]
+fn saved_plan_backend_cross_check_rejects_non_addressing_attribute_change() {
+    let planned = s3_backend_config_with_encrypt(false);
+    let current = s3_backend_config_with_encrypt(true);
+
+    let err = ensure_saved_plan_backend_matches_current(Some(&planned), Some(&current))
+        .expect_err("any backend attribute change should invalidate a saved plan");
+    let msg = err.to_string();
+
+    assert!(msg.contains("Saved plan backend does not match the current `backend.crn`"));
+    assert!(msg.contains("The plan file recorded one backend"));
+    assert!(msg.contains("Re-run `carina plan`"));
+}
+
 #[test]
 fn build_state_after_apply_finds_write_only_with_provider_prefix() {
     // The schema map is keyed by provider-prefixed names (e.g., "awscc.ec2.Vpc"),
@@ -2015,7 +2053,13 @@ mod saved_plan_version_tests {
         });
         std::fs::write(&plan_path, serde_json::to_string(&v3).unwrap()).expect("write plan");
 
-        let result = crate::commands::apply::run_apply_from_plan(&plan_path, true, false).await;
+        let result = crate::commands::apply::run_apply_from_plan(
+            &plan_path,
+            true,
+            false,
+            &carina_core::parser::ProviderContext::default(),
+        )
+        .await;
 
         let err = result.expect_err("v3 saved plan must be rejected");
         let msg = err.to_string();

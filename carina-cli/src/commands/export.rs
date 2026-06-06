@@ -5,7 +5,7 @@ use colored::Colorize;
 
 use carina_core::config_loader::load_configuration_with_config;
 use carina_core::parser::ProviderContext;
-use carina_state::{StateBackend, resolve_backend};
+use carina_state::{StateBackend, resolve_backend_for_read};
 
 use crate::error::AppError;
 
@@ -33,7 +33,7 @@ pub async fn run_export(
     )?
     .parsed;
 
-    let backend: Box<dyn StateBackend> = resolve_backend(parsed.backend.as_ref())
+    let backend: Box<dyn StateBackend> = resolve_backend_for_read(parsed.backend.as_ref())
         .await
         .map_err(AppError::Backend)?;
 

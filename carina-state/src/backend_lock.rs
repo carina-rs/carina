@@ -1,11 +1,10 @@
 //! Local backend-configuration lock file for change detection.
 //!
-//! Carina stores a hash of the current `backend` block in a local file
-//! (`carina-backend.lock`) at the project root. Before
-//! each plan/apply, the stored hash is compared against the current
-//! configuration — a mismatch indicates that the backend has been
-//! reconfigured (for example, the bucket or key was changed), and Carina
-//! refuses to proceed without an explicit `--reconfigure` override.
+//! Carina stores a snapshot of the current `backend` block in a local
+//! file (`carina-backend.lock`) at the project root. Commands compare
+//! the stored snapshot against the current configuration: `init` and
+//! `plan` warn on mismatch, while mutating commands refuse until
+//! `carina init --migrate-state` explicitly moves state.
 //!
 //! This prevents silently pointing state operations at a different state
 //! file, which could lead to resources being treated as unmanaged or
@@ -61,8 +60,8 @@ impl BackendLock {
     }
 
     /// Build a lock snapshot representing the implicit local backend that
-    /// is used when no `backend` block is configured. Allows
-    /// `check_backend_lock` to detect local → remote transitions.
+    /// is used when no `backend` block is configured. Allows drift
+    /// inspection to detect local → remote transitions.
     pub fn local_default() -> Self {
         Self {
             backend_type: crate::backend::LOCAL_BACKEND_TYPE.to_string(),
@@ -74,9 +73,9 @@ impl BackendLock {
     /// backend when present, the implicit local default when absent.
     ///
     /// This is the single source of truth for "what backend does this
-    /// configuration name"; `check_backend_lock`, `ensure_backend_lock`,
-    /// `init`'s drift check, and the migration path all go through it so
-    /// they cannot disagree.
+    /// configuration name"; lock creation, drift inspection, `init`'s
+    /// warning path, and the migration path all go through it so they
+    /// cannot disagree.
     pub fn for_config(
         backend_config: Option<&carina_core::parser::BackendConfig>,
     ) -> Result<Self, carina_core::value::SerializationError> {

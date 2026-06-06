@@ -17,11 +17,11 @@ use carina_core::effect::Effect;
 use carina_core::plan::Plan;
 use carina_core::provider::Provider;
 use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
-use carina_state::{LockInfo, StateBackend, resolve_backend};
+use carina_state::{LockInfo, StateBackend};
 
 use carina_core::parser::ProviderContext;
 
-use super::validate_and_resolve_with_config;
+use super::{DriftCommand, validate_and_resolve_with_config, verify_for_mutation};
 use crate::DetailLevel;
 use crate::commands::shared::progress::{
     RefreshProgress, format_duration, refresh_multi_progress, spinner_style,
@@ -46,7 +46,6 @@ pub async fn run_destroy(
     lock: bool,
     refresh: bool,
     force: bool,
-    reconfigure: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
     let mut parsed = load_configuration_with_config(
@@ -59,27 +58,22 @@ pub async fn run_destroy(
     let base_dir = get_base_dir(path);
     validate_and_resolve_with_config(&mut parsed, base_dir, true)?;
 
-    // Detect backend reconfiguration before touching any state
-    crate::commands::check_backend_lock(base_dir, parsed.backend.as_ref(), reconfigure)?;
+    let verified_backend =
+        verify_for_mutation(base_dir, parsed.backend.as_ref(), DriftCommand::Destroy)?;
 
     // Don't exit early when resources are empty -- orphaned resources in the
     // state file may still need to be destroyed.
 
     // Check for backend configuration - use local backend by default
-    let backend_config = parsed.backend.as_ref();
-    let backend: Box<dyn StateBackend> = resolve_backend(backend_config)
+    let backend: Box<dyn StateBackend> = verified_backend
+        .resolve()
         .await
         .map_err(AppError::Backend)?;
 
-    let mut protected_bucket: Option<String> = None;
-
     // Get the state bucket name for protection check (S3 backend only)
-    if let Some(config) = backend_config {
-        protected_bucket = config.attributes.get("bucket").and_then(|v| match v {
-            Value::Concrete(ConcreteValue::String(s)) => Some(s.clone()),
-            _ => None,
-        });
-    }
+    let protected_bucket = verified_backend
+        .string_attribute("bucket")
+        .map(str::to_owned);
 
     // Acquire lock (unless --lock=false)
     let lock_info: Option<LockInfo> = if lock {

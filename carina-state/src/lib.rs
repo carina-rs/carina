@@ -54,7 +54,7 @@ pub use backend::{BackendConfig, BackendError, BackendResult, LOCAL_BACKEND_TYPE
 pub use backend_lock::BackendLock;
 pub use backends::{
     LocalBackend, StateUrl, anchored_local_path, create_backend, create_local_backend,
-    load_state_from_url, resolve_backend, resolve_backend_anchored,
+    load_state_from_url, resolve_backend_anchored, resolve_backend_for_read,
 };
 pub use lock::LockInfo;
 pub use state::{

@@ -55,7 +55,7 @@ project/
 ### Task 1: Move backend lock to project root
 
 - `carina-state/src/backend_lock.rs` — change `LOCK_DIR` / `LOCK_FILE` to write `carina-backend.lock` at project root
-- Migration: `check_backend_lock()` checks both old (`.carina/backend-lock.json`) and new location; reads from old if new doesn't exist
+- Migration: backend lock loading checks both old (`.carina/backend-lock.json`) and new location; reads from old if new doesn't exist
 - Update tests
 
 ### Task 2: Create backend lock in init, remove from apply/destroy
@@ -63,7 +63,7 @@ project/
 - `carina-cli/src/commands/init.rs` — add `ensure_backend_lock()` call after plugin resolution
 - `carina-cli/src/commands/apply.rs` — remove `ensure_backend_lock()` (2 call sites)
 - `carina-cli/src/commands/destroy.rs` — remove `ensure_backend_lock()` (1 call site)
-- `carina-cli/src/commands/mod.rs` — `check_backend_lock()` returns error when lock missing + backend configured
+- `carina-cli/src/commands/mod.rs` — backend drift inspection reports missing locks so commands can decide whether to initialize or refuse
 - Update tests
 
 ### Task 3: Copy `file://` plugins into `.carina/providers/`

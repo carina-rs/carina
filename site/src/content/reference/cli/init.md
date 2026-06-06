@@ -33,11 +33,12 @@ recorded in `carina-backend.lock`. This covers backend changes such as
 moving from local state to a remote backend, or changing the
 `backend s3 { key = ... }` value during a directory refactor.
 
-Without this flag, a backend change is a **hard error** — `carina init`
-refuses to proceed and points you at `--migrate-state`. This protects
-against accidentally editing `backend.crn` or checking out a branch with
-a different backend: adopting the new backend (and abandoning the old
-state) is never silent.
+Without this flag, a backend change is a warning, not a hard error:
+`carina init` still resolves provider plugins and exits successfully, but
+it leaves `carina-backend.lock` unchanged and points you at
+`--migrate-state`. This keeps PR-time `plan` visible across backend-key
+changes while preserving the safety rule: mutating commands refuse until
+state migration is explicit.
 
 With the flag, `init` reads the state from the locked (old) backend,
 writes it to the configured backend, and verifies the copy. It then

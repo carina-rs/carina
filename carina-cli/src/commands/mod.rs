@@ -14,13 +14,17 @@ pub mod state;
 pub mod validate;
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use carina_core::module_resolver;
 use carina_core::parser::{BackendConfig, ProviderContext};
+use carina_core::resource::{ConcreteValue, Value};
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
-use carina_state::BackendLock;
+use carina_state::{
+    BackendConfig as StateBackendConfig, BackendError, BackendLock, StateBackend,
+    resolve_backend_anchored,
+};
 
 use crate::error::AppError;
 use crate::wiring::{
@@ -32,48 +36,145 @@ use crate::wiring::{
     validate_resources_with_ctx, validate_wait_bindings_with_ctx,
 };
 
-/// Detect whether the `backend` block in the current configuration has
-/// changed since the last run, by comparing against `carina-backend.lock`
-/// under `base_dir`.
-///
-/// - If no lock exists, returns an error asking user to run `carina init`.
-/// - If the lock matches, nothing happens.
-/// - If the lock differs and `reconfigure` is `false`, returns an error
-///   explaining the change and asking the user to re-run with `--reconfigure`.
-/// - If `reconfigure` is `true`, overwrites the lock with the new config.
-pub fn check_backend_lock(
+#[must_use = "Drifted must be handled before mutating state — apply/destroy must refuse, init/plan must warn"]
+#[derive(Debug, PartialEq)]
+pub enum BackendDriftStatus {
+    Fresh,
+    Unchanged,
+    Drifted {
+        existing: BackendLock,
+        configured: BackendLock,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriftCommand {
+    Apply,
+    Destroy,
+    RefreshState,
+}
+
+impl DriftCommand {
+    fn verb_phrase(self) -> &'static str {
+        match self {
+            Self::Apply => "Cannot apply",
+            Self::Destroy => "Cannot destroy",
+            Self::RefreshState => "Cannot refresh state",
+        }
+    }
+}
+
+pub fn inspect_backend_drift(
     base_dir: &Path,
     backend_config: Option<&BackendConfig>,
-    reconfigure: bool,
-) -> Result<(), AppError> {
-    let current = BackendLock::for_config(backend_config)?;
+) -> Result<BackendDriftStatus, AppError> {
+    let configured = BackendLock::for_config(backend_config)?;
     let existing = BackendLock::load(base_dir).map_err(AppError::Backend)?;
 
-    match existing {
-        Some(existing) if existing != current => {
-            if reconfigure {
-                current.save(base_dir).map_err(AppError::Backend)?;
-                Ok(())
-            } else {
-                Err(AppError::Config(format!(
-                    "Backend configuration has changed since the last run:\n\n{}\n\n\
-                     Changing backend settings can silently redirect Carina at a \
-                     different state file, which may cause state loss or drift.\n\n\
-                     To preserve existing state, run `carina init --migrate-state` \
-                     — it will copy state from the old backend to the new one and \
-                     update the backend lock.\n\n\
-                     To discard the old state and start fresh with the new backend, \
-                     re-run with --reconfigure.",
-                    existing.describe_diff(&current)
-                )))
-            }
-        }
-        Some(_) => Ok(()),
-        // No lock file — user must run `carina init` first
-        None => Err(AppError::Config(
+    Ok(match existing {
+        None => BackendDriftStatus::Fresh,
+        Some(existing) if existing == configured => BackendDriftStatus::Unchanged,
+        Some(existing) => BackendDriftStatus::Drifted {
+            existing,
+            configured,
+        },
+    })
+}
+
+#[must_use = "VerifiedBackend proves Fresh and Drifted were rejected before mutating state"]
+#[derive(Debug, Clone)]
+pub struct VerifiedBackend {
+    parser_config: Option<BackendConfig>,
+    state_config: Option<StateBackendConfig>,
+    base_dir: PathBuf,
+}
+
+impl VerifiedBackend {
+    pub async fn resolve(&self) -> Result<Box<dyn StateBackend>, BackendError> {
+        resolve_backend_anchored(self.state_config.as_ref(), &self.base_dir).await
+    }
+
+    pub fn is_configured(&self) -> bool {
+        self.parser_config.is_some()
+    }
+
+    pub fn string_attribute(&self, key: &str) -> Option<&str> {
+        self.parser_config.as_ref().and_then(|config| {
+            config.attributes.get(key).and_then(|value| match value {
+                Value::Concrete(ConcreteValue::String(value)) => Some(value.as_str()),
+                _ => None,
+            })
+        })
+    }
+
+    pub fn bool_attribute(&self, key: &str) -> Option<bool> {
+        self.parser_config.as_ref().and_then(|config| {
+            config.attributes.get(key).and_then(|value| match value {
+                Value::Concrete(ConcreteValue::Bool(value)) => Some(*value),
+                _ => None,
+            })
+        })
+    }
+}
+
+pub fn verify_for_mutation(
+    base_dir: &Path,
+    backend_config: Option<&BackendConfig>,
+    command: DriftCommand,
+) -> Result<VerifiedBackend, AppError> {
+    let verified_base_dir = base_dir
+        .canonicalize()
+        .unwrap_or_else(|_| base_dir.to_path_buf());
+
+    match inspect_backend_drift(&verified_base_dir, backend_config)? {
+        BackendDriftStatus::Fresh => Err(AppError::Config(
             "Backend lock file not found. Run 'carina init' to initialize the project.".to_string(),
         )),
+        BackendDriftStatus::Unchanged => Ok(VerifiedBackend {
+            parser_config: backend_config.cloned(),
+            state_config: backend_config.map(StateBackendConfig::from),
+            base_dir: verified_base_dir,
+        }),
+        BackendDriftStatus::Drifted {
+            existing,
+            configured,
+        } => Err(AppError::Config(drift_error_message(
+            command,
+            &existing,
+            &configured,
+        ))),
     }
+}
+
+fn backend_drift_header(existing: &BackendLock, configured: &BackendLock) -> String {
+    format!(
+        "Backend configuration changed since the last state migration:\n{}",
+        existing.describe_diff(configured)
+    )
+}
+
+pub fn drift_warning(existing: &BackendLock, configured: &BackendLock) -> String {
+    format!(
+        "{}\n\n    plan reads state from the OLD backend recorded in carina-backend.lock.\n    \
+         Before running apply or destroy, run `carina init --migrate-state .`\n    \
+         to migrate state from the OLD backend to the new one.\n\n    \
+         To revert instead, restore the backend block to match the lock.",
+        backend_drift_header(existing, configured)
+    )
+}
+
+pub fn drift_error_message(
+    command: DriftCommand,
+    existing: &BackendLock,
+    configured: &BackendLock,
+) -> String {
+    format!(
+        "{}\n\n{} without first migrating the state. State migration is an\n\
+         explicit, named operation:\n\n    carina init --migrate-state .\n\n\
+         Or revert the `backend` block to match the lock if the change was unintended.",
+        backend_drift_header(existing, configured),
+        command.verb_phrase()
+    )
 }
 
 /// Error message for a provider block that declares no `source` attribute.
@@ -509,13 +610,127 @@ mod tests {
         }
     }
 
-    #[test]
-    fn check_backend_lock_errors_when_lock_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = s3_backend_config("my-bucket", "us-east-1");
-        let err = check_backend_lock(tmp.path(), Some(&config), false).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("carina init"));
+    fn local_backend_config(path: &str) -> BackendConfig {
+        let mut attributes = HashMap::new();
+        attributes.insert(
+            "path".to_string(),
+            Value::Concrete(ConcreteValue::String(path.to_string())),
+        );
+        BackendConfig {
+            backend_type: "local".to_string(),
+            attributes,
+        }
+    }
+
+    mod inspect_backend_drift {
+        use super::*;
+
+        #[test]
+        fn inspect_returns_fresh_when_no_lock() {
+            let tmp = tempfile::tempdir().unwrap();
+            let config = s3_backend_config("my-bucket", "us-east-1");
+
+            let status = crate::commands::inspect_backend_drift(tmp.path(), Some(&config)).unwrap();
+
+            assert_eq!(status, BackendDriftStatus::Fresh);
+        }
+
+        #[test]
+        fn inspect_returns_unchanged_when_config_matches_lock() {
+            let tmp = tempfile::tempdir().unwrap();
+            let config = s3_backend_config("my-bucket", "us-east-1");
+            ensure_backend_lock(tmp.path(), Some(&config)).unwrap();
+
+            let status = crate::commands::inspect_backend_drift(tmp.path(), Some(&config)).unwrap();
+
+            assert_eq!(status, BackendDriftStatus::Unchanged);
+        }
+
+        #[test]
+        fn inspect_returns_drifted_when_config_differs() {
+            let tmp = tempfile::tempdir().unwrap();
+            let old = s3_backend_config("old-bucket", "us-east-1");
+            let new = s3_backend_config("new-bucket", "us-east-1");
+            ensure_backend_lock(tmp.path(), Some(&old)).unwrap();
+
+            let status = crate::commands::inspect_backend_drift(tmp.path(), Some(&new)).unwrap();
+            let existing = BackendLock::for_config(Some(&old)).unwrap();
+            let configured = BackendLock::for_config(Some(&new)).unwrap();
+
+            assert_eq!(
+                status,
+                BackendDriftStatus::Drifted {
+                    existing,
+                    configured,
+                }
+            );
+        }
+
+        #[test]
+        fn inspect_returns_fresh_with_no_backend_and_no_lock() {
+            let tmp = tempfile::tempdir().unwrap();
+
+            let status = crate::commands::inspect_backend_drift(tmp.path(), None).unwrap();
+
+            assert_eq!(status, BackendDriftStatus::Fresh);
+        }
+
+        #[test]
+        fn inspect_returns_drifted_when_lock_is_remote_and_config_is_local() {
+            let tmp = tempfile::tempdir().unwrap();
+            let remote = s3_backend_config("my-bucket", "us-east-1");
+            ensure_backend_lock(tmp.path(), Some(&remote)).unwrap();
+
+            let status = crate::commands::inspect_backend_drift(tmp.path(), None).unwrap();
+            let existing = BackendLock::for_config(Some(&remote)).unwrap();
+            let configured = BackendLock::for_config(None).unwrap();
+
+            assert_eq!(
+                status,
+                BackendDriftStatus::Drifted {
+                    existing,
+                    configured,
+                }
+            );
+        }
+
+        #[test]
+        fn drift_warning_names_old_and_new() {
+            let old =
+                BackendLock::for_config(Some(&local_backend_config("legacy/state.json"))).unwrap();
+            let new = BackendLock::for_config(Some(&local_backend_config("state.json"))).unwrap();
+
+            let warning = drift_warning(&old, &new);
+
+            assert!(warning.contains("legacy/state.json"));
+            assert!(warning.contains("state.json"));
+            assert!(warning.contains("carina init --migrate-state"));
+        }
+
+        #[test]
+        fn drift_error_names_apply_blocker() {
+            let old =
+                BackendLock::for_config(Some(&local_backend_config("legacy/state.json"))).unwrap();
+            let new = BackendLock::for_config(Some(&local_backend_config("state.json"))).unwrap();
+
+            let error = drift_error_message(DriftCommand::Apply, &old, &new);
+
+            assert!(error.contains("carina init --migrate-state"));
+            assert!(error.contains("Cannot apply without first migrating the state"));
+        }
+
+        #[test]
+        fn drift_error_names_refresh_blocker() {
+            let old =
+                BackendLock::for_config(Some(&local_backend_config("legacy/state.json"))).unwrap();
+            let new = BackendLock::for_config(Some(&local_backend_config("state.json"))).unwrap();
+
+            let error = drift_error_message(DriftCommand::RefreshState, &old, &new);
+
+            assert!(error.contains("carina init --migrate-state"));
+            assert!(error.contains("Cannot refresh state without first migrating the state"));
+            assert!(!error.contains("Cannot apply without first migrating the state"));
+        }
     }
 
     #[test]
@@ -524,78 +739,6 @@ mod tests {
         let config = s3_backend_config("my-bucket", "us-east-1");
         ensure_backend_lock(tmp.path(), Some(&config)).unwrap();
         assert!(tmp.path().join("carina-backend.lock").exists());
-    }
-
-    #[test]
-    fn check_backend_lock_passes_when_config_unchanged() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = s3_backend_config("my-bucket", "us-east-1");
-        ensure_backend_lock(tmp.path(), Some(&config)).unwrap();
-        let result = check_backend_lock(tmp.path(), Some(&config), false);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn check_backend_lock_blocks_on_bucket_change() {
-        let tmp = tempfile::tempdir().unwrap();
-        let old = s3_backend_config("old-bucket", "us-east-1");
-        let new = s3_backend_config("new-bucket", "us-east-1");
-        ensure_backend_lock(tmp.path(), Some(&old)).unwrap();
-        let err = check_backend_lock(tmp.path(), Some(&new), false).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("Backend configuration has changed"));
-        assert!(msg.contains("bucket"));
-        assert!(msg.contains("old-bucket"));
-        assert!(msg.contains("new-bucket"));
-        assert!(msg.contains("carina init --migrate-state"));
-        assert!(msg.contains("--reconfigure"));
-    }
-
-    #[test]
-    fn check_backend_lock_accepts_change_with_reconfigure() {
-        let tmp = tempfile::tempdir().unwrap();
-        let old = s3_backend_config("old-bucket", "us-east-1");
-        let new = s3_backend_config("new-bucket", "us-east-1");
-        ensure_backend_lock(tmp.path(), Some(&old)).unwrap();
-        let result = check_backend_lock(tmp.path(), Some(&new), true);
-        assert!(result.is_ok());
-        let result2 = check_backend_lock(tmp.path(), Some(&new), false);
-        assert!(result2.is_ok());
-    }
-
-    #[test]
-    fn check_backend_lock_errors_when_lock_missing_no_backend() {
-        let tmp = tempfile::tempdir().unwrap();
-        let err = check_backend_lock(tmp.path(), None, false).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("carina init"));
-    }
-
-    #[test]
-    fn check_backend_lock_blocks_local_to_remote_transition() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Simulate first apply with no backend (local default)
-        ensure_backend_lock(tmp.path(), None).unwrap();
-        // Second run: user adds an S3 backend
-        let new = s3_backend_config("my-bucket", "us-east-1");
-        let err = check_backend_lock(tmp.path(), Some(&new), false).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("Backend configuration has changed"));
-        assert!(msg.contains("local"));
-        assert!(msg.contains("s3"));
-        assert!(msg.contains("--reconfigure"));
-    }
-
-    #[test]
-    fn check_backend_lock_allows_local_to_remote_with_reconfigure() {
-        let tmp = tempfile::tempdir().unwrap();
-        ensure_backend_lock(tmp.path(), None).unwrap();
-        let new = s3_backend_config("my-bucket", "us-east-1");
-        let result = check_backend_lock(tmp.path(), Some(&new), true);
-        assert!(result.is_ok());
-        // Subsequent run with the new backend should now pass
-        let result2 = check_backend_lock(tmp.path(), Some(&new), false);
-        assert!(result2.is_ok());
     }
 
     fn empty_parsed_file() -> carina_core::parser::InferredFile {

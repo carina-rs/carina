@@ -74,10 +74,6 @@ enum Commands {
         /// Output plan as JSON
         #[arg(long)]
         json: bool,
-
-        /// Accept a changed backend configuration and overwrite the local backend lock
-        #[arg(long)]
-        reconfigure: bool,
     },
     /// Apply changes to reach the desired state
     Apply {
@@ -92,10 +88,6 @@ enum Commands {
         /// Enable/disable state locking (default: true)
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         lock: bool,
-
-        /// Accept a changed backend configuration and overwrite the local backend lock
-        #[arg(long)]
-        reconfigure: bool,
     },
     /// Destroy all resources defined in the configuration file
     Destroy {
@@ -118,10 +110,6 @@ enum Commands {
         /// Force destroy even if resources have prevent_destroy set
         #[arg(long)]
         force: bool,
-
-        /// Accept a changed backend configuration and overwrite the local backend lock
-        #[arg(long)]
-        reconfigure: bool,
     },
     /// Show export values from the state
     Export {
@@ -321,7 +309,6 @@ async fn main() {
         tui,
         refresh,
         json,
-        reconfigure,
     } = cli.command
     {
         match run_plan(
@@ -331,7 +318,6 @@ async fn main() {
             tui,
             refresh,
             json,
-            reconfigure,
             &provider_context,
         )
         .await
@@ -358,12 +344,11 @@ async fn main() {
             path,
             auto_approve,
             lock,
-            reconfigure,
         } => {
             if path.extension().is_some_and(|ext| ext == "json") {
-                run_apply_from_plan(&path, auto_approve, lock).await
+                run_apply_from_plan(&path, auto_approve, lock, &provider_context).await
             } else {
-                run_apply(&path, auto_approve, lock, reconfigure, &provider_context).await
+                run_apply(&path, auto_approve, lock, &provider_context).await
             }
         }
         Commands::Destroy {
@@ -372,19 +357,7 @@ async fn main() {
             lock,
             refresh,
             force,
-            reconfigure,
-        } => {
-            run_destroy(
-                &path,
-                auto_approve,
-                lock,
-                refresh,
-                force,
-                reconfigure,
-                &provider_context,
-            )
-            .await
-        }
+        } => run_destroy(&path, auto_approve, lock, refresh, force, &provider_context).await,
         Commands::Export { name, json, raw } => {
             let format = if raw {
                 commands::export::OutputFormat::Raw

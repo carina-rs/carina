@@ -38,11 +38,11 @@ pub fn create_local_backend() -> Box<dyn StateBackend> {
     Box::new(LocalBackend::new())
 }
 
-/// Resolve a backend from an optional parser BackendConfig.
+/// Resolve a backend from an optional parser BackendConfig for read-only use.
 ///
 /// If a config is provided, converts it to a StateBackendConfig and creates the
 /// appropriate backend. If no config is provided, falls back to a local backend.
-pub async fn resolve_backend(
+pub async fn resolve_backend_for_read(
     backend_config: Option<&carina_core::parser::BackendConfig>,
 ) -> BackendResult<Box<dyn StateBackend>> {
     if let Some(config) = backend_config {
@@ -56,7 +56,7 @@ pub async fn resolve_backend(
 /// Resolve a backend, anchoring a local backend's relative state `path`
 /// (or the unset default) at `base_dir` instead of the process CWD.
 ///
-/// `resolve_backend` / `create_backend` treat a local `path` as
+/// `resolve_backend_for_read` / `create_backend` treat a local `path` as
 /// CWD-relative, which is correct only when the command is run from the
 /// project directory. Commands that accept an explicit directory
 /// argument (`carina init <dir>`, upstream `remote_state` resolution)
@@ -119,8 +119,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_resolve_backend_none_returns_local() {
-        let backend = resolve_backend(None).await;
+    async fn test_resolve_backend_for_read_none_returns_local() {
+        let backend = resolve_backend_for_read(None).await;
         assert!(backend.is_ok(), "None config should return a local backend");
         // Local backend read_state returns Ok(None) when no state file exists
         let state = backend.unwrap().read_state().await;
@@ -128,7 +128,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_resolve_backend_invalid_config_returns_error() {
+    async fn test_resolve_backend_for_read_invalid_config_returns_error() {
         use carina_core::parser::BackendConfig as ParserBackendConfig;
 
         let config = ParserBackendConfig {
@@ -136,7 +136,7 @@ mod tests {
             attributes: HashMap::new(),
         };
 
-        let result = resolve_backend(Some(&config)).await;
+        let result = resolve_backend_for_read(Some(&config)).await;
         assert!(result.is_err());
 
         if let Err(BackendError::UnsupportedBackend(name)) = result {
