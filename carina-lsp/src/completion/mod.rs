@@ -654,20 +654,31 @@ impl CompletionProvider {
         schema: &'a ResourceSchema,
         attr_type: &'a AttributeType,
     ) -> Option<&'a [StructField]> {
+        let mut budget = carina_core::schema::ShapeWalkBudget::new(64);
+        self.extract_struct_fields_with_budget(schema, attr_type, &mut budget)
+    }
+
+    fn extract_struct_fields_with_budget<'a>(
+        &self,
+        schema: &'a ResourceSchema,
+        attr_type: &'a AttributeType,
+        budget: &mut carina_core::schema::ShapeWalkBudget,
+    ) -> Option<&'a [StructField]> {
         use carina_core::schema::Shape;
         // Project onto `Shape` so any `Ref` chain is peeled at the
         // type level (carina#3349). The cyclic-CFN case
         // (`Statement -> AndStatement -> List<Statement>`) descends
         // because `shape_of` walks `Ref` against the schema's defs.
         match schema.shape_of(attr_type) {
-            Shape::Struct { fields, .. } => Some(fields),
+            Shape::Struct { .. } => schema.struct_fields_with_budget(attr_type, budget),
             Shape::List { inner, .. } => match schema.shape_of(inner) {
-                Shape::Struct { fields, .. } => Some(fields),
+                Shape::Struct { .. } => schema.struct_fields_with_budget(inner, budget),
                 _ => None,
             },
-            Shape::Union(members) => members
+            Shape::Union => schema
+                .union_members_with_budget(attr_type, budget)?
                 .iter()
-                .find_map(|m| self.extract_struct_fields(schema, m)),
+                .find_map(|m| self.extract_struct_fields_with_budget(schema, m, budget)),
             _ => None,
         }
     }

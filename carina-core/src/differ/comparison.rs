@@ -121,11 +121,19 @@ pub(crate) fn type_aware_equal(
             (
                 Value::Concrete(ConcreteValue::Map(ma)),
                 Value::Concrete(ConcreteValue::Map(mb)),
-                crate::schema::Shape::Struct { fields, .. },
-            ) => type_aware_struct_equal(ma, mb, fields, defs, secret_ctx),
+                crate::schema::Shape::Struct { .. },
+            ) => {
+                let attr_type = attr_type.expect("Some(shape) implies Some(attr_type)");
+                let fields = crate::schema::struct_fields_with_defs(attr_type, defs)
+                    .expect("Shape::Struct must expose struct fields internally");
+                type_aware_struct_equal(ma, mb, fields, defs, secret_ctx)
+            }
 
             // Union: try each member type; if any says equal, they're equal
-            (_, _, crate::schema::Shape::Union(types)) => {
+            (_, _, crate::schema::Shape::Union) => {
+                let attr_type = attr_type.expect("Some(shape) implies Some(attr_type)");
+                let types = crate::schema::union_members_with_defs(attr_type, defs)
+                    .expect("Shape::Union must expose union members internally");
                 // Also check Int/Float coercion for unions containing numeric types
                 match (a, b) {
                     (

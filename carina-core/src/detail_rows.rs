@@ -348,7 +348,9 @@ fn map_entry_subtype<'a>(
         match t.shape_with_defs(defs) {
             crate::schema::Shape::List { inner, .. } => t = inner,
             crate::schema::Shape::Map { value, .. } => return Some(value),
-            crate::schema::Shape::Struct { fields, .. } => {
+            crate::schema::Shape::Struct { .. } => {
+                let fields = crate::schema::struct_fields_with_defs(t, defs)
+                    .expect("Shape::Struct must expose struct fields internally");
                 // Canonical field accessor — resolves `block_name`
                 // aliases too, matching `validate_struct` /
                 // `collect_struct` (#2214).
@@ -356,7 +358,9 @@ fn map_entry_subtype<'a>(
                     .get(key)
                     .map(|f| &f.field_type);
             }
-            crate::schema::Shape::Union(members) => {
+            crate::schema::Shape::Union => {
+                let members = crate::schema::union_members_with_defs(t, defs)
+                    .expect("Shape::Union must expose union members internally");
                 t = members.iter().find(|m| {
                     matches!(
                         &m.kind,

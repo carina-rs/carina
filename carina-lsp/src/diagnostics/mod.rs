@@ -629,7 +629,7 @@ impl DiagnosticEngine {
                                 )),
                                 // ResourceRef type check for Union, StringEnum, and Custom types
                                 (
-                                    carina_core::schema::Shape::Union(_)
+                                    carina_core::schema::Shape::Union
                                     | carina_core::schema::Shape::StringEnum { .. }
                                     | carina_core::schema::Shape::Custom { .. },
                                     Value::Deferred(DeferredValue::ResourceRef { path }),
@@ -808,7 +808,7 @@ impl DiagnosticEngine {
                                 // checkpoint and must not be type-checked
                                 // against Union members here — see #2847
                                 // for the bare-binding (`BindingRef`) form.
-                                (carina_core::schema::Shape::Union(_), value)
+                                (carina_core::schema::Shape::Union, value)
                                     if !matches!(
                                         value,
                                         Value::Deferred(DeferredValue::ResourceRef { .. })

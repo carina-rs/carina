@@ -660,13 +660,39 @@ pub enum Shape<'a> {
         value: &'a AttributeType,
     },
     /// Named struct — see [`AttrTypeKind::Struct`].
-    Struct {
-        name: &'a str,
-        fields: &'a [StructField],
-    },
+    Struct { name: &'a str },
     /// Union of types — see [`AttrTypeKind::Union`].
-    Union(&'a [AttributeType]),
+    Union,
     // Intentionally NO Ref variant — see type-level docs.
+}
+
+/// Explicit traversal budget for public schema accessors that expose
+/// nested struct fields or union members.
+///
+/// The public [`Shape`] view classifies `Struct` and `Union` without
+/// handing out iterable branch lists. Callers outside `carina-core` that
+/// genuinely need to walk those branches must carry this budget, making
+/// an unbounded schema graph DFS unrepresentable by the accessor
+/// signatures.
+#[derive(Debug, Clone)]
+pub struct ShapeWalkBudget {
+    remaining: usize,
+}
+
+impl ShapeWalkBudget {
+    pub fn new(max_steps: usize) -> Self {
+        Self {
+            remaining: max_steps,
+        }
+    }
+
+    fn take(&mut self) -> bool {
+        let Some(next) = self.remaining.checked_sub(1) else {
+            return false;
+        };
+        self.remaining = next;
+        true
+    }
 }
 
 impl fmt::Debug for Shape<'_> {
@@ -723,12 +749,8 @@ impl fmt::Debug for Shape<'_> {
                 .field("key", key)
                 .field("value", value)
                 .finish(),
-            Shape::Struct { name, fields } => f
-                .debug_struct("Shape::Struct")
-                .field("name", name)
-                .field("fields", fields)
-                .finish(),
-            Shape::Union(members) => f.debug_tuple("Shape::Union").field(members).finish(),
+            Shape::Struct { name } => f.debug_struct("Shape::Struct").field("name", name).finish(),
+            Shape::Union => f.debug_tuple("Shape::Union").finish(),
         }
     }
 }
@@ -1532,6 +1554,38 @@ impl AttributeType {
         Ok(Self::shape_from_resolved(self))
     }
 
+    pub fn struct_fields_ref_free_with_budget(
+        &self,
+        budget: &mut ShapeWalkBudget,
+    ) -> Result<Option<&[StructField]>, RefEncountered> {
+        if !budget.take() {
+            return Ok(None);
+        }
+        if let AttrTypeKind::Ref(name) = &self.kind {
+            return Err(RefEncountered { name: name.clone() });
+        }
+        Ok(match &self.kind {
+            AttrTypeKind::Struct { fields, .. } => Some(fields.as_slice()),
+            _ => None,
+        })
+    }
+
+    pub fn union_members_ref_free_with_budget(
+        &self,
+        budget: &mut ShapeWalkBudget,
+    ) -> Result<Option<&[AttributeType]>, RefEncountered> {
+        if !budget.take() {
+            return Ok(None);
+        }
+        if let AttrTypeKind::Ref(name) = &self.kind {
+            return Err(RefEncountered { name: name.clone() });
+        }
+        Ok(match &self.kind {
+            AttrTypeKind::Union(members) => Some(members.as_slice()),
+            _ => None,
+        })
+    }
+
     fn shape_from_resolved(resolved: &AttributeType) -> Shape<'_> {
         match &resolved.kind {
             AttrTypeKind::String => Shape::String,
@@ -1584,11 +1638,10 @@ impl AttributeType {
                 key: key.as_ref(),
                 value: value.as_ref(),
             },
-            AttrTypeKind::Struct { name, fields } => Shape::Struct {
+            AttrTypeKind::Struct { name, fields: _ } => Shape::Struct {
                 name: name.as_str(),
-                fields: fields.as_slice(),
             },
-            AttrTypeKind::Union(members) => Shape::Union(members.as_slice()),
+            AttrTypeKind::Union(_members) => Shape::Union,
             AttrTypeKind::Ref(_) => unreachable!(
                 "resolve_refs guarantees the returned attr is not Ref; \
                  reaching this arm violates ResolvedAttrType's invariant"
@@ -3642,6 +3695,42 @@ pub enum SchemaKind {
     DataSource,
 }
 
+pub(crate) fn struct_fields_with_defs<'a>(
+    attr_type: &'a AttributeType,
+    defs: &'a std::collections::BTreeMap<String, AttributeType>,
+) -> Option<&'a [StructField]> {
+    match attr_type.resolve_refs_with_defs(defs).as_attr().kind() {
+        AttrTypeKind::Struct { fields, .. } => Some(fields.as_slice()),
+        _ => None,
+    }
+}
+
+pub(crate) fn union_members_with_defs<'a>(
+    attr_type: &'a AttributeType,
+    defs: &'a std::collections::BTreeMap<String, AttributeType>,
+) -> Option<&'a [AttributeType]> {
+    match attr_type.resolve_refs_with_defs(defs).as_attr().kind() {
+        AttrTypeKind::Union(members) => Some(members.as_slice()),
+        _ => None,
+    }
+}
+
+fn string_enum_identity_matches_input(
+    input: &str,
+    enum_name: &str,
+    identity: Option<&TypeIdentity>,
+) -> bool {
+    if input.strip_prefix(&format!("{enum_name}.")).is_some() {
+        return true;
+    }
+    if let Some(identity) = identity {
+        return input
+            .strip_prefix(&format!("{identity}."))
+            .is_some_and(|value| !value.is_empty());
+    }
+    false
+}
+
 /// Resource schema
 #[derive(Debug, Clone)]
 pub struct ResourceSchema {
@@ -3759,6 +3848,100 @@ impl ResourceSchema {
     /// definition map.
     pub fn shape_of<'a>(&'a self, ty: &'a AttributeType) -> Shape<'a> {
         ty.shape_with_defs(&self.defs)
+    }
+
+    pub fn struct_fields_with_budget<'a>(
+        &'a self,
+        ty: &'a AttributeType,
+        budget: &mut ShapeWalkBudget,
+    ) -> Option<&'a [StructField]> {
+        if !budget.take() {
+            return None;
+        }
+        struct_fields_with_defs(ty, &self.defs)
+    }
+
+    pub fn union_members_with_budget<'a>(
+        &'a self,
+        ty: &'a AttributeType,
+        budget: &mut ShapeWalkBudget,
+    ) -> Option<&'a [AttributeType]> {
+        if !budget.take() {
+            return None;
+        }
+        union_members_with_defs(ty, &self.defs)
+    }
+
+    /// Return the valid API values for a top-level StringEnum attribute
+    /// referenced by a namespaced DSL alias.
+    ///
+    /// This intentionally does not walk into `Struct` fields. Enum alias
+    /// resolution already dispatches with the user-visible attribute name:
+    /// list items keep the same name and map values use the map key as the
+    /// next name. Looking up that top-level attribute and peeling only
+    /// transparent wrappers keeps recursive schemas (for example WAFv2
+    /// `Statement`) out of the alias hot path.
+    pub fn enum_valid_values_for_attr_alias(&self, attr_name: &str, input: &str) -> Vec<String> {
+        let Some(attr_schema) = self.attributes.get(attr_name) else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::new();
+        self.collect_enum_valid_values_for_alias(&attr_schema.attr_type, input, &mut out);
+        out
+    }
+
+    fn collect_enum_valid_values_for_alias(
+        &self,
+        attr_type: &AttributeType,
+        input: &str,
+        out: &mut Vec<String>,
+    ) {
+        match self.shape_of(attr_type) {
+            Shape::StringEnum {
+                name,
+                values,
+                identity,
+                ..
+            } => {
+                if string_enum_identity_matches_input(input, name, identity) {
+                    for value in values {
+                        if !out.contains(value) {
+                            out.push(value.clone());
+                        }
+                    }
+                }
+            }
+            Shape::Custom { base, .. } | Shape::CustomEnum { base, .. } => {
+                self.collect_enum_valid_values_for_alias(base, input, out);
+            }
+            Shape::List { inner, .. } => {
+                self.collect_enum_valid_values_for_alias(inner, input, out);
+            }
+            Shape::Map { value, .. } => {
+                self.collect_enum_valid_values_for_alias(value, input, out);
+            }
+            Shape::Union => {
+                if let Some(members) = self.union_members_of(attr_type) {
+                    for member in members {
+                        self.collect_enum_valid_values_for_alias(member, input, out);
+                    }
+                }
+            }
+            Shape::String
+            | Shape::Int
+            | Shape::Float
+            | Shape::Bool
+            | Shape::Duration
+            | Shape::Struct { .. } => {}
+        }
+    }
+
+    pub(crate) fn union_members_of<'a>(
+        &'a self,
+        ty: &'a AttributeType,
+    ) -> Option<&'a [AttributeType]> {
+        union_members_with_defs(ty, &self.defs)
     }
 
     pub fn with_description(mut self, desc: impl Into<String>) -> Self {
@@ -4207,20 +4390,30 @@ fn recurse_block_names_into_value(
     // wildcard arm below cannot silently swallow a `Ref` — the bug
     // class is structurally impossible.
     match field_type.shape_with_defs(defs) {
-        Shape::Struct { fields: inner, .. } => {
+        Shape::Struct { .. } => {
             if let Value::Concrete(ConcreteValue::Map(inner_map)) = value {
+                let inner = struct_fields_with_defs(field_type, defs)
+                    .expect("Shape::Struct must expose struct fields internally");
                 resolve_block_names_in_map(inner_map, inner, defs, resource_id, errors);
             }
         }
         Shape::List { inner, .. } => {
             // `List<Ref>`: peel the element type too via `shape(defs)`
             // so the walk reaches the underlying struct fields.
-            if let Shape::Struct { fields: inner, .. } = inner.shape_with_defs(defs)
+            if let Shape::Struct { .. } = inner.shape_with_defs(defs)
                 && let Value::Concrete(ConcreteValue::List(items)) = value
             {
+                let inner_fields = struct_fields_with_defs(inner, defs)
+                    .expect("Shape::Struct must expose struct fields internally");
                 for item in items.iter_mut() {
                     if let Value::Concrete(ConcreteValue::Map(item_map)) = item {
-                        resolve_block_names_in_map(item_map, inner, defs, resource_id, errors);
+                        resolve_block_names_in_map(
+                            item_map,
+                            inner_fields,
+                            defs,
+                            resource_id,
+                            errors,
+                        );
                     }
                 }
             }
