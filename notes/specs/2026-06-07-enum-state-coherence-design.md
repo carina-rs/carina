@@ -121,11 +121,10 @@ Enum {
     /// 効く。`Some(...)` は host で動く固有の関数で、関数ポインタである
     /// 都合上 WASM は越境できない。
     validate: Option<CustomValidator>,
-    /// API spelling → DSL spelling の書き戻し関数。host 側では
-    /// 関数ポインタとして直接持つ。WASM 越境では関数ポインタが
-    /// 通せないので、proto の wire form は transform を文字列名で
-    /// 運び、host 側の registry（後述）で名前から関数を引き直す。
-    to_dsl: Option<fn(&str) -> String>,
+    /// API spelling → DSL spelling の書き戻し transform。WASM 越境で
+    /// 関数ポインタは運べないので、proto と同じ data-driven enum を
+    /// 持ち、host はその data を直接評価する。
+    to_dsl: Option<DslTransform>,
 }
 ```
 
@@ -144,33 +143,59 @@ Enum {
   固有の検査を持たない」というシグナルで、振る舞いから型を推測する
   必要をなくす。旧 CustomEnum で動いていた validator は `Some(...)` で
   そのまま渡す。
-- `to_dsl` は `Option<fn(&str) -> String>` のままにする。host 側で
-  直接呼べる関数ポインタとして持つ。
+- `to_dsl` は `Option<DslTransform>` で持つ。transform は protocol の
+  data なので、WASM provider と host のメモリ空間が分かれていても同じ
+  意味を保ったまま越境できる。
 - 旧 StringEnum/CustomEnum の二分にあった「`(values, validate)` の
   どちらか一方しか動かない」性質を取り除き、両者は併存可能。`values`
   が `Some` で同時に `validate` も `Some` の組み合わせは、closed enum
   に追加のドメイン検査を載せたい場合に意味がある。
 
-## WASM 越境部の transform registry
+## WASM 越境部の data-driven transform enum
 
-`to_dsl` の関数ポインタは WASM コンポーネントを跨げない。これに対応
-するため、proto の wire form は `Option<String>` で transform の名前を
-運び、host 側の registry が名前から関数を引き当てる。
+`to_dsl` の関数ポインタは WASM コンポーネントを跨げない。provider 側で
+関数を登録しても、その登録先は provider のメモリ空間にある registry
+であり、host process の `carina-core` registry には届かない。したがって
+wire form に文字列名だけを載せ、host 側で名前から関数を引く設計では、
+provider 固有の transform が常に未登録になり得る。これは `unknown DSL
+transform` 警告と state/DSL 差分の再発点になる。
 
-- `carina-core::schema::register_dsl_transform(name, fn)` で provider
-  プラグインが起動時に自分の transform を登録する。
-- `carina-core::schema::dsl_transform_for(name) -> Option<fn>` で host
-  が proto 受信時に逆引きする。
-- carina-core 側で `hyphen_to_underscore`（Region/AZ で使う API form
-  → DSL form の正規化）を組み込みで登録しておく。これは provider 側で
-  最も典型的に使われる transform なので、provider 側で再登録不要にする。
-- registry にない名前が wire form に乗ってきた場合は、`to_dsl: None`
-  に degrade し、一度だけ警告を出す。schema load 全体は失敗しない。
+このため proto の wire form は `Option<DslTransform>` を運ぶ。variant は
+generic operation の data だけで構成する。
 
-この設計により、provider 側の任意の transform（trailing dot を落とす、
-table 引きで mapping する、など）を新しい名前で登録すれば WASM 越境
-できる。proto の wire form 自体は文字列のままで、新しい transform 種
-が増えても protocol 改版は要らない。
+```rust
+pub enum DslTransform {
+    Identity,
+    HyphenToUnderscore,
+    StripSuffix(String),
+    ReplaceTable(Vec<(String, String)>),
+    Unknown(serde_json::Value),
+}
+```
+
+- wire shape は `type` 文字列 field を持つ object で、payload を持つ
+  variant では `value` field に variant ごとの data を入れる。
+  例: `{"type":"HyphenToUnderscore"}` / `{"type":"StripSuffix","value":"."}`。
+- `Identity` / `Unknown(_)` は入力をそのまま返す。`Unknown(_)` は future
+  variant を古い host が deserialize した場合の forward-compat fallback
+  である。
+- `HyphenToUnderscore` は Region/AZ の API spelling (`ap-northeast-1`)
+  から DSL spelling (`ap_northeast_1`) への generic transform を表す。
+- `StripSuffix(String)` は Route53 hosted zone name の trailing dot の
+  ような suffix 正規化を provider 固有関数なしで表す。
+- `ReplaceTable(Vec<(String, String)>)` は `ip_protocol_all` のような
+  有限表引き transform を data として表す。
+- 未知の `type` tag は payload の形に関係なく `Unknown(raw_json)` として
+  deserialize する。たとえば `{"type":"Future","value":[["a","b"]]}`
+  や `{"type":"Other","value":{"x":1}}` は schema load を失敗させず、
+  host 側では identity transform として扱う。`Unknown` は raw JSON を
+  保持して serialize し直すため、host が schema を再出力しても future
+  provider の variant 名や payload を `"Unknown"` に潰さない。
+
+host は `DslTransform::apply(&self, s)` を呼ぶだけでよく、provider 側の
+関数登録や host 側の組み込み carve-out は不要になる。新しい transform
+が必要な場合は provider 固有名を増やすのではなく、既存の generic
+variant で表すか、protocol enum に新 variant を追加する。
 
 これにより、Carina-core / LSP / differ / state 読み戻し経路は **Enum
 型を 1 つだけ** 知っていれば良い。WASM 越境部 (`Shape` / `RawShape`)

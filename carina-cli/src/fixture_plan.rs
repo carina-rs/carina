@@ -403,7 +403,7 @@ impl ProviderFactory for DynamicEnumFixtureFactory {
             None,
             vec![],
             None,
-            Some(|s| s.replace('-', "_")),
+            Some(carina_core::schema::DslTransform::HyphenToUnderscore),
         );
         vec![
             ResourceSchema::new("network.Subnet")

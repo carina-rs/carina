@@ -91,7 +91,7 @@ echo "  Done."
 # ── Check 2: carina-core must not reference provider crates ───────────────────
 echo "=== Check 2: carina-core provider references ==="
 check_rust_files "carina-core/src" \
-    'carina_provider_' \
+    'carina_provider_(aws|awscc)' \
     "carina-core provider reference"
 echo "  Done."
 
@@ -115,7 +115,7 @@ echo "  Done."
 # instantiates provider factories.
 echo "=== Check 5: carina-lsp provider references (excluding main.rs wiring) ==="
 check_rust_files "carina-lsp/src" \
-    'carina_provider_' \
+    'carina_provider_(aws|awscc)' \
     "carina-lsp provider reference" \
     "main.rs"
 echo "  Done."

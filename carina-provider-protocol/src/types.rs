@@ -482,11 +482,11 @@ pub enum AttributeType {
         name: String,
         base: Box<AttributeType>,
         namespace: String,
-        /// Stable registry key for a host-installed API→DSL
-        /// transform. Unknown keys deserialize successfully and
-        /// degrade to no transform during proto→core conversion.
+        /// Data-driven API-to-DSL transform. The host applies the
+        /// carried operation directly, so provider plugins do not need
+        /// to register host-process callbacks across the WASM boundary.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        dsl_transform: Option<String>,
+        dsl_transform: Option<DslTransform>,
     },
     /// Named reference into the enclosing [`ResourceSchema::defs`]
     /// map. Used to express cyclic CFN definition graphs (WAFv2
@@ -502,6 +502,81 @@ pub enum AttributeType {
     Ref {
         name: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DslTransform {
+    Identity,
+    HyphenToUnderscore,
+    StripSuffix(String),
+    ReplaceTable(Vec<(String, String)>),
+    Unknown(serde_json::Value),
+}
+
+impl DslTransform {
+    pub fn apply(&self, s: &str) -> String {
+        match self {
+            Self::Identity | Self::Unknown(_) => s.to_string(),
+            Self::HyphenToUnderscore => s.replace('-', "_"),
+            Self::StripSuffix(suffix) => s.strip_suffix(suffix.as_str()).unwrap_or(s).to_string(),
+            Self::ReplaceTable(table) => table
+                .iter()
+                .find(|(k, _)| k == s)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| s.to_string()),
+        }
+    }
+}
+
+impl Serialize for DslTransform {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let value = match self {
+            Self::Identity => serde_json::json!({ "type": "Identity" }),
+            Self::HyphenToUnderscore => serde_json::json!({ "type": "HyphenToUnderscore" }),
+            Self::StripSuffix(suffix) => {
+                serde_json::json!({ "type": "StripSuffix", "value": suffix })
+            }
+            Self::ReplaceTable(table) => {
+                serde_json::json!({ "type": "ReplaceTable", "value": table })
+            }
+            Self::Unknown(raw) => raw.clone(),
+        };
+        value.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for DslTransform {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        let tag = raw
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| serde::de::Error::custom("DslTransform missing string `type` tag"))?;
+
+        match tag {
+            "Identity" => Ok(Self::Identity),
+            "HyphenToUnderscore" => Ok(Self::HyphenToUnderscore),
+            "StripSuffix" => {
+                let value = raw
+                    .get("value")
+                    .cloned()
+                    .ok_or_else(|| serde::de::Error::custom("StripSuffix missing `value`"))?;
+                serde_json::from_value(value)
+                    .map(Self::StripSuffix)
+                    .map_err(serde::de::Error::custom)
+            }
+            "ReplaceTable" => {
+                let value = raw
+                    .get("value")
+                    .cloned()
+                    .ok_or_else(|| serde::de::Error::custom("ReplaceTable missing `value`"))?;
+                serde_json::from_value(value)
+                    .map(Self::ReplaceTable)
+                    .map_err(serde::de::Error::custom)
+            }
+            _ => Ok(Self::Unknown(raw)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -875,20 +950,125 @@ mod tests {
 
     #[test]
     fn custom_enum_dsl_transform_round_trip() {
-        let attr = AttributeType::CustomEnum {
-            name: "ZoneName".to_string(),
-            base: Box::new(AttributeType::String),
-            namespace: "aws.AvailabilityZone".to_string(),
-            dsl_transform: Some("hyphen_to_underscore".to_string()),
-        };
-        let json = serde_json::to_string(&attr).unwrap();
-        assert!(json.contains("\"dsl_transform\":\"hyphen_to_underscore\""));
-        let back: AttributeType = serde_json::from_str(&json).unwrap();
-        match back {
+        let transforms = [
+            DslTransform::Identity,
+            DslTransform::HyphenToUnderscore,
+            DslTransform::StripSuffix(".".to_string()),
+            DslTransform::ReplaceTable(vec![("all".to_string(), "-1".to_string())]),
+        ];
+
+        for transform in transforms {
+            let attr = AttributeType::CustomEnum {
+                name: "ZoneName".to_string(),
+                base: Box::new(AttributeType::String),
+                namespace: "aws.AvailabilityZone".to_string(),
+                dsl_transform: Some(transform.clone()),
+            };
+            let json = serde_json::to_string(&attr).unwrap();
+            let back: AttributeType = serde_json::from_str(&json).unwrap();
+            match back {
+                AttributeType::CustomEnum { dsl_transform, .. } => {
+                    assert_eq!(dsl_transform, Some(transform));
+                }
+                other => panic!("expected CustomEnum, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn dsl_transform_replace_table_applies_first_match() {
+        let transform = DslTransform::ReplaceTable(vec![
+            ("-1".to_string(), "all".to_string()),
+            ("tcp".to_string(), "tcp".to_string()),
+        ]);
+        assert_eq!(transform.apply("-1"), "all");
+        assert_eq!(transform.apply("udp"), "udp");
+    }
+
+    #[test]
+    fn dsl_transform_unknown_unit_deserializes_as_identity() {
+        let json = r#"{"type":"FutureTransform"}"#;
+        let transform: DslTransform = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            transform,
+            DslTransform::Unknown(serde_json::json!({"type":"FutureTransform"}))
+        );
+        assert_eq!(transform.apply("foo.bar."), "foo.bar.");
+    }
+
+    #[test]
+    fn dsl_transform_unknown_sequence_payload_deserializes_as_identity() {
+        let json = r#"{"type":"FutureTransform","value":[["a","b"]]}"#;
+        let transform: DslTransform = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            transform,
+            DslTransform::Unknown(serde_json::json!({
+                "type": "FutureTransform",
+                "value": [["a", "b"]]
+            }))
+        );
+        assert_eq!(transform.apply("foo.bar."), "foo.bar.");
+    }
+
+    #[test]
+    fn custom_enum_unknown_sequence_payload_deserializes_without_schema_failure() {
+        let json = r#"{
+            "type":"custom_enum",
+            "name":"ZoneName",
+            "base":{"type":"String"},
+            "namespace":"aws.AvailabilityZone",
+            "dsl_transform":{"type":"FutureTransform","value":[["a","b"]]}
+        }"#;
+        let attr: AttributeType = serde_json::from_str(json).unwrap();
+        match attr {
             AttributeType::CustomEnum { dsl_transform, .. } => {
-                assert_eq!(dsl_transform.as_deref(), Some("hyphen_to_underscore"));
+                assert!(matches!(
+                    dsl_transform,
+                    Some(DslTransform::Unknown(raw))
+                        if raw == serde_json::json!({
+                            "type": "FutureTransform",
+                            "value": [["a", "b"]]
+                        })
+                ));
             }
             other => panic!("expected CustomEnum, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn custom_enum_unknown_struct_payload_deserializes_without_schema_failure() {
+        let json = r#"{
+            "type":"custom_enum",
+            "name":"ZoneName",
+            "base":{"type":"String"},
+            "namespace":"aws.AvailabilityZone",
+            "dsl_transform":{"type":"Other","value":{"x":1}}
+        }"#;
+        let attr: AttributeType = serde_json::from_str(json).unwrap();
+        match attr {
+            AttributeType::CustomEnum { dsl_transform, .. } => {
+                assert!(matches!(
+                    dsl_transform,
+                    Some(DslTransform::Unknown(raw))
+                        if raw == serde_json::json!({
+                            "type": "Other",
+                            "value": {"x": 1}
+                        })
+                ));
+            }
+            other => panic!("expected CustomEnum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dsl_transform_unknown_serializes_losslessly() {
+        let raw = serde_json::json!({
+            "type": "FutureTransform",
+            "value": [["a", "b"]]
+        });
+        let transform = DslTransform::Unknown(raw.clone());
+        let json = serde_json::to_string(&transform).unwrap();
+        let back: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, raw);
     }
 }

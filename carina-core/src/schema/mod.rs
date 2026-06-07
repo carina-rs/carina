@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::Arc;
 
 use indexmap::IndexMap;
 
@@ -16,6 +16,7 @@ use crate::value::format_value_with_key;
 mod resolved_attr_type;
 mod type_identity;
 
+pub use carina_provider_protocol::types::DslTransform;
 pub use resolved_attr_type::ResolvedAttrType;
 pub use type_identity::TypeIdentity;
 
@@ -44,53 +45,6 @@ pub type ResourceValidator = fn(&HashMap<String, Value>) -> Result<(), Vec<TypeE
 /// return a structured `TypeError` directly — both of which a bare `fn`
 /// pointer cannot do. See #2217.
 pub type CustomValidator = Arc<dyn Fn(&Value) -> Result<(), TypeError> + Send + Sync>;
-
-/// API-to-DSL transform used for dynamic enum state normalization.
-///
-/// Direct host-side schemas pass these as function pointers through
-/// [`AttributeType::enum_`] / [`AttributeType::enum_with_base`]. Provider
-/// components crossing the WASM protocol boundary instead send a stable
-/// string key, which the host resolves through this registry.
-pub type DslTransformFn = fn(&str) -> String;
-
-static DSL_TRANSFORMS: LazyLock<RwLock<HashMap<String, DslTransformFn>>> = LazyLock::new(|| {
-    let mut transforms = HashMap::new();
-    transforms.insert(
-        "hyphen_to_underscore".to_string(),
-        hyphen_to_underscore as DslTransformFn,
-    );
-    RwLock::new(transforms)
-});
-
-fn hyphen_to_underscore(s: &str) -> String {
-    s.replace('-', "_")
-}
-
-/// Register a named API-to-DSL transform for plugin-provided dynamic enums.
-///
-/// Provider crates use this at initialization time for transforms that cannot
-/// cross the WASM boundary as function pointers. Re-registering a name replaces
-/// the previous function.
-pub fn register_dsl_transform(name: &str, f: DslTransformFn) {
-    let mut transforms = DSL_TRANSFORMS
-        .write()
-        .expect("DSL transform registry lock poisoned");
-    transforms.insert(name.to_string(), f);
-}
-
-/// Look up a named API-to-DSL transform registered with
-/// [`register_dsl_transform`].
-///
-/// The built-in `"hyphen_to_underscore"` transform is available without
-/// provider-side registration. Unknown names return `None` so older hosts can
-/// still load schemas emitted by newer providers, losing only the transform.
-pub fn dsl_transform_for(name: &str) -> Option<DslTransformFn> {
-    DSL_TRANSFORMS
-        .read()
-        .expect("DSL transform registry lock poisoned")
-        .get(name)
-        .copied()
-}
 
 /// Build a [`CustomValidator`] from any closure that returns a structured
 /// [`TypeError`]. This is the preferred constructor: validators that emit
@@ -341,11 +295,11 @@ pub type EnumParts<'a> = (
 #[derive(Clone, Copy)]
 pub struct DslMap<'a> {
     aliases: &'a [(String, String)],
-    to_dsl: Option<fn(&str) -> String>,
+    to_dsl: Option<&'a DslTransform>,
 }
 
 impl<'a> DslMap<'a> {
-    pub fn new(aliases: &'a [(String, String)], to_dsl: Option<fn(&str) -> String>) -> Self {
+    pub fn new(aliases: &'a [(String, String)], to_dsl: Option<&'a DslTransform>) -> Self {
         Self { aliases, to_dsl }
     }
 
@@ -355,7 +309,10 @@ impl<'a> DslMap<'a> {
         self.aliases
             .iter()
             .find_map(|(a, d)| (a == api).then(|| d.clone()))
-            .unwrap_or_else(|| self.to_dsl.map_or_else(|| api.to_string(), |f| f(api)))
+            .unwrap_or_else(|| {
+                self.to_dsl
+                    .map_or_else(|| api.to_string(), |transform| transform.apply(api))
+            })
     }
 
     /// Translate a DSL spelling back to its API-canonical spelling.
@@ -385,8 +342,7 @@ impl<'a> DslMap<'a> {
     /// transform callback, so this returns `false` for them even
     /// though `aliases` itself is empty.
     pub fn is_empty(&self) -> bool {
-        let has_transform = self.to_dsl.map(|_| true).unwrap_or(false);
-        self.aliases.is_empty() && !has_transform
+        self.aliases.is_empty() && self.to_dsl.is_none()
     }
 }
 
@@ -508,8 +464,8 @@ pub(crate) enum AttrTypeKind {
         /// API → DSL spelling aliases for closed enums.
         dsl_aliases: Vec<(String, String)>,
         validate: Option<CustomValidator>,
-        /// Optional API → DSL callback for dynamic enum spaces.
-        to_dsl: Option<fn(&str) -> String>,
+        /// Optional API → DSL transform for dynamic enum spaces.
+        to_dsl: Option<DslTransform>,
     },
     /// Structurally-validated custom type — values carry their own
     /// format (e.g. `arn:aws:s3:::bucket-name`, `vpc-12345678`) and
@@ -625,7 +581,7 @@ pub enum Shape<'a> {
         values: Option<&'a [String]>,
         dsl_aliases: &'a [(String, String)],
         validate: Option<&'a CustomValidator>,
-        to_dsl: Option<fn(&str) -> String>,
+        to_dsl: Option<&'a DslTransform>,
     },
     /// Structural custom type — see [`AttrTypeKind::Custom`].
     Custom {
@@ -773,7 +729,7 @@ pub enum RawShape<'a> {
         values: Option<&'a [String]>,
         dsl_aliases: &'a [(String, String)],
         validate: Option<&'a CustomValidator>,
-        to_dsl: Option<fn(&str) -> String>,
+        to_dsl: Option<&'a DslTransform>,
     },
     /// Structural custom type — see [`AttrTypeKind::Custom`].
     Custom {
@@ -1564,7 +1520,7 @@ impl AttributeType {
                 values: values.as_deref(),
                 dsl_aliases: dsl_aliases.as_slice(),
                 validate: validate.as_ref(),
-                to_dsl: *to_dsl,
+                to_dsl: to_dsl.as_ref(),
             },
             AttrTypeKind::Custom {
                 identity,
@@ -1636,7 +1592,7 @@ impl AttributeType {
                 values: values.as_deref(),
                 dsl_aliases: dsl_aliases.as_slice(),
                 validate: validate.as_ref(),
-                to_dsl: *to_dsl,
+                to_dsl: to_dsl.as_ref(),
             },
             AttrTypeKind::Custom {
                 identity,
@@ -1740,9 +1696,8 @@ impl AttributeType {
     /// - `values: None`, empty `dsl_aliases`, `validate: None`,
     ///   `to_dsl: Some(...)`: a WASM-bridged dynamic enum. Schema-local
     ///   validation is absent because validation happens through
-    ///   `ProviderContext.validators`; the transform is resolved from
-    ///   the carina-core registry when the protocol payload is converted
-    ///   back to core types.
+    ///   `ProviderContext.validators`; the protocol payload carries
+    ///   the transform as data and the host applies it directly.
     ///
     /// At least one of `values: Some(...)`, `validate: Some(...)`, or a
     /// separately registered provider validator should exist for real
@@ -1750,10 +1705,9 @@ impl AttributeType {
     /// no schema-local membership check and may accept arbitrary strings
     /// at validation sites that do not have provider lookup context.
     ///
-    /// The WASM path cannot carry function pointers. Providers register
-    /// a transform with [`register_dsl_transform`] and send the stable
-    /// transform name in the protocol's `dsl_transform` string field;
-    /// the host then installs the registered function as `to_dsl`.
+    /// The WASM path cannot carry function pointers, so providers send
+    /// the protocol's `dsl_transform` enum and the host stores that
+    /// data in `to_dsl`.
     ///
     /// See `notes/specs/2026-06-07-enum-state-coherence-design.md`
     /// for the enum state-coherence design and the reason these former
@@ -1763,7 +1717,7 @@ impl AttributeType {
         values: Option<Vec<String>>,
         dsl_aliases: Vec<(String, String)>,
         validate: Option<CustomValidator>,
-        to_dsl: Option<fn(&str) -> String>,
+        to_dsl: Option<DslTransform>,
     ) -> Self {
         Self::enum_with_base(
             identity,
@@ -1787,17 +1741,15 @@ impl AttributeType {
     /// [`AttributeType::string`].
     ///
     /// When this constructor is used from WASM proto conversion, the
-    /// protocol carries only a transform name string. Providers install
-    /// the implementation with [`register_dsl_transform`], and the host
-    /// resolves that name before passing the resulting function pointer
-    /// as `to_dsl`.
+    /// protocol carries a data-driven transform enum that the host
+    /// applies directly; no host-process registry lookup is needed.
     pub fn enum_with_base(
         identity: TypeIdentity,
         base: AttributeType,
         values: Option<Vec<String>>,
         dsl_aliases: Vec<(String, String)>,
         validate: Option<CustomValidator>,
-        to_dsl: Option<fn(&str) -> String>,
+        to_dsl: Option<DslTransform>,
     ) -> Self {
         AttributeType {
             kind: AttrTypeKind::Enum {
@@ -1919,7 +1871,7 @@ impl AttributeType {
                 values.as_deref(),
                 dsl_aliases.as_slice(),
                 validate.as_ref(),
-                DslMap::new(dsl_aliases, *to_dsl),
+                DslMap::new(dsl_aliases, to_dsl.as_ref()),
             )),
             _ => None,
         }
@@ -2004,7 +1956,7 @@ impl AttributeType {
                 identity,
                 values.as_deref(),
                 dsl_aliases,
-                DslMap::new(dsl_aliases, *to_dsl),
+                DslMap::new(dsl_aliases, to_dsl.as_ref()),
                 validate.as_ref(),
                 value,
             ),

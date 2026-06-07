@@ -891,6 +891,7 @@ name = "carina-core"
 version = "0.4.0"
 dependencies = [
  "argon2",
+ "carina-provider-protocol",
  "futures",
  "indexmap",
  "pest",
