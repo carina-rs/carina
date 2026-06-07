@@ -880,11 +880,11 @@ async fn run_apply_locked(
         .as_ref()
         .map(|sf| sf.build_saved_attrs())
         .unwrap_or_default();
-    // awscc#251: lift pre-StringEnum-migration state (`ConcreteValue::
-    // String` at a now-`StringEnum` position) before the differ /
+    // awscc#251: lift pre-Enum-migration state (`ConcreteValue::
+    // String` at a now-`Enum` position) before the differ /
     // `hydrate_read_state` consume it, so apply does not diff lifted
     // desired against un-lifted saved state. Same seam as the plan path.
-    carina_core::utils::lift_saved_state_string_enums(
+    carina_core::utils::lift_saved_state_enum_leaves(
         &mut saved_attrs,
         &sorted_resources,
         ctx.schemas(),
@@ -1126,7 +1126,7 @@ async fn run_apply_locked(
     // `parsed.data_sources` (not `sorted_resources`), so it is
     // independent of the deferred-for expansion sequence the helper
     // above pins.
-    carina_core::utils::lift_current_state_string_enums_for_data_sources(
+    carina_core::utils::lift_current_state_enum_leaves_for_data_sources(
         &mut current_states,
         &data_sources,
         ctx.schemas(),

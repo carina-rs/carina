@@ -953,10 +953,10 @@ pub(crate) async fn run_state_refresh_locked(
     // carina#3272: expand `for _, _ in <iter> { ... }` loops the same
     // way `run_apply_locked` does, so the materialised children land
     // in `sorted_resources` (and therefore in the orphan-classification
-    // `desired_ids` set below + the `lift_current_state_string_enums`
+    // `desired_ids` set below + the `lift_current_state_enum_leaves`
     // input slice). Without this, every for-loop-produced resource is
     // mis-classified as `(orphan)` on refresh and its enum-typed attrs
-    // skip the StringEnum lift, surfacing snake_case ↔ SCREAMING_CASE
+    // skip the Enum lift, surfacing snake_case ↔ SCREAMING_CASE
     // as a phantom `~` diff.
     //
     // Refresh has no `moved` block (that is a plan/apply concept), so
@@ -1092,13 +1092,13 @@ pub(crate) async fn run_state_refresh_locked(
         .as_ref()
         .map(|sf| sf.build_saved_attrs())
         .unwrap_or_default();
-    // awscc#251: lift pre-StringEnum-migration state before
+    // awscc#251: lift pre-Enum-migration state before
     // `hydrate_read_state` carries it forward into read state.
     // carina#3272: use the post-expansion `sorted_resources` (not
     // `parsed.resources`) so for-loop-materialised children's saved
     // state is lifted too — otherwise their enum-typed attrs stay
     // as plain `String` and the differ surfaces a phantom case diff.
-    carina_core::utils::lift_saved_state_string_enums(
+    carina_core::utils::lift_saved_state_enum_leaves(
         &mut saved_attrs,
         &sorted_resources,
         ctx.schemas(),
@@ -1111,7 +1111,7 @@ pub(crate) async fn run_state_refresh_locked(
     // as plain `String` for IAM enum fields and must be lifted before
     // they are written back / compared.
     // carina#3272: same `sorted_resources` reason as above.
-    carina_core::utils::lift_current_state_string_enums(
+    carina_core::utils::lift_current_state_enum_leaves(
         &mut current_states,
         &sorted_resources,
         ctx.schemas(),

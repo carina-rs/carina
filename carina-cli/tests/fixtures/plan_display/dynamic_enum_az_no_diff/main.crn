@@ -1,0 +1,9 @@
+provider fixture {}
+
+let subnet = fixture.network.Subnet {
+  availability_zone = fixture.network.Subnet.ZoneName.ap_northeast_1a
+}
+
+exports {
+  availability_zone = subnet.availability_zone
+}

@@ -14,7 +14,7 @@ use carina_core::resource::{
 };
 use carina_core::schema::{
     AttributeSchema as CoreAttributeSchema, AttributeType as CoreAttributeType,
-    ResourceSchema as CoreResourceSchema, StructField as CoreStructField, noop_validator,
+    ResourceSchema as CoreResourceSchema, StructField as CoreStructField, legacy_validator,
 };
 use carina_core::value::{SerializationContext, SerializationError};
 
@@ -749,9 +749,7 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
             name,
             namespace,
             dsl_aliases,
-        } => CoreAttributeType::string_enum(
-            name.clone(),
-            values.clone(),
+        } => CoreAttributeType::enum_(
             // Lift the wire-form flat dotted prefix into the
             // structured `TypeIdentity` the core schema now carries
             // (carina#3222). The pre-#3222 core form mirrored the
@@ -761,8 +759,12 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
             namespace
                 .as_deref()
                 .filter(|s| !s.is_empty())
-                .map(|ns| carina_core::schema::string_enum_identity(name, Some(ns))),
+                .map(|ns| carina_core::schema::enum_identity(name, Some(ns)))
+                .unwrap_or_else(|| carina_core::schema::TypeIdentity::bare(name)),
+            Some(values.clone()),
             dsl_aliases.clone(),
+            None,
+            None,
         ),
         proto::AttributeType::List { inner, ordered } => {
             if *ordered {
@@ -796,7 +798,7 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
             proto_attr_type_to_core(base),
             pattern.clone(),
             *length,
-            noop_validator(), // Validation is handled via ProviderContext.validators
+            legacy_validator(|_| Ok(())), // Validation is handled via ProviderContext.validators
             // `to_dsl` is a `fn` pointer that does not survive the
             // WASM-component boundary; host-side normalization for
             // plugin-provided types is registered separately, so this
@@ -807,23 +809,51 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
             name,
             base,
             namespace,
-        } => CoreAttributeType::custom_enum(
-            // CustomEnum requires a populated identity (the
+            dsl_transform,
+        } => CoreAttributeType::enum_with_base(
+            // Enum requires a populated identity (the
             // shorthand expansion needs the dotted prefix);
-            // `string_enum_identity` is the inverse of
+            // `enum_identity` is the inverse of
             // `TypeIdentity::dotted_prefix` and recovers the
             // structured form from the wire's flat `namespace + name`
             // shape.
-            carina_core::schema::string_enum_identity(name, Some(namespace.as_str())),
+            carina_core::schema::enum_identity(name, Some(namespace.as_str())),
             proto_attr_type_to_core(base),
-            noop_validator(), // Validation is handled via ProviderContext.validators
             None,
+            vec![],
+            None, // Validation is handled via ProviderContext.validators
+            resolve_dsl_transform(dsl_transform.as_deref()),
         ),
         // Cyclic CFN struct reference (carina#3340). The host's
         // structural counterpart is `AttributeType::Ref`; the matching
         // `ResourceSchema.defs` map is converted alongside in
         // `proto_schema_to_core` so resolution at walk-sites succeeds.
         proto::AttributeType::Ref { name } => CoreAttributeType::ref_(name.clone()),
+    }
+}
+
+fn resolve_dsl_transform(name: Option<&str>) -> Option<fn(&str) -> String> {
+    let name = name?;
+    let transform = carina_core::schema::dsl_transform_for(name);
+    if transform.is_none() {
+        warn_unknown_dsl_transform_once(name);
+    }
+    transform
+}
+
+fn warn_unknown_dsl_transform_once(name: &str) {
+    use std::collections::HashSet;
+    use std::sync::{LazyLock, RwLock};
+
+    static WARNED: LazyLock<RwLock<HashSet<String>>> =
+        LazyLock::new(|| RwLock::new(HashSet::new()));
+    let mut warned = WARNED
+        .write()
+        .expect("unknown DSL transform warning registry lock poisoned");
+    if warned.insert(name.to_string()) {
+        log::warn!(
+            "unknown DSL transform `{name}` in provider schema; enum state normalization will continue without this transform"
+        );
     }
 }
 
@@ -1836,13 +1866,13 @@ mod tests {
         );
     }
 
-    /// carina#2831: a proto `StringEnum` that carries `dsl_aliases`
+    /// carina#2831: a proto closed enum that carries `dsl_aliases`
     /// reaches the core schema with the alias list populated, so the
     /// host validator can accept the DSL spelling. Before this change
     /// `proto_attr_type_to_core` discarded the alias info because the
     /// equivalent `to_dsl` field was a non-serializable `fn` pointer.
     #[test]
-    fn proto_string_enum_dsl_aliases_propagate_to_core() {
+    fn proto_enum_dsl_aliases_propagate_to_core() {
         let proto_attr = proto::AttributeType::StringEnum {
             name: "ObjectOwnership".to_string(),
             values: vec![
@@ -1860,7 +1890,7 @@ mod tests {
         };
         let core_attr = proto_attr_type_to_core(&proto_attr);
         match core_attr.shape_ref_free().expect("test schema is Ref-free") {
-            carina_core::schema::Shape::StringEnum { dsl_aliases, .. } => {
+            carina_core::schema::Shape::Enum { dsl_aliases, .. } => {
                 assert_eq!(dsl_aliases.len(), 2);
                 assert!(
                     dsl_aliases
@@ -1869,24 +1899,201 @@ mod tests {
                     "dsl_aliases lost in proto -> core conversion: {dsl_aliases:?}"
                 );
             }
-            other => panic!("expected StringEnum, got {other:?}"),
+            other => panic!("expected Enum, got {other:?}"),
         }
     }
 
     /// Older provider components emit no `dsl_aliases` field; the
     /// proto deserializes it as an empty vec, which converts to a core
-    /// `StringEnum` with an empty alias list. Validation behaves like
+    /// `Enum` with an empty alias list. Validation behaves like
     /// the old `to_dsl: None` path: API-only spellings.
     #[test]
-    fn proto_string_enum_without_aliases_yields_empty_core_aliases() {
+    fn proto_enum_without_aliases_yields_empty_core_aliases() {
         let json = r#"{"type":"string_enum","values":["A","B"],"name":"X"}"#;
         let proto_attr: proto::AttributeType = serde_json::from_str(json).unwrap();
         let core_attr = proto_attr_type_to_core(&proto_attr);
         match core_attr.shape_ref_free().expect("test schema is Ref-free") {
-            carina_core::schema::Shape::StringEnum { dsl_aliases, .. } => {
+            carina_core::schema::Shape::Enum { dsl_aliases, .. } => {
                 assert!(dsl_aliases.is_empty());
             }
-            other => panic!("expected StringEnum, got {other:?}"),
+            other => panic!("expected Enum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_custom_enum_transform_lifts_state_string_to_dsl_identifier() {
+        let proto_attr = proto::AttributeType::CustomEnum {
+            name: "ZoneName".to_string(),
+            base: Box::new(proto::AttributeType::String),
+            namespace: "aws.AvailabilityZone".to_string(),
+            dsl_transform: Some("hyphen_to_underscore".to_string()),
+        };
+        let core_attr = proto_attr_type_to_core(&proto_attr);
+        let state = carina_core::resource::Value::Concrete(
+            carina_core::resource::ConcreteValue::String("ap-northeast-1a".to_string()),
+        );
+
+        let lifted = carina_core::utils::lift_enum_leaves(&state, &core_attr)
+            .expect("WASM-bridged dynamic enum should lift provider state");
+
+        assert_eq!(
+            lifted,
+            carina_core::resource::Value::Concrete(
+                carina_core::resource::ConcreteValue::EnumIdentifier(
+                    "aws.AvailabilityZone.ZoneName.ap_northeast_1a".to_string()
+                )
+            )
+        );
+        match core_attr.shape_ref_free().expect("test schema is Ref-free") {
+            carina_core::schema::Shape::Enum { base, .. } => {
+                assert!(matches!(
+                    base.shape_ref_free().expect("base is Ref-free"),
+                    carina_core::schema::Shape::String
+                ));
+            }
+            other => panic!("expected Enum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_custom_enum_transform_does_not_lift_garbage_state_string() {
+        let proto_attr = proto::AttributeType::CustomEnum {
+            name: "ZoneName".to_string(),
+            base: Box::new(proto::AttributeType::String),
+            namespace: "aws.AvailabilityZone".to_string(),
+            dsl_transform: Some("hyphen_to_underscore".to_string()),
+        };
+        let core_attr = proto_attr_type_to_core(&proto_attr);
+
+        let garbage = carina_core::resource::Value::Concrete(
+            carina_core::resource::ConcreteValue::String("garbage-not-an-az".to_string()),
+        );
+        assert_eq!(
+            carina_core::utils::lift_enum_leaves(&garbage, &core_attr),
+            None,
+            "unknown dynamic enum strings must remain String for strict validation"
+        );
+
+        let az_shaped_garbage = carina_core::resource::Value::Concrete(
+            carina_core::resource::ConcreteValue::String("foo_bar_42".to_string()),
+        );
+        assert_eq!(
+            carina_core::utils::lift_enum_leaves(&az_shaped_garbage, &core_attr),
+            None,
+            "already-DSL-looking unknown strings must stay String without data-form membership"
+        );
+
+        let already_dsl = carina_core::resource::Value::Concrete(
+            carina_core::resource::ConcreteValue::EnumIdentifier("ap_northeast_1a".to_string()),
+        );
+        assert_eq!(
+            carina_core::utils::lift_enum_leaves(&already_dsl, &core_attr),
+            Some(carina_core::resource::Value::Concrete(
+                carina_core::resource::ConcreteValue::EnumIdentifier(
+                    "aws.AvailabilityZone.ZoneName.ap_northeast_1a".to_string()
+                )
+            )),
+            "parser-produced DSL enum identifiers must still canonicalize"
+        );
+
+        for raw in ["   ", "", "AP-NORTHEAST-1A"] {
+            let value = carina_core::resource::Value::Concrete(
+                carina_core::resource::ConcreteValue::String(raw.to_string()),
+            );
+            assert_eq!(
+                carina_core::utils::lift_enum_leaves(&value, &core_attr),
+                None,
+                "{raw:?} must remain a String for strict validation"
+            );
+        }
+
+        let valid = carina_core::resource::Value::Concrete(
+            carina_core::resource::ConcreteValue::String("ap-northeast-1a".to_string()),
+        );
+        assert_eq!(
+            carina_core::utils::lift_enum_leaves(&valid, &core_attr),
+            Some(carina_core::resource::Value::Concrete(
+                carina_core::resource::ConcreteValue::EnumIdentifier(
+                    "aws.AvailabilityZone.ZoneName.ap_northeast_1a".to_string()
+                )
+            )),
+            "valid AZ strings must still lift through the WASM-bridged transform"
+        );
+    }
+
+    #[test]
+    fn proto_custom_enum_registered_transform_lifts_state_string() {
+        fn fake_transform(s: &str) -> String {
+            s.strip_prefix("api-").unwrap_or(s).to_string()
+        }
+
+        carina_core::schema::register_dsl_transform("test_fake_transform", fake_transform);
+
+        let proto_attr = proto::AttributeType::CustomEnum {
+            name: "Mode".to_string(),
+            base: Box::new(proto::AttributeType::String),
+            namespace: "test.Dynamic".to_string(),
+            dsl_transform: Some("test_fake_transform".to_string()),
+        };
+        let core_attr = proto_attr_type_to_core(&proto_attr);
+        let state = carina_core::resource::Value::Concrete(
+            carina_core::resource::ConcreteValue::String("api-enabled1".to_string()),
+        );
+
+        let lifted = carina_core::utils::lift_enum_leaves(&state, &core_attr)
+            .expect("registered transform should lift structurally valid state");
+
+        assert_eq!(
+            lifted,
+            carina_core::resource::Value::Concrete(
+                carina_core::resource::ConcreteValue::EnumIdentifier(
+                    "test.Dynamic.Mode.enabled1".to_string()
+                )
+            )
+        );
+    }
+
+    #[test]
+    fn proto_custom_enum_registry_miss_deserializes_and_uses_no_transform() {
+        let json = r#"{
+            "type":"custom_enum",
+            "name":"ZoneName",
+            "base":{"type":"String"},
+            "namespace":"aws.AvailabilityZone",
+            "dsl_transform":"snake_to_kebab"
+        }"#;
+        let proto_attr: proto::AttributeType =
+            serde_json::from_str(json).expect("unknown transform must deserialize");
+        match &proto_attr {
+            proto::AttributeType::CustomEnum { dsl_transform, .. } => {
+                assert_eq!(dsl_transform.as_deref(), Some("snake_to_kebab"));
+            }
+            other => panic!("expected proto CustomEnum, got {other:?}"),
+        }
+
+        let core_attr = proto_attr_type_to_core(&proto_attr);
+        match core_attr.shape_ref_free().expect("test schema is Ref-free") {
+            carina_core::schema::Shape::Enum { to_dsl, .. } => {
+                assert!(to_dsl.is_none(), "unknown transform must degrade to no-op");
+            }
+            other => panic!("expected Enum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proto_custom_enum_none_transform_uses_no_transform() {
+        let proto_attr = proto::AttributeType::CustomEnum {
+            name: "ZoneName".to_string(),
+            base: Box::new(proto::AttributeType::String),
+            namespace: "aws.AvailabilityZone".to_string(),
+            dsl_transform: None,
+        };
+        let core_attr = proto_attr_type_to_core(&proto_attr);
+        match core_attr.shape_ref_free().expect("test schema is Ref-free") {
+            carina_core::schema::Shape::Enum { to_dsl, .. } => {
+                assert!(to_dsl.is_none(), "None transform must remain no transform");
+            }
+            other => panic!("expected Enum, got {other:?}"),
         }
     }
 

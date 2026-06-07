@@ -1,7 +1,7 @@
 use super::*;
 use crate::parser::{ParsedFile, ProviderContext};
 use crate::resource::Resource;
-use crate::schema::{ResourceSchema, SchemaRegistry, TypeIdentity, noop_validator};
+use crate::schema::{ResourceSchema, SchemaRegistry, TypeIdentity};
 
 fn empty_parsed() -> ParsedFile {
     ParsedFile {
@@ -1529,11 +1529,12 @@ fn is_type_expr_compatible_string_rejects_union_of_only_specific_customs() {
 fn is_type_expr_compatible_string_accepts_union_of_only_strings() {
     let schema = AttributeType::union(vec![
         AttributeType::string(),
-        AttributeType::string_enum(
-            "Mode".to_string(),
-            vec!["A".to_string(), "B".to_string()],
-            None,
+        AttributeType::enum_(
+            TypeIdentity::bare("Mode"),
+            Some(vec!["A".to_string(), "B".to_string()]),
             vec![],
+            None,
+            None,
         ),
     ]);
     assert!(
@@ -1637,7 +1638,7 @@ fn attribute_param_ref_type_mismatch_detected() {
             AttributeType::string(),
             None,
             None,
-            noop_validator(),
+            crate::schema::legacy_validator(|_| Ok(())),
             None,
         ),
     ));
@@ -1790,12 +1791,12 @@ fn type_compat_subtype_accepted() {
             AttributeType::string(),
             None,
             None,
-            noop_validator(),
+            crate::schema::legacy_validator(|_| Ok(())),
             None,
         ),
         None,
         None,
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
     assert!(is_type_expr_compatible_with_schema(
@@ -1815,12 +1816,12 @@ fn type_compat_sibling_rejected() {
             AttributeType::string(),
             None,
             None,
-            noop_validator(),
+            crate::schema::legacy_validator(|_| Ok(())),
             None,
         ),
         None,
         None,
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
     assert!(!is_type_expr_compatible_with_schema(
@@ -1840,12 +1841,12 @@ fn type_compat_resource_id_subtype() {
             AttributeType::string(),
             None,
             None,
-            noop_validator(),
+            crate::schema::legacy_validator(|_| Ok(())),
             None,
         ),
         None,
         None,
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
     assert!(is_type_expr_compatible_with_schema(
@@ -1865,12 +1866,12 @@ fn type_compat_resource_id_siblings_rejected() {
             AttributeType::string(),
             None,
             None,
-            noop_validator(),
+            crate::schema::legacy_validator(|_| Ok(())),
             None,
         ),
         None,
         None,
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
     assert!(!is_type_expr_compatible_with_schema(
@@ -1887,7 +1888,7 @@ fn type_compat_exact_match() {
         AttributeType::string(),
         None,
         None,
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
     assert!(is_type_expr_compatible_with_schema(
@@ -2008,7 +2009,7 @@ fn type_compat_simple_rejected_when_union_has_no_plain_string() {
     ));
 }
 
-// `Custom` and `StringEnum` are deliberately excluded from the new
+// `Custom` and `Enum` are deliberately excluded from the new
 // Union allow-list: both are string-shaped at runtime, so a `Simple`
 // value sharing a union with one of them is ambiguous about which
 // branch the consumer treats as the route. The Custom-chain walk
@@ -2023,7 +2024,7 @@ fn type_compat_simple_rejected_when_union_has_string_shaped_peer() {
         AttributeType::string(),
         None,
         None,
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
     let with_custom = AttributeType::union(vec![AttributeType::string(), arn]);
@@ -2034,11 +2035,12 @@ fn type_compat_simple_rejected_when_union_has_string_shaped_peer() {
     ));
     let with_enum = AttributeType::union(vec![
         AttributeType::string(),
-        AttributeType::string_enum(
-            "Status".to_string(),
-            vec!["enabled".to_string(), "disabled".to_string()],
-            None,
+        AttributeType::enum_(
+            TypeIdentity::bare("Status"),
+            Some(vec!["enabled".to_string(), "disabled".to_string()]),
             vec![],
+            None,
+            None,
         ),
     ]);
     assert!(!is_type_expr_compatible_with_schema(
@@ -2368,7 +2370,7 @@ fn validate_resources_rejects_missing_exclusive_required() {
 #[test]
 fn enum_membership_violation_in_for_body_is_flagged() {
     // Regression for #2044: inside a `for` body, a string literal that
-    // isn't a valid member of a StringEnum attribute must be flagged.
+    // isn't a valid member of a Enum attribute must be flagged.
     let src = r#"
         provider test {
             source = 'x/y'
@@ -2390,11 +2392,12 @@ fn enum_membership_violation_in_for_body_is_flagged() {
             "r.mode_holder",
             vec![(
                 "mode",
-                AttributeType::string_enum(
-                    "Mode".to_string(),
-                    vec!["on".to_string(), "off".to_string()],
-                    None,
+                AttributeType::enum_(
+                    TypeIdentity::bare("Mode"),
+                    Some(vec!["on".to_string(), "off".to_string()]),
                     vec![],
+                    None,
+                    None,
                 ),
             )],
         ),
@@ -2425,11 +2428,12 @@ fn mode_schema() -> SchemaRegistry {
             "r.mode_holder",
             vec![(
                 "mode",
-                AttributeType::string_enum(
-                    "Mode".to_string(),
-                    vec!["fast".to_string(), "slow".to_string()],
-                    Some(crate::schema::string_enum_identity("Mode", Some("test.r"))),
+                AttributeType::enum_(
+                    crate::schema::enum_identity("Mode", Some("test.r")),
+                    Some(vec!["fast".to_string(), "slow".to_string()]),
                     vec![],
+                    None,
+                    None,
                 ),
             )],
         ),

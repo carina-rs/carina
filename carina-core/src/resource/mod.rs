@@ -614,7 +614,7 @@ pub enum ConcreteValue {
     /// identifier (`tcp`) or namespaced identifier
     /// (`awscc.ec2.SecurityGroup.IpProtocol.tcp`), not as a quoted
     /// string literal. The parser routes `namespaced_id` and bare
-    /// `variable_ref`s in `StringEnum` attribute positions into this
+    /// `variable_ref`s in `Enum` attribute positions into this
     /// variant so the validator can distinguish "identifier value"
     /// from "string value" without re-deriving the question from
     /// string content. See carina#2986.

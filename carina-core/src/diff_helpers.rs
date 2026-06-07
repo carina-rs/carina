@@ -14,7 +14,7 @@ use crate::schema::{AttributeType, ResourceSchema, empty_defs_for_schema_walks};
 /// (`detail_rows`) and the unchanged-count helper below (carina#3073).
 ///
 /// With a resolved `attr_type`, delegate to the differ's exact
-/// `type_aware_equal` (its `StringEnum` arm alias-folds
+/// `type_aware_equal` (its `Enum` arm alias-folds
 /// `EnumIdentifier("allow")` vs `String("Allow")`), so the rendered
 /// rows and the hidden-count agree with `find_changed_attributes`.
 /// Without one (no registry — embedded / test callers) fall back to

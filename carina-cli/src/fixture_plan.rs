@@ -11,9 +11,12 @@ use carina_core::config_loader::{get_base_dir, load_configuration};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
 use carina_core::plan::Plan;
+use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult};
 use carina_core::resolver::resolve_refs_for_plan;
 use carina_core::resource::{ResourceId, State, Value};
-use carina_core::schema::SchemaRegistry;
+use carina_core::schema::{
+    AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, TypeIdentity,
+};
 use carina_state::{StateFile, check_and_migrate};
 
 use crate::commands::validate_and_resolve;
@@ -81,7 +84,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         None
     };
 
-    let wiring = WiringContext::new(vec![]);
+    let wiring = WiringContext::new(fixture_provider_factories(&fixture_pathbuf));
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
     if let Some(sf) = state_file.as_ref() {
         carina_core::module_resolver::reconcile_anonymous_module_instances(
@@ -131,6 +134,31 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             current_states.insert(ds.id.clone(), State::not_found(ds.id.clone()));
         }
     }
+
+    let directives_map = state_file
+        .as_ref()
+        .map(|sf| sf.build_directives())
+        .unwrap_or_default();
+
+    let mut saved_attrs = state_file
+        .as_ref()
+        .map(|sf| sf.build_saved_attrs())
+        .unwrap_or_default();
+
+    // Keep fixture plans aligned with the real CLI plan/apply wiring:
+    // state-file attributes are lifted before the differ sees them, so
+    // fixture coverage exercises the enum-state lift seam instead of
+    // relying on differ cross-shape tolerance.
+    carina_core::utils::lift_saved_state_enum_leaves(
+        &mut saved_attrs,
+        &sorted_resources,
+        wiring.schemas(),
+    );
+
+    let mut prev_explicit = state_file
+        .as_ref()
+        .map(|sf| sf.build_explicit())
+        .unwrap_or_default();
 
     // Insert every upstream binding — even when the state file is
     // unreadable — so `resolve_refs_for_plan` knows the binding name
@@ -196,6 +224,16 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &mut data_sources_for_plan,
         wiring.schemas(),
     );
+    carina_core::utils::lift_current_state_enum_leaves(
+        &mut current_states,
+        &sorted_resources,
+        wiring.schemas(),
+    );
+    carina_core::utils::lift_current_state_enum_leaves_for_data_sources(
+        &mut current_states,
+        &data_sources,
+        wiring.schemas(),
+    );
     carina_core::value::canonicalize_states_with_schemas(&mut current_states, wiring.schemas());
 
     normalize_desired_with_ctx(&wiring, &mut resources);
@@ -225,21 +263,6 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
 
     resolve_enum_aliases_with_ctx(&wiring, &mut resources);
     resolve_enum_aliases_in_states(&wiring, &mut current_states);
-
-    let directives_map = state_file
-        .as_ref()
-        .map(|sf| sf.build_directives())
-        .unwrap_or_default();
-
-    let mut saved_attrs = state_file
-        .as_ref()
-        .map(|sf| sf.build_saved_attrs())
-        .unwrap_or_default();
-
-    let mut prev_explicit = state_file
-        .as_ref()
-        .map(|sf| sf.build_explicit())
-        .unwrap_or_default();
 
     let orphan_dependencies = if let Some(sf) = state_file.as_ref() {
         let desired_ids: HashSet<ResourceId> =
@@ -326,6 +349,66 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         resolved_export_params,
         prev_explicit,
         expansion_trace: parsed.expansion_trace,
+    }
+}
+
+fn fixture_provider_factories(fixture_path: &Path) -> Vec<Box<dyn ProviderFactory>> {
+    match fixture_path.file_name().and_then(|name| name.to_str()) {
+        Some("dynamic_enum_az_no_diff") => vec![Box::new(DynamicEnumFixtureFactory)],
+        _ => vec![],
+    }
+}
+
+struct DynamicEnumFixtureFactory;
+
+impl ProviderFactory for DynamicEnumFixtureFactory {
+    fn name(&self) -> &str {
+        "fixture"
+    }
+
+    fn display_name(&self) -> &str {
+        "Fixture provider"
+    }
+
+    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+        HashMap::new()
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &indexmap::IndexMap<String, Value>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
+        "test".to_string()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _attributes: &indexmap::IndexMap<String, Value>,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
+    }
+
+    fn schemas(&self) -> Vec<ResourceSchema> {
+        let zone_name = AttributeType::enum_(
+            TypeIdentity::new(
+                Some("fixture"),
+                vec!["network".to_string(), "Subnet".to_string()],
+                "ZoneName",
+            ),
+            None,
+            vec![],
+            None,
+            Some(|s| s.replace('-', "_")),
+        );
+        vec![
+            ResourceSchema::new("network.Subnet")
+                .attribute(AttributeSchema::new("availability_zone", zone_name).required()),
+        ]
     }
 }
 

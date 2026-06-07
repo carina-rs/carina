@@ -464,7 +464,7 @@ pub(crate) fn parse_primary_eval(
                 // Bare identifiers (`dedicated`, `enabled`) are emitted as
                 // `ConcreteValue::EnumIdentifier` short form. The validator
                 // performs schema-aware namespace expansion against the
-                // enclosing attribute's `StringEnum` definition; if the
+                // enclosing attribute's `Enum` definition; if the
                 // attribute isn't an enum, the validator surfaces a clear
                 // type mismatch with the user-typed text intact. Binding
                 // precedence is already honored by the `get_variable` arm

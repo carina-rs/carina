@@ -482,6 +482,11 @@ pub enum AttributeType {
         name: String,
         base: Box<AttributeType>,
         namespace: String,
+        /// Stable registry key for a host-installed API→DSL
+        /// transform. Unknown keys deserialize successfully and
+        /// degrade to no transform during proto→core conversion.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dsl_transform: Option<String>,
     },
     /// Named reference into the enclosing [`ResourceSchema::defs`]
     /// map. Used to express cyclic CFN definition graphs (WAFv2
@@ -866,5 +871,24 @@ mod tests {
             !json.contains("dsl_aliases"),
             "empty dsl_aliases must be omitted, got: {json}"
         );
+    }
+
+    #[test]
+    fn custom_enum_dsl_transform_round_trip() {
+        let attr = AttributeType::CustomEnum {
+            name: "ZoneName".to_string(),
+            base: Box::new(AttributeType::String),
+            namespace: "aws.AvailabilityZone".to_string(),
+            dsl_transform: Some("hyphen_to_underscore".to_string()),
+        };
+        let json = serde_json::to_string(&attr).unwrap();
+        assert!(json.contains("\"dsl_transform\":\"hyphen_to_underscore\""));
+        let back: AttributeType = serde_json::from_str(&json).unwrap();
+        match back {
+            AttributeType::CustomEnum { dsl_transform, .. } => {
+                assert_eq!(dsl_transform.as_deref(), Some("hyphen_to_underscore"));
+            }
+            other => panic!("expected CustomEnum, got {other:?}"),
+        }
     }
 }

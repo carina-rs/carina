@@ -377,7 +377,7 @@ instance_tenancy =
 
 #[test]
 #[ignore = "requires provider schemas"]
-fn string_enum_completion_for_aws_s3_bucket_versioning_status() {
+fn enum_completion_for_aws_s3_bucket_versioning_status() {
     let provider = test_provider();
     let doc = create_document(
         r#"aws.s3.Bucket {
@@ -395,7 +395,7 @@ versioning_status =
         completions
             .iter()
             .any(|c| c.label == "aws.s3.Bucket.VersioningStatus.Enabled"),
-        "Should complete namespaced enum values from StringEnum schema metadata"
+        "Should complete namespaced enum values from Enum schema metadata"
     );
     assert!(
         completions
@@ -407,7 +407,7 @@ versioning_status =
 
 #[test]
 #[ignore = "requires provider schemas"]
-fn string_enum_completion_for_awscc_ipam_pool_address_family() {
+fn enum_completion_for_awscc_ipam_pool_address_family() {
     let provider = test_provider();
     let doc = create_document(
         r#"awscc.ec2.ipam_pool {
@@ -425,7 +425,7 @@ address_family =
         completions
             .iter()
             .any(|c| c.label == "awscc.ec2.ipam_pool.AddressFamily.IPv4"),
-        "Should complete awscc enum values from StringEnum schema metadata"
+        "Should complete awscc enum values from Enum schema metadata"
     );
     assert!(
         completions
@@ -1081,8 +1081,8 @@ fn context_detection_type_position_in_attributes() {
 }
 
 #[test]
-fn string_enum_completion_derives_namespace_from_resource_type() {
-    // When a StringEnum has name but no namespace (WASM provider case),
+fn enum_completion_derives_namespace_from_resource_type() {
+    // When a Enum has name but no namespace (WASM provider case),
     // completions derive the namespace from the resource type and emit
     // fully-qualified identifiers.
     let provider = test_provider_with_nameless_enum();
@@ -1125,8 +1125,8 @@ versioning_status =
 }
 
 #[test]
-fn string_enum_completion_in_struct_derives_namespace() {
-    // StringEnum inside a struct field also resolves via the resource type
+fn enum_completion_in_struct_derives_namespace() {
+    // Enum inside a struct field also resolves via the resource type
     // and emits the fully-qualified form.
     let provider = test_provider_with_nameless_enum();
     let doc = create_document(
@@ -1317,9 +1317,9 @@ fn unknown_attribute_fallback_has_no_type_pollution() {
 }
 
 #[test]
-fn string_enum_completion_inside_for_loop_body() {
+fn enum_completion_inside_for_loop_body() {
     // Regression for #1974: inside a `for` body, the enclosing resource_type
-    // must still be detected so StringEnum completions fire. Previously the
+    // must still be detected so Enum completions fire. Previously the
     // for's opening `{` tripped the context detector into brace_depth >= 1
     // before the resource block's `{`, and `extract_resource_type` was only
     // consulted at brace_depth == 0 — so the resource schema was missed,
@@ -1345,28 +1345,28 @@ for item in items {
 
     assert!(
         labels.contains(&"awscc.s3.Bucket.VersioningStatus.Enabled"),
-        "StringEnum 'Enabled' must still be offered (fully-qualified) inside a for body. Got: {:?}",
+        "Enum 'Enabled' must still be offered (fully-qualified) inside a for body. Got: {:?}",
         labels
     );
     assert!(
         labels.contains(&"awscc.s3.Bucket.VersioningStatus.Suspended"),
-        "StringEnum 'Suspended' must still be offered (fully-qualified) inside a for body. Got: {:?}",
+        "Enum 'Suspended' must still be offered (fully-qualified) inside a for body. Got: {:?}",
         labels
     );
     assert!(
         !labels.iter().any(|l| l.starts_with("aws.Region.")),
-        "Region values must not pollute StringEnum completions inside for body. Got: {:?}",
+        "Region values must not pollute Enum completions inside for body. Got: {:?}",
         labels
     );
     assert!(
         !labels.contains(&"true") && !labels.contains(&"false"),
-        "Boolean values must not pollute StringEnum completions. Got: {:?}",
+        "Boolean values must not pollute Enum completions. Got: {:?}",
         labels
     );
 }
 
 #[test]
-fn string_enum_completion_inside_nested_for_loop_body() {
+fn enum_completion_inside_nested_for_loop_body() {
     // Two stacked `for` bodies still have to see through to the resource
     // type inside. Regression safety net for the for_body_depth tracker.
     let provider = test_provider_with_enum_and_regions();

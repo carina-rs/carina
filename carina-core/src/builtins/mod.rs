@@ -49,7 +49,7 @@ pub enum BuiltinReturnType {
     Map,
     /// Return shape depends on the arguments (e.g. `lookup`, `min`, `max`,
     /// `map`). Matches any base type the attribute accepts, but still fails
-    /// to match `Custom` / `StringEnum` attributes — the caller has no
+    /// to match `Custom` / `Enum` attributes — the caller has no
     /// evidence the returned value satisfies those semantic constraints.
     Any,
     /// Returns a `Value::Deferred(DeferredValue::Secret)` wrapper.

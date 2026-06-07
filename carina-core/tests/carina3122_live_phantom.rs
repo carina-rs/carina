@@ -17,7 +17,7 @@
 //! byte-equal and irrelevant. The difference is entirely:
 //!   1. `allowed_methods` / `cached_methods` — identical namespaced
 //!      String values, element order reversed (schema:
-//!      `unordered_list(StringEnum)`, order is NOT significant), and
+//!      `unordered_list(Enum)`, order is NOT significant), and
 //!   2. server-side read-back defaults present only in `from`
 //!      (`http_version`, `ipv6_enabled`, `cache_behaviors: []`, …)
 //!      that the user never authored.

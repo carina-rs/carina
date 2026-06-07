@@ -95,11 +95,12 @@ pub(super) fn test_engine_with_iam_policy_arn_custom_type() -> DiagnosticEngine 
 pub(super) fn test_engine_with_enum_attr() -> DiagnosticEngine {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let mode_enum = AttributeType::string_enum(
-        "Mode".to_string(),
-        vec!["fast".to_string(), "slow".to_string()],
-        None,
+    let mode_enum = AttributeType::enum_(
+        carina_core::schema::TypeIdentity::bare("Mode"),
+        Some(vec!["fast".to_string(), "slow".to_string()]),
         vec![],
+        None,
+        None,
     );
 
     let schema =
@@ -122,14 +123,12 @@ pub(super) fn test_engine_with_enum_attr() -> DiagnosticEngine {
 pub(super) fn test_engine_with_namespaced_enum_attr() -> DiagnosticEngine {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let mode_enum = AttributeType::string_enum(
-        "Mode".to_string(),
-        vec!["fast".to_string(), "slow".to_string()],
-        Some(carina_core::schema::string_enum_identity(
-            "Mode",
-            Some("test.r"),
-        )),
+    let mode_enum = AttributeType::enum_(
+        carina_core::schema::enum_identity("Mode", Some("test.r")),
+        Some(vec!["fast".to_string(), "slow".to_string()]),
         vec![],
+        None,
+        None,
     );
 
     let schema =
@@ -162,10 +161,11 @@ pub(super) fn test_engine_with_custom_namespaced_attr() -> DiagnosticEngine {
         }
     }
 
-    let mode_custom = AttributeType::custom_enum(
-        carina_core::schema::string_enum_identity("Mode", Some("test.r")),
-        AttributeType::string(),
-        legacy_validator(validate_mode),
+    let mode_custom = AttributeType::enum_(
+        carina_core::schema::enum_identity("Mode", Some("test.r")),
+        None,
+        vec![],
+        Some(legacy_validator(validate_mode)),
         None,
     );
 

@@ -17,7 +17,7 @@ use crate::value::{SECRET_PREFIX, SecretHashContext, argon2id_hash, value_to_jso
 /// - List/Map: recurse with inner element type
 /// - Struct: recurse with per-field type information, tolerating extra fields
 ///   with default values (e.g., `false` for Bool)
-/// - StringEnum: extract enum values from namespaced identifiers and compare
+/// - Enum: extract enum values from namespaced identifiers and compare
 ///   case-insensitively (e.g., `awscc.s3.Bucket.Type.AES256` equals `"AES256"`)
 ///
 /// Without type information, falls back to `Value::semantically_equal()`.
@@ -158,7 +158,7 @@ pub(crate) fn type_aware_equal(
                 }
             }
 
-            // StringEnum: extract enum values from namespaced identifiers
+            // Enum: extract enum values from namespaced identifiers
             // and compare. Phase 5 of carina#2986: accept the cross-shape
             // `String × EnumIdentifier` pair so the differ is stable
             // across "state file stores plain string, desired-side parsed
@@ -169,73 +169,9 @@ pub(crate) fn type_aware_equal(
             (
                 a,
                 b,
-                crate::schema::Shape::StringEnum {
+                crate::schema::Shape::Enum {
                     values,
                     dsl_aliases,
-                    ..
-                },
-            ) if matches!(
-                a,
-                Value::Concrete(ConcreteValue::String(_) | ConcreteValue::EnumIdentifier(_))
-            ) && matches!(
-                b,
-                Value::Concrete(ConcreteValue::String(_) | ConcreteValue::EnumIdentifier(_))
-            ) =>
-            {
-                let text = |v: &Value| -> Option<String> {
-                    match v {
-                        Value::Concrete(ConcreteValue::String(s))
-                        | Value::Concrete(ConcreteValue::EnumIdentifier(s)) => Some(s.clone()),
-                        _ => None,
-                    }
-                };
-                let (Some(sa), Some(sb)) = (text(a), text(b)) else {
-                    return a.semantically_equal(b);
-                };
-                if sa == sb {
-                    return true;
-                }
-                let valid_values: Vec<&str> = values.iter().map(String::as_str).collect();
-                let va = crate::utils::extract_enum_value_with_values(&sa, &valid_values);
-                let vb = crate::utils::extract_enum_value_with_values(&sb, &valid_values);
-                // Map both sides through the DSL alias table to a common
-                // (API-canonical) form before comparing. `eq_ignore_ascii_case`
-                // alone suffices when the DSL alias differs only in case
-                // from the API canonical (`enabled` vs `Enabled`), but it
-                // fails on compound-word aliases like
-                // `bucket_owner_enforced` vs `BucketOwnerEnforced` — same
-                // enum value, different spelling. Aligning both sides to
-                // the API spelling closes that gap (aws#271).
-                let canonical = |trailing: &str| -> String {
-                    // dsl_aliases is `[(api, dsl)]`; if `trailing` matches
-                    // the DSL spelling, swap it for the API spelling.
-                    for (api, dsl) in dsl_aliases {
-                        if dsl.eq_ignore_ascii_case(trailing) {
-                            return api.clone();
-                        }
-                    }
-                    trailing.to_string()
-                };
-                canonical(va).eq_ignore_ascii_case(&canonical(vb))
-            }
-
-            // CustomEnum: a namespaced enum carrying a `to_dsl` callback,
-            // not an `Aliases` table (StringEnum's shape). The differ sees
-            // both shapes in the wild: the provider-read side stores the
-            // AWS-canonical value (e.g. `String("ap-northeast-1a")` for
-            // `aws.AvailabilityZone`), while the DSL side flows through
-            // `resolve_enum_value_recursive` and arrives as the
-            // fully-qualified namespaced spelling
-            // (`String("aws.AvailabilityZone.ap_northeast_1a")` /
-            // `EnumIdentifier(...)` of the same). Without this arm the
-            // post-apply plan reports a phantom `forces replacement`
-            // diff on every `CustomEnum`-typed attribute — see
-            // carina-rs/carina#3312 and the closed carina-rs/carina-provider-aws#363.
-            (
-                a,
-                b,
-                crate::schema::Shape::CustomEnum {
-                    identity: _,
                     to_dsl,
                     ..
                 },
@@ -260,39 +196,14 @@ pub(crate) fn type_aware_equal(
                 if sa == sb {
                     return true;
                 }
-                // Normalize both sides to the trailing enum-value spelling,
-                // then map through `to_dsl` if available. Each side may
-                // arrive in any of these shapes:
-                //
-                //   - AWS-canonical:     `ap-northeast-1a`
-                //   - Dotted namespace:  `aws.AvailabilityZone.ap_northeast_1a`
-                //   - With `kind` tail:  `aws.AvailabilityZone.ZoneName.ap_northeast_1a`
-                //     (the WIT-bridged identity, where the original
-                //     `("aws.AvailabilityZone", "ZoneName")` axis split
-                //     does not round-trip and `kind` carries the full
-                //     dotted form — see carina#3312)
-                //   - Or any of the above with `EnumIdentifier` shape
-                //
-                // Stripping is greedy: take the segment after the last `.`,
-                // since the trailing enum value never contains a `.` in
-                // any AWS namespace (`ap_northeast_1a`, `dedicated`, etc.).
-                // The `to_dsl` mapping then aligns hyphenated AWS spellings
-                // with underscored DSL spellings (`ap-northeast-1a` ↔
-                // `ap_northeast_1a`); when `to_dsl` is `None` (the WIT
-                // bridge currently drops the function pointer), text
-                // equality after stripping is still sufficient for the
-                // identical-segment case.
+                let dsl_map = crate::schema::DslMap::new(dsl_aliases, to_dsl);
                 let canonical = |s: &str| -> String {
-                    let trailing = match s.rsplit_once('.') {
-                        Some((_, tail)) => tail,
-                        None => s,
-                    };
-                    match to_dsl {
-                        Some(f) => f(trailing),
-                        None => trailing.to_string(),
-                    }
+                    let valid_values: Vec<&str> =
+                        values.into_iter().flatten().map(String::as_str).collect();
+                    let trailing = crate::utils::extract_enum_value_with_values(s, &valid_values);
+                    dsl_map.api_for(&dsl_map.dsl_for(trailing))
                 };
-                canonical(&sa) == canonical(&sb)
+                canonical(&sa).eq_ignore_ascii_case(&canonical(&sb))
             }
 
             // Custom types with base type: delegate to base
@@ -434,7 +345,7 @@ fn type_aware_struct_equal(
 /// - Bool: `false`
 /// - Int: `0`
 /// - Float: `0.0`
-/// - String / StringEnum: `""`
+/// - String / Enum: `""`
 /// - List: empty list
 /// - Map / Struct: empty map
 /// - Custom: delegates to the base type
@@ -471,7 +382,7 @@ fn is_type_default(
         }
         (
             Value::Concrete(ConcreteValue::String(s) | ConcreteValue::EnumIdentifier(s)),
-            Some(crate::schema::Shape::StringEnum { .. }),
+            Some(crate::schema::Shape::Enum { .. }),
         ) if s.is_empty() => true,
         (Value::Concrete(ConcreteValue::List(l)), Some(crate::schema::Shape::List { .. }))
             if l.is_empty() =>

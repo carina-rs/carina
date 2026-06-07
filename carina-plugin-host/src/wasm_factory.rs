@@ -1255,7 +1255,7 @@ pub struct WasmProviderFactory {
     cached_config_completions: HashMap<String, Vec<CompletionValue>>,
     cached_identity_attributes: Vec<String>,
     cached_enum_aliases: HashMap<String, HashMap<String, HashMap<String, String>>>,
-    /// Provider config attribute types (e.g., `region` → `AttributeType::StringEnum`).
+    /// Provider config attribute types (e.g., `region` → `AttributeType::Enum`).
     /// Used by `ProviderFactory::provider_config_attribute_types()` so the host
     /// validates provider attributes against these types using its own carina-core,
     /// catching format bugs without requiring a provider rebuild.

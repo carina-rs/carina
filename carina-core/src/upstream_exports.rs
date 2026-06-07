@@ -758,7 +758,7 @@ fn check_resource_ref_at_position(
     // `Union<plain Strings>` directly via subtyping (#2643), so this
     // fallback only handles the receivers it doesn't yet cover —
     // `Custom { identity: None }`-shaped wrappers and
-    // `StringEnum` receivers — and the non-`Simple` string-shaped
+    // `Enum` receivers — and the non-`Simple` string-shaped
     // values (e.g. `SchemaType` / scalar `String` literal) the
     // strict path also doesn't recognise. The reverse direction
     // (`String → Custom { semantic_name: Some(_) }`) stays strict
@@ -2112,7 +2112,7 @@ mod tests {
         // Consumer attribute is `Custom { name: "KmsKeyArn", base: Arn }`;
         // export declares plain `TypeExpr::Simple("arn")`. The type checker
         // walks Custom's base chain, so `arn` accepts `KmsKeyArn`.
-        use crate::schema::{AttributeType, TypeIdentity, noop_validator};
+        use crate::schema::{AttributeType, TypeIdentity};
         let parsed = parse_project_with_provider(
             r#"
                 let orgs = upstream_state { source = "../organizations" }
@@ -2131,12 +2131,12 @@ mod tests {
                 AttributeType::string(),
                 None,
                 None,
-                noop_validator(),
+                crate::schema::legacy_validator(|_| Ok(())),
                 None,
             ),
             None,
             None,
-            noop_validator(),
+            crate::schema::legacy_validator(|_| Ok(())),
             None,
         );
         let schemas = schema_with_attr("name", kms_arn);
@@ -2159,7 +2159,7 @@ mod tests {
         // narrowing the comparison fires `map(AwsAccountId)` against the
         // receiver and (when the receiver is anything but a compatible map)
         // false-flags the position. Issue #2447.
-        use crate::schema::{AttributeType, TypeIdentity, noop_validator};
+        use crate::schema::{AttributeType, TypeIdentity};
         let parsed = parse_project_with_provider(
             r#"
                 let orgs = upstream_state { source = "../organizations" }
@@ -2184,7 +2184,7 @@ mod tests {
             AttributeType::string(),
             None,
             None,
-            noop_validator(),
+            crate::schema::legacy_validator(|_| Ok(())),
             None,
         );
         let schemas = schema_with_attr("name", aws_account_id);

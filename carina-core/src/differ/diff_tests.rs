@@ -1025,20 +1025,18 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
             StructField::new("from_port", AttributeType::int()),
             StructField::new(
                 "ip_protocol",
-                AttributeType::string_enum(
-                    "IpProtocol".to_string(),
-                    vec![
+                AttributeType::enum_(
+                    crate::schema::enum_identity("IpProtocol", Some("awscc.ec2.SecurityGroup")),
+                    Some(vec![
                         "tcp".to_string(),
                         "udp".to_string(),
                         "icmp".to_string(),
                         "-1".to_string(),
                         "all".to_string(),
-                    ],
-                    Some(crate::schema::string_enum_identity(
-                        "IpProtocol",
-                        Some("awscc.ec2.SecurityGroup"),
-                    )),
+                    ]),
                     vec![("-1".to_string(), "all".to_string())],
+                    None,
+                    None,
                 ),
             ),
             StructField::new("to_port", AttributeType::int()),
@@ -1338,7 +1336,7 @@ fn diff_false_positive_when_ordered_true_for_struct_list() {
 }
 
 /// Regression for aws#271: enum DSL alias (snake_case) and API canonical
-/// (PascalCase compound) must compare equal under StringEnum even when
+/// (PascalCase compound) must compare equal under Enum even when
 /// `eq_ignore_ascii_case` alone is not enough.
 ///
 /// Scenario: BucketOwnershipControls.object_ownership — state stores
@@ -1354,17 +1352,16 @@ fn diff_no_change_for_compound_word_dsl_alias() {
     let schema =
         ResourceSchema::new("aws.s3.BucketOwnershipControls").attribute(AttributeSchema::new(
             "object_ownership",
-            AttributeType::string_enum(
-                "ObjectOwnership".to_string(),
-                vec![
+            AttributeType::enum_(
+                crate::schema::enum_identity(
+                    "ObjectOwnership",
+                    Some("aws.s3.BucketOwnershipControls"),
+                ),
+                Some(vec![
                     "BucketOwnerEnforced".to_string(),
                     "BucketOwnerPreferred".to_string(),
                     "ObjectWriter".to_string(),
-                ],
-                Some(crate::schema::string_enum_identity(
-                    "ObjectOwnership",
-                    Some("aws.s3.BucketOwnershipControls"),
-                )),
+                ]),
                 vec![
                     (
                         "BucketOwnerEnforced".to_string(),
@@ -1376,6 +1373,8 @@ fn diff_no_change_for_compound_word_dsl_alias() {
                     ),
                     ("ObjectWriter".to_string(), "object_writer".to_string()),
                 ],
+                None,
+                None,
             ),
         ));
 

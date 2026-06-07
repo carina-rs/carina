@@ -40,19 +40,17 @@ fn validate_string_type() {
 }
 
 #[test]
-fn validate_string_enum_type() {
+fn validate_enum_type() {
     // Phase 4 of carina#2986: enum attributes accept only
     // `ConcreteValue::EnumIdentifier`. Constructed-by-hand strings are
     // rejected as `StringLiteralExpectedEnum` — see
-    // `validate_string_enum_rejects_quoted_string_literal` for that path.
-    let t = AttributeType::string_enum(
-        "AddressFamily".to_string(),
-        vec!["IPv4".to_string(), "IPv6".to_string()],
-        Some(crate::schema::string_enum_identity(
-            "AddressFamily",
-            Some("awscc.ec2.ipam_pool"),
-        )),
+    // `validate_enum_rejects_quoted_string_literal` for that path.
+    let t = AttributeType::enum_(
+        crate::schema::enum_identity("AddressFamily", Some("awscc.ec2.ipam_pool")),
+        Some(vec!["IPv4".to_string(), "IPv6".to_string()]),
         vec![],
+        None,
+        None,
     );
     assert!(
         t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
@@ -81,20 +79,18 @@ fn validate_string_enum_type() {
 }
 
 #[test]
-fn validate_string_enum_rejects_quoted_string_literal() {
-    // Phase 4 of carina#2986: a `String`-shaped value on a `StringEnum`
+fn validate_enum_rejects_quoted_string_literal() {
+    // Phase 4 of carina#2986: a `String`-shaped value on a `Enum`
     // attribute means the user wrote `attr = "value"`. The validator
     // emits `StringLiteralExpectedEnum` with the full expected variant
     // list so the LSP code action can offer "drop quotes / use
     // identifier form" without re-deriving candidates.
-    let t = AttributeType::string_enum(
-        "AddressFamily".to_string(),
-        vec!["IPv4".to_string(), "IPv6".to_string()],
-        Some(crate::schema::string_enum_identity(
-            "AddressFamily",
-            Some("awscc.ec2.ipam_pool"),
-        )),
+    let t = AttributeType::enum_(
+        crate::schema::enum_identity("AddressFamily", Some("awscc.ec2.ipam_pool")),
+        Some(vec!["IPv4".to_string(), "IPv6".to_string()]),
         vec![],
+        None,
+        None,
     );
     let err = t
         .validate(&Value::Concrete(ConcreteValue::String("IPv4".to_string())))
@@ -106,35 +102,31 @@ fn validate_string_enum_rejects_quoted_string_literal() {
 }
 
 #[test]
-fn string_enum_type_name_uses_declared_name() {
-    let t = AttributeType::string_enum(
-        "VersioningStatus".to_string(),
-        vec!["Enabled".to_string(), "Suspended".to_string()],
-        Some(crate::schema::string_enum_identity(
-            "VersioningStatus",
-            Some("aws.s3.Bucket"),
-        )),
+fn enum_type_name_uses_dotted_identity() {
+    let t = AttributeType::enum_(
+        crate::schema::enum_identity("VersioningStatus", Some("aws.s3.Bucket")),
+        Some(vec!["Enabled".to_string(), "Suspended".to_string()]),
         vec![],
+        None,
+        None,
     );
-    assert_eq!(t.type_name(), "VersioningStatus");
+    assert_eq!(t.type_name(), "aws.s3.Bucket.VersioningStatus");
 }
 
 #[test]
-fn validate_string_enum_accepts_dsl_alias() {
-    let t = AttributeType::string_enum(
-        "IpProtocol".to_string(),
-        vec![
+fn validate_enum_accepts_dsl_alias() {
+    let t = AttributeType::enum_(
+        crate::schema::enum_identity("IpProtocol", Some("awscc.ec2.SecurityGroup")),
+        Some(vec![
             "tcp".to_string(),
             "udp".to_string(),
             "icmp".to_string(),
             "icmpv6".to_string(),
             "-1".to_string(),
-        ],
-        Some(crate::schema::string_enum_identity(
-            "IpProtocol",
-            Some("awscc.ec2.SecurityGroup"),
-        )),
+        ]),
         vec![("-1".to_string(), "all".to_string())],
+        None,
+        None,
     );
     // Canonical "-1" is rewritten to DSL "all" — the DSL surface must
     // not accept the API form when an alias is registered. Users
@@ -171,17 +163,15 @@ fn validate_string_enum_accepts_dsl_alias() {
 }
 
 fn iam_policy_version_enum() -> AttributeType {
-    AttributeType::string_enum(
-        "Version".to_string(),
-        vec!["2012-10-17".to_string(), "2008-10-17".to_string()],
-        Some(crate::schema::string_enum_identity(
-            "Version",
-            Some("aws.iam.PolicyDocument"),
-        )),
+    AttributeType::enum_(
+        crate::schema::enum_identity("Version", Some("aws.iam.PolicyDocument")),
+        Some(vec!["2012-10-17".to_string(), "2008-10-17".to_string()]),
         vec![
             ("2012-10-17".to_string(), "2012_10_17".to_string()),
             ("2008-10-17".to_string(), "2008_10_17".to_string()),
         ],
+        None,
+        None,
     )
 }
 
@@ -205,7 +195,7 @@ fn assert_iam_policy_version_candidates(expected: &[ExpectedEnumVariant]) {
 }
 
 #[test]
-fn invalid_enum_variant_candidates_use_dsl_spelling_for_string_enum_aliases() {
+fn invalid_enum_variant_candidates_use_dsl_spelling_for_enum_aliases() {
     let err = iam_policy_version_enum()
         .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "bad_version".to_string(),
@@ -235,7 +225,7 @@ fn invalid_enum_variant_candidates_use_dsl_spelling_for_string_enum_aliases() {
 }
 
 #[test]
-fn string_literal_expected_enum_candidates_use_dsl_spelling_for_string_enum_aliases() {
+fn string_literal_expected_enum_candidates_use_dsl_spelling_for_enum_aliases() {
     let err = iam_policy_version_enum()
         .validate(&Value::Concrete(ConcreteValue::String(
             "2012-10-17".to_string(),
@@ -262,18 +252,16 @@ fn string_literal_expected_enum_candidates_use_dsl_spelling_for_string_enum_alia
 }
 
 #[test]
-fn string_enum_candidates_preserve_genuine_extra_aliases() {
-    let t = AttributeType::string_enum(
-        "Mode".to_string(),
-        vec!["ALL".to_string()],
-        Some(crate::schema::string_enum_identity(
-            "Mode",
-            Some("test.service.Resource"),
-        )),
+fn enum_candidates_preserve_genuine_extra_aliases() {
+    let t = AttributeType::enum_(
+        crate::schema::enum_identity("Mode", Some("test.service.Resource")),
+        Some(vec!["ALL".to_string()]),
         vec![
             ("ALL".to_string(), "all".to_string()),
             ("LEGACY_ALL".to_string(), "legacy_all".to_string()),
         ],
+        None,
+        None,
     );
     let err = t
         .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
@@ -297,20 +285,21 @@ fn string_enum_candidates_preserve_genuine_extra_aliases() {
 }
 
 #[test]
-fn validate_string_enum_all_without_dsl_aliases_requires_explicit_variant() {
+fn validate_enum_all_without_dsl_aliases_requires_explicit_variant() {
     // Without "all" as a direct variant or in `dsl_aliases`, the bare
     // identifier `all` is not accepted. Issue #1428.
-    let without_all = AttributeType::string_enum(
-        String::new(),
-        vec![
+    let without_all = AttributeType::enum_(
+        TypeIdentity::bare(String::new()),
+        Some(vec![
             "tcp".to_string(),
             "udp".to_string(),
             "icmp".to_string(),
             "icmpv6".to_string(),
             "-1".to_string(),
-        ],
-        None,
+        ]),
         vec![],
+        None,
+        None,
     );
     // Without "all" in values and no dsl_aliases entry mapping to "all", it is rejected
     assert!(
@@ -322,18 +311,19 @@ fn validate_string_enum_all_without_dsl_aliases_requires_explicit_variant() {
     );
 
     // With "all" added to values, it is accepted even without dsl_aliases
-    let with_all = AttributeType::string_enum(
-        String::new(),
-        vec![
+    let with_all = AttributeType::enum_(
+        TypeIdentity::bare(String::new()),
+        Some(vec![
             "tcp".to_string(),
             "udp".to_string(),
             "icmp".to_string(),
             "icmpv6".to_string(),
             "-1".to_string(),
             "all".to_string(),
-        ],
-        None,
+        ]),
         vec![],
+        None,
+        None,
     );
     assert!(
         with_all
@@ -345,17 +335,15 @@ fn validate_string_enum_all_without_dsl_aliases_requires_explicit_variant() {
 }
 
 #[test]
-fn validate_string_enum_accepts_values_with_dots() {
+fn validate_enum_accepts_values_with_dots() {
     // Values like "ipsec.1" contain dots that should not be treated as
     // namespace separators (issue #611)
-    let t = AttributeType::string_enum(
-        "Type".to_string(),
-        vec!["ipsec.1".to_string()],
-        Some(crate::schema::string_enum_identity(
-            "Type",
-            Some("awscc.ec2.vpn_gateway"),
-        )),
+    let t = AttributeType::enum_(
+        crate::schema::enum_identity("Type", Some("awscc.ec2.vpn_gateway")),
+        Some(vec!["ipsec.1".to_string()]),
         vec![],
+        None,
+        None,
     );
     // Bare identifier with dot should match directly (carried as
     // `EnumIdentifier` under strict mode — the test name still says
@@ -392,14 +380,12 @@ fn invalid_enum_error_preserves_user_typed_string_literal() {
     // the error verbatim (echoed inside double quotes per the
     // `format_string_literal_expected_enum` shape) without leaking the
     // synthesized namespaced form.
-    let t = AttributeType::string_enum(
-        "TargetType".to_string(),
-        vec!["AWS_ACCOUNT".to_string()],
-        Some(crate::schema::string_enum_identity(
-            "TargetType",
-            Some("awscc.sso.Assignment"),
-        )),
+    let t = AttributeType::enum_(
+        crate::schema::enum_identity("TargetType", Some("awscc.sso.Assignment")),
+        Some(vec!["AWS_ACCOUNT".to_string()]),
         vec![],
+        None,
+        None,
     );
     let err = t
         .validate(&Value::Concrete(ConcreteValue::String("aaa".to_string())))
@@ -421,14 +407,12 @@ fn invalid_enum_error_names_the_enum_type_and_fully_qualified_variants() {
     // expected and list allowed variants in their fully-qualified form
     // so the user can copy-paste one into their .crn without having to
     // synthesize the namespace prefix.
-    let t = AttributeType::string_enum(
-        "TargetType".to_string(),
-        vec!["AWS_ACCOUNT".to_string()],
-        Some(crate::schema::string_enum_identity(
-            "TargetType",
-            Some("awscc.sso.Assignment"),
-        )),
+    let t = AttributeType::enum_(
+        crate::schema::enum_identity("TargetType", Some("awscc.sso.Assignment")),
+        Some(vec!["AWS_ACCOUNT".to_string()]),
         vec![],
+        None,
+        None,
     );
     let err = t
         .validate(&Value::Concrete(ConcreteValue::String("aaa".to_string())))
@@ -451,14 +435,12 @@ fn with_attribute_adds_attribute_name_to_enum_error() {
     // `InvalidEnumVariant` (for genuine wrong-variant inputs) and
     // `StringLiteralExpectedEnum` (the strict-mode quoted-string
     // rejection). Pin both behaviors:
-    let t = AttributeType::string_enum(
-        "TargetType".to_string(),
-        vec!["AWS_ACCOUNT".to_string()],
-        Some(crate::schema::string_enum_identity(
-            "TargetType",
-            Some("awscc.sso.Assignment"),
-        )),
+    let t = AttributeType::enum_(
+        crate::schema::enum_identity("TargetType", Some("awscc.sso.Assignment")),
+        Some(vec!["AWS_ACCOUNT".to_string()]),
         vec![],
+        None,
+        None,
     );
     // String-literal path (strict-mode rejection): rendered as
     // `'target_id' (TargetType) expects an enum identifier, got a
@@ -553,14 +535,12 @@ fn schema_validate_wraps_enum_error_with_attribute_name() {
     let schema = ResourceSchema::new("test.assignment").attribute(
         AttributeSchema::new(
             "target_type",
-            AttributeType::string_enum(
-                "TargetType".to_string(),
-                vec!["AWS_ACCOUNT".to_string()],
-                Some(crate::schema::string_enum_identity(
-                    "TargetType",
-                    Some("awscc.sso.Assignment"),
-                )),
+            AttributeType::enum_(
+                crate::schema::enum_identity("TargetType", Some("awscc.sso.Assignment")),
+                Some(vec!["AWS_ACCOUNT".to_string()]),
                 vec![],
+                None,
+                None,
             ),
         )
         .required(),
@@ -684,14 +664,12 @@ fn schema_validate_with_origins_emits_string_literal_diagnostic_for_quoted_enum(
     let schema = ResourceSchema::new("test.assignment").attribute(
         AttributeSchema::new(
             "target_type",
-            AttributeType::string_enum(
-                "TargetType".to_string(),
-                vec!["AWS_ACCOUNT".to_string()],
-                Some(crate::schema::string_enum_identity(
-                    "TargetType",
-                    Some("awscc.sso.Assignment"),
-                )),
+            AttributeType::enum_(
+                crate::schema::enum_identity("TargetType", Some("awscc.sso.Assignment")),
+                Some(vec!["AWS_ACCOUNT".to_string()]),
                 vec![],
+                None,
+                None,
             ),
         )
         .required(),
@@ -736,14 +714,12 @@ fn schema_validate_with_origins_leaves_valid_values_alone() {
     let schema = ResourceSchema::new("test.assignment").attribute(
         AttributeSchema::new(
             "target_type",
-            AttributeType::string_enum(
-                "TargetType".to_string(),
-                vec!["AWS_ACCOUNT".to_string()],
-                Some(crate::schema::string_enum_identity(
-                    "TargetType",
-                    Some("awscc.sso.Assignment"),
-                )),
+            AttributeType::enum_(
+                crate::schema::enum_identity("TargetType", Some("awscc.sso.Assignment")),
+                Some(vec!["AWS_ACCOUNT".to_string()]),
                 vec![],
+                None,
+                None,
             ),
         )
         .required(),
@@ -779,10 +755,12 @@ fn schema_validate_with_origins_reshapes_custom_namespaced_type() {
     let schema = ResourceSchema::new("test.r.mode_holder").attribute(
         AttributeSchema::new(
             "mode",
-            AttributeType::custom_enum(
-                crate::schema::string_enum_identity("Mode", Some("test.r")),
+            AttributeType::enum_with_base(
+                crate::schema::enum_identity("Mode", Some("test.r")),
                 AttributeType::string(),
-                legacy_validator(validate_mode),
+                None,
+                vec![],
+                Some(legacy_validator(validate_mode)),
                 None,
             ),
         )
@@ -816,11 +794,12 @@ fn schema_validate_with_origins_reshapes_custom_namespaced_type() {
 fn invalid_enum_error_without_namespace_uses_bare_variants() {
     // Non-namespaced enums must keep emitting bare variant names — there's
     // no namespace to prefix with.
-    let t = AttributeType::string_enum(
-        "Mode".to_string(),
-        vec!["fast".to_string(), "slow".to_string()],
-        None,
+    let t = AttributeType::enum_(
+        TypeIdentity::bare("Mode".to_string()),
+        Some(vec!["fast".to_string(), "slow".to_string()]),
         vec![],
+        None,
+        None,
     );
     let err = t
         .validate(&Value::Concrete(ConcreteValue::String("zzz".to_string())))
@@ -843,14 +822,12 @@ fn invalid_enum_error_preserves_bare_identifier_form() {
     // path produces the same `Value::Concrete(ConcreteValue::String(...))`), the error echoes the
     // full form back — still the "user-typed" form because that's what
     // was in the Value. This verifies the fix doesn't regress that case.
-    let t = AttributeType::string_enum(
-        "TargetType".to_string(),
-        vec!["AWS_ACCOUNT".to_string()],
-        Some(crate::schema::string_enum_identity(
-            "TargetType",
-            Some("awscc.sso.Assignment"),
-        )),
+    let t = AttributeType::enum_(
+        crate::schema::enum_identity("TargetType", Some("awscc.sso.Assignment")),
+        Some(vec!["AWS_ACCOUNT".to_string()]),
         vec![],
+        None,
+        None,
     );
     let input = "awscc.sso.Assignment.TargetType.NOT_REAL".to_string();
     let err = t
@@ -864,19 +841,17 @@ fn invalid_enum_error_preserves_bare_identifier_form() {
 }
 
 #[test]
-fn validate_string_enum_rejects_double_namespace() {
-    let t = AttributeType::string_enum(
-        "InstanceTenancy".to_string(),
-        vec![
+fn validate_enum_rejects_double_namespace() {
+    let t = AttributeType::enum_(
+        crate::schema::enum_identity("InstanceTenancy", Some("awscc.ec2.Vpc")),
+        Some(vec![
             "default".to_string(),
             "dedicated".to_string(),
             "host".to_string(),
-        ],
-        Some(crate::schema::string_enum_identity(
-            "InstanceTenancy",
-            Some("awscc.ec2.Vpc"),
-        )),
+        ]),
         vec![],
+        None,
+        None,
     );
     // Double-namespace must be rejected
     assert!(
@@ -2074,7 +2049,7 @@ fn union_type_name() {
         AttributeType::string(),
         None,
         None,
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
     let type_b = AttributeType::custom(
@@ -2082,7 +2057,7 @@ fn union_type_name() {
         AttributeType::string(),
         None,
         None,
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
 
@@ -2097,7 +2072,7 @@ fn union_accepts_type_name() {
         AttributeType::string(),
         None,
         None,
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
     let type_b = AttributeType::custom(
@@ -2105,7 +2080,7 @@ fn union_accepts_type_name() {
         AttributeType::string(),
         None,
         None,
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
 
@@ -3102,7 +3077,7 @@ fn make_custom(name: &str, base: AttributeType) -> AttributeType {
         base,
         None,
         None,
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     )
 }
@@ -3113,7 +3088,7 @@ fn make_custom_anon_pattern(pattern: &str) -> AttributeType {
         AttributeType::string(),
         Some(pattern.to_string()),
         None,
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     )
 }
@@ -3124,7 +3099,7 @@ fn make_custom_anon_len(min: u64, max: u64) -> AttributeType {
         AttributeType::string(),
         None,
         Some((Some(min), Some(max))),
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     )
 }
@@ -3169,7 +3144,7 @@ fn assignable_rejects_same_kind_across_providers() {
             AttributeType::string(),
             None,
             None,
-            noop_validator(),
+            crate::schema::legacy_validator(|_| Ok(())),
             None,
         )
     };
@@ -3177,6 +3152,23 @@ fn assignable_rejects_same_kind_across_providers() {
     let gcp_region = provider_custom("gcp");
     assert!(!aws_region.is_assignable_to(&gcp_region));
     assert!(!gcp_region.is_assignable_to(&aws_region));
+}
+
+#[test]
+fn assignable_rejects_same_enum_kind_across_namespaces() {
+    let provider_enum = |namespace: &str| {
+        AttributeType::enum_(
+            crate::schema::enum_identity("Mode", Some(namespace)),
+            Some(vec!["fast".to_string()]),
+            vec![],
+            None,
+            None,
+        )
+    };
+    let aws_enum = provider_enum("aws.foo");
+    let bar_enum = provider_enum("aws.bar");
+    assert!(!aws_enum.is_assignable_to(&bar_enum));
+    assert!(!bar_enum.is_assignable_to(&aws_enum));
 }
 
 /// The generic provider-scoped `aws.Arn` (no service/resource segments)
@@ -3192,7 +3184,7 @@ fn assignable_specific_arn_flows_into_generic_arn() {
             AttributeType::string(),
             None,
             None,
-            noop_validator(),
+            crate::schema::legacy_validator(|_| Ok(())),
             None,
         )
     };
@@ -3223,7 +3215,7 @@ fn assignable_identity_axis_directionality() {
             AttributeType::string(),
             None,
             None,
-            noop_validator(),
+            crate::schema::legacy_validator(|_| Ok(())),
             None,
         )
     };
@@ -3251,7 +3243,7 @@ fn assignable_narrow_to_anonymous_unconstrained_sink() {
         AttributeType::string(),
         None,
         None,
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
     assert!(account.is_assignable_to(&anon));
@@ -3303,7 +3295,7 @@ fn assignable_union_source_requires_all_members_assignable() {
         AttributeType::string(),
         None,
         None,
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
     let both_ok = AttributeType::union(vec![vpc.clone(), vpc.clone()]);
@@ -3328,7 +3320,7 @@ fn semantic_custom_assigns_to_anonymous_unconstrained_sink() {
         AttributeType::string(),
         None,
         None,
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
     assert!(vpc.is_assignable_to(&anon));
@@ -3367,7 +3359,7 @@ fn make_custom_anon_pattern_and_len(
         AttributeType::string(),
         pattern.map(str::to_string),
         length,
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     )
 }
@@ -3477,7 +3469,7 @@ fn custom_carries_semantic_name_pattern_length() {
         AttributeType::string(),
         Some("^vpc-[a-f0-9]+$".to_string()),
         Some((Some(8), Some(21))),
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
     match t.kind() {
@@ -3502,7 +3494,7 @@ fn custom_pattern_rejects_and_accepts_string_values() {
         AttributeType::string(),
         Some("^[a-z]+$".to_string()),
         None,
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
 
@@ -3558,7 +3550,7 @@ fn custom_pattern_rejects_wafv2_description_parentheses() {
         AttributeType::string(),
         Some(pattern.to_string()),
         None,
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
 
@@ -3592,7 +3584,7 @@ fn custom_length_uses_character_count_not_bytes() {
         AttributeType::string(),
         None,
         Some((Some(1), Some(5))),
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
 
@@ -3631,7 +3623,7 @@ fn custom_length_enforces_minimum_bound() {
         AttributeType::string(),
         None,
         Some((Some(2), None)),
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
 
@@ -3662,7 +3654,7 @@ fn custom_non_string_base_skips_pattern_and_length() {
         AttributeType::int(),
         Some("^[a-z]+$".to_string()),
         Some((Some(100), Some(200))),
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
 
@@ -3684,7 +3676,7 @@ fn custom_uncompilable_pattern_is_non_fatal() {
         AttributeType::string(),
         Some(pattern.to_string()),
         None,
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
 
@@ -3703,7 +3695,7 @@ fn schema_validate_attr_dispatches_to_custom_pattern_validation() {
         AttributeType::string(),
         Some("^[a-z]+$".to_string()),
         None,
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
     let schema = Schema::flat(AttributeType::string());
@@ -3732,7 +3724,7 @@ fn custom_type_name_anonymous_pattern_only() {
         AttributeType::string(),
         Some("^foo$".to_string()),
         None,
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
     assert_eq!(t.type_name(), "String(pattern)");
@@ -3745,7 +3737,7 @@ fn custom_type_name_anonymous_length_only() {
         AttributeType::string(),
         None,
         Some((Some(1), Some(64))),
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
     assert_eq!(t.type_name(), "String(len: 1..=64)");
@@ -3758,7 +3750,7 @@ fn custom_type_name_anonymous_pattern_and_length() {
         AttributeType::string(),
         Some("^.*$".to_string()),
         Some((Some(1), Some(64))),
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
     assert_eq!(t.type_name(), "String(pattern, len: 1..=64)");
@@ -4092,22 +4084,20 @@ fn expected_includes_to_dsl_aliases_with_alias_flag() {
     // values, `expected` stores only the DSL spelling. These entries are
     // still canonical suggestions (`is_alias = false`) because they are
     // the only spellings users can type.
-    let t = AttributeType::string_enum(
-        "VersioningStatus".to_string(),
-        vec!["Enabled".to_string(), "Suspended".to_string()],
-        Some(crate::schema::string_enum_identity(
-            "VersioningStatus",
-            Some("aws.s3.Bucket"),
-        )),
+    let t = AttributeType::enum_(
+        crate::schema::enum_identity("VersioningStatus", Some("aws.s3.Bucket")),
+        Some(vec!["Enabled".to_string(), "Suspended".to_string()]),
         vec![
             ("Enabled".to_string(), "enabled".to_string()),
             ("Suspended".to_string(), "suspended".to_string()),
         ],
+        None,
+        None,
     );
     // Use `EnumIdentifier` so the strict-mode validator reaches the
     // wrong-variant branch (`InvalidEnumVariant`). A `String` here would
     // be rejected earlier as `StringLiteralExpectedEnum` — that path is
-    // covered by `validate_string_enum_rejects_quoted_string_literal`.
+    // covered by `validate_enum_rejects_quoted_string_literal`.
     let err = t
         .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
             "zzz".to_string(),
@@ -4154,10 +4144,12 @@ fn custom_namespaced_string_literal_routes_validator_text_to_extra_message() {
     let schema = ResourceSchema::new("test.r.mode_holder").attribute(
         AttributeSchema::new(
             "mode",
-            AttributeType::custom_enum(
-                crate::schema::string_enum_identity("Mode", Some("test.r")),
+            AttributeType::enum_with_base(
+                crate::schema::enum_identity("Mode", Some("test.r")),
                 AttributeType::string(),
-                legacy_validator(validate_mode),
+                None,
+                vec![],
+                Some(legacy_validator(validate_mode)),
                 None,
             ),
         )
@@ -4244,15 +4236,15 @@ fn expected_enum_variant_serde_round_trip() {
 // On a Union failure, surface the closest-matching member's error rather
 // than a generic TypeMismatch. "Closest" is measured by structural
 // distance: same outer constructor (Map↔Struct, List↔List, String↔
-// StringEnum/Custom) wins over an unrelated member. Tie-broken by
+// Enum/Custom) wins over an unrelated member. Tie-broken by
 // declaration order, so the existing Map/Struct case continues to pick
 // the Struct member's error first.
 
 #[test]
-fn union_string_vs_string_enum_picks_enum_error_for_string_input() {
-    // Acceptance #2 from #2219: `Int | StringEnum` with an identifier
+fn union_string_vs_enum_picks_enum_error_for_string_input() {
+    // Acceptance #2 from #2219: `Int | Enum` with an identifier
     // input that doesn't match any enum variant must surface the
-    // `InvalidEnumVariant` error from the StringEnum member (so the
+    // `InvalidEnumVariant` error from the Enum member (so the
     // user sees `expected one of: fast, slow`), not a generic
     // `TypeMismatch` from the Int member.
     //
@@ -4263,11 +4255,12 @@ fn union_string_vs_string_enum_picks_enum_error_for_string_input() {
     // different concern covered separately.
     let union_type = AttributeType::union(vec![
         AttributeType::int(),
-        AttributeType::string_enum(
-            "Mode".to_string(),
-            vec!["fast".to_string(), "slow".to_string()],
-            None,
+        AttributeType::enum_(
+            TypeIdentity::bare("Mode".to_string()),
+            Some(vec!["fast".to_string(), "slow".to_string()]),
             vec![],
+            None,
+            None,
         ),
     ]);
     let err = union_type
@@ -4283,7 +4276,7 @@ fn union_string_vs_string_enum_picks_enum_error_for_string_input() {
                 "expected `fast` in candidate list, got: {rendered:?}"
             );
         }
-        other => panic!("expected InvalidEnumVariant from the StringEnum member, got: {other:?}"),
+        other => panic!("expected InvalidEnumVariant from the Enum member, got: {other:?}"),
     }
 }
 
@@ -4778,10 +4771,10 @@ fn union_walk_custom_lookup_emits_smallest_error_set_when_all_fail() {
 
 #[test]
 fn union_walk_custom_lookup_cidr_accepts_ipv4_when_lookup_routes_correctly() {
-    // Regression for awscc#217. WASM-plugin schemas arrive with the
-    // schema-attached `Custom.validate` closure stripped (replaced by
-    // `noop_validator`); host-side validation runs through `lookup`
-    // by semantic_name. Models that: lookup approves `Ipv4Cidr` for
+    // Regression for awscc#217. WASM-plugin schemas arrive without
+    // the schema-attached `Custom.validate` behavior; host-side
+    // validation runs through `lookup` by semantic_name. Models that:
+    // lookup approves `Ipv4Cidr` for
     // `"10.0.0.0/8"` and rejects `Ipv6Cidr`. The Union must surface
     // no errors — the previous loop would have pushed the IPv6
     // rejection through anyway. This is the awscc#217 reproduction.
@@ -4818,7 +4811,7 @@ fn union_walk_custom_lookup_cidr_accepts_ipv4_when_lookup_routes_correctly() {
 }
 
 // =====================================================================
-// carina#2831: `StringEnum.dsl_aliases` is the data form that survives
+// carina#2831: `Enum.dsl_aliases` is the data form that survives
 // the WASM-component boundary, replacing the closure-based `to_dsl`
 // pointer that could not. Once aliases are populated, the validator
 // must accept the DSL spellings, including in fully-qualified form
@@ -4839,17 +4832,13 @@ fn dsl_aliases_validator_accepts_dsl_spellings_only() {
     // bare-DSL forms (`bucket_owner_enforced`,
     // `awscc.s3.Bucket.ObjectOwnership.bucket_owner_enforced`) are
     // accepted.
-    let t = AttributeType::string_enum(
-        "ObjectOwnership".to_string(),
-        vec![
+    let t = AttributeType::enum_(
+        crate::schema::enum_identity("ObjectOwnership", Some("awscc.s3.Bucket")),
+        Some(vec![
             "ObjectWriter".to_string(),
             "BucketOwnerPreferred".to_string(),
             "BucketOwnerEnforced".to_string(),
-        ],
-        Some(crate::schema::string_enum_identity(
-            "ObjectOwnership",
-            Some("awscc.s3.Bucket"),
-        )),
+        ]),
         vec![
             ("ObjectWriter".to_string(), "object_writer".to_string()),
             (
@@ -4861,6 +4850,8 @@ fn dsl_aliases_validator_accepts_dsl_spellings_only() {
                 "bucket_owner_enforced".to_string(),
             ),
         ],
+        None,
+        None,
     );
 
     // Bare API spelling: REJECTED under strict mode (the DSL alias
@@ -4927,18 +4918,16 @@ fn enum_without_dsl_aliases_accepts_api_spelling_as_before() {
     // accepted via the `values` list. This is the staged-migration
     // hook — strictness flips on per enum as codegen populates the
     // table, so a partial sweep never breaks compilation.
-    let t = AttributeType::string_enum(
-        "TrafficType".to_string(),
-        vec![
+    let t = AttributeType::enum_(
+        crate::schema::enum_identity("TrafficType", Some("aws.ec2.FlowLog")),
+        Some(vec![
             "ACCEPT".to_string(),
             "REJECT".to_string(),
             "ALL".to_string(),
-        ],
-        Some(crate::schema::string_enum_identity(
-            "TrafficType",
-            Some("aws.ec2.FlowLog"),
-        )),
+        ]),
         vec![],
+        None,
+        None,
     );
     assert!(
         t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
@@ -4954,17 +4943,15 @@ fn dsl_aliases_diagnostic_tags_alias_entries_distinct_from_canonical() {
     // The `expected` list carried by `TypeError::InvalidEnumVariant`
     // stores DSL spellings as canonical candidates for 1:1 alias
     // tables, so LSP code actions suggest writable identifiers.
-    let t = AttributeType::string_enum(
-        "VersioningStatus".to_string(),
-        vec!["Enabled".to_string(), "Suspended".to_string()],
-        Some(crate::schema::string_enum_identity(
-            "VersioningStatus",
-            Some("aws.s3.Bucket"),
-        )),
+    let t = AttributeType::enum_(
+        crate::schema::enum_identity("VersioningStatus", Some("aws.s3.Bucket")),
+        Some(vec!["Enabled".to_string(), "Suspended".to_string()]),
         vec![
             ("Enabled".to_string(), "enabled".to_string()),
             ("Suspended".to_string(), "suspended".to_string()),
         ],
+        None,
+        None,
     );
     // Use `EnumIdentifier` so the strict-mode validator reaches the
     // unknown-variant branch (the alias-tagging behavior we want to
@@ -4998,14 +4985,12 @@ fn dsl_aliases_empty_keeps_api_only_validation() {
     // providers and for enums whose API spelling already matches the
     // DSL spelling. Validation must continue to accept the API
     // spelling and nothing else.
-    let t = AttributeType::string_enum(
-        "Status".to_string(),
-        vec!["active".to_string(), "inactive".to_string()],
-        Some(crate::schema::string_enum_identity(
-            "Status",
-            Some("test.r"),
-        )),
+    let t = AttributeType::enum_(
+        crate::schema::enum_identity("Status", Some("test.r")),
+        Some(vec!["active".to_string(), "inactive".to_string()]),
         vec![],
+        None,
+        None,
     );
     assert!(
         t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
@@ -5021,7 +5006,7 @@ fn dsl_aliases_empty_keeps_api_only_validation() {
     );
 }
 
-// #2978 — collision between a `let` binding name and a `StringEnum`
+// #2978 — collision between a `let` binding name and a `Enum`
 // DSL alias. The parser resolves a bare identifier to the binding
 // first (see parser/expressions/primary.rs:367-374), producing a
 // `Value::Deferred(DeferredValue::BindingRef { binding: "vpc" })` for
@@ -5030,7 +5015,7 @@ fn dsl_aliases_empty_keeps_api_only_validation() {
 // error from the resolver, which is hard to diagnose. Pin the
 // behavior here so a regression on the `validate` side is visible
 // without round-tripping through plan execution.
-mod string_enum_binding_collision {
+mod enum_binding_collision {
     use super::*;
     use crate::resource::DeferredValue;
 
@@ -5038,17 +5023,13 @@ mod string_enum_binding_collision {
         // Mirrors the awscc.ec2.FlowLog.ResourceType enum that
         // surfaced the issue. The `"vpc"` alias is what collides with
         // a `let vpc = ...` binding name in real fixtures.
-        AttributeType::string_enum(
-            "ResourceType".to_string(),
-            vec![
+        AttributeType::enum_(
+            crate::schema::enum_identity("ResourceType", Some("awscc.ec2.FlowLog")),
+            Some(vec![
                 "NetworkInterface".to_string(),
                 "Subnet".to_string(),
                 "VPC".to_string(),
-            ],
-            Some(crate::schema::string_enum_identity(
-                "ResourceType",
-                Some("awscc.ec2.FlowLog"),
-            )),
+            ]),
             vec![
                 (
                     "NetworkInterface".to_string(),
@@ -5057,6 +5038,8 @@ mod string_enum_binding_collision {
                 ("Subnet".to_string(), "subnet".to_string()),
                 ("VPC".to_string(), "vpc".to_string()),
             ],
+            None,
+            None,
         )
     }
 
@@ -5123,7 +5106,7 @@ mod string_enum_binding_collision {
     }
 
     #[test]
-    fn collision_check_only_fires_on_string_enum() {
+    fn collision_check_only_fires_on_enum() {
         // Other AttributeType kinds (e.g., String) must not be
         // affected by the collision check — many of them legitimately
         // accept a `BindingRef`.
@@ -5188,7 +5171,7 @@ mod dsl_map_api_for {
     #[test]
     fn aliases_resolves_dsl_to_api_canonical() {
         let aliases = alias_table();
-        let map = DslMap::Aliases(&aliases);
+        let map = DslMap::new(&aliases, None);
         assert_eq!(map.api_for("enabled"), "Enabled");
         assert_eq!(map.api_for("suspended"), "Suspended");
         assert_eq!(map.api_for("vpc"), "VPC");
@@ -5200,7 +5183,7 @@ mod dsl_map_api_for {
         // off identity-mapped values (where API spelling == DSL spelling)
         // straight to the SDK.
         let aliases = alias_table();
-        let map = DslMap::Aliases(&aliases);
+        let map = DslMap::new(&aliases, None);
         assert_eq!(map.api_for("unknown"), "unknown");
     }
 
@@ -5210,14 +5193,14 @@ mod dsl_map_api_for {
         // no-op: the alias table is `(api, dsl)`, so an API value
         // doesn't match any `dsl` side and falls through.
         let aliases = alias_table();
-        let map = DslMap::Aliases(&aliases);
+        let map = DslMap::new(&aliases, None);
         assert_eq!(map.api_for("Enabled"), "Enabled");
     }
 
     #[test]
     fn aliases_empty_table_is_identity() {
         let aliases: Vec<(String, String)> = vec![];
-        let map = DslMap::Aliases(&aliases);
+        let map = DslMap::new(&aliases, None);
         assert_eq!(map.api_for("anything"), "anything");
     }
 
@@ -5231,13 +5214,13 @@ mod dsl_map_api_for {
         fn to_dsl(api: &str) -> String {
             api.replace('-', "_")
         }
-        let map = DslMap::Closure(Some(to_dsl));
+        let map = DslMap::new(&[], Some(to_dsl));
         assert_eq!(map.api_for("ap_northeast_1"), "ap_northeast_1");
     }
 
     #[test]
     fn closure_none_returns_input_unchanged() {
-        let map = DslMap::Closure(None);
+        let map = DslMap::new(&[], None);
         assert_eq!(map.api_for("anything"), "anything");
     }
 
@@ -5252,26 +5235,24 @@ mod dsl_map_api_for {
             ("Foo".to_string(), "bar".to_string()),
             ("Baz".to_string(), "bar".to_string()),
         ];
-        let map = DslMap::Aliases(&aliases);
+        let map = DslMap::new(&aliases, None);
         assert_eq!(map.api_for("bar"), "Foo");
     }
 }
 
-// carina#2996: `Map<StringEnum, V>` bare-identifier key acceptance.
+// carina#2996: `Map<Enum, V>` bare-identifier key acceptance.
 fn condition_operator_map(value: AttributeType) -> AttributeType {
     AttributeType::map_with_key(
-        AttributeType::string_enum(
-            "ConditionOperator".to_string(),
-            vec![
+        AttributeType::enum_(
+            crate::schema::enum_identity("ConditionOperator", Some("aws.iam.ConditionOperator")),
+            Some(vec![
                 "string_equals".to_string(),
                 "string_not_equals".to_string(),
                 "arn_like".to_string(),
-            ],
-            Some(crate::schema::string_enum_identity(
-                "ConditionOperator",
-                Some("aws.iam.ConditionOperator"),
-            )),
+            ]),
             vec![],
+            None,
+            None,
         ),
         value,
     )
@@ -5287,30 +5268,28 @@ fn map_value_with_one_key(key: &str) -> Value {
 }
 
 #[test]
-fn validate_map_with_string_enum_key_accepts_bare_identifier_spelling() {
+fn validate_map_with_enum_key_accepts_bare_identifier_spelling() {
     let map_t = condition_operator_map(AttributeType::string());
     let val = map_value_with_one_key("string_equals");
     assert!(
         map_t.validate(&val).is_ok(),
-        "bare-identifier map key for Map<StringEnum, V> must be accepted: {:?}",
+        "bare-identifier map key for Map<Enum, V> must be accepted: {:?}",
         map_t.validate(&val)
     );
 }
 
 #[test]
-fn validate_map_with_string_enum_key_accepts_dsl_alias_spelling() {
+fn validate_map_with_enum_key_accepts_dsl_alias_spelling() {
     // `IpProtocol` has a `("-1", "all")` alias: DSL must accept `all`
     // both at attribute-value position (already covered) and at
-    // map-key position when used as `Map<StringEnum<IpProtocol>, V>`.
+    // map-key position when used as `Map<Enum<IpProtocol>, V>`.
     let map_t = AttributeType::map_with_key(
-        AttributeType::string_enum(
-            "IpProtocol".to_string(),
-            vec!["tcp".to_string(), "-1".to_string()],
-            Some(crate::schema::string_enum_identity(
-                "IpProtocol",
-                Some("awscc.ec2.SecurityGroup"),
-            )),
+        AttributeType::enum_(
+            crate::schema::enum_identity("IpProtocol", Some("awscc.ec2.SecurityGroup")),
+            Some(vec!["tcp".to_string(), "-1".to_string()]),
             vec![("-1".to_string(), "all".to_string())],
+            None,
+            None,
         ),
         AttributeType::string(),
     );
@@ -5323,7 +5302,7 @@ fn validate_map_with_string_enum_key_accepts_dsl_alias_spelling() {
 }
 
 #[test]
-fn validate_map_with_string_enum_key_rejects_unknown_variant() {
+fn validate_map_with_enum_key_rejects_unknown_variant() {
     let map_t = condition_operator_map(AttributeType::string());
     let val = map_value_with_one_key("not_a_variant");
     // The diagnostic must surface as `MapKeyError(InvalidEnumVariant)`,
@@ -5342,42 +5321,38 @@ fn validate_map_with_string_enum_key_rejects_unknown_variant() {
 }
 
 // awscc#251: persisted state files written before awscc#250 made IAM
-// policy `version`/`effect` into `StringEnum` store these as plain JSON
+// policy `version`/`effect` into `Enum` store these as plain JSON
 // strings. On load they become `ConcreteValue::String`. The carina#2986
-// Phase 4 strict validator then rejects them at the `StringEnum`
+// Phase 4 strict validator then rejects them at the `Enum`
 // position because it demands `ConcreteValue::EnumIdentifier`. The
 // schema-aware state-migration lift in
-// `crate::utils::lift_state_string_enums_to_identifiers` walks loaded
+// `crate::utils::lift_state_enum_leaves` walks loaded
 // attributes against their schema and lifts recognized API-canonical /
 // alias strings to `EnumIdentifier` so old state validates again.
 #[test]
-fn lift_state_string_enums_to_identifiers_fixes_awscc251() {
-    use crate::utils::lift_state_string_enums_to_identifiers;
+fn lift_state_enum_leaves_fixes_awscc251() {
+    use crate::utils::lift_state_enum_leaves;
     use indexmap::IndexMap;
 
-    let version_enum = AttributeType::string_enum(
-        "Version".to_string(),
-        vec!["2012-10-17".to_string(), "2008-10-17".to_string()],
-        Some(crate::schema::string_enum_identity(
-            "Version",
-            Some("aws.iam.PolicyDocument"),
-        )),
+    let version_enum = AttributeType::enum_(
+        crate::schema::enum_identity("Version", Some("aws.iam.PolicyDocument")),
+        Some(vec!["2012-10-17".to_string(), "2008-10-17".to_string()]),
         vec![
             ("2012-10-17".to_string(), "2012_10_17".to_string()),
             ("2008-10-17".to_string(), "2008_10_17".to_string()),
         ],
+        None,
+        None,
     );
-    let effect_enum = AttributeType::string_enum(
-        "Effect".to_string(),
-        vec!["Allow".to_string(), "Deny".to_string()],
-        Some(crate::schema::string_enum_identity(
-            "Effect",
-            Some("aws.iam.PolicyDocument"),
-        )),
+    let effect_enum = AttributeType::enum_(
+        crate::schema::enum_identity("Effect", Some("aws.iam.PolicyDocument")),
+        Some(vec!["Allow".to_string(), "Deny".to_string()]),
         vec![
             ("Allow".to_string(), "allow".to_string()),
             ("Deny".to_string(), "deny".to_string()),
         ],
+        None,
+        None,
     );
     let statement_struct = AttributeType::struct_(
         "Statement".to_string(),
@@ -5419,7 +5394,7 @@ fn lift_state_string_enums_to_identifiers_fixes_awscc251() {
 
     // BEFORE the lift: strict validator rejects the loaded String.
     let before = schema.validate(&attrs);
-    let errs = before.expect_err("loaded state String must fail strict StringEnum validation");
+    let errs = before.expect_err("loaded state String must fail strict Enum validation");
     fn has_string_literal_expected_enum(errs: &[TypeError]) -> bool {
         errs.iter().any(|e| match e {
             TypeError::StringLiteralExpectedEnum { .. } => true,
@@ -5437,12 +5412,12 @@ fn lift_state_string_enums_to_identifiers_fixes_awscc251() {
     );
 
     // Apply the lift.
-    lift_state_string_enums_to_identifiers(&mut attrs, &schema);
+    lift_state_enum_leaves(&mut attrs, &schema);
 
     // AFTER the lift: validation passes.
     schema
         .validate(&attrs)
-        .expect("lifted state must pass strict StringEnum validation");
+        .expect("lifted state must pass strict Enum validation");
 
     // The lifted values are EnumIdentifier in the DSL spelling: the
     // strict carina#2986 validator requires the alias form when a
@@ -5452,7 +5427,9 @@ fn lift_state_string_enums_to_identifiers_fixes_awscc251() {
     };
     assert_eq!(
         policy["version"],
-        Value::Concrete(ConcreteValue::EnumIdentifier("2012_10_17".to_string()))
+        Value::Concrete(ConcreteValue::EnumIdentifier(
+            "aws.iam.PolicyDocument.Version.2012_10_17".to_string()
+        ))
     );
     let Value::Concrete(ConcreteValue::List(stmts)) = &policy["statement"] else {
         panic!("statement should be a List");
@@ -5462,23 +5439,23 @@ fn lift_state_string_enums_to_identifiers_fixes_awscc251() {
     };
     assert_eq!(
         stmt["effect"],
-        Value::Concrete(ConcreteValue::EnumIdentifier("allow".to_string()))
+        Value::Concrete(ConcreteValue::EnumIdentifier(
+            "aws.iam.PolicyDocument.Effect.allow".to_string()
+        ))
     );
 }
 
 #[test]
-fn lift_state_string_enums_is_idempotent_and_preserves_invalid() {
-    use crate::utils::lift_state_string_enums_to_identifiers;
+fn lift_state_enums_is_idempotent_and_preserves_invalid() {
+    use crate::utils::lift_state_enum_leaves;
     use indexmap::IndexMap;
 
-    let version_enum = AttributeType::string_enum(
-        "Version".to_string(),
-        vec!["2012-10-17".to_string()],
-        Some(crate::schema::string_enum_identity(
-            "Version",
-            Some("aws.iam.PolicyDocument"),
-        )),
+    let version_enum = AttributeType::enum_(
+        crate::schema::enum_identity("Version", Some("aws.iam.PolicyDocument")),
+        Some(vec!["2012-10-17".to_string()]),
         vec![("2012-10-17".to_string(), "2012_10_17".to_string())],
+        None,
+        None,
     );
     let policy_struct = AttributeType::struct_(
         "PolicyDocument".to_string(),
@@ -5487,7 +5464,7 @@ fn lift_state_string_enums_is_idempotent_and_preserves_invalid() {
     let schema = ResourceSchema::new("aws.iam.role_policy")
         .attribute(AttributeSchema::new("policy", policy_struct));
 
-    // Case 1: already an EnumIdentifier (post-fix re-plan) — no-op.
+    // Case 1: already an EnumIdentifier (post-fix re-plan) is normalized.
     let mut already = IndexMap::new();
     already.insert(
         "version".to_string(),
@@ -5498,14 +5475,16 @@ fn lift_state_string_enums_is_idempotent_and_preserves_invalid() {
         "policy".to_string(),
         Value::Concrete(ConcreteValue::Map(already.clone())),
     );
-    lift_state_string_enums_to_identifiers(&mut attrs, &schema);
+    lift_state_enum_leaves(&mut attrs, &schema);
     let Value::Concrete(ConcreteValue::Map(p)) = &attrs["policy"] else {
         panic!("map");
     };
     assert_eq!(
         p["version"],
-        Value::Concrete(ConcreteValue::EnumIdentifier("2012_10_17".to_string())),
-        "already-lifted EnumIdentifier must pass through unchanged"
+        Value::Concrete(ConcreteValue::EnumIdentifier(
+            "aws.iam.PolicyDocument.Version.2012_10_17".to_string()
+        )),
+        "already-lifted EnumIdentifier must normalize to fully-qualified DSL spelling"
     );
 
     // Case 2: unrecognized string — left as String so the strict
@@ -5521,7 +5500,7 @@ fn lift_state_string_enums_is_idempotent_and_preserves_invalid() {
         "policy".to_string(),
         Value::Concrete(ConcreteValue::Map(bad)),
     );
-    lift_state_string_enums_to_identifiers(&mut attrs2, &schema);
+    lift_state_enum_leaves(&mut attrs2, &schema);
     let Value::Concrete(ConcreteValue::Map(p2)) = &attrs2["policy"] else {
         panic!("map");
     };
@@ -5533,6 +5512,74 @@ fn lift_state_string_enums_is_idempotent_and_preserves_invalid() {
     assert!(
         schema.validate(&attrs2).is_err(),
         "invalid persisted state must still fail validation, not be masked"
+    );
+}
+
+#[test]
+fn dynamic_enum_lift_raw_string_requires_transform_and_structural_dsl_member() {
+    use crate::utils::lift_state_enum_leaves;
+
+    fn az_schema() -> ResourceSchema {
+        let zone_name = AttributeType::enum_(
+            crate::schema::enum_identity("ZoneName", Some("aws.AvailabilityZone")),
+            None,
+            vec![],
+            None,
+            Some(|s| s.replace('-', "_")),
+        );
+        ResourceSchema::new("aws.ec2.subnet")
+            .attribute(AttributeSchema::new("availability_zone", zone_name))
+    }
+
+    fn lifted_value(raw: &str) -> Value {
+        let schema = az_schema();
+        let mut attrs = HashMap::from([(
+            "availability_zone".to_string(),
+            Value::Concrete(ConcreteValue::String(raw.to_string())),
+        )]);
+        lift_state_enum_leaves(&mut attrs, &schema);
+        attrs.remove("availability_zone").unwrap()
+    }
+
+    assert_eq!(
+        lifted_value("foo_bar_42"),
+        Value::Concrete(ConcreteValue::String("foo_bar_42".to_string())),
+        "raw strings whose transform is a no-op must stay String"
+    );
+    assert_eq!(
+        lifted_value("Active"),
+        Value::Concrete(ConcreteValue::String("Active".to_string())),
+        "uppercase raw strings must stay String"
+    );
+    assert_eq!(
+        lifted_value("ap-northeast-1z"),
+        Value::Concrete(ConcreteValue::EnumIdentifier(
+            "aws.AvailabilityZone.ZoneName.ap_northeast_1z".to_string()
+        )),
+        "structural API-form dynamic enum strings must lift"
+    );
+    assert_eq!(
+        lifted_value("123_abc"),
+        Value::Concrete(ConcreteValue::String("123_abc".to_string())),
+        "raw strings that already look DSL-like but start with a digit must stay String"
+    );
+}
+
+#[test]
+fn dsl_map_is_empty_means_no_aliases_and_no_transform() {
+    let empty_aliases: Vec<(String, String)> = Vec::new();
+    assert!(
+        DslMap::new(&empty_aliases, None).is_empty(),
+        "no aliases and no transform means no rewrite machinery"
+    );
+    assert!(
+        !DslMap::new(&empty_aliases, Some(|s| s.replace('-', "_"))).is_empty(),
+        "a dynamic transform counts as rewrite machinery even when aliases are empty"
+    );
+    let aliases = vec![("Allow".to_string(), "allow".to_string())];
+    assert!(
+        !DslMap::new(&aliases, None).is_empty(),
+        "alias-table entries count as rewrite machinery"
     );
 }
 
