@@ -3,6 +3,7 @@
 //! These mirror carina-core types but are JSON-serializable across the process boundary.
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 fn default_true() -> bool {
@@ -514,16 +515,18 @@ pub enum DslTransform {
 }
 
 impl DslTransform {
-    pub fn apply(&self, s: &str) -> String {
+    pub fn apply<'a>(&self, s: &'a str) -> Cow<'a, str> {
         match self {
-            Self::Identity | Self::Unknown(_) => s.to_string(),
-            Self::HyphenToUnderscore => s.replace('-', "_"),
-            Self::StripSuffix(suffix) => s.strip_suffix(suffix.as_str()).unwrap_or(s).to_string(),
-            Self::ReplaceTable(table) => table
-                .iter()
-                .find(|(k, _)| k == s)
-                .map(|(_, v)| v.clone())
-                .unwrap_or_else(|| s.to_string()),
+            Self::Identity | Self::Unknown(_) => Cow::Borrowed(s),
+            Self::HyphenToUnderscore => Cow::Owned(s.replace('-', "_")),
+            Self::StripSuffix(suffix) => match s.strip_suffix(suffix.as_str()) {
+                Some(stripped) => Cow::Borrowed(stripped),
+                None => Cow::Borrowed(s),
+            },
+            Self::ReplaceTable(table) => match table.iter().find(|(k, _)| k == s) {
+                Some((_, v)) => Cow::Owned(v.clone()),
+                None => Cow::Borrowed(s),
+            },
         }
     }
 }
@@ -983,6 +986,25 @@ mod tests {
         ]);
         assert_eq!(transform.apply("-1"), "all");
         assert_eq!(transform.apply("udp"), "udp");
+    }
+
+    #[test]
+    fn dsl_transform_no_change_paths_borrow_input() {
+        let identity = DslTransform::Identity;
+        let result = identity.apply("unchanged");
+        assert!(matches!(result, Cow::Borrowed("unchanged")));
+
+        let unknown = DslTransform::Unknown(serde_json::json!({"type":"FutureTransform"}));
+        let result = unknown.apply("foo.bar.");
+        assert!(matches!(result, Cow::Borrowed("foo.bar.")));
+
+        let strip_suffix = DslTransform::StripSuffix(".".to_string());
+        let result = strip_suffix.apply("foo");
+        assert!(matches!(result, Cow::Borrowed("foo")));
+
+        let replace_table = DslTransform::ReplaceTable(vec![("-1".to_string(), "all".to_string())]);
+        let result = replace_table.apply("udp");
+        assert!(matches!(result, Cow::Borrowed("udp")));
     }
 
     #[test]

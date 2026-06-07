@@ -3,6 +3,7 @@
 //! Providers define schemas for each resource type,
 //! enabling type validation at parse time.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
@@ -305,13 +306,13 @@ impl<'a> DslMap<'a> {
 
     /// Translate an API spelling to its DSL spelling. Returns the
     /// input unchanged when no mapping applies.
-    pub fn dsl_for(&self, api: &str) -> String {
+    pub fn dsl_for<'b>(&self, api: &'b str) -> Cow<'b, str> {
         self.aliases
             .iter()
-            .find_map(|(a, d)| (a == api).then(|| d.clone()))
+            .find_map(|(a, d)| (a == api).then(|| Cow::Owned(d.clone())))
             .unwrap_or_else(|| {
                 self.to_dsl
-                    .map_or_else(|| api.to_string(), |transform| transform.apply(api))
+                    .map_or_else(|| Cow::Borrowed(api), |transform| transform.apply(api))
             })
     }
 
@@ -2813,11 +2814,13 @@ fn enum_expected_variants(
 
     for value in values {
         let dsl_value = dsl_map.dsl_for(value);
-        canonical_dsl_values.insert(dsl_value.clone());
-        if seen_values.insert(dsl_value.clone()) {
+        let owned = dsl_value.into_owned();
+        canonical_dsl_values.insert(owned.clone());
+        if !seen_values.contains(&owned) {
             expected.push(ExpectedEnumVariant::from_namespaced(
-                namespace, type_name, &dsl_value, false,
+                namespace, type_name, &owned, false,
             ));
+            seen_values.insert(owned);
         }
     }
 
