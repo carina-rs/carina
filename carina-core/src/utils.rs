@@ -1106,7 +1106,7 @@ fn enum_member_accepts(
         return false;
     }
     let resolved = expand_enum_shorthand(
-        &Value::Concrete(ConcreteValue::EnumIdentifier(dsl.clone())),
+        &Value::Concrete(ConcreteValue::EnumIdentifier(dsl.to_string())),
         identity,
     );
     if let Some(validate) = validate {
