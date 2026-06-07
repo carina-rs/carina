@@ -8,6 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+carina-provider-protocol = { path = "../carina-provider-protocol" }
 futures = "0.3"
 pest = "2"
 pest_derive = "2"

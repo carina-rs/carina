@@ -5211,10 +5211,8 @@ mod dsl_map_api_for {
         // as-is for the Closure variant. Callers that go through a
         // `Closure` (currently only Region with hyphen↔underscore) must
         // reverse the mapping themselves.
-        fn to_dsl(api: &str) -> String {
-            api.replace('-', "_")
-        }
-        let map = DslMap::new(&[], Some(to_dsl));
+        let transform = crate::schema::DslTransform::HyphenToUnderscore;
+        let map = DslMap::new(&[], Some(&transform));
         assert_eq!(map.api_for("ap_northeast_1"), "ap_northeast_1");
     }
 
@@ -5525,7 +5523,7 @@ fn dynamic_enum_lift_raw_string_requires_transform_and_structural_dsl_member() {
             None,
             vec![],
             None,
-            Some(|s| s.replace('-', "_")),
+            Some(crate::schema::DslTransform::HyphenToUnderscore),
         );
         ResourceSchema::new("aws.ec2.subnet")
             .attribute(AttributeSchema::new("availability_zone", zone_name))
@@ -5573,7 +5571,11 @@ fn dsl_map_is_empty_means_no_aliases_and_no_transform() {
         "no aliases and no transform means no rewrite machinery"
     );
     assert!(
-        !DslMap::new(&empty_aliases, Some(|s| s.replace('-', "_"))).is_empty(),
+        !DslMap::new(
+            &empty_aliases,
+            Some(&crate::schema::DslTransform::HyphenToUnderscore)
+        )
+        .is_empty(),
         "a dynamic transform counts as rewrite machinery even when aliases are empty"
     );
     let aliases = vec![("Allow".to_string(), "allow".to_string())];

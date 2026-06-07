@@ -822,38 +822,13 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
             None,
             vec![],
             None, // Validation is handled via ProviderContext.validators
-            resolve_dsl_transform(dsl_transform.as_deref()),
+            dsl_transform.clone(),
         ),
         // Cyclic CFN struct reference (carina#3340). The host's
         // structural counterpart is `AttributeType::Ref`; the matching
         // `ResourceSchema.defs` map is converted alongside in
         // `proto_schema_to_core` so resolution at walk-sites succeeds.
         proto::AttributeType::Ref { name } => CoreAttributeType::ref_(name.clone()),
-    }
-}
-
-fn resolve_dsl_transform(name: Option<&str>) -> Option<fn(&str) -> String> {
-    let name = name?;
-    let transform = carina_core::schema::dsl_transform_for(name);
-    if transform.is_none() {
-        warn_unknown_dsl_transform_once(name);
-    }
-    transform
-}
-
-fn warn_unknown_dsl_transform_once(name: &str) {
-    use std::collections::HashSet;
-    use std::sync::{LazyLock, RwLock};
-
-    static WARNED: LazyLock<RwLock<HashSet<String>>> =
-        LazyLock::new(|| RwLock::new(HashSet::new()));
-    let mut warned = WARNED
-        .write()
-        .expect("unknown DSL transform warning registry lock poisoned");
-    if warned.insert(name.to_string()) {
-        log::warn!(
-            "unknown DSL transform `{name}` in provider schema; enum state normalization will continue without this transform"
-        );
     }
 }
 
@@ -1926,7 +1901,7 @@ mod tests {
             name: "ZoneName".to_string(),
             base: Box::new(proto::AttributeType::String),
             namespace: "aws.AvailabilityZone".to_string(),
-            dsl_transform: Some("hyphen_to_underscore".to_string()),
+            dsl_transform: Some(proto::DslTransform::HyphenToUnderscore),
         };
         let core_attr = proto_attr_type_to_core(&proto_attr);
         let state = carina_core::resource::Value::Concrete(
@@ -1961,7 +1936,7 @@ mod tests {
             name: "ZoneName".to_string(),
             base: Box::new(proto::AttributeType::String),
             namespace: "aws.AvailabilityZone".to_string(),
-            dsl_transform: Some("hyphen_to_underscore".to_string()),
+            dsl_transform: Some(proto::DslTransform::HyphenToUnderscore),
         };
         let core_attr = proto_attr_type_to_core(&proto_attr);
 
@@ -2022,51 +1997,44 @@ mod tests {
     }
 
     #[test]
-    fn proto_custom_enum_registered_transform_lifts_state_string() {
-        fn fake_transform(s: &str) -> String {
-            s.strip_prefix("api-").unwrap_or(s).to_string()
-        }
-
-        carina_core::schema::register_dsl_transform("test_fake_transform", fake_transform);
-
+    fn proto_custom_enum_strip_suffix_transform_resolves_on_host() {
         let proto_attr = proto::AttributeType::CustomEnum {
-            name: "Mode".to_string(),
+            name: "ZoneName".to_string(),
             base: Box::new(proto::AttributeType::String),
             namespace: "test.Dynamic".to_string(),
-            dsl_transform: Some("test_fake_transform".to_string()),
+            dsl_transform: Some(proto::DslTransform::StripSuffix(".".to_string())),
         };
         let core_attr = proto_attr_type_to_core(&proto_attr);
-        let state = carina_core::resource::Value::Concrete(
-            carina_core::resource::ConcreteValue::String("api-enabled1".to_string()),
-        );
-
-        let lifted = carina_core::utils::lift_enum_leaves(&state, &core_attr)
-            .expect("registered transform should lift structurally valid state");
-
-        assert_eq!(
-            lifted,
-            carina_core::resource::Value::Concrete(
-                carina_core::resource::ConcreteValue::EnumIdentifier(
-                    "test.Dynamic.Mode.enabled1".to_string()
-                )
-            )
-        );
+        match core_attr.shape_ref_free().expect("test schema is Ref-free") {
+            carina_core::schema::Shape::Enum {
+                to_dsl: Some(transform),
+                ..
+            } => {
+                assert_eq!(transform.apply("foo.bar."), "foo.bar");
+            }
+            other => panic!("expected Enum with transform, got {other:?}"),
+        }
     }
 
     #[test]
-    fn proto_custom_enum_registry_miss_deserializes_and_uses_no_transform() {
+    fn proto_custom_enum_unknown_transform_deserializes_and_uses_identity() {
         let json = r#"{
             "type":"custom_enum",
             "name":"ZoneName",
             "base":{"type":"String"},
             "namespace":"aws.AvailabilityZone",
-            "dsl_transform":"snake_to_kebab"
+            "dsl_transform":{"type":"FutureTransform"}
         }"#;
         let proto_attr: proto::AttributeType =
-            serde_json::from_str(json).expect("unknown transform must deserialize");
+            serde_json::from_str(json).expect("future transform must deserialize");
         match &proto_attr {
             proto::AttributeType::CustomEnum { dsl_transform, .. } => {
-                assert_eq!(dsl_transform.as_deref(), Some("snake_to_kebab"));
+                assert_eq!(
+                    dsl_transform,
+                    &Some(proto::DslTransform::Unknown(serde_json::json!({
+                        "type": "FutureTransform"
+                    })))
+                );
             }
             other => panic!("expected proto CustomEnum, got {other:?}"),
         }
@@ -2074,7 +2042,13 @@ mod tests {
         let core_attr = proto_attr_type_to_core(&proto_attr);
         match core_attr.shape_ref_free().expect("test schema is Ref-free") {
             carina_core::schema::Shape::Enum { to_dsl, .. } => {
-                assert!(to_dsl.is_none(), "unknown transform must degrade to no-op");
+                assert_eq!(
+                    to_dsl,
+                    Some(&proto::DslTransform::Unknown(serde_json::json!({
+                        "type": "FutureTransform"
+                    })))
+                );
+                assert_eq!(to_dsl.unwrap().apply("snake_to_kebab"), "snake_to_kebab");
             }
             other => panic!("expected Enum, got {other:?}"),
         }

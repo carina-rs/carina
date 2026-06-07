@@ -4292,16 +4292,12 @@ mod tests {
         use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
         use std::collections::HashMap;
 
-        fn hyphen_to_underscore(s: &str) -> String {
-            s.replace('-', "_")
-        }
-
         let az_enum = AttributeType::enum_(
             crate::schema::enum_identity("ZoneName", Some("aws.AvailabilityZone")),
             None,
             vec![],
             None,
-            Some(hyphen_to_underscore),
+            Some(crate::schema::DslTransform::HyphenToUnderscore),
         );
         let schema = ResourceSchema::new("ec2.Subnet")
             .attribute(AttributeSchema::new("availability_zone", az_enum));

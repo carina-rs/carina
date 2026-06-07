@@ -1042,7 +1042,7 @@ mod tests {
             None,
             vec![],
             None,
-            Some(|s| s.replace('-', "_")),
+            Some(crate::schema::DslTransform::HyphenToUnderscore),
         );
 
         assert_eq!(

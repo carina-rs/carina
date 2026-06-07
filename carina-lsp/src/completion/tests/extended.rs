@@ -2438,7 +2438,7 @@ fn dynamic_enum_completion_offers_namespaced_prefix() {
         None,
         vec![],
         None,
-        Some(|s| s.replace('-', "_")),
+        Some(carina_core::schema::DslTransform::HyphenToUnderscore),
     );
     let schema = ResourceSchema::new("network.Subnet")
         .attribute(AttributeSchema::new("availability_zone", zone_name));

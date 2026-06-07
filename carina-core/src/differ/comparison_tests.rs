@@ -336,7 +336,7 @@ fn type_aware_enum_canonical_vs_namespaced_identifier() {
         None,
         vec![],
         None,
-        Some(|s: &str| s.replace('-', "_")),
+        Some(crate::schema::DslTransform::HyphenToUnderscore),
     );
 
     // Provider-read AWS canonical form vs DSL fully-qualified identifier.

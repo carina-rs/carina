@@ -132,16 +132,12 @@ fn region_schemas() -> SchemaRegistry {
         }
         Err("expected string".to_string())
     }
-    fn to_dsl(s: &str) -> String {
-        s.replace('-', "_")
-    }
-
     let region_custom = AttributeType::enum_(
         carina_core::schema::enum_identity("Region", Some("test")),
         None,
         vec![],
         Some(legacy_validator(validate_region)),
-        Some(to_dsl),
+        Some(carina_core::schema::DslTransform::HyphenToUnderscore),
     );
 
     single_schema_map(
