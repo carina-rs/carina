@@ -726,10 +726,6 @@ pub async fn run_plan(
         // from the plan's terminal section so they don't read as a run-on
         // (#3148).
         print!("{}", refresh_plan_separator(refresh));
-        if let Some(note) = drift_note.as_ref() {
-            println!("{}", note.yellow());
-            println!();
-        }
         print_plan(
             &ctx.plan,
             detail,
@@ -741,6 +737,10 @@ pub async fn run_plan(
             Some(&ctx.prev_explicit),
             Some(&ctx.expansion_trace),
         );
+        if let Some(note) = drift_note.as_ref() {
+            println!();
+            println!("{}", note.yellow());
+        }
     }
 
     // Save plan to file if --out was specified

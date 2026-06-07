@@ -224,6 +224,32 @@ mod backend_drift_gate {
     }
 
     #[test]
+    fn plan_drift_warning_prints_after_plan_summary() {
+        let tmp = write_drift_fixture(true);
+        let project = tmp.path();
+
+        let output = carina(project, &["plan", "--refresh=false", "."]);
+
+        assert!(
+            output.status.success(),
+            "plan should warn and exit 0 on drift.\nstdout: {}\nstderr: {}",
+            stdout(&output),
+            stderr(&output),
+        );
+        let stdout = stdout(&output);
+        let no_changes_idx = stdout
+            .find("No changes. Infrastructure is up-to-date.")
+            .expect("plan summary must be present in stdout");
+        let warning_idx = stdout
+            .find("Backend migration pending: plan read state from the OLD backend")
+            .expect("backend migration warning must be present in stdout");
+        assert!(
+            warning_idx > no_changes_idx,
+            "warning must appear after the plan summary, got stdout:\n{stdout}",
+        );
+    }
+
+    #[test]
     fn plan_out_with_drift_records_locked_backend() {
         let tmp = write_drift_fixture(true);
         let project = tmp.path();
