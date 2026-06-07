@@ -1266,12 +1266,12 @@ pub fn is_list_of_maps(value: &Value) -> bool {
 /// list shrinking to empty still routes through per-element `-` lines
 /// instead of the inline `[a, b] → []` form.
 ///
-/// `EnumIdentifier` is accepted (carina#3075): a `List<StringEnum>`
+/// `EnumIdentifier` is accepted (carina#3075): a `List<Enum>`
 /// reaches the renderer with `EnumIdentifier` elements on both sides
-/// (state lifted by `lift_saved_state_string_enums`, desired emitted
+/// (state lifted by `lift_saved_state_enums`, desired emitted
 /// by the parser per carina#2986). Treating it as its string payload —
 /// the same `String`/`EnumIdentifier` interchangeability the differ's
-/// `StringEnum` arm already relies on — lets the string-list diff path
+/// `Enum` arm already relies on — lets the string-list diff path
 /// (and its schema-aware enum canonicalization) engage instead of the
 /// value falling to a coarse inline `Changed` row.
 pub fn as_string_list(value: &Value) -> Option<Vec<String>> {
@@ -1429,6 +1429,16 @@ pub(crate) fn canonicalize_with_type(
         (Value::Deferred(DeferredValue::Secret(inner)), _) => Value::Deferred(
             DeferredValue::Secret(Box::new(canonicalize_with_type(*inner, attr_type, defs))),
         ),
+        // Enum must not fall through to the `(v, _) => v` wildcard.
+        // That is the same failure mode as carina#3080's Union gap:
+        // the ranker/canonicalizer path looked correct for other
+        // branches while this leaf silently skipped normalization.
+        (val, crate::schema::Shape::Enum { .. }) => {
+            // Thread `defs` here too to preserve the invariant for every
+            // `canonicalize_with_type` arm, even though the resolved Enum
+            // leaf itself does not contain a Ref.
+            crate::utils::lift_enum_leaves_with_defs(&val, unwrapped, defs).unwrap_or(val)
+        }
         // Union: the missing nesting kind (List/Map/Struct/Secret
         // already recurse; Union was the lone gap — carina#3080).
         // `principal` is `Union[Struct{ service: Union[String,
@@ -1755,13 +1765,16 @@ mod tests {
     }
 
     fn status_enum(namespace: Option<&str>) -> AttributeType {
-        use crate::schema::string_enum_identity;
+        use crate::schema::enum_identity;
 
-        AttributeType::string_enum(
-            "Status",
-            vec!["enabled".to_string(), "disabled".to_string()],
-            namespace.map(|ns| string_enum_identity("Status", Some(ns))),
+        AttributeType::enum_(
+            namespace
+                .map(|ns| enum_identity("Status", Some(ns)))
+                .unwrap_or_else(|| crate::schema::TypeIdentity::bare("Status")),
+            Some(vec!["enabled".to_string(), "disabled".to_string()]),
             Vec::new(),
+            None,
+            None,
         )
     }
 
@@ -1824,7 +1837,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_value_alias_extracts_top_level_list_string_enum() {
+    fn resolve_value_alias_extracts_top_level_list_enum() {
         let schema = schema_with_attr(
             "svc.Resource",
             "statuses",
@@ -1843,7 +1856,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_value_alias_extracts_map_value_string_enum() {
+    fn resolve_value_alias_extracts_map_value_enum() {
         let schema = schema_with_attr(
             "svc.Resource",
             "status_by_name",
@@ -1862,7 +1875,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_value_alias_extracts_union_string_enum_member() {
+    fn resolve_value_alias_extracts_union_enum_member() {
         let schema = schema_with_attr(
             "svc.Resource",
             "status",
@@ -1884,7 +1897,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_value_alias_extracts_bare_string_enum_by_name() {
+    fn resolve_value_alias_extracts_bare_enum_by_name() {
         let schema = schema_with_attr("svc.Resource", "status", status_enum(None));
 
         assert_eq!(
@@ -1895,7 +1908,7 @@ mod tests {
 
     #[test]
     fn enum_alias_resolution_does_not_explode_on_recursive_struct_schema() {
-        use crate::schema::{AttributeSchema, ResourceSchema, StructField, string_enum_identity};
+        use crate::schema::{AttributeSchema, ResourceSchema, StructField, enum_identity};
 
         fn recursive_statement_def() -> AttributeType {
             let mut union_arms = vec![
@@ -1957,11 +1970,12 @@ mod tests {
             )
         }
 
-        let scope = AttributeType::string_enum(
-            "Scope",
-            vec!["CLOUDFRONT".to_string(), "REGIONAL".to_string()],
-            Some(string_enum_identity("Scope", Some("aws.wafv2.WebAcl"))),
+        let scope = AttributeType::enum_(
+            enum_identity("Scope", Some("aws.wafv2.WebAcl")),
+            Some(vec!["CLOUDFRONT".to_string(), "REGIONAL".to_string()]),
             Vec::new(),
+            None,
+            None,
         );
         let schema = ResourceSchema::new("wafv2.WebAcl")
             .attribute(AttributeSchema::new("scope", scope))
@@ -3655,6 +3669,28 @@ mod tests {
     }
 
     #[test]
+    fn canonicalize_enum_lifts_state_string_to_dsl_identifier() {
+        let t = AttributeType::enum_(
+            crate::schema::enum_identity("Effect", Some("aws.iam.PolicyDocument")),
+            Some(vec!["Allow".to_string(), "Deny".to_string()]),
+            vec![
+                ("Allow".to_string(), "allow".to_string()),
+                ("Deny".to_string(), "deny".to_string()),
+            ],
+            None,
+            None,
+        );
+        let v = Value::Concrete(ConcreteValue::String("Allow".to_string()));
+        let canon = canonicalize_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
+        assert_eq!(
+            canon,
+            Value::Concrete(ConcreteValue::EnumIdentifier(
+                "aws.iam.PolicyDocument.Effect.allow".to_string()
+            ))
+        );
+    }
+
+    #[test]
     fn canonicalize_passes_through_non_string_list() {
         let t = string_or_list_of_strings();
         // List with non-String elements stays as List — not the canonical
@@ -3841,10 +3877,9 @@ mod tests {
 
     #[test]
     fn canonicalize_through_custom_wrapper() {
-        use crate::schema::TypeIdentity;
         // Custom wrappers must be transparent for type matching.
         let t = AttributeType::custom(
-            Some(TypeIdentity::bare("PolicyConditionValue")),
+            Some(crate::schema::TypeIdentity::bare("PolicyConditionValue")),
             string_or_list_of_strings(),
             None,
             None,
@@ -4247,6 +4282,60 @@ mod tests {
         assert_eq!(
             resources[0].attributes.get("subject"),
             state.attributes.get("subject"),
+        );
+    }
+
+    #[test]
+    fn canonicalize_pipeline_dynamic_az_enum_state_api_spelling_has_no_diff() {
+        use crate::differ::{Diff, diff};
+        use crate::resource::{Resource, ResourceId, State};
+        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+        use std::collections::HashMap;
+
+        fn hyphen_to_underscore(s: &str) -> String {
+            s.replace('-', "_")
+        }
+
+        let az_enum = AttributeType::enum_(
+            crate::schema::enum_identity("ZoneName", Some("aws.AvailabilityZone")),
+            None,
+            vec![],
+            None,
+            Some(hyphen_to_underscore),
+        );
+        let schema = ResourceSchema::new("ec2.Subnet")
+            .attribute(AttributeSchema::new("availability_zone", az_enum));
+        let mut registry = SchemaRegistry::new();
+        registry.insert("awscc", schema.clone());
+
+        let id = ResourceId::with_provider("awscc", "ec2.Subnet", "subnet", None);
+        let mut desired = vec![
+            Resource::with_provider("awscc", "ec2.Subnet", "subnet", None).with_attribute(
+                "availability_zone",
+                Value::Concrete(ConcreteValue::EnumIdentifier("ap_northeast_1a".to_string())),
+            ),
+        ];
+        canonicalize_resources_with_schemas(&mut desired, &registry);
+
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "availability_zone".to_string(),
+            Value::Concrete(ConcreteValue::String("ap-northeast-1a".to_string())),
+        );
+        let mut states = HashMap::new();
+        states.insert(id.clone(), State::existing(id, attrs));
+        canonicalize_states_with_schemas(&mut states, &registry);
+
+        let result = diff(
+            &desired[0],
+            states.values().next().expect("state exists"),
+            None,
+            None,
+            Some(&schema),
+        );
+        assert!(
+            matches!(result, Diff::NoChange(_)),
+            "dynamic AZ enum API spelling in state must canonicalize to DSL spelling; got {result:?}"
         );
     }
 

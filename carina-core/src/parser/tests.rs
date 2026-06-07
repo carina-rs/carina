@@ -468,7 +468,7 @@ fn parse_bare_identifier_becomes_enum_identifier() {
     // Phase 3 of carina#2986: a bare identifier that is not a known
     // variable or binding lowers to `ConcreteValue::EnumIdentifier`, the
     // strict short-form variant. The validator performs schema-aware
-    // namespace expansion against the enclosing `StringEnum`; this is the
+    // namespace expansion against the enclosing `Enum`; this is the
     // mechanism that turns `dedicated` into
     // `awscc.ec2.Vpc.InstanceTenancy.dedicated` at validation time without
     // requiring schema context in the parser.

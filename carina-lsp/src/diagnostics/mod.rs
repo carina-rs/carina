@@ -572,17 +572,17 @@ impl DiagnosticEngine {
                                 }
                             }
 
-                            // #2309: when the attribute schema is a StringEnum and
+                            // #2309: when the attribute schema is a Enum and
                             // validation fails, emit a Diagnostic with the structured
                             // candidate list on `Diagnostic.data` and a range that
                             // covers the offending value text — both prerequisites
                             // for the `textDocument/codeAction` quick-fix. Falls
                             // through to the generic match below for everything
-                            // else (and when the StringEnum branch can't locate a
+                            // else (and when the Enum branch can't locate a
                             // value range).
-                            if let carina_core::schema::Shape::StringEnum { .. } =
+                            if let carina_core::schema::Shape::Enum { .. } =
                                 schema.shape_of(&attr_schema.attr_type)
-                                && let Some(diag) = build_string_enum_diagnostic(
+                                && let Some(diag) = build_enum_diagnostic(
                                     &attr_schema.attr_type,
                                     attr_value,
                                     attr_name,
@@ -627,10 +627,10 @@ impl DiagnosticEngine {
                                     "Type mismatch: expected Float, got String \"{}\".",
                                     s
                                 )),
-                                // ResourceRef type check for Union, StringEnum, and Custom types
+                                // ResourceRef type check for Union, Enum, and Custom types
                                 (
                                     carina_core::schema::Shape::Union
-                                    | carina_core::schema::Shape::StringEnum { .. }
+                                    | carina_core::schema::Shape::Enum { .. }
                                     | carina_core::schema::Shape::Custom { .. },
                                     Value::Deferred(DeferredValue::ResourceRef { path }),
                                 ) => check_resource_ref_type_mismatch(
@@ -639,7 +639,7 @@ impl DiagnosticEngine {
                                     path.binding(),
                                     path.attribute(),
                                 ),
-                                // StringEnum: the structured-payload path
+                                // Enum: the structured-payload path
                                 // above handles `InvalidEnumVariant` /
                                 // `StringLiteralExpectedEnum` and
                                 // `continue`s past this match. We only
@@ -649,7 +649,7 @@ impl DiagnosticEngine {
                                 // namespace-shape fallback) — surface the
                                 // plain message so the user still sees a
                                 // diagnostic, just without the quick-fix.
-                                (carina_core::schema::Shape::StringEnum { .. }, value) => {
+                                (carina_core::schema::Shape::Enum { .. }, value) => {
                                     let schema_view =
                                         schema.schema_view_for(attr_schema.attr_type.clone());
                                     schema_view.validate(value).err().map(|e| {
@@ -680,7 +680,7 @@ impl DiagnosticEngine {
                                         None
                                     } else {
                                         // Structural Custom: values reach the validator
-                                        // verbatim. CustomEnum has its own arm below — the
+                                        // verbatim. Enum has its own arm below — the
                                         // pre-#3222 `namespace.is_some()` gate is now a
                                         // type-level split.
                                         let lookup = carina_core::parser::provider_context_lookup(
@@ -692,62 +692,6 @@ impl DiagnosticEngine {
                                                 identity.and_then(|id| lookup(id, value).err())
                                             })
                                             .map(|inner_err| inner_err.to_string())
-                                    }
-                                }
-                                (
-                                    carina_core::schema::Shape::CustomEnum {
-                                        identity,
-                                        validate,
-                                        ..
-                                    },
-                                    value,
-                                ) => {
-                                    if matches!(
-                                        value,
-                                        carina_core::resource::Value::Deferred(
-                                            carina_core::resource::DeferredValue::Unknown(_)
-                                        )
-                                    ) {
-                                        None
-                                    } else {
-                                        // Enum-shaped Custom: expand the namespaced
-                                        // shorthand before validating. The pre-#3222
-                                        // gate (`Custom.namespace.is_some()`) is
-                                        // structurally captured by this arm — values for
-                                        // structural `Custom` never reach here, so the
-                                        // carina#3216 class of mis-expansion is impossible.
-                                        let resolved_value =
-                                            carina_core::utils::expand_enum_shorthand(
-                                                value, identity,
-                                            );
-                                        let lookup = carina_core::parser::provider_context_lookup(
-                                            &self.provider_context,
-                                        );
-                                        let kind = identity.kind.as_str();
-                                        validate(&resolved_value)
-                                            .err()
-                                            .or_else(|| lookup(identity, &resolved_value).err())
-                                            .map(|inner_err| {
-                                                // Mirror the CLI shape-mismatch
-                                                // diagnostic when the user wrote a
-                                                // quoted string literal on an enum-
-                                                // shaped Custom. See #2094.
-                                                let inner_msg = inner_err.to_string();
-                                                if matches!(value, Value::Concrete(ConcreteValue::String(s)) if !s.contains('.'))
-                                                    && resource_quoted_string_attrs.contains(attr_name)
-                                                {
-                                                    let typed = match value {
-                                                        Value::Concrete(ConcreteValue::String(s)) => s.as_str(),
-                                                        _ => "",
-                                                    };
-                                                    format!(
-                                                        "'{}' ({}) expects an enum identifier, got a string literal \"{}\". {}",
-                                                        attr_name, kind, typed, inner_msg
-                                                    )
-                                                } else {
-                                                    inner_msg
-                                                }
-                                            })
                                     }
                                 }
                                 // String type - check for bare resource binding
@@ -1415,7 +1359,7 @@ fn strip_line_comment(line: &str) -> &str {
     line
 }
 
-/// Build a `Diagnostic` for a failed `StringEnum` attribute validation,
+/// Build a `Diagnostic` for a failed `Enum` attribute validation,
 /// carrying the structured candidate list on `Diagnostic.data` and a
 /// range over the offending value text. Returns `None` when validation
 /// passed, when the value range can't be located (block-syntax,
@@ -1424,7 +1368,7 @@ fn strip_line_comment(line: &str) -> &str {
 ///
 /// See #2309. The structured payload is consumed by
 /// [`crate::code_action::code_actions_for_diagnostic`].
-fn build_string_enum_diagnostic(
+fn build_enum_diagnostic(
     attr_type: &carina_core::schema::AttributeType,
     attr_value: &Value,
     attr_name: &str,
@@ -1432,7 +1376,7 @@ fn build_string_enum_diagnostic(
     value_range: Option<tower_lsp::lsp_types::Range>,
 ) -> Option<Diagnostic> {
     use crate::code_action::{EnumDiagnosticData, EnumDiagnosticKind};
-    // `StringEnum` carries no `AttributeType::Ref` by construction, so an
+    // `Enum` carries no `AttributeType::Ref` by construction, so an
     // empty `defs` is sound here.
     let err = carina_core::schema::Schema::flat(attr_type.clone())
         .validate(attr_value)
@@ -1453,7 +1397,7 @@ fn build_string_enum_diagnostic(
             (EnumDiagnosticKind::StringLiteral, expected.clone())
         }
         // The error wasn't an enum-variant mismatch (e.g. TypeMismatch
-        // when a non-string Value was passed to StringEnum). Skip the
+        // when a non-string Value was passed to Enum). Skip the
         // structured payload — the generic match below will surface a
         // plain message instead.
         _ => return None,

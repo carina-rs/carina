@@ -591,6 +591,26 @@ fn snapshot_no_changes_enum() {
 }
 
 #[test]
+fn dynamic_enum_az_state_api_spelling_has_no_diff_in_cli_plan_path() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("dynamic_enum_az_no_diff");
+    assert!(
+        plan.effects().is_empty(),
+        "API-spelled saved state must compare equal to DSL-spelled desired state through the CLI plan path:\n{}",
+        strip_ansi(&format_plan(
+            &plan,
+            DetailLevel::Full,
+            &HashMap::new(),
+            Some(&schemas),
+            &HashMap::new(),
+            &[],
+            &[],
+            None,
+            None,
+        ))
+    );
+}
+
+#[test]
 fn snapshot_destroy_full() {
     use carina_core::resource::Value;
     let (plan, current_states, _schemas, _moved) =

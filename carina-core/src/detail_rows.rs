@@ -1508,16 +1508,16 @@ fn compute_string_list_change(
         Some(ov) => crate::value::as_string_list(ov)?,
         None => Vec::new(),
     };
-    // carina#3075: when the element type is a `StringEnum`, the set-diff
+    // carina#3075: when the element type is a `Enum`, the set-diff
     // must compare enum *values*, not raw spellings — otherwise a
     // DSL-alias element (`"allow"`) vs its API-canonical form
     // (`"Allow"`) is reported as a phantom `- allow / + Allow` pair
     // alongside any genuine add/remove. Canonicalize every element to
-    // the API spelling first, mirroring the differ's `StringEnum` arm
+    // the API spelling first, mirroring the differ's `Enum` arm
     // (`extract_enum_value_with_values` → `DslMap::api_for`).
-    if let Some((_, values, _, dsl_map)) = attr_type
+    if let Some((_, Some(values), _, _, dsl_map)) = attr_type
         .and_then(string_list_inner_type)
-        .and_then(|t| t.string_enum_parts())
+        .and_then(|t| t.enum_parts())
     {
         let valid: Vec<&str> = values.iter().map(String::as_str).collect();
         for s in old_list.iter_mut().chain(new_list.iter_mut()) {
@@ -1551,9 +1551,8 @@ fn string_list_inner_type(attr_type: &AttributeType) -> Option<&AttributeType> {
         | AttrTypeKind::Float
         | AttrTypeKind::Bool
         | AttrTypeKind::Duration
-        | AttrTypeKind::StringEnum { .. }
+        | AttrTypeKind::Enum { .. }
         | AttrTypeKind::Custom { .. }
-        | AttrTypeKind::CustomEnum { .. }
         | AttrTypeKind::Map { .. }
         | AttrTypeKind::Struct { .. } => None,
     }
@@ -2228,28 +2227,30 @@ mod tests {
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
     /// Build a registry whose `iam.Role.policy` attribute is the
-    /// IAM-policy-doc shape: a Struct with a StringEnum `version` and a
-    /// `List<Struct{ effect: StringEnum }>` `statement`. `dsl_aliases`
+    /// IAM-policy-doc shape: a Struct with a Enum `version` and a
+    /// `List<Struct{ effect: Enum }>` `statement`. `dsl_aliases`
     /// map the API spelling to the DSL alias, mirroring the real
     /// provider schema (`Allow`↔`allow`, `2012-10-17`↔`2012_10_17`).
     fn iam_policy_registry() -> SchemaRegistry {
-        let effect = AttributeType::string_enum(
-            "Effect".to_string(),
-            vec!["Allow".to_string(), "Deny".to_string()],
-            None,
+        let effect = AttributeType::enum_(
+            crate::schema::TypeIdentity::bare("Effect"),
+            Some(vec!["Allow".to_string(), "Deny".to_string()]),
             vec![
                 ("Allow".to_string(), "allow".to_string()),
                 ("Deny".to_string(), "deny".to_string()),
             ],
-        );
-        let version = AttributeType::string_enum(
-            "Version".to_string(),
-            vec!["2012-10-17".to_string(), "2008-10-17".to_string()],
             None,
+            None,
+        );
+        let version = AttributeType::enum_(
+            crate::schema::TypeIdentity::bare("Version"),
+            Some(vec!["2012-10-17".to_string(), "2008-10-17".to_string()]),
             vec![
                 ("2012-10-17".to_string(), "2012_10_17".to_string()),
                 ("2008-10-17".to_string(), "2008_10_17".to_string()),
             ],
+            None,
+            None,
         );
         let statement = AttributeType::unordered_list(AttributeType::struct_(
             "Statement".to_string(),
@@ -2295,7 +2296,7 @@ mod tests {
     /// carina#3073: state holds the DSL-alias spelling
     /// (`EnumIdentifier("allow")`/`("2012_10_17")`), desired resolves to
     /// the API-canonical `String("Allow")`/`String("2012-10-17")`. The
-    /// schema types both as `StringEnum` with `dsl_aliases`, so
+    /// schema types both as `Enum` with `dsl_aliases`, so
     /// `type_aware_equal` considers them equal — the renderer must emit
     /// **zero** rows, not a phantom `~ policy` / `~ effect: "allow" →
     /// "Allow"`.
@@ -2480,18 +2481,19 @@ mod tests {
 
     /// MapDiff shape (carina#3073 Risk): the IAM fixture exercises the
     /// *list-of-maps* path (sites 3/4). This pins the *Map* path (site
-    /// 5 / `compute_map_diff`): a `Map<String, StringEnum>` attribute
+    /// 5 / `compute_map_diff`): a `Map<String, Enum>` attribute
     /// whose only change is an enum-equal value must produce no row.
     #[test]
-    fn update_map_of_string_enum_enum_equal_value_no_phantom() {
-        let enum_t = AttributeType::string_enum(
-            "Mode".to_string(),
-            vec!["On".to_string(), "Off".to_string()],
-            None,
+    fn update_map_of_enum_enum_equal_value_no_phantom() {
+        let enum_t = AttributeType::enum_(
+            crate::schema::TypeIdentity::bare("Mode"),
+            Some(vec!["On".to_string(), "Off".to_string()]),
             vec![
                 ("On".to_string(), "on".to_string()),
                 ("Off".to_string(), "off".to_string()),
             ],
+            None,
+            None,
         );
         let map_t = AttributeType::map_with_key(AttributeType::string(), enum_t);
         let schema = ResourceSchema::new("x.Thing").attribute(AttributeSchema::new("modes", map_t));
@@ -2523,7 +2525,7 @@ mod tests {
         let rows = build_detail_rows(&effect, Some(&registry), DetailLevel::Explicit, None, None);
         assert!(
             rows.is_empty(),
-            "enum-equal Map<String,StringEnum> value must produce no row, got: {rows:?}"
+            "enum-equal Map<String,Enum> value must produce no row, got: {rows:?}"
         );
     }
 
@@ -2651,14 +2653,15 @@ mod tests {
     }
 
     fn modes_registry() -> SchemaRegistry {
-        let mode = AttributeType::string_enum(
-            "Mode".to_string(),
-            vec!["Allow".to_string(), "Deny".to_string()],
-            None,
+        let mode = AttributeType::enum_(
+            crate::schema::TypeIdentity::bare("Mode"),
+            Some(vec!["Allow".to_string(), "Deny".to_string()]),
             vec![
                 ("Allow".to_string(), "allow".to_string()),
                 ("Deny".to_string(), "deny".to_string()),
             ],
+            None,
+            None,
         );
         let schema = ResourceSchema::new("x.Thing").attribute(AttributeSchema::new(
             "modes",
@@ -2669,8 +2672,8 @@ mod tests {
         registry
     }
 
-    /// Real apply/plan-path element shape for a `List<StringEnum>`:
-    /// both state (lifted by `lift_saved_state_string_enums`) and
+    /// Real apply/plan-path element shape for a `List<Enum>`:
+    /// both state (lifted by `lift_saved_state_enums`) and
     /// desired (parser-emitted per carina#2986) carry
     /// `ConcreteValue::EnumIdentifier`, NOT `String`. Tests must use
     /// this shape — a `String`-element test passes while the real path
@@ -2684,7 +2687,7 @@ mod tests {
         ))
     }
 
-    /// carina#3075: a `List<StringEnum>` attribute whose state holds the
+    /// carina#3075: a `List<Enum>` attribute whose state holds the
     /// DSL-alias spelling (`["allow"]`) and whose desired resolves to
     /// API-canonical (`["Allow", "Deny"]`) — a genuine add of `Deny`
     /// co-occurring with an enum-spelling-only element. The
@@ -2693,7 +2696,7 @@ mod tests {
     /// `+ Deny`. Schema-aware: only the genuine add must render.
     /// Elements are `EnumIdentifier` (the real runtime shape).
     #[test]
-    fn update_string_list_of_string_enum_only_genuine_add_renders() {
+    fn update_string_list_of_enum_only_genuine_add_renders() {
         let registry = modes_registry();
         let from = State::existing(
             ResourceId::new("x.Thing", "t"),
@@ -3174,7 +3177,7 @@ mod tests {
     /// Pins that the canonicalization only engages when a schema is
     /// available. Same real `EnumIdentifier` element shape.
     #[test]
-    fn update_string_list_of_string_enum_no_registry_keeps_schema_blind() {
+    fn update_string_list_of_enum_no_registry_keeps_schema_blind() {
         let from = State::existing(
             ResourceId::new("x.Thing", "t"),
             [("modes".to_string(), enum_list(&["allow"]))]

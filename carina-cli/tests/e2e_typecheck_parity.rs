@@ -28,7 +28,6 @@ use carina_core::provider::{
 use carina_core::resource::{ConcreteValue, DataSource, ResourceId, State, Value};
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField, legacy_validator,
-    noop_validator,
 };
 use carina_lsp::diagnostics::DiagnosticEngine;
 use carina_lsp::document::Document;
@@ -247,18 +246,16 @@ impl Provider for NoopProvider {
 }
 
 // ============================================================================
-// Scenario 1: StringEnum bare / TypeQualified / fully-qualified all pass
+// Scenario 1: Enum bare / TypeQualified / fully-qualified all pass
 // ============================================================================
 
 fn enum_schemas() -> SchemaRegistry {
-    let mode = AttributeType::string_enum(
-        "Mode".to_string(),
-        vec!["fast".to_string(), "slow".to_string()],
-        Some(carina_core::schema::string_enum_identity(
-            "Mode",
-            Some("test.r"),
-        )),
+    let mode = AttributeType::enum_(
+        carina_core::schema::enum_identity("Mode", Some("test.r")),
+        Some(vec!["fast".to_string(), "slow".to_string()]),
         vec![],
+        None,
+        None,
     );
     single_schema_map(
         ResourceSchema::new("r.mode_holder")
@@ -353,10 +350,11 @@ fn region_schemas() -> SchemaRegistry {
         s.replace('-', "_")
     }
 
-    let region_custom = AttributeType::custom_enum(
-        carina_core::schema::string_enum_identity("Region", Some("test")),
-        AttributeType::string(),
-        legacy_validator(validate_region),
+    let region_custom = AttributeType::enum_(
+        carina_core::schema::enum_identity("Region", Some("test")),
+        None,
+        vec![],
+        Some(legacy_validator(validate_region)),
         Some(to_dsl),
     );
 
@@ -782,7 +780,7 @@ test.r.renamed_block {
 // ============================================================================
 // Scenario: WASM-plugin Custom validator bridge (#2354)
 //
-// A schema produced via the WASM plugin path carries `validate: noop_validator()`
+// A schema produced via the WASM plugin path carries `validate: None`
 // on every `AttributeType::Custom`, with the real validator behind the
 // factory's `validate_custom_type`. The validation pipeline must reach
 // through `ProviderContext.custom_type_validator` so a bad `vpc_id`
@@ -850,7 +848,7 @@ fn wasm_style_vpc_schema() -> ResourceSchema {
         AttributeType::string(),
         None,
         None,
-        noop_validator(),
+        carina_core::schema::legacy_validator(|_| Ok(())),
         None,
     );
     ResourceSchema::new("ec2.security_group")
@@ -941,7 +939,7 @@ fn wasm_style_subnet_schema() -> ResourceSchema {
         AttributeType::string(),
         None,
         None,
-        noop_validator(),
+        carina_core::schema::legacy_validator(|_| Ok(())),
         None,
     );
     ResourceSchema::new("ec2.subnet").attribute(AttributeSchema::new(

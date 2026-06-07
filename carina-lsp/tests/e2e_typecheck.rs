@@ -35,18 +35,16 @@ fn messages_of(diags: &[tower_lsp::lsp_types::Diagnostic]) -> Vec<&String> {
 }
 
 // ---------------------------------------------------------------
-// Scenario 1: StringEnum with bare / TypeQualified / fully-qualified
+// Scenario 1: Enum with bare / TypeQualified / fully-qualified
 // ---------------------------------------------------------------
 
 fn enum_schemas() -> SchemaRegistry {
-    let mode = AttributeType::string_enum(
-        "Mode".to_string(),
-        vec!["fast".to_string(), "slow".to_string()],
-        Some(carina_core::schema::string_enum_identity(
-            "Mode",
-            Some("test.r"),
-        )),
+    let mode = AttributeType::enum_(
+        carina_core::schema::enum_identity("Mode", Some("test.r")),
+        Some(vec!["fast".to_string(), "slow".to_string()]),
         vec![],
+        None,
+        None,
     );
     single_schema_map(
         ResourceSchema::new("r.mode_holder")
@@ -113,7 +111,7 @@ test.r.mode_holder {
 fn region_schemas() -> SchemaRegistry {
     // Mirrors the production `aws_region()` shape (#2248): the `Custom`
     // validate path does **not** consult the schema-level `to_dsl`
-    // callback — only `StringEnum` validation does, for alias matching.
+    // callback — only `Enum` validation does, for alias matching.
     // So a `Custom` validator that wants to accept both DSL
     // (`test.Region.ap_northeast_1`) and raw AWS-string (`"ap-northeast-1"`)
     // forms must normalise inside the callback, exactly as
@@ -138,10 +136,11 @@ fn region_schemas() -> SchemaRegistry {
         s.replace('-', "_")
     }
 
-    let region_custom = AttributeType::custom_enum(
-        carina_core::schema::string_enum_identity("Region", Some("test")),
-        AttributeType::string(),
-        legacy_validator(validate_region),
+    let region_custom = AttributeType::enum_(
+        carina_core::schema::enum_identity("Region", Some("test")),
+        None,
+        vec![],
+        Some(legacy_validator(validate_region)),
         Some(to_dsl),
     );
 

@@ -22,17 +22,15 @@ use support::fixture::{analyze, engine_with_schemas, write_fixture};
 use tower_lsp::lsp_types::{Diagnostic, Url};
 
 fn versioning_schema() -> SchemaRegistry {
-    let versioning = AttributeType::string_enum(
-        "VersioningStatus".to_string(),
-        vec!["Enabled".to_string(), "Suspended".to_string()],
-        Some(carina_core::schema::string_enum_identity(
-            "VersioningStatus",
-            Some("aws.s3.Bucket"),
-        )),
+    let versioning = AttributeType::enum_(
+        carina_core::schema::enum_identity("VersioningStatus", Some("aws.s3.Bucket")),
+        Some(vec!["Enabled".to_string(), "Suspended".to_string()]),
         vec![
             ("Enabled".to_string(), "enabled".to_string()),
             ("Suspended".to_string(), "suspended".to_string()),
         ],
+        None,
+        None,
     );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -61,7 +59,7 @@ fn dummy_uri() -> Url {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario 1: bare-identifier mismatch on a namespaced StringEnum
+// Scenario 1: bare-identifier mismatch on a namespaced Enum
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -105,7 +103,7 @@ fn bare_identifier_invalid_emits_payload_and_quick_fix() {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario 2: quoted string literal on a StringEnum (StringLiteral kind)
+// Scenario 2: quoted string literal on a Enum (StringLiteral kind)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -167,15 +165,16 @@ fn string_literal_emits_string_literal_kind_and_replaces_quotes() {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario 3: non-namespaced StringEnum
+// Scenario 3: non-namespaced Enum
 // ---------------------------------------------------------------------------
 
 fn bare_mode_schema() -> SchemaRegistry {
-    let mode = AttributeType::string_enum(
-        "Mode".to_string(),
-        vec!["fast".to_string(), "slow".to_string()],
-        None,
+    let mode = AttributeType::enum_(
+        carina_core::schema::TypeIdentity::bare("Mode"),
+        Some(vec!["fast".to_string(), "slow".to_string()]),
         vec![],
+        None,
+        None,
     );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(

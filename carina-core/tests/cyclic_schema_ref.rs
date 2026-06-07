@@ -358,7 +358,7 @@ fn cyclic_ref_terminates_on_finite_value() {
 }
 
 /// Regression for carina#3347: `Schema::validate_attr`'s `Map` arm
-/// must lift a `Map<StringEnum, ...>` key into `EnumIdentifier` shape
+/// must lift a `Map<Enum, ...>` key into `EnumIdentifier` shape
 /// before validating it, mirroring `validate_map`'s pre-existing
 /// `key_is_enum` special case (carina#2996). Without this lift, a
 /// Map key written as a bare identifier in source surfaces as
@@ -370,15 +370,16 @@ fn cyclic_ref_terminates_on_finite_value() {
 /// as a `validate_iam_policy_document` regression in awscc#282 when
 /// pulling the new rev.
 #[test]
-fn schema_validate_attr_map_arm_lifts_string_enum_key() {
+fn schema_validate_attr_map_arm_lifts_enum_key() {
     use carina_core::resource::ConcreteValue;
     use carina_core::schema::{AttributeType, Schema};
 
-    let key_type = AttributeType::string_enum(
-        "Op".to_string(),
-        vec!["eq".to_string(), "neq".to_string()],
-        None,
+    let key_type = AttributeType::enum_(
+        carina_core::schema::TypeIdentity::bare("Op"),
+        Some(vec!["eq".to_string(), "neq".to_string()]),
         vec![],
+        None,
+        None,
     );
     let attr_type = AttributeType::map_with_key(key_type, AttributeType::string());
 
@@ -392,7 +393,7 @@ fn schema_validate_attr_map_arm_lifts_string_enum_key() {
     let schema = Schema::flat(attr_type);
     schema
         .validate(&value)
-        .expect("a bare-identifier Map key for a StringEnum key type must validate");
+        .expect("a bare-identifier Map key for a Enum key type must validate");
 
     // Negative case: an unknown enum variant must still fail
     // (guard against a "lift everything to EnumIdentifier and accept"
@@ -405,7 +406,7 @@ fn schema_validate_attr_map_arm_lifts_string_enum_key() {
     let bad_value = Value::Concrete(ConcreteValue::Map(bad_payload));
     schema
         .validate(&bad_value)
-        .expect_err("an unknown StringEnum Map key must fail validation");
+        .expect_err("an unknown Enum Map key must fail validation");
 }
 
 fn build_resource(id: &ResourceId, attrs: &[(&str, Value)]) -> Resource {

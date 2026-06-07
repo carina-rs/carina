@@ -148,11 +148,12 @@ pub(super) fn test_provider_single_attr() -> CompletionProvider {
 /// `region_completions_data`, so tests can detect region pollution in
 /// type-incompatible completion paths (see #1974).
 pub(super) fn test_provider_with_enum_and_regions() -> CompletionProvider {
-    let status_enum = AttributeType::string_enum(
-        "VersioningStatus".to_string(),
-        vec!["Enabled".to_string(), "Suspended".to_string()],
-        None,
+    let status_enum = AttributeType::enum_(
+        carina_core::schema::TypeIdentity::bare("VersioningStatus"),
+        Some(vec!["Enabled".to_string(), "Suspended".to_string()]),
         vec![],
+        None,
+        None,
     );
     let schema = ResourceSchema::new("s3.Bucket")
         .attribute(AttributeSchema::new("versioning_status", status_enum));
@@ -178,17 +179,18 @@ pub(super) fn test_provider_with_enum_and_regions() -> CompletionProvider {
     )
 }
 
-/// Provider with StringEnum that has name but no namespace (simulates WASM provider).
+/// Provider with Enum that has name but no namespace (simulates WASM provider).
 pub(super) fn test_provider_with_nameless_enum() -> CompletionProvider {
-    // Top-level attribute with StringEnum (no namespace)
-    let status_enum = AttributeType::string_enum(
-        "VersioningStatus".to_string(),
-        vec!["Enabled".to_string(), "Suspended".to_string()],
-        None,
+    // Top-level attribute with Enum (no namespace)
+    let status_enum = AttributeType::enum_(
+        carina_core::schema::TypeIdentity::bare("VersioningStatus"),
+        Some(vec!["Enabled".to_string(), "Suspended".to_string()]),
         vec![],
+        None,
+        None,
     );
 
-    // Nested struct field with StringEnum (no namespace)
+    // Nested struct field with Enum (no namespace)
     let versioning_struct = AttributeType::struct_(
         "VersioningConfiguration".to_string(),
         vec![StructField::new("status", status_enum.clone())],
@@ -237,7 +239,7 @@ pub(super) fn test_provider_with_vpc_and_security_group() -> CompletionProvider 
     CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![])
 }
 
-/// Provider exposing both a namespaced `StringEnum` (`principal_type`) and a
+/// Provider exposing both a namespaced `Enum` (`principal_type`) and a
 /// `Custom` semantic subtype (`target_id` → `aws_account_id`) on the same
 /// resource. Used to reproduce the two value-position completion leaks
 /// reported in the parent issue.
@@ -253,14 +255,12 @@ pub(super) fn test_provider_with_custom_semantic_attr() -> CompletionProvider {
         legacy_validator(noop_validate),
         None,
     );
-    let principal_type = AttributeType::string_enum(
-        "PrincipalType".to_string(),
-        vec!["GROUP".to_string(), "USER".to_string()],
-        Some(carina_core::schema::string_enum_identity(
-            "PrincipalType",
-            Some("awscc.sso.Assignment"),
-        )),
+    let principal_type = AttributeType::enum_(
+        carina_core::schema::enum_identity("PrincipalType", Some("awscc.sso.Assignment")),
+        Some(vec!["GROUP".to_string(), "USER".to_string()]),
         vec![],
+        None,
+        None,
     );
     let schema = ResourceSchema::new("sso.Assignment")
         .attribute(AttributeSchema::new("principal_type", principal_type))

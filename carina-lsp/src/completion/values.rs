@@ -590,24 +590,39 @@ impl CompletionProvider {
                     },
                 ]
             }
-            Shape::StringEnum {
-                name,
-                values,
+            Shape::Enum {
                 identity,
+                values,
                 dsl_aliases,
+                ..
             } => {
                 // Derive the dotted prefix from the structured
                 // identity. Fall back to the surrounding resource
                 // type when the enum has no provider scope of its
                 // own — this matches the pre-#3222 `namespace`
                 // fallback rule for bare enums.
-                let id_prefix = identity.and_then(|id| id.dotted_prefix());
+                let name = identity.kind.as_str();
+                let id_prefix = identity.dotted_prefix();
                 let effective_ns = id_prefix.as_deref().or(if !name.is_empty() {
                     resource_type
                 } else {
                     None
                 });
-                self.string_enum_completions(name, values, effective_ns, dsl_aliases)
+                match values {
+                    Some(values) => self.enum_completions(name, values, effective_ns, dsl_aliases),
+                    None => effective_ns
+                        .map(|ns| {
+                            let prefix = format!("{ns}.{name}.");
+                            vec![CompletionItem {
+                                label: prefix.clone(),
+                                kind: Some(CompletionItemKind::ENUM_MEMBER),
+                                detail: Some("Enum value prefix".to_string()),
+                                insert_text: Some(prefix),
+                                ..Default::default()
+                            }]
+                        })
+                        .unwrap_or_default(),
+                }
             }
             Shape::Int => {
                 vec![] // No specific completions for integers
@@ -1311,7 +1326,7 @@ impl CompletionProvider {
     /// 1. **Structural / type-driven candidates** —
     ///    [`Self::completions_for_type`] knows that `Bool` →
     ///    `true`/`false`, `Cidr` → CIDR snippets, `Arn` → an ARN
-    ///    template, `StringEnum` → the enum members, etc. Lifts unions
+    ///    template, `Enum` → the enum members, etc. Lifts unions
     ///    and unwraps lists/maps recursively.
     /// 2. **Built-in function calls** whose return type is assignable
     ///    to the target — `concat`, `join`, `format!`, … filtered by
@@ -1785,7 +1800,7 @@ impl CompletionProvider {
         completions
     }
 
-    pub(super) fn string_enum_completions(
+    pub(super) fn enum_completions(
         &self,
         type_name: &str,
         values: &[String],
@@ -1983,7 +1998,7 @@ fn infer_for_binding_type(
 /// Matching rules:
 /// * `BuiltinReturnType::Any` fits any base-typed attribute (String, Int,
 ///   List, Map) — the built-in's concrete shape depends on its arguments.
-///   It does not fit `Custom` or `StringEnum`: no argument-derived result
+///   It does not fit `Custom` or `Enum`: no argument-derived result
 ///   can prove the semantic invariant those types require.
 /// * A built-in returning plain `String` fits only a schema-declared
 ///   `String` or a `Union` containing one. It does **not** fit a `Custom`
@@ -2022,17 +2037,15 @@ fn return_type_fits(
         Shape::Bool => false,
         Shape::List { .. } => matches!(ret, R::List | R::Any),
         Shape::Map { .. } => matches!(ret, R::Map | R::Any),
-        // StringEnum expects a specific identifier form; no built-in
+        // Enum expects a specific identifier form; no built-in
         // currently produces such values, and `Any` alone doesn't give us
         // enough confidence to suggest one.
-        Shape::StringEnum { .. } => false,
+        Shape::Enum { .. } => false,
         // Custom types carry a semantic meaning (Cidr, AwsAccountId, Arn,
         // …) that built-ins don't declare. Not even `Any` fits — we need
         // a semantic return annotation before a built-in can be suggested
-        // here. CustomEnum (carina#3222) is even more specific — the
-        // value must be a namespaced enum identifier, which no built-in
-        // can synthesise.
-        Shape::Custom { .. } | Shape::CustomEnum { .. } => false,
+        // here.
+        Shape::Custom { .. } => false,
         // Float, Duration, and Struct attributes — no matching built-in today.
         Shape::Float => false,
         Shape::Duration => false,

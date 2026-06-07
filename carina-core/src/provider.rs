@@ -1196,8 +1196,7 @@ fn collect_validators_from_type(
         | AttrTypeKind::Float
         | AttrTypeKind::Bool
         | AttrTypeKind::Duration
-        | AttrTypeKind::StringEnum { .. }
-        | AttrTypeKind::CustomEnum { .. } => {}
+        | AttrTypeKind::Enum { .. } => {}
     }
 }
 
@@ -1242,8 +1241,7 @@ fn collect_type_names_from_type(
         | AttrTypeKind::Float
         | AttrTypeKind::Bool
         | AttrTypeKind::Duration
-        | AttrTypeKind::StringEnum { .. }
-        | AttrTypeKind::CustomEnum { .. } => {}
+        | AttrTypeKind::Enum { .. } => {}
     }
 }
 

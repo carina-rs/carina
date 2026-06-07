@@ -983,7 +983,7 @@ fn literal_completions_from_type_expr(type_expr: &parser::TypeExpr) -> Vec<Compl
 /// reused without forking a parallel implementation.
 ///
 /// `Simple(name)` (snake_case) is reified as
-/// `AttributeType::custom(None, String, None, None, noop_validator(), None)` — same shape `parse_exports_type_text` produces for `exports`
+/// `AttributeType::custom(None, String, None, None, None, None)` — same shape `parse_exports_type_text` produces for `exports`
 /// annotations. The other arms cover the structural cases the
 /// dispatcher recurses through. Returns `None` for shapes that have no
 /// useful default (e.g. resource refs, `<unknown>`).

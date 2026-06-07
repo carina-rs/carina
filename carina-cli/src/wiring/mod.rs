@@ -1496,7 +1496,7 @@ pub fn expand_same_config_deferred_for<E: Clone>(
 }
 
 /// Result of the deferred-for-expansion + materialised-child-read +
-/// StringEnum-lift trio that every refresh path runs on its
+/// Enum-lift trio that every refresh path runs on its
 /// `current_states`.
 ///
 /// Closes the bug class behind carina#3266 / #3271 / #3272 at the type
@@ -1512,7 +1512,7 @@ pub fn expand_same_config_deferred_for<E: Clone>(
 /// 2. `refresh_resource_set` — read each materialised child through
 ///    the provider (filtered through `refreshable_child_ids` so a
 ///    `moved`-target or orphan-pre-read child is not re-read).
-/// 3. `lift_current_state_string_enums` on the **post-expansion**
+/// 3. `lift_current_state_enum_leaves` on the **post-expansion**
 ///    `sorted_resources`, so enum-typed attrs on the new children are
 ///    not surfaced as phantom case diffs (carina#3272).
 ///
@@ -1608,11 +1608,11 @@ pub async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNorm
             .await;
     }
 
-    // Phase 3: lift StringEnums on the post-expansion slice. Both
+    // Phase 3: lift Enums on the post-expansion slice. Both
     // pre-existing managed resources and the new for-loop children
     // need this so enum-typed attrs aren't surfaced as phantom case
     // diffs (carina#3272).
-    carina_core::utils::lift_current_state_string_enums(
+    carina_core::utils::lift_current_state_enum_leaves(
         inputs.current_states,
         &sorted_resources,
         inputs.schemas,
@@ -1679,16 +1679,16 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         .map(|sf| sf.build_saved_attrs())
         .unwrap_or_default();
     // awscc#251: state files written before a provider promoted an
-    // attribute from `Custom` to `StringEnum` (e.g. awscc#250 for IAM
+    // attribute from `Custom` to `Enum` (e.g. awscc#250 for IAM
     // policy `version`/`effect`) store enum values as plain JSON
     // strings. `build_saved_attrs` bridges those through the
     // schema-blind `json_to_dsl_value` into `ConcreteValue::String`,
     // which the strict carina#2986 Phase 4 validator then rejects at
-    // the now-`StringEnum` position. Lift recognized members to
+    // the now-`Enum` position. Lift recognized members to
     // `ConcreteValue::EnumIdentifier` against each resource's current
     // schema before any diff/validation consumes the loaded state.
     // carina-state stays schema-free; the registry only exists here.
-    carina_core::utils::lift_saved_state_string_enums(
+    carina_core::utils::lift_saved_state_enum_leaves(
         &mut saved_attrs,
         &sorted_resources,
         ctx.schemas(),
@@ -2033,17 +2033,17 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     // On a refresh the live value comes from `provider.read()` into
     // `current_states`, a different map. A provider returning an IAM
     // policy doc with plain `String` `version`/`effect` (the wire shape
-    // for a field that was `Custom` at create time, now `StringEnum`
+    // for a field that was `Custom` at create time, now `Enum`
     // after awscc#250) flows un-lifted into the differ and the strict
     // carina#2986 validator rejects it. Lift `current_states` here —
     // both refresh branches have populated it by now, before the
     // resolver / differ consume it.
-    carina_core::utils::lift_current_state_string_enums(
+    carina_core::utils::lift_current_state_enum_leaves(
         &mut current_states,
         &sorted_resources,
         ctx.schemas(),
     );
-    carina_core::utils::lift_current_state_string_enums_for_data_sources(
+    carina_core::utils::lift_current_state_enum_leaves_for_data_sources(
         &mut current_states,
         &data_sources,
         ctx.schemas(),

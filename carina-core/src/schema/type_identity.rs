@@ -208,7 +208,7 @@ impl TypeIdentity {
     /// `Ipv4Cidr` ⇒ `None`.
     ///
     /// Replaces the load-bearing string lookups against the
-    /// pre-carina#3222 `Custom.namespace` / `StringEnum.namespace`
+    /// pre-carina#3222 `Custom.namespace` / `Enum.namespace`
     /// fields. Where the legacy field was `Some(prefix)`, the prefix
     /// is the value this returns; where it was `None`, this returns
     /// `None`.

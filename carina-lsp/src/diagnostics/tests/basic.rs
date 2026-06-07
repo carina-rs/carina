@@ -793,10 +793,10 @@ fn value_range_uses_character_offsets_for_multibyte_literal() {
 }
 
 #[test]
-fn string_enum_with_non_string_value_still_emits_diagnostic() {
-    // Regression: when #2309 routed StringEnum through
-    // `build_string_enum_diagnostic`, the fall-back match arm for
-    // StringEnum was removed. That hid `TypeError::TypeMismatch`
+fn enum_with_non_string_value_still_emits_diagnostic() {
+    // Regression: when #2309 routed Enum through
+    // `build_enum_diagnostic`, the fall-back match arm for
+    // Enum was removed. That hid `TypeError::TypeMismatch`
     // diagnostics when the user typed a non-string value (e.g. an
     // integer) against an enum-typed attribute. The fall-through
     // generic-message arm restored it; this test pins the behavior.
@@ -808,7 +808,7 @@ fn string_enum_with_non_string_value_still_emits_diagnostic() {
             .iter()
             .any(|d| d.message.to_ascii_lowercase().contains("type mismatch")
                 || d.message.to_ascii_lowercase().contains("expected")),
-        "non-string value against StringEnum must still produce a diagnostic, got: {:?}",
+        "non-string value against Enum must still produce a diagnostic, got: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }

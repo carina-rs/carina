@@ -113,7 +113,7 @@ outer {
 
 #[test]
 #[ignore = "requires provider schemas"]
-fn string_enum_invalid_value_top_level() {
+fn enum_invalid_value_top_level() {
     let engine = test_engine();
     let doc = create_document(
         r#"provider awscc {
@@ -133,13 +133,13 @@ instance_tenancy = awscc.ec2.Vpc.InstanceTenancy.invalid_value
         .find(|d| d.message.contains("invalid_value"));
     assert!(
         enum_diag.is_some(),
-        "Should warn about invalid StringEnum value. Got diagnostics: {:?}",
+        "Should warn about invalid Enum value. Got diagnostics: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
 
 #[test]
-fn string_enum_valid_value_top_level() {
+fn enum_valid_value_top_level() {
     let engine = test_engine();
     let doc = create_document(
         r#"provider awscc {
@@ -159,14 +159,14 @@ instance_tenancy = awscc.ec2.Vpc.InstanceTenancy.default
         .find(|d| d.message.contains("instance_tenancy") && d.message.contains("invalid"));
     assert!(
         enum_diag.is_none(),
-        "Should NOT warn about valid StringEnum value. Got diagnostics: {:?}",
+        "Should NOT warn about valid Enum value. Got diagnostics: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
 
 #[test]
 #[ignore = "requires provider schemas"]
-fn string_enum_invalid_value_in_struct_field() {
+fn enum_invalid_value_in_struct_field() {
     let engine = test_engine();
     let doc = create_document(
         r#"provider awscc {
@@ -191,13 +191,13 @@ security_group_ingress {
         .find(|d| d.message.contains("invalid_proto"));
     assert!(
         enum_diag.is_some(),
-        "Should warn about invalid StringEnum value in struct field. Got diagnostics: {:?}",
+        "Should warn about invalid Enum value in struct field. Got diagnostics: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
 
 #[test]
-fn string_enum_valid_value_in_struct_field() {
+fn enum_valid_value_in_struct_field() {
     let engine = test_engine();
     let doc = create_document(
         r#"provider awscc {
@@ -222,7 +222,7 @@ security_group_ingress {
         .find(|d| d.message.contains("ip_protocol") && d.message.contains("invalid"));
     assert!(
         enum_diag.is_none(),
-        "Should NOT warn about valid StringEnum value in struct field. Got diagnostics: {:?}",
+        "Should NOT warn about valid Enum value in struct field. Got diagnostics: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
@@ -261,14 +261,15 @@ security_group_ingress {
 
 #[test]
 fn list_item_type_validation() {
-    // Use a test engine with a List(StringEnum) schema to test list item validation
+    // Use a test engine with a List(Enum) schema to test list item validation
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let list_enum = AttributeType::list(AttributeType::string_enum(
-        "Protocol".to_string(),
-        vec!["tcp".to_string(), "udp".to_string()],
-        None,
+    let list_enum = AttributeType::list(AttributeType::enum_(
+        carina_core::schema::TypeIdentity::bare("Protocol"),
+        Some(vec!["tcp".to_string(), "udp".to_string()]),
         vec![],
+        None,
+        None,
     ));
 
     let schema = ResourceSchema::new("list.resource")
@@ -301,7 +302,7 @@ protocols = [tcp, invalid_protocol]
         .find(|d| d.message.contains("invalid_protocol"));
     assert!(
         item_diag.is_some(),
-        "Should warn about invalid item in List(StringEnum). Got diagnostics: {:?}",
+        "Should warn about invalid item in List(Enum). Got diagnostics: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
@@ -350,11 +351,12 @@ fn union_static_value_validated() {
         .attribute(AttributeSchema::new(
             "mode",
             AttributeType::union(vec![
-                AttributeType::string_enum(
-                    "Mode".to_string(),
-                    vec!["active".to_string(), "passive".to_string()],
-                    None,
+                AttributeType::enum_(
+                    carina_core::schema::TypeIdentity::bare("Mode"),
+                    Some(vec!["active".to_string(), "passive".to_string()]),
                     vec![],
+                    None,
+                    None,
                 ),
                 AttributeType::int(),
             ]),
@@ -379,7 +381,7 @@ mode = "invalid_mode"
 
     // After #2219 the Union error surfaces the closest member's
     // structured error rather than a generic `Type mismatch`. For a
-    // string input that fails `StringEnum | Int`, the StringEnum
+    // string input that fails `Enum | Int`, the Enum
     // member's "Invalid value 'invalid_mode' ... expected one of
     // active, passive" is the right message.
     let invalid_value_error = diagnostics.iter().find(|d| {
@@ -389,7 +391,7 @@ mode = "invalid_mode"
     });
     assert!(
         invalid_value_error.is_some(),
-        "Should warn about invalid Union value with the StringEnum member's variant list. Got diagnostics: {:?}",
+        "Should warn about invalid Union value with the Enum member's variant list. Got diagnostics: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
@@ -403,11 +405,12 @@ fn union_valid_static_value_no_warning() {
         .attribute(AttributeSchema::new(
             "mode",
             AttributeType::union(vec![
-                AttributeType::string_enum(
-                    "Mode".to_string(),
-                    vec!["active".to_string(), "passive".to_string()],
-                    None,
+                AttributeType::enum_(
+                    carina_core::schema::TypeIdentity::bare("Mode"),
+                    Some(vec!["active".to_string(), "passive".to_string()]),
                     vec![],
+                    None,
+                    None,
                 ),
                 AttributeType::int(),
             ]),
@@ -449,11 +452,12 @@ fn union_valid_int_value_no_warning() {
         .attribute(AttributeSchema::new(
             "mode",
             AttributeType::union(vec![
-                AttributeType::string_enum(
-                    "Mode".to_string(),
-                    vec!["active".to_string(), "passive".to_string()],
-                    None,
+                AttributeType::enum_(
+                    carina_core::schema::TypeIdentity::bare("Mode"),
+                    Some(vec!["active".to_string(), "passive".to_string()]),
                     vec![],
+                    None,
+                    None,
                 ),
                 AttributeType::int(),
             ]),
@@ -1286,7 +1290,7 @@ attributes {
 #[test]
 fn resource_ref_type_check_helper_regression() {
     // Regression test for refactoring: all three ResourceRef type-checking paths
-    // (Union, StringEnum, Custom) must produce consistent "Type mismatch" diagnostics.
+    // (Union, Enum, Custom) must produce consistent "Type mismatch" diagnostics.
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
 
     fn dummy_validate(v: &carina_core::resource::Value) -> Result<(), String> {
@@ -1303,15 +1307,16 @@ fn resource_ref_type_check_helper_regression() {
         .attribute(AttributeSchema::new("name", AttributeType::string()))
         .attribute(AttributeSchema::new(
             "my_id",
-            AttributeType::custom_enum(
-                carina_core::schema::string_enum_identity("MyId", Some("test")),
-                AttributeType::string(),
-                legacy_validator(dummy_validate),
+            AttributeType::enum_(
+                carina_core::schema::enum_identity("MyId", Some("test")),
+                None,
+                vec![],
+                Some(legacy_validator(dummy_validate)),
                 None,
             ),
         ));
 
-    // Target resource: has Union, StringEnum, and Custom attributes
+    // Target resource: has Union, Enum, and Custom attributes
     let target_schema = ResourceSchema::new("target")
         .attribute(AttributeSchema::new(
             "union_attr",
@@ -1319,19 +1324,21 @@ fn resource_ref_type_check_helper_regression() {
         ))
         .attribute(AttributeSchema::new(
             "enum_attr",
-            AttributeType::string_enum(
-                "Status".to_string(),
-                vec!["active".to_string(), "inactive".to_string()],
-                None,
+            AttributeType::enum_(
+                carina_core::schema::TypeIdentity::bare("Status"),
+                Some(vec!["active".to_string(), "inactive".to_string()]),
                 vec![],
+                None,
+                None,
             ),
         ))
         .attribute(AttributeSchema::new(
             "custom_attr",
-            AttributeType::custom_enum(
-                carina_core::schema::string_enum_identity("MyId", Some("test")),
-                AttributeType::string(),
-                legacy_validator(dummy_validate),
+            AttributeType::enum_(
+                carina_core::schema::enum_identity("MyId", Some("test")),
+                None,
+                vec![],
+                Some(legacy_validator(dummy_validate)),
                 None,
             ),
         ));
@@ -1361,7 +1368,7 @@ union_attr = src.my_id
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 
-    // Case 2: StringEnum attr with incompatible ResourceRef (MyId != Status) -> mismatch
+    // Case 2: Enum attr with incompatible ResourceRef (MyId != Status) -> mismatch
     let doc = create_document(
         r#"let src = test.source {
 name = "hello"
@@ -1377,7 +1384,7 @@ enum_attr = src.my_id
         .find(|d| d.message.contains("Type mismatch") && d.message.contains("MyId"));
     assert!(
         enum_mismatch.is_some(),
-        "StringEnum attr should warn about type mismatch for incompatible ResourceRef. Got: {:?}",
+        "Enum attr should warn about type mismatch for incompatible ResourceRef. Got: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 
@@ -1673,13 +1680,14 @@ fn undefined_resource_still_fires_when_identifier_is_not_a_declared_provider() {
 fn map_key_validation_warns_on_invalid_key() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
-    // Build schema: statement.condition has StringEnum keys
+    // Build schema: statement.condition has Enum keys
     let condition_type = AttributeType::map_with_key(
-        AttributeType::string_enum(
-            "ConditionOperator".to_string(),
-            vec!["string_equals".to_string(), "string_like".to_string()],
-            None,
+        AttributeType::enum_(
+            carina_core::schema::TypeIdentity::bare("ConditionOperator"),
+            Some(vec!["string_equals".to_string(), "string_like".to_string()]),
             vec![],
+            None,
+            None,
         ),
         AttributeType::map(AttributeType::string()),
     );
@@ -2983,7 +2991,7 @@ fn lsp_enum_diagnostic_includes_attribute_name() {
 
 /// Regression for #2094: the LSP must mirror the CLI's
 /// `StringLiteralExpectedEnum` diagnostic when the user writes
-/// `mode = "aaa"` against a namespaced `StringEnum` attribute.
+/// `mode = "aaa"` against a namespaced `Enum` attribute.
 /// See PR 2 (#2112) for the CLI side.
 #[test]
 fn lsp_quoted_literal_on_namespaced_enum_says_got_a_string_literal() {
@@ -3051,7 +3059,7 @@ fn lsp_bare_invalid_on_namespaced_enum_keeps_invalid_variant_wording() {
 
 /// Regression for #2094 Custom-type case: a namespaced `AttributeType::Custom`
 /// written as `mode = "aaa"` must emit a shape-mismatch diagnostic just
-/// like `StringEnum`.
+/// like `Enum`.
 #[test]
 fn lsp_quoted_literal_on_namespaced_custom_says_got_a_string_literal() {
     let provider = test_engine_with_custom_namespaced_attr();

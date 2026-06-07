@@ -636,7 +636,7 @@ pub fn is_string_compatible_type(
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> bool {
     match attr_type.shape_with_defs(defs) {
-        Shape::String | Shape::Custom { .. } | Shape::StringEnum { .. } => true,
+        Shape::String | Shape::Custom { .. } | Shape::Enum { .. } => true,
         Shape::Union => crate::schema::union_members_with_defs(attr_type, defs)
             .expect("Shape::Union must expose union members internally")
             .iter()
@@ -645,7 +645,6 @@ pub fn is_string_compatible_type(
         | Shape::Float
         | Shape::Bool
         | Shape::Duration
-        | Shape::CustomEnum { .. }
         | Shape::List { .. }
         | Shape::Map { .. }
         | Shape::Struct { .. } => false,
@@ -654,7 +653,7 @@ pub fn is_string_compatible_type(
 
 /// Returns `true` only for receivers that name no specific identity:
 /// plain `String` or a `Union` of plain Strings. The wider sibling
-/// [`is_string_compatible_type`] also accepts `Custom` and `StringEnum`
+/// [`is_string_compatible_type`] also accepts `Custom` and `Enum`
 /// receivers, but those carry constraints (specific identity / fixed
 /// value set) that would be erased by accepting a `Simple(name)` value.
 fn is_plain_string_or_string_union(
@@ -672,8 +671,7 @@ fn is_plain_string_or_string_union(
         | Shape::Bool
         | Shape::Duration
         | Shape::Custom { .. }
-        | Shape::CustomEnum { .. }
-        | Shape::StringEnum { .. }
+        | Shape::Enum { .. }
         | Shape::List { .. }
         | Shape::Map { .. }
         | Shape::Struct { .. } => false,
@@ -718,8 +716,7 @@ fn attr_type_demands_specific_custom(
         | Shape::Float
         | Shape::Bool
         | Shape::Duration
-        | Shape::CustomEnum { .. }
-        | Shape::StringEnum { .. }
+        | Shape::Enum { .. }
         | Shape::List { .. }
         | Shape::Map { .. }
         | Shape::Struct { .. } => false,

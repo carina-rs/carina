@@ -334,7 +334,7 @@ fn infer_type_from_value_with_visiting(
         Value::Concrete(ConcreteValue::String(_)) => Ok(TypeExpr::String),
         // Enum identifiers infer as `String` for the type-expression
         // layer — the value-layer distinction matters only inside the
-        // `StringEnum` validator. See carina#2986.
+        // `Enum` validator. See carina#2986.
         Value::Concrete(ConcreteValue::EnumIdentifier(_)) => Ok(TypeExpr::String),
         Value::Concrete(ConcreteValue::Int(_)) => Ok(TypeExpr::Int),
         Value::Concrete(ConcreteValue::Float(_)) => Ok(TypeExpr::Float),
@@ -610,9 +610,11 @@ fn descend_struct_field<'a>(
 /// - `Custom { identity: None, .. }` → falls through to the base
 ///   type; an anonymous Custom is structurally a wrapper and carries
 ///   no identity to project.
-/// - `StringEnum` → `TypeExpr::String` (an enum value is still a
-///   string when matched against an annotation; specific enum
-///   identities are not currently expressible at the `TypeExpr` level).
+/// - closed `Enum` (`values: Some`) → `TypeExpr::String`
+/// - dynamic `Enum` (`values: None` with provider transform or host
+///   validator) → `TypeExpr::SchemaType`, preserving the typed
+///   identity old CustomEnum-origin schemas carried before enum
+///   unification.
 fn attribute_type_to_type_expr(attr_type: &AttributeType) -> TypeExpr {
     match attr_type.kind() {
         AttrTypeKind::String => TypeExpr::String,
@@ -631,19 +633,23 @@ fn attribute_type_to_type_expr(attr_type: &AttributeType) -> TypeExpr {
             None => TypeExpr::Simple(crate::parser::pascal_to_snake(&id.kind)),
         },
         AttrTypeKind::Custom { base, .. } => attribute_type_to_type_expr(base),
-        // CustomEnum's identity is mandatory and always provider-
-        // scoped (an enum-shorthand needs the dotted prefix), so the
-        // bare-identity / fall-through-to-base arms above do not
-        // apply.
-        AttrTypeKind::CustomEnum { identity, .. } => match &identity.provider {
-            Some(provider) => TypeExpr::SchemaType {
-                provider: provider.clone(),
-                path: identity.segments.join("."),
-                type_name: identity.kind.clone(),
-            },
-            None => TypeExpr::Simple(crate::parser::pascal_to_snake(&identity.kind)),
-        },
-        AttrTypeKind::StringEnum { .. } => TypeExpr::String,
+        AttrTypeKind::Enum {
+            identity,
+            values,
+            validate,
+            to_dsl,
+            ..
+        } if values.is_none() && (validate.is_some() || to_dsl.is_some()) => {
+            match &identity.provider {
+                Some(provider) => TypeExpr::SchemaType {
+                    provider: provider.clone(),
+                    path: identity.segments.join("."),
+                    type_name: identity.kind.clone(),
+                },
+                None => TypeExpr::Simple(crate::parser::pascal_to_snake(&identity.kind)),
+            }
+        }
+        AttrTypeKind::Enum { .. } => TypeExpr::String,
         AttrTypeKind::List { inner, .. } => {
             TypeExpr::List(Box::new(attribute_type_to_type_expr(inner)))
         }
@@ -1027,6 +1033,42 @@ mod tests {
             &schemas_with_vpc(),
         );
         assert_eq!(r, Ok(TypeExpr::String));
+    }
+
+    #[test]
+    fn dynamic_enum_attr_type_projects_to_schema_type() {
+        let region = AttributeType::enum_(
+            TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),
+            None,
+            vec![],
+            None,
+            Some(|s| s.replace('-', "_")),
+        );
+
+        assert_eq!(
+            attribute_type_to_type_expr(&region),
+            TypeExpr::SchemaType {
+                provider: "aws".to_string(),
+                path: String::new(),
+                type_name: "Region".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn closed_enum_attr_type_still_projects_to_string() {
+        let effect = AttributeType::enum_(
+            crate::schema::enum_identity("Effect", Some("aws.iam.PolicyDocument")),
+            Some(vec!["Allow".to_string(), "Deny".to_string()]),
+            vec![
+                ("Allow".to_string(), "allow".to_string()),
+                ("Deny".to_string(), "deny".to_string()),
+            ],
+            None,
+            None,
+        );
+
+        assert_eq!(attribute_type_to_type_expr(&effect), TypeExpr::String);
     }
 
     #[test]

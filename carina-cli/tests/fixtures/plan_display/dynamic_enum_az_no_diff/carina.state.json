@@ -1,0 +1,31 @@
+{
+  "version": 7,
+  "serial": 1,
+  "lineage": "test-lineage-dynamic-enum-az-no-diff",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "network.Subnet",
+      "name": "subnet",
+      "provider": "fixture",
+      "identifier": "subnet-fixture",
+      "attributes": {
+        "availability_zone": "ap-northeast-1a"
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "subnet",
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "availability_zone": {
+            "kind": "leaf"
+          }
+        }
+      }
+    }
+  ]
+}

@@ -127,7 +127,7 @@ mod tests {
     use super::*;
     use carina_core::resource::{ConcreteValue, Value};
     use carina_core::schema::{
-        AttributeSchema, AttributeType, ResourceSchema, TypeError, string_enum_identity,
+        AttributeSchema, AttributeType, ResourceSchema, TypeError, enum_identity,
     };
     use std::collections::HashMap;
     use tower_lsp::lsp_types::{Position, Range};
@@ -290,17 +290,15 @@ mod tests {
         let schema = ResourceSchema::new("aws.iam.PolicyDocument").attribute(
             AttributeSchema::new(
                 "Version",
-                AttributeType::string_enum(
-                    "Version".to_string(),
-                    vec!["2012-10-17".to_string(), "2008-10-17".to_string()],
-                    Some(string_enum_identity(
-                        "Version",
-                        Some("aws.iam.PolicyDocument"),
-                    )),
+                AttributeType::enum_(
+                    enum_identity("Version", Some("aws.iam.PolicyDocument")),
+                    Some(vec!["2012-10-17".to_string(), "2008-10-17".to_string()]),
                     vec![
                         ("2012-10-17".to_string(), "2012_10_17".to_string()),
                         ("2008-10-17".to_string(), "2008_10_17".to_string()),
                     ],
+                    None,
+                    None,
                 ),
             )
             .required(),

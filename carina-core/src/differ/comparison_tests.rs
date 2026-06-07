@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::resource::{ConcreteValue, DeferredValue, Value};
-use crate::schema::{TypeIdentity, noop_validator};
+use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
 
 #[test]
@@ -125,7 +125,7 @@ fn type_aware_custom_delegates_to_base() {
         AttributeType::float(),
         None,
         None,
-        noop_validator(),
+        crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
     assert!(type_aware_equal(
@@ -260,20 +260,21 @@ fn type_aware_struct_does_not_ignore_non_default_bool() {
 }
 
 #[test]
-fn type_aware_string_enum_namespaced_vs_raw() {
-    // StringEnum with namespace
-    let enum_type = AttributeType::string_enum(
-        "ServerSideEncryptionByDefaultSseAlgorithm".to_string(),
-        vec![
+fn type_aware_enum_namespaced_vs_raw() {
+    // Enum with namespace
+    let enum_type = AttributeType::enum_(
+        crate::schema::enum_identity(
+            "ServerSideEncryptionByDefaultSseAlgorithm",
+            Some("awscc.s3.Bucket"),
+        ),
+        Some(vec![
             "aws:kms".to_string(),
             "AES256".to_string(),
             "aws:kms:dsse".to_string(),
-        ],
-        Some(crate::schema::string_enum_identity(
-            "ServerSideEncryptionByDefaultSseAlgorithm",
-            Some("awscc.s3.Bucket"),
-        )),
+        ]),
         vec![],
+        None,
+        None,
     );
 
     // Namespaced form vs raw string
@@ -321,7 +322,7 @@ fn type_aware_string_enum_namespaced_vs_raw() {
     );
 }
 
-/// Regression for carina#3312: `CustomEnum` attributes with a `to_dsl`
+/// Regression for carina#3312: `Enum` attributes with a `to_dsl`
 /// callback (e.g. `aws.AvailabilityZone`, where `to_dsl = |s|
 /// s.replace('-', '_')`) must compare equal across the `String("ap-northeast-1a")`
 /// vs `String("aws.AvailabilityZone.ap_northeast_1a")` / `EnumIdentifier(...)`
@@ -329,11 +330,12 @@ fn type_aware_string_enum_namespaced_vs_raw() {
 /// and DSL-side desired (fully-qualified identifier). Without this arm
 /// the differ reports a phantom replacement on every post-apply plan.
 #[test]
-fn type_aware_custom_enum_canonical_vs_namespaced_identifier() {
-    let az_type = AttributeType::custom_enum(
+fn type_aware_enum_canonical_vs_namespaced_identifier() {
+    let az_type = AttributeType::enum_(
         TypeIdentity::new(Some("aws"), ["AvailabilityZone"], "ZoneName"),
-        AttributeType::string(),
-        noop_validator(),
+        None,
+        vec![],
+        None,
         Some(|s: &str| s.replace('-', "_")),
     );
 
@@ -427,7 +429,7 @@ fn type_aware_custom_enum_canonical_vs_namespaced_identifier() {
 }
 
 #[test]
-fn type_aware_struct_ignores_default_string_enum_empty() {
+fn type_aware_struct_ignores_default_enum_empty() {
     use crate::schema::StructField;
 
     let struct_type = AttributeType::struct_(
@@ -436,11 +438,12 @@ fn type_aware_struct_ignores_default_string_enum_empty() {
             StructField::new("name", AttributeType::string()),
             StructField::new(
                 "status",
-                AttributeType::string_enum(
-                    "Status".to_string(),
-                    vec!["Active".to_string(), "Inactive".to_string()],
-                    None,
+                AttributeType::enum_(
+                    TypeIdentity::bare("Status"),
+                    Some(vec!["Active".to_string(), "Inactive".to_string()]),
                     vec![],
+                    None,
+                    None,
                 ),
             ),
         ],
@@ -472,7 +475,7 @@ fn type_aware_struct_ignores_default_string_enum_empty() {
             crate::schema::empty_defs_for_schema_walks(),
             None
         ),
-        "Struct with extra default StringEnum empty string should be considered equal"
+        "Struct with extra default Enum empty string should be considered equal"
     );
 }
 
@@ -491,7 +494,7 @@ fn type_aware_struct_ignores_default_custom_type() {
                     AttributeType::int(),
                     None,
                     None,
-                    noop_validator(),
+                    crate::schema::legacy_validator(|_| Ok(())),
                     None,
                 ),
             ),
@@ -1331,7 +1334,7 @@ fn carina3080_principal_scalar_vs_singleton_is_no_change_via_pipeline() {
 /// `Distribution` must NOT report a change for `allowed_methods` /
 /// `cached_methods`. Those are nested two Struct levels deep
 /// (`distribution_config` → `default_cache_behavior` →
-/// `allowed_methods`) and schema-typed `unordered_list(StringEnum)`.
+/// `allowed_methods`) and schema-typed `unordered_list(Enum)`.
 ///
 /// Representative subset modeling the same axes as the live plan
 /// against `carina-rs/infra registry/dev/registry` (the verbatim live
@@ -1344,7 +1347,7 @@ fn carina3080_principal_scalar_vs_singleton_is_no_change_via_pipeline() {
 /// - Desired (`to`):   `[String("…AllowedMethods.get"),
 ///                        String("…AllowedMethods.head")]` — order get, head
 ///
-/// `allowed_methods` is schema-typed `unordered_list(StringEnum)`, so
+/// `allowed_methods` is schema-typed `unordered_list(Enum)`, so
 /// element order is NOT significant: a multiset-equal pair must be
 /// `NoChange`. A pure order-only difference, not a type or alias
 /// mismatch.
@@ -1367,17 +1370,15 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
     use crate::value::{canonicalize_resources_with_schemas, canonicalize_states_with_schemas};
 
     let method_enum = |name: &str, values: &[&str]| {
-        AttributeType::string_enum(
-            name.to_string(),
-            values.iter().map(|s| s.to_string()).collect(),
-            Some(crate::schema::string_enum_identity(
-                name,
-                Some("awscc.cloudfront.Distribution"),
-            )),
+        AttributeType::enum_(
+            crate::schema::enum_identity(name, Some("awscc.cloudfront.Distribution")),
+            Some(values.iter().map(|s| s.to_string()).collect()),
             values
                 .iter()
                 .map(|s| (s.to_string(), s.to_lowercase()))
                 .collect(),
+            None,
+            None,
         )
     };
     let default_cache_behavior = AttributeType::struct_(
@@ -1489,7 +1490,7 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
     // `from` vs `to` (registry/dev/registry, state_serial 33). They
     // are present ONLY in `from` (state); `to` (desired) has just the
     // user-authored fields. Critically, several are NOT type-zero
-    // (`http_version` is a non-empty StringEnum, `ipv6_enabled`/
+    // (`http_version` is a non-empty Enum, `ipv6_enabled`/
     // `staging` are `true`), so `is_type_default` does NOT tolerate
     // them — they must instead be stripped by the `prev_explicit`
     // projection. This test exercises the real `diff` signature with
@@ -1591,7 +1592,7 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
         "carina#3122 SHAPE A: a steady-state no-op plan must be \
          NoChange. State carries server read-back defaults the user \
          never authored (http_version, ipv6_enabled, …) plus \
-         order-reversed unordered List<StringEnum> allowed_methods/\
+         order-reversed unordered List<Enum> allowed_methods/\
          cached_methods; prev_explicit projection + unordered-list \
          multiset must collapse all of it — got {result:?}"
     );
@@ -1618,17 +1619,15 @@ fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline()
     use crate::value::{canonicalize_resources_with_schemas, canonicalize_states_with_schemas};
 
     let method_enum = |name: &str, values: &[&str]| {
-        AttributeType::string_enum(
-            name.to_string(),
-            values.iter().map(|s| s.to_string()).collect(),
-            Some(crate::schema::string_enum_identity(
-                name,
-                Some("awscc.cloudfront.Distribution"),
-            )),
+        AttributeType::enum_(
+            crate::schema::enum_identity(name, Some("awscc.cloudfront.Distribution")),
+            Some(values.iter().map(|s| s.to_string()).collect()),
             values
                 .iter()
                 .map(|s| (s.to_string(), s.to_lowercase()))
                 .collect(),
+            None,
+            None,
         )
     };
     // The only load-bearing difference for the `allowed_methods`

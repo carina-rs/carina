@@ -173,14 +173,19 @@ outer {
 }
 
 #[test]
-fn list_string_enum_completions() {
+fn list_enum_completions() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let list_enum = AttributeType::list(AttributeType::string_enum(
-        "Protocol".to_string(),
-        vec!["tcp".to_string(), "udp".to_string(), "icmp".to_string()],
-        None,
+    let list_enum = AttributeType::list(AttributeType::enum_(
+        carina_core::schema::TypeIdentity::bare("Protocol"),
+        Some(vec![
+            "tcp".to_string(),
+            "udp".to_string(),
+            "icmp".to_string(),
+        ]),
         vec![],
+        None,
+        None,
     ));
 
     let schema = ResourceSchema::new("list.resource")
@@ -193,11 +198,16 @@ fn list_string_enum_completions() {
         CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
 
     let completions = provider.completions_for_type(
-        &AttributeType::list(AttributeType::string_enum(
-            "Protocol".to_string(),
-            vec!["tcp".to_string(), "udp".to_string(), "icmp".to_string()],
-            None,
+        &AttributeType::list(AttributeType::enum_(
+            carina_core::schema::TypeIdentity::bare("Protocol"),
+            Some(vec![
+                "tcp".to_string(),
+                "udp".to_string(),
+                "icmp".to_string(),
+            ]),
             vec![],
+            None,
+            None,
         )),
         None,
     );
@@ -205,12 +215,12 @@ fn list_string_enum_completions() {
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"'tcp'"),
-        "Should offer tcp as completion for List(StringEnum). Got: {:?}",
+        "Should offer tcp as completion for List(Enum). Got: {:?}",
         labels
     );
     assert!(
         labels.contains(&"'udp'"),
-        "Should offer udp as completion for List(StringEnum). Got: {:?}",
+        "Should offer udp as completion for List(Enum). Got: {:?}",
         labels
     );
 }
@@ -241,11 +251,12 @@ fn union_completions_include_member_types() {
     let provider = test_provider();
     let completions = provider.completions_for_type(
         &AttributeType::union(vec![
-            AttributeType::string_enum(
-                "Mode".to_string(),
-                vec!["active".to_string(), "passive".to_string()],
-                None,
+            AttributeType::enum_(
+                carina_core::schema::TypeIdentity::bare("Mode"),
+                Some(vec!["active".to_string(), "passive".to_string()]),
                 vec![],
+                None,
+                None,
             ),
             AttributeType::bool(),
         ]),
@@ -254,15 +265,15 @@ fn union_completions_include_member_types() {
 
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
-    // Should have StringEnum completions
+    // Should have Enum completions
     assert!(
         labels.contains(&"'active'"),
-        "Should offer 'active' from StringEnum member. Got: {:?}",
+        "Should offer 'active' from Enum member. Got: {:?}",
         labels
     );
     assert!(
         labels.contains(&"'passive'"),
-        "Should offer 'passive' from StringEnum member. Got: {:?}",
+        "Should offer 'passive' from Enum member. Got: {:?}",
         labels
     );
     // Should have Bool completions
@@ -1075,23 +1086,24 @@ outer =
 }
 
 #[test]
-fn map_key_completions_from_string_enum_key_type() {
+fn map_key_completions_from_enum_key_type() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     use std::sync::Arc;
 
-    // Create a schema with a Map attribute whose key is StringEnum
+    // Create a schema with a Map attribute whose key is Enum
     let condition_keys = vec![
         "string_equals".to_string(),
         "string_like".to_string(),
         "arn_like".to_string(),
     ];
     let map_type = AttributeType::map_with_key(
-        AttributeType::string_enum(
-            "ConditionOperator".to_string(),
-            condition_keys.clone(),
-            None,
+        AttributeType::enum_(
+            carina_core::schema::TypeIdentity::bare("ConditionOperator"),
+            Some(condition_keys.clone()),
             vec![],
+            None,
+            None,
         ),
         AttributeType::map(AttributeType::string()),
     );
@@ -2382,7 +2394,7 @@ fn namespaced_enum_tail_tokens_do_not_leak_into_sibling_value_position() {
     );
 }
 
-/// Namespaced `StringEnum` completions must offer the fully-qualified
+/// Namespaced `Enum` completions must offer the fully-qualified
 /// form (`awscc.sso.Assignment.PrincipalType.GROUP`), not the bare tail
 /// (`GROUP`). The bare form is accepted by the DSL resolver but causes
 /// the sibling-attribute leak exercised above.
@@ -2412,6 +2424,51 @@ fn namespaced_enum_completions_offer_full_form_not_bare_tail() {
         !labels.contains(&"GROUP"),
         "bare 'GROUP' must not be offered for namespaced enum — use fully-qualified form. Got: {:?}",
         labels
+    );
+}
+
+#[test]
+fn dynamic_enum_completion_offers_namespaced_prefix() {
+    let zone_name = AttributeType::enum_(
+        carina_core::schema::TypeIdentity::new(
+            Some("test"),
+            vec!["network".to_string(), "Subnet".to_string()],
+            "ZoneName",
+        ),
+        None,
+        vec![],
+        None,
+        Some(|s| s.replace('-', "_")),
+    );
+    let schema = ResourceSchema::new("network.Subnet")
+        .attribute(AttributeSchema::new("availability_zone", zone_name));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
+    let provider =
+        CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
+    let doc = create_document(
+        r#"test.network.Subnet {
+  availability_zone =
+}
+"#,
+    );
+
+    let completions = provider.complete(
+        &doc,
+        Position {
+            line: 1,
+            character: 21,
+        },
+        None,
+    );
+
+    assert!(
+        completions.iter().any(|item| {
+            item.label == "test.network.Subnet.ZoneName."
+                && item.insert_text.as_deref() == Some("test.network.Subnet.ZoneName.")
+        }),
+        "expected dynamic enum prefix completion, got: {:?}",
+        completions
     );
 }
 
@@ -2450,7 +2507,7 @@ fn builtins_suppressed_at_plain_string_value_position() {
 fn for_loop_binding_not_offered_at_incompatible_enum_attribute() {
     // `for _, account_id in orgs.accounts` where `orgs.accounts` is
     // `map(AwsAccountId)`. Inside the body, `principal_type` is a
-    // `StringEnum` — `account_id` (semantic type `aws_account_id`)
+    // `Enum` — `account_id` (semantic type `aws_account_id`)
     // can't type-check as `PrincipalType`, so it must be filtered out.
     let provider = test_provider_with_custom_semantic_attr();
     let (_tmp, base) = set_up_upstream_project(

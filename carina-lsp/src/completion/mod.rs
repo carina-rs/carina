@@ -778,7 +778,7 @@ impl CompletionProvider {
             }
 
             // Try map key completions: if the attribute type at attr_path is a Map
-            // with a StringEnum key, provide key name completions
+            // with a Enum key, provide key name completions
             if let Some(key_type) = self.resolve_map_key_type(schema, attr_path) {
                 return self.map_key_completions_from_type(key_type, &trigger_suggest);
             }
@@ -802,14 +802,17 @@ impl CompletionProvider {
         }
     }
 
-    /// Generate completions from a Map key type (e.g., StringEnum values).
+    /// Generate completions from a Map key type (e.g., Enum values).
     fn map_key_completions_from_type(
         &self,
         key_type: &AttributeType,
         trigger_suggest: &Command,
     ) -> Vec<CompletionItem> {
         match key_type.shape_ref_free() {
-            Ok(Shape::StringEnum { values, .. }) => values
+            Ok(Shape::Enum {
+                values: Some(values),
+                ..
+            }) => values
                 .iter()
                 .map(|v| CompletionItem {
                     label: v.clone(),
