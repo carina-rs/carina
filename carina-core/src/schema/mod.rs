@@ -2442,18 +2442,22 @@ impl AttributeType {
     /// Rules (first match wins):
     /// 1. Union sink: OK if source is assignable to any member.
     /// 2. Union source: OK iff source is assignable to sink for every member.
-    /// 3. Custom→Custom with both `identity: Some` where the source's
-    ///    identity is not [`TypeIdentity::assignable_to`] the sink's:
-    ///    NG. Directional per-axis subsumption — an empty axis on the
-    ///    **sink** widens (any source matches), but an empty axis on
-    ///    the **source** against a populated sink is rejected (no
-    ///    evidence). So `aws.iam.Role.Arn` flows into `aws.Arn` (sink
-    ///    is wider) but `aws.Arn` does not flow into `aws.iam.Role.Arn`
-    ///    (source has no Role-specific evidence). `aws.Region` and
-    ///    `gcp.Region` are rejected both ways (populated providers
-    ///    differ). Closes carina#3218.
-    /// 4. Custom→Custom: check pattern (pat-1 literal equality) and length
-    ///    containment (source ⊆ sink), then recurse on base.
+    /// 3. Custom→Custom with both `identity: Some`: the source's identity
+    ///    must be [`TypeIdentity::assignable_to`] the sink's, any length
+    ///    range must be contained by the sink's range, and the base types
+    ///    must also be assignable. This is the final verdict for identified
+    ///    custom types: pattern checks are subsumed by identity subsumption
+    ///    and are not consulted in this arm, while length containment remains
+    ///    a structural safety check. Directional per-axis subsumption — an
+    ///    empty axis on the **sink** widens (any source matches), but an empty
+    ///    axis on the **source** against a populated sink is rejected (no
+    ///    evidence). So `aws.iam.Role.Arn` flows into `aws.Arn` (sink is
+    ///    wider) but `aws.Arn` does not flow into `aws.iam.Role.Arn` (source
+    ///    has no Role-specific evidence). `aws.Region` and `gcp.Region` are
+    ///    rejected both ways (populated providers differ). Closes carina#3218.
+    /// 4. Custom→Custom where at least one side has `identity: None`: check
+    ///    pattern (literal equality) and length containment (source ⊆ sink),
+    ///    then recurse on base. For both-identified pairs, see rule 3.
     /// 5. Custom source → non-Custom sink: recurse on `source.base`.
     /// 6. non-Custom source → Custom sink: NG (source has no proof of
     ///    satisfying the sink's identity/pattern/length).
@@ -2492,13 +2496,21 @@ impl AttributeType {
             (
                 Custom {
                     identity: Some(s_id),
+                    length: s_len,
+                    base: s_base,
                     ..
                 },
                 Custom {
                     identity: Some(k_id),
+                    length: k_len,
+                    base: k_base,
                     ..
                 },
-            ) if !s_id.assignable_to(k_id) => false,
+            ) => {
+                s_id.assignable_to(k_id)
+                    && length_contains(s_len.as_ref(), k_len.as_ref())
+                    && s_base.is_assignable_to(k_base)
+            }
             (Enum { identity: s_id, .. }, Enum { identity: k_id, .. })
                 if !s_id.assignable_to(k_id) =>
             {
