@@ -3171,6 +3171,26 @@ fn assignable_rejects_same_enum_kind_across_namespaces() {
     assert!(!bar_enum.is_assignable_to(&aws_enum));
 }
 
+/// carina#3413: same `TypeIdentity` for an Enum constructed independently
+/// must remain mutually assignable. Mirrors the Custom-variant tests above
+/// in the Enum codepath (carina#3412's identity-aware arm).
+#[test]
+fn assignable_accepts_same_enum_typeidentity_from_distinct_constructions() {
+    let mk = || {
+        AttributeType::enum_(
+            crate::schema::enum_identity("Status", Some("aws.s3.Bucket.Versioning")),
+            Some(vec!["enabled".to_string(), "suspended".to_string()]),
+            vec![],
+            None,
+            None,
+        )
+    };
+    let a = mk();
+    let b = mk();
+    assert!(a.is_assignable_to(&b));
+    assert!(b.is_assignable_to(&a));
+}
+
 /// The generic provider-scoped `aws.Arn` (no service/resource segments)
 /// stays assignable against a more specific `aws.iam.Role.Arn`: an
 /// `segments` is **directional**: an empty `segments` source carries
@@ -3202,6 +3222,105 @@ fn assignable_specific_arn_flows_into_generic_arn() {
     let cert_arn = mk(&["acm", "Certificate"]);
     assert!(!role_arn.is_assignable_to(&cert_arn));
     assert!(!cert_arn.is_assignable_to(&role_arn));
+}
+
+/// carina#3413: two callers that independently construct the SAME
+/// `TypeIdentity` (e.g. both call `provider_type("ec2", "Vpc", "Id")`,
+/// producing `aws.ec2.Vpc.Id`) must produce AttributeType values that
+/// are mutually assignable. This is the type-safety property that
+/// lets a value flow from one provider's resource attribute into
+/// another provider's resource attribute without a runtime alias
+/// check, after the awscc-local carina-aws-types crate was dismantled
+/// in carina-provider-awscc#338.
+#[test]
+fn assignable_accepts_same_typeidentity_from_distinct_constructions_vpc_id() {
+    let mk = || {
+        AttributeType::custom(
+            Some(TypeIdentity::new(Some("aws"), vec!["ec2", "Vpc"], "Id")),
+            AttributeType::string(),
+            None,
+            None,
+            crate::schema::legacy_validator(|_| Ok(())),
+            None,
+        )
+    };
+    let a = mk();
+    let b = mk();
+    assert!(a.is_assignable_to(&b));
+    assert!(b.is_assignable_to(&a));
+}
+
+/// carina#3413: same as above but for the `aws.AccountId` form which
+/// has empty `segments`. Guards against accidental loosening that
+/// would only cover populated-segments identities.
+#[test]
+fn assignable_accepts_same_typeidentity_from_distinct_constructions_account_id() {
+    let mk = || {
+        AttributeType::custom(
+            Some(TypeIdentity::new(
+                Some("aws"),
+                Vec::<String>::new(),
+                "AccountId",
+            )),
+            AttributeType::string(),
+            None,
+            None,
+            crate::schema::legacy_validator(|_| Ok(())),
+            None,
+        )
+    };
+    let a = mk();
+    let b = mk();
+    assert!(a.is_assignable_to(&b));
+    assert!(b.is_assignable_to(&a));
+}
+
+/// carina#3413: deeper segments path (`aws.iam.Role.Arn`). One of the
+/// concrete identities motivating the original issue body.
+#[test]
+fn assignable_accepts_same_typeidentity_from_distinct_constructions_iam_role_arn() {
+    let mk = || {
+        AttributeType::custom(
+            Some(TypeIdentity::new(Some("aws"), vec!["iam", "Role"], "Arn")),
+            AttributeType::string(),
+            None,
+            None,
+            crate::schema::legacy_validator(|_| Ok(())),
+            None,
+        )
+    };
+    let a = mk();
+    let b = mk();
+    assert!(a.is_assignable_to(&b));
+    assert!(b.is_assignable_to(&a));
+}
+
+/// carina#3413 guard: canonicalizing AWS identities to `aws.*` must
+/// NOT loosen `is_assignable_to` between genuinely different
+/// providers. A hypothetical `gcp.AccountId` must still be rejected
+/// against `aws.AccountId`. Complements
+/// `assignable_rejects_same_kind_across_providers` in the AccountId
+/// context that motivated carina#3413.
+#[test]
+fn assignable_rejects_account_id_across_genuinely_different_providers() {
+    let mk = |provider: &str| {
+        AttributeType::custom(
+            Some(TypeIdentity::new(
+                Some(provider),
+                Vec::<String>::new(),
+                "AccountId",
+            )),
+            AttributeType::string(),
+            None,
+            None,
+            crate::schema::legacy_validator(|_| Ok(())),
+            None,
+        )
+    };
+    let aws_account = mk("aws");
+    let gcp_account = mk("gcp");
+    assert!(!aws_account.is_assignable_to(&gcp_account));
+    assert!(!gcp_account.is_assignable_to(&aws_account));
 }
 
 /// Directional per-axis subsumption: source missing a populated sink
