@@ -3198,18 +3198,18 @@ fn assignable_accepts_same_enum_typeidentity_from_distinct_constructions() {
 /// carina#3218.
 #[test]
 fn assignable_specific_arn_flows_into_generic_arn() {
-    let mk = |segments: &[&str]| {
+    let mk = |segments: &[&str], pattern: Option<&str>| {
         AttributeType::custom(
             Some(TypeIdentity::new(Some("aws"), segments.to_vec(), "Arn")),
             AttributeType::string(),
-            None,
+            pattern.map(str::to_string),
             None,
             crate::schema::legacy_validator(|_| Ok(())),
             None,
         )
     };
-    let generic = mk(&[]);
-    let role_arn = mk(&["iam", "Role"]);
+    let generic = mk(&[], None);
+    let role_arn = mk(&["iam", "Role"], None);
 
     // Specific → generic: narrower source satisfies wider sink.
     assert!(role_arn.is_assignable_to(&generic));
@@ -3219,9 +3219,82 @@ fn assignable_specific_arn_flows_into_generic_arn() {
     assert!(!generic.is_assignable_to(&role_arn));
 
     // …and two specific ARNs with different service/resource differ.
-    let cert_arn = mk(&["acm", "Certificate"]);
+    let cert_arn = mk(&["acm", "Certificate"], None);
     assert!(!role_arn.is_assignable_to(&cert_arn));
     assert!(!cert_arn.is_assignable_to(&role_arn));
+
+    // Matching patterns do not make different same-depth identities compatible.
+    let s3_bucket_arn = mk(
+        &["s3", "Bucket"],
+        Some("^arn:(aws|aws-cn|aws-us-gov):s3:::.+$"),
+    );
+    let s3_object_arn = mk(
+        &["s3", "Object"],
+        Some("^arn:(aws|aws-cn|aws-us-gov):s3:::.+$"),
+    );
+    assert!(!s3_bucket_arn.is_assignable_to(&s3_object_arn));
+    assert!(!s3_object_arn.is_assignable_to(&s3_bucket_arn));
+}
+
+#[test]
+fn assignable_specific_arn_with_pattern_flows_into_generic_arn_with_pattern() {
+    let mk = |segments: &[&str], pattern: &str| {
+        AttributeType::custom(
+            Some(TypeIdentity::new(Some("aws"), segments.to_vec(), "Arn")),
+            AttributeType::string(),
+            Some(pattern.to_string()),
+            None,
+            crate::schema::legacy_validator(|_| Ok(())),
+            None,
+        )
+    };
+
+    let generic = mk(&[], "^arn:(aws|aws-cn|aws-us-gov):[^:]+:.+$");
+    let bucket_arn = mk(&["s3", "Bucket"], "^arn:(aws|aws-cn|aws-us-gov):s3:::.+$");
+
+    assert!(bucket_arn.is_assignable_to(&generic));
+    assert!(!generic.is_assignable_to(&bucket_arn));
+}
+
+#[test]
+fn assignable_specific_arn_without_pattern_flows_into_generic_arn_with_pattern() {
+    let mk = |segments: &[&str], pattern: Option<&str>| {
+        AttributeType::custom(
+            Some(TypeIdentity::new(Some("aws"), segments.to_vec(), "Arn")),
+            AttributeType::string(),
+            pattern.map(str::to_string),
+            None,
+            crate::schema::legacy_validator(|_| Ok(())),
+            None,
+        )
+    };
+
+    let generic = mk(&[], Some("^arn:(aws|aws-cn|aws-us-gov):[^:]+:.+$"));
+    let role_arn = mk(&["iam", "Role"], None);
+
+    assert!(role_arn.is_assignable_to(&generic));
+}
+
+#[test]
+fn assignable_identified_custom_length_must_be_contained() {
+    let mk = |length: Option<(Option<u64>, Option<u64>)>| {
+        AttributeType::custom(
+            Some(TypeIdentity::bare("SizedString")),
+            AttributeType::string(),
+            None,
+            length,
+            crate::schema::legacy_validator(|_| Ok(())),
+            None,
+        )
+    };
+
+    let narrow = mk(Some((Some(1), Some(32))));
+    let wide = mk(Some((Some(1), Some(64))));
+    assert!(narrow.is_assignable_to(&wide));
+    assert!(!wide.is_assignable_to(&narrow));
+
+    let unproven = mk(None);
+    assert!(!unproven.is_assignable_to(&wide));
 }
 
 /// carina#3413: two callers that independently construct the SAME
