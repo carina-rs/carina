@@ -1149,7 +1149,17 @@ fn collect_validators_from_type(
     use crate::schema::AttrTypeKind;
 
     match &attr_type.kind {
-        AttrTypeKind::Custom {
+        AttrTypeKind::String {
+            identity: Some(id),
+            validate,
+            ..
+        }
+        | AttrTypeKind::Int {
+            identity: Some(id),
+            validate,
+            ..
+        }
+        | AttrTypeKind::Float {
             identity: Some(id),
             validate,
             ..
@@ -1164,8 +1174,13 @@ fn collect_validators_from_type(
                 })
             });
         }
-        AttrTypeKind::Custom { identity: None, .. } => {}
-        AttrTypeKind::List { inner, .. } => {
+        AttrTypeKind::String { identity: None, .. }
+        | AttrTypeKind::Int { identity: None, .. }
+        | AttrTypeKind::Float { identity: None, .. } => {}
+        AttrTypeKind::List {
+            element_type: inner,
+            ..
+        } => {
             collect_validators_from_type(inner, validators);
         }
         AttrTypeKind::Map { key, value: inner } => {
@@ -1191,12 +1206,7 @@ fn collect_validators_from_type(
         // because each def is visited exactly once. (carina#3340.)
         AttrTypeKind::Ref(_) => {}
         // Primitives carry no nested Custom types and no Ref.
-        AttrTypeKind::String
-        | AttrTypeKind::Int
-        | AttrTypeKind::Float
-        | AttrTypeKind::Bool
-        | AttrTypeKind::Duration
-        | AttrTypeKind::Enum { .. } => {}
+        AttrTypeKind::Bool | AttrTypeKind::Duration | AttrTypeKind::Enum { .. } => {}
     }
 }
 
@@ -1209,13 +1219,24 @@ fn collect_type_names_from_type(
     use crate::schema::AttrTypeKind;
 
     match &attr_type.kind {
-        AttrTypeKind::Custom {
+        AttrTypeKind::String {
+            identity: Some(id), ..
+        }
+        | AttrTypeKind::Int {
+            identity: Some(id), ..
+        }
+        | AttrTypeKind::Float {
             identity: Some(id), ..
         } => {
             names.insert(id.clone());
         }
-        AttrTypeKind::Custom { identity: None, .. } => {}
-        AttrTypeKind::List { inner, .. } => {
+        AttrTypeKind::String { identity: None, .. }
+        | AttrTypeKind::Int { identity: None, .. }
+        | AttrTypeKind::Float { identity: None, .. } => {}
+        AttrTypeKind::List {
+            element_type: inner,
+            ..
+        } => {
             collect_type_names_from_type(inner, names);
         }
         AttrTypeKind::Map { key, value: inner } => {
@@ -1236,12 +1257,7 @@ fn collect_type_names_from_type(
         // caller walks `schema.defs` separately to avoid infinite
         // recursion on cyclic schemas (carina#3340).
         AttrTypeKind::Ref(_) => {}
-        AttrTypeKind::String
-        | AttrTypeKind::Int
-        | AttrTypeKind::Float
-        | AttrTypeKind::Bool
-        | AttrTypeKind::Duration
-        | AttrTypeKind::Enum { .. } => {}
+        AttrTypeKind::Bool | AttrTypeKind::Duration | AttrTypeKind::Enum { .. } => {}
     }
 }
 

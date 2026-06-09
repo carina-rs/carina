@@ -95,19 +95,23 @@ pub(crate) fn type_aware_equal(
             (
                 Value::Concrete(ConcreteValue::Int(i)),
                 Value::Concrete(ConcreteValue::Float(f)),
-                crate::schema::Shape::Float | crate::schema::Shape::Int,
+                crate::schema::Shape::Float { .. } | crate::schema::Shape::Int { .. },
             ) => (*i as f64) == *f && (*i as f64) as i64 == *i,
             (
                 Value::Concrete(ConcreteValue::Float(f)),
                 Value::Concrete(ConcreteValue::Int(i)),
-                crate::schema::Shape::Float | crate::schema::Shape::Int,
+                crate::schema::Shape::Float { .. } | crate::schema::Shape::Int { .. },
             ) => *f == (*i as f64) && (*i as f64) as i64 == *i,
 
             // Lists: ordered or multiset comparison with inner type awareness
             (
                 Value::Concrete(ConcreteValue::List(la)),
                 Value::Concrete(ConcreteValue::List(lb)),
-                crate::schema::Shape::List { inner, ordered },
+                crate::schema::Shape::List {
+                    element_type: inner,
+                    ordered,
+                    ..
+                },
             ) => type_aware_lists_equal(la, lb, Some(inner), defs, ordered, secret_ctx),
 
             // Maps: recursive comparison with inner value type
@@ -146,7 +150,8 @@ pub(crate) fn type_aware_equal(
                     ) if types.iter().any(|t| {
                         matches!(
                             &t.kind,
-                            crate::schema::AttrTypeKind::Float | crate::schema::AttrTypeKind::Int
+                            crate::schema::AttrTypeKind::Float { .. }
+                                | crate::schema::AttrTypeKind::Int { .. }
                         )
                     }) =>
                     {
@@ -204,11 +209,6 @@ pub(crate) fn type_aware_equal(
                     dsl_map.api_for(&dsl_map.dsl_for(trailing))
                 };
                 canonical(&sa).eq_ignore_ascii_case(&canonical(&sb))
-            }
-
-            // Custom types with base type: delegate to base
-            (_, _, crate::schema::Shape::Custom { base, .. }) => {
-                type_aware_equal(a, b, Some(base), defs, secret_ctx)
             }
 
             // `Shape` has no `Ref` variant by construction (see
@@ -364,8 +364,8 @@ fn is_type_default(
         (Value::Concrete(ConcreteValue::Bool(false)), Some(crate::schema::Shape::Bool) | None) => {
             true
         }
-        (Value::Concrete(ConcreteValue::Int(0)), Some(crate::schema::Shape::Int)) => true,
-        (Value::Concrete(ConcreteValue::Float(f)), Some(crate::schema::Shape::Float))
+        (Value::Concrete(ConcreteValue::Int(0)), Some(crate::schema::Shape::Int { .. })) => true,
+        (Value::Concrete(ConcreteValue::Float(f)), Some(crate::schema::Shape::Float { .. }))
             if *f == 0.0 =>
         {
             true
@@ -375,7 +375,7 @@ fn is_type_default(
         {
             true
         }
-        (Value::Concrete(ConcreteValue::String(s)), Some(crate::schema::Shape::String))
+        (Value::Concrete(ConcreteValue::String(s)), Some(crate::schema::Shape::String { .. }))
             if s.is_empty() =>
         {
             true
@@ -393,10 +393,6 @@ fn is_type_default(
             Value::Concrete(ConcreteValue::Map(m)),
             Some(crate::schema::Shape::Map { .. } | crate::schema::Shape::Struct { .. }),
         ) if m.is_empty() => true,
-        // Custom types: delegate to the base type
-        (_, Some(crate::schema::Shape::Custom { base, .. })) => {
-            is_type_default(value, Some(base), defs)
-        }
         _ => false,
     }
 }

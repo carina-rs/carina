@@ -622,7 +622,10 @@ fn walk_value_against_type(
             // element against the same expected type — the leaf-ref
             // comparison will fire if the element doesn't fit.
             let inner = match expected_shape {
-                crate::schema::Shape::List { inner, .. } => inner,
+                crate::schema::Shape::List {
+                    element_type: inner,
+                    ..
+                } => inner,
                 _ => expected,
             };
             for item in items {
@@ -1939,7 +1942,7 @@ mod tests {
         assert!(matches!(errs[0].export_type, TypeExpr::Int));
         assert!(matches!(
             errs[0].expected_type.kind(),
-            crate::schema::AttrTypeKind::String
+            crate::schema::AttrTypeKind::String { .. }
         ));
         assert!(errs[0].diagnostic_message().contains("String"));
     }

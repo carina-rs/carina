@@ -765,7 +765,10 @@ fn resolve_enum_value_recursive_projected(
             }
             changed.then_some(Value::Concrete(ConcreteValue::Map(rewritten)))
         }
-        crate::schema::Shape::List { inner, .. } => {
+        crate::schema::Shape::List {
+            element_type: inner,
+            ..
+        } => {
             let Value::Concrete(ConcreteValue::List(items)) = value else {
                 return None;
             };
@@ -1045,7 +1048,10 @@ fn lift_enum_leaves_projected(
             }
             changed.then_some(Value::Concrete(ConcreteValue::Map(rewritten)))
         }
-        crate::schema::Shape::List { inner, .. } => {
+        crate::schema::Shape::List {
+            element_type: inner,
+            ..
+        } => {
             let Value::Concrete(ConcreteValue::List(items)) = value else {
                 return None;
             };

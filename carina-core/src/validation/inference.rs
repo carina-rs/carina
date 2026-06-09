@@ -519,7 +519,10 @@ fn infer_resource_ref_with_visiting(
                 PathSegment::Subscript {
                     index: Subscript::Int { .. },
                 },
-                AttrTypeKind::List { inner, .. },
+                AttrTypeKind::List {
+                    element_type: inner,
+                    ..
+                },
             ) => inner,
             (
                 PathSegment::Subscript {
@@ -617,12 +620,13 @@ fn descend_struct_field<'a>(
 ///   unification.
 fn attribute_type_to_type_expr(attr_type: &AttributeType) -> TypeExpr {
     match attr_type.kind() {
-        AttrTypeKind::String => TypeExpr::String,
-        AttrTypeKind::Int => TypeExpr::Int,
-        AttrTypeKind::Float => TypeExpr::Float,
-        AttrTypeKind::Bool => TypeExpr::Bool,
-        AttrTypeKind::Duration => TypeExpr::Duration,
-        AttrTypeKind::Custom {
+        AttrTypeKind::String {
+            identity: Some(id), ..
+        }
+        | AttrTypeKind::Int {
+            identity: Some(id), ..
+        }
+        | AttrTypeKind::Float {
             identity: Some(id), ..
         } => match &id.provider {
             Some(provider) => TypeExpr::SchemaType {
@@ -632,7 +636,11 @@ fn attribute_type_to_type_expr(attr_type: &AttributeType) -> TypeExpr {
             },
             None => TypeExpr::Simple(crate::parser::pascal_to_snake(&id.kind)),
         },
-        AttrTypeKind::Custom { base, .. } => attribute_type_to_type_expr(base),
+        AttrTypeKind::String { .. } => TypeExpr::String,
+        AttrTypeKind::Int { .. } => TypeExpr::Int,
+        AttrTypeKind::Float { .. } => TypeExpr::Float,
+        AttrTypeKind::Bool => TypeExpr::Bool,
+        AttrTypeKind::Duration => TypeExpr::Duration,
         AttrTypeKind::Enum {
             identity,
             values,
@@ -650,9 +658,10 @@ fn attribute_type_to_type_expr(attr_type: &AttributeType) -> TypeExpr {
             }
         }
         AttrTypeKind::Enum { .. } => TypeExpr::String,
-        AttrTypeKind::List { inner, .. } => {
-            TypeExpr::List(Box::new(attribute_type_to_type_expr(inner)))
-        }
+        AttrTypeKind::List {
+            element_type: inner,
+            ..
+        } => TypeExpr::List(Box::new(attribute_type_to_type_expr(inner))),
         AttrTypeKind::Map { value, .. } => {
             TypeExpr::Map(Box::new(attribute_type_to_type_expr(value)))
         }

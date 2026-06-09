@@ -14,9 +14,7 @@ use crate::parser::{
 };
 use crate::provider::ProviderFactory;
 use crate::resource::{ConcreteValue, DeferredValue, Resource, Value};
-use crate::schema::{
-    AttrTypeKind, AttributeType, SchemaRegistry, Shape, TypeIdentity, suggest_similar_name,
-};
+use crate::schema::{AttributeType, SchemaRegistry, Shape, TypeIdentity, suggest_similar_name};
 
 /// Render the trailing `" Did you mean 'X'?"` segment for an unknown
 /// name in a diagnostic, or an empty string when nothing close enough
@@ -492,8 +490,8 @@ pub fn is_type_expr_compatible_with_schema(
             is_string_compatible_type(attr_type, defs)
         }
         TypeExpr::Bool => matches!(attr_type.shape_with_defs(defs), Shape::Bool),
-        TypeExpr::Int => matches!(attr_type.shape_with_defs(defs), Shape::Int),
-        TypeExpr::Float => matches!(attr_type.shape_with_defs(defs), Shape::Float),
+        TypeExpr::Int => matches!(attr_type.shape_with_defs(defs), Shape::Int { .. }),
+        TypeExpr::Float => matches!(attr_type.shape_with_defs(defs), Shape::Float { .. }),
         TypeExpr::Duration => matches!(attr_type.shape_with_defs(defs), Shape::Duration),
         TypeExpr::Simple(name) => {
             // Two compatibility directions both succeed:
@@ -516,18 +514,25 @@ pub fn is_type_expr_compatible_with_schema(
             //
             // The walk traverses post-Ref-peel shapes so a `Ref`
             // pointing at a `Custom` chain is followed correctly.
-            let mut current: &AttributeType = attr_type;
-            loop {
-                let resolved = current.resolve_refs_with_defs(defs);
-                let resolved_attr = resolved.as_attr();
-                let type_snake = crate::parser::pascal_to_snake(&resolved_attr.type_name());
-                if type_snake == *name {
+            let resolved = attr_type.resolve_refs_with_defs(defs);
+            let resolved_attr = resolved.as_attr();
+            let type_snake = crate::parser::pascal_to_snake(&resolved_attr.type_name());
+            if type_snake == *name {
+                return true;
+            }
+            match resolved_attr.shape_with_defs(defs) {
+                Shape::String {
+                    identity: Some(id), ..
+                }
+                | Shape::Int {
+                    identity: Some(id), ..
+                }
+                | Shape::Float {
+                    identity: Some(id), ..
+                } if crate::parser::pascal_to_snake(&id.kind) == *name => {
                     return true;
                 }
-                match resolved_attr.kind() {
-                    AttrTypeKind::Custom { base, .. } => current = base.as_ref(),
-                    _ => break,
-                }
+                _ => {}
             }
             if is_plain_string_or_string_union(attr_type, defs) {
                 return true;
@@ -548,15 +553,13 @@ pub fn is_type_expr_compatible_with_schema(
                     .expect("Shape::Union must expose union members internally");
                 let has_plain_string = members
                     .iter()
-                    .any(|m| matches!(m.shape_with_defs(defs), Shape::String));
+                    .any(|m| is_plain_string_or_string_union(m, defs));
                 let others_shape_disjoint = members.iter().all(|m| {
-                    matches!(
-                        m.shape_with_defs(defs),
-                        Shape::String
-                            | Shape::List { .. }
-                            | Shape::Map { .. }
-                            | Shape::Struct { .. }
-                    )
+                    is_plain_string_or_string_union(m, defs)
+                        || matches!(
+                            m.shape_with_defs(defs),
+                            Shape::List { .. } | Shape::Map { .. } | Shape::Struct { .. }
+                        )
                 });
                 if has_plain_string && others_shape_disjoint {
                     return true;
@@ -566,7 +569,7 @@ pub fn is_type_expr_compatible_with_schema(
         }
         TypeExpr::List(inner) => match attr_type.shape_with_defs(defs) {
             Shape::List {
-                inner: schema_inner,
+                element_type: schema_inner,
                 ..
             } => is_type_expr_compatible_with_schema(inner, schema_inner, defs),
             _ => false,
@@ -636,13 +639,13 @@ pub fn is_string_compatible_type(
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> bool {
     match attr_type.shape_with_defs(defs) {
-        Shape::String | Shape::Custom { .. } | Shape::Enum { .. } => true,
+        Shape::String { .. } | Shape::Enum { .. } => true,
         Shape::Union => crate::schema::union_members_with_defs(attr_type, defs)
             .expect("Shape::Union must expose union members internally")
             .iter()
             .all(|t| is_string_compatible_type(t, defs)),
-        Shape::Int
-        | Shape::Float
+        Shape::Int { .. }
+        | Shape::Float { .. }
         | Shape::Bool
         | Shape::Duration
         | Shape::List { .. }
@@ -661,16 +664,21 @@ fn is_plain_string_or_string_union(
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> bool {
     match attr_type.shape_with_defs(defs) {
-        Shape::String => true,
+        Shape::String {
+            identity: None,
+            pattern: None,
+            length: None,
+            ..
+        } => true,
+        Shape::String { .. } => false,
         Shape::Union => crate::schema::union_members_with_defs(attr_type, defs)
             .expect("Shape::Union must expose union members internally")
             .iter()
             .all(|t| is_plain_string_or_string_union(t, defs)),
-        Shape::Int
-        | Shape::Float
+        Shape::Int { .. }
+        | Shape::Float { .. }
         | Shape::Bool
         | Shape::Duration
-        | Shape::Custom { .. }
         | Shape::Enum { .. }
         | Shape::List { .. }
         | Shape::Map { .. }
@@ -703,17 +711,16 @@ fn attr_type_demands_specific_custom(
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> bool {
     match attr_type.shape_with_defs(defs) {
-        Shape::Custom {
+        Shape::String {
             identity: Some(_), ..
         } => true,
-        Shape::Custom { identity: None, .. } => false,
+        Shape::String { identity: None, .. } => false,
         Shape::Union => crate::schema::union_members_with_defs(attr_type, defs)
             .expect("Shape::Union must expose union members internally")
             .iter()
             .any(|t| attr_type_demands_specific_custom(t, defs)),
-        Shape::String
-        | Shape::Int
-        | Shape::Float
+        Shape::Int { .. }
+        | Shape::Float { .. }
         | Shape::Bool
         | Shape::Duration
         | Shape::Enum { .. }
@@ -1539,7 +1546,10 @@ pub(crate) fn narrow_attribute_type<'a>(
                 PathSegment::Subscript {
                     index: Subscript::Int { .. },
                 },
-                Shape::List { inner, .. },
+                Shape::List {
+                    element_type: inner,
+                    ..
+                },
             ) => inner,
             (
                 PathSegment::Subscript {

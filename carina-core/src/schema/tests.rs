@@ -2860,12 +2860,18 @@ fn resolved_attr_type_never_returns_ref_after_peel() {
         !matches!(resolved.as_attr().kind(), AttrTypeKind::Ref(_)),
         "resolve_refs must never return a Ref after peeling"
     );
-    assert!(matches!(resolved.as_attr().kind(), AttrTypeKind::String));
+    assert!(matches!(
+        resolved.as_attr().kind(),
+        AttrTypeKind::String { .. }
+    ));
 
     // Non-Ref input is returned as-is (identity behavior).
     let plain = AttributeType::int();
     let resolved = plain.resolve_refs_with_defs(&defs);
-    assert!(matches!(resolved.as_attr().kind(), AttrTypeKind::Int));
+    assert!(matches!(
+        resolved.as_attr().kind(),
+        AttrTypeKind::Int { .. }
+    ));
 }
 
 #[test]
@@ -2903,9 +2909,13 @@ fn shape_ref_free_projects_non_ref_shape() {
         .shape_ref_free()
         .expect("non-Ref shape is projectable")
     {
-        Shape::List { inner, ordered } => {
+        Shape::List {
+            element_type: inner,
+            ordered,
+            ..
+        } => {
             assert!(ordered);
-            assert!(matches!(inner.kind(), AttrTypeKind::String));
+            assert!(matches!(inner.kind(), AttrTypeKind::String { .. }));
         }
         other => panic!("expected list shape, got {other:?}"),
     }
@@ -2936,11 +2946,11 @@ mod projection_api_guard {
         let attr_type = AttributeType::string();
         assert!(matches!(
             attr_type.shape_ref_free().expect("string is Ref-free"),
-            Shape::String
+            Shape::String { .. }
         ));
 
         let schema = Schema::flat(AttributeType::int());
-        assert!(matches!(schema.shape_of(&schema.root), Shape::Int));
+        assert!(matches!(schema.shape_of(&schema.root), Shape::Int { .. }));
     }
 }
 
@@ -3665,7 +3675,7 @@ fn custom_carries_semantic_name_pattern_length() {
         None,
     );
     match t.kind() {
-        AttrTypeKind::Custom {
+        AttrTypeKind::String {
             identity,
             pattern,
             length,
@@ -3675,7 +3685,7 @@ fn custom_carries_semantic_name_pattern_length() {
             assert_eq!(pattern.as_deref(), Some("^vpc-[a-f0-9]+$"));
             assert_eq!(*length, Some((Some(8), Some(21))));
         }
-        _ => panic!("expected Custom"),
+        _ => panic!("expected refined String"),
     }
 }
 
@@ -3840,7 +3850,7 @@ fn custom_length_enforces_minimum_bound() {
 }
 
 #[test]
-fn custom_non_string_base_skips_pattern_and_length() {
+fn custom_int_base_maps_length_to_range() {
     let attr = AttributeType::custom(
         None,
         AttributeType::int(),
@@ -3851,8 +3861,12 @@ fn custom_non_string_base_skips_pattern_and_length() {
     );
 
     assert!(
-        attr.validate(&Value::Concrete(ConcreteValue::Int(5)))
+        attr.validate(&Value::Concrete(ConcreteValue::Int(150)))
             .is_ok()
+    );
+    assert!(
+        attr.validate(&Value::Concrete(ConcreteValue::Int(5)))
+            .is_err()
     );
 }
 
@@ -3980,13 +3994,12 @@ fn validate_email_function_directly() {
 fn validate_email_type() {
     let t = types::email();
 
-    // Type identity: Custom with kind "Email" and String base
+    // Type identity: refined String with kind "Email"
     match t.kind() {
-        AttrTypeKind::Custom { identity, base, .. } => {
+        AttrTypeKind::String { identity, .. } => {
             assert_eq!(identity.as_ref().map(|id| id.kind.as_str()), Some("Email"));
-            assert!(matches!(base.kind(), AttrTypeKind::String));
         }
-        other => panic!("Expected AttributeType::Custom, got: {:?}", other),
+        other => panic!("Expected refined String, got: {:?}", other),
     }
 
     // Valid emails
@@ -6050,9 +6063,12 @@ fn raw_shape_passes_through_non_ref_variants() {
     // Sanity check that non-Ref variants still project correctly.
     assert!(matches!(
         AttributeType::string().raw_shape(),
-        RawShape::String
+        RawShape::String { .. }
     ));
-    assert!(matches!(AttributeType::int().raw_shape(), RawShape::Int));
+    assert!(matches!(
+        AttributeType::int().raw_shape(),
+        RawShape::Int { .. }
+    ));
     assert!(matches!(AttributeType::bool().raw_shape(), RawShape::Bool));
     match AttributeType::list(AttributeType::string()).raw_shape() {
         RawShape::List { ordered, .. } => assert!(ordered),

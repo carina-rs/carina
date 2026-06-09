@@ -1228,24 +1228,14 @@ fn union_string_or_list_non_canonical_mixed_shapes_fail_to_equal() {
 }
 
 #[test]
-fn union_string_or_list_through_custom_wrapper() {
-    // `Custom` wrappers around the union must remain transparent —
-    // the comparator delegates `Custom { base, .. }` to its `base`.
-    let inner = string_or_list_of_strings_type();
-    let custom = AttributeType::custom(
-        Some(TypeIdentity::bare("PolicyConditionValue")),
-        inner,
-        None,
-        None,
-        std::sync::Arc::new(|_| Ok(())),
-        None,
-    );
+fn union_string_or_list_compares_string_list() {
+    let union = string_or_list_of_strings_type();
     let a = Value::Concrete(ConcreteValue::StringList(vec!["x".to_string()]));
     let b = Value::Concrete(ConcreteValue::StringList(vec!["x".to_string()]));
     assert!(type_aware_equal(
         &a,
         &b,
-        Some(&custom),
+        Some(&union),
         crate::schema::empty_defs_for_schema_walks(),
         None
     ));

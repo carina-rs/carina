@@ -193,7 +193,7 @@ impl DiagnosticEngine {
             // `List<Ref<Rule>>` field (same bug class as carina#3349).
             let is_list_struct = matches!(
                 schema.shape_of(&attr_schema.attr_type),
-                Shape::List { inner, .. } if matches!(
+                Shape::List { element_type: inner, .. } if matches!(
                     schema.shape_of(inner),
                     Shape::Struct { .. }
                 )

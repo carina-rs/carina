@@ -346,7 +346,10 @@ fn map_entry_subtype<'a>(
         // variant. `shape(defs)` panics on a dangling `Ref` —
         // schema-construction bug, surfaced loudly.
         match t.shape_with_defs(defs) {
-            crate::schema::Shape::List { inner, .. } => t = inner,
+            crate::schema::Shape::List {
+                element_type: inner,
+                ..
+            } => t = inner,
             crate::schema::Shape::Map { value, .. } => return Some(value),
             crate::schema::Shape::Struct { .. } => {
                 let fields = crate::schema::struct_fields_with_defs(t, defs)
@@ -1220,7 +1223,13 @@ fn compute_list_of_maps_diff_parts(
     // as carina#3349. `resolve_refs` is a no-op on non-Ref inputs.
     let attr_type_peeled = attr_type.map(|t| t.resolve_refs_with_defs(defs).as_attr());
     let item_type = match attr_type_peeled.map(|t| (&t.kind, t)) {
-        Some((crate::schema::AttrTypeKind::List { inner, .. }, _)) => Some(inner.as_ref()),
+        Some((
+            crate::schema::AttrTypeKind::List {
+                element_type: inner,
+                ..
+            },
+            _,
+        )) => Some(inner.as_ref()),
         // The attribute itself may already be the element type when
         // this is reached recursively from a Map value.
         _ => attr_type_peeled,
@@ -1537,7 +1546,10 @@ fn compute_string_list_change(
 fn string_list_inner_type(attr_type: &AttributeType) -> Option<&AttributeType> {
     use crate::schema::AttrTypeKind;
     match &attr_type.kind {
-        AttrTypeKind::List { inner, .. } => Some(inner),
+        AttrTypeKind::List {
+            element_type: inner,
+            ..
+        } => Some(inner),
         AttrTypeKind::Union(members) => members.iter().find_map(string_list_inner_type),
         // `AttributeType::Ref` (carina#3340): in CFN-derived schemas
         // the resolved target is a `Struct`, never a `List<String>`.
@@ -1546,13 +1558,12 @@ fn string_list_inner_type(attr_type: &AttributeType) -> Option<&AttributeType> {
         // `Ref` for list shapes would need to thread `&defs` and
         // resolve here.
         AttrTypeKind::Ref(_) => None,
-        AttrTypeKind::String
-        | AttrTypeKind::Int
-        | AttrTypeKind::Float
+        AttrTypeKind::String { .. }
+        | AttrTypeKind::Int { .. }
+        | AttrTypeKind::Float { .. }
         | AttrTypeKind::Bool
         | AttrTypeKind::Duration
         | AttrTypeKind::Enum { .. }
-        | AttrTypeKind::Custom { .. }
         | AttrTypeKind::Map { .. }
         | AttrTypeKind::Struct { .. } => None,
     }

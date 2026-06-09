@@ -41,7 +41,7 @@ impl fmt::Display for RefEncountered {
 /// Type alias for resource validator functions
 pub type ResourceValidator = fn(&HashMap<String, Value>) -> Result<(), Vec<TypeError>>;
 
-/// Validator stored on `AttrTypeKind::Custom`. Boxed as `Arc<dyn Fn>` so it
+/// Validator stored on refined primitive/list shapes. Boxed as `Arc<dyn Fn>` so it
 /// can capture provider-side state (region, account ID, schema handles) and
 /// return a structured `TypeError` directly — both of which a bare `fn`
 /// pointer cannot do. See #2217.
@@ -58,6 +58,10 @@ where
     Arc::new(f)
 }
 
+fn noop_validator() -> CustomValidator {
+    validator(|_| Ok(()))
+}
+
 /// Build a [`CustomValidator`] from a closure that still uses the legacy
 /// `Result<(), String>` shape. The returned message is wrapped in
 /// `TypeError::ValidationFailed`. Use this for builtins that haven't yet
@@ -69,7 +73,7 @@ where
     Arc::new(move |v| f(v).map_err(|message| TypeError::ValidationFailed { message }))
 }
 
-/// External validator looked up by `AttrTypeKind::Custom.identity`
+/// External validator looked up by refined primitive identity.
 /// at validation time. Used to bridge to provider-supplied validators
 /// (the `ProviderContext.validators` map and WASM factory's
 /// `validate_custom_type`) that the schema itself cannot carry across
@@ -143,7 +147,7 @@ fn enum_binding_collision_message(
     )
 }
 
-/// Walk an [`AttributeType`] and apply `lookup` to every `Custom` node
+/// Walk an [`AttributeType`] and apply `lookup` to every identified refined node
 /// reached. Pushes any returned error into `errors`, tagged with
 /// `attr_name` so it points back at the user-visible attribute. Used
 /// by `ResourceSchema::validate_inner` to bridge provider-supplied
@@ -172,24 +176,10 @@ fn walk_custom_lookup(
         return;
     }
     match &attr_type.kind {
-        AttrTypeKind::Custom { identity, .. } => {
-            if let Some(id) = identity
-                && let Err(e) = lookup(id, value)
-            {
-                // Re-wrap as `ResourceValidationFailed` so the attribute
-                // slot survives. `with_attribute` only enriches the two
-                // enum-variant errors; bare `ValidationFailed` would
-                // arrive at the LSP without a position hint and get
-                // filtered out by the resource-level dedup.
-                let message = match e {
-                    TypeError::ValidationFailed { message } => message,
-                    other => other.to_string(),
-                };
-                errors.push(TypeError::ResourceValidationFailed {
-                    message,
-                    attribute: Some(attr_name.to_string()),
-                });
-            }
+        AttrTypeKind::String { identity, .. }
+        | AttrTypeKind::Int { identity, .. }
+        | AttrTypeKind::Float { identity, .. } => {
+            run_identified_lookup(identity.as_ref(), value, attr_name, lookup, errors)
         }
         AttrTypeKind::Enum { identity, .. } => {
             if let Err(e) = lookup(identity, value) {
@@ -203,7 +193,10 @@ fn walk_custom_lookup(
                 });
             }
         }
-        AttrTypeKind::List { inner, .. } => {
+        AttrTypeKind::List {
+            element_type: inner,
+            ..
+        } => {
             if let Value::Concrete(ConcreteValue::List(items)) = value {
                 for item in items {
                     walk_custom_lookup(inner, item, attr_name, lookup, defs, errors);
@@ -255,11 +248,7 @@ fn walk_custom_lookup(
                 errors.extend(b);
             }
         }
-        AttrTypeKind::String
-        | AttrTypeKind::Int
-        | AttrTypeKind::Float
-        | AttrTypeKind::Bool
-        | AttrTypeKind::Duration => {}
+        AttrTypeKind::Bool | AttrTypeKind::Duration => {}
         // `Ref`: resolve via the schema's def map and continue the
         // walk. The resolved target (typically a `Struct`) may carry
         // identity-bearing custom types whose validators must run.
@@ -276,6 +265,27 @@ fn walk_custom_lookup(
                 // the dangling-Ref diagnostic for this attribute.
             }
         },
+    }
+}
+
+fn run_identified_lookup(
+    identity: Option<&TypeIdentity>,
+    value: &Value,
+    attr_name: &str,
+    lookup: CustomTypeLookup<'_>,
+    errors: &mut Vec<TypeError>,
+) {
+    if let Some(id) = identity
+        && let Err(e) = lookup(id, value)
+    {
+        let message = match e {
+            TypeError::ValidationFailed { message } => message,
+            other => other.to_string(),
+        };
+        errors.push(TypeError::ResourceValidationFailed {
+            message,
+            attribute: Some(attr_name.to_string()),
+        });
     }
 }
 
@@ -437,11 +447,25 @@ pub struct AttributeType {
 #[derive(Clone)]
 pub(crate) enum AttrTypeKind {
     /// String
-    String,
+    String {
+        identity: Option<TypeIdentity>,
+        pattern: Option<String>,
+        length: Option<(Option<u64>, Option<u64>)>,
+        validate: CustomValidator,
+        to_dsl: Option<DslTransform>,
+    },
     /// Integer
-    Int,
+    Int {
+        identity: Option<TypeIdentity>,
+        range: Option<(Option<i64>, Option<i64>)>,
+        validate: CustomValidator,
+    },
     /// Floating-point number
-    Float,
+    Float {
+        identity: Option<TypeIdentity>,
+        range: Option<(Option<f64>, Option<f64>)>,
+        validate: CustomValidator,
+    },
     /// Boolean
     Bool,
     /// Time duration. Values use the `<integer><unit>` literal
@@ -468,53 +492,15 @@ pub(crate) enum AttrTypeKind {
         /// Optional API → DSL transform for dynamic enum spaces.
         to_dsl: Option<DslTransform>,
     },
-    /// Structurally-validated custom type — values carry their own
-    /// format (e.g. `arn:aws:s3:::bucket-name`, `vpc-12345678`) and
-    /// reach the validator verbatim. Distinct from [`AttrTypeKind::Enum`],
-    /// which gates enum shorthand through `expand_enum_shorthand`.
-    ///
-    /// The split was introduced in carina#3222 (S2.5c-followup) so the
-    /// enum-shorthand vs structural divide is a compile-time fact
-    /// rather than a runtime `namespace.is_some()` check — the
-    /// carina#3216 class of mis-expansion (`aws.Arn.arn:aws:s3:...`)
-    /// is structurally impossible under this shape.
-    Custom {
-        /// `Some(identity)` when this type carries a structured type
-        /// identity (e.g. `aws.iam.Role.Arn`, `aws.VpcId`). `None` when
-        /// this is a generic string/int pattern type synthesized by
-        /// codegen for a property without a named semantic.
-        ///
-        /// Replaces the former flat `semantic_name: Option<String>`:
-        /// keying identity on discrete `provider + segments + kind`
-        /// axes keeps two providers' same-named types distinct. See
-        /// [`TypeIdentity`].
-        identity: Option<TypeIdentity>,
-        base: Box<AttributeType>,
-        /// Optional regex pattern constraint (for structural comparison).
-        pattern: Option<String>,
-        /// Optional length bounds (min, max).
-        length: Option<(Option<u64>, Option<u64>)>,
-        validate: CustomValidator,
-        /// Optional value-level normalization callback applied when
-        /// the provider reads a state value back from the SDK. For
-        /// example, `route53.hosted_zone.name` arrives with a trailing
-        /// `.` that the DSL form does not carry — the closure strips
-        /// it so the differ does not report a phantom diff.
-        ///
-        /// Distinct from [`AttrTypeKind::Enum`]'s `to_dsl`, which
-        /// expands the *DSL spelling* of enum variants. Here the
-        /// closure is a generic state→DSL normalizer.
-        /// `Option<fn>` because closures cannot cross the WASM
-        /// boundary; structural normalization is host-side only.
-        to_dsl: Option<fn(&str) -> String>,
-    },
     /// List
     /// `ordered`: if true, element order matters (sequential comparison);
     /// if false, order is ignored (multiset comparison).
     /// Defaults to true (matching CloudFormation's insertionOrder default).
     List {
-        inner: Box<AttributeType>,
+        element_type: Box<AttributeType>,
         ordered: bool,
+        length: Option<(Option<u64>, Option<u64>)>,
+        validate: CustomValidator,
     },
     /// Map with typed keys and values.
     /// `key`: type constraint for map keys (e.g., `String` for unconstrained,
@@ -565,12 +551,26 @@ pub(crate) enum AttrTypeKind {
 /// enum and the compiler will surface the omission.
 #[derive(Clone, Copy)]
 pub enum Shape<'a> {
-    /// String — see [`AttrTypeKind::String`].
-    String,
-    /// Integer — see [`AttrTypeKind::Int`].
-    Int,
-    /// Floating-point — see [`AttrTypeKind::Float`].
-    Float,
+    /// String — see [`AttrTypeKind::String { .. }`].
+    String {
+        identity: Option<&'a TypeIdentity>,
+        pattern: Option<&'a str>,
+        length: Option<(Option<u64>, Option<u64>)>,
+        validate: &'a CustomValidator,
+        to_dsl: Option<&'a DslTransform>,
+    },
+    /// Integer — see [`AttrTypeKind::Int { .. }`].
+    Int {
+        identity: Option<&'a TypeIdentity>,
+        range: Option<(Option<i64>, Option<i64>)>,
+        validate: &'a CustomValidator,
+    },
+    /// Floating-point — see [`AttrTypeKind::Float { .. }`].
+    Float {
+        identity: Option<&'a TypeIdentity>,
+        range: Option<(Option<f64>, Option<f64>)>,
+        validate: &'a CustomValidator,
+    },
     /// Boolean — see [`AttrTypeKind::Bool`].
     Bool,
     /// Time duration — see [`AttrTypeKind::Duration`].
@@ -584,19 +584,12 @@ pub enum Shape<'a> {
         validate: Option<&'a CustomValidator>,
         to_dsl: Option<&'a DslTransform>,
     },
-    /// Structural custom type — see [`AttrTypeKind::Custom`].
-    Custom {
-        identity: Option<&'a TypeIdentity>,
-        base: &'a AttributeType,
-        pattern: Option<&'a str>,
-        length: Option<(Option<u64>, Option<u64>)>,
-        validate: &'a CustomValidator,
-        to_dsl: Option<fn(&str) -> String>,
-    },
     /// List with element type and ordering — see [`AttrTypeKind::List`].
     List {
-        inner: &'a AttributeType,
+        element_type: &'a AttributeType,
         ordered: bool,
+        length: Option<(Option<u64>, Option<u64>)>,
+        validate: &'a CustomValidator,
     },
     /// Map with typed key/value — see [`AttrTypeKind::Map`].
     Map {
@@ -642,9 +635,36 @@ impl ShapeWalkBudget {
 impl fmt::Debug for Shape<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Shape::String => f.write_str("Shape::String"),
-            Shape::Int => f.write_str("Shape::Int"),
-            Shape::Float => f.write_str("Shape::Float"),
+            Shape::String {
+                identity,
+                pattern,
+                length,
+                validate: _,
+                to_dsl: _,
+            } => f
+                .debug_struct("Shape::String { .. }")
+                .field("identity", identity)
+                .field("pattern", pattern)
+                .field("length", length)
+                .finish_non_exhaustive(),
+            Shape::Int {
+                identity,
+                range,
+                validate: _,
+            } => f
+                .debug_struct("Shape::Int { .. }")
+                .field("identity", identity)
+                .field("range", range)
+                .finish_non_exhaustive(),
+            Shape::Float {
+                identity,
+                range,
+                validate: _,
+            } => f
+                .debug_struct("Shape::Float { .. }")
+                .field("identity", identity)
+                .field("range", range)
+                .finish_non_exhaustive(),
             Shape::Bool => f.write_str("Shape::Bool"),
             Shape::Duration => f.write_str("Shape::Duration"),
             Shape::Enum {
@@ -661,25 +681,17 @@ impl fmt::Debug for Shape<'_> {
                 .field("values", values)
                 .field("dsl_aliases", dsl_aliases)
                 .finish_non_exhaustive(),
-            Shape::Custom {
-                identity,
-                base,
-                pattern,
+            Shape::List {
+                element_type,
+                ordered,
                 length,
                 validate: _,
-                to_dsl: _,
             } => f
-                .debug_struct("Shape::Custom")
-                .field("identity", identity)
-                .field("base", base)
-                .field("pattern", pattern)
+                .debug_struct("Shape::List")
+                .field("element_type", element_type)
+                .field("ordered", ordered)
                 .field("length", length)
                 .finish_non_exhaustive(),
-            Shape::List { inner, ordered } => f
-                .debug_struct("Shape::List")
-                .field("inner", inner)
-                .field("ordered", ordered)
-                .finish(),
             Shape::Map { key, value } => f
                 .debug_struct("Shape::Map")
                 .field("key", key)
@@ -713,12 +725,26 @@ impl fmt::Debug for Shape<'_> {
 /// against the source enum and the compiler will surface the omission.
 #[derive(Clone, Copy)]
 pub enum RawShape<'a> {
-    /// String — see [`AttrTypeKind::String`].
-    String,
-    /// Integer — see [`AttrTypeKind::Int`].
-    Int,
-    /// Floating-point — see [`AttrTypeKind::Float`].
-    Float,
+    /// String — see [`AttrTypeKind::String { .. }`].
+    String {
+        identity: Option<&'a TypeIdentity>,
+        pattern: Option<&'a str>,
+        length: Option<(Option<u64>, Option<u64>)>,
+        validate: &'a CustomValidator,
+        to_dsl: Option<&'a DslTransform>,
+    },
+    /// Integer — see [`AttrTypeKind::Int { .. }`].
+    Int {
+        identity: Option<&'a TypeIdentity>,
+        range: Option<(Option<i64>, Option<i64>)>,
+        validate: &'a CustomValidator,
+    },
+    /// Floating-point — see [`AttrTypeKind::Float { .. }`].
+    Float {
+        identity: Option<&'a TypeIdentity>,
+        range: Option<(Option<f64>, Option<f64>)>,
+        validate: &'a CustomValidator,
+    },
     /// Boolean — see [`AttrTypeKind::Bool`].
     Bool,
     /// Time duration — see [`AttrTypeKind::Duration`].
@@ -732,19 +758,12 @@ pub enum RawShape<'a> {
         validate: Option<&'a CustomValidator>,
         to_dsl: Option<&'a DslTransform>,
     },
-    /// Structural custom type — see [`AttrTypeKind::Custom`].
-    Custom {
-        identity: Option<&'a TypeIdentity>,
-        base: &'a AttributeType,
-        pattern: Option<&'a str>,
-        length: Option<(Option<u64>, Option<u64>)>,
-        validate: &'a CustomValidator,
-        to_dsl: Option<fn(&str) -> String>,
-    },
     /// List with element type and ordering — see [`AttrTypeKind::List`].
     List {
-        inner: &'a AttributeType,
+        element_type: &'a AttributeType,
         ordered: bool,
+        length: Option<(Option<u64>, Option<u64>)>,
+        validate: &'a CustomValidator,
     },
     /// Map with typed key/value — see [`AttrTypeKind::Map`].
     Map {
@@ -767,9 +786,36 @@ pub enum RawShape<'a> {
 impl fmt::Debug for RawShape<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            RawShape::String => f.write_str("RawShape::String"),
-            RawShape::Int => f.write_str("RawShape::Int"),
-            RawShape::Float => f.write_str("RawShape::Float"),
+            RawShape::String {
+                identity,
+                pattern,
+                length,
+                validate: _,
+                to_dsl: _,
+            } => f
+                .debug_struct("RawShape::String { .. }")
+                .field("identity", identity)
+                .field("pattern", pattern)
+                .field("length", length)
+                .finish_non_exhaustive(),
+            RawShape::Int {
+                identity,
+                range,
+                validate: _,
+            } => f
+                .debug_struct("RawShape::Int { .. }")
+                .field("identity", identity)
+                .field("range", range)
+                .finish_non_exhaustive(),
+            RawShape::Float {
+                identity,
+                range,
+                validate: _,
+            } => f
+                .debug_struct("RawShape::Float { .. }")
+                .field("identity", identity)
+                .field("range", range)
+                .finish_non_exhaustive(),
             RawShape::Bool => f.write_str("RawShape::Bool"),
             RawShape::Duration => f.write_str("RawShape::Duration"),
             RawShape::Enum {
@@ -786,25 +832,17 @@ impl fmt::Debug for RawShape<'_> {
                 .field("values", values)
                 .field("dsl_aliases", dsl_aliases)
                 .finish_non_exhaustive(),
-            RawShape::Custom {
-                identity,
-                base,
-                pattern,
+            RawShape::List {
+                element_type,
+                ordered,
                 length,
                 validate: _,
-                to_dsl: _,
             } => f
-                .debug_struct("RawShape::Custom")
-                .field("identity", identity)
-                .field("base", base)
-                .field("pattern", pattern)
+                .debug_struct("RawShape::List")
+                .field("element_type", element_type)
+                .field("ordered", ordered)
                 .field("length", length)
                 .finish_non_exhaustive(),
-            RawShape::List { inner, ordered } => f
-                .debug_struct("RawShape::List")
-                .field("inner", inner)
-                .field("ordered", ordered)
-                .finish(),
             RawShape::Map { key, value } => f
                 .debug_struct("RawShape::Map")
                 .field("key", key)
@@ -864,7 +902,7 @@ impl Schema {
     /// **Do not** call [`Self::validate`] or [`Self::validate_collect`]
     /// on a Schema produced by `with_defs`; those entry points walk
     /// `self.root`, which here is a non-load-bearing
-    /// `AttrTypeKind::String` and will silently validate every
+    /// `AttrTypeKind::String { .. }` and will silently validate every
     /// value as a String.
     pub fn with_defs(defs: std::collections::BTreeMap<String, AttributeType>) -> Self {
         Self {
@@ -1024,7 +1062,10 @@ impl Schema {
                     }
                 }
             }
-            AttrTypeKind::List { inner, .. } => {
+            AttrTypeKind::List {
+                element_type: inner,
+                ..
+            } => {
                 let Some(items) = (match concrete {
                     ConcreteValueRef::List(items) => Some(items),
                     _ => None,
@@ -1081,7 +1122,12 @@ impl Schema {
                     ),
                 }),
             },
-            AttrTypeKind::List { inner, ordered } => {
+            AttrTypeKind::List {
+                element_type: inner,
+                ordered,
+                length,
+                validate,
+            } => {
                 if let Some(ConcreteValueRef::List(items)) = value.as_concrete() {
                     for (i, item) in items.iter().enumerate() {
                         if let Err(inner_err) = self.validate_attr(inner, item) {
@@ -1102,8 +1148,10 @@ impl Schema {
                     let _ = ordered;
                     AttributeType {
                         kind: AttrTypeKind::List {
-                            inner: inner.clone(),
+                            element_type: inner.clone(),
                             ordered: *ordered,
+                            length: *length,
+                            validate: validate.clone(),
                         },
                     }
                     .validate(value)
@@ -1227,9 +1275,40 @@ impl fmt::Debug for AttributeType {
     // variant matches what `#[derive(Debug)]` would produce.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
-            AttrTypeKind::String => f.write_str("String"),
-            AttrTypeKind::Int => f.write_str("Int"),
-            AttrTypeKind::Float => f.write_str("Float"),
+            AttrTypeKind::String {
+                identity,
+                pattern,
+                length,
+                to_dsl,
+                validate: _,
+            } => f
+                .debug_struct("String")
+                .field("identity", identity)
+                .field("pattern", pattern)
+                .field("length", length)
+                .field("to_dsl", to_dsl)
+                .field("validate", &"<closure>")
+                .finish(),
+            AttrTypeKind::Int {
+                identity,
+                range,
+                validate: _,
+            } => f
+                .debug_struct("Int")
+                .field("identity", identity)
+                .field("range", range)
+                .field("validate", &"<closure>")
+                .finish(),
+            AttrTypeKind::Float {
+                identity,
+                range,
+                validate: _,
+            } => f
+                .debug_struct("Float")
+                .field("identity", identity)
+                .field("range", range)
+                .field("validate", &"<closure>")
+                .finish(),
             AttrTypeKind::Bool => f.write_str("Bool"),
             AttrTypeKind::Duration => f.write_str("Duration"),
             AttrTypeKind::Enum {
@@ -1248,26 +1327,17 @@ impl fmt::Debug for AttributeType {
                 .field("to_dsl", to_dsl)
                 .field("validate", &"<closure>")
                 .finish(),
-            AttrTypeKind::Custom {
-                identity,
-                base,
-                pattern,
+            AttrTypeKind::List {
+                element_type,
+                ordered,
                 length,
-                to_dsl,
                 validate: _,
             } => f
-                .debug_struct("Custom")
-                .field("identity", identity)
-                .field("base", base)
-                .field("pattern", pattern)
-                .field("length", length)
-                .field("to_dsl", to_dsl)
-                .field("validate", &"<closure>")
-                .finish(),
-            AttrTypeKind::List { inner, ordered } => f
                 .debug_struct("List")
-                .field("inner", inner)
+                .field("element_type", element_type)
                 .field("ordered", ordered)
+                .field("length", length)
+                .field("validate", &"<closure>")
                 .finish(),
             AttrTypeKind::Map { key, value } => f
                 .debug_struct("Map")
@@ -1503,9 +1573,37 @@ impl AttributeType {
 
     fn shape_from_resolved(resolved: &AttributeType) -> Shape<'_> {
         match &resolved.kind {
-            AttrTypeKind::String => Shape::String,
-            AttrTypeKind::Int => Shape::Int,
-            AttrTypeKind::Float => Shape::Float,
+            AttrTypeKind::String {
+                identity,
+                pattern,
+                length,
+                validate,
+                to_dsl,
+            } => Shape::String {
+                identity: identity.as_ref(),
+                pattern: pattern.as_deref(),
+                length: *length,
+                validate,
+                to_dsl: to_dsl.as_ref(),
+            },
+            AttrTypeKind::Int {
+                identity,
+                range,
+                validate,
+            } => Shape::Int {
+                identity: identity.as_ref(),
+                range: *range,
+                validate,
+            },
+            AttrTypeKind::Float {
+                identity,
+                range,
+                validate,
+            } => Shape::Float {
+                identity: identity.as_ref(),
+                range: *range,
+                validate,
+            },
             AttrTypeKind::Bool => Shape::Bool,
             AttrTypeKind::Duration => Shape::Duration,
             AttrTypeKind::Enum {
@@ -1523,24 +1621,16 @@ impl AttributeType {
                 validate: validate.as_ref(),
                 to_dsl: to_dsl.as_ref(),
             },
-            AttrTypeKind::Custom {
-                identity,
-                base,
-                pattern,
+            AttrTypeKind::List {
+                element_type,
+                ordered,
                 length,
                 validate,
-                to_dsl,
-            } => Shape::Custom {
-                identity: identity.as_ref(),
-                base: base.as_ref(),
-                pattern: pattern.as_deref(),
+            } => Shape::List {
+                element_type: element_type.as_ref(),
+                ordered: *ordered,
                 length: *length,
                 validate,
-                to_dsl: *to_dsl,
-            },
-            AttrTypeKind::List { inner, ordered } => Shape::List {
-                inner: inner.as_ref(),
-                ordered: *ordered,
             },
             AttrTypeKind::Map { key, value } => Shape::Map {
                 key: key.as_ref(),
@@ -1575,9 +1665,37 @@ impl AttributeType {
     /// carina#3349 bug class at the walk-site.
     pub fn raw_shape<'a>(&'a self) -> RawShape<'a> {
         match &self.kind {
-            AttrTypeKind::String => RawShape::String,
-            AttrTypeKind::Int => RawShape::Int,
-            AttrTypeKind::Float => RawShape::Float,
+            AttrTypeKind::String {
+                identity,
+                pattern,
+                length,
+                validate,
+                to_dsl,
+            } => RawShape::String {
+                identity: identity.as_ref(),
+                pattern: pattern.as_deref(),
+                length: *length,
+                validate,
+                to_dsl: to_dsl.as_ref(),
+            },
+            AttrTypeKind::Int {
+                identity,
+                range,
+                validate,
+            } => RawShape::Int {
+                identity: identity.as_ref(),
+                range: *range,
+                validate,
+            },
+            AttrTypeKind::Float {
+                identity,
+                range,
+                validate,
+            } => RawShape::Float {
+                identity: identity.as_ref(),
+                range: *range,
+                validate,
+            },
             AttrTypeKind::Bool => RawShape::Bool,
             AttrTypeKind::Duration => RawShape::Duration,
             AttrTypeKind::Enum {
@@ -1595,24 +1713,16 @@ impl AttributeType {
                 validate: validate.as_ref(),
                 to_dsl: to_dsl.as_ref(),
             },
-            AttrTypeKind::Custom {
-                identity,
-                base,
-                pattern,
+            AttrTypeKind::List {
+                element_type,
+                ordered,
                 length,
                 validate,
-                to_dsl,
-            } => RawShape::Custom {
-                identity: identity.as_ref(),
-                base: base.as_ref(),
-                pattern: pattern.as_deref(),
+            } => RawShape::List {
+                element_type: element_type.as_ref(),
+                ordered: *ordered,
                 length: *length,
                 validate,
-                to_dsl: *to_dsl,
-            },
-            AttrTypeKind::List { inner, ordered } => RawShape::List {
-                inner: inner.as_ref(),
-                ordered: *ordered,
             },
             AttrTypeKind::Map { key, value } => RawShape::Map {
                 key: key.as_ref(),
@@ -1639,21 +1749,35 @@ impl AttributeType {
     /// Create the primitive `String` type.
     pub fn string() -> Self {
         AttributeType {
-            kind: AttrTypeKind::String,
+            kind: AttrTypeKind::String {
+                identity: None,
+                pattern: None,
+                length: None,
+                validate: noop_validator(),
+                to_dsl: None,
+            },
         }
     }
 
     /// Create the primitive `Int` type.
     pub fn int() -> Self {
         AttributeType {
-            kind: AttrTypeKind::Int,
+            kind: AttrTypeKind::Int {
+                identity: None,
+                range: None,
+                validate: noop_validator(),
+            },
         }
     }
 
     /// Create the primitive `Float` type.
     pub fn float() -> Self {
         AttributeType {
-            kind: AttrTypeKind::Float,
+            kind: AttrTypeKind::Float {
+                identity: None,
+                range: None,
+                validate: noop_validator(),
+            },
         }
     }
 
@@ -1773,14 +1897,40 @@ impl AttributeType {
         validate: CustomValidator,
         to_dsl: Option<fn(&str) -> String>,
     ) -> Self {
+        assert!(
+            to_dsl.is_none(),
+            "custom shim: function-pointer to_dsl cannot be represented as DslTransform"
+        );
         AttributeType {
-            kind: AttrTypeKind::Custom {
-                identity,
-                base: Box::new(base),
-                pattern,
-                length,
-                validate,
-                to_dsl,
+            kind: match base.kind {
+                AttrTypeKind::String { to_dsl, .. } => AttrTypeKind::String {
+                    identity,
+                    pattern,
+                    length,
+                    validate,
+                    to_dsl,
+                },
+                AttrTypeKind::Int { .. } => AttrTypeKind::Int {
+                    identity,
+                    range: length.map(|(min, max)| (min.map(|v| v as i64), max.map(|v| v as i64))),
+                    validate,
+                },
+                AttrTypeKind::Float { .. } => AttrTypeKind::Float {
+                    identity,
+                    range: None,
+                    validate,
+                },
+                AttrTypeKind::List {
+                    element_type,
+                    ordered,
+                    ..
+                } => AttrTypeKind::List {
+                    element_type,
+                    ordered,
+                    length,
+                    validate,
+                },
+                other => panic!("custom shim: unexpected base {other:?}"),
             },
         }
     }
@@ -1814,8 +1964,10 @@ impl AttributeType {
     pub fn list(inner: AttributeType) -> Self {
         AttributeType {
             kind: AttrTypeKind::List {
-                inner: Box::new(inner),
+                element_type: Box::new(inner),
                 ordered: true,
+                length: None,
+                validate: noop_validator(),
             },
         }
     }
@@ -1824,8 +1976,10 @@ impl AttributeType {
     pub fn unordered_list(inner: AttributeType) -> Self {
         AttributeType {
             kind: AttrTypeKind::List {
-                inner: Box::new(inner),
+                element_type: Box::new(inner),
                 ordered: false,
+                length: None,
+                validate: noop_validator(),
             },
         }
     }
@@ -1961,14 +2115,13 @@ impl AttributeType {
                 validate.as_ref(),
                 value,
             ),
-            AttrTypeKind::Custom { .. } => self.validate_custom(value),
             AttrTypeKind::List { .. } => self.validate_list(value),
             AttrTypeKind::Map { .. } => self.validate_map(value),
             AttrTypeKind::Struct { .. } => self.validate_struct(value),
             AttrTypeKind::Union(_) => self.validate_union(value),
-            AttrTypeKind::String
-            | AttrTypeKind::Int
-            | AttrTypeKind::Float
+            AttrTypeKind::String { .. }
+            | AttrTypeKind::Int { .. }
+            | AttrTypeKind::Float { .. }
             | AttrTypeKind::Bool
             | AttrTypeKind::Duration => self.validate_primitive(value),
             // Unreachable: `validate` rejects `Ref` early before
@@ -1994,13 +2147,51 @@ impl AttributeType {
     /// Value::Deferred(DeferredValue::Interpolation(_))` arm is now structurally unrepresentable.
     fn validate_primitive(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
         match (&self.kind, value) {
-            (AttrTypeKind::String, ConcreteValueRef::String(_)) => Ok(()),
-            (AttrTypeKind::Int, ConcreteValueRef::Int(_)) => Ok(()),
-            (AttrTypeKind::Float, ConcreteValueRef::Float(f)) if f.is_finite() => Ok(()),
-            (AttrTypeKind::Float, ConcreteValueRef::Float(f)) => Err(TypeError::ValidationFailed {
-                message: format!("non-finite float value: {f}"),
-            }),
-            (AttrTypeKind::Float, ConcreteValueRef::Int(_)) => Ok(()),
+            (
+                AttrTypeKind::String {
+                    identity,
+                    pattern,
+                    length,
+                    validate,
+                    ..
+                },
+                ConcreteValueRef::String(s),
+            ) => {
+                validate_string_refinement(identity.as_ref(), pattern.as_deref(), *length, s)?;
+                validate(&value.to_owned_value())
+            }
+            (
+                AttrTypeKind::Int {
+                    range, validate, ..
+                },
+                ConcreteValueRef::Int(i),
+            ) => {
+                validate_int_range(*range, i)?;
+                validate(&value.to_owned_value())
+            }
+            (
+                AttrTypeKind::Float {
+                    range, validate, ..
+                },
+                ConcreteValueRef::Float(f),
+            ) if f.is_finite() => {
+                validate_float_range(*range, f)?;
+                validate(&value.to_owned_value())
+            }
+            (AttrTypeKind::Float { .. }, ConcreteValueRef::Float(f)) => {
+                Err(TypeError::ValidationFailed {
+                    message: format!("non-finite float value: {f}"),
+                })
+            }
+            (
+                AttrTypeKind::Float {
+                    range, validate, ..
+                },
+                ConcreteValueRef::Int(i),
+            ) => {
+                validate_float_range(*range, i as f64)?;
+                validate(&value.to_owned_value())
+            }
             (AttrTypeKind::Bool, ConcreteValueRef::Bool(_)) => Ok(()),
             (AttrTypeKind::Duration, ConcreteValueRef::Duration(_)) => Ok(()),
             _ => Err(TypeError::TypeMismatch {
@@ -2140,75 +2331,6 @@ impl AttributeType {
         }
     }
 
-    /// Validate against a `Custom` variant.
-    ///
-    /// For String-shaped concrete values, this first enforces the schema
-    /// `pattern` constraint, then the `length` constraint using character
-    /// count. Patterns that Rust's regex engine cannot compile are skipped so
-    /// provider schema compatibility issues do not become user validation
-    /// errors (awscc#295). After those structural checks, validation delegates
-    /// to the Custom `validate` closure.
-    ///
-    /// Pre-carina#3222 this function also handled enum-shaped Customs
-    /// (gated on `namespace.is_some()`). Those are now
-    /// [`AttrTypeKind::Enum`], so the structurally-validated arm is the
-    /// only thing left here.
-    ///
-    /// Phase 2 of RFC #2972: takes [`ConcreteValueRef`]. The deferred-skip
-    /// guard for `Value::Deferred(DeferredValue::ResourceRef)`/`Value::Deferred(DeferredValue::Interpolation)` is gone —
-    /// the dispatcher filters them out in [`Self::validate`].
-    fn validate_custom(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
-        let AttrTypeKind::Custom {
-            identity,
-            base: _,
-            pattern,
-            length,
-            validate,
-            to_dsl: _,
-        } = &self.kind
-        else {
-            unreachable!("validate_custom called on non-Custom");
-        };
-        let type_name = identity.as_ref().map(|id| id.kind.clone());
-        // Pattern and length only apply to String-shaped concrete values.
-        // EnumIdentifier/StringList-shaped Custom values are not checked here;
-        // structural string Customs for awscc#295 arrive as String.
-        if let ConcreteValueRef::String(s) = value {
-            if let Some(pattern) = pattern
-                // awscc#295: CloudFormation patterns may contain constructs
-                // Rust's regex crate rejects; skip those provider constraints
-                // instead of reporting a schema-compatibility issue as a user error.
-                && let Ok(re) = regex::Regex::new(pattern)
-                // awscc#295: JSON Schema / CloudControl `pattern` is an
-                // unanchored substring match unless the pattern supplies ^/$.
-                && !re.is_match(s)
-            {
-                return Err(TypeError::PatternMismatch {
-                    value: s.to_string(),
-                    pattern: pattern.clone(),
-                    attribute: None,
-                    type_name,
-                });
-            }
-            if let Some((min, max)) = length {
-                let count = s.chars().count();
-                let count_u64 = count as u64;
-                if min.is_some_and(|min| count_u64 < min) || max.is_some_and(|max| count_u64 > max)
-                {
-                    return Err(TypeError::LengthOutOfRange {
-                        value: s.to_string(),
-                        length: count,
-                        min: *min,
-                        max: *max,
-                        attribute: None,
-                        type_name,
-                    });
-                }
-            }
-        }
-        validate(&value.to_owned_value())
-    }
-
     /// Validate a `List` variant by validating each item with the inner type.
     ///
     /// Phase 2 of RFC #2972 (closes #2954): takes [`ConcreteValueRef`].
@@ -2220,7 +2342,13 @@ impl AttributeType {
     /// `Ok(())` immediately. Type fitness for upstream list refs is
     /// the deferred-aware checker's job.
     fn validate_list(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
-        let AttrTypeKind::List { inner, .. } = &self.kind else {
+        let AttrTypeKind::List {
+            element_type: inner,
+            length,
+            validate,
+            ..
+        } = &self.kind
+        else {
             unreachable!("validate_list called on non-List");
         };
         // `ConcreteValueRef::StringList` is the canonicalized form for
@@ -2228,6 +2356,7 @@ impl AttributeType {
         // Structurally equivalent to a `List` of strings — accept the
         // same way.
         if let ConcreteValueRef::StringList(items) = value {
+            validate_list_length(*length, items.len())?;
             for (i, s) in items.iter().enumerate() {
                 inner
                     .validate(&Value::Concrete(ConcreteValue::String(s.clone())))
@@ -2236,7 +2365,7 @@ impl AttributeType {
                         inner: Box::new(e),
                     })?;
             }
-            return Ok(());
+            return validate(&value.to_owned_value());
         }
         let ConcreteValueRef::List(items) = value else {
             return Err(TypeError::TypeMismatch {
@@ -2244,13 +2373,14 @@ impl AttributeType {
                 got: value.type_name().to_string(),
             });
         };
+        validate_list_length(*length, items.len())?;
         for (i, item) in items.iter().enumerate() {
             inner.validate(item).map_err(|e| TypeError::ListItemError {
                 index: i,
                 inner: Box::new(e),
             })?;
         }
-        Ok(())
+        validate(&value.to_owned_value())
     }
 
     /// Validate a `Map` variant: keys against `key`, values against `value`.
@@ -2395,19 +2525,27 @@ impl AttributeType {
 
     pub fn type_name(&self) -> String {
         match &self.kind {
-            AttrTypeKind::String => "String".to_string(),
-            AttrTypeKind::Int => "Int".to_string(),
-            AttrTypeKind::Float => "Float".to_string(),
             AttrTypeKind::Bool => "Bool".to_string(),
             AttrTypeKind::Duration => "Duration".to_string(),
             AttrTypeKind::Enum { identity, .. } => identity.to_string(),
-            AttrTypeKind::Custom {
+            AttrTypeKind::String {
                 identity,
                 pattern,
                 length,
                 ..
             } => custom_display_name(identity.as_ref(), pattern.as_deref(), length.as_ref()),
-            AttrTypeKind::List { inner, .. } => format!("List<{}>", inner.type_name()),
+            AttrTypeKind::Int { identity, .. } => identity
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "Int".to_string()),
+            AttrTypeKind::Float { identity, .. } => identity
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "Float".to_string()),
+            AttrTypeKind::List {
+                element_type: inner,
+                ..
+            } => format!("List<{}>", inner.type_name()),
             AttrTypeKind::Map { value: inner, .. } => format!("Map<{}>", inner.type_name()),
             AttrTypeKind::Struct { name, .. } => format!("Struct({})", name),
             AttrTypeKind::Union(types) => {
@@ -2432,7 +2570,19 @@ impl AttributeType {
     /// Used for cross-schema type compatibility: all String-based Custom types
     /// are considered compatible with each other.
     pub fn is_string_based_custom(&self) -> bool {
-        matches!(&self.kind, AttrTypeKind::Custom { base, .. } if matches!(base.kind, AttrTypeKind::String))
+        matches!(
+            &self.kind,
+            AttrTypeKind::String {
+                identity: Some(_),
+                ..
+            } | AttrTypeKind::String {
+                pattern: Some(_),
+                ..
+            } | AttrTypeKind::String {
+                length: Some(_),
+                ..
+            }
+        )
     }
 
     /// Check if a value of `self`'s type can be assigned to a sink of
@@ -2494,23 +2644,19 @@ impl AttributeType {
         }
         match (&self.kind, &sink.kind) {
             (
-                Custom {
+                String {
                     identity: Some(s_id),
                     length: s_len,
-                    base: s_base,
+                    pattern: _,
                     ..
                 },
-                Custom {
+                String {
                     identity: Some(k_id),
                     length: k_len,
-                    base: k_base,
+                    pattern: _,
                     ..
                 },
-            ) => {
-                s_id.assignable_to(k_id)
-                    && length_contains(s_len.as_ref(), k_len.as_ref())
-                    && s_base.is_assignable_to(k_base)
-            }
+            ) => s_id.assignable_to(k_id) && length_contains(s_len.as_ref(), k_len.as_ref()),
             (Enum { identity: s_id, .. }, Enum { identity: k_id, .. })
                 if !s_id.assignable_to(k_id) =>
             {
@@ -2530,39 +2676,74 @@ impl AttributeType {
             ) => s_id.assignable_to(k_id) && s_base.is_assignable_to(k_base),
             // Anonymous source → identified sink has no proof of identity.
             (
-                Custom { identity: None, .. },
-                Custom {
+                String { identity: None, .. }
+                | Int { identity: None, .. }
+                | Float { identity: None, .. },
+                String {
+                    identity: Some(_), ..
+                }
+                | Int {
+                    identity: Some(_), ..
+                }
+                | Float {
                     identity: Some(_), ..
                 },
             ) => false,
             (
-                Custom {
+                String {
                     pattern: s_pat,
                     length: s_len,
-                    base: s_base,
                     ..
                 },
-                Custom {
+                String {
                     pattern: k_pat,
                     length: k_len,
-                    base: k_base,
                     ..
                 },
             ) => {
-                if let (Some(sp), Some(kp)) = (s_pat, k_pat) {
-                    if sp != kp {
-                        return false;
-                    }
-                } else if k_pat.is_some() && s_pat.is_none() {
+                if !pattern_compatible(s_pat.as_deref(), k_pat.as_deref()) {
                     return false;
                 }
                 if !length_contains(s_len.as_ref(), k_len.as_ref()) {
                     return false;
                 }
-                s_base.is_assignable_to(k_base)
+                true
             }
-            (Custom { base, .. }, _non_custom_kind) => base.is_assignable_to(sink),
-            (_non_custom, Custom { .. }) => false,
+            (
+                Int {
+                    identity: Some(s_id),
+                    range: s_range,
+                    ..
+                },
+                Int {
+                    identity: Some(k_id),
+                    range: k_range,
+                    ..
+                },
+            ) => s_id.assignable_to(k_id) && i64_range_contains(s_range.as_ref(), k_range.as_ref()),
+            (Int { range: s_range, .. }, Int { range: k_range, .. }) => {
+                i64_range_contains(s_range.as_ref(), k_range.as_ref())
+            }
+            (
+                Float {
+                    identity: Some(s_id),
+                    range: s_range,
+                    ..
+                },
+                Float {
+                    identity: Some(k_id),
+                    range: k_range,
+                    ..
+                },
+            ) => s_id.assignable_to(k_id) && f64_range_contains(s_range.as_ref(), k_range.as_ref()),
+            (Float { range: s_range, .. }, Float { range: k_range, .. }) => {
+                f64_range_contains(s_range.as_ref(), k_range.as_ref())
+            }
+            (String { .. }, _) | (Int { .. }, _) | (Float { .. }, _)
+                if self.type_name() != sink.type_name() =>
+            {
+                false
+            }
             (_a, _b) => self.type_name() == sink.type_name(),
         }
     }
@@ -2607,6 +2788,89 @@ fn validation_error_message(err: TypeError) -> String {
     }
 }
 
+fn validate_string_refinement(
+    identity: Option<&TypeIdentity>,
+    pattern: Option<&str>,
+    length: Option<(Option<u64>, Option<u64>)>,
+    s: &str,
+) -> Result<(), TypeError> {
+    let type_name = identity.map(|id| id.kind.clone());
+    if let Some(pattern) = pattern
+        && let Ok(re) = regex::Regex::new(pattern)
+        && !re.is_match(s)
+    {
+        return Err(TypeError::PatternMismatch {
+            value: s.to_string(),
+            pattern: pattern.to_string(),
+            attribute: None,
+            type_name,
+        });
+    }
+    if let Some((min, max)) = length {
+        let count = s.chars().count();
+        let count_u64 = count as u64;
+        if min.is_some_and(|min| count_u64 < min) || max.is_some_and(|max| count_u64 > max) {
+            return Err(TypeError::LengthOutOfRange {
+                value: s.to_string(),
+                length: count,
+                min,
+                max,
+                attribute: None,
+                type_name,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_list_length(
+    length: Option<(Option<u64>, Option<u64>)>,
+    count: usize,
+) -> Result<(), TypeError> {
+    if let Some((min, max)) = length {
+        let count_u64 = count as u64;
+        if min.is_some_and(|min| count_u64 < min) || max.is_some_and(|max| count_u64 > max) {
+            return Err(TypeError::LengthOutOfRange {
+                value: format!("{count} items"),
+                length: count,
+                min,
+                max,
+                attribute: None,
+                type_name: Some("List".to_string()),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_int_range(
+    range: Option<(Option<i64>, Option<i64>)>,
+    value: i64,
+) -> Result<(), TypeError> {
+    if let Some((min, max)) = range
+        && (min.is_some_and(|min| value < min) || max.is_some_and(|max| value > max))
+    {
+        return Err(TypeError::ValidationFailed {
+            message: format!("value {value} is outside allowed range {min:?}..={max:?}"),
+        });
+    }
+    Ok(())
+}
+
+fn validate_float_range(
+    range: Option<(Option<f64>, Option<f64>)>,
+    value: f64,
+) -> Result<(), TypeError> {
+    if let Some((min, max)) = range
+        && (min.is_some_and(|min| value < min) || max.is_some_and(|max| value > max))
+    {
+        return Err(TypeError::ValidationFailed {
+            message: format!("value {value} is outside allowed range {min:?}..={max:?}"),
+        });
+    }
+    Ok(())
+}
+
 /// Rank a Union member against a runtime value by structural distance:
 /// how close the member's outer constructor is to the input's. Higher
 /// is closer; 0 means no shared structure. Used by `validate_union`
@@ -2638,9 +2902,9 @@ pub(crate) fn union_member_score(member: &AttributeType, value: ConcreteValueRef
         // still routes through this member so that error reaches the
         // caller instead of a generic `TypeMismatch`.
         (AT::Map { .. }, ConcreteValueRef::Map(_))
-        | (AT::String, ConcreteValueRef::String(_))
-        | (AT::Int, ConcreteValueRef::Int(_))
-        | (AT::Float, ConcreteValueRef::Float(_))
+        | (AT::String { .. }, ConcreteValueRef::String(_))
+        | (AT::Int { .. }, ConcreteValueRef::Int(_))
+        | (AT::Float { .. }, ConcreteValueRef::Float(_))
         | (AT::Bool, ConcreteValueRef::Bool(_))
         | (AT::Enum { .. }, ConcreteValueRef::String(_))
         | (AT::Enum { .. }, ConcreteValueRef::EnumIdentifier(_)) => 80,
@@ -2653,7 +2917,13 @@ pub(crate) fn union_member_score(member: &AttributeType, value: ConcreteValueRef
         // re-projecting the first element through `as_concrete()` —
         // a deferred element contributes no bonus (the projection
         // returns `None`).
-        (AT::List { inner, .. }, ConcreteValueRef::List(items)) => {
+        (
+            AT::List {
+                element_type: inner,
+                ..
+            },
+            ConcreteValueRef::List(items),
+        ) => {
             let inner_bonus = items
                 .first()
                 .and_then(|first| first.as_concrete())
@@ -2661,11 +2931,6 @@ pub(crate) fn union_member_score(member: &AttributeType, value: ConcreteValueRef
                 .unwrap_or(0);
             80 + inner_bonus
         }
-        // Custom defers to its `base`. A Custom with a Struct/Int/
-        // String base ranks the same as that base would — its
-        // validator's `ValidationFailed` message is then the one
-        // `validate_union` surfaces on failure.
-        (AT::Custom { base, .. }, v) => union_member_score(base, v),
         // Nested Union: recurse and take the best inner match.
         (AT::Union(inner), v) => inner
             .iter()
@@ -2759,6 +3024,48 @@ fn length_contains(
     let s_max = s_max.unwrap_or(u64::MAX);
     let k_min = k_min.unwrap_or(0);
     let k_max = k_max.unwrap_or(u64::MAX);
+    k_min <= s_min && s_max <= k_max
+}
+
+fn pattern_compatible(source: Option<&str>, sink: Option<&str>) -> bool {
+    match (source, sink) {
+        (_, None) => true,
+        (Some(source), Some(sink)) => source == sink,
+        (None, Some(_)) => false,
+    }
+}
+
+fn i64_range_contains(
+    source: Option<&(Option<i64>, Option<i64>)>,
+    sink: Option<&(Option<i64>, Option<i64>)>,
+) -> bool {
+    let Some((s_min, s_max)) = source else {
+        return sink.is_none();
+    };
+    let Some((k_min, k_max)) = sink else {
+        return true;
+    };
+    let s_min = s_min.unwrap_or(i64::MIN);
+    let s_max = s_max.unwrap_or(i64::MAX);
+    let k_min = k_min.unwrap_or(i64::MIN);
+    let k_max = k_max.unwrap_or(i64::MAX);
+    k_min <= s_min && s_max <= k_max
+}
+
+fn f64_range_contains(
+    source: Option<&(Option<f64>, Option<f64>)>,
+    sink: Option<&(Option<f64>, Option<f64>)>,
+) -> bool {
+    let Some((s_min, s_max)) = source else {
+        return sink.is_none();
+    };
+    let Some((k_min, k_max)) = sink else {
+        return true;
+    };
+    let s_min = s_min.unwrap_or(f64::NEG_INFINITY);
+    let s_max = s_max.unwrap_or(f64::INFINITY);
+    let k_min = k_min.unwrap_or(f64::NEG_INFINITY);
+    let k_max = k_max.unwrap_or(f64::INFINITY);
     k_min <= s_min && s_max <= k_max
 }
 
@@ -3830,10 +4137,10 @@ impl ResourceSchema {
                     }
                 }
             }
-            Shape::Custom { base, .. } => {
-                self.append_enum_values_from_top_level_attr_type(base, input, out);
-            }
-            Shape::List { inner, .. } => {
+            Shape::List {
+                element_type: inner,
+                ..
+            } => {
                 self.append_enum_values_from_top_level_attr_type(inner, input, out);
             }
             Shape::Map { value, .. } => {
@@ -3846,9 +4153,9 @@ impl ResourceSchema {
                     }
                 }
             }
-            Shape::String
-            | Shape::Int
-            | Shape::Float
+            Shape::String { .. }
+            | Shape::Int { .. }
+            | Shape::Float { .. }
             | Shape::Bool
             | Shape::Duration
             | Shape::Struct { .. } => {}
@@ -4045,7 +4352,7 @@ impl ResourceSchema {
     }
 
     /// As [`validate_with_origins`], but also runs `lookup` on every
-    /// `AttrTypeKind::Custom` value reached during traversal so
+    /// refined primitive identity reached during traversal so
     /// provider-supplied validators that the schema itself cannot
     /// carry (WASM plugin path) still get to reject bad values.
     pub fn validate_with_origins_and_lookup(
@@ -4192,7 +4499,10 @@ fn collect_block_names_from_type(attr_type: &AttributeType, result: &mut HashMap
                 collect_block_names_from_type(&field.field_type, result);
             }
         }
-        AttrTypeKind::List { inner, .. } => {
+        AttrTypeKind::List {
+            element_type: inner,
+            ..
+        } => {
             collect_block_names_from_type(inner, result);
         }
         AttrTypeKind::Map { value: inner, .. } => {
@@ -4207,13 +4517,12 @@ fn collect_block_names_from_type(attr_type: &AttributeType, result: &mut HashMap
         // entries directly to avoid infinite recursion on cyclic
         // schemas (carina#3340).
         AttrTypeKind::Ref(_) => {}
-        AttrTypeKind::String
-        | AttrTypeKind::Int
-        | AttrTypeKind::Float
+        AttrTypeKind::String { .. }
+        | AttrTypeKind::Int { .. }
+        | AttrTypeKind::Float { .. }
         | AttrTypeKind::Bool
         | AttrTypeKind::Duration
-        | AttrTypeKind::Enum { .. }
-        | AttrTypeKind::Custom { .. } => {}
+        | AttrTypeKind::Enum { .. } => {}
     }
 }
 
@@ -4314,7 +4623,10 @@ fn recurse_block_names_into_value(
                 resolve_block_names_in_map(inner_map, inner, defs, resource_id, errors);
             }
         }
-        Shape::List { inner, .. } => {
+        Shape::List {
+            element_type: inner,
+            ..
+        } => {
             // `List<Ref>`: peel the element type too via `shape(defs)`
             // so the walk reaches the underlying struct fields.
             if let Shape::Struct { .. } = inner.shape_with_defs(defs)

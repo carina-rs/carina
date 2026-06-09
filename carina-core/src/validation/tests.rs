@@ -1783,17 +1783,10 @@ fn validate_export_params_rejects_type_mismatch() {
 
 #[test]
 fn type_compat_subtype_accepted() {
-    // arn accepts KmsKeyArn (subtype via base chain: KmsKeyArn → Arn)
+    // arn accepts a provider-scoped KMS key ARN (narrower segments, same kind).
     let kms_key_arn = AttributeType::custom(
-        Some(TypeIdentity::bare("KmsKeyArn")),
-        AttributeType::custom(
-            Some(TypeIdentity::bare("Arn")),
-            AttributeType::string(),
-            None,
-            None,
-            crate::schema::legacy_validator(|_| Ok(())),
-            None,
-        ),
+        Some(TypeIdentity::new(Some("aws"), ["kms", "Key"], "Arn")),
+        AttributeType::string(),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -1808,17 +1801,10 @@ fn type_compat_subtype_accepted() {
 
 #[test]
 fn type_compat_sibling_rejected() {
-    // kms_key_arn rejects IamRoleArn (sibling: IamRoleArn → Arn, not KmsKeyArn)
+    // kms_key_arn rejects an IAM role ARN sibling.
     let iam_role_arn = AttributeType::custom(
-        Some(TypeIdentity::bare("IamRoleArn")),
-        AttributeType::custom(
-            Some(TypeIdentity::bare("Arn")),
-            AttributeType::string(),
-            None,
-            None,
-            crate::schema::legacy_validator(|_| Ok(())),
-            None,
-        ),
+        Some(TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn")),
+        AttributeType::string(),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -1833,24 +1819,17 @@ fn type_compat_sibling_rejected() {
 
 #[test]
 fn type_compat_resource_id_subtype() {
-    // aws_resource_id accepts VpcId (subtype)
+    // resource_id accepts VPC resource IDs (narrower segments, same kind).
     let vpc_id = AttributeType::custom(
-        Some(TypeIdentity::bare("VpcId")),
-        AttributeType::custom(
-            Some(TypeIdentity::bare("AwsResourceId")),
-            AttributeType::string(),
-            None,
-            None,
-            crate::schema::legacy_validator(|_| Ok(())),
-            None,
-        ),
+        Some(TypeIdentity::new(Some("aws"), ["ec2", "Vpc"], "ResourceId")),
+        AttributeType::string(),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
     assert!(is_type_expr_compatible_with_schema(
-        &TypeExpr::Simple("aws_resource_id".to_string()),
+        &TypeExpr::Simple("resource_id".to_string()),
         &vpc_id,
         crate::schema::empty_defs_for_schema_walks(),
     ));

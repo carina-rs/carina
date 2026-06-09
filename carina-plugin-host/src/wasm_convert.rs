@@ -1566,7 +1566,7 @@ mod tests {
                 .attr_type
                 .shape_ref_free()
                 .expect("test schema is Ref-free"),
-            carina_core::schema::Shape::String
+            carina_core::schema::Shape::String { .. }
         ));
         assert!(desc_attr.required);
 
@@ -1588,7 +1588,7 @@ mod tests {
                 .attr_type
                 .shape_ref_free()
                 .expect("test schema is Ref-free"),
-            carina_core::schema::Shape::Int
+            carina_core::schema::Shape::Int { .. }
         ));
 
         // Ingress attribute: list with ordered=false, provider_name, block_name, removable
@@ -1603,7 +1603,11 @@ mod tests {
             .shape_ref_free()
             .expect("test schema is Ref-free")
         {
-            carina_core::schema::Shape::List { inner, ordered } => {
+            carina_core::schema::Shape::List {
+                element_type: inner,
+                ordered,
+                ..
+            } => {
                 assert!(!ordered, "list should be unordered");
 
                 // Union inside list
@@ -1624,7 +1628,7 @@ mod tests {
                                         .field_type
                                         .shape_ref_free()
                                         .expect("test schema is Ref-free"),
-                                    carina_core::schema::Shape::Int
+                                    carina_core::schema::Shape::Int { .. }
                                 ));
                                 assert!(from_port.required);
                                 assert_eq!(
@@ -1644,7 +1648,7 @@ mod tests {
                                         .field_type
                                         .shape_ref_free()
                                         .expect("test schema is Ref-free"),
-                                    carina_core::schema::Shape::String
+                                    carina_core::schema::Shape::String { .. }
                                 ));
                                 assert!(protocol.block_name.is_none());
                                 assert!(protocol.provider_name.is_none());
@@ -1657,7 +1661,7 @@ mod tests {
                             members[1]
                                 .shape_ref_free()
                                 .expect("test schema is Ref-free"),
-                            carina_core::schema::Shape::String
+                            carina_core::schema::Shape::String { .. }
                         ));
                     }
                     other => panic!("expected Union inside list, got {:?}", other),
@@ -1923,7 +1927,7 @@ mod tests {
             carina_core::schema::Shape::Enum { base, .. } => {
                 assert!(matches!(
                     base.shape_ref_free().expect("base is Ref-free"),
-                    carina_core::schema::Shape::String
+                    carina_core::schema::Shape::String { .. }
                 ));
             }
             other => panic!("expected Enum, got {other:?}"),
@@ -2081,7 +2085,7 @@ mod tests {
         };
         let core_attr = proto_attr_type_to_core(&proto_attr);
         match core_attr.shape_ref_free().expect("test schema is Ref-free") {
-            carina_core::schema::Shape::Custom {
+            carina_core::schema::Shape::String {
                 identity,
                 pattern,
                 length,
