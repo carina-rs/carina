@@ -15,7 +15,7 @@ use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult
 use carina_core::resolver::resolve_refs_for_plan;
 use carina_core::resource::{ResourceId, State, Value};
 use carina_core::schema::{
-    AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, TypeIdentity,
+    AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry, TypeIdentity,
 };
 use carina_state::{StateFile, check_and_migrate};
 
@@ -355,6 +355,9 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
 fn fixture_provider_factories(fixture_path: &Path) -> Vec<Box<dyn ProviderFactory>> {
     match fixture_path.file_name().and_then(|name| name.to_str()) {
         Some("dynamic_enum_az_no_diff") => vec![Box::new(DynamicEnumFixtureFactory)],
+        Some("route53_hosted_zone_name_strip_suffix_no_diff") => {
+            vec![Box::new(Route53HostedZoneFixtureFactory)]
+        }
         _ => vec![],
     }
 }
@@ -408,6 +411,58 @@ impl ProviderFactory for DynamicEnumFixtureFactory {
         vec![
             ResourceSchema::new("network.Subnet")
                 .attribute(AttributeSchema::new("availability_zone", zone_name).required()),
+        ]
+    }
+}
+
+struct Route53HostedZoneFixtureFactory;
+
+impl ProviderFactory for Route53HostedZoneFixtureFactory {
+    fn name(&self) -> &str {
+        "fixture"
+    }
+
+    fn display_name(&self) -> &str {
+        "Fixture provider"
+    }
+
+    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+        HashMap::new()
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &indexmap::IndexMap<String, Value>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
+        "test".to_string()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _attributes: &indexmap::IndexMap<String, Value>,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
+    }
+
+    fn schemas(&self) -> Vec<ResourceSchema> {
+        let zone_name = AttributeType::refined_string(
+            Some(TypeIdentity::new(
+                Some("fixture"),
+                vec!["route53".to_string(), "HostedZone".to_string()],
+                "Name",
+            )),
+            None,
+            Some((None, Some(1024))),
+            Some(DslTransform::StripSuffix(".".to_string())),
+        );
+        vec![
+            ResourceSchema::new("route53.HostedZone")
+                .attribute(AttributeSchema::new("name", zone_name).required()),
         ]
     }
 }

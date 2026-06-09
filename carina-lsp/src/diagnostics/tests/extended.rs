@@ -1774,13 +1774,12 @@ fn distinct_semantic_customs_are_rejected() {
         .as_data_source()
         .attribute(AttributeSchema::new(
             "account_id",
-            AttributeType::custom(
+            AttributeType::refined_string_with_validator(
                 Some(carina_core::schema::TypeIdentity::new(
                     Some("aws"),
                     Vec::<String>::new(),
                     "AwsAccountId",
                 )),
-                AttributeType::string(),
                 None,
                 None,
                 legacy_validator(validate_account_id),
@@ -1791,13 +1790,12 @@ fn distinct_semantic_customs_are_rejected() {
     // Target resource: has a TargetId attribute (also String-based Custom)
     let target_schema = ResourceSchema::new("sso.Assignment").attribute(AttributeSchema::new(
         "target_id",
-        AttributeType::custom(
+        AttributeType::refined_string_with_validator(
             Some(carina_core::schema::TypeIdentity::new(
                 Some("awscc"),
                 Vec::<String>::new(),
                 "TargetId",
             )),
-            AttributeType::string(),
             None,
             None,
             legacy_validator(validate_target_id),
@@ -1837,9 +1835,8 @@ fn exports_cross_file_ref_no_false_positive() {
     use carina_core::resource::{ConcreteValue, Value};
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let aws_account_id_type = AttributeType::custom(
+    let aws_account_id_type = AttributeType::refined_string_with_validator(
         Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
-        AttributeType::string(),
         None,
         None,
         carina_core::schema::legacy_validator(|v| match v {
@@ -3095,9 +3092,8 @@ fn lsp_quoted_literal_on_namespaced_custom_says_got_a_string_literal() {
 fn lsp_custom_string_pattern_mismatch_reports_required_pattern() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
 
-    let bucket_name = AttributeType::custom(
+    let bucket_name = AttributeType::refined_string_with_validator(
         Some(carina_core::schema::TypeIdentity::bare("BucketName")),
-        AttributeType::string(),
         Some("^prod-[a-z0-9]+$".to_string()),
         None,
         legacy_validator(|_| Ok(())),

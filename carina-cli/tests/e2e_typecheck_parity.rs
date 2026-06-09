@@ -839,9 +839,8 @@ impl ProviderFactory for WasmStyleProviderFactory {
 }
 
 fn wasm_style_vpc_schema() -> ResourceSchema {
-    let vpc_id_type = AttributeType::custom(
+    let vpc_id_type = AttributeType::refined_string_with_validator(
         Some(carina_core::schema::TypeIdentity::bare("VpcId")),
-        AttributeType::string(),
         None,
         None,
         carina_core::schema::legacy_validator(|_| Ok(())),
@@ -930,9 +929,8 @@ awsccmock.ec2.security_group {
 }
 
 fn wasm_style_subnet_schema() -> ResourceSchema {
-    let vpc_id_type = AttributeType::custom(
+    let vpc_id_type = AttributeType::refined_string_with_validator(
         Some(carina_core::schema::TypeIdentity::bare("VpcId")),
-        AttributeType::string(),
         None,
         None,
         carina_core::schema::legacy_validator(|_| Ok(())),
@@ -1044,9 +1042,8 @@ fn vpc_id_validate_2358(v: &Value) -> Result<(), String> {
 }
 
 fn vpc_id_custom_type_2358() -> AttributeType {
-    AttributeType::custom(
+    AttributeType::refined_string_with_validator(
         Some(carina_core::schema::TypeIdentity::bare("VpcId")),
-        AttributeType::string(),
         None,
         None,
         legacy_validator(vpc_id_validate_2358),

@@ -219,9 +219,8 @@ pub(super) fn test_provider_with_vpc_and_security_group() -> CompletionProvider 
     fn noop_validate(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let vpc_id_custom = AttributeType::custom(
+    let vpc_id_custom = AttributeType::refined_string_with_validator(
         Some(carina_core::schema::TypeIdentity::bare("VpcId")),
-        AttributeType::string(),
         None,
         None,
         legacy_validator(noop_validate),
@@ -247,9 +246,8 @@ pub(super) fn test_provider_with_custom_semantic_attr() -> CompletionProvider {
     fn noop_validate(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let account_id = AttributeType::custom(
+    let account_id = AttributeType::refined_string_with_validator(
         Some(carina_core::schema::TypeIdentity::bare("aws_account_id")),
-        AttributeType::string(),
         None,
         None,
         legacy_validator(noop_validate),

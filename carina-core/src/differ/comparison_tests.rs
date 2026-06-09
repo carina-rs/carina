@@ -120,13 +120,10 @@ fn type_aware_union_numeric() {
 
 #[test]
 fn type_aware_custom_delegates_to_base() {
-    let custom_type = AttributeType::custom(
+    let custom_type = AttributeType::refined_float_with_validator(
         Some(TypeIdentity::bare("Port")),
-        AttributeType::float(),
-        None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
-        None,
     );
     assert!(type_aware_equal(
         &Value::Concrete(ConcreteValue::Int(8080)),
@@ -489,13 +486,10 @@ fn type_aware_struct_ignores_default_custom_type() {
             StructField::new("name", AttributeType::string()),
             StructField::new(
                 "port",
-                AttributeType::custom(
+                AttributeType::refined_int_with_validator(
                     Some(TypeIdentity::bare("Port")),
-                    AttributeType::int(),
-                    None,
                     None,
                     crate::schema::legacy_validator(|_| Ok(())),
-                    None,
                 ),
             ),
         ],

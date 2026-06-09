@@ -797,21 +797,12 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
             ordered,
             length,
             ..
-        } => {
-            let base = if *ordered {
-                CoreAttributeType::list(proto_attr_type_to_core(element_type))
-            } else {
-                CoreAttributeType::unordered_list(proto_attr_type_to_core(element_type))
-            };
-            CoreAttributeType::custom(
-                None,
-                base,
-                None,
-                *length,
-                legacy_validator(|_| Ok(())),
-                None,
-            )
-        }
+        } => CoreAttributeType::refined_list(
+            proto_attr_type_to_core(element_type),
+            *ordered,
+            *length,
+            legacy_validator(|_| Ok(())),
+        ),
         proto::AttributeType::Map { inner, key } => CoreAttributeType::map_with_key(
             proto_attr_type_to_core(key),
             proto_attr_type_to_core(inner),
@@ -830,22 +821,44 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
             length,
             to_dsl,
             ..
-        } => CoreAttributeType::custom(
-            if name.is_empty() {
+        } => {
+            let identity = if name.is_empty() {
                 None
             } else {
                 Some(carina_core::schema::TypeIdentity::from_dotted(name))
-            },
-            custom_base_to_core(base, to_dsl.clone()),
-            pattern.clone(),
-            *length,
-            legacy_validator(|_| Ok(())), // Validation is handled via ProviderContext.validators
-            // `to_dsl` is a `fn` pointer that does not survive the
-            // WASM-component boundary; host-side normalization for
-            // plugin-provided types is registered separately, so this
-            // arm always sees `None` after the proto→core lift.
-            None,
-        ),
+            };
+            let validate = legacy_validator(|_| Ok(())); // Validation is handled via ProviderContext.validators
+            match base.as_ref() {
+                proto::AttributeType::String { .. } => {
+                    CoreAttributeType::refined_string_with_validator(
+                        identity,
+                        pattern.clone(),
+                        *length,
+                        validate,
+                        to_dsl.clone(),
+                    )
+                }
+                proto::AttributeType::Int { .. } => CoreAttributeType::refined_int_with_validator(
+                    identity,
+                    length.map(|(min, max)| (min.map(|v| v as i64), max.map(|v| v as i64))),
+                    validate,
+                ),
+                proto::AttributeType::Float { .. } => {
+                    CoreAttributeType::refined_float_with_validator(identity, None, validate)
+                }
+                proto::AttributeType::List {
+                    element_type,
+                    ordered,
+                    ..
+                } => CoreAttributeType::refined_list(
+                    proto_attr_type_to_core(element_type),
+                    *ordered,
+                    *length,
+                    validate,
+                ),
+                other => panic!("legacy Custom wire type has unsupported base {other:?}"),
+            }
+        }
         proto::AttributeType::CustomEnum {
             name,
             base,
@@ -870,20 +883,6 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
         // `ResourceSchema.defs` map is converted alongside in
         // `proto_schema_to_core` so resolution at walk-sites succeeds.
         proto::AttributeType::Ref { name } => CoreAttributeType::ref_(name.clone()),
-    }
-}
-
-fn custom_base_to_core(
-    base: &proto::AttributeType,
-    to_dsl: Option<proto::DslTransform>,
-) -> CoreAttributeType {
-    match base {
-        proto::AttributeType::String { .. } => {
-            CoreAttributeType::refined_string(None, None, None, to_dsl)
-        }
-        proto::AttributeType::Int { .. } => CoreAttributeType::int(),
-        proto::AttributeType::Float { .. } => CoreAttributeType::float(),
-        _ => proto_attr_type_to_core(base),
     }
 }
 

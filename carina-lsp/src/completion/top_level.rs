@@ -983,7 +983,7 @@ fn literal_completions_from_type_expr(type_expr: &parser::TypeExpr) -> Vec<Compl
 /// reused without forking a parallel implementation.
 ///
 /// `Simple(name)` (snake_case) is reified as
-/// `AttributeType::custom(None, String, None, None, None, None)` — same shape `parse_exports_type_text` produces for `exports`
+/// refined String with a bare identity — same shape `parse_exports_type_text` produces for `exports`
 /// annotations. The other arms cover the structural cases the
 /// dispatcher recurses through. Returns `None` for shapes that have no
 /// useful default (e.g. resource refs, `<unknown>`).
@@ -1000,11 +1000,10 @@ fn type_expr_to_attribute_type(
         parser::TypeExpr::Int => Some(AttributeType::int()),
         parser::TypeExpr::Float => Some(AttributeType::float()),
         parser::TypeExpr::Duration => Some(AttributeType::duration()),
-        parser::TypeExpr::Simple(name) => Some(AttributeType::custom(
+        parser::TypeExpr::Simple(name) => Some(AttributeType::refined_string_with_validator(
             Some(carina_core::schema::TypeIdentity::bare(
                 parser::snake_to_pascal(name),
             )),
-            AttributeType::string(),
             None,
             None,
             legacy_validator(noop),

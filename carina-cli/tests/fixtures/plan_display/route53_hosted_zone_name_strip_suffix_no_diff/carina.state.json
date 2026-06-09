@@ -1,0 +1,31 @@
+{
+  "version": 7,
+  "serial": 1,
+  "lineage": "test-lineage-route53-hosted-zone-name-strip-suffix-no-diff",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "route53.HostedZone",
+      "name": "zone",
+      "provider": "fixture",
+      "identifier": "hosted-zone-fixture",
+      "attributes": {
+        "name": "registry-dev.carina-rs.dev."
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "zone",
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "name": {
+            "kind": "leaf"
+          }
+        }
+      }
+    }
+  ]
+}

@@ -2115,9 +2115,8 @@ fn parse_exports_type_text(text: &str) -> Option<AttributeType> {
         name if name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
             && name.chars().all(|c| c.is_ascii_alphanumeric()) =>
         {
-            Some(AttributeType::custom(
+            Some(AttributeType::refined_string_with_validator(
                 Some(carina_core::schema::TypeIdentity::bare(name)),
-                AttributeType::string(),
                 None,
                 None,
                 legacy_validator(noop_validate),

@@ -1766,12 +1766,23 @@ impl AttributeType {
         length: Option<(Option<u64>, Option<u64>)>,
         to_dsl: Option<DslTransform>,
     ) -> Self {
+        Self::refined_string_with_validator(identity, pattern, length, noop_validator(), to_dsl)
+    }
+
+    /// Create a String type with refinement metadata and a custom validator.
+    pub fn refined_string_with_validator(
+        identity: Option<TypeIdentity>,
+        pattern: Option<String>,
+        length: Option<(Option<u64>, Option<u64>)>,
+        validate: CustomValidator,
+        to_dsl: Option<DslTransform>,
+    ) -> Self {
         AttributeType {
             kind: AttrTypeKind::String {
                 identity,
                 pattern,
                 length,
-                validate: noop_validator(),
+                validate,
                 to_dsl,
             },
         }
@@ -1793,11 +1804,20 @@ impl AttributeType {
         identity: Option<TypeIdentity>,
         range: Option<(Option<i64>, Option<i64>)>,
     ) -> Self {
+        Self::refined_int_with_validator(identity, range, noop_validator())
+    }
+
+    /// Create an Int type with refinement metadata and a custom validator.
+    pub fn refined_int_with_validator(
+        identity: Option<TypeIdentity>,
+        range: Option<(Option<i64>, Option<i64>)>,
+        validate: CustomValidator,
+    ) -> Self {
         AttributeType {
             kind: AttrTypeKind::Int {
                 identity,
                 range,
-                validate: noop_validator(),
+                validate,
             },
         }
     }
@@ -1818,11 +1838,20 @@ impl AttributeType {
         identity: Option<TypeIdentity>,
         range: Option<(Option<f64>, Option<f64>)>,
     ) -> Self {
+        Self::refined_float_with_validator(identity, range, noop_validator())
+    }
+
+    /// Create a Float type with refinement metadata and a custom validator.
+    pub fn refined_float_with_validator(
+        identity: Option<TypeIdentity>,
+        range: Option<(Option<f64>, Option<f64>)>,
+        validate: CustomValidator,
+    ) -> Self {
         AttributeType {
             kind: AttrTypeKind::Float {
                 identity,
                 range,
-                validate: noop_validator(),
+                validate,
             },
         }
     }
@@ -1934,53 +1963,6 @@ impl AttributeType {
         }
     }
 
-    /// Create a structural `Custom` type.
-    pub fn custom(
-        identity: Option<TypeIdentity>,
-        base: AttributeType,
-        pattern: Option<String>,
-        length: Option<(Option<u64>, Option<u64>)>,
-        validate: CustomValidator,
-        to_dsl: Option<fn(&str) -> String>,
-    ) -> Self {
-        assert!(
-            to_dsl.is_none(),
-            "custom shim: function-pointer to_dsl cannot be represented as DslTransform"
-        );
-        AttributeType {
-            kind: match base.kind {
-                AttrTypeKind::String { to_dsl, .. } => AttrTypeKind::String {
-                    identity,
-                    pattern,
-                    length,
-                    validate,
-                    to_dsl,
-                },
-                AttrTypeKind::Int { .. } => AttrTypeKind::Int {
-                    identity,
-                    range: length.map(|(min, max)| (min.map(|v| v as i64), max.map(|v| v as i64))),
-                    validate,
-                },
-                AttrTypeKind::Float { .. } => AttrTypeKind::Float {
-                    identity,
-                    range: None,
-                    validate,
-                },
-                AttrTypeKind::List {
-                    element_type,
-                    ordered,
-                    ..
-                } => AttrTypeKind::List {
-                    element_type,
-                    ordered,
-                    length,
-                    validate,
-                },
-                other => panic!("custom shim: unexpected base {other:?}"),
-            },
-        }
-    }
-
     /// Create a `Struct` type.
     pub fn struct_(name: impl Into<String>, fields: Vec<StructField>) -> Self {
         AttributeType {
@@ -2008,26 +1990,29 @@ impl AttributeType {
 
     /// Create a List type with default ordering (ordered=true, matching CloudFormation default).
     pub fn list(inner: AttributeType) -> Self {
+        Self::refined_list(inner, true, None, noop_validator())
+    }
+
+    /// Create a List type with protocol-carried refinement metadata.
+    pub fn refined_list(
+        element_type: AttributeType,
+        ordered: bool,
+        length: Option<(Option<u64>, Option<u64>)>,
+        validate: CustomValidator,
+    ) -> Self {
         AttributeType {
             kind: AttrTypeKind::List {
-                element_type: Box::new(inner),
-                ordered: true,
-                length: None,
-                validate: noop_validator(),
+                element_type: Box::new(element_type),
+                ordered,
+                length,
+                validate,
             },
         }
     }
 
     /// Create an unordered List type (insertionOrder=false).
     pub fn unordered_list(inner: AttributeType) -> Self {
-        AttributeType {
-            kind: AttrTypeKind::List {
-                element_type: Box::new(inner),
-                ordered: false,
-                length: None,
-                validate: noop_validator(),
-            },
-        }
+        Self::refined_list(inner, false, None, noop_validator())
     }
 
     /// Create a Map type with unconstrained string keys.
@@ -4801,10 +4786,8 @@ pub mod types {
 
     /// Positive integer type
     pub fn positive_int() -> AttributeType {
-        AttributeType::custom(
+        AttributeType::refined_int_with_validator(
             Some(TypeIdentity::bare("PositiveInt")),
-            AttributeType::int(),
-            None,
             None,
             legacy_validator(|value| {
                 if let Value::Concrete(ConcreteValue::Int(n)) = value {
@@ -4817,15 +4800,13 @@ pub mod types {
                     Err("Expected integer".to_string())
                 }
             }),
-            None,
         )
     }
 
     /// IPv4 CIDR block type (e.g., "10.0.0.0/16")
     pub fn ipv4_cidr() -> AttributeType {
-        AttributeType::custom(
+        AttributeType::refined_string_with_validator(
             Some(TypeIdentity::bare("Ipv4Cidr")),
-            AttributeType::string(),
             None,
             None,
             legacy_validator(|value| {
@@ -4841,9 +4822,8 @@ pub mod types {
 
     /// IPv4 address type (e.g., "10.0.1.5", "192.168.0.1")
     pub fn ipv4_address() -> AttributeType {
-        AttributeType::custom(
+        AttributeType::refined_string_with_validator(
             Some(TypeIdentity::bare("Ipv4Address")),
-            AttributeType::string(),
             None,
             None,
             legacy_validator(|value| {
@@ -4859,9 +4839,8 @@ pub mod types {
 
     /// IPv6 address type (e.g., "2001:db8::1", "::1")
     pub fn ipv6_address() -> AttributeType {
-        AttributeType::custom(
+        AttributeType::refined_string_with_validator(
             Some(TypeIdentity::bare("Ipv6Address")),
-            AttributeType::string(),
             None,
             None,
             legacy_validator(|value| {
@@ -4877,9 +4856,8 @@ pub mod types {
 
     /// IPv6 CIDR block type (e.g., "2001:db8::/32", "::/0")
     pub fn ipv6_cidr() -> AttributeType {
-        AttributeType::custom(
+        AttributeType::refined_string_with_validator(
             Some(TypeIdentity::bare("Ipv6Cidr")),
-            AttributeType::string(),
             None,
             None,
             legacy_validator(|value| {
@@ -4904,9 +4882,8 @@ pub mod types {
     /// requires a non-empty local part, a single `@`, and a domain that
     /// contains at least one dot with non-empty labels.
     pub fn email() -> AttributeType {
-        AttributeType::custom(
+        AttributeType::refined_string_with_validator(
             Some(TypeIdentity::bare("Email")),
-            AttributeType::string(),
             None,
             None,
             legacy_validator(|value| {

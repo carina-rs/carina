@@ -611,6 +611,27 @@ fn dynamic_enum_az_state_api_spelling_has_no_diff_in_cli_plan_path() {
 }
 
 #[test]
+fn route53_hosted_zone_name_strip_suffix_no_diff() {
+    let (plan, schemas, _moved) =
+        build_plan_from_fixture("route53_hosted_zone_name_strip_suffix_no_diff");
+    assert!(
+        plan.effects().is_empty(),
+        "Route53 HostedZone state names with a trailing dot must compare equal to DSL names without one:\n{}",
+        strip_ansi(&format_plan(
+            &plan,
+            DetailLevel::Full,
+            &HashMap::new(),
+            Some(&schemas),
+            &HashMap::new(),
+            &[],
+            &[],
+            None,
+            None,
+        ))
+    );
+}
+
+#[test]
 fn snapshot_destroy_full() {
     use carina_core::resource::Value;
     let (plan, current_states, _schemas, _moved) =

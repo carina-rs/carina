@@ -2756,9 +2756,8 @@ fn exports_map_value_offers_matching_resource_refs() {
     fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let account_id = AttributeType::custom(
+    let account_id = AttributeType::refined_string_with_validator(
         Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
-        AttributeType::string(),
         None,
         None,
         legacy_validator(validate_noop),
@@ -2840,9 +2839,8 @@ fn exports_map_value_multiple_entries_returns_refs() {
     fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let account_id = AttributeType::custom(
+    let account_id = AttributeType::refined_string_with_validator(
         Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
-        AttributeType::string(),
         None,
         None,
         legacy_validator(validate_noop),
@@ -2897,9 +2895,8 @@ fn exports_map_value_includes_bindings_from_sibling_files() {
     fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let account_id = AttributeType::custom(
+    let account_id = AttributeType::refined_string_with_validator(
         Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
-        AttributeType::string(),
         None,
         None,
         legacy_validator(validate_noop),
@@ -2954,9 +2951,8 @@ fn custom_type_value_ref_includes_sibling_file_bindings() {
     fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let account_id = AttributeType::custom(
+    let account_id = AttributeType::refined_string_with_validator(
         Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
-        AttributeType::string(),
         None,
         None,
         legacy_validator(validate_noop),
@@ -3054,9 +3050,8 @@ fn binding_dot_completion_resolves_sibling_file_binding() {
     fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let account_id = AttributeType::custom(
+    let account_id = AttributeType::refined_string_with_validator(
         Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
-        AttributeType::string(),
         None,
         None,
         legacy_validator(validate_noop),
@@ -3289,9 +3284,8 @@ fn upstream_state_string_export_not_offered_to_specific_custom_receiver() {
     fn noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let vpc_id_type = AttributeType::custom(
+    let vpc_id_type = AttributeType::refined_string_with_validator(
         Some(carina_core::schema::TypeIdentity::bare("VpcId")),
-        AttributeType::string(),
         None,
         None,
         legacy_validator(noop),
