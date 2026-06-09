@@ -393,9 +393,30 @@ pub struct AttributeSchema {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AttributeType {
-    String,
-    Int,
-    Float,
+    String {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pattern: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        length: Option<(Option<u64>, Option<u64>)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        validate: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_dsl: Option<DslTransform>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity: Option<String>,
+    },
+    Int {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        range: Option<(Option<i64>, Option<i64>)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity: Option<String>,
+    },
+    Float {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        range: Option<(Option<f64>, Option<f64>)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity: Option<String>,
+    },
     Bool,
     /// Time duration. Authored in the DSL as a literal like `30min`,
     /// `1h`, or `15s` (`duration_literal` in the grammar); reaches the
@@ -432,11 +453,16 @@ pub enum AttributeType {
     },
     #[serde(rename = "list")]
     List {
-        inner: Box<AttributeType>,
+        #[serde(rename = "element_type", alias = "inner")]
+        element_type: Box<AttributeType>,
         /// Whether list elements are ordered (positional comparison).
         /// When false, elements are compared as multisets (order-insensitive).
         #[serde(default = "default_true")]
         ordered: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        length: Option<(Option<u64>, Option<u64>)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        validate: Option<serde_json::Value>,
     },
     #[serde(rename = "map")]
     Map {
@@ -471,6 +497,10 @@ pub enum AttributeType {
         pattern: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         length: Option<(Option<u64>, Option<u64>)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        validate: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_dsl: Option<DslTransform>,
     },
     /// Enum-shaped custom type: values are written as namespaced
     /// shorthand and expanded host-side via `expand_enum_shorthand`
@@ -600,6 +630,16 @@ pub struct StructField {
 mod tests {
     use super::*;
 
+    fn string_attr() -> AttributeType {
+        AttributeType::String {
+            pattern: None,
+            length: None,
+            validate: None,
+            to_dsl: None,
+            identity: None,
+        }
+    }
+
     #[test]
     fn test_value_roundtrip() {
         let values = vec![
@@ -678,9 +718,11 @@ mod tests {
     fn custom_pattern_and_length_round_trip() {
         let attr = AttributeType::Custom {
             name: "awscc.wafv2.WebACL.EntityDescription".to_string(),
-            base: Box::new(AttributeType::String),
+            base: Box::new(string_attr()),
             pattern: Some("^[a-z]+$".to_string()),
             length: Some((Some(1), Some(9))),
+            validate: None,
+            to_dsl: None,
         };
 
         let json = serde_json::to_string(&attr).unwrap();
@@ -696,6 +738,104 @@ mod tests {
             }
             other => panic!("expected Custom, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn refined_primitive_attribute_types_round_trip() {
+        let attrs = [
+            AttributeType::String {
+                pattern: Some("^[a-z]+$".to_string()),
+                length: Some((Some(1), Some(63))),
+                validate: Some(serde_json::json!(true)),
+                to_dsl: Some(DslTransform::StripSuffix(".".to_string())),
+                identity: Some("aws.route53.HostedZone.Name".to_string()),
+            },
+            AttributeType::Int {
+                range: Some((Some(-1), Some(65535))),
+                identity: Some("aws.ec2.Port".to_string()),
+            },
+            AttributeType::Float {
+                range: Some((Some(0.0), Some(1.0))),
+                identity: Some("awscc.wafv2.Rate".to_string()),
+            },
+            AttributeType::List {
+                element_type: Box::new(string_attr()),
+                ordered: false,
+                length: Some((Some(1), Some(5))),
+                validate: Some(serde_json::json!(true)),
+            },
+        ];
+
+        for attr in attrs {
+            let json = serde_json::to_string(&attr).unwrap();
+            let back: AttributeType = serde_json::from_str(&json).unwrap();
+            assert_eq!(json, serde_json::to_string(&back).unwrap());
+        }
+    }
+
+    #[test]
+    fn primitive_attribute_types_default_missing_refinements() {
+        for json in [
+            r#"{"type":"String"}"#,
+            r#"{"type":"Int"}"#,
+            r#"{"type":"Float"}"#,
+        ] {
+            let attr: AttributeType = serde_json::from_str(json).unwrap();
+            match attr {
+                AttributeType::String {
+                    pattern,
+                    length,
+                    validate,
+                    to_dsl,
+                    identity,
+                } => {
+                    assert!(pattern.is_none());
+                    assert!(length.is_none());
+                    assert!(validate.is_none());
+                    assert!(to_dsl.is_none());
+                    assert!(identity.is_none());
+                }
+                AttributeType::Int { range, identity } => {
+                    assert!(range.is_none());
+                    assert!(identity.is_none());
+                }
+                AttributeType::Float { range, identity } => {
+                    assert!(range.is_none());
+                    assert!(identity.is_none());
+                }
+                other => panic!("unexpected primitive default shape: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn list_inner_alias_deserializes_and_emits_element_type() {
+        let json = r#"{
+            "type":"list",
+            "inner":{"type":"String"},
+            "ordered":false,
+            "length":[1,3],
+            "validate":true
+        }"#;
+        let attr: AttributeType = serde_json::from_str(json).unwrap();
+        match &attr {
+            AttributeType::List {
+                element_type,
+                ordered,
+                length,
+                validate,
+            } => {
+                assert!(matches!(**element_type, AttributeType::String { .. }));
+                assert!(!ordered);
+                assert_eq!(*length, Some((Some(1), Some(3))));
+                assert_eq!(*validate, Some(serde_json::json!(true)));
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+
+        let emitted = serde_json::to_string(&attr).unwrap();
+        assert!(emitted.contains("element_type"), "emitted: {emitted}");
+        assert!(!emitted.contains("inner"), "emitted: {emitted}");
     }
 
     #[test]
@@ -721,10 +861,12 @@ mod tests {
                     fields: vec![StructField {
                         name: "and_statement".into(),
                         field_type: AttributeType::List {
-                            inner: Box::new(AttributeType::Ref {
+                            element_type: Box::new(AttributeType::Ref {
                                 name: "Statement".into(),
                             }),
                             ordered: true,
+                            length: None,
+                            validate: None,
                         },
                         required: false,
                         description: None,
@@ -819,14 +961,14 @@ mod tests {
                     name: "IamPolicyPrincipal".into(),
                     fields: vec![StructField {
                         name: "service".into(),
-                        field_type: AttributeType::String,
+                        field_type: string_attr(),
                         required: false,
                         description: None,
                         block_name: None,
                         provider_name: None,
                     }],
                 },
-                AttributeType::String,
+                string_attr(),
             ],
         };
 
@@ -963,7 +1105,7 @@ mod tests {
         for transform in transforms {
             let attr = AttributeType::CustomEnum {
                 name: "ZoneName".to_string(),
-                base: Box::new(AttributeType::String),
+                base: Box::new(string_attr()),
                 namespace: "aws.AvailabilityZone".to_string(),
                 dsl_transform: Some(transform.clone()),
             };

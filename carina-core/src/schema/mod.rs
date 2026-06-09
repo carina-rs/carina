@@ -1759,6 +1759,24 @@ impl AttributeType {
         }
     }
 
+    /// Create a String type with protocol-carried refinement metadata.
+    pub fn refined_string(
+        identity: Option<TypeIdentity>,
+        pattern: Option<String>,
+        length: Option<(Option<u64>, Option<u64>)>,
+        to_dsl: Option<DslTransform>,
+    ) -> Self {
+        AttributeType {
+            kind: AttrTypeKind::String {
+                identity,
+                pattern,
+                length,
+                validate: noop_validator(),
+                to_dsl,
+            },
+        }
+    }
+
     /// Create the primitive `Int` type.
     pub fn int() -> Self {
         AttributeType {
@@ -1770,12 +1788,40 @@ impl AttributeType {
         }
     }
 
+    /// Create an Int type with protocol-carried refinement metadata.
+    pub fn refined_int(
+        identity: Option<TypeIdentity>,
+        range: Option<(Option<i64>, Option<i64>)>,
+    ) -> Self {
+        AttributeType {
+            kind: AttrTypeKind::Int {
+                identity,
+                range,
+                validate: noop_validator(),
+            },
+        }
+    }
+
     /// Create the primitive `Float` type.
     pub fn float() -> Self {
         AttributeType {
             kind: AttrTypeKind::Float {
                 identity: None,
                 range: None,
+                validate: noop_validator(),
+            },
+        }
+    }
+
+    /// Create a Float type with protocol-carried refinement metadata.
+    pub fn refined_float(
+        identity: Option<TypeIdentity>,
+        range: Option<(Option<f64>, Option<f64>)>,
+    ) -> Self {
+        AttributeType {
+            kind: AttrTypeKind::Float {
+                identity,
+                range,
                 validate: noop_validator(),
             },
         }
