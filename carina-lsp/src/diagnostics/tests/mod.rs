@@ -76,9 +76,8 @@ pub(super) fn test_engine_with_iam_policy_arn_custom_type() -> DiagnosticEngine 
         AttributeSchema, AttributeType, ResourceSchema, TypeIdentity, legacy_validator,
     };
 
-    let iam_policy_arn = AttributeType::custom(
+    let iam_policy_arn = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::new(Some("aws"), ["iam", "Policy"], "Arn")),
-        AttributeType::string(),
         None,
         None,
         legacy_validator(|_| Ok(())),

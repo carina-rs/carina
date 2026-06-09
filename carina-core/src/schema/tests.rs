@@ -1930,9 +1930,8 @@ fn exclusive_required_multiple_groups() {
 #[test]
 fn validate_union_type() {
     // Create two Custom types that validate different prefixes
-    let type_a = AttributeType::custom(
+    let type_a = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::bare("TypeA")),
-        AttributeType::string(),
         None,
         None,
         legacy_validator(|value| {
@@ -1948,9 +1947,8 @@ fn validate_union_type() {
         }),
         None,
     );
-    let type_b = AttributeType::custom(
+    let type_b = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::bare("TypeB")),
-        AttributeType::string(),
         None,
         None,
         legacy_validator(|value| {
@@ -2044,17 +2042,15 @@ fn union_struct_unknown_field_shows_specific_error() {
 
 #[test]
 fn union_type_name() {
-    let type_a = AttributeType::custom(
+    let type_a = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::bare("TypeA")),
-        AttributeType::string(),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
-    let type_b = AttributeType::custom(
+    let type_b = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::bare("TypeB")),
-        AttributeType::string(),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -2067,17 +2063,15 @@ fn union_type_name() {
 
 #[test]
 fn union_accepts_type_name() {
-    let type_a = AttributeType::custom(
+    let type_a = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::bare("TypeA")),
-        AttributeType::string(),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
-    let type_b = AttributeType::custom(
+    let type_b = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::bare("TypeB")),
-        AttributeType::string(),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -3082,20 +3076,26 @@ fn validate_skips_internal_attributes() {
 }
 
 fn make_custom(name: &str, base: AttributeType) -> AttributeType {
-    AttributeType::custom(
-        Some(TypeIdentity::bare(name)),
-        base,
-        None,
-        None,
-        crate::schema::legacy_validator(|_| Ok(())),
-        None,
-    )
+    match base.raw_shape() {
+        RawShape::String { .. } => AttributeType::refined_string_with_validator(
+            Some(TypeIdentity::bare(name)),
+            None,
+            None,
+            crate::schema::legacy_validator(|_| Ok(())),
+            None,
+        ),
+        RawShape::Int { .. } => AttributeType::refined_int_with_validator(
+            Some(TypeIdentity::bare(name)),
+            None,
+            crate::schema::legacy_validator(|_| Ok(())),
+        ),
+        other => panic!("test helper does not support refined base {other:?}"),
+    }
 }
 
 fn make_custom_anon_pattern(pattern: &str) -> AttributeType {
-    AttributeType::custom(
+    AttributeType::refined_string_with_validator(
         None,
-        AttributeType::string(),
         Some(pattern.to_string()),
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -3104,9 +3104,8 @@ fn make_custom_anon_pattern(pattern: &str) -> AttributeType {
 }
 
 fn make_custom_anon_len(min: u64, max: u64) -> AttributeType {
-    AttributeType::custom(
+    AttributeType::refined_string_with_validator(
         None,
-        AttributeType::string(),
         None,
         Some((Some(min), Some(max))),
         crate::schema::legacy_validator(|_| Ok(())),
@@ -3145,13 +3144,12 @@ fn assignable_allows_same_semantic_name() {
 #[test]
 fn assignable_rejects_same_kind_across_providers() {
     let provider_custom = |provider: &str| {
-        AttributeType::custom(
+        AttributeType::refined_string_with_validator(
             Some(TypeIdentity::new(
                 Some(provider),
                 Vec::<String>::new(),
                 "Region",
             )),
-            AttributeType::string(),
             None,
             None,
             crate::schema::legacy_validator(|_| Ok(())),
@@ -3209,9 +3207,8 @@ fn assignable_accepts_same_enum_typeidentity_from_distinct_constructions() {
 #[test]
 fn assignable_specific_arn_flows_into_generic_arn() {
     let mk = |segments: &[&str], pattern: Option<&str>| {
-        AttributeType::custom(
+        AttributeType::refined_string_with_validator(
             Some(TypeIdentity::new(Some("aws"), segments.to_vec(), "Arn")),
-            AttributeType::string(),
             pattern.map(str::to_string),
             None,
             crate::schema::legacy_validator(|_| Ok(())),
@@ -3249,9 +3246,8 @@ fn assignable_specific_arn_flows_into_generic_arn() {
 #[test]
 fn assignable_specific_arn_with_pattern_flows_into_generic_arn_with_pattern() {
     let mk = |segments: &[&str], pattern: &str| {
-        AttributeType::custom(
+        AttributeType::refined_string_with_validator(
             Some(TypeIdentity::new(Some("aws"), segments.to_vec(), "Arn")),
-            AttributeType::string(),
             Some(pattern.to_string()),
             None,
             crate::schema::legacy_validator(|_| Ok(())),
@@ -3269,9 +3265,8 @@ fn assignable_specific_arn_with_pattern_flows_into_generic_arn_with_pattern() {
 #[test]
 fn assignable_specific_arn_without_pattern_flows_into_generic_arn_with_pattern() {
     let mk = |segments: &[&str], pattern: Option<&str>| {
-        AttributeType::custom(
+        AttributeType::refined_string_with_validator(
             Some(TypeIdentity::new(Some("aws"), segments.to_vec(), "Arn")),
-            AttributeType::string(),
             pattern.map(str::to_string),
             None,
             crate::schema::legacy_validator(|_| Ok(())),
@@ -3288,9 +3283,8 @@ fn assignable_specific_arn_without_pattern_flows_into_generic_arn_with_pattern()
 #[test]
 fn assignable_identified_custom_length_must_be_contained() {
     let mk = |length: Option<(Option<u64>, Option<u64>)>| {
-        AttributeType::custom(
+        AttributeType::refined_string_with_validator(
             Some(TypeIdentity::bare("SizedString")),
-            AttributeType::string(),
             None,
             length,
             crate::schema::legacy_validator(|_| Ok(())),
@@ -3318,9 +3312,8 @@ fn assignable_identified_custom_length_must_be_contained() {
 #[test]
 fn assignable_accepts_same_typeidentity_from_distinct_constructions_vpc_id() {
     let mk = || {
-        AttributeType::custom(
+        AttributeType::refined_string_with_validator(
             Some(TypeIdentity::new(Some("aws"), vec!["ec2", "Vpc"], "Id")),
-            AttributeType::string(),
             None,
             None,
             crate::schema::legacy_validator(|_| Ok(())),
@@ -3339,13 +3332,12 @@ fn assignable_accepts_same_typeidentity_from_distinct_constructions_vpc_id() {
 #[test]
 fn assignable_accepts_same_typeidentity_from_distinct_constructions_account_id() {
     let mk = || {
-        AttributeType::custom(
+        AttributeType::refined_string_with_validator(
             Some(TypeIdentity::new(
                 Some("aws"),
                 Vec::<String>::new(),
                 "AccountId",
             )),
-            AttributeType::string(),
             None,
             None,
             crate::schema::legacy_validator(|_| Ok(())),
@@ -3363,9 +3355,8 @@ fn assignable_accepts_same_typeidentity_from_distinct_constructions_account_id()
 #[test]
 fn assignable_accepts_same_typeidentity_from_distinct_constructions_iam_role_arn() {
     let mk = || {
-        AttributeType::custom(
+        AttributeType::refined_string_with_validator(
             Some(TypeIdentity::new(Some("aws"), vec!["iam", "Role"], "Arn")),
-            AttributeType::string(),
             None,
             None,
             crate::schema::legacy_validator(|_| Ok(())),
@@ -3387,13 +3378,12 @@ fn assignable_accepts_same_typeidentity_from_distinct_constructions_iam_role_arn
 #[test]
 fn assignable_rejects_account_id_across_genuinely_different_providers() {
     let mk = |provider: &str| {
-        AttributeType::custom(
+        AttributeType::refined_string_with_validator(
             Some(TypeIdentity::new(
                 Some(provider),
                 Vec::<String>::new(),
                 "AccountId",
             )),
-            AttributeType::string(),
             None,
             None,
             crate::schema::legacy_validator(|_| Ok(())),
@@ -3412,9 +3402,8 @@ fn assignable_rejects_account_id_across_genuinely_different_providers() {
 #[test]
 fn assignable_identity_axis_directionality() {
     let mk = |provider: Option<&str>, segments: &[&str]| {
-        AttributeType::custom(
+        AttributeType::refined_string_with_validator(
             Some(TypeIdentity::new(provider, segments.to_vec(), "Arn")),
-            AttributeType::string(),
             None,
             None,
             crate::schema::legacy_validator(|_| Ok(())),
@@ -3440,9 +3429,8 @@ fn assignable_identity_axis_directionality() {
 fn assignable_narrow_to_anonymous_unconstrained_sink() {
     // Semantic source with no pattern assigns to fully-anonymous unconstrained sink.
     let account = make_custom("AwsAccountId", AttributeType::string());
-    let anon = AttributeType::custom(
+    let anon = AttributeType::refined_string_with_validator(
         None,
-        AttributeType::string(),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -3492,9 +3480,8 @@ fn assignable_union_sink_accepts_assignable_member() {
 fn assignable_union_source_requires_all_members_assignable() {
     // All members of source must be assignable to sink.
     let vpc = make_custom("VpcId", AttributeType::string());
-    let anon_any = AttributeType::custom(
+    let anon_any = AttributeType::refined_string_with_validator(
         None,
-        AttributeType::string(),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -3517,9 +3504,8 @@ fn semantic_custom_assigns_to_anonymous_unconstrained_sink() {
     // Replaces the old buggy `is_compatible_with_two_string_based_customs`
     // which asserted VpcId <-> SubnetId were symmetric-compatible.
     let vpc = make_custom("VpcId", AttributeType::string());
-    let anon = AttributeType::custom(
+    let anon = AttributeType::refined_string_with_validator(
         None,
-        AttributeType::string(),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -3556,9 +3542,8 @@ fn make_custom_anon_pattern_and_len(
     pattern: Option<&str>,
     length: Option<(Option<u64>, Option<u64>)>,
 ) -> AttributeType {
-    AttributeType::custom(
+    AttributeType::refined_string_with_validator(
         None,
-        AttributeType::string(),
         pattern.map(str::to_string),
         length,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -3666,9 +3651,8 @@ fn assignable_anon_length_both_none_compatible() {
 
 #[test]
 fn custom_carries_semantic_name_pattern_length() {
-    let t = AttributeType::custom(
+    let t = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::bare("VpcId")),
-        AttributeType::string(),
         Some("^vpc-[a-f0-9]+$".to_string()),
         Some((Some(8), Some(21))),
         crate::schema::legacy_validator(|_| Ok(())),
@@ -3691,9 +3675,8 @@ fn custom_carries_semantic_name_pattern_length() {
 
 #[test]
 fn custom_pattern_rejects_and_accepts_string_values() {
-    let attr = AttributeType::custom(
+    let attr = AttributeType::refined_string_with_validator(
         None,
-        AttributeType::string(),
         Some("^[a-z]+$".to_string()),
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -3720,9 +3703,8 @@ fn custom_pattern_rejects_and_accepts_string_values() {
 
 #[test]
 fn custom_pattern_and_length_passes_still_run_validator() {
-    let attr = AttributeType::custom(
+    let attr = AttributeType::refined_string_with_validator(
         None,
-        AttributeType::string(),
         Some("^[a-z]+$".to_string()),
         Some((Some(1), Some(10))),
         validator(|_| {
@@ -3747,9 +3729,8 @@ fn custom_pattern_and_length_passes_still_run_validator() {
 #[test]
 fn custom_pattern_rejects_wafv2_description_parentheses() {
     let pattern = r"^[a-zA-Z0-9=:#@/\-,.][a-zA-Z0-9+=:#@/\-,.\s]+[a-zA-Z0-9+=:#@/\-,.]{1,256}$";
-    let attr = AttributeType::custom(
+    let attr = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::bare("EntityDescription")),
-        AttributeType::string(),
         Some(pattern.to_string()),
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -3781,9 +3762,8 @@ fn custom_pattern_rejects_wafv2_description_parentheses() {
 
 #[test]
 fn custom_length_uses_character_count_not_bytes() {
-    let attr = AttributeType::custom(
+    let attr = AttributeType::refined_string_with_validator(
         None,
-        AttributeType::string(),
         None,
         Some((Some(1), Some(5))),
         crate::schema::legacy_validator(|_| Ok(())),
@@ -3820,9 +3800,8 @@ fn custom_length_uses_character_count_not_bytes() {
 
 #[test]
 fn custom_length_enforces_minimum_bound() {
-    let attr = AttributeType::custom(
+    let attr = AttributeType::refined_string_with_validator(
         None,
-        AttributeType::string(),
         None,
         Some((Some(2), None)),
         crate::schema::legacy_validator(|_| Ok(())),
@@ -3851,13 +3830,11 @@ fn custom_length_enforces_minimum_bound() {
 
 #[test]
 fn custom_int_base_maps_length_to_range() {
-    let attr = AttributeType::custom(
+    let attr = AttributeType::refined_int_with_validator(
         None,
-        AttributeType::int(),
-        Some("^[a-z]+$".to_string()),
-        Some((Some(100), Some(200))),
+        Some((Some(100), Some(200)))
+            .map(|(min, max)| (min.map(|v| v as i64), max.map(|v| v as i64))),
         crate::schema::legacy_validator(|_| Ok(())),
-        None,
     );
 
     assert!(
@@ -3877,9 +3854,8 @@ fn custom_uncompilable_pattern_is_non_fatal() {
         regex::Regex::new(pattern).is_err(),
         "test must use a pattern unsupported by the regex crate"
     );
-    let attr = AttributeType::custom(
+    let attr = AttributeType::refined_string_with_validator(
         None,
-        AttributeType::string(),
         Some(pattern.to_string()),
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -3896,9 +3872,8 @@ fn custom_uncompilable_pattern_is_non_fatal() {
 
 #[test]
 fn schema_validate_attr_dispatches_to_custom_pattern_validation() {
-    let attr = AttributeType::custom(
+    let attr = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::bare("Slug")),
-        AttributeType::string(),
         Some("^[a-z]+$".to_string()),
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -3925,9 +3900,8 @@ fn schema_validate_attr_dispatches_to_custom_pattern_validation() {
 
 #[test]
 fn custom_type_name_anonymous_pattern_only() {
-    let t = AttributeType::custom(
+    let t = AttributeType::refined_string_with_validator(
         None,
-        AttributeType::string(),
         Some("^foo$".to_string()),
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -3938,9 +3912,8 @@ fn custom_type_name_anonymous_pattern_only() {
 
 #[test]
 fn custom_type_name_anonymous_length_only() {
-    let t = AttributeType::custom(
+    let t = AttributeType::refined_string_with_validator(
         None,
-        AttributeType::string(),
         None,
         Some((Some(1), Some(64))),
         crate::schema::legacy_validator(|_| Ok(())),
@@ -3951,9 +3924,8 @@ fn custom_type_name_anonymous_length_only() {
 
 #[test]
 fn custom_type_name_anonymous_pattern_and_length() {
-    let t = AttributeType::custom(
+    let t = AttributeType::refined_string_with_validator(
         None,
-        AttributeType::string(),
         Some("^.*$".to_string()),
         Some((Some(1), Some(64))),
         crate::schema::legacy_validator(|_| Ok(())),
@@ -4531,9 +4503,8 @@ fn union_string_vs_custom_picks_custom_error_for_string_input() {
     }
     let union_type = AttributeType::union(vec![
         AttributeType::int(),
-        AttributeType::custom(
+        AttributeType::refined_string_with_validator(
             Some(TypeIdentity::bare("Arn")),
-            AttributeType::string(),
             None,
             None,
             legacy_validator(must_be_arn),
@@ -4598,13 +4569,10 @@ fn union_custom_with_int_base_picks_custom_error_for_int_input() {
     // through a Custom on top so the actual reachable failure path
     // is the `Custom` one.
     let union_type = AttributeType::union(vec![
-        AttributeType::custom(
+        AttributeType::refined_int_with_validator(
             Some(TypeIdentity::bare("PositiveInt")),
-            AttributeType::int(),
-            None,
             None,
             legacy_validator(must_be_positive),
-            None,
         ),
         AttributeType::bool(),
     ]);
@@ -4664,9 +4632,8 @@ fn custom_validator_can_capture_external_state() {
     // closure-capable validator can. This is the core acceptance for
     // #2217 (closure-capable Custom validator).
     let allowed_region = "ap-northeast-1".to_string();
-    let attr = AttributeType::custom(
+    let attr = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::bare("Region")),
-        AttributeType::string(),
         None,
         None,
         validator(move |v| match v {
@@ -4706,9 +4673,8 @@ fn custom_validator_returns_structured_type_error_directly() {
     // bypassing the legacy `String -> ValidationFailed` round-trip.
     // This is what unlocks LSP code-action quick-fixes for Custom-typed
     // attributes (see #2220 / #2309 for the structured-error path).
-    let attr = AttributeType::custom(
+    let attr = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::bare("Mode")),
-        AttributeType::string(),
         None,
         None,
         validator(|v| match v {
@@ -4853,9 +4819,8 @@ fn walk_custom_lookup_skips_value_unknown() {
                 .to_string(),
         })
     });
-    let custom_type = AttributeType::custom(
+    let custom_type = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::bare("vpc_id")),
-        AttributeType::string(),
         None,
         None,
         always_fail,
@@ -4898,9 +4863,8 @@ fn union_walk_custom_lookup_succeeds_when_any_member_accepts() {
     // because the approving arm matches; the sibling's failure is
     // discarded.
     let custom = |name: &str| {
-        AttributeType::custom(
+        AttributeType::refined_string_with_validator(
             Some(TypeIdentity::bare(name)),
-            AttributeType::string(),
             None,
             None,
             validator(|_v: &Value| Ok(())),
@@ -4941,9 +4905,8 @@ fn union_walk_custom_lookup_emits_smallest_error_set_when_all_fail() {
     // sum. Both arms emit a single error here, so the Union's error
     // count must be 1, not 2.
     let custom = |name: &str| {
-        AttributeType::custom(
+        AttributeType::refined_string_with_validator(
             Some(TypeIdentity::bare(name)),
-            AttributeType::string(),
             None,
             None,
             validator(|_v: &Value| Ok(())),

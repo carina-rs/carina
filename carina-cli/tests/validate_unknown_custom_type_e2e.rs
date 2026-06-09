@@ -76,18 +76,16 @@ impl ProviderFactory for AwsccTestFactory {
         Box::pin(async { Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer> })
     }
     fn schemas(&self) -> Vec<ResourceSchema> {
-        let iam_policy_arn = AttributeType::custom(
+        let iam_policy_arn = AttributeType::refined_string_with_validator(
             Some(TypeIdentity::new(Some("aws"), ["iam", "Policy"], "Arn")),
-            AttributeType::string(),
             None,
             None,
             legacy_validator(|_| Ok(())),
             None,
         );
 
-        let generic_arn = AttributeType::custom(
+        let generic_arn = AttributeType::refined_string_with_validator(
             Some(TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Arn")),
-            AttributeType::string(),
             None,
             None,
             legacy_validator(|_| Ok(())),

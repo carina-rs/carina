@@ -805,9 +805,8 @@ mod tests {
     }
 
     fn vpc_id_custom() -> AttributeType {
-        AttributeType::custom(
+        AttributeType::refined_string_with_validator(
             Some(TypeIdentity::bare("VpcId")),
-            AttributeType::string(),
             None,
             None,
             legacy_validator(noop),

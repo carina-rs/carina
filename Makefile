@@ -46,6 +46,8 @@ plan-no-changes-enum:
 	$(PLAN_FIXTURE) no_changes_enum
 plan-dynamic-enum-az-no-diff:
 	$(PLAN_FIXTURE) dynamic_enum_az_no_diff
+plan-route53-hosted-zone-name-strip-suffix-no-diff:
+	$(PLAN_FIXTURE) route53_hosted_zone_name_strip_suffix_no_diff
 plan-destroy-full:
 	$(PLAN_FIXTURE) destroy_full --destroy
 plan-destroy-orphans:
@@ -132,6 +134,9 @@ plan-fixtures:
 	@echo ""
 	@echo "=== no_changes_enum ==="
 	@$(MAKE) plan-no-changes-enum
+	@echo ""
+	@echo "=== route53_hosted_zone_name_strip_suffix_no_diff ==="
+	@$(MAKE) plan-route53-hosted-zone-name-strip-suffix-no-diff
 	@echo ""
 	@echo "=== destroy_full ==="
 	@$(MAKE) plan-destroy-full
@@ -266,7 +271,7 @@ plan-multi-instance-create:
 	$(PLAN_FIXTURE) multi_instance_create
 plan-multi-instance-module:
 	$(PLAN_FIXTURE) multi_instance_module
-.PHONY: plan-all-create plan-no-changes plan-empty-explicit-children-no-changes plan-no-changes-enum plan-dynamic-enum-az-no-diff plan-mixed plan-delete plan-delete-list-of-maps plan-compact plan-import-deferred-interpolation \
+.PHONY: plan-all-create plan-no-changes plan-empty-explicit-children-no-changes plan-no-changes-enum plan-dynamic-enum-az-no-diff plan-route53-hosted-zone-name-strip-suffix-no-diff plan-mixed plan-delete plan-delete-list-of-maps plan-compact plan-import-deferred-interpolation \
         plan-map-diff plan-list-diff-added-struct plan-list-diff-removed-struct \
         plan-list-diff-modified-with-unchanged \
         plan-list-diff-modified-with-unchanged-nested \

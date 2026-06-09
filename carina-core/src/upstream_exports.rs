@@ -2127,16 +2127,8 @@ mod tests {
         );
         let exports =
             mk_typed_exports(&[("orgs", &[("key_arn", TypeExpr::Simple("arn".to_string()))])]);
-        let kms_arn = AttributeType::custom(
+        let kms_arn = AttributeType::refined_string_with_validator(
             Some(TypeIdentity::bare("KmsKeyArn")),
-            AttributeType::custom(
-                Some(TypeIdentity::bare("Arn")),
-                AttributeType::string(),
-                None,
-                None,
-                crate::schema::legacy_validator(|_| Ok(())),
-                None,
-            ),
             None,
             None,
             crate::schema::legacy_validator(|_| Ok(())),
@@ -2182,9 +2174,8 @@ mod tests {
         // Receiver is `String`. Without narrowing, `map(AwsAccountId)`
         // compares against `String` and fails. With narrowing,
         // `AwsAccountId` (Custom over String) is accepted.
-        let aws_account_id = AttributeType::custom(
+        let aws_account_id = AttributeType::refined_string_with_validator(
             Some(TypeIdentity::bare("AwsAccountId")),
-            AttributeType::string(),
             None,
             None,
             crate::schema::legacy_validator(|_| Ok(())),

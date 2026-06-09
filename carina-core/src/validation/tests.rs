@@ -1394,9 +1394,8 @@ fn is_type_expr_compatible_unknown_rejects_custom_receiver() {
     fn noop(_v: &crate::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let custom = AttributeType::custom(
+    let custom = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::bare("VpcId")),
-        AttributeType::string(),
         None,
         None,
         legacy_validator(noop),
@@ -1415,9 +1414,8 @@ fn is_type_expr_compatible_string_rejects_custom_with_semantic_name() {
     fn noop(_v: &crate::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let schema = AttributeType::custom(
+    let schema = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::bare("VpcId")),
-        AttributeType::string(),
         None,
         None,
         legacy_validator(noop),
@@ -1443,9 +1441,8 @@ fn is_type_expr_compatible_string_accepts_custom_without_semantic_name() {
     fn noop(_v: &crate::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let schema = AttributeType::custom(
+    let schema = AttributeType::refined_string_with_validator(
         None,
-        AttributeType::string(),
         Some("^.+$".to_string()),
         None,
         legacy_validator(noop),
@@ -1473,9 +1470,8 @@ fn is_type_expr_compatible_string_rejects_union_containing_specific_custom() {
     }
     let schema = AttributeType::union(vec![
         AttributeType::string(),
-        AttributeType::custom(
+        AttributeType::refined_string_with_validator(
             Some(TypeIdentity::bare("VpcId")),
-            AttributeType::string(),
             None,
             None,
             legacy_validator(noop),
@@ -1502,9 +1498,8 @@ fn is_type_expr_compatible_string_rejects_union_of_only_specific_customs() {
         Ok(())
     }
     let mk = |name: &str| {
-        AttributeType::custom(
+        AttributeType::refined_string_with_validator(
             Some(TypeIdentity::bare(name)),
-            AttributeType::string(),
             None,
             None,
             legacy_validator(noop),
@@ -1556,9 +1551,8 @@ fn is_type_expr_compatible_simple_vpcid_accepts_custom_vpcid() {
     fn noop(_v: &crate::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let schema = AttributeType::custom(
+    let schema = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::bare("VpcId")),
-        AttributeType::string(),
         None,
         None,
         legacy_validator(noop),
@@ -1633,9 +1627,8 @@ fn attribute_param_ref_type_mismatch_detected() {
     role_schema = role_schema.attribute(AttributeSchema::new("role_name", AttributeType::string()));
     role_schema = role_schema.attribute(AttributeSchema::new(
         "arn",
-        AttributeType::custom(
+        AttributeType::refined_string_with_validator(
             Some(TypeIdentity::bare("IamRoleArn")),
-            AttributeType::string(),
             None,
             None,
             crate::schema::legacy_validator(|_| Ok(())),
@@ -1784,9 +1777,8 @@ fn validate_export_params_rejects_type_mismatch() {
 #[test]
 fn type_compat_subtype_accepted() {
     // arn accepts a provider-scoped KMS key ARN (narrower segments, same kind).
-    let kms_key_arn = AttributeType::custom(
+    let kms_key_arn = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::new(Some("aws"), ["kms", "Key"], "Arn")),
-        AttributeType::string(),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -1802,9 +1794,8 @@ fn type_compat_subtype_accepted() {
 #[test]
 fn type_compat_sibling_rejected() {
     // kms_key_arn rejects an IAM role ARN sibling.
-    let iam_role_arn = AttributeType::custom(
+    let iam_role_arn = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn")),
-        AttributeType::string(),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -1820,9 +1811,8 @@ fn type_compat_sibling_rejected() {
 #[test]
 fn type_compat_resource_id_subtype() {
     // resource_id accepts VPC resource IDs (narrower segments, same kind).
-    let vpc_id = AttributeType::custom(
+    let vpc_id = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::new(Some("aws"), ["ec2", "Vpc"], "ResourceId")),
-        AttributeType::string(),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -1838,16 +1828,8 @@ fn type_compat_resource_id_subtype() {
 #[test]
 fn type_compat_resource_id_siblings_rejected() {
     // vpc_id rejects SubnetId (sibling)
-    let subnet_id = AttributeType::custom(
+    let subnet_id = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::bare("SubnetId")),
-        AttributeType::custom(
-            Some(TypeIdentity::bare("AwsResourceId")),
-            AttributeType::string(),
-            None,
-            None,
-            crate::schema::legacy_validator(|_| Ok(())),
-            None,
-        ),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -1862,9 +1844,8 @@ fn type_compat_resource_id_siblings_rejected() {
 
 #[test]
 fn type_compat_exact_match() {
-    let arn = AttributeType::custom(
+    let arn = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::bare("Arn")),
-        AttributeType::string(),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
@@ -1998,9 +1979,8 @@ fn type_compat_simple_rejected_when_union_has_no_plain_string() {
 // allow-list, this test will fail and force a re-think.
 #[test]
 fn type_compat_simple_rejected_when_union_has_string_shaped_peer() {
-    let arn = AttributeType::custom(
+    let arn = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::bare("Arn")),
-        AttributeType::string(),
         None,
         None,
         crate::schema::legacy_validator(|_| Ok(())),
