@@ -275,7 +275,13 @@ fn path_traverses_deferred(
         // bail out at the first cycle hop (carina#3340).
         let resolved = current_type.resolve_refs_with_defs(defs).as_attr();
         match (resolved.kind(), segment) {
-            (AttrTypeKind::List { inner, .. }, PathSegment::Subscript { .. }) => {
+            (
+                AttrTypeKind::List {
+                    element_type: inner,
+                    ..
+                },
+                PathSegment::Subscript { .. },
+            ) => {
                 current_type = inner;
             }
             (AttrTypeKind::Map { value, .. }, PathSegment::Subscript { .. }) => {

@@ -57,7 +57,7 @@ pub fn list_struct_attr_names(schema: &ResourceSchema) -> HashSet<String> {
             // variant, so a `Ref`-typed attribute cannot be missed.
             matches!(
                 attr_schema.attr_type.shape_with_defs(&schema.defs),
-                Shape::List { inner, .. } if matches!(
+                Shape::List { element_type: inner, .. } if matches!(
                     inner.shape_with_defs(&schema.defs),
                     Shape::Struct { .. }
                 )

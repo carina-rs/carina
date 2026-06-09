@@ -94,7 +94,7 @@ impl CompletionProvider {
                 if let Some(bn) = &attr.block_name
                     && matches!(
                         schema.shape_of(&attr.attr_type),
-                        Shape::List { inner, .. } if matches!(
+                        Shape::List { element_type: inner, .. } if matches!(
                             schema.shape_of(inner),
                             Shape::Struct { .. }
                         )
@@ -544,11 +544,17 @@ impl CompletionProvider {
         }
     }
 
-    /// Extract the Custom type's kind name from an AttributeType, if it
-    /// is a Custom type with a structured identity.
+    /// Extract a refined type's kind name from an AttributeType, if it
+    /// has a structured identity.
     fn extract_custom_type_name(attr_type: &AttributeType) -> Option<&str> {
         match attr_type.shape_ref_free() {
-            Ok(Shape::Custom {
+            Ok(Shape::String {
+                identity: Some(id), ..
+            })
+            | Ok(Shape::Int {
+                identity: Some(id), ..
+            })
+            | Ok(Shape::Float {
                 identity: Some(id), ..
             }) => Some(&id.kind),
             Ok(_) | Err(_) => None,
@@ -624,10 +630,10 @@ impl CompletionProvider {
                         .unwrap_or_default(),
                 }
             }
-            Shape::Int => {
+            Shape::Int { .. } => {
                 vec![] // No specific completions for integers
             }
-            Shape::Float => {
+            Shape::Float { .. } => {
                 vec![] // No specific completions for floats
             }
             // Curated unit-snippet completions for Duration attributes,
@@ -662,10 +668,10 @@ impl CompletionProvider {
                     ..Default::default()
                 },
             ],
-            Shape::Custom {
+            Shape::String {
                 identity: Some(id), ..
             } if id.kind == "Cidr" || id.kind == "Ipv4Cidr" => self.cidr_completions(),
-            Shape::Custom {
+            Shape::String {
                 identity: Some(id), ..
             } if id.kind == "Ipv6Cidr" => self.ipv6_cidr_completions(),
             // Generic ARN snippet only for the bare `Arn` type. Specific
@@ -677,7 +683,7 @@ impl CompletionProvider {
             // family snippets can be added as additional arms later if
             // the per-type formats are useful enough to justify the
             // surface. See #2621.
-            Shape::Custom {
+            Shape::String {
                 identity: Some(id), ..
             } if id.kind == "Arn" => self.arn_completions(),
             // AvailabilityZone is split into two distinct types post-S2.5:
@@ -686,7 +692,7 @@ impl CompletionProvider {
             // lives in `segments`. We surface AZ-letter completions only for
             // zone-name typed sinks — zone-id values look like `usw2-az1` and
             // are not derivable from region code + letter.
-            Shape::Custom {
+            Shape::String {
                 identity: Some(id), ..
             } if id.kind == "ZoneName"
                 && id.segments.first().map(String::as_str) == Some("AvailabilityZone") =>
@@ -694,9 +700,10 @@ impl CompletionProvider {
                 self.availability_zone_completions(id)
             }
             // List(non-Struct): delegate to inner type completions
-            Shape::List { inner, .. } => {
-                self.completions_for_type_with_budget(inner, resource_type, budget)
-            }
+            Shape::List {
+                element_type: inner,
+                ..
+            } => self.completions_for_type_with_budget(inner, resource_type, budget),
             // Map: delegate to inner value type completions
             Shape::Map { value: inner, .. } => {
                 self.completions_for_type_with_budget(inner, resource_type, budget)
@@ -1301,7 +1308,13 @@ impl CompletionProvider {
         };
         let effective = if in_nested {
             match annotation.shape_ref_free() {
-                Ok(Shape::List { inner, .. } | Shape::Map { value: inner, .. }) => inner.clone(),
+                Ok(
+                    Shape::List {
+                        element_type: inner,
+                        ..
+                    }
+                    | Shape::Map { value: inner, .. },
+                ) => inner.clone(),
                 // Inside `{ ... }` of a non-collection annotation we
                 // don't know what the user means — fall silent.
                 Ok(_) | Err(_) => return Vec::new(),
@@ -2031,8 +2044,15 @@ fn return_type_fits(
             .ok()
             .flatten()
             .is_some_and(|members| members.iter().any(|m| return_type_fits(ret, m, budget))),
-        Shape::String => matches!(ret, R::String | R::Any),
-        Shape::Int => matches!(ret, R::Int | R::Any),
+        Shape::String {
+            identity: None,
+            pattern: None,
+            length: None,
+            to_dsl: None,
+            ..
+        } => matches!(ret, R::String | R::Any),
+        Shape::String { .. } => false,
+        Shape::Int { .. } => matches!(ret, R::Int | R::Any),
         // No built-in currently returns a Bool; leave as unfit.
         Shape::Bool => false,
         Shape::List { .. } => matches!(ret, R::List | R::Any),
@@ -2041,13 +2061,8 @@ fn return_type_fits(
         // currently produces such values, and `Any` alone doesn't give us
         // enough confidence to suggest one.
         Shape::Enum { .. } => false,
-        // Custom types carry a semantic meaning (Cidr, AwsAccountId, Arn,
-        // …) that built-ins don't declare. Not even `Any` fits — we need
-        // a semantic return annotation before a built-in can be suggested
-        // here.
-        Shape::Custom { .. } => false,
         // Float, Duration, and Struct attributes — no matching built-in today.
-        Shape::Float => false,
+        Shape::Float { .. } => false,
         Shape::Duration => false,
         Shape::Struct { .. } => false,
     }

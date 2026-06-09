@@ -1333,9 +1333,14 @@ fn is_string_or_list_of_strings(attr_type: &AttributeType) -> bool {
     let mut has_list_of_string = false;
     for m in members {
         match &peel_custom(m).kind {
-            AttrTypeKind::String => has_string = true,
-            AttrTypeKind::List { inner, .. }
-                if matches!(&peel_custom(inner.as_ref()).kind, AttrTypeKind::String) =>
+            AttrTypeKind::String { .. } => has_string = true,
+            AttrTypeKind::List {
+                element_type: inner,
+                ..
+            } if matches!(
+                &peel_custom(inner.as_ref()).kind,
+                AttrTypeKind::String { .. }
+            ) =>
             {
                 has_list_of_string = true;
             }
@@ -1346,11 +1351,7 @@ fn is_string_or_list_of_strings(attr_type: &AttributeType) -> bool {
 }
 
 fn peel_custom(t: &AttributeType) -> &AttributeType {
-    let mut cur = t;
-    while let AttrTypeKind::Custom { base, .. } = &cur.kind {
-        cur = base.as_ref();
-    }
-    cur
+    t
 }
 
 /// Convert `value` to the canonical `Value::Concrete(ConcreteValue::StringList)` form when
@@ -1393,7 +1394,13 @@ pub(crate) fn canonicalize_with_type(
     // passed Ref-typed values through without canonicalization —
     // exactly the carina#3340 / carina#3349 bug class.
     match (value, unwrapped.shape_with_defs(defs)) {
-        (Value::Concrete(ConcreteValue::List(items)), crate::schema::Shape::List { inner, .. }) => {
+        (
+            Value::Concrete(ConcreteValue::List(items)),
+            crate::schema::Shape::List {
+                element_type: inner,
+                ..
+            },
+        ) => {
             let canonicalized = items
                 .into_iter()
                 .map(|v| canonicalize_with_type(v, inner, defs))
@@ -3876,16 +3883,8 @@ mod tests {
     }
 
     #[test]
-    fn canonicalize_through_custom_wrapper() {
-        // Custom wrappers must be transparent for type matching.
-        let t = AttributeType::custom(
-            Some(crate::schema::TypeIdentity::bare("PolicyConditionValue")),
-            string_or_list_of_strings(),
-            None,
-            None,
-            std::sync::Arc::new(|_| Ok(())),
-            None,
-        );
+    fn canonicalize_string_or_list_union() {
+        let t = string_or_list_of_strings();
         let v = Value::Concrete(ConcreteValue::String("x".to_string()));
         let canon = canonicalize_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
         assert_eq!(

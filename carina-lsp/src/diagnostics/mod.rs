@@ -613,7 +613,7 @@ impl DiagnosticEngine {
                                 )),
                                 // Int type should not receive String
                                 (
-                                    carina_core::schema::Shape::Int,
+                                    carina_core::schema::Shape::Int { .. },
                                     Value::Concrete(ConcreteValue::String(s)),
                                 ) => Some(format!(
                                     "Type mismatch: expected Int, got String \"{}\".",
@@ -621,7 +621,7 @@ impl DiagnosticEngine {
                                 )),
                                 // Float type should not receive String
                                 (
-                                    carina_core::schema::Shape::Float,
+                                    carina_core::schema::Shape::Float { .. },
                                     Value::Concrete(ConcreteValue::String(s)),
                                 ) => Some(format!(
                                     "Type mismatch: expected Float, got String \"{}\".",
@@ -631,7 +631,15 @@ impl DiagnosticEngine {
                                 (
                                     carina_core::schema::Shape::Union
                                     | carina_core::schema::Shape::Enum { .. }
-                                    | carina_core::schema::Shape::Custom { .. },
+                                    | carina_core::schema::Shape::String {
+                                        identity: Some(_), ..
+                                    }
+                                    | carina_core::schema::Shape::Int {
+                                        identity: Some(_), ..
+                                    }
+                                    | carina_core::schema::Shape::Float {
+                                        identity: Some(_), ..
+                                    },
                                     Value::Deferred(DeferredValue::ResourceRef { path }),
                                 ) => check_resource_ref_type_mismatch(
                                     &binding_schema_map,
@@ -664,8 +672,26 @@ impl DiagnosticEngine {
                                     })
                                 }
                                 (
-                                    carina_core::schema::Shape::Custom {
-                                        identity, validate, ..
+                                    carina_core::schema::Shape::String {
+                                        identity: Some(identity),
+                                        validate,
+                                        ..
+                                    },
+                                    value,
+                                )
+                                | (
+                                    carina_core::schema::Shape::Int {
+                                        identity: Some(identity),
+                                        validate,
+                                        ..
+                                    },
+                                    value,
+                                )
+                                | (
+                                    carina_core::schema::Shape::Float {
+                                        identity: Some(identity),
+                                        validate,
+                                        ..
                                     },
                                     value,
                                 ) => {
@@ -688,15 +714,13 @@ impl DiagnosticEngine {
                                         );
                                         validate(value)
                                             .err()
-                                            .or_else(|| {
-                                                identity.and_then(|id| lookup(id, value).err())
-                                            })
+                                            .or_else(|| lookup(identity, value).err())
                                             .map(|inner_err| inner_err.to_string())
                                     }
                                 }
                                 // String type - check for bare resource binding
                                 (
-                                    carina_core::schema::Shape::String,
+                                    carina_core::schema::Shape::String { .. },
                                     Value::Concrete(ConcreteValue::String(s)),
                                 ) => {
                                     if let Some(binding) =
@@ -721,7 +745,10 @@ impl DiagnosticEngine {
                                 // `List<Ref<Struct>>` correctly defers to
                                 // the struct-validation pass (carina#3349).
                                 (
-                                    carina_core::schema::Shape::List { inner, .. },
+                                    carina_core::schema::Shape::List {
+                                        element_type: inner,
+                                        ..
+                                    },
                                     Value::Concrete(ConcreteValue::List(_)),
                                 ) if !matches!(
                                     schema.shape_of(inner),
@@ -797,7 +824,10 @@ impl DiagnosticEngine {
                             // drop `Ref` and skip the entire pass.
                             let is_struct_shape = match schema.shape_of(&attr_schema.attr_type) {
                                 carina_core::schema::Shape::Struct { .. } => true,
-                                carina_core::schema::Shape::List { inner, .. } => matches!(
+                                carina_core::schema::Shape::List {
+                                    element_type: inner,
+                                    ..
+                                } => matches!(
                                     schema.shape_of(inner),
                                     carina_core::schema::Shape::Struct { .. }
                                 ),

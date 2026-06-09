@@ -671,7 +671,10 @@ impl CompletionProvider {
         // because `shape_of` walks `Ref` against the schema's defs.
         match schema.shape_of(attr_type) {
             Shape::Struct { .. } => schema.struct_fields_with_budget(attr_type, budget),
-            Shape::List { inner, .. } => match schema.shape_of(inner) {
+            Shape::List {
+                element_type: inner,
+                ..
+            } => match schema.shape_of(inner) {
                 Shape::Struct { .. } => schema.struct_fields_with_budget(inner, budget),
                 _ => None,
             },
