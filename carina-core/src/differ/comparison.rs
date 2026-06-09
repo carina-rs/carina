@@ -103,6 +103,22 @@ pub(crate) fn type_aware_equal(
                 crate::schema::Shape::Float { .. } | crate::schema::Shape::Int { .. },
             ) => *f == (*i as f64) && (*i as f64) as i64 == *i,
 
+            // String refinements may carry provider/API-to-DSL normalization
+            // such as Route53 trailing-dot stripping.
+            (
+                Value::Concrete(ConcreteValue::String(sa)),
+                Value::Concrete(ConcreteValue::String(sb)),
+                crate::schema::Shape::String {
+                    to_dsl: Some(transform),
+                    ..
+                },
+            ) => transform.apply(sa) == transform.apply(sb),
+            (
+                Value::Concrete(ConcreteValue::String(sa)),
+                Value::Concrete(ConcreteValue::String(sb)),
+                crate::schema::Shape::String { to_dsl: None, .. },
+            ) => sa == sb,
+
             // Lists: ordered or multiset comparison with inner type awareness
             (
                 Value::Concrete(ConcreteValue::List(la)),
@@ -567,4 +583,30 @@ pub(super) fn find_changed_attributes(
     }
 
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::DslTransform;
+
+    #[test]
+    fn refined_string_to_dsl_transform_is_applied_before_comparison() {
+        let attr_type = AttributeType::refined_string(
+            None,
+            None,
+            None,
+            Some(DslTransform::StripSuffix(".".to_string())),
+        );
+        let state = Value::Concrete(ConcreteValue::String("foo.example.com.".to_string()));
+        let desired = Value::Concrete(ConcreteValue::String("foo.example.com".to_string()));
+
+        assert!(type_aware_equal(
+            &state,
+            &desired,
+            Some(&attr_type),
+            empty_defs_for_schema_walks(),
+            None,
+        ));
+    }
 }
