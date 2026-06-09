@@ -739,9 +739,35 @@ fn proto_attr_schema_to_core(a: &proto::AttributeSchema) -> CoreAttributeSchema 
 
 fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
     match t {
-        proto::AttributeType::String => CoreAttributeType::string(),
-        proto::AttributeType::Int => CoreAttributeType::int(),
-        proto::AttributeType::Float => CoreAttributeType::float(),
+        proto::AttributeType::String {
+            pattern,
+            length,
+            to_dsl,
+            identity,
+            ..
+        } => CoreAttributeType::refined_string(
+            identity
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(carina_core::schema::TypeIdentity::from_dotted),
+            pattern.clone(),
+            *length,
+            to_dsl.clone(),
+        ),
+        proto::AttributeType::Int { range, identity } => CoreAttributeType::refined_int(
+            identity
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(carina_core::schema::TypeIdentity::from_dotted),
+            *range,
+        ),
+        proto::AttributeType::Float { range, identity } => CoreAttributeType::refined_float(
+            identity
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(carina_core::schema::TypeIdentity::from_dotted),
+            *range,
+        ),
         proto::AttributeType::Bool => CoreAttributeType::bool(),
         proto::AttributeType::Duration => CoreAttributeType::duration(),
         proto::AttributeType::StringEnum {
@@ -766,12 +792,25 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
             None,
             None,
         ),
-        proto::AttributeType::List { inner, ordered } => {
-            if *ordered {
-                CoreAttributeType::list(proto_attr_type_to_core(inner))
+        proto::AttributeType::List {
+            element_type,
+            ordered,
+            length,
+            ..
+        } => {
+            let base = if *ordered {
+                CoreAttributeType::list(proto_attr_type_to_core(element_type))
             } else {
-                CoreAttributeType::unordered_list(proto_attr_type_to_core(inner))
-            }
+                CoreAttributeType::unordered_list(proto_attr_type_to_core(element_type))
+            };
+            CoreAttributeType::custom(
+                None,
+                base,
+                None,
+                *length,
+                legacy_validator(|_| Ok(())),
+                None,
+            )
         }
         proto::AttributeType::Map { inner, key } => CoreAttributeType::map_with_key(
             proto_attr_type_to_core(key),
@@ -789,13 +828,15 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
             base,
             pattern,
             length,
+            to_dsl,
+            ..
         } => CoreAttributeType::custom(
             if name.is_empty() {
                 None
             } else {
                 Some(carina_core::schema::TypeIdentity::from_dotted(name))
             },
-            proto_attr_type_to_core(base),
+            custom_base_to_core(base, to_dsl.clone()),
             pattern.clone(),
             *length,
             legacy_validator(|_| Ok(())), // Validation is handled via ProviderContext.validators
@@ -832,6 +873,20 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
     }
 }
 
+fn custom_base_to_core(
+    base: &proto::AttributeType,
+    to_dsl: Option<proto::DslTransform>,
+) -> CoreAttributeType {
+    match base {
+        proto::AttributeType::String { .. } => {
+            CoreAttributeType::refined_string(None, None, None, to_dsl)
+        }
+        proto::AttributeType::Int { .. } => CoreAttributeType::int(),
+        proto::AttributeType::Float { .. } => CoreAttributeType::float(),
+        _ => proto_attr_type_to_core(base),
+    }
+}
+
 fn proto_struct_field_to_core(f: &proto::StructField) -> CoreStructField {
     CoreStructField {
         name: f.name.clone(),
@@ -853,6 +908,16 @@ fn proto_struct_field_to_core(f: &proto::StructField) -> CoreStructField {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn proto_string() -> proto::AttributeType {
+        proto::AttributeType::String {
+            pattern: None,
+            length: None,
+            validate: None,
+            to_dsl: None,
+            identity: None,
+        }
+    }
 
     /// RFC #2371 stage 4 contract pin: `Value::Deferred(DeferredValue::Unknown)` reaching either
     /// WASM-boundary converter is a stage-2 invariant violation
@@ -1903,7 +1968,7 @@ mod tests {
     fn proto_custom_enum_transform_lifts_state_string_to_dsl_identifier() {
         let proto_attr = proto::AttributeType::CustomEnum {
             name: "ZoneName".to_string(),
-            base: Box::new(proto::AttributeType::String),
+            base: Box::new(proto_string()),
             namespace: "aws.AvailabilityZone".to_string(),
             dsl_transform: Some(proto::DslTransform::HyphenToUnderscore),
         };
@@ -1938,7 +2003,7 @@ mod tests {
     fn proto_custom_enum_transform_does_not_lift_garbage_state_string() {
         let proto_attr = proto::AttributeType::CustomEnum {
             name: "ZoneName".to_string(),
-            base: Box::new(proto::AttributeType::String),
+            base: Box::new(proto_string()),
             namespace: "aws.AvailabilityZone".to_string(),
             dsl_transform: Some(proto::DslTransform::HyphenToUnderscore),
         };
@@ -2004,7 +2069,7 @@ mod tests {
     fn proto_custom_enum_strip_suffix_transform_resolves_on_host() {
         let proto_attr = proto::AttributeType::CustomEnum {
             name: "ZoneName".to_string(),
-            base: Box::new(proto::AttributeType::String),
+            base: Box::new(proto_string()),
             namespace: "test.Dynamic".to_string(),
             dsl_transform: Some(proto::DslTransform::StripSuffix(".".to_string())),
         };
@@ -2062,7 +2127,7 @@ mod tests {
     fn proto_custom_enum_none_transform_uses_no_transform() {
         let proto_attr = proto::AttributeType::CustomEnum {
             name: "ZoneName".to_string(),
-            base: Box::new(proto::AttributeType::String),
+            base: Box::new(proto_string()),
             namespace: "aws.AvailabilityZone".to_string(),
             dsl_transform: None,
         };
@@ -2079,9 +2144,11 @@ mod tests {
     fn proto_custom_pattern_and_length_propagate_to_core() {
         let proto_attr = proto::AttributeType::Custom {
             name: "awscc.wafv2.WebACL.EntityDescription".to_string(),
-            base: Box::new(proto::AttributeType::String),
+            base: Box::new(proto_string()),
             pattern: Some("^x$".to_string()),
             length: Some((Some(1), Some(9))),
+            validate: None,
+            to_dsl: None,
         };
         let core_attr = proto_attr_type_to_core(&proto_attr);
         match core_attr.shape_ref_free().expect("test schema is Ref-free") {
@@ -2099,6 +2166,173 @@ mod tests {
                 assert_eq!(length, Some((Some(1), Some(9))));
             }
             other => panic!("expected Custom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn old_custom_string_payload_lifts_to_refined_core_string() {
+        let json = r#"{
+            "type":"custom",
+            "name":"aws.route53.HostedZone.Name",
+            "base":{"type":"String"},
+            "pattern":"^[a-z.]+$",
+            "length":[1,1024],
+            "to_dsl":{"type":"StripSuffix","value":"."}
+        }"#;
+        let proto_attr: proto::AttributeType = serde_json::from_str(json).unwrap();
+        let core_attr = proto_attr_type_to_core(&proto_attr);
+
+        match core_attr.shape_ref_free().expect("test schema is Ref-free") {
+            carina_core::schema::Shape::String {
+                identity,
+                pattern,
+                length,
+                to_dsl,
+                ..
+            } => {
+                assert_eq!(identity.map(|id| id.kind.as_str()), Some("Name"));
+                assert_eq!(pattern, Some("^[a-z.]+$"));
+                assert_eq!(length, Some((Some(1), Some(1024))));
+                assert_eq!(to_dsl.unwrap().apply("example.com."), "example.com");
+            }
+            other => panic!("expected refined String, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn old_custom_int_payload_lifts_length_to_refined_core_range() {
+        let json = r#"{
+            "type":"custom",
+            "name":"aws.ec2.Port",
+            "base":{"type":"Int"},
+            "length":[0,65535]
+        }"#;
+        let proto_attr: proto::AttributeType = serde_json::from_str(json).unwrap();
+        let core_attr = proto_attr_type_to_core(&proto_attr);
+
+        match core_attr.shape_ref_free().expect("test schema is Ref-free") {
+            carina_core::schema::Shape::Int {
+                identity, range, ..
+            } => {
+                assert_eq!(identity.map(|id| id.kind.as_str()), Some("Port"));
+                assert_eq!(range, Some((Some(0), Some(65535))));
+            }
+            other => panic!("expected refined Int, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn old_custom_float_payload_lifts_to_refined_core_float_identity() {
+        let json = r#"{
+            "type":"custom",
+            "name":"awscc.wafv2.Size",
+            "base":{"type":"Float"}
+        }"#;
+        let proto_attr: proto::AttributeType = serde_json::from_str(json).unwrap();
+        let core_attr = proto_attr_type_to_core(&proto_attr);
+
+        match core_attr.shape_ref_free().expect("test schema is Ref-free") {
+            carina_core::schema::Shape::Float {
+                identity, range, ..
+            } => {
+                assert_eq!(identity.map(|id| id.kind.as_str()), Some("Size"));
+                assert!(range.is_none());
+            }
+            other => panic!("expected refined Float, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn old_custom_list_payload_lifts_to_refined_core_list() {
+        let json = r#"{
+            "type":"custom",
+            "name":"awscc.wafv2.StatementList",
+            "base":{
+                "type":"list",
+                "inner":{"type":"String"},
+                "ordered":false
+            },
+            "length":[1,5],
+            "validate":true
+        }"#;
+        let proto_attr: proto::AttributeType = serde_json::from_str(json).unwrap();
+        let core_attr = proto_attr_type_to_core(&proto_attr);
+
+        match core_attr.shape_ref_free().expect("test schema is Ref-free") {
+            carina_core::schema::Shape::List {
+                element_type,
+                ordered,
+                length,
+                ..
+            } => {
+                assert!(!ordered);
+                assert_eq!(length, Some((Some(1), Some(5))));
+                assert!(matches!(
+                    element_type.shape_ref_free().expect("element is Ref-free"),
+                    carina_core::schema::Shape::String { .. }
+                ));
+            }
+            other => panic!("expected refined List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_primitive_payloads_lift_to_refined_core_shapes() {
+        let cases = [
+            r#"{
+                "type":"String",
+                "identity":"aws.route53.HostedZone.Name",
+                "pattern":"^[a-z.]+$",
+                "length":[1,1024],
+                "to_dsl":{"type":"StripSuffix","value":"."}
+            }"#,
+            r#"{"type":"Int","identity":"aws.ec2.Port","range":[-1,65535]}"#,
+            r#"{"type":"Float","identity":"awscc.wafv2.Size","range":[0.0,1.0]}"#,
+            r#"{
+                "type":"list",
+                "element_type":{"type":"String"},
+                "ordered":true,
+                "length":[1,3],
+                "validate":true
+            }"#,
+        ];
+
+        for json in cases {
+            let proto_attr: proto::AttributeType = serde_json::from_str(json).unwrap();
+            let core_attr = proto_attr_type_to_core(&proto_attr);
+            match core_attr.shape_ref_free().expect("test schema is Ref-free") {
+                carina_core::schema::Shape::String {
+                    identity,
+                    pattern,
+                    length,
+                    to_dsl,
+                    ..
+                } => {
+                    assert_eq!(identity.map(|id| id.kind.as_str()), Some("Name"));
+                    assert_eq!(pattern, Some("^[a-z.]+$"));
+                    assert_eq!(length, Some((Some(1), Some(1024))));
+                    assert_eq!(to_dsl.unwrap().apply("example.com."), "example.com");
+                }
+                carina_core::schema::Shape::Int {
+                    identity, range, ..
+                } => {
+                    assert_eq!(identity.map(|id| id.kind.as_str()), Some("Port"));
+                    assert_eq!(range, Some((Some(-1), Some(65535))));
+                }
+                carina_core::schema::Shape::Float {
+                    identity, range, ..
+                } => {
+                    assert_eq!(identity.map(|id| id.kind.as_str()), Some("Size"));
+                    assert_eq!(range, Some((Some(0.0), Some(1.0))));
+                }
+                carina_core::schema::Shape::List {
+                    ordered, length, ..
+                } => {
+                    assert!(ordered);
+                    assert_eq!(length, Some((Some(1), Some(3))));
+                }
+                other => panic!("unexpected lifted shape: {other:?}"),
+            }
         }
     }
 
