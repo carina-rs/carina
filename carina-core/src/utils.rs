@@ -239,7 +239,7 @@ fn is_provider_segment(s: &str) -> bool {
 }
 
 /// A `service` segment (5+ part shape, sits at index 1) — lowercase ASCII
-/// or digits; mirrors the original `is_dsl_enum_format` rule.
+/// or digits; mirrors the legacy namespaced-text rule.
 fn is_service_segment(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
@@ -286,9 +286,9 @@ pub fn expand_enum_shorthand(value: &Value, identity: &crate::schema::TypeIdenti
     // payload as `String` (only the source-shape tag differs) and goes
     // through the same namespace expansion. The result is materialized as
     // `String` because every downstream consumer
-    // (`validate_enum`, the LSP completion helpers, the
-    // builtin-result coercion in `convert_enum_value`) reads through the
-    // `Value::Concrete(ConcreteValue::String)` arm. The `EnumIdentifier`
+    // (`validate_enum`, the LSP completion helpers, and display shortening)
+    // reads through the `Value::Concrete(ConcreteValue::String)` arm. The
+    // `EnumIdentifier`
     // distinction is a parser-level signal used for strict shape
     // enforcement at the validator entry, not a wire-level form.
     //
@@ -341,6 +341,14 @@ fn is_type_name_segment(s: &str) -> bool {
 /// Extract the last dot-separated part from a namespaced identifier.
 /// Returns the original string if no dots are present.
 ///
+/// This is a legacy read-normalization helper, not a general-purpose enum
+/// wire-value extractor. It mis-splits enum values that themselves contain
+/// dots, such as `awscc.ec2.vpn_gateway.Type.ipsec.1` -> `1`; use
+/// `extract_enum_value_with_values` internally when valid enum values are
+/// available. It must not be used for provider wire-out paths. Its remaining
+/// legitimate consumers are the provider read-normalize seam, and demotion is
+/// deferred to the carina#3409 enum-state-coherence implementation.
+///
 /// # Examples
 ///
 /// ```
@@ -367,25 +375,7 @@ pub fn extract_enum_value(s: &str) -> &str {
 /// to find the correct enum value.
 ///
 /// Falls back to [`extract_enum_value`] if no valid values match.
-///
-/// # Examples
-///
-/// ```
-/// use carina_core::utils::extract_enum_value_with_values;
-///
-/// let values = &["ipsec.1"];
-/// assert_eq!(
-///     extract_enum_value_with_values("awscc.ec2.vpn_gateway.Type.ipsec.1", values),
-///     "ipsec.1"
-/// );
-///
-/// let values = &["default", "dedicated", "host"];
-/// assert_eq!(
-///     extract_enum_value_with_values("awscc.ec2.Vpc.InstanceTenancy.default", values),
-///     "default"
-/// );
-/// ```
-pub fn extract_enum_value_with_values<'a>(s: &'a str, valid_values: &[&str]) -> &'a str {
+pub(crate) fn extract_enum_value_with_values<'a>(s: &'a str, valid_values: &[&str]) -> &'a str {
     if !s.contains('.') {
         return s;
     }
@@ -418,7 +408,7 @@ pub fn extract_enum_value_with_values<'a>(s: &'a str, valid_values: &[&str]) -> 
 }
 
 /// Canonicalize one `Enum` value to its API spelling: strip any
-/// namespace prefix ([`extract_enum_value_with_values`]) then map the
+/// namespace prefix with `extract_enum_value_with_values` then map the
 /// DSL alias to the API form via [`crate::schema::DslMap::api_for`].
 ///
 /// This is the exact-match canonicalization used by the plan renderer's
@@ -452,7 +442,7 @@ pub fn canonicalize_enum_to_api(
     dsl_map.api_for(extract_enum_value_with_values(s, valid_values))
 }
 
-/// Strip the namespace prefix from a DSL enum identifier and return the raw value.
+/// Return the display value for namespaced enum text.
 ///
 /// Handles the following patterns:
 /// - 2-part: `TypeName.value_name` -> `value_name`
@@ -461,45 +451,15 @@ pub fn canonicalize_enum_to_api(
 /// - 5-part: `provider.service.resource.TypeName.value_name` -> `value_name`
 ///
 /// The first component of TypeName must be uppercase.
-/// The extracted value is returned as-is without any transformation.
-/// Returns the original value unchanged if it doesn't match any pattern.
+/// The extracted value is returned as-is without any transformation. Returns
+/// `None` if the input doesn't match any pattern.
 ///
-/// # Examples
-///
-/// ```
-/// use carina_core::utils::convert_enum_value;
-///
-/// assert_eq!(convert_enum_value("aws.Region.ap_northeast_1"), "ap_northeast_1");
-/// assert_eq!(convert_enum_value("Region.ap_northeast_1"), "ap_northeast_1");
-/// assert_eq!(convert_enum_value("awscc.ec2.ipam.Tier.advanced"), "advanced");
-/// assert_eq!(convert_enum_value("eu-west-1"), "eu-west-1");
-/// ```
-pub fn convert_enum_value(value: &str) -> &str {
-    NamespacedId::parse(value).map_or(value, |id| id.value())
-}
-
-/// Check if a string is in DSL enum format (a namespaced identifier).
-///
-/// Recognizes the following patterns:
-/// - `TypeName.value` (2-part, e.g., `Region.ap_northeast_1`)
-/// - `provider.TypeName.value` (3-part, e.g., `aws.Region.ap_northeast_1`)
-/// - `provider.resource.TypeName.value` (4-part, e.g., `aws.s3.VersioningStatus.Enabled`)
-/// - `provider.service.resource.TypeName.value` (5-part, e.g., `awscc.ec2.Vpc.InstanceTenancy.default`)
-///
-/// # Examples
-///
-/// ```
-/// use carina_core::utils::is_dsl_enum_format;
-///
-/// assert!(is_dsl_enum_format("Region.ap_northeast_1"));
-/// assert!(is_dsl_enum_format("aws.Region.ap_northeast_1"));
-/// assert!(is_dsl_enum_format("aws.s3.VersioningStatus.Enabled"));
-/// assert!(is_dsl_enum_format("awscc.ec2.Vpc.InstanceTenancy.default"));
-/// assert!(!is_dsl_enum_format("my-bucket"));
-/// assert!(!is_dsl_enum_format("some.random.string"));
-/// ```
-pub fn is_dsl_enum_format(s: &str) -> bool {
-    NamespacedId::parse(s).is_some()
+/// This uses the positional [`NamespacedId::parse`] legacy shape, where the
+/// 5+-segment branch pins `TypeName` at index 3. Structural identities with
+/// intermediate struct segments can therefore mis-split 6+-segment values, so
+/// this helper is display-only and must never feed a provider wire path.
+pub(crate) fn enum_display_value(s: &str) -> Option<&str> {
+    NamespacedId::parse(s).map(|id| id.value())
 }
 
 /// Validate namespace format for an enum identifier.
@@ -1126,7 +1086,7 @@ fn dynamic_enum_member_is_structural(
         .dotted_prefix()
         .map(|prefix| format!("{}.{}.{}", prefix, identity.kind, dsl))
         .unwrap_or_else(|| format!("{}.{}", identity.kind, dsl));
-    if !is_dsl_enum_format(&full) || !is_dynamic_dsl_member_segment(dsl) {
+    if NamespacedId::parse(&full).is_none() || !is_dynamic_dsl_member_segment(dsl) {
         return false;
     }
     match source {
@@ -1399,68 +1359,69 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_enum_value_2_part() {
+    fn test_enum_display_value_extracts_2_part() {
         assert_eq!(
-            convert_enum_value("Region.ap_northeast_1"),
-            "ap_northeast_1"
+            enum_display_value("Region.ap_northeast_1"),
+            Some("ap_northeast_1")
         );
     }
 
     #[test]
-    fn test_convert_enum_value_3_part() {
+    fn test_enum_display_value_extracts_3_part() {
         assert_eq!(
-            convert_enum_value("aws.Region.ap_northeast_1"),
-            "ap_northeast_1"
-        );
-        assert_eq!(convert_enum_value("aws.Region.us_east_1"), "us_east_1");
-        assert_eq!(
-            convert_enum_value("aws.AvailabilityZone.ap_northeast_1a"),
-            "ap_northeast_1a"
+            enum_display_value("aws.Region.ap_northeast_1"),
+            Some("ap_northeast_1")
         );
         assert_eq!(
-            convert_enum_value("aws.AvailabilityZone.us_east_1b"),
-            "us_east_1b"
-        );
-    }
-
-    #[test]
-    fn test_convert_enum_value_4_part() {
-        assert_eq!(
-            convert_enum_value("aws.s3.VersioningStatus.Enabled"),
-            "Enabled"
-        );
-        assert_eq!(convert_enum_value("aws.ec2.IpProtocol.tcp"), "tcp");
-    }
-
-    #[test]
-    fn test_convert_enum_value_5_part() {
-        assert_eq!(
-            convert_enum_value("awscc.ec2.ipam.Tier.advanced"),
-            "advanced"
+            enum_display_value("aws.Region.us_east_1"),
+            Some("us_east_1")
         );
         assert_eq!(
-            convert_enum_value("awscc.ec2.ipam_pool.AddressFamily.IPv4"),
-            "IPv4"
+            enum_display_value("aws.AvailabilityZone.ap_northeast_1a"),
+            Some("ap_northeast_1a")
         );
         assert_eq!(
-            convert_enum_value("awscc.ec2.Vpc.InstanceTenancy.default"),
-            "default"
+            enum_display_value("aws.AvailabilityZone.us_east_1b"),
+            Some("us_east_1b")
         );
     }
 
     #[test]
-    fn test_convert_enum_value_passthrough() {
-        // Already in SDK format - should be returned unchanged
-        assert_eq!(convert_enum_value("eu-west-1"), "eu-west-1");
-        assert_eq!(convert_enum_value("ap-northeast-1a"), "ap-northeast-1a");
+    fn test_enum_display_value_extracts_4_part() {
+        assert_eq!(
+            enum_display_value("aws.s3.VersioningStatus.Enabled"),
+            Some("Enabled")
+        );
+        assert_eq!(enum_display_value("aws.ec2.IpProtocol.tcp"), Some("tcp"));
     }
 
     #[test]
-    fn test_convert_enum_value_invalid_patterns() {
+    fn test_enum_display_value_extracts_5_part() {
+        assert_eq!(
+            enum_display_value("awscc.ec2.ipam.Tier.advanced"),
+            Some("advanced")
+        );
+        assert_eq!(
+            enum_display_value("awscc.ec2.ipam_pool.AddressFamily.IPv4"),
+            Some("IPv4")
+        );
+        assert_eq!(
+            enum_display_value("awscc.ec2.Vpc.InstanceTenancy.default"),
+            Some("default")
+        );
+    }
+
+    #[test]
+    fn test_enum_display_value_passthrough_is_none() {
+        assert_eq!(enum_display_value("eu-west-1"), None);
+        assert_eq!(enum_display_value("ap-northeast-1a"), None);
+    }
+
+    #[test]
+    fn test_enum_display_value_invalid_patterns_are_none() {
         // lowercase first part in 2-part -> not a TypeName pattern
-        assert_eq!(convert_enum_value("region.us_east_1"), "region.us_east_1");
-        // single value -> passthrough
-        assert_eq!(convert_enum_value("Enabled"), "Enabled");
+        assert_eq!(enum_display_value("region.us_east_1"), None);
+        assert_eq!(enum_display_value("Enabled"), None);
     }
 
     // validate_enum_namespace tests
@@ -1734,59 +1695,60 @@ mod tests {
         );
     }
 
-    // is_dsl_enum_format tests
+    // enum_display_value shape-detection tests
 
     #[test]
-    fn test_is_dsl_enum_format_2_part() {
-        assert!(is_dsl_enum_format("Region.ap_northeast_1"));
-        assert!(is_dsl_enum_format("VersioningStatus.Enabled"));
+    fn test_enum_display_value_detects_2_part() {
+        assert!(enum_display_value("Region.ap_northeast_1").is_some());
+        assert!(enum_display_value("VersioningStatus.Enabled").is_some());
         // lowercase first part → not a TypeName
-        assert!(!is_dsl_enum_format("region.ap_northeast_1"));
+        assert!(enum_display_value("region.ap_northeast_1").is_none());
     }
 
     #[test]
-    fn test_is_dsl_enum_format_3_part() {
-        assert!(is_dsl_enum_format("aws.Region.ap_northeast_1"));
-        assert!(is_dsl_enum_format("gcp.Region.us_central1"));
+    fn test_enum_display_value_detects_3_part() {
+        assert!(enum_display_value("aws.Region.ap_northeast_1").is_some());
+        assert!(enum_display_value("gcp.Region.us_central1").is_some());
         // uppercase provider → not valid
-        assert!(!is_dsl_enum_format("AWS.Region.ap_northeast_1"));
+        assert!(enum_display_value("AWS.Region.ap_northeast_1").is_none());
         // lowercase TypeName → not valid
-        assert!(!is_dsl_enum_format("aws.region.ap_northeast_1"));
+        assert!(enum_display_value("aws.region.ap_northeast_1").is_none());
     }
 
     #[test]
-    fn test_is_dsl_enum_format_4_part() {
-        assert!(is_dsl_enum_format("aws.s3.VersioningStatus.Enabled"));
-        assert!(is_dsl_enum_format("aws.ec2.IpProtocol.tcp"));
+    fn test_enum_display_value_detects_4_part() {
+        assert!(enum_display_value("aws.s3.VersioningStatus.Enabled").is_some());
+        assert!(enum_display_value("aws.ec2.IpProtocol.tcp").is_some());
         // resource with digits
-        assert!(is_dsl_enum_format("aws.s3.VersioningStatus.Suspended"));
+        assert!(enum_display_value("aws.s3.VersioningStatus.Suspended").is_some());
     }
 
     #[test]
-    fn test_is_dsl_enum_format_5_part() {
-        assert!(is_dsl_enum_format("awscc.ec2.Vpc.InstanceTenancy.default"));
-        assert!(is_dsl_enum_format("awscc.ec2.ipam_pool.AddressFamily.IPv4"));
+    fn test_enum_display_value_detects_5_part() {
+        assert!(enum_display_value("awscc.ec2.Vpc.InstanceTenancy.default").is_some());
+        assert!(enum_display_value("awscc.ec2.ipam_pool.AddressFamily.IPv4").is_some());
     }
 
     #[test]
-    fn test_is_dsl_enum_format_6_part_dotted_value() {
+    fn test_enum_display_value_detects_6_part_dotted_value() {
         // 6-part: provider.service.resource.TypeName.value.with.dots
-        assert!(is_dsl_enum_format("awscc.ec2.vpn_gateway.Type.ipsec.1"));
+        assert!(enum_display_value("awscc.ec2.vpn_gateway.Type.ipsec.1").is_some());
     }
 
     #[test]
-    fn test_is_dsl_enum_format_deep_structural_plain_value() {
-        assert!(is_dsl_enum_format(
-            "aws.s3.BucketLifecycleConfiguration.Rules.Status.enabled"
-        ));
+    fn test_enum_display_value_detects_deep_structural_plain_value() {
+        assert!(
+            enum_display_value("aws.s3.BucketLifecycleConfiguration.Rules.Status.enabled")
+                .is_some()
+        );
     }
 
     #[test]
-    fn test_is_dsl_enum_format_non_matching() {
-        assert!(!is_dsl_enum_format("my-bucket"));
-        assert!(!is_dsl_enum_format("ap-northeast-1"));
-        assert!(!is_dsl_enum_format("some.random.string"));
-        assert!(!is_dsl_enum_format("a.b.c.d.e.f"));
+    fn test_enum_display_value_non_matching() {
+        assert!(enum_display_value("my-bucket").is_none());
+        assert!(enum_display_value("ap-northeast-1").is_none());
+        assert!(enum_display_value("some.random.string").is_none());
+        assert!(enum_display_value("a.b.c.d.e.f").is_none());
     }
 
     // extract_enum_value_with_values tests
@@ -1875,29 +1837,32 @@ mod tests {
         );
     }
 
-    // convert_enum_value with dotted values
+    // enum_display_value with dotted values
 
     #[test]
-    fn test_convert_enum_value_6_part_dotted_value() {
+    fn test_enum_display_value_6_part_dotted_value() {
         assert_eq!(
-            convert_enum_value("awscc.ec2.vpn_gateway.Type.ipsec.1"),
-            "ipsec.1"
+            enum_display_value("awscc.ec2.vpn_gateway.Type.ipsec.1"),
+            Some("ipsec.1")
         );
     }
 
-    // convert_enum_value: underscores in enum values must be preserved (#1675)
+    // enum_display_value: underscores in enum values must be preserved (#1675)
 
     #[test]
-    fn test_convert_enum_value_preserves_underscores() {
+    fn test_enum_display_value_preserves_underscores() {
         // Enum values like AWS_ACCOUNT must not have underscores converted to hyphens
         assert_eq!(
-            convert_enum_value("awscc.sso.Assignment.TargetType.AWS_ACCOUNT"),
-            "AWS_ACCOUNT"
+            enum_display_value("awscc.sso.Assignment.TargetType.AWS_ACCOUNT"),
+            Some("AWS_ACCOUNT")
         );
-        assert_eq!(convert_enum_value("TargetType.AWS_ACCOUNT"), "AWS_ACCOUNT");
         assert_eq!(
-            convert_enum_value("awscc.sso.Assignment.PrincipalType.GROUP"),
-            "GROUP"
+            enum_display_value("TargetType.AWS_ACCOUNT"),
+            Some("AWS_ACCOUNT")
+        );
+        assert_eq!(
+            enum_display_value("awscc.sso.Assignment.PrincipalType.GROUP"),
+            Some("GROUP")
         );
     }
 
@@ -1974,7 +1939,7 @@ mod tests {
     }
 
     #[test]
-    fn is_dsl_enum_format_table() {
+    fn enum_display_value_detection_table() {
         let cases: &[(&str, bool)] = &[
             ("Type.gp2", true),
             ("Iops.100", true),
@@ -1990,28 +1955,35 @@ mod tests {
             ("aws.s3.versioningstatus.Enabled", false),
         ];
         for (input, expected) in cases {
-            assert_eq!(is_dsl_enum_format(input), *expected, "input={input:?}");
+            assert_eq!(
+                enum_display_value(input).is_some(),
+                *expected,
+                "input={input:?}"
+            );
         }
     }
 
     #[test]
-    fn convert_enum_value_table() {
-        let cases: &[(&str, &str)] = &[
-            ("Type.gp2", "gp2"),
-            ("Iops.100", "100"),
-            ("aws.Region.ap_northeast_1", "ap_northeast_1"),
-            ("aws.route53.RecordType.AAAA", "AAAA"),
-            ("aws.ec2.Volume.Iops.100", "100"),
-            ("awscc.ec2.vpn_gateway.Type.ipsec.1", "ipsec.1"),
-            ("awscc.ec2.Vpc.InstanceTenancy.default", "default"),
-            ("TargetType.AWS_ACCOUNT", "AWS_ACCOUNT"),
-            ("awscc.sso.Assignment.TargetType.AWS_ACCOUNT", "AWS_ACCOUNT"),
-            ("eu-west-1", "eu-west-1"),
-            ("region.us_east_1", "region.us_east_1"),
-            ("Enabled", "Enabled"),
+    fn enum_display_value_table() {
+        let cases: &[(&str, Option<&str>)] = &[
+            ("Type.gp2", Some("gp2")),
+            ("Iops.100", Some("100")),
+            ("aws.Region.ap_northeast_1", Some("ap_northeast_1")),
+            ("aws.route53.RecordType.AAAA", Some("AAAA")),
+            ("aws.ec2.Volume.Iops.100", Some("100")),
+            ("awscc.ec2.vpn_gateway.Type.ipsec.1", Some("ipsec.1")),
+            ("awscc.ec2.Vpc.InstanceTenancy.default", Some("default")),
+            ("TargetType.AWS_ACCOUNT", Some("AWS_ACCOUNT")),
+            (
+                "awscc.sso.Assignment.TargetType.AWS_ACCOUNT",
+                Some("AWS_ACCOUNT"),
+            ),
+            ("eu-west-1", None),
+            ("region.us_east_1", None),
+            ("Enabled", None),
         ];
         for (input, expected) in cases {
-            assert_eq!(convert_enum_value(input), *expected, "input={input:?}");
+            assert_eq!(enum_display_value(input), *expected, "input={input:?}");
         }
     }
 

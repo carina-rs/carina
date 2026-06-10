@@ -27,8 +27,8 @@ fn test_resolve_enum_aliases_ip_protocol_all() {
 
 #[test]
 fn test_resolve_enum_aliases_no_alias() {
-    // "tcp" has no alias mapping, so it should be converted from DSL enum
-    // to its raw form by convert_enum_value but not further changed.
+    // "tcp" has no alias mapping here, so schema-free extraction must not
+    // rewrite the namespaced DSL value.
     let mut resource =
         Resource::with_provider("awscc", "ec2.security_group_egress", "test-rule", None);
     resource.set_attr(
@@ -2715,7 +2715,7 @@ mod wait_until_enum_alias {
     use carina_core::provider::{
         BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer, ProviderResult,
     };
-    use carina_core::schema::{AttributeType, ResourceSchema};
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, enum_identity};
 
     /// Minimal aws-like factory that mirrors the REAL
     /// `carina-provider-aws` ACM `status` enum reverse alias:
@@ -2723,12 +2723,13 @@ mod wait_until_enum_alias {
     /// canonical AWS value; verified against
     /// `carina-provider-aws/.../acm/certificate.rs`). The DSL value
     /// `aws.acm.Certificate.Status.issued` — the exact form in the
-    /// reopened issue #3358 — passes through `convert_enum_value` to the
-    /// trailing segment `"issued"`, which is the alias-map key. Keying on
+    /// reopened issue #3358 — is shortened by
+    /// `resolve_value_alias_with_schemas` to the trailing segment `"issued"`,
+    /// which is the alias-map key. Keying on
     /// PascalCase `"Issued"` would NOT match the real provider, so the
     /// test would prove a path production never exercises. Everything
-    /// else is stubbed to the minimum the helper needs (it only consults
-    /// `get_enum_alias_reverse`).
+    /// else is stubbed to the minimum the helper needs: an enum schema for
+    /// `status` and `get_enum_alias_reverse`.
     struct AcmAliasFactory;
 
     impl ProviderFactory for AcmAliasFactory {
@@ -2762,7 +2763,18 @@ mod wait_until_enum_alias {
             Box::pin(async { Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer> })
         }
         fn schemas(&self) -> Vec<ResourceSchema> {
-            vec![ResourceSchema::new("acm.Certificate")]
+            vec![
+                ResourceSchema::new("acm.Certificate").attribute(AttributeSchema::new(
+                    "status",
+                    AttributeType::enum_(
+                        enum_identity("Status", Some("aws.acm.Certificate")),
+                        Some(vec!["issued".to_string(), "pending_validation".to_string()]),
+                        Vec::new(),
+                        None,
+                        None,
+                    ),
+                )),
+            ]
         }
         fn get_enum_alias_reverse(
             &self,
@@ -2777,9 +2789,8 @@ mod wait_until_enum_alias {
         }
     }
 
-    // The helper only consults `factory.get_enum_alias_reverse`; the
-    // provider is never instantiated. These methods exist only to
-    // satisfy the trait and are unreachable in these tests.
+    // The provider is never instantiated. These methods exist only to satisfy
+    // the trait and are unreachable in these tests.
     struct StubProvider;
     impl Provider for StubProvider {
         fn name(&self) -> &str {
