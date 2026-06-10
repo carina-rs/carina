@@ -1,6 +1,8 @@
 use super::*;
 use crate::resource::Resource;
-use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+use crate::schema::{
+    AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry, enum_identity,
+};
 use indexmap::IndexMap;
 
 fn make_s3_bucket_schema() -> ResourceSchema {
@@ -12,6 +14,196 @@ fn registry_with_s3_bucket() -> SchemaRegistry {
     let mut r = SchemaRegistry::new();
     r.insert("awscc", make_s3_bucket_schema());
     r
+}
+
+fn provider_config(name: &str, attrs: Vec<(&str, Value)>) -> ProviderConfig {
+    ProviderConfig {
+        name: name.to_string(),
+        attributes: attrs
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect(),
+        default_tags: IndexMap::new(),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
+    }
+}
+
+fn region_type(provider: &str) -> AttributeType {
+    AttributeType::enum_(
+        enum_identity("Region", Some(provider)),
+        None,
+        Vec::new(),
+        None,
+        Some(DslTransform::HyphenToUnderscore),
+    )
+}
+
+fn eip_domain_type(provider: &str) -> AttributeType {
+    AttributeType::enum_(
+        enum_identity("Domain", Some(&format!("{provider}.ec2.Eip"))),
+        Some(vec!["vpc".to_string(), "standard".to_string()]),
+        Vec::new(),
+        None,
+        None,
+    )
+}
+
+#[test]
+fn test_anonymous_id_stable_across_provider_namespace_change_in_identity() {
+    let schema = ResourceSchema::new("ec2.Route")
+        .attribute(AttributeSchema::new(
+            "route_table_id",
+            AttributeType::string(),
+        ))
+        .attribute(AttributeSchema::new(
+            "destination_cidr_block",
+            AttributeType::string(),
+        ));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
+    let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
+    let provider_attr_type = |provider: &str, attr: &str| {
+        (provider == "awscc" && attr == "region").then(|| region_type("awscc"))
+    };
+
+    let make_resource = || {
+        let mut resource = Resource::with_provider("awscc", "ec2.Route", "", None);
+        resource.set_attr(
+            "route_table_id".to_string(),
+            Value::Concrete(ConcreteValue::String("rtb-123".to_string())),
+        );
+        resource.set_attr(
+            "destination_cidr_block".to_string(),
+            Value::Concrete(ConcreteValue::String("0.0.0.0/0".to_string())),
+        );
+        resource
+    };
+
+    let providers_awscc = vec![provider_config(
+        "awscc",
+        vec![(
+            "region",
+            Value::Concrete(ConcreteValue::EnumIdentifier(
+                "awscc.Region.ap_northeast_1".to_string(),
+            )),
+        )],
+    )];
+    let providers_aws = vec![provider_config(
+        "awscc",
+        vec![(
+            "region",
+            Value::Concrete(ConcreteValue::EnumIdentifier(
+                "aws.Region.ap_northeast_1".to_string(),
+            )),
+        )],
+    )];
+
+    let mut resources_awscc = vec![make_resource()];
+    let mut resources_aws = vec![make_resource()];
+    compute_anonymous_identifiers_with_provider_config_types(
+        &mut resources_awscc,
+        &providers_awscc,
+        &schemas,
+        &identity_fn,
+        &provider_attr_type,
+    )
+    .unwrap();
+    compute_anonymous_identifiers_with_provider_config_types(
+        &mut resources_aws,
+        &providers_aws,
+        &schemas,
+        &identity_fn,
+        &provider_attr_type,
+    )
+    .unwrap();
+
+    assert_eq!(
+        resources_awscc[0].id.name_str(),
+        resources_aws[0].id.name_str()
+    );
+}
+
+#[test]
+fn test_anonymous_id_stable_across_provider_namespace_change_in_attribute() {
+    let schema = ResourceSchema::new("ec2.Eip")
+        .attribute(AttributeSchema::new("domain", eip_domain_type("awscc")).create_only());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
+    let providers = vec![provider_config("awscc", vec![])];
+    let identity_fn = |_: &str| -> Vec<String> { vec![] };
+
+    let make_resource = |domain: &str| {
+        let mut resource = Resource::with_provider("awscc", "ec2.Eip", "", None);
+        resource.set_attr(
+            "domain".to_string(),
+            Value::Concrete(ConcreteValue::EnumIdentifier(domain.to_string())),
+        );
+        resource
+    };
+
+    let mut resources_awscc = vec![make_resource("awscc.ec2.Eip.Domain.vpc")];
+    let mut resources_aws = vec![make_resource("aws.ec2.Eip.Domain.vpc")];
+    compute_anonymous_identifiers(&mut resources_awscc, &providers, &schemas, &identity_fn)
+        .unwrap();
+    compute_anonymous_identifiers(&mut resources_aws, &providers, &schemas, &identity_fn).unwrap();
+
+    assert_eq!(
+        resources_awscc[0].id.name_str(),
+        resources_aws[0].id.name_str()
+    );
+}
+
+#[test]
+fn test_reconcile_anonymous_id_after_provider_namespace_change() {
+    let schema = ResourceSchema::new("ec2.Eip")
+        .attribute(AttributeSchema::new("domain", eip_domain_type("awscc")).create_only())
+        .attribute(AttributeSchema::new("public_ipv4_pool", AttributeType::string()).create_only());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
+    let providers = vec![provider_config("awscc", vec![])];
+    let identity_fn = |_: &str| -> Vec<String> { vec![] };
+
+    let make_resource = |domain: &str, pool: &str| {
+        let mut resource = Resource::with_provider("awscc", "ec2.Eip", "", None);
+        resource.set_attr(
+            "domain".to_string(),
+            Value::Concrete(ConcreteValue::EnumIdentifier(domain.to_string())),
+        );
+        resource.set_attr(
+            "public_ipv4_pool".to_string(),
+            Value::Concrete(ConcreteValue::String(pool.to_string())),
+        );
+        resource
+    };
+
+    let mut old_resources = vec![make_resource("awscc.ec2.Eip.Domain.vpc", "pool-a")];
+    compute_anonymous_identifiers(&mut old_resources, &providers, &schemas, &identity_fn).unwrap();
+    let state_name = old_resources[0].id.name_str().to_string();
+
+    let mut desired_resources = vec![make_resource("aws.ec2.Eip.Domain.vpc", "pool-b")];
+    compute_anonymous_identifiers(&mut desired_resources, &providers, &schemas, &identity_fn)
+        .unwrap();
+    assert_ne!(state_name, desired_resources[0].id.name_str());
+
+    let state_entries = vec![AnonymousIdStateInfo {
+        name: state_name.clone(),
+        create_only_values: vec![
+            ("domain".to_string(), "awscc.ec2.Eip.Domain.vpc".to_string()),
+            ("public_ipv4_pool".to_string(), "pool-a".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    }];
+    reconcile_anonymous_identifiers(&mut desired_resources, &schemas, &|_provider, _rt| {
+        state_entries.clone()
+    });
+
+    assert_eq!(desired_resources[0].id.name_str(), state_name);
 }
 
 #[test]

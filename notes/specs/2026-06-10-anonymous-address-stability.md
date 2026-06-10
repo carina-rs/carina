@@ -321,3 +321,30 @@ test proves the same requirement for resource attributes such as EIP `domain`.
 The third test covers the end-to-end compute-then-reconcile flow with old state
 and a new desired resource whose only semantic difference is the provider
 namespace prefix embedded in the enum identifier.
+
+## Implementation notes
+
+The implementation keeps `Value::Deferred` hash inputs unchanged. User-authored
+`let` binding names are neutral local names, so provider lock bumps do not
+change their meaning, and existing deferred strings such as
+`ResourceRef(main_rtb.id)` remain the intended deterministic representation.
+
+Only `Value::Concrete(ConcreteValue::EnumIdentifier(_))` values are normalized.
+That covers provider config identity attributes such as `region` and
+schema-known resource enum attributes such as EIP `domain`. Primitive values,
+maps, lists, and deferred values continue to use the existing deterministic
+value string path unless a schema-known enum leaf is being hashed directly.
+
+When the enum schema cannot be resolved, the enum identity does not match the
+expected attribute type, or the value cannot be converted to an API-canonical
+enum value, the implementation falls back to the old deterministic string. This
+avoids surprising hash movement for cases outside the known enum path while
+stabilizing the cases that can be normalized confidently.
+
+The primary target is DSL spelling changes inside a provider-compatible enum
+space, for example `awscc.Region.ap_northeast_1` and
+`aws.Region.ap_northeast_1` both hashing as `ap-northeast-1`. Switching the
+resource provider itself, such as `awscc.ec2.Route` to `aws.ec2.Route`, still
+changes the anonymous identifier prefix from `awscc_*` to `aws_*`; that broader
+provider-switch behavior is out of scope for this implementation and should be
+tracked separately.
