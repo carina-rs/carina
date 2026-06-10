@@ -303,16 +303,17 @@ type system. Options include:
 The goal is to prevent future consumers from accidentally reusing parser-surface
 enum text as a durable identity value.
 
-## Reproducing tests
+## Planned reproducing tests
 
-This design PR adds three failing tests to
+The implementation PR will add three reproducing tests to
 `carina-core/src/identifier/tests.rs`:
 
 - `test_anonymous_id_stable_across_provider_namespace_change_in_identity`;
 - `test_anonymous_id_stable_across_provider_namespace_change_in_attribute`;
 - `test_reconcile_anonymous_id_after_provider_namespace_change`.
 
-They intentionally have no `#[ignore]` marker.
+The implementation PR should add them without `#[ignore]` markers. They should
+be introduced alongside the fix and should be green in that PR.
 
 The first test proves that provider config identity values such as `region`
 must hash by API value, not by `awscc.*` versus `aws.*` DSL namespace. The second
@@ -320,7 +321,3 @@ test proves the same requirement for resource attributes such as EIP `domain`.
 The third test covers the end-to-end compute-then-reconcile flow with old state
 and a new desired resource whose only semantic difference is the provider
 namespace prefix embedded in the enum identifier.
-
-During this design PR these tests fail. The implementation PR should make them
-green by canonicalizing enum hash inputs rather than changing the test
-expectations.
