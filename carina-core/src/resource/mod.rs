@@ -1,10 +1,16 @@
 //! Resource - Representing resources and their state
 
+mod enum_value;
+
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+
+pub use enum_value::{
+    CanonicalEnumValue, EnumValueResolver, RawEnumIdentifier, RawEnumIdentifierParts,
+};
 
 /// The `name` portion of a `ResourceId`.
 ///
@@ -618,7 +624,8 @@ pub enum ConcreteValue {
     /// variant so the validator can distinguish "identifier value"
     /// from "string value" without re-deriving the question from
     /// string content. See carina#2986.
-    EnumIdentifier(String),
+    EnumIdentifier(RawEnumIdentifier),
+    CanonicalEnum(CanonicalEnumValue),
     Int(i64),
     Float(f64),
     Bool(bool),
@@ -681,7 +688,8 @@ pub enum DeferredValue {
 pub enum ConcreteValueRef<'a> {
     String(&'a str),
     /// See `ConcreteValue::EnumIdentifier`.
-    EnumIdentifier(&'a str),
+    EnumIdentifier(&'a RawEnumIdentifier),
+    CanonicalEnum(&'a CanonicalEnumValue),
     Int(i64),
     Float(f64),
     Bool(bool),
@@ -699,9 +707,19 @@ impl<'a> ConcreteValueRef<'a> {
     pub fn as_string_like(&self) -> Option<&'a str> {
         match self {
             ConcreteValueRef::String(s) => Some(s),
-            ConcreteValueRef::EnumIdentifier(s) => Some(s),
+            ConcreteValueRef::EnumIdentifier(s) => Some(s.as_str()),
+            ConcreteValueRef::CanonicalEnum(_) => None,
             _ => None,
         }
+    }
+}
+
+impl ConcreteValue {
+    /// TODO(carina#3438): remove in chain PR 5.
+    /// Temporary constructor for call sites that still build parser-surface
+    /// enum identifiers from string text.
+    pub fn enum_identifier(text: impl Into<String>) -> Self {
+        Self::EnumIdentifier(RawEnumIdentifier::parse(text))
     }
 }
 
@@ -742,6 +760,7 @@ impl Value {
             Value::Concrete(c) => Some(match c {
                 ConcreteValue::String(s) => ConcreteValueRef::String(s),
                 ConcreteValue::EnumIdentifier(s) => ConcreteValueRef::EnumIdentifier(s),
+                ConcreteValue::CanonicalEnum(c) => ConcreteValueRef::CanonicalEnum(c),
                 ConcreteValue::Int(n) => ConcreteValueRef::Int(*n),
                 ConcreteValue::Float(f) => ConcreteValueRef::Float(*f),
                 ConcreteValue::Bool(b) => ConcreteValueRef::Bool(*b),
@@ -866,14 +885,18 @@ impl PartialEq for Value {
             (
                 Value::Concrete(ConcreteValue::EnumIdentifier(a)),
                 Value::Concrete(ConcreteValue::EnumIdentifier(b)),
-            )
-            | (
+            ) => a == b,
+            (
                 Value::Concrete(ConcreteValue::EnumIdentifier(a)),
                 Value::Concrete(ConcreteValue::String(b)),
-            )
-            | (
+            ) => a.as_str() == b,
+            (
                 Value::Concrete(ConcreteValue::String(a)),
                 Value::Concrete(ConcreteValue::EnumIdentifier(b)),
+            ) => a == b,
+            (
+                Value::Concrete(ConcreteValue::CanonicalEnum(a)),
+                Value::Concrete(ConcreteValue::CanonicalEnum(b)),
             ) => a == b,
             (Value::Concrete(ConcreteValue::Int(a)), Value::Concrete(ConcreteValue::Int(b))) => {
                 a == b
@@ -1111,6 +1134,7 @@ impl Value {
             Value::Deferred(DeferredValue::Secret(inner)) => inner.visit_refs(f),
             Value::Concrete(ConcreteValue::String(_))
             | Value::Concrete(ConcreteValue::EnumIdentifier(_))
+            | Value::Concrete(ConcreteValue::CanonicalEnum(_))
             | Value::Concrete(ConcreteValue::Int(_))
             | Value::Concrete(ConcreteValue::Float(_))
             | Value::Concrete(ConcreteValue::Bool(_))
@@ -1185,8 +1209,9 @@ impl Value {
     fn hash_into(&self, hasher: &mut impl Hasher) {
         std::mem::discriminant(self).hash(hasher);
         match self {
-            Value::Concrete(ConcreteValue::String(s))
-            | Value::Concrete(ConcreteValue::EnumIdentifier(s)) => s.hash(hasher),
+            Value::Concrete(ConcreteValue::String(s)) => s.hash(hasher),
+            Value::Concrete(ConcreteValue::EnumIdentifier(s)) => s.hash(hasher),
+            Value::Concrete(ConcreteValue::CanonicalEnum(c)) => c.hash(hasher),
             Value::Concrete(ConcreteValue::Int(i)) => i.hash(hasher),
             Value::Concrete(ConcreteValue::Float(f)) => {
                 // Use bits for deterministic hashing (NaN == NaN for our purposes)

@@ -61,7 +61,7 @@ fn invalid_enum_variant_namespaced_display() {
     let mut attrs = HashMap::new();
     attrs.insert(
         "versioning".to_string(),
-        Value::Concrete(ConcreteValue::EnumIdentifier(
+        Value::Concrete(ConcreteValue::enum_identifier(
             "aws.s3.Bucket.VersioningStatus.NotReal".to_string(),
         )),
     );
@@ -81,7 +81,7 @@ fn invalid_enum_variant_bare_display() {
         None,
     );
     let err = carina_core::schema::Schema::flat(t.clone())
-        .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        .validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "zzz".to_string(),
         )))
         .unwrap_err();
@@ -102,7 +102,7 @@ fn invalid_enum_variant_with_dsl_aliases_display() {
         None,
     );
     let err = carina_core::schema::Schema::flat(t.clone())
-        .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        .validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "zzz".to_string(),
         )))
         .unwrap_err();

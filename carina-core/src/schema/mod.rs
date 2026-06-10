@@ -1462,7 +1462,7 @@ impl fmt::Display for FieldPath {
 /// drift again (carina#3347).
 pub(crate) fn lift_map_key(key_type: &AttributeType, key: &str) -> Value {
     if matches!(&key_type.kind, AttrTypeKind::Enum { .. }) {
-        Value::Concrete(ConcreteValue::EnumIdentifier(key.to_string()))
+        Value::Concrete(ConcreteValue::enum_identifier(key.to_string()))
     } else {
         Value::Concrete(ConcreteValue::String(key.to_string()))
     }
@@ -2303,7 +2303,7 @@ impl AttributeType {
         // must stay internal: error messages should quote what the user
         // actually typed. See #2077.
         let user_input = match value {
-            ConcreteValueRef::EnumIdentifier(s) => Some(s),
+            ConcreteValueRef::EnumIdentifier(s) => Some(s.as_str()),
             _ => None,
         };
         if let Value::Concrete(ConcreteValue::String(s)) = &resolved_value {
@@ -3668,6 +3668,7 @@ impl Value {
         match self {
             Value::Concrete(ConcreteValue::String(_)) => "String".to_string(),
             Value::Concrete(ConcreteValue::EnumIdentifier(_)) => "EnumIdentifier".to_string(),
+            Value::Concrete(ConcreteValue::CanonicalEnum(_)) => "CanonicalEnum".to_string(),
             Value::Concrete(ConcreteValue::Int(_)) => "Int".to_string(),
             Value::Concrete(ConcreteValue::Float(_)) => "Float".to_string(),
             Value::Concrete(ConcreteValue::Bool(_)) => "Bool".to_string(),
@@ -3698,6 +3699,7 @@ impl ConcreteValueRef<'_> {
         match self {
             ConcreteValueRef::String(_) => "String",
             ConcreteValueRef::EnumIdentifier(_) => "EnumIdentifier",
+            ConcreteValueRef::CanonicalEnum(_) => "CanonicalEnum",
             ConcreteValueRef::Int(_) => "Int",
             ConcreteValueRef::Float(_) => "Float",
             ConcreteValueRef::Bool(_) => "Bool",
@@ -3716,7 +3718,10 @@ impl ConcreteValueRef<'_> {
         match self {
             ConcreteValueRef::String(s) => Value::Concrete(ConcreteValue::String(s.to_string())),
             ConcreteValueRef::EnumIdentifier(s) => {
-                Value::Concrete(ConcreteValue::EnumIdentifier(s.to_string()))
+                Value::Concrete(ConcreteValue::enum_identifier(s.to_string()))
+            }
+            ConcreteValueRef::CanonicalEnum(c) => {
+                Value::Concrete(ConcreteValue::CanonicalEnum(c.clone()))
             }
             ConcreteValueRef::Int(n) => Value::Concrete(ConcreteValue::Int(n)),
             ConcreteValueRef::Float(f) => Value::Concrete(ConcreteValue::Float(f)),

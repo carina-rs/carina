@@ -56,6 +56,7 @@ fn describe_value_shape(value: &Value) -> &'static str {
         }
         Value::Concrete(ConcreteValue::Map(_)) => "map",
         Value::Concrete(ConcreteValue::EnumIdentifier(_)) => "enum identifier",
+        Value::Concrete(ConcreteValue::CanonicalEnum(_)) => "canonical enum",
         Value::Deferred(DeferredValue::ResourceRef { .. }) => "resource reference",
         Value::Deferred(DeferredValue::BindingRef { .. }) => "binding reference",
         Value::Deferred(DeferredValue::Interpolation(_)) => "interpolation",

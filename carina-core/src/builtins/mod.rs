@@ -414,6 +414,7 @@ fn value_type_name(value: &Value) -> &'static str {
     match value {
         Value::Concrete(ConcreteValue::String(_)) => "String",
         Value::Concrete(ConcreteValue::EnumIdentifier(_)) => "EnumIdentifier",
+        Value::Concrete(ConcreteValue::CanonicalEnum(_)) => "CanonicalEnum",
         Value::Concrete(ConcreteValue::Int(_)) => "Int",
         Value::Concrete(ConcreteValue::Float(_)) => "Float",
         Value::Concrete(ConcreteValue::Bool(_)) => "Bool",

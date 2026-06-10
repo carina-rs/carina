@@ -306,7 +306,7 @@ mod tests {
         let mut attrs = HashMap::new();
         attrs.insert(
             "Version".to_string(),
-            Value::Concrete(ConcreteValue::EnumIdentifier("bad_version".to_string())),
+            Value::Concrete(ConcreteValue::enum_identifier("bad_version")),
         );
         let mut errs = schema.validate(&attrs).unwrap_err();
         let err = errs.remove(0);

@@ -88,7 +88,7 @@ fn test_anonymous_id_stable_across_provider_namespace_change_in_identity() {
         "awscc",
         vec![(
             "region",
-            Value::Concrete(ConcreteValue::EnumIdentifier(
+            Value::Concrete(ConcreteValue::enum_identifier(
                 "awscc.Region.ap_northeast_1".to_string(),
             )),
         )],
@@ -97,7 +97,7 @@ fn test_anonymous_id_stable_across_provider_namespace_change_in_identity() {
         "awscc",
         vec![(
             "region",
-            Value::Concrete(ConcreteValue::EnumIdentifier(
+            Value::Concrete(ConcreteValue::enum_identifier(
                 "aws.Region.ap_northeast_1".to_string(),
             )),
         )],
@@ -141,7 +141,7 @@ fn test_anonymous_id_stable_across_provider_namespace_change_in_attribute() {
         let mut resource = Resource::with_provider("awscc", "ec2.Eip", "", None);
         resource.set_attr(
             "domain".to_string(),
-            Value::Concrete(ConcreteValue::EnumIdentifier(domain.to_string())),
+            Value::Concrete(ConcreteValue::enum_identifier(domain.to_string())),
         );
         resource
     };
@@ -172,7 +172,7 @@ fn test_reconcile_anonymous_id_after_provider_namespace_change() {
         let mut resource = Resource::with_provider("awscc", "ec2.Eip", "", None);
         resource.set_attr(
             "domain".to_string(),
-            Value::Concrete(ConcreteValue::EnumIdentifier(domain.to_string())),
+            Value::Concrete(ConcreteValue::enum_identifier(domain.to_string())),
         );
         resource.set_attr(
             "public_ipv4_pool".to_string(),

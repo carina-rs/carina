@@ -221,13 +221,18 @@ pub fn value_to_json_with_context(
 ) -> Result<serde_json::Value, SerializationError> {
     let ctx = SerializationContext::ValueToJson;
     match value {
-        Value::Concrete(ConcreteValue::String(s))
-        | Value::Concrete(ConcreteValue::EnumIdentifier(s)) => {
+        Value::Concrete(ConcreteValue::String(s)) => {
             // Both serialize as a flat JSON string. The schema-aware
             // state loader re-classifies `EnumIdentifier` from the
             // attribute's declared type, so the on-disk JSON stays
             // unchanged. See carina#2986 design doc §5.
             Ok(serde_json::Value::String(s.clone()))
+        }
+        Value::Concrete(ConcreteValue::EnumIdentifier(s)) => {
+            Ok(serde_json::Value::String(s.to_string()))
+        }
+        Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
+            Ok(serde_json::Value::String(c.api_value().to_string()))
         }
         Value::Concrete(ConcreteValue::Int(n)) => Ok(serde_json::Value::Number((*n).into())),
         Value::Concrete(ConcreteValue::Duration(d)) => {
@@ -482,7 +487,12 @@ pub(crate) fn format_value_into<S: FormatSink>(
             // match how the user typed them. The resolver has already
             // canonicalized any namespaced form, so `s` is the bare
             // identifier ready for direct display.
-            sink.write_str(s)
+            sink.write_str(s.as_str())
+        }
+        Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
+            sink.write_str("\"")?;
+            sink.write_str(c.api_value())?;
+            sink.write_str("\"")
         }
         Value::Concrete(ConcreteValue::Int(n)) => sink.write_str(&n.to_string()),
         Value::Concrete(ConcreteValue::Duration(d)) => sink.write_str(&render_duration(*d)),
@@ -1280,8 +1290,9 @@ pub fn as_string_list(value: &Value) -> Option<Vec<String>> {
         Value::Concrete(ConcreteValue::List(items)) => items
             .iter()
             .map(|v| match v {
-                Value::Concrete(ConcreteValue::String(s))
-                | Value::Concrete(ConcreteValue::EnumIdentifier(s)) => Some(s.clone()),
+                Value::Concrete(ConcreteValue::String(s)) => Some(s.clone()),
+                Value::Concrete(ConcreteValue::EnumIdentifier(s)) => Some(s.to_string()),
+                Value::Concrete(ConcreteValue::CanonicalEnum(c)) => Some(c.api_value().to_string()),
                 _ => None,
             })
             .collect(),
@@ -3691,7 +3702,7 @@ mod tests {
         let canon = canonicalize_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
         assert_eq!(
             canon,
-            Value::Concrete(ConcreteValue::EnumIdentifier(
+            Value::Concrete(ConcreteValue::enum_identifier(
                 "aws.iam.PolicyDocument.Effect.allow".to_string()
             ))
         );
@@ -4307,7 +4318,9 @@ mod tests {
         let mut desired = vec![
             Resource::with_provider("awscc", "ec2.Subnet", "subnet", None).with_attribute(
                 "availability_zone",
-                Value::Concrete(ConcreteValue::EnumIdentifier("ap_northeast_1a".to_string())),
+                Value::Concrete(ConcreteValue::enum_identifier(
+                    "ap_northeast_1a".to_string(),
+                )),
             ),
         ];
         canonicalize_resources_with_schemas(&mut desired, &registry);

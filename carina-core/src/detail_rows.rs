@@ -2318,8 +2318,8 @@ mod tests {
             [(
                 "policy".to_string(),
                 iam_policy_value(
-                    ConcreteValue::EnumIdentifier("allow".to_string()),
-                    ConcreteValue::EnumIdentifier("2012_10_17".to_string()),
+                    ConcreteValue::enum_identifier("allow".to_string()),
+                    ConcreteValue::enum_identifier("2012_10_17".to_string()),
                 ),
             )]
             .into_iter()
@@ -2357,8 +2357,8 @@ mod tests {
                 (
                     "policy".to_string(),
                     iam_policy_value(
-                        ConcreteValue::EnumIdentifier("allow".to_string()),
-                        ConcreteValue::EnumIdentifier("2012_10_17".to_string()),
+                        ConcreteValue::enum_identifier("allow".to_string()),
+                        ConcreteValue::enum_identifier("2012_10_17".to_string()),
                     ),
                 ),
                 (
@@ -2411,8 +2411,8 @@ mod tests {
             [(
                 "policy".to_string(),
                 iam_policy_value(
-                    ConcreteValue::EnumIdentifier("allow".to_string()),
-                    ConcreteValue::EnumIdentifier("2012_10_17".to_string()),
+                    ConcreteValue::enum_identifier("allow".to_string()),
+                    ConcreteValue::enum_identifier("2012_10_17".to_string()),
                 ),
             )]
             .into_iter()
@@ -2451,8 +2451,8 @@ mod tests {
             [(
                 "policy".to_string(),
                 iam_policy_value(
-                    ConcreteValue::EnumIdentifier("allow".to_string()),
-                    ConcreteValue::EnumIdentifier("2012_10_17".to_string()),
+                    ConcreteValue::enum_identifier("allow".to_string()),
+                    ConcreteValue::enum_identifier("2012_10_17".to_string()),
                 ),
             )]
             .into_iter()
@@ -2520,7 +2520,7 @@ mod tests {
             ResourceId::new("x.Thing", "t"),
             [(
                 "modes".to_string(),
-                mk(ConcreteValue::EnumIdentifier("on".to_string())),
+                mk(ConcreteValue::enum_identifier("on".to_string())),
             )]
             .into_iter()
             .collect(),
@@ -2551,8 +2551,8 @@ mod tests {
             [(
                 "policy".to_string(),
                 iam_policy_value(
-                    ConcreteValue::EnumIdentifier("allow".to_string()),
-                    ConcreteValue::EnumIdentifier("2012_10_17".to_string()),
+                    ConcreteValue::enum_identifier("allow".to_string()),
+                    ConcreteValue::enum_identifier("2012_10_17".to_string()),
                 ),
             )]
             .into_iter()
@@ -2596,8 +2596,8 @@ mod tests {
                 (
                     "policy".to_string(),
                     iam_policy_value(
-                        ConcreteValue::EnumIdentifier("allow".to_string()),
-                        ConcreteValue::EnumIdentifier("2012_10_17".to_string()),
+                        ConcreteValue::enum_identifier("allow".to_string()),
+                        ConcreteValue::enum_identifier("2012_10_17".to_string()),
                     ),
                 ),
                 (
@@ -2693,7 +2693,7 @@ mod tests {
         Value::Concrete(ConcreteValue::List(
             items
                 .iter()
-                .map(|s| Value::Concrete(ConcreteValue::EnumIdentifier(s.to_string())))
+                .map(|s| Value::Concrete(ConcreteValue::enum_identifier(s.to_string())))
                 .collect(),
         ))
     }

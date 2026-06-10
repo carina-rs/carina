@@ -314,7 +314,7 @@ pub(in crate::parser) fn extract_directives(
 fn value_as_binding_name(value: &Value, context: &str) -> Result<String, ParseError> {
     match value {
         Value::Deferred(DeferredValue::BindingRef { binding }) => Ok(binding.clone()),
-        Value::Concrete(ConcreteValue::EnumIdentifier(name)) => Ok(name.clone()),
+        Value::Concrete(ConcreteValue::EnumIdentifier(name)) => Ok(name.to_string()),
         Value::Concrete(ConcreteValue::String(name)) => {
             let bare = name
                 .strip_prefix("${")

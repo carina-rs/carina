@@ -400,7 +400,7 @@ fn type_aware_enum_canonical_vs_namespaced_identifier() {
     assert!(
         type_aware_equal(
             &Value::Concrete(ConcreteValue::String("ap-northeast-1a".to_string())),
-            &Value::Concrete(ConcreteValue::EnumIdentifier(
+            &Value::Concrete(ConcreteValue::enum_identifier(
                 "aws.AvailabilityZone.ap_northeast_1a".to_string()
             )),
             Some(&az_type),

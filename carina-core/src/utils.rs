@@ -1014,7 +1014,7 @@ fn lift_enum_leaves_projected(
                 .dotted_prefix()
                 .map(|prefix| format!("{}.{}.{}", prefix, identity.kind, dsl))
                 .unwrap_or_else(|| format!("{}.{}", identity.kind, dsl));
-            return Some(Value::Concrete(ConcreteValue::EnumIdentifier(full)));
+            return Some(Value::Concrete(ConcreteValue::enum_identifier(full)));
         }
         // Recognized-or-not, an Enum leaf has no children.
         return None;
@@ -1112,7 +1112,7 @@ fn enum_member_accepts(
         return false;
     }
     let resolved = expand_enum_shorthand(
-        &Value::Concrete(ConcreteValue::EnumIdentifier(dsl.to_string())),
+        &Value::Concrete(ConcreteValue::enum_identifier(dsl.to_string())),
         identity,
     );
     if let Some(validate) = validate {
@@ -1252,7 +1252,7 @@ pub fn convert_region_value(value: &str) -> String {
 /// let mut attrs = IndexMap::new();
 /// attrs.insert(
 ///     "region".to_string(),
-///     Value::Concrete(ConcreteValue::EnumIdentifier("aws.Region.us_east_1".into())),
+///     Value::Concrete(ConcreteValue::enum_identifier("aws.Region.us_east_1")),
 /// );
 /// assert_eq!(extract_region_from_attrs(&attrs, "ap-northeast-1"), "us-east-1");
 ///
@@ -2284,7 +2284,7 @@ mod tests {
         }
 
         fn ei(s: &str) -> Value {
-            Value::Concrete(ConcreteValue::EnumIdentifier(s.to_string()))
+            Value::Concrete(ConcreteValue::enum_identifier(s.to_string()))
         }
 
         /// Regression for aws#313: post-carina#2986 the parser emits
@@ -2557,7 +2557,7 @@ mod tests {
 
         #[test]
         fn enum_identifier_namespaced_form() {
-            let attrs = attrs_with_region(Value::Concrete(ConcreteValue::EnumIdentifier(
+            let attrs = attrs_with_region(Value::Concrete(ConcreteValue::enum_identifier(
                 "aws.Region.us_east_1".to_string(),
             )));
             assert_eq!(
@@ -2664,7 +2664,7 @@ mod tests {
         };
         assert_eq!(
             pd["version"],
-            Value::Concrete(ConcreteValue::EnumIdentifier(
+            Value::Concrete(ConcreteValue::enum_identifier(
                 "aws.iam.PolicyDocument.Version.2012_10_17".to_string()
             )),
             "resource present in registry must have its state lifted"
@@ -2734,7 +2734,7 @@ mod tests {
         };
         assert_eq!(
             pd["version"],
-            Value::Concrete(ConcreteValue::EnumIdentifier(
+            Value::Concrete(ConcreteValue::enum_identifier(
                 "aws.iam.PolicyDocument.Version.2012_10_17".to_string()
             )),
             "provider-read state String must be lifted to EnumIdentifier"
