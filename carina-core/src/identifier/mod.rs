@@ -316,7 +316,9 @@ fn canonical_create_only_value_string(
     attribute_type: Option<&AttributeType>,
 ) -> Option<String> {
     match value {
-        Value::Concrete(ConcreteValue::String(s)) => Some(s.clone()),
+        Value::Concrete(ConcreteValue::String(s)) => {
+            Some(canonical_create_only_text_string(s, attribute_type))
+        }
         Value::Concrete(ConcreteValue::EnumIdentifier(_)) => {
             Some(canonical_enum_feature_string(value, attribute_type))
         }
@@ -324,10 +326,14 @@ fn canonical_create_only_value_string(
     }
 }
 
-fn canonical_state_create_only_value_string(
+fn canonical_create_only_text_string(
     value: &str,
     attribute_type: Option<&AttributeType>,
 ) -> String {
+    if attribute_type.and_then(AttributeType::enum_parts).is_none() {
+        return value.to_string();
+    }
+
     let enum_value = Value::Concrete(ConcreteValue::EnumIdentifier(value.to_string()));
     let canonical = canonical_enum_feature_string(&enum_value, attribute_type);
     if canonical == deterministic_value_string(&enum_value) {
@@ -335,6 +341,13 @@ fn canonical_state_create_only_value_string(
     } else {
         canonical
     }
+}
+
+fn canonical_state_create_only_value_string(
+    value: &str,
+    attribute_type: Option<&AttributeType>,
+) -> String {
+    canonical_create_only_text_string(value, attribute_type)
 }
 
 /// Maximum Hamming distance (out of 64 bits) for SimHash-based reconciliation.

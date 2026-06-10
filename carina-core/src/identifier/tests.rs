@@ -207,6 +207,43 @@ fn test_reconcile_anonymous_id_after_provider_namespace_change() {
 }
 
 #[test]
+fn test_reconcile_anonymous_id_mixed_string_and_enum_identifier_for_enum_attribute() {
+    let schema = ResourceSchema::new("ec2.Subnet")
+        .attribute(AttributeSchema::new("region", region_type("awscc")).create_only())
+        .attribute(AttributeSchema::new("name", AttributeType::string()).create_only());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
+
+    let state_name = "awscc_ec2_subnet_oldhash".to_string();
+    let mut resource =
+        Resource::with_provider("awscc", "ec2.Subnet", "awscc_ec2_subnet_newhash", None);
+    resource.set_attr(
+        "region".to_string(),
+        Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
+    );
+    resource.set_attr(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("new-subnet".to_string())),
+    );
+
+    let state_entries = vec![AnonymousIdStateInfo {
+        name: state_name.clone(),
+        create_only_values: vec![
+            ("region".to_string(), "ap-northeast-1".to_string()),
+            ("name".to_string(), "old-subnet".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    }];
+    let mut resources = vec![resource];
+    reconcile_anonymous_identifiers(&mut resources, &schemas, &|_provider, _rt| {
+        state_entries.clone()
+    });
+
+    assert_eq!(resources[0].id.name_str(), state_name);
+}
+
+#[test]
 fn test_generate_random_suffix_format() {
     let suffix = generate_random_suffix();
     assert_eq!(suffix.len(), 8);
