@@ -53,6 +53,13 @@ fn eip_domain_type(provider: &str) -> AttributeType {
     )
 }
 
+fn canonical_eip_domain(provider: &str, raw: &str) -> crate::resource::CanonicalEnumValue {
+    let attr_type = eip_domain_type(provider);
+    crate::resource::EnumValueResolver::new(&attr_type)
+        .resolve_raw(&crate::resource::RawEnumIdentifier::parse(raw))
+        .unwrap()
+}
+
 fn route53_record_set_schema() -> ResourceSchema {
     ResourceSchema::new("route53.record_set")
         .attribute(AttributeSchema::new("name", AttributeType::string()).create_only())
@@ -132,9 +139,6 @@ fn test_anonymous_id_stable_across_provider_namespace_change_in_identity() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", schema);
     let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
-    let provider_attr_type = |provider: &str, attr: &str| {
-        (provider == "awscc" && attr == "region").then(|| region_type("awscc"))
-    };
 
     let make_resource = || {
         let mut resource = Resource::with_provider("awscc", "ec2.Route", "", None);
@@ -149,7 +153,7 @@ fn test_anonymous_id_stable_across_provider_namespace_change_in_identity() {
         resource
     };
 
-    let providers_awscc = vec![provider_config(
+    let mut providers_awscc = vec![provider_config(
         "awscc",
         vec![(
             "region",
@@ -158,7 +162,7 @@ fn test_anonymous_id_stable_across_provider_namespace_change_in_identity() {
             )),
         )],
     )];
-    let providers_aws = vec![provider_config(
+    let mut providers_aws = vec![provider_config(
         "awscc",
         vec![(
             "region",
@@ -167,23 +171,29 @@ fn test_anonymous_id_stable_across_provider_namespace_change_in_identity() {
             )),
         )],
     )];
+    crate::value::canonicalize_provider_configs_with_attribute_types(
+        &mut providers_awscc,
+        &|provider, attr| (provider == "awscc" && attr == "region").then(|| region_type("awscc")),
+    );
+    crate::value::canonicalize_provider_configs_with_attribute_types(
+        &mut providers_aws,
+        &|provider, attr| (provider == "awscc" && attr == "region").then(|| region_type("awscc")),
+    );
 
     let mut resources_awscc = vec![make_resource()];
     let mut resources_aws = vec![make_resource()];
-    compute_anonymous_identifiers_with_provider_config_types(
+    compute_anonymous_identifiers_with_provider_configs(
         &mut resources_awscc,
         &providers_awscc,
         &schemas,
         &identity_fn,
-        &provider_attr_type,
     )
     .unwrap();
-    compute_anonymous_identifiers_with_provider_config_types(
+    compute_anonymous_identifiers_with_provider_configs(
         &mut resources_aws,
         &providers_aws,
         &schemas,
         &identity_fn,
-        &provider_attr_type,
     )
     .unwrap();
 
@@ -206,7 +216,14 @@ fn test_anonymous_id_stable_across_provider_namespace_change_in_attribute() {
         let mut resource = Resource::with_provider("awscc", "ec2.Eip", "", None);
         resource.set_attr(
             "domain".to_string(),
-            Value::Concrete(ConcreteValue::enum_identifier(domain.to_string())),
+            Value::Concrete(ConcreteValue::CanonicalEnum(canonical_eip_domain(
+                if domain.starts_with("awscc.") {
+                    "awscc"
+                } else {
+                    "aws"
+                },
+                domain,
+            ))),
         );
         resource
     };
@@ -238,14 +255,10 @@ fn test_anonymous_id_stable_for_nested_canonical_enum_create_only_values() {
     let providers = vec![provider_config("awscc", vec![])];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
-    let canonical = |provider: &str, raw: &str| {
-        let attr_type = eip_domain_type(provider);
-        crate::resource::EnumValueResolver::new(&attr_type)
-            .resolve_raw(&crate::resource::RawEnumIdentifier::parse(raw))
-            .unwrap()
-    };
     let make_resource = |provider: &str, raw: &str| {
-        let enum_value = Value::Concrete(ConcreteValue::CanonicalEnum(canonical(provider, raw)));
+        let enum_value = Value::Concrete(ConcreteValue::CanonicalEnum(canonical_eip_domain(
+            provider, raw,
+        )));
         let mut resource = Resource::with_provider("awscc", "ec2.Eip", "", None);
         resource.set_attr(
             "domains".to_string(),
@@ -286,7 +299,14 @@ fn test_reconcile_anonymous_id_after_provider_namespace_change() {
         let mut resource = Resource::with_provider("awscc", "ec2.Eip", "", None);
         resource.set_attr(
             "domain".to_string(),
-            Value::Concrete(ConcreteValue::enum_identifier(domain.to_string())),
+            Value::Concrete(ConcreteValue::CanonicalEnum(canonical_eip_domain(
+                if domain.starts_with("awscc.") {
+                    "awscc"
+                } else {
+                    "aws"
+                },
+                domain,
+            ))),
         );
         resource.set_attr(
             "public_ipv4_pool".to_string(),
@@ -307,7 +327,7 @@ fn test_reconcile_anonymous_id_after_provider_namespace_change() {
     let state_entries = vec![AnonymousIdStateInfo {
         name: state_name.clone(),
         create_only_values: vec![
-            ("domain".to_string(), "awscc.ec2.Eip.Domain.vpc".to_string()),
+            ("domain".to_string(), "EnumApiValue(\"vpc\")".to_string()),
             ("public_ipv4_pool".to_string(), "pool-a".to_string()),
         ]
         .into_iter()

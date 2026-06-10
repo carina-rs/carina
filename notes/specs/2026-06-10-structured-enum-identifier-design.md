@@ -497,12 +497,38 @@ Recommended chain:
 4. Provider follow-up PRs. Update `carina-provider-aws`,
    `carina-provider-awscc`, and `carina-aws-types` construction/match sites, then
    bump revisions in Carina.
-5. Shim removal PR. Remove string-out hash helpers, raw-string enum extraction
-   APIs from durable identity paths, and any temporary constructors that let
-   production code mint canonical enum values without schema. This must happen
-   after provider config attributes such as `region` are canonicalized; otherwise
-   removing raw fallback and `api_for_hash_feature` would regress provider
-   config hash stability.
+5. Shim removal PR. Remove string-out hash helpers and raw-string enum
+   extraction APIs from durable identity paths. This must happen after provider
+   config attributes such as `region` are canonicalized; otherwise removing raw
+   fallback and `api_for_hash_feature` would regress provider config hash
+   stability.
+
+PR 5 implemented that final cleanup with one deliberately narrow exception:
+raw enum construction and `RawEnumIdentifier::as_str()` remain available for
+parser, display, formatter, and diagnostic surfaces. Durable identity no longer
+schema-resolves parser-surface enum text at the hash boundary. Instead, provider
+config identity attributes and resource attributes are canonicalized before
+identity generation, and the hash feature path renders only
+`ConcreteValue::CanonicalEnum` as `EnumApiValue(...)`. Raw enum identifiers that
+somehow reach the hash path use the deterministic fallback representation.
+
+The cleanup makes several hazards unrepresentable or harder to write by
+accident:
+
+- `DslMap::api_for_hash_feature` is gone; enum API spelling is produced by the
+  enum resolver and stored in `CanonicalEnumValue`.
+- `RawEnumIdentifier` no longer dereferences to `str`, so callers cannot
+  silently pass it into string operations, slicing, or `split_once` without
+  choosing `as_str()` explicitly.
+- `String == RawEnumIdentifier` cross-type equality is gone; remaining
+  text comparisons spell out `raw.as_str()` and are therefore reviewable.
+- anonymous hash features turn only `CanonicalEnumValue` into `EnumApiValue`;
+  parser-surface enum text cannot be made canonical there by passing schema.
+
+The remaining convention is explicit rather than hidden: `as_str()` is a
+source/display API, not an identity API. Unresolvable enum-like values still use
+the deterministic fallback so invalid or unresolved inputs do not gain new
+semantic meaning during identity generation.
 
 This mirrors the #3371-style split: design first, core types second, consumers
 third, external repo follow-up fourth, cleanup last.
@@ -574,4 +600,9 @@ Together, the two prior docs say:
 - schema-aware extraction should replace position-based dotted-string parsing;
 - raw enum source text and canonical enum semantics are different values.
 
-This document makes that last point enforceable in Rust types.
+The PR 5 implementation makes that last point enforceable for durable identity
+boundaries: hash generation and create-only reconciliation consume
+`CanonicalEnumValue` when they need enum API semantics, and they no longer carry
+schema-aware raw-text rescue logic. It does not outlaw raw text entirely:
+`RawEnumIdentifier::as_str()` remains the supported display/diagnostic escape
+hatch, and unresolved values deliberately keep deterministic fallback behavior.

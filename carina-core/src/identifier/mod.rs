@@ -8,7 +8,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::parser::ProviderConfig;
 use crate::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, Value};
 use crate::schema::{AttributeType, ResourceSchema, SchemaRegistry};
-use crate::utils::{extract_enum_value_with_values, validate_enum_namespace};
 use crate::validation::is_string_compatible_type;
 
 /// Generate a random 8-character lowercase hex suffix using UUID v4.
@@ -237,86 +236,20 @@ fn deterministic_value_string(value: &Value) -> String {
     }
 }
 
-fn enum_identifier_segments_match(
-    raw: &str,
-    attribute_type: &AttributeType,
-    allow_dotted_value: bool,
-) -> bool {
-    let Some((identity, _, _, _, _)) = attribute_type.enum_parts() else {
-        return false;
-    };
-    if !raw.contains('.') {
-        return true;
-    }
-
-    let parts: Vec<&str> = raw.split('.').collect();
-    let Some(kind_idx) = parts.iter().position(|part| *part == identity.kind) else {
-        return false;
-    };
-    if kind_idx + 1 >= parts.len() {
-        return false;
-    }
-    if !allow_dotted_value && parts.len() != kind_idx + 2 {
-        return false;
-    }
-
-    if !identity.segments.is_empty() {
-        let prefix = &parts[..kind_idx];
-        if prefix.len() < identity.segments.len() {
-            return false;
-        }
-        let segment_start = prefix.len() - identity.segments.len();
-        if !prefix[segment_start..]
-            .iter()
-            .copied()
-            .eq(identity.segments.iter().map(String::as_str))
-        {
-            return false;
-        }
-    }
-
-    validate_enum_namespace(raw, identity).is_ok()
-        || parts
-            .get(kind_idx)
-            .is_some_and(|kind| *kind == identity.kind)
-}
-
-/// Return the anonymous-hash feature string for a schema-known enum value.
+/// Return the anonymous-hash feature string for an already canonicalized value.
 ///
-/// Only parser-surface `EnumIdentifier` values are canonicalized. All other
-/// values deliberately keep the legacy deterministic representation so deferred
-/// bindings and non-enum hash inputs do not change.
+/// `CanonicalEnum` values hash by provider API text. Raw enum identifiers are
+/// intentionally not schema-resolved here; callers must canonicalize at schema
+/// boundaries before durable identity generation.
 pub(crate) fn canonical_enum_feature_string(
     value: &Value,
-    attribute_type: Option<&AttributeType>,
+    _attribute_type: Option<&AttributeType>,
 ) -> String {
     if let Value::Concrete(ConcreteValue::CanonicalEnum(c)) = value {
-        return format!("EnumApiValue({:?})", c.api_value());
+        format!("EnumApiValue({:?})", c.api_value())
+    } else {
+        deterministic_value_string(value)
     }
-    let Some(attribute_type) = attribute_type else {
-        return deterministic_value_string(value);
-    };
-    let Value::Concrete(ConcreteValue::EnumIdentifier(raw)) = value else {
-        return deterministic_value_string(value);
-    };
-    let Some((_identity, values, _aliases, _validate, dsl_map)) = attribute_type.enum_parts()
-    else {
-        return deterministic_value_string(value);
-    };
-    if !enum_identifier_segments_match(raw.as_str(), attribute_type, values.is_some()) {
-        return deterministic_value_string(value);
-    }
-
-    let valid_values: Vec<&str> = values.into_iter().flatten().map(String::as_str).collect();
-    let variant = extract_enum_value_with_values(raw.as_str(), &valid_values);
-    let api_value = dsl_map.api_for_hash_feature(variant);
-    if let Some(values) = values
-        && !values.iter().any(|v| v == &api_value)
-    {
-        return deterministic_value_string(value);
-    }
-
-    format!("EnumApiValue({:?})", api_value)
 }
 
 fn canonical_create_only_value_string(
@@ -327,9 +260,7 @@ fn canonical_create_only_value_string(
         Value::Concrete(ConcreteValue::String(s)) => {
             Some(canonical_create_only_text_string(s, attribute_type))
         }
-        Value::Concrete(ConcreteValue::EnumIdentifier(_)) => {
-            Some(canonical_enum_feature_string(value, attribute_type))
-        }
+        Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => Some(raw.as_str().to_string()),
         Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
             Some(format!("EnumApiValue({:?})", c.api_value()))
         }
@@ -381,27 +312,16 @@ fn canonical_create_only_feature_string(
 
 fn canonical_create_only_text_string(
     value: &str,
-    attribute_type: Option<&AttributeType>,
+    _attribute_type: Option<&AttributeType>,
 ) -> String {
-    if attribute_type.and_then(AttributeType::enum_parts).is_none() {
-        return value.to_string();
-    }
-
-    let enum_value = Value::Concrete(ConcreteValue::enum_identifier(value.to_string()));
-    let canonical = canonical_enum_feature_string(&enum_value, attribute_type);
-    if canonical == deterministic_value_string(&enum_value) {
-        value.to_string()
-    } else {
-        canonical
-    }
+    value.to_string()
 }
 
 /// Convert a persisted state JSON create-only attribute into the same canonical
 /// feature string used for desired-side anonymous identifier reconciliation.
 ///
-/// The JSON reader preserves typed enum objects as `CanonicalEnum` and ordinary
-/// legacy enum strings remain strings; `canonical_create_only_value_string`
-/// then applies schema-known List/Map/Enum normalization symmetrically.
+/// The JSON reader preserves typed enum objects as `CanonicalEnum`; ordinary
+/// legacy enum strings remain strings and are not schema-resolved here.
 pub fn canonical_create_only_state_json_string(
     value: &serde_json::Value,
     attribute_type: Option<&AttributeType>,
@@ -576,8 +496,6 @@ fn compute_resource_simhash(
     simhash_from_identity_and_resource(&identity_values, resource, registry.get_for(resource))
 }
 
-type ProviderConfigAttributeTypeFn<'a> = dyn Fn(&str, &str) -> Option<AttributeType> + 'a;
-
 /// Compute stable identifiers for anonymous resources (those with empty ResourceId.name).
 /// Uses create-only properties and provider identity attributes to generate a deterministic hash.
 ///
@@ -589,21 +507,19 @@ pub fn compute_anonymous_identifiers(
     registry: &SchemaRegistry,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
 ) -> Result<(), String> {
-    compute_anonymous_identifiers_with_provider_config_types(
+    compute_anonymous_identifiers_with_provider_configs(
         resources,
         providers,
         registry,
         identity_attributes_fn,
-        &|_, _| None,
     )
 }
 
-pub fn compute_anonymous_identifiers_with_provider_config_types(
+pub fn compute_anonymous_identifiers_with_provider_configs(
     resources: &mut [Resource],
     providers: &[ProviderConfig],
     registry: &SchemaRegistry,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
-    provider_config_attribute_type_fn: &ProviderConfigAttributeTypeFn<'_>,
 ) -> Result<(), String> {
     use std::collections::BTreeMap;
     use std::hash::{Hash, Hasher};
@@ -635,11 +551,9 @@ pub fn compute_anonymous_identifiers_with_provider_config_types(
         if let Some(pc) = providers.iter().find(|p| p.name == *provider_name) {
             for attr_name in &identity_attrs {
                 if let Some(value) = pc.attributes.get(attr_name.as_str()) {
-                    let attribute_type =
-                        provider_config_attribute_type_fn(provider_name, attr_name);
                     identity_values.insert(
                         attr_name.clone(),
-                        canonical_enum_feature_string(value, attribute_type.as_ref()),
+                        canonical_enum_feature_string(value, None),
                     );
                 }
             }

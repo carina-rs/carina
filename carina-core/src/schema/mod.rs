@@ -346,16 +346,6 @@ impl<'a> DslMap<'a> {
         self.aliases
             .iter()
             .find_map(|(a, d)| (d == dsl).then(|| a.clone()))
-            .unwrap_or_else(|| dsl.to_string())
-    }
-
-    /// Translate a DSL spelling back to its API-canonical spelling, using
-    /// inverse transforms for dynamic enum spaces where that inverse is
-    /// lossless enough for identity/hash consumers.
-    pub(crate) fn api_for_hash_feature(&self, dsl: &str) -> String {
-        self.aliases
-            .iter()
-            .find_map(|(a, d)| (d == dsl).then(|| a.clone()))
             .unwrap_or_else(|| match self.to_dsl {
                 Some(DslTransform::HyphenToUnderscore) => dsl.replace('_', "-"),
                 Some(DslTransform::ReplaceTable(table)) => table

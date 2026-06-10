@@ -396,6 +396,7 @@ pub(crate) fn parse_for_expr(
                     format!("string \"{}\"", if s.len() > 50 { &s[..50] } else { s })
                 }
                 Value::Concrete(ConcreteValue::EnumIdentifier(s)) => {
+                    let s = s.as_str();
                     format!("identifier `{}`", if s.len() > 50 { &s[..50] } else { s })
                 }
                 Value::Concrete(ConcreteValue::Int(i)) => format!("int {}", i),

@@ -5373,15 +5373,13 @@ mod dsl_map_api_for {
     }
 
     #[test]
-    fn closure_some_returns_input_unchanged() {
-        // The closure is one-way (api -> dsl); reversing it is not
-        // representable, so `api_for` is documented to return the input
-        // as-is for the Closure variant. Callers that go through a
-        // `Closure` (currently only Region with hyphen↔underscore) must
-        // reverse the mapping themselves.
+    fn transform_reverses_lossless_dsl_spelling() {
+        // HyphenToUnderscore is reversible enough for enum canonicalization:
+        // provider-facing API values use hyphens while DSL spelling uses
+        // underscores.
         let transform = crate::schema::DslTransform::HyphenToUnderscore;
         let map = DslMap::new(&[], Some(&transform));
-        assert_eq!(map.api_for("ap_northeast_1"), "ap_northeast_1");
+        assert_eq!(map.api_for("ap_northeast_1"), "ap-northeast-1");
     }
 
     #[test]

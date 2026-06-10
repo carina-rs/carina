@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::ops::Deref;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -83,9 +82,10 @@ impl RawEnumIdentifier {
         &self.parsed
     }
 
-    /// TODO(carina#3438): remove in chain PR 5.
-    /// Temporary accessor for call sites that still consume enum identifiers
-    /// as parser-surface strings during the PR chain.
+    /// Parser-surface text for display, formatter, and diagnostics paths.
+    ///
+    /// Do not use this for durable identity comparison; use schema-resolved
+    /// [`CanonicalEnumValue`] instead.
     pub fn as_str(&self) -> &str {
         &self.text
     }
@@ -103,27 +103,9 @@ impl fmt::Debug for RawEnumIdentifier {
     }
 }
 
-// TODO(carina#3438): remove in chain PR 5.
-// Temporary string-like shim for existing display/formatter call sites.
-impl Deref for RawEnumIdentifier {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        self.as_str()
-    }
-}
-
 impl PartialEq for RawEnumIdentifier {
     fn eq(&self, other: &Self) -> bool {
         self.text == other.text
-    }
-}
-
-// TODO(carina#3438): remove in chain PR 5.
-// Temporary equality shim preserving old String/EnumIdentifier comparisons.
-impl PartialEq<RawEnumIdentifier> for String {
-    fn eq(&self, other: &RawEnumIdentifier) -> bool {
-        *self == other.text
     }
 }
 
@@ -289,12 +271,12 @@ impl<'a> EnumValueResolver<'a> {
         }
 
         let api_value = match phase {
-            EnumInputPhase::RawDsl => dsl_map.api_for_hash_feature(&variant),
+            EnumInputPhase::RawDsl => dsl_map.api_for(&variant),
             EnumInputPhase::StateText => {
                 if valid.contains(&text) {
                     text.to_string()
                 } else {
-                    dsl_map.api_for_hash_feature(&variant)
+                    dsl_map.api_for(&variant)
                 }
             }
         };

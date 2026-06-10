@@ -1243,7 +1243,7 @@ pub fn extract_region_from_attrs(
     use crate::resource::{ConcreteValue, Value};
     match attributes.get("region") {
         Some(Value::Concrete(ConcreteValue::String(s))) => convert_region_value(s),
-        Some(Value::Concrete(ConcreteValue::EnumIdentifier(s))) => convert_region_value(s),
+        Some(Value::Concrete(ConcreteValue::EnumIdentifier(s))) => convert_region_value(s.as_str()),
         _ => default_region.to_string(),
     }
 }

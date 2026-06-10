@@ -128,6 +128,7 @@ fn format_value(value: &Value) -> String {
         Value::Concrete(ConcreteValue::EnumIdentifier(s)) => {
             // Enum identifiers render unquoted to match how the user
             // typed them.
+            let s = s.as_str();
             if s.len() > 50 {
                 format!("{}...", &s[..47])
             } else {

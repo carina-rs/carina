@@ -1600,6 +1600,102 @@ pub fn canonicalize_resources_with_schemas(
     }
 }
 
+type ProviderConfigAttributeTypeFn<'a> = dyn Fn(&str, &str) -> Option<AttributeType> + 'a;
+
+fn canonicalize_provider_config_with_type(value: Value, attr_type: &AttributeType) -> Value {
+    let defs = crate::schema::empty_defs_for_schema_walks();
+    let unwrapped = peel_custom(attr_type);
+    if is_string_or_list_of_strings(unwrapped) {
+        return canonicalize_to_string_list(value);
+    }
+    match (value, unwrapped.shape_with_defs(defs)) {
+        (
+            Value::Concrete(ConcreteValue::List(items)),
+            crate::schema::Shape::List { element_type, .. },
+        ) => Value::Concrete(ConcreteValue::List(
+            items
+                .into_iter()
+                .map(|v| canonicalize_provider_config_with_type(v, element_type))
+                .collect(),
+        )),
+        (Value::Concrete(ConcreteValue::Map(map)), crate::schema::Shape::Map { value: vt, .. }) => {
+            Value::Concrete(ConcreteValue::Map(
+                map.into_iter()
+                    .map(|(k, v)| (k, canonicalize_provider_config_with_type(v, vt)))
+                    .collect(),
+            ))
+        }
+        (Value::Concrete(ConcreteValue::Map(map)), crate::schema::Shape::Struct { .. }) => {
+            let fields = crate::schema::struct_fields_with_defs(unwrapped, defs)
+                .expect("Shape::Struct must expose struct fields internally");
+            Value::Concrete(ConcreteValue::Map(
+                map.into_iter()
+                    .map(|(k, v)| {
+                        let field_type = fields
+                            .iter()
+                            .find(|f| f.name == k || f.provider_name.as_deref() == Some(k.as_str()))
+                            .map(|f| &f.field_type);
+                        let canon = match field_type {
+                            Some(ft) => canonicalize_provider_config_with_type(v, ft),
+                            None => v,
+                        };
+                        (k, canon)
+                    })
+                    .collect(),
+            ))
+        }
+        (Value::Deferred(DeferredValue::Secret(inner)), _) => {
+            Value::Deferred(DeferredValue::Secret(Box::new(
+                canonicalize_provider_config_with_type(*inner, attr_type),
+            )))
+        }
+        (val, crate::schema::Shape::Enum { .. }) => {
+            let resolver = crate::resource::EnumValueResolver::new(unwrapped);
+            match val {
+                Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => resolver
+                    .resolve_state_text(raw.as_str())
+                    .map(|c| Value::Concrete(ConcreteValue::CanonicalEnum(c)))
+                    .unwrap_or_else(|_| Value::Concrete(ConcreteValue::EnumIdentifier(raw))),
+                Value::Concrete(ConcreteValue::String(s)) => resolver
+                    .resolve_state_text(&s)
+                    .map(|c| Value::Concrete(ConcreteValue::CanonicalEnum(c)))
+                    .unwrap_or_else(|_| Value::Concrete(ConcreteValue::String(s))),
+                Value::Concrete(ConcreteValue::CanonicalEnum(_)) => val,
+                other => other,
+            }
+        }
+        (val, crate::schema::Shape::Union) => {
+            let members = crate::schema::union_members_with_defs(unwrapped, defs)
+                .expect("Shape::Union must expose union members internally");
+            match crate::schema::select_union_member(members, &val) {
+                Some(member) => canonicalize_provider_config_with_type(val, member),
+                None => val,
+            }
+        }
+        (v, _) => v,
+    }
+}
+
+/// Walk every provider config's attributes, canonicalizing enum-typed leaves
+/// such as provider identity `region` before those values feed durable
+/// identity hashing.
+pub fn canonicalize_provider_configs_with_attribute_types(
+    providers: &mut [crate::parser::ProviderConfig],
+    provider_config_attribute_type_fn: &ProviderConfigAttributeTypeFn<'_>,
+) {
+    for provider in providers.iter_mut() {
+        let mut new_attrs = indexmap::IndexMap::new();
+        for (key, value) in std::mem::take(&mut provider.attributes) {
+            let canon = match provider_config_attribute_type_fn(&provider.name, &key) {
+                Some(attr_type) => canonicalize_provider_config_with_type(value, &attr_type),
+                None => value,
+            };
+            new_attrs.insert(key, canon);
+        }
+        provider.attributes = new_attrs;
+    }
+}
+
 /// [`DataSource`](crate::resource::DataSource) counterpart of
 /// [`canonicalize_resources_with_schemas`]. Schema lookup routes through
 /// the data-source registry (`get_for_data_source`); data sources whose
@@ -2682,6 +2778,68 @@ mod tests {
             map.get("primary").unwrap(),
             Value::Concrete(ConcreteValue::CanonicalEnum(c)) if c.api_value() == "vpc"
         ));
+    }
+
+    #[test]
+    fn canonicalize_provider_configs_replaces_region_enum_with_canonical_api_value() {
+        use crate::parser::ProviderConfig;
+        use crate::schema::{AttributeType, DslTransform, TypeIdentity};
+
+        let mut providers = vec![
+            ProviderConfig {
+                name: "aws".to_string(),
+                attributes: indexmap::indexmap! {
+                    "region".to_string() => Value::Concrete(ConcreteValue::enum_identifier(
+                        "aws.Region.ap_northeast_1",
+                    )),
+                },
+                default_tags: indexmap::IndexMap::new(),
+                source: None,
+                version: None,
+                revision: None,
+                unresolved_attributes: indexmap::IndexMap::new(),
+                binding: None,
+                is_default: true,
+            },
+            ProviderConfig {
+                name: "awscc".to_string(),
+                attributes: indexmap::indexmap! {
+                    "region".to_string() => Value::Concrete(ConcreteValue::enum_identifier(
+                        "awscc.Region.ap_northeast_1",
+                    )),
+                },
+                default_tags: indexmap::IndexMap::new(),
+                source: None,
+                version: None,
+                revision: None,
+                unresolved_attributes: indexmap::IndexMap::new(),
+                binding: None,
+                is_default: true,
+            },
+        ];
+
+        canonicalize_provider_configs_with_attribute_types(&mut providers, &|provider, attr| {
+            (attr == "region").then(|| {
+                AttributeType::enum_(
+                    TypeIdentity::new(Some(provider), Vec::<String>::new(), "Region"),
+                    None,
+                    Vec::new(),
+                    None,
+                    Some(DslTransform::HyphenToUnderscore),
+                )
+            })
+        });
+
+        let api_values: Vec<_> = providers
+            .iter()
+            .map(
+                |provider| match provider.attributes.get("region").unwrap() {
+                    Value::Concrete(ConcreteValue::CanonicalEnum(c)) => c.api_value().to_string(),
+                    other => panic!("expected CanonicalEnum, got {other:?}"),
+                },
+            )
+            .collect();
+        assert_eq!(api_values, ["ap-northeast-1", "ap-northeast-1"]);
     }
 
     #[test]
