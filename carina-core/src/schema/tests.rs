@@ -5494,7 +5494,7 @@ fn validate_map_with_enum_key_rejects_unknown_variant() {
 // schema-aware state-migration lift in
 // `crate::utils::lift_state_enum_leaves` walks loaded
 // attributes against their schema and lifts recognized API-canonical /
-// alias strings to `EnumIdentifier` so old state validates again.
+// alias strings to `CanonicalEnum` so old state validates again.
 #[test]
 fn lift_state_enum_leaves_fixes_awscc251() {
     use crate::utils::lift_state_enum_leaves;
@@ -5585,30 +5585,28 @@ fn lift_state_enum_leaves_fixes_awscc251() {
         .validate(&attrs)
         .expect("lifted state must pass strict Enum validation");
 
-    // The lifted values are EnumIdentifier in the DSL spelling: the
-    // strict carina#2986 validator requires the alias form when a
-    // `dsl_aliases` entry rewrites the API value (carina#2980).
+    // The lifted values are CanonicalEnum in the provider API spelling.
     let Value::Concrete(ConcreteValue::Map(policy)) = &attrs["policy"] else {
         panic!("policy should be a Map");
     };
-    assert_eq!(
-        policy["version"],
-        Value::Concrete(ConcreteValue::enum_identifier(
-            "aws.iam.PolicyDocument.Version.2012_10_17".to_string()
-        ))
-    );
+    assert!(matches!(
+        &policy["version"],
+        Value::Concrete(ConcreteValue::CanonicalEnum(c))
+            if c.identity().to_string() == "aws.iam.PolicyDocument.Version"
+                && c.api_value() == "2012-10-17"
+    ));
     let Value::Concrete(ConcreteValue::List(stmts)) = &policy["statement"] else {
         panic!("statement should be a List");
     };
     let Value::Concrete(ConcreteValue::Map(stmt)) = &stmts[0] else {
         panic!("statement[0] should be a Map");
     };
-    assert_eq!(
-        stmt["effect"],
-        Value::Concrete(ConcreteValue::enum_identifier(
-            "aws.iam.PolicyDocument.Effect.allow".to_string()
-        ))
-    );
+    assert!(matches!(
+        &stmt["effect"],
+        Value::Concrete(ConcreteValue::CanonicalEnum(c))
+            if c.identity().to_string() == "aws.iam.PolicyDocument.Effect"
+                && c.api_value() == "Allow"
+    ));
 }
 
 #[test]
@@ -5630,7 +5628,7 @@ fn lift_state_enums_is_idempotent_and_preserves_invalid() {
     let schema = ResourceSchema::new("aws.iam.role_policy")
         .attribute(AttributeSchema::new("policy", policy_struct));
 
-    // Case 1: already an EnumIdentifier (post-fix re-plan) is normalized.
+    // Case 1: already an EnumIdentifier (post-fix re-plan) is canonicalized.
     let mut already = IndexMap::new();
     already.insert(
         "version".to_string(),
@@ -5645,12 +5643,14 @@ fn lift_state_enums_is_idempotent_and_preserves_invalid() {
     let Value::Concrete(ConcreteValue::Map(p)) = &attrs["policy"] else {
         panic!("map");
     };
-    assert_eq!(
-        p["version"],
-        Value::Concrete(ConcreteValue::enum_identifier(
-            "aws.iam.PolicyDocument.Version.2012_10_17".to_string()
-        )),
-        "already-lifted EnumIdentifier must normalize to fully-qualified DSL spelling"
+    assert!(
+        matches!(
+            &p["version"],
+            Value::Concrete(ConcreteValue::CanonicalEnum(c))
+                if c.identity().to_string() == "aws.iam.PolicyDocument.Version"
+                    && c.api_value() == "2012-10-17"
+        ),
+        "already-lifted EnumIdentifier must canonicalize to API value"
     );
 
     // Case 2: unrecognized string — left as String so the strict
@@ -5717,11 +5717,13 @@ fn dynamic_enum_lift_raw_string_requires_transform_and_structural_dsl_member() {
         Value::Concrete(ConcreteValue::String("Active".to_string())),
         "uppercase raw strings must stay String"
     );
-    assert_eq!(
-        lifted_value("ap-northeast-1z"),
-        Value::Concrete(ConcreteValue::enum_identifier(
-            "aws.AvailabilityZone.ZoneName.ap_northeast_1z".to_string()
-        )),
+    assert!(
+        matches!(
+            lifted_value("ap-northeast-1z"),
+            Value::Concrete(ConcreteValue::CanonicalEnum(c))
+                if c.identity().to_string() == "aws.AvailabilityZone.ZoneName"
+                    && c.api_value() == "ap-northeast-1z"
+        ),
         "structural API-form dynamic enum strings must lift"
     );
     assert_eq!(

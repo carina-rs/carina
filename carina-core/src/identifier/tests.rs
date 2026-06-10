@@ -159,6 +159,55 @@ fn test_anonymous_id_stable_across_provider_namespace_change_in_attribute() {
 }
 
 #[test]
+fn test_anonymous_id_stable_for_nested_canonical_enum_create_only_values() {
+    let domain = eip_domain_type("awscc");
+    let schema = ResourceSchema::new("ec2.Eip")
+        .attribute(
+            AttributeSchema::new("domains", AttributeType::list(domain.clone())).create_only(),
+        )
+        .attribute(
+            AttributeSchema::new("domain_by_name", AttributeType::map(domain)).create_only(),
+        );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
+    let providers = vec![provider_config("awscc", vec![])];
+    let identity_fn = |_: &str| -> Vec<String> { vec![] };
+
+    let canonical = |provider: &str, raw: &str| {
+        let attr_type = eip_domain_type(provider);
+        crate::resource::EnumValueResolver::new(&attr_type)
+            .resolve_raw(&crate::resource::RawEnumIdentifier::parse(raw))
+            .unwrap()
+    };
+    let make_resource = |provider: &str, raw: &str| {
+        let enum_value = Value::Concrete(ConcreteValue::CanonicalEnum(canonical(provider, raw)));
+        let mut resource = Resource::with_provider("awscc", "ec2.Eip", "", None);
+        resource.set_attr(
+            "domains".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![enum_value.clone()])),
+        );
+        resource.set_attr(
+            "domain_by_name".to_string(),
+            Value::Concrete(ConcreteValue::Map(indexmap::indexmap! {
+                "primary".to_string() => enum_value,
+            })),
+        );
+        resource
+    };
+
+    let mut resources_awscc = vec![make_resource("awscc", "awscc.ec2.Eip.Domain.vpc")];
+    let mut resources_aws = vec![make_resource("aws", "aws.ec2.Eip.Domain.vpc")];
+    compute_anonymous_identifiers(&mut resources_awscc, &providers, &schemas, &identity_fn)
+        .unwrap();
+    compute_anonymous_identifiers(&mut resources_aws, &providers, &schemas, &identity_fn).unwrap();
+
+    assert_eq!(
+        resources_awscc[0].id.name_str(),
+        resources_aws[0].id.name_str()
+    );
+}
+
+#[test]
 fn test_reconcile_anonymous_id_after_provider_namespace_change() {
     let schema = ResourceSchema::new("ec2.Eip")
         .attribute(AttributeSchema::new("domain", eip_domain_type("awscc")).create_only())

@@ -10,7 +10,10 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 
-use crate::resource::{ConcreteValue, ConcreteValueRef, DeferredValue, Resource, Value};
+use crate::resource::{
+    ConcreteValue, ConcreteValueRef, DeferredValue, EnumValueResolver, RawEnumIdentifier, Resource,
+    Value,
+};
 use crate::utils::{extract_enum_value_with_values, validate_enum_namespace};
 use crate::value::format_value_with_key;
 
@@ -1462,7 +1465,10 @@ impl fmt::Display for FieldPath {
 /// drift again (carina#3347).
 pub(crate) fn lift_map_key(key_type: &AttributeType, key: &str) -> Value {
     if matches!(&key_type.kind, AttrTypeKind::Enum { .. }) {
-        Value::Concrete(ConcreteValue::enum_identifier(key.to_string()))
+        EnumValueResolver::new(key_type)
+            .resolve_state_text(key)
+            .map(|c| Value::Concrete(ConcreteValue::CanonicalEnum(c)))
+            .unwrap_or_else(|_| Value::Concrete(ConcreteValue::enum_identifier(key.to_string())))
     } else {
         Value::Concrete(ConcreteValue::String(key.to_string()))
     }
@@ -2166,6 +2172,7 @@ impl AttributeType {
                 dsl_aliases,
                 DslMap::new(dsl_aliases, to_dsl.as_ref()),
                 validate.as_ref(),
+                to_dsl.as_ref(),
                 value,
             ),
             AttrTypeKind::List { .. } => self.validate_list(value),
@@ -2265,6 +2272,7 @@ impl AttributeType {
         dsl_aliases: &[(String, String)],
         dsl_map: DslMap<'_>,
         validate: Option<&CustomValidator>,
+        to_dsl: Option<&DslTransform>,
         value: ConcreteValueRef<'_>,
     ) -> Result<(), TypeError> {
         let prefix = identity.dotted_prefix();
@@ -2274,6 +2282,30 @@ impl AttributeType {
             .map(|values| enum_expected_variants(prefix_ref, name, values, dsl_aliases))
             .unwrap_or_default();
         let enumerated = values.map(|_| true).unwrap_or(false);
+        if let ConcreteValueRef::CanonicalEnum(c) = value {
+            if c.identity().same_type(identity) {
+                return Ok(());
+            }
+            return Err(TypeError::TypeMismatch {
+                expected: name.to_string(),
+                got: c.identity().to_string(),
+            });
+        }
+        if let ConcreteValueRef::EnumIdentifier(raw) = value {
+            let enum_attr = AttributeType::enum_(
+                identity.clone(),
+                values.map(<[_]>::to_vec),
+                dsl_aliases.to_vec(),
+                validate.cloned(),
+                to_dsl.cloned(),
+            );
+            if EnumValueResolver::new(&enum_attr)
+                .resolve_raw(&RawEnumIdentifier::parse(raw.as_str()))
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
         let resolved_value = Self::resolve_enum_input(identity, value);
         let validation_result = validate.map(|validate| validate(&resolved_value));
         let validation_ok = validation_result

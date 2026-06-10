@@ -212,6 +212,13 @@ pub(crate) fn type_aware_equal(
                 )
             ) =>
             {
+                if let (
+                    Value::Concrete(ConcreteValue::CanonicalEnum(left)),
+                    Value::Concrete(ConcreteValue::CanonicalEnum(right)),
+                ) = (a, b)
+                {
+                    return left == right;
+                }
                 let text = |v: &Value| -> Option<String> {
                     match v {
                         Value::Concrete(ConcreteValue::String(s)) => Some(s.clone()),
@@ -228,6 +235,10 @@ pub(crate) fn type_aware_equal(
                 if sa == sb {
                     return true;
                 }
+                // Temporary compatibility while some provider-read/state
+                // paths can still surface unresolved strings. Once every
+                // enum-typed state leaf is resolver-lifted, comparison above
+                // should be CanonicalEnum × CanonicalEnum.
                 let dsl_map = crate::schema::DslMap::new(dsl_aliases, to_dsl);
                 let canonical = |s: &str| -> String {
                     let valid_values: Vec<&str> =

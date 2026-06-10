@@ -298,9 +298,9 @@ impl<'a> EnumValueResolver<'a> {
         });
         let valid_value = matched_value.is_some();
         let api_value = matched_value.map_or(api_value, Clone::clone);
-        // NOTE(carina#3438 PR3): validate receives the bare api_value here; the legacy
-        // validate_enum path passes the expanded namespaced text. Verify provider
-        // validators accept both before swapping consumers.
+        // Provider validators at this boundary receive the canonical API
+        // spelling; source-facing namespace checks have already run for
+        // RawDsl input above.
         let validation_result = validate.map(|validate| {
             validate(&crate::resource::Value::Concrete(
                 crate::resource::ConcreteValue::String(api_value.clone()),

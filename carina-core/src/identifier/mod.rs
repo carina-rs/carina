@@ -167,7 +167,7 @@ fn deterministic_value_string(value: &Value) -> String {
             format!("EnumIdentifier({:?})", s.as_str())
         }
         Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
-            format!("CanonicalEnum({:?}, {:?})", c.identity(), c.api_value())
+            format!("EnumApiValue({:?})", c.api_value())
         }
         Value::Concrete(ConcreteValue::Int(i)) => format!("Int({})", i),
         Value::Concrete(ConcreteValue::Float(f)) => format!("Float({})", f),
@@ -290,6 +290,9 @@ pub(crate) fn canonical_enum_feature_string(
     value: &Value,
     attribute_type: Option<&AttributeType>,
 ) -> String {
+    if let Value::Concrete(ConcreteValue::CanonicalEnum(c)) = value {
+        return format!("EnumApiValue({:?})", c.api_value());
+    }
     let Some(attribute_type) = attribute_type else {
         return deterministic_value_string(value);
     };
@@ -326,6 +329,9 @@ fn canonical_create_only_value_string(
         }
         Value::Concrete(ConcreteValue::EnumIdentifier(_)) => {
             Some(canonical_enum_feature_string(value, attribute_type))
+        }
+        Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
+            Some(format!("EnumApiValue({:?})", c.api_value()))
         }
         _ => None,
     }

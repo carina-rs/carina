@@ -1972,7 +1972,7 @@ mod tests {
     }
 
     #[test]
-    fn proto_custom_enum_transform_lifts_state_string_to_dsl_identifier() {
+    fn proto_custom_enum_transform_lifts_state_string_to_canonical_enum() {
         let proto_attr = proto::AttributeType::CustomEnum {
             name: "ZoneName".to_string(),
             base: Box::new(proto_string()),
@@ -1987,14 +1987,15 @@ mod tests {
         let lifted = carina_core::utils::lift_enum_leaves(&state, &core_attr)
             .expect("WASM-bridged dynamic enum should lift provider state");
 
-        assert_eq!(
-            lifted,
+        match lifted {
             carina_core::resource::Value::Concrete(
-                carina_core::resource::ConcreteValue::enum_identifier(
-                    "aws.AvailabilityZone.ZoneName.ap_northeast_1a".to_string()
-                )
-            )
-        );
+                carina_core::resource::ConcreteValue::CanonicalEnum(c),
+            ) => {
+                assert_eq!(c.identity().to_string(), "aws.AvailabilityZone.ZoneName");
+                assert_eq!(c.api_value(), "ap-northeast-1a");
+            }
+            other => panic!("expected CanonicalEnum, got {other:?}"),
+        }
         match core_attr.shape_ref_free().expect("test schema is Ref-free") {
             carina_core::schema::Shape::Enum { base, .. } => {
                 assert!(matches!(
@@ -2037,15 +2038,17 @@ mod tests {
         let already_dsl = carina_core::resource::Value::Concrete(
             carina_core::resource::ConcreteValue::enum_identifier("ap_northeast_1a".to_string()),
         );
-        assert_eq!(
-            carina_core::utils::lift_enum_leaves(&already_dsl, &core_attr),
+        match carina_core::utils::lift_enum_leaves(&already_dsl, &core_attr) {
             Some(carina_core::resource::Value::Concrete(
-                carina_core::resource::ConcreteValue::enum_identifier(
-                    "aws.AvailabilityZone.ZoneName.ap_northeast_1a".to_string()
-                )
-            )),
-            "parser-produced DSL enum identifiers must still canonicalize"
-        );
+                carina_core::resource::ConcreteValue::CanonicalEnum(c),
+            )) => {
+                assert_eq!(c.identity().to_string(), "aws.AvailabilityZone.ZoneName");
+                assert_eq!(c.api_value(), "ap-northeast-1a");
+            }
+            other => panic!(
+                "parser-produced DSL enum identifiers must still canonicalize, got {other:?}"
+            ),
+        }
 
         for raw in ["   ", "", "AP-NORTHEAST-1A"] {
             let value = carina_core::resource::Value::Concrete(
@@ -2061,15 +2064,19 @@ mod tests {
         let valid = carina_core::resource::Value::Concrete(
             carina_core::resource::ConcreteValue::String("ap-northeast-1a".to_string()),
         );
-        assert_eq!(
-            carina_core::utils::lift_enum_leaves(&valid, &core_attr),
+        match carina_core::utils::lift_enum_leaves(&valid, &core_attr) {
             Some(carina_core::resource::Value::Concrete(
-                carina_core::resource::ConcreteValue::enum_identifier(
-                    "aws.AvailabilityZone.ZoneName.ap_northeast_1a".to_string()
+                carina_core::resource::ConcreteValue::CanonicalEnum(c),
+            )) => {
+                assert_eq!(c.identity().to_string(), "aws.AvailabilityZone.ZoneName");
+                assert_eq!(c.api_value(), "ap-northeast-1a");
+            }
+            other => {
+                panic!(
+                    "valid AZ strings must lift through the WASM-bridged transform, got {other:?}"
                 )
-            )),
-            "valid AZ strings must still lift through the WASM-bridged transform"
-        );
+            }
+        }
     }
 
     #[test]
