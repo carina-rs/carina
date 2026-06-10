@@ -489,11 +489,7 @@ pub(crate) fn format_value_into<S: FormatSink>(
             // identifier ready for direct display.
             sink.write_str(s.as_str())
         }
-        Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
-            sink.write_str("\"")?;
-            sink.write_str(c.api_value())?;
-            sink.write_str("\"")
-        }
+        Value::Concrete(ConcreteValue::CanonicalEnum(c)) => sink.write_str(c.api_value()),
         Value::Concrete(ConcreteValue::Int(n)) => sink.write_str(&n.to_string()),
         Value::Concrete(ConcreteValue::Duration(d)) => sink.write_str(&render_duration(*d)),
         Value::Concrete(ConcreteValue::Float(f)) => {
@@ -2501,6 +2497,17 @@ mod tests {
     fn test_format_value_bare_enum_string() {
         let v = Value::Concrete(ConcreteValue::String("dedicated".to_string()));
         assert_eq!(format_value(&v), "\"dedicated\"");
+    }
+
+    #[test]
+    fn test_format_value_canonical_enum_unquoted() {
+        let v = Value::Concrete(ConcreteValue::CanonicalEnum(
+            crate::resource::CanonicalEnumValue::new_for_test(
+                crate::schema::TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),
+                "ap-northeast-1",
+            ),
+        ));
+        assert_eq!(format_value(&v), "ap-northeast-1");
     }
 
     #[test]

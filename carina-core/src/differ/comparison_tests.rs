@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::resource::{ConcreteValue, DeferredValue, Value};
+use crate::resource::{CanonicalEnumValue, ConcreteValue, DeferredValue, Value};
 use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
 
@@ -422,6 +422,48 @@ fn type_aware_enum_canonical_vs_namespaced_identifier() {
             None,
         ),
         "Different enum values must not be folded as equal"
+    );
+}
+
+#[test]
+fn type_aware_enum_canonical_enum_value_compares_against_string() {
+    let az_identity = TypeIdentity::new(Some("aws"), ["AvailabilityZone"], "ZoneName");
+    let az_type = AttributeType::enum_(
+        az_identity.clone(),
+        None,
+        vec![],
+        None,
+        Some(crate::schema::DslTransform::HyphenToUnderscore),
+    );
+
+    assert!(
+        type_aware_equal(
+            &Value::Concrete(ConcreteValue::CanonicalEnum(
+                CanonicalEnumValue::new_for_test(az_identity.clone(), "ap-northeast-1a"),
+            )),
+            &Value::Concrete(ConcreteValue::String(
+                "aws.AvailabilityZone.ap_northeast_1a".to_string()
+            )),
+            Some(&az_type),
+            crate::schema::empty_defs_for_schema_walks(),
+            None,
+        ),
+        "CanonicalEnum API value must compare equal to equivalent DSL String"
+    );
+
+    assert!(
+        !type_aware_equal(
+            &Value::Concrete(ConcreteValue::CanonicalEnum(
+                CanonicalEnumValue::new_for_test(az_identity, "ap-northeast-1a"),
+            )),
+            &Value::Concrete(ConcreteValue::String(
+                "aws.AvailabilityZone.ap_northeast_1c".to_string()
+            )),
+            Some(&az_type),
+            crate::schema::empty_defs_for_schema_walks(),
+            None,
+        ),
+        "Different CanonicalEnum API values must not compare equal"
     );
 }
 

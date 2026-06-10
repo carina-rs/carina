@@ -3167,7 +3167,7 @@ fn length_display(min: Option<&u64>, max: Option<&u64>) -> String {
     }
 }
 
-fn enum_value_matches(input: &str, expected: &str) -> bool {
+pub(crate) fn enum_value_matches(input: &str, expected: &str) -> bool {
     input == expected
         || input.eq_ignore_ascii_case(expected)
         || input.replace('_', "-").eq_ignore_ascii_case(expected)

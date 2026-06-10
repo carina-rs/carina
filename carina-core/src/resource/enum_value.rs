@@ -7,6 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::schema::{
     AttributeType, DslMap, EnumParts, ExpectedEnumVariant, TypeError, TypeIdentity,
+    enum_value_matches,
 };
 use crate::utils::{NamespacedId, extract_enum_value_with_values, validate_enum_namespace};
 
@@ -106,25 +107,9 @@ impl Deref for RawEnumIdentifier {
     }
 }
 
-// TODO(carina#3438): remove in chain PR 5.
-// Temporary string-like shim for existing helper boundaries.
-impl AsRef<str> for RawEnumIdentifier {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-
 impl PartialEq for RawEnumIdentifier {
     fn eq(&self, other: &Self) -> bool {
         self.text == other.text
-    }
-}
-
-// TODO(carina#3438): remove in chain PR 5.
-// Temporary equality shim preserving old String/EnumIdentifier comparisons.
-impl PartialEq<String> for RawEnumIdentifier {
-    fn eq(&self, other: &String) -> bool {
-        self.text == *other
     }
 }
 
@@ -182,7 +167,7 @@ impl CanonicalEnumValue {
         }
     }
 
-    pub(super) fn new_resolved(identity: TypeIdentity, api_value: String) -> Self {
+    fn new_resolved(identity: TypeIdentity, api_value: String) -> Self {
         Self {
             identity,
             api_value,
@@ -319,12 +304,6 @@ impl<'a> EnumValueResolver<'a> {
 enum EnumInputPhase {
     RawDsl,
     StateText,
-}
-
-fn enum_value_matches(input: &str, expected: &str) -> bool {
-    input == expected
-        || input.eq_ignore_ascii_case(expected)
-        || input.replace('_', "-").eq_ignore_ascii_case(expected)
 }
 
 fn api_spelling_rejected_in_dsl(variant: &str, dsl_aliases: &[(String, String)]) -> bool {

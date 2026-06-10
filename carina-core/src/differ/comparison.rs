@@ -198,16 +198,27 @@ pub(crate) fn type_aware_equal(
                 },
             ) if matches!(
                 a,
-                Value::Concrete(ConcreteValue::String(_) | ConcreteValue::EnumIdentifier(_))
+                Value::Concrete(
+                    ConcreteValue::String(_)
+                        | ConcreteValue::EnumIdentifier(_)
+                        | ConcreteValue::CanonicalEnum(_)
+                )
             ) && matches!(
                 b,
-                Value::Concrete(ConcreteValue::String(_) | ConcreteValue::EnumIdentifier(_))
+                Value::Concrete(
+                    ConcreteValue::String(_)
+                        | ConcreteValue::EnumIdentifier(_)
+                        | ConcreteValue::CanonicalEnum(_)
+                )
             ) =>
             {
                 let text = |v: &Value| -> Option<String> {
                     match v {
                         Value::Concrete(ConcreteValue::String(s)) => Some(s.clone()),
                         Value::Concrete(ConcreteValue::EnumIdentifier(s)) => Some(s.to_string()),
+                        Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
+                            Some(c.api_value().to_string())
+                        }
                         _ => None,
                     }
                 };

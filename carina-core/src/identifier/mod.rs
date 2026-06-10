@@ -348,13 +348,6 @@ fn canonical_create_only_text_string(
     }
 }
 
-fn canonical_state_create_only_value_string(
-    value: &str,
-    attribute_type: Option<&AttributeType>,
-) -> String {
-    canonical_create_only_text_string(value, attribute_type)
-}
-
 /// Maximum Hamming distance (out of 64 bits) for SimHash-based reconciliation.
 /// Two identifiers with distance below this threshold are considered the "same resource"
 /// with modified attributes.
@@ -840,7 +833,7 @@ pub fn reconcile_anonymous_identifiers(
                 if let Some(state_value) = entry.create_only_values.get(*attr) {
                     let attribute_type = schema.attributes.get(*attr).map(|attr| &attr.attr_type);
                     let state_value =
-                        canonical_state_create_only_value_string(state_value, attribute_type);
+                        canonical_create_only_text_string(state_value, attribute_type);
                     if &state_value == value {
                         matched += 1;
                     } else {
