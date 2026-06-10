@@ -12,7 +12,7 @@ use crate::schema::{
 use crate::utils::{NamespacedId, extract_enum_value_with_values, validate_enum_namespace};
 
 /// Parser-surface enum identifier text plus schema-free syntax classification.
-#[derive(Debug, Clone, Eq)]
+#[derive(Clone, Eq)]
 pub struct RawEnumIdentifier {
     text: String,
     parsed: RawEnumIdentifierParts,
@@ -94,6 +94,12 @@ impl RawEnumIdentifier {
 impl fmt::Display for RawEnumIdentifier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.text)
+    }
+}
+
+impl fmt::Debug for RawEnumIdentifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.text, f)
     }
 }
 
@@ -366,6 +372,7 @@ fn expected_variants(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resource::ConcreteValue;
     use crate::schema::{DslTransform, enum_identity};
 
     #[test]
@@ -404,6 +411,12 @@ mod tests {
             RawEnumIdentifier::parse("some.random.string").parsed(),
             &RawEnumIdentifierParts::Unclassified
         );
+    }
+
+    #[test]
+    fn debug_output_is_transparent_to_text() {
+        let v = ConcreteValue::enum_identifier("dedicated");
+        assert_eq!(format!("{:?}", v), r#"EnumIdentifier("dedicated")"#);
     }
 
     #[test]
