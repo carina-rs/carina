@@ -53,6 +53,47 @@ fn eip_domain_type(provider: &str) -> AttributeType {
     )
 }
 
+fn route53_record_set_schema() -> ResourceSchema {
+    ResourceSchema::new("route53.record_set")
+        .attribute(AttributeSchema::new("name", AttributeType::string()).create_only())
+        .attribute(AttributeSchema::new("hosted_zone_id", AttributeType::string()).create_only())
+        .attribute(AttributeSchema::new("type", AttributeType::string()).identity())
+        .attribute(AttributeSchema::new("ttl", AttributeType::string()))
+        .attribute(AttributeSchema::new(
+            "resource_records",
+            AttributeType::list(AttributeType::string()),
+        ))
+}
+
+fn route53_record_set_resource(record_type: &str) -> Resource {
+    let mut resource = Resource::with_provider("awscc", "route53.record_set", "", None);
+    resource.set_attr(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("carina-rs.dev".to_string())),
+    );
+    resource.set_attr(
+        "hosted_zone_id".to_string(),
+        Value::Concrete(ConcreteValue::String("Z123".to_string())),
+    );
+    resource.set_attr(
+        "type".to_string(),
+        Value::Concrete(ConcreteValue::String(record_type.to_string())),
+    );
+    resource
+}
+
+fn route53_state_entry(name: &str) -> AnonymousIdStateInfo {
+    AnonymousIdStateInfo {
+        name: name.to_string(),
+        create_only_values: vec![
+            ("name".to_string(), "carina-rs.dev".to_string()),
+            ("hosted_zone_id".to_string(), "Z123".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    }
+}
+
 #[test]
 fn test_anonymous_id_stable_across_provider_namespace_change_in_identity() {
     let schema = ResourceSchema::new("ec2.Route")
@@ -1110,6 +1151,71 @@ fn test_identity_attribute_prevents_collision() {
         resources[0].id.name_str(),
         resources[1].id.name_str(),
         "different identity attr values should produce different identifiers"
+    );
+}
+
+#[test]
+fn test_reconcile_anonymous_id_full_match_claims_state_entry_once() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", route53_record_set_schema());
+    let providers = vec![provider_config("awscc", vec![])];
+    let identity_fn = |_: &str| -> Vec<String> { vec![] };
+
+    let mut resources = vec![
+        route53_record_set_resource("A"),
+        route53_record_set_resource("AAAA"),
+    ];
+    compute_anonymous_identifiers(&mut resources, &providers, &schemas, &identity_fn)
+        .expect("identity attrs should produce distinct Route53 record identifiers");
+
+    let old_state_name = "route53_record_set_11223344";
+    assert_ne!(resources[0].id.name_str(), old_state_name);
+    assert_ne!(resources[1].id.name_str(), old_state_name);
+
+    let state_entries = vec![route53_state_entry(old_state_name)];
+    reconcile_anonymous_identifiers(&mut resources, &schemas, &|_provider, _rt| {
+        state_entries.clone()
+    });
+
+    let names: HashSet<&str> = resources.iter().map(|r| r.id.name_str()).collect();
+    assert_eq!(names.len(), 2, "reconcile must not duplicate ResourceIds");
+    assert_eq!(
+        resources
+            .iter()
+            .filter(|r| r.id.name_str() == old_state_name)
+            .count(),
+        1,
+        "only one resource may claim the migrated state entry"
+    );
+}
+
+#[test]
+fn test_reconcile_anonymous_id_full_match_does_not_steal_live_entry() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", route53_record_set_schema());
+    let providers = vec![provider_config("awscc", vec![])];
+    let identity_fn = |_: &str| -> Vec<String> { vec![] };
+
+    let mut resources = vec![
+        route53_record_set_resource("A"),
+        route53_record_set_resource("AAAA"),
+    ];
+    compute_anonymous_identifiers(&mut resources, &providers, &schemas, &identity_fn)
+        .expect("identity attrs should produce distinct Route53 record identifiers");
+
+    let live_a_name = resources[0].id.name_str().to_string();
+    let new_aaaa_name = resources[1].id.name_str().to_string();
+    let state_entries = vec![route53_state_entry(&live_a_name)];
+
+    reconcile_anonymous_identifiers(&mut resources, &schemas, &|_provider, _rt| {
+        state_entries.clone()
+    });
+
+    assert_eq!(resources[0].id.name_str(), live_a_name);
+    assert_eq!(
+        resources[1].id.name_str(),
+        new_aaaa_name,
+        "new AAAA record must not steal the live A record state entry"
     );
 }
 

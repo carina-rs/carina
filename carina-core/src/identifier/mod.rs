@@ -805,6 +805,20 @@ pub fn reconcile_anonymous_identifiers(
     find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
 ) -> Vec<(String, String)> {
     let mut renames: Vec<(String, String)> = Vec::new();
+    let mut used_names: HashMap<(String, String), HashSet<String>> = HashMap::new();
+    for resource in resources.iter() {
+        let key = (
+            resource.id.provider.clone(),
+            resource.id.resource_type.clone(),
+        );
+        used_names
+            .entry(key)
+            .or_default()
+            .insert(resource.id.name_str().to_string());
+    }
+
+    let mut claimed_names: HashMap<(String, String), HashSet<String>> = HashMap::new();
+
     for resource in resources.iter_mut() {
         if resource.id.name.is_pending() {
             continue;
@@ -823,6 +837,10 @@ pub fn reconcile_anonymous_identifiers(
 
         let create_only_attrs = schema.create_only_attributes();
         let state_entries = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
+        let key = (
+            resource.id.provider.clone(),
+            resource.id.resource_type.clone(),
+        );
 
         // If the resource's name already exists in state, no reconciliation is needed.
         if state_entries
@@ -884,11 +902,23 @@ pub fn reconcile_anonymous_identifiers(
         // Prefer a unique full match over partial matches; if full matches are
         // ambiguous, skip rather than guessing. Partial matches keep the
         // existing "some create-only values changed" reconciliation behavior.
+        // Entries already used by another current resource are live and must
+        // not be stolen; entries claimed earlier in this pass are also excluded
+        // so two resources cannot collapse onto the same state row.
         let mut full_matches: Vec<&str> = Vec::new();
         let mut partial_matches: Vec<&str> = Vec::new();
         for entry in &state_entries {
             if entry.name == resource.id.name_str() {
                 // Same identifier, no reconciliation needed
+                continue;
+            }
+            if used_names
+                .get(&key)
+                .is_some_and(|names| names.contains(&entry.name))
+                || claimed_names
+                    .get(&key)
+                    .is_some_and(|names| names.contains(&entry.name))
+            {
                 continue;
             }
 
@@ -915,20 +945,25 @@ pub fn reconcile_anonymous_identifiers(
             }
         }
 
-        if full_matches.len() == 1 {
-            resource.id = ResourceId::with_provider(
-                &resource.id.provider,
-                &resource.id.resource_type,
-                full_matches[0],
-                resource.id.provider_instance.clone(),
-            );
+        let matched_name = if full_matches.len() == 1 {
+            Some(full_matches[0])
         } else if full_matches.is_empty() && partial_matches.len() == 1 {
+            Some(partial_matches[0])
+        } else {
+            None
+        };
+
+        if let Some(matched_name) = matched_name {
             resource.id = ResourceId::with_provider(
                 &resource.id.provider,
                 &resource.id.resource_type,
-                partial_matches[0],
+                matched_name,
                 resource.id.provider_instance.clone(),
             );
+            claimed_names
+                .entry(key)
+                .or_default()
+                .insert(matched_name.to_string());
         }
     }
     renames
