@@ -35,6 +35,3 @@ site/.astro/
 
 # Superpowers brainstorm sessions
 .superpowers/
-# Added by dagayn
-.dagayn/
-.mcp.json
