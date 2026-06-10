@@ -595,7 +595,7 @@ pub fn apply_provider_prefix_renames(renames: &[(String, String)], state_file: &
 
 pub fn compute_anonymous_identifiers_with_ctx(
     ctx: &WiringContext,
-    resources: &mut [Resource],
+    mut resources: carina_core::value::CanonicalizedResources<'_>,
     providers: &[ProviderConfig],
 ) -> Vec<AppError> {
     let canonical_providers =
@@ -607,7 +607,7 @@ pub fn compute_anonymous_identifiers_with_ctx(
         );
 
     match identifier::compute_anonymous_identifiers_with_provider_configs(
-        resources,
+        resources.as_mut_slice(),
         &canonical_providers,
         ctx.schemas(),
         &|name| identity_attributes_for_provider(ctx, name),
@@ -2803,7 +2803,9 @@ pub fn compute_anonymous_identifiers(
     providers: &[ProviderConfig],
 ) -> Result<(), AppError> {
     let ctx = WiringContext::new(vec![]);
-    let errors = compute_anonymous_identifiers_with_ctx(&ctx, resources, providers);
+    let canonical_resources =
+        carina_core::value::canonicalize_resources_with_schemas(resources, ctx.schemas());
+    let errors = compute_anonymous_identifiers_with_ctx(&ctx, canonical_resources, providers);
     if errors.is_empty() {
         Ok(())
     } else {

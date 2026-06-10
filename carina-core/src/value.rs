@@ -1578,10 +1578,20 @@ fn canonicalize_to_string_list(value: Value) -> Value {
 /// Call this once after `resolver::resolve_refs_*` and before the
 /// differ runs, so every `Resource` flowing into the plan / state /
 /// provider boundary carries the canonical shape. See #2481, #2511.
-pub fn canonicalize_resources_with_schemas(
-    resources: &mut [crate::resource::Resource],
+pub struct CanonicalizedResources<'a> {
+    resources: &'a mut [crate::resource::Resource],
+}
+
+impl<'a> CanonicalizedResources<'a> {
+    pub fn as_mut_slice(&mut self) -> &mut [crate::resource::Resource] {
+        self.resources
+    }
+}
+
+pub fn canonicalize_resources_with_schemas<'a>(
+    resources: &'a mut [crate::resource::Resource],
     registry: &crate::schema::SchemaRegistry,
-) {
+) -> CanonicalizedResources<'a> {
     for resource in resources.iter_mut() {
         let Some(schema) = registry.get_for(resource) else {
             continue;
@@ -1598,6 +1608,8 @@ pub fn canonicalize_resources_with_schemas(
         }
         resource.attributes = new_attrs;
     }
+
+    CanonicalizedResources { resources }
 }
 
 type ProviderConfigAttributeTypeFn<'a> = dyn Fn(&str, &str) -> Option<AttributeType> + 'a;

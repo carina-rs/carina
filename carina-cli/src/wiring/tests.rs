@@ -823,7 +823,9 @@ fn dependency_chain_wrappers_return_vec_app_error() {
     let errors = resolve_attr_prefixes_with_ctx(&ctx, &mut resources);
     assert!(errors.is_empty(), "resolve_attr_prefixes: got {errors:?}");
 
-    let errors = compute_anonymous_identifiers_with_ctx(&ctx, &mut resources, &providers);
+    let canonical_resources =
+        carina_core::value::canonicalize_resources_with_schemas(&mut resources, ctx.schemas());
+    let errors = compute_anonymous_identifiers_with_ctx(&ctx, canonical_resources, &providers);
     assert!(
         errors.is_empty(),
         "compute_anonymous_identifiers: got {errors:?}",
@@ -946,10 +948,15 @@ fn compute_anonymous_identifiers_with_ctx_canonicalizes_provider_config_identity
 
     let mut resources_awscc = vec![anonymous_route_resource()];
     let mut resources_aws = vec![anonymous_route_resource()];
-    let errors =
-        compute_anonymous_identifiers_with_ctx(&ctx, &mut resources_awscc, &providers_awscc);
+    let canonical_awscc = carina_core::value::canonicalize_resources_with_schemas(
+        &mut resources_awscc,
+        ctx.schemas(),
+    );
+    let errors = compute_anonymous_identifiers_with_ctx(&ctx, canonical_awscc, &providers_awscc);
     assert!(errors.is_empty(), "awscc spelling errors: {errors:?}");
-    let errors = compute_anonymous_identifiers_with_ctx(&ctx, &mut resources_aws, &providers_aws);
+    let canonical_aws =
+        carina_core::value::canonicalize_resources_with_schemas(&mut resources_aws, ctx.schemas());
+    let errors = compute_anonymous_identifiers_with_ctx(&ctx, canonical_aws, &providers_aws);
     assert!(errors.is_empty(), "aws spelling errors: {errors:?}");
 
     assert_eq!(
@@ -968,7 +975,10 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
     let providers_aws = vec![region_provider_config("aws.Region.ap_northeast_1")];
 
     let mut anonymous = vec![anonymous_route_resource()];
-    let errors = compute_anonymous_identifiers_with_ctx(&ctx, &mut anonymous, &providers_awscc);
+    let canonical_anonymous =
+        carina_core::value::canonicalize_resources_with_schemas(&mut anonymous, ctx.schemas());
+    let errors =
+        compute_anonymous_identifiers_with_ctx(&ctx, canonical_anonymous, &providers_awscc);
     assert!(errors.is_empty(), "anonymous setup errors: {errors:?}");
     let old_name = anonymous[0].id.name_str().to_string();
 

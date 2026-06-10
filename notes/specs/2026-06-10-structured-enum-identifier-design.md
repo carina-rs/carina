@@ -127,8 +127,7 @@ The design builds on these existing pieces:
   dotted values such as `ipsec.1`.
 - `TypeIdentity` stores provider, segments, and kind as structural axes; its
   dotted display is derived and is not source of truth.
-- `DslMap` owns API/DSL spelling conversion through `dsl_for`, `api_for`, and
-  the #3437 hash-specific `api_for_hash_feature`.
+- `DslMap` owns API/DSL spelling conversion through `dsl_for` and `api_for`.
 
 The proposed resolver should absorb namespace validation and value extraction as
 implementation details, consume `enum_parts` as schema input, and eventually
@@ -515,6 +514,10 @@ Provider config canonicalization is also represented as the
 `CanonicalizedProviderConfigs` typestate wrapper, so anonymous hash and
 anonymous-to-named rename code cannot be called with raw provider configs in
 normal builds.
+Resource canonicalization is represented by a `CanonicalizedResources` witness
+returned from `canonicalize_resources_with_schemas`, so the CLI
+`validate_and_resolve` path cannot call anonymous identity generation before
+resource enum leaves have been canonicalized.
 
 The cleanup makes several hazards unrepresentable or harder to write by
 accident:
@@ -529,10 +532,21 @@ accident:
 - anonymous hash features turn only `CanonicalEnumValue` into `EnumApiValue`;
   parser-surface enum text cannot be made canonical there by passing schema.
 
+Round-2 enforcement status:
+
+| Boundary | Enforcement |
+| --- | --- |
+| Hash feature rendering of enum API values | Compile-time: only `ConcreteValue::CanonicalEnum` renders as `EnumApiValue(...)`; raw enum text takes the deterministic fallback path. |
+| Provider config identity input | Compile-time at the seam: hash and rename detection require `CanonicalizedProviderConfigs`. The closure used to look up provider config attribute types is still a caller responsibility. |
+| Resource identity input in the CLI validation pipeline | Compile-time at the seam: `compute_anonymous_identifiers_with_ctx` requires `CanonicalizedResources`, which only `canonicalize_resources_with_schemas` returns. |
+| Raw/source text access | Convention: `RawEnumIdentifier::as_str()` remains for display, formatting, diagnostics, and explicit source-text comparisons. |
+| Unresolvable enum-like values | Runtime fallback: values that cannot be lifted to `CanonicalEnumValue` keep the deterministic representation rather than gaining inferred enum semantics. |
+
 The remaining convention is explicit rather than hidden: `as_str()` is a
-source/display API, not an identity API. Unresolvable enum-like values still use
-the deterministic fallback so invalid or unresolved inputs do not gain new
-semantic meaning during identity generation.
+source/display API, not an identity API. `DslMap::api_for` now covers the
+transform-bearing enum case that `api_for_hash_feature` handled during #3437;
+that is a public behavior change for provider repos that consume the shared
+schema API.
 
 This mirrors the #3371-style split: design first, core types second, consumers
 third, external repo follow-up fourth, cleanup last.
