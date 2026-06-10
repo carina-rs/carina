@@ -216,9 +216,17 @@ pub(crate) fn type_aware_equal(
                     Value::Concrete(ConcreteValue::CanonicalEnum(left)),
                     Value::Concrete(ConcreteValue::CanonicalEnum(right)),
                 ) = (a, b)
+                    && left == right
                 {
-                    return left == right;
+                    return true;
                 }
+                // `CanonicalEnumValue` equality remains identity-strict:
+                // `aws.Region.ap-northeast-1` and
+                // `awscc.Region.ap-northeast-1` are different typed values.
+                // Diffing answers a narrower question: would applying change
+                // provider API text? If strict equality fails, fall through to
+                // the canonical text comparison below so cross-provider export
+                // flows do not produce phantom updates.
                 let text = |v: &Value| -> Option<String> {
                     match v {
                         Value::Concrete(ConcreteValue::String(s)) => Some(s.clone()),
@@ -615,7 +623,7 @@ pub(super) fn find_changed_attributes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::DslTransform;
+    use crate::schema::{DslTransform, TypeIdentity};
 
     #[test]
     fn refined_string_to_dsl_transform_is_applied_before_comparison() {
@@ -631,6 +639,68 @@ mod tests {
         assert!(type_aware_equal(
             &state,
             &desired,
+            Some(&attr_type),
+            empty_defs_for_schema_walks(),
+            None,
+        ));
+    }
+
+    #[test]
+    fn canonical_enum_cross_identity_same_api_value_is_no_change() {
+        let attr_type = AttributeType::enum_(
+            TypeIdentity::new(Some("awscc"), Vec::<String>::new(), "Region"),
+            Some(vec!["ap-northeast-1".to_string()]),
+            Vec::new(),
+            None,
+            Some(DslTransform::HyphenToUnderscore),
+        );
+        let producer = Value::Concrete(ConcreteValue::CanonicalEnum(
+            crate::resource::CanonicalEnumValue::new_for_test(
+                TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),
+                "ap-northeast-1",
+            ),
+        ));
+        let consumer = Value::Concrete(ConcreteValue::CanonicalEnum(
+            crate::resource::CanonicalEnumValue::new_for_test(
+                TypeIdentity::new(Some("awscc"), Vec::<String>::new(), "Region"),
+                "ap-northeast-1",
+            ),
+        ));
+
+        assert!(type_aware_equal(
+            &producer,
+            &consumer,
+            Some(&attr_type),
+            empty_defs_for_schema_walks(),
+            None,
+        ));
+    }
+
+    #[test]
+    fn canonical_enum_cross_identity_different_api_value_is_change() {
+        let attr_type = AttributeType::enum_(
+            TypeIdentity::new(Some("awscc"), Vec::<String>::new(), "Region"),
+            Some(vec!["ap-northeast-1".to_string(), "us-east-1".to_string()]),
+            Vec::new(),
+            None,
+            Some(DslTransform::HyphenToUnderscore),
+        );
+        let producer = Value::Concrete(ConcreteValue::CanonicalEnum(
+            crate::resource::CanonicalEnumValue::new_for_test(
+                TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),
+                "ap-northeast-1",
+            ),
+        ));
+        let consumer = Value::Concrete(ConcreteValue::CanonicalEnum(
+            crate::resource::CanonicalEnumValue::new_for_test(
+                TypeIdentity::new(Some("awscc"), Vec::<String>::new(), "Region"),
+                "us-east-1",
+            ),
+        ));
+
+        assert!(!type_aware_equal(
+            &producer,
+            &consumer,
             Some(&attr_type),
             empty_defs_for_schema_walks(),
             None,
