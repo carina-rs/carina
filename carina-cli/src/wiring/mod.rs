@@ -461,10 +461,22 @@ pub fn apply_anonymous_to_named_renames(
                     let create_only_values = create_only_attrs
                         .iter()
                         .filter_map(|attr| {
-                            sr.attributes
-                                .get(*attr)
-                                .and_then(|v| v.as_str())
-                                .map(|s| (attr.to_string(), s.to_string()))
+                            let attribute_type = ctx
+                                .schemas()
+                                .get(
+                                    provider,
+                                    resource_type,
+                                    carina_core::schema::SchemaKind::Resource,
+                                )
+                                .and_then(|schema| schema.attributes.get(*attr))
+                                .map(|schema_attr| &schema_attr.attr_type);
+                            sr.attributes.get(*attr).and_then(|v| {
+                                identifier::canonical_create_only_state_json_string(
+                                    v,
+                                    attribute_type,
+                                )
+                                .map(|s| (attr.to_string(), s))
+                            })
                         })
                         .collect();
                     AnonymousIdStateInfo {
@@ -520,10 +532,22 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
                     let create_only_values = create_only_attrs
                         .iter()
                         .filter_map(|attr| {
-                            sr.attributes
-                                .get(*attr)
-                                .and_then(|v| v.as_str())
-                                .map(|s| (attr.to_string(), s.to_string()))
+                            let attribute_type = ctx
+                                .schemas()
+                                .get(
+                                    provider,
+                                    resource_type,
+                                    carina_core::schema::SchemaKind::Resource,
+                                )
+                                .and_then(|schema| schema.attributes.get(*attr))
+                                .map(|schema_attr| &schema_attr.attr_type);
+                            sr.attributes.get(*attr).and_then(|v| {
+                                identifier::canonical_create_only_state_json_string(
+                                    v,
+                                    attribute_type,
+                                )
+                                .map(|s| (attr.to_string(), s))
+                            })
                         })
                         .collect();
                     AnonymousIdStateInfo {

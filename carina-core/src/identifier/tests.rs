@@ -256,6 +256,80 @@ fn test_reconcile_anonymous_id_after_provider_namespace_change() {
 }
 
 #[test]
+fn test_reconcile_anonymous_id_after_nested_enum_create_only_hash_migration() {
+    let domain = eip_domain_type("awscc");
+    let schema = ResourceSchema::new("ec2.Eip")
+        .attribute(AttributeSchema::new("domains", AttributeType::list(domain)).create_only())
+        .attribute(AttributeSchema::new("public_ipv4_pool", AttributeType::string()).create_only());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
+    let providers = vec![provider_config("awscc", vec![])];
+    let identity_fn = |_: &str| -> Vec<String> { vec![] };
+
+    let make_old_resource = |pool: &str| {
+        let mut resource = Resource::with_provider("awscc", "ec2.Eip", "", None);
+        resource.set_attr(
+            "domains".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::enum_identifier("awscc.ec2.Eip.Domain.vpc".to_string()),
+            )])),
+        );
+        resource.set_attr(
+            "public_ipv4_pool".to_string(),
+            Value::Concrete(ConcreteValue::String(pool.to_string())),
+        );
+        resource
+    };
+    let make_new_resource = |pool: &str| {
+        let attr_type = eip_domain_type("aws");
+        let canonical = crate::resource::EnumValueResolver::new(&attr_type)
+            .resolve_raw(&crate::resource::RawEnumIdentifier::parse(
+                "aws.ec2.Eip.Domain.vpc",
+            ))
+            .unwrap();
+        let mut resource = Resource::with_provider("awscc", "ec2.Eip", "", None);
+        resource.set_attr(
+            "domains".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::CanonicalEnum(canonical),
+            )])),
+        );
+        resource.set_attr(
+            "public_ipv4_pool".to_string(),
+            Value::Concrete(ConcreteValue::String(pool.to_string())),
+        );
+        resource
+    };
+
+    let mut old_resources = vec![make_old_resource("pool-a")];
+    compute_anonymous_identifiers(&mut old_resources, &providers, &schemas, &identity_fn).unwrap();
+    let state_name = old_resources[0].id.name_str().to_string();
+
+    let mut desired_resources = vec![make_new_resource("pool-b")];
+    compute_anonymous_identifiers(&mut desired_resources, &providers, &schemas, &identity_fn)
+        .unwrap();
+    assert_ne!(state_name, desired_resources[0].id.name_str());
+
+    let state_entries = vec![AnonymousIdStateInfo {
+        name: state_name.clone(),
+        create_only_values: vec![
+            (
+                "domains".to_string(),
+                r#"List([EnumApiValue("vpc")])"#.to_string(),
+            ),
+            ("public_ipv4_pool".to_string(), "pool-a".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    }];
+    reconcile_anonymous_identifiers(&mut desired_resources, &schemas, &|_provider, _rt| {
+        state_entries.clone()
+    });
+
+    assert_eq!(desired_resources[0].id.name_str(), state_name);
+}
+
+#[test]
 fn test_reconcile_anonymous_id_mixed_string_and_enum_identifier_for_enum_attribute() {
     let schema = ResourceSchema::new("ec2.Subnet")
         .attribute(AttributeSchema::new("region", region_type("awscc")).create_only())

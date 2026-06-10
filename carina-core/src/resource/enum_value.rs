@@ -165,6 +165,20 @@ impl CanonicalEnumValue {
         &self.api_value
     }
 
+    /// Rebuild a canonical enum from Carina's trusted state JSON.
+    ///
+    /// This is intentionally not a general construction path: normal DSL and
+    /// provider-read inputs must go through [`EnumValueResolver`] so schema
+    /// membership and spelling rules stay centralized. State JSON already
+    /// persisted the resolved identity and API value, so round-trip decoding is
+    /// the sole resolver-gating exception.
+    pub(crate) fn from_trusted_state(identity: TypeIdentity, api_value: impl Into<String>) -> Self {
+        Self {
+            identity,
+            api_value: api_value.into(),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn new_for_test(identity: TypeIdentity, api_value: impl Into<String>) -> Self {
         Self {

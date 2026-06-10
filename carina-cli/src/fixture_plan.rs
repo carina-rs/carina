@@ -355,10 +355,74 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
 fn fixture_provider_factories(fixture_path: &Path) -> Vec<Box<dyn ProviderFactory>> {
     match fixture_path.file_name().and_then(|name| name.to_str()) {
         Some("dynamic_enum_az_no_diff") => vec![Box::new(DynamicEnumFixtureFactory)],
+        Some("enum_display") => vec![Box::new(EnumDisplayFixtureFactory)],
         Some("route53_hosted_zone_name_strip_suffix_no_diff") => {
             vec![Box::new(Route53HostedZoneFixtureFactory)]
         }
         _ => vec![],
+    }
+}
+
+struct EnumDisplayFixtureFactory;
+
+impl ProviderFactory for EnumDisplayFixtureFactory {
+    fn name(&self) -> &str {
+        "awscc"
+    }
+
+    fn display_name(&self) -> &str {
+        "AWS Cloud Control fixture provider"
+    }
+
+    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+        HashMap::from([(
+            "region".to_string(),
+            AttributeType::enum_(
+                TypeIdentity::new(Some("awscc"), Vec::<String>::new(), "Region"),
+                None,
+                vec![],
+                None,
+                Some(DslTransform::HyphenToUnderscore),
+            ),
+        )])
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &indexmap::IndexMap<String, Value>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
+        "ap-northeast-1".to_string()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _attributes: &indexmap::IndexMap<String, Value>,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
+    }
+
+    fn schemas(&self) -> Vec<ResourceSchema> {
+        let tenancy = AttributeType::enum_(
+            TypeIdentity::new(Some("awscc"), ["ec2", "Vpc"], "InstanceTenancy"),
+            Some(vec![
+                "default".to_string(),
+                "dedicated".to_string(),
+                "host".to_string(),
+            ]),
+            vec![],
+            None,
+            None,
+        );
+        vec![
+            ResourceSchema::new("ec2.Vpc")
+                .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).required())
+                .attribute(AttributeSchema::new("instance_tenancy", tenancy).required()),
+        ]
     }
 }
 

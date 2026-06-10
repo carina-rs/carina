@@ -22,7 +22,8 @@ use crate::commands::apply::{
 };
 use crate::commands::plan::{CurrentStateEntry, PlanFile};
 use crate::commands::shared::state_writeback::{
-    ApplyStateSave, FinalizeApplyInput, build_state_after_apply, queue_state_refresh,
+    ApplyStateSave, FinalizeApplyInput, PostApplyStates, build_state_after_apply,
+    queue_state_refresh,
 };
 use crate::commands::state::run_state_refresh_locked;
 use crate::wiring::{
@@ -2638,6 +2639,81 @@ fn build_state_after_apply_persists_write_only_attributes() {
     assert_eq!(
         saved_resource.attributes.get("cidr_block"),
         Some(&json!("10.0.0.0/16"))
+    );
+}
+
+#[test]
+fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
+    use carina_core::differ::create_plan;
+    use carina_core::resource::EnumValueResolver;
+    use carina_core::schema::{AttributeSchema, AttributeType, TypeIdentity};
+
+    let domain_type = AttributeType::enum_(
+        TypeIdentity::new(Some("aws"), ["ec2", "Eip"], "Domain"),
+        Some(vec!["vpc".to_string(), "standard".to_string()]),
+        Vec::new(),
+        None,
+        None,
+    );
+    let domain = EnumValueResolver::new(&domain_type)
+        .resolve_state_text("vpc")
+        .unwrap();
+    let mut resource = Resource::with_provider("aws", "ec2.Eip", "main", None);
+    resource.set_attr(
+        "domain".to_string(),
+        Value::Concrete(ConcreteValue::CanonicalEnum(domain)),
+    );
+    let id = resource.id.clone();
+    let applied_states = HashMap::from([(
+        id.clone(),
+        State::existing(
+            id,
+            HashMap::from([(
+                "allocation_id".to_string(),
+                Value::Concrete(ConcreteValue::String("eipalloc-123".to_string())),
+            )]),
+        ),
+    )]);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("ec2.Eip")
+            .attribute(AttributeSchema::new(
+                "allocation_id",
+                AttributeType::string(),
+            ))
+            .attribute(AttributeSchema::new("domain", domain_type).write_only()),
+    );
+
+    let saved = build_state_after_apply(ApplyStateSave {
+        state_file: None,
+        sorted_resources: &[resource.clone()],
+        current_states: &HashMap::new(),
+        applied_states: &applied_states,
+        permanent_name_overrides: &HashMap::new(),
+        plan: &Plan::new(),
+        successfully_deleted: &HashSet::new(),
+        failed_refreshes: &HashSet::new(),
+        schemas: &schemas,
+    })
+    .unwrap();
+    let reloaded = PostApplyStates::from_current_and_state(&HashMap::new(), &saved);
+
+    let plan = create_plan(
+        &[resource],
+        &[],
+        reloaded.as_map(),
+        &HashMap::new(),
+        &schemas,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &[],
+    );
+    assert!(
+        plan.effects().is_empty(),
+        "typed enum state JSON must reload as CanonicalEnum, got effects: {:?}",
+        plan.effects()
     );
 }
 

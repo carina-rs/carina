@@ -333,8 +333,50 @@ fn canonical_create_only_value_string(
         Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
             Some(format!("EnumApiValue({:?})", c.api_value()))
         }
+        Value::Concrete(ConcreteValue::List(items)) => {
+            let inner_type = attribute_type
+                .and_then(|attr| attr.shape_ref_free().ok())
+                .and_then(|shape| match shape {
+                    crate::schema::Shape::List { element_type, .. } => Some(element_type),
+                    _ => None,
+                });
+            let parts: Vec<String> = items
+                .iter()
+                .map(|item| canonical_create_only_feature_string(item, inner_type))
+                .collect();
+            Some(format!("List([{}])", parts.join(", ")))
+        }
+        Value::Concrete(ConcreteValue::Map(map)) => {
+            let value_type = attribute_type
+                .and_then(|attr| attr.shape_ref_free().ok())
+                .and_then(|shape| match shape {
+                    crate::schema::Shape::Map { value, .. } => Some(value),
+                    _ => None,
+                });
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by_key(|(key, _)| *key);
+            let parts: Vec<String> = entries
+                .iter()
+                .map(|(key, item)| {
+                    format!(
+                        "{:?}: {}",
+                        key,
+                        canonical_create_only_feature_string(item, value_type)
+                    )
+                })
+                .collect();
+            Some(format!("Map({{{}}})", parts.join(", ")))
+        }
         _ => None,
     }
+}
+
+fn canonical_create_only_feature_string(
+    value: &Value,
+    attribute_type: Option<&AttributeType>,
+) -> String {
+    canonical_create_only_value_string(value, attribute_type)
+        .unwrap_or_else(|| canonical_enum_feature_string(value, attribute_type))
 }
 
 fn canonical_create_only_text_string(
@@ -352,6 +394,21 @@ fn canonical_create_only_text_string(
     } else {
         canonical
     }
+}
+
+/// Convert a persisted state JSON create-only attribute into the same canonical
+/// feature string used for desired-side anonymous identifier reconciliation.
+///
+/// The JSON reader preserves typed enum objects as `CanonicalEnum` and ordinary
+/// legacy enum strings remain strings; `canonical_create_only_value_string`
+/// then applies schema-known List/Map/Enum normalization symmetrically.
+pub fn canonical_create_only_state_json_string(
+    value: &serde_json::Value,
+    attribute_type: Option<&AttributeType>,
+) -> Option<String> {
+    crate::value::json_to_dsl_value(value)
+        .as_ref()
+        .and_then(|value| canonical_create_only_value_string(value, attribute_type))
 }
 
 /// Maximum Hamming distance (out of 64 bits) for SimHash-based reconciliation.

@@ -9,7 +9,7 @@ use thiserror::Error;
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value,
 };
-use crate::schema::{AttrTypeKind, AttributeType};
+use crate::schema::{AttrTypeKind, AttributeType, TypeIdentity};
 use crate::utils::{convert_enum_value, extract_enum_value_with_values, is_dsl_enum_format};
 
 /// Where in the pipeline a `Value` is being serialized. Used so the
@@ -350,6 +350,9 @@ pub fn json_to_dsl_value(json: &serde_json::Value) -> Option<Value> {
             items.iter().filter_map(json_to_dsl_value).collect(),
         ))),
         serde_json::Value::Object(map) => {
+            if let Some(canonical) = json_to_canonical_enum(map) {
+                return Some(Value::Concrete(ConcreteValue::CanonicalEnum(canonical)));
+            }
             let m: IndexMap<_, _> = map
                 .iter()
                 .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
@@ -358,6 +361,43 @@ pub fn json_to_dsl_value(json: &serde_json::Value) -> Option<Value> {
         }
         serde_json::Value::Null => None,
     }
+}
+
+fn json_to_canonical_enum(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Option<CanonicalEnumValue> {
+    let serde_json::Value::Object(payload) = map.get("Enum")? else {
+        return None;
+    };
+    if map.len() != 1 {
+        return None;
+    }
+
+    let serde_json::Value::Object(identity) = payload.get("identity")? else {
+        return None;
+    };
+    let provider = match identity.get("provider")? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Null => None,
+        _ => return None,
+    };
+    let serde_json::Value::Array(segments) = identity.get("segments")? else {
+        return None;
+    };
+    let segments: Vec<String> = segments
+        .iter()
+        .map(|segment| match segment {
+            serde_json::Value::String(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let kind = identity.get("kind")?.as_str()?.to_string();
+    let api_value = payload.get("api_value")?.as_str()?.to_string();
+
+    Some(CanonicalEnumValue::from_trusted_state(
+        TypeIdentity::new(provider, segments, kind),
+        api_value,
+    ))
 }
 
 /// Format a `Value` for display
@@ -2555,6 +2595,19 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn json_to_dsl_value_round_trips_canonical_enum_typed_object() {
+        let v = Value::Concrete(ConcreteValue::CanonicalEnum(
+            crate::resource::CanonicalEnumValue::new_for_test(
+                crate::schema::TypeIdentity::new(Some("aws"), ["ec2", "Eip"], "Domain"),
+                "vpc",
+            ),
+        ));
+        let json = value_to_json(&v).unwrap();
+
+        assert_eq!(json_to_dsl_value(&json), Some(v));
     }
 
     #[test]
