@@ -442,6 +442,14 @@ pub fn apply_anonymous_to_named_renames(
         return Vec::new();
     };
 
+    let canonical_providers =
+        carina_core::value::canonicalize_provider_configs_with_attribute_types(
+            providers,
+            &|provider_name, attr_name| {
+                provider_config_attribute_type_for(ctx, provider_name, attr_name)
+            },
+        );
+
     let renames = identifier::detect_anonymous_to_named_renames(
         resources,
         ctx.schemas(),
@@ -461,21 +469,9 @@ pub fn apply_anonymous_to_named_renames(
                     let create_only_values = create_only_attrs
                         .iter()
                         .filter_map(|attr| {
-                            let attribute_type = ctx
-                                .schemas()
-                                .get(
-                                    provider,
-                                    resource_type,
-                                    carina_core::schema::SchemaKind::Resource,
-                                )
-                                .and_then(|schema| schema.attributes.get(*attr))
-                                .map(|schema_attr| &schema_attr.attr_type);
                             sr.attributes.get(*attr).and_then(|v| {
-                                identifier::canonical_create_only_state_json_string(
-                                    v,
-                                    attribute_type,
-                                )
-                                .map(|s| (attr.to_string(), s))
+                                identifier::canonical_create_only_state_json_string(v)
+                                    .map(|s| (attr.to_string(), s))
                             })
                         })
                         .collect();
@@ -486,7 +482,7 @@ pub fn apply_anonymous_to_named_renames(
                 })
                 .collect()
         },
-        providers,
+        &canonical_providers,
         &|name| identity_attributes_for_provider(ctx, name),
     );
 
@@ -532,21 +528,9 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
                     let create_only_values = create_only_attrs
                         .iter()
                         .filter_map(|attr| {
-                            let attribute_type = ctx
-                                .schemas()
-                                .get(
-                                    provider,
-                                    resource_type,
-                                    carina_core::schema::SchemaKind::Resource,
-                                )
-                                .and_then(|schema| schema.attributes.get(*attr))
-                                .map(|schema_attr| &schema_attr.attr_type);
                             sr.attributes.get(*attr).and_then(|v| {
-                                identifier::canonical_create_only_state_json_string(
-                                    v,
-                                    attribute_type,
-                                )
-                                .map(|s| (attr.to_string(), s))
+                                identifier::canonical_create_only_state_json_string(v)
+                                    .map(|s| (attr.to_string(), s))
                             })
                         })
                         .collect();
@@ -587,17 +571,22 @@ pub fn apply_provider_prefix_renames(renames: &[(String, String)], state_file: &
 
 pub fn compute_anonymous_identifiers_with_ctx(
     ctx: &WiringContext,
-    resources: &mut [Resource],
+    mut resources: carina_core::value::CanonicalizedResources<'_>,
     providers: &[ProviderConfig],
 ) -> Vec<AppError> {
-    match identifier::compute_anonymous_identifiers_with_provider_config_types(
-        resources,
-        providers,
+    let canonical_providers =
+        carina_core::value::canonicalize_provider_configs_with_attribute_types(
+            providers,
+            &|provider_name, attr_name| {
+                provider_config_attribute_type_for(ctx, provider_name, attr_name)
+            },
+        );
+
+    match identifier::compute_anonymous_identifiers_with_provider_configs(
+        resources.as_mut_slice(),
+        &canonical_providers,
         ctx.schemas(),
         &|name| identity_attributes_for_provider(ctx, name),
-        &|provider_name, attr_name| {
-            provider_config_attribute_type_for(ctx, provider_name, attr_name)
-        },
     ) {
         Ok(()) => Vec::new(),
         Err(msg) => vec![AppError::Config(msg)],
@@ -2790,7 +2779,9 @@ pub fn compute_anonymous_identifiers(
     providers: &[ProviderConfig],
 ) -> Result<(), AppError> {
     let ctx = WiringContext::new(vec![]);
-    let errors = compute_anonymous_identifiers_with_ctx(&ctx, resources, providers);
+    let canonical_resources =
+        carina_core::value::canonicalize_resources_with_schemas(resources, ctx.schemas());
+    let errors = compute_anonymous_identifiers_with_ctx(&ctx, canonical_resources, providers);
     if errors.is_empty() {
         Ok(())
     } else {

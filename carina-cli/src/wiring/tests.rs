@@ -823,10 +823,195 @@ fn dependency_chain_wrappers_return_vec_app_error() {
     let errors = resolve_attr_prefixes_with_ctx(&ctx, &mut resources);
     assert!(errors.is_empty(), "resolve_attr_prefixes: got {errors:?}");
 
-    let errors = compute_anonymous_identifiers_with_ctx(&ctx, &mut resources, &providers);
+    let canonical_resources =
+        carina_core::value::canonicalize_resources_with_schemas(&mut resources, ctx.schemas());
+    let errors = compute_anonymous_identifiers_with_ctx(&ctx, canonical_resources, &providers);
     assert!(
         errors.is_empty(),
         "compute_anonymous_identifiers: got {errors:?}",
+    );
+}
+
+struct RegionIdentityFactory;
+
+impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
+    fn name(&self) -> &str {
+        "awscc"
+    }
+
+    fn display_name(&self) -> &str {
+        "AWSCC region identity test provider"
+    }
+
+    fn provider_config_attribute_types(
+        &self,
+    ) -> HashMap<String, carina_core::schema::AttributeType> {
+        HashMap::from([(
+            "region".to_string(),
+            carina_core::schema::AttributeType::enum_(
+                carina_core::schema::TypeIdentity::new(
+                    Some("awscc"),
+                    Vec::<String>::new(),
+                    "Region",
+                ),
+                None,
+                Vec::new(),
+                None,
+                Some(carina_core::schema::DslTransform::HyphenToUnderscore),
+            ),
+        )])
+    }
+
+    fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+        "ap-northeast-1".to_string()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _attributes: &IndexMap<String, Value>,
+    ) -> carina_core::provider::BoxFuture<
+        '_,
+        carina_core::provider::ProviderResult<Box<dyn carina_core::provider::Provider>>,
+    > {
+        Box::pin(async {
+            Ok(Box::new(MockProvider::new()) as Box<dyn carina_core::provider::Provider>)
+        })
+    }
+
+    fn create_normalizer(
+        &self,
+        _binding: Option<&str>,
+        _attributes: &IndexMap<String, Value>,
+    ) -> carina_core::provider::BoxFuture<'_, Box<dyn carina_core::provider::ProviderNormalizer>>
+    {
+        Box::pin(async {
+            Box::new(carina_core::provider::NoopNormalizer)
+                as Box<dyn carina_core::provider::ProviderNormalizer>
+        })
+    }
+
+    fn schemas(&self) -> Vec<carina_core::schema::ResourceSchema> {
+        vec![
+            carina_core::schema::ResourceSchema::new("ec2.Route").attribute(
+                carina_core::schema::AttributeSchema::new(
+                    "route_table_id",
+                    carina_core::schema::AttributeType::string(),
+                ),
+            ),
+        ]
+    }
+
+    fn identity_attributes(&self) -> Vec<&str> {
+        vec!["region"]
+    }
+}
+
+fn region_identity_ctx() -> WiringContext {
+    WiringContext::new(vec![Box::new(RegionIdentityFactory)])
+}
+
+fn region_provider_config(raw_region: &str) -> ProviderConfig {
+    ProviderConfig {
+        name: "awscc".to_string(),
+        attributes: indexmap::indexmap! {
+            "region".to_string() => Value::Concrete(ConcreteValue::enum_identifier(raw_region)),
+        },
+        default_tags: IndexMap::new(),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
+    }
+}
+
+fn anonymous_route_resource() -> Resource {
+    let mut resource = Resource::with_provider("awscc", "ec2.Route", "", None);
+    resource.set_attr(
+        "route_table_id".to_string(),
+        Value::Concrete(ConcreteValue::String("rtb-123".to_string())),
+    );
+    resource
+}
+
+#[test]
+fn compute_anonymous_identifiers_with_ctx_canonicalizes_provider_config_identity_enums() {
+    let ctx = region_identity_ctx();
+    let providers_awscc = vec![region_provider_config("awscc.Region.ap_northeast_1")];
+    let providers_aws = vec![region_provider_config("aws.Region.ap_northeast_1")];
+
+    let mut resources_awscc = vec![anonymous_route_resource()];
+    let mut resources_aws = vec![anonymous_route_resource()];
+    let canonical_awscc = carina_core::value::canonicalize_resources_with_schemas(
+        &mut resources_awscc,
+        ctx.schemas(),
+    );
+    let errors = compute_anonymous_identifiers_with_ctx(&ctx, canonical_awscc, &providers_awscc);
+    assert!(errors.is_empty(), "awscc spelling errors: {errors:?}");
+    let canonical_aws =
+        carina_core::value::canonicalize_resources_with_schemas(&mut resources_aws, ctx.schemas());
+    let errors = compute_anonymous_identifiers_with_ctx(&ctx, canonical_aws, &providers_aws);
+    assert!(errors.is_empty(), "aws spelling errors: {errors:?}");
+
+    assert_eq!(
+        resources_awscc[0].id.name_str(),
+        resources_aws[0].id.name_str(),
+        "provider config region spelling must canonicalize before anonymous hash"
+    );
+}
+
+#[test]
+fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums() {
+    use carina_state::state::{ResourceState, StateFile};
+
+    let ctx = region_identity_ctx();
+    let providers_awscc = vec![region_provider_config("awscc.Region.ap_northeast_1")];
+    let providers_aws = vec![region_provider_config("aws.Region.ap_northeast_1")];
+
+    let mut anonymous = vec![anonymous_route_resource()];
+    let canonical_anonymous =
+        carina_core::value::canonicalize_resources_with_schemas(&mut anonymous, ctx.schemas());
+    let errors =
+        compute_anonymous_identifiers_with_ctx(&ctx, canonical_anonymous, &providers_awscc);
+    assert!(errors.is_empty(), "anonymous setup errors: {errors:?}");
+    let old_name = anonymous[0].id.name_str().to_string();
+
+    let mut named = anonymous_route_resource();
+    named.id = ResourceId::with_provider("awscc", "ec2.Route", "route", None);
+    named.binding = Some("route".to_string());
+    let resources = vec![named.clone()];
+
+    let mut state_file = StateFile::new();
+    state_file
+        .resources
+        .push(ResourceState::new("ec2.Route", &old_name, "awscc"));
+    let mut current_states = HashMap::new();
+    let mut prev_explicit = HashMap::new();
+    let mut saved_attrs = HashMap::new();
+
+    let renames = apply_anonymous_to_named_renames(
+        &ctx,
+        &resources,
+        &providers_aws,
+        &mut current_states,
+        &mut prev_explicit,
+        &mut saved_attrs,
+        &Some(state_file),
+    );
+
+    assert_eq!(
+        renames,
+        vec![(
+            ResourceId::with_provider("awscc", "ec2.Route", old_name, None),
+            named.id
+        )],
+        "provider config region spelling must canonicalize before rename simhash"
     );
 }
 

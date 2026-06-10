@@ -479,14 +479,17 @@ pub fn validate_and_resolve_errors_with_factories(
         }
     }
 
-    carina_core::value::canonicalize_resources_with_schemas(&mut parsed.resources, ctx.schemas());
+    let canonical_resources = carina_core::value::canonicalize_resources_with_schemas(
+        &mut parsed.resources,
+        ctx.schemas(),
+    );
 
     // Compute anonymous identifiers — downstream plan code assumes
     // every resource has a stable id, so a collision error must stop
     // the pipeline here.
     errors.extend(compute_anonymous_identifiers_with_ctx(
         &ctx,
-        &mut parsed.resources,
+        canonical_resources,
         &parsed.providers,
     ));
     if !errors.is_empty() {
@@ -858,6 +861,131 @@ exports {
             result.is_ok(),
             "skip_resource_validation=true must bypass upstream field check, got: {:?}",
             result.err()
+        );
+    }
+
+    struct ResourceCreateOnlyEnumFactory {
+        enum_provider: &'static str,
+    }
+
+    impl carina_core::provider::ProviderFactory for ResourceCreateOnlyEnumFactory {
+        fn name(&self) -> &str {
+            "awscc"
+        }
+
+        fn display_name(&self) -> &str {
+            "AWSCC resource create-only enum test provider"
+        }
+
+        fn provider_config_attribute_types(
+            &self,
+        ) -> HashMap<String, carina_core::schema::AttributeType> {
+            HashMap::new()
+        }
+
+        fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+            "ap-northeast-1".to_string()
+        }
+
+        fn create_provider(
+            &self,
+            _binding: Option<&str>,
+            _attributes: &IndexMap<String, Value>,
+        ) -> carina_core::provider::BoxFuture<
+            '_,
+            carina_core::provider::ProviderResult<Box<dyn carina_core::provider::Provider>>,
+        > {
+            Box::pin(async {
+                Ok(Box::new(carina_provider_mock::MockProvider::new())
+                    as Box<dyn carina_core::provider::Provider>)
+            })
+        }
+
+        fn create_normalizer(
+            &self,
+            _binding: Option<&str>,
+            _attributes: &IndexMap<String, Value>,
+        ) -> carina_core::provider::BoxFuture<'_, Box<dyn carina_core::provider::ProviderNormalizer>>
+        {
+            Box::pin(async {
+                Box::new(carina_core::provider::NoopNormalizer)
+                    as Box<dyn carina_core::provider::ProviderNormalizer>
+            })
+        }
+
+        fn schemas(&self) -> Vec<carina_core::schema::ResourceSchema> {
+            vec![
+                carina_core::schema::ResourceSchema::new("ec2.Subnet").attribute(
+                    carina_core::schema::AttributeSchema::new(
+                        "placement_region",
+                        carina_core::schema::AttributeType::enum_(
+                            carina_core::schema::TypeIdentity::new(
+                                Some(self.enum_provider),
+                                Vec::<String>::new(),
+                                "Region",
+                            ),
+                            None,
+                            Vec::new(),
+                            None,
+                            Some(carina_core::schema::DslTransform::HyphenToUnderscore),
+                        ),
+                    )
+                    .create_only(),
+                ),
+            ]
+        }
+    }
+
+    fn resource_create_only_enum_file(raw_region: &str) -> carina_core::parser::InferredFile {
+        let mut resource =
+            carina_core::resource::Resource::with_provider("awscc", "ec2.Subnet", "", None);
+        resource.set_attr(
+            "placement_region".to_string(),
+            Value::Concrete(ConcreteValue::enum_identifier(raw_region)),
+        );
+
+        carina_core::parser::InferredFile {
+            resources: vec![resource],
+            ..carina_core::parser::InferredFile::default()
+        }
+    }
+
+    #[test]
+    fn validate_and_resolve_canonicalizes_resource_create_only_enums_before_anonymous_hash() {
+        let base_dir = tempfile::tempdir().unwrap();
+        let mut awscc = resource_create_only_enum_file("awscc.Region.ap_northeast_1");
+        let mut aws = resource_create_only_enum_file("aws.Region.ap_northeast_1");
+
+        let errors = validate_and_resolve_errors_with_factories(
+            &mut awscc,
+            base_dir.path(),
+            false,
+            vec![Box::new(ResourceCreateOnlyEnumFactory {
+                enum_provider: "awscc",
+            })],
+            HashMap::new(),
+        );
+        assert!(errors.is_empty(), "awscc spelling errors: {errors:?}");
+
+        let errors = validate_and_resolve_errors_with_factories(
+            &mut aws,
+            base_dir.path(),
+            false,
+            vec![Box::new(ResourceCreateOnlyEnumFactory {
+                enum_provider: "aws",
+            })],
+            HashMap::new(),
+        );
+        assert!(errors.is_empty(), "aws spelling errors: {errors:?}");
+
+        assert_eq!(
+            awscc.resources[0].id.name_str(),
+            aws.resources[0].id.name_str(),
+            "resource create-only enum spelling must canonicalize before anonymous hash"
         );
     }
 }

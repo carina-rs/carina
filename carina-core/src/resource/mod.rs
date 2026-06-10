@@ -715,9 +715,10 @@ impl<'a> ConcreteValueRef<'a> {
 }
 
 impl ConcreteValue {
-    /// TODO(carina#3438): remove in chain PR 5.
-    /// Temporary constructor for call sites that still build parser-surface
-    /// enum identifiers from string text.
+    /// Build a parser-surface enum identifier from source/display text.
+    ///
+    /// This is a raw-value convenience API for parsers and tests. Durable
+    /// identity comparisons must use schema-resolved `CanonicalEnum` values.
     pub fn enum_identifier(text: impl Into<String>) -> Self {
         Self::EnumIdentifier(RawEnumIdentifier::parse(text))
     }
@@ -893,7 +894,7 @@ impl PartialEq for Value {
             (
                 Value::Concrete(ConcreteValue::String(a)),
                 Value::Concrete(ConcreteValue::EnumIdentifier(b)),
-            ) => a == b,
+            ) => a == b.as_str(),
             (
                 Value::Concrete(ConcreteValue::CanonicalEnum(a)),
                 Value::Concrete(ConcreteValue::CanonicalEnum(b)),

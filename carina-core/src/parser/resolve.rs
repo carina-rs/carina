@@ -498,7 +498,7 @@ fn collect_reference_roots(
             // fallback (`EnumIdentifier("B.attr")`) both appear before the parser
             // classifies the RHS as a binding ref or resource ref.
             push_root(name.as_str(), variables, structural, roots);
-            if let Some((root, _)) = name.split_once('.') {
+            if let Some((root, _)) = name.as_str().split_once('.') {
                 push_root(root, variables, structural, roots);
             }
         }

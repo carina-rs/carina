@@ -1444,6 +1444,21 @@ pub(crate) fn canonicalize_with_type(
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> Value {
+    canonicalize_with_type_for_enum_phase(value, attr_type, defs, EnumIdentifierPhase::RawDsl)
+}
+
+#[derive(Clone, Copy)]
+enum EnumIdentifierPhase {
+    RawDsl,
+    StateText,
+}
+
+fn canonicalize_with_type_for_enum_phase(
+    value: Value,
+    attr_type: &AttributeType,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+    enum_identifier_phase: EnumIdentifierPhase,
+) -> Value {
     let unwrapped = peel_custom(attr_type);
     if is_string_or_list_of_strings(unwrapped) {
         return canonicalize_to_string_list(value);
@@ -1464,14 +1479,21 @@ pub(crate) fn canonicalize_with_type(
         ) => {
             let canonicalized = items
                 .into_iter()
-                .map(|v| canonicalize_with_type(v, inner, defs))
+                .map(|v| {
+                    canonicalize_with_type_for_enum_phase(v, inner, defs, enum_identifier_phase)
+                })
                 .collect();
             Value::Concrete(ConcreteValue::List(canonicalized))
         }
         (Value::Concrete(ConcreteValue::Map(map)), crate::schema::Shape::Map { value: vt, .. }) => {
             let canonicalized = map
                 .into_iter()
-                .map(|(k, v)| (k, canonicalize_with_type(v, vt, defs)))
+                .map(|(k, v)| {
+                    (
+                        k,
+                        canonicalize_with_type_for_enum_phase(v, vt, defs, enum_identifier_phase),
+                    )
+                })
                 .collect();
             Value::Concrete(ConcreteValue::Map(canonicalized))
         }
@@ -1486,7 +1508,12 @@ pub(crate) fn canonicalize_with_type(
                         .find(|f| f.name == k || f.provider_name.as_deref() == Some(k.as_str()))
                         .map(|f| &f.field_type);
                     let canon = match field_type {
-                        Some(ft) => canonicalize_with_type(v, ft, defs),
+                        Some(ft) => canonicalize_with_type_for_enum_phase(
+                            v,
+                            ft,
+                            defs,
+                            enum_identifier_phase,
+                        ),
                         None => v,
                     };
                     (k, canon)
@@ -1495,7 +1522,12 @@ pub(crate) fn canonicalize_with_type(
             Value::Concrete(ConcreteValue::Map(canonicalized))
         }
         (Value::Deferred(DeferredValue::Secret(inner)), _) => Value::Deferred(
-            DeferredValue::Secret(Box::new(canonicalize_with_type(*inner, attr_type, defs))),
+            DeferredValue::Secret(Box::new(canonicalize_with_type_for_enum_phase(
+                *inner,
+                attr_type,
+                defs,
+                enum_identifier_phase,
+            ))),
         ),
         // Enum must not fall through to the `(v, _) => v` wildcard.
         // That is the same failure mode as carina#3080's Union gap:
@@ -1504,10 +1536,15 @@ pub(crate) fn canonicalize_with_type(
         (val, crate::schema::Shape::Enum { .. }) => {
             let resolver = crate::resource::EnumValueResolver::with_defs(unwrapped, defs);
             match val {
-                Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => resolver
-                    .resolve_raw(&raw)
-                    .map(|c| Value::Concrete(ConcreteValue::CanonicalEnum(c)))
-                    .unwrap_or_else(|_| Value::Concrete(ConcreteValue::EnumIdentifier(raw))),
+                Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
+                    let resolved = match enum_identifier_phase {
+                        EnumIdentifierPhase::RawDsl => resolver.resolve_raw(&raw),
+                        EnumIdentifierPhase::StateText => resolver.resolve_state_text(raw.as_str()),
+                    };
+                    resolved
+                        .map(|c| Value::Concrete(ConcreteValue::CanonicalEnum(c)))
+                        .unwrap_or_else(|_| Value::Concrete(ConcreteValue::EnumIdentifier(raw)))
+                }
                 Value::Concrete(ConcreteValue::String(s)) => resolver
                     .resolve_state_text(&s)
                     .map(|c| Value::Concrete(ConcreteValue::CanonicalEnum(c)))
@@ -1534,7 +1571,9 @@ pub(crate) fn canonicalize_with_type(
             let members = crate::schema::union_members_with_defs(unwrapped, defs)
                 .expect("Shape::Union must expose union members internally");
             match crate::schema::select_union_member(members, &val) {
-                Some(member) => canonicalize_with_type(val, member, defs),
+                Some(member) => {
+                    canonicalize_with_type_for_enum_phase(val, member, defs, enum_identifier_phase)
+                }
                 None => val,
             }
         }
@@ -1569,6 +1608,23 @@ fn canonicalize_to_string_list(value: Value) -> Value {
     }
 }
 
+/// Witness holding an exclusive borrow of resources canonicalized
+/// against a specific schema registry.
+///
+/// The only producer is [`canonicalize_resources_with_schemas`]. While
+/// the witness is alive, callers cannot mutate the underlying resources
+/// through another borrow, so identity code can require this type as
+/// evidence that the canonicalize pass already ran.
+pub struct CanonicalizedResources<'a> {
+    resources: &'a mut [crate::resource::Resource],
+}
+
+impl<'a> CanonicalizedResources<'a> {
+    pub fn as_mut_slice(&mut self) -> &mut [crate::resource::Resource] {
+        self.resources
+    }
+}
+
 /// Walk every resource's attributes, canonicalizing values whose
 /// declared schema type is `Union[String, list(String)]` into
 /// `Value::Concrete(ConcreteValue::StringList)`. Resources whose schema is not in the registry
@@ -1578,10 +1634,10 @@ fn canonicalize_to_string_list(value: Value) -> Value {
 /// Call this once after `resolver::resolve_refs_*` and before the
 /// differ runs, so every `Resource` flowing into the plan / state /
 /// provider boundary carries the canonical shape. See #2481, #2511.
-pub fn canonicalize_resources_with_schemas(
-    resources: &mut [crate::resource::Resource],
+pub fn canonicalize_resources_with_schemas<'a>(
+    resources: &'a mut [crate::resource::Resource],
     registry: &crate::schema::SchemaRegistry,
-) {
+) -> CanonicalizedResources<'a> {
     for resource in resources.iter_mut() {
         let Some(schema) = registry.get_for(resource) else {
             continue;
@@ -1598,6 +1654,58 @@ pub fn canonicalize_resources_with_schemas(
         }
         resource.attributes = new_attrs;
     }
+
+    CanonicalizedResources { resources }
+}
+
+type ProviderConfigAttributeTypeFn<'a> = dyn Fn(&str, &str) -> Option<AttributeType> + 'a;
+
+/// Provider configs whose schema-known attributes have been canonicalized.
+///
+/// Durable identity code accepts this wrapper rather than raw
+/// `ProviderConfig` slices, so callers cannot skip provider config enum
+/// canonicalization at the hash seam.
+#[derive(Debug, Clone)]
+pub struct CanonicalizedProviderConfigs {
+    providers: Vec<crate::parser::ProviderConfig>,
+}
+
+impl CanonicalizedProviderConfigs {
+    pub fn as_slice(&self) -> &[crate::parser::ProviderConfig] {
+        &self.providers
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_configs_for_test(providers: Vec<crate::parser::ProviderConfig>) -> Self {
+        Self { providers }
+    }
+}
+
+fn canonicalize_provider_config_with_type(value: Value, attr_type: &AttributeType) -> Value {
+    let defs = crate::schema::empty_defs_for_schema_walks();
+    canonicalize_with_type_for_enum_phase(value, attr_type, defs, EnumIdentifierPhase::StateText)
+}
+
+/// Walk every provider config's attributes, canonicalizing enum-typed leaves
+/// such as provider identity `region` before those values feed durable
+/// identity hashing.
+pub fn canonicalize_provider_configs_with_attribute_types(
+    providers: &[crate::parser::ProviderConfig],
+    provider_config_attribute_type_fn: &ProviderConfigAttributeTypeFn<'_>,
+) -> CanonicalizedProviderConfigs {
+    let mut providers = providers.to_vec();
+    for provider in providers.iter_mut() {
+        let mut new_attrs = indexmap::IndexMap::new();
+        for (key, value) in std::mem::take(&mut provider.attributes) {
+            let canon = match provider_config_attribute_type_fn(&provider.name, &key) {
+                Some(attr_type) => canonicalize_provider_config_with_type(value, &attr_type),
+                None => value,
+            };
+            new_attrs.insert(key, canon);
+        }
+        provider.attributes = new_attrs;
+    }
+    CanonicalizedProviderConfigs { providers }
 }
 
 /// [`DataSource`](crate::resource::DataSource) counterpart of
@@ -2682,6 +2790,70 @@ mod tests {
             map.get("primary").unwrap(),
             Value::Concrete(ConcreteValue::CanonicalEnum(c)) if c.api_value() == "vpc"
         ));
+    }
+
+    #[test]
+    fn canonicalize_provider_configs_replaces_region_enum_with_canonical_api_value() {
+        use crate::parser::ProviderConfig;
+        use crate::schema::{AttributeType, DslTransform, TypeIdentity};
+
+        let providers = vec![
+            ProviderConfig {
+                name: "aws".to_string(),
+                attributes: indexmap::indexmap! {
+                    "region".to_string() => Value::Concrete(ConcreteValue::enum_identifier(
+                        "aws.Region.ap_northeast_1",
+                    )),
+                },
+                default_tags: indexmap::IndexMap::new(),
+                source: None,
+                version: None,
+                revision: None,
+                unresolved_attributes: indexmap::IndexMap::new(),
+                binding: None,
+                is_default: true,
+            },
+            ProviderConfig {
+                name: "awscc".to_string(),
+                attributes: indexmap::indexmap! {
+                    "region".to_string() => Value::Concrete(ConcreteValue::enum_identifier(
+                        "awscc.Region.ap_northeast_1",
+                    )),
+                },
+                default_tags: indexmap::IndexMap::new(),
+                source: None,
+                version: None,
+                revision: None,
+                unresolved_attributes: indexmap::IndexMap::new(),
+                binding: None,
+                is_default: true,
+            },
+        ];
+
+        let providers =
+            canonicalize_provider_configs_with_attribute_types(&providers, &|provider, attr| {
+                (attr == "region").then(|| {
+                    AttributeType::enum_(
+                        TypeIdentity::new(Some(provider), Vec::<String>::new(), "Region"),
+                        None,
+                        Vec::new(),
+                        None,
+                        Some(DslTransform::HyphenToUnderscore),
+                    )
+                })
+            });
+
+        let api_values: Vec<_> = providers
+            .as_slice()
+            .iter()
+            .map(
+                |provider| match provider.attributes.get("region").unwrap() {
+                    Value::Concrete(ConcreteValue::CanonicalEnum(c)) => c.api_value().to_string(),
+                    other => panic!("expected CanonicalEnum, got {other:?}"),
+                },
+            )
+            .collect();
+        assert_eq!(api_values, ["ap-northeast-1", "ap-northeast-1"]);
     }
 
     #[test]

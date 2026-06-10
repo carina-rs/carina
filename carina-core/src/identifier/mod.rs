@@ -5,11 +5,12 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+#[cfg(test)]
 use crate::parser::ProviderConfig;
 use crate::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, Value};
-use crate::schema::{AttributeType, ResourceSchema, SchemaRegistry};
-use crate::utils::{extract_enum_value_with_values, validate_enum_namespace};
+use crate::schema::SchemaRegistry;
 use crate::validation::is_string_compatible_type;
+use crate::value::CanonicalizedProviderConfigs;
 
 /// Generate a random 8-character lowercase hex suffix using UUID v4.
 pub fn generate_random_suffix() -> String {
@@ -237,132 +238,27 @@ fn deterministic_value_string(value: &Value) -> String {
     }
 }
 
-fn enum_identifier_segments_match(
-    raw: &str,
-    attribute_type: &AttributeType,
-    allow_dotted_value: bool,
-) -> bool {
-    let Some((identity, _, _, _, _)) = attribute_type.enum_parts() else {
-        return false;
-    };
-    if !raw.contains('.') {
-        return true;
-    }
-
-    let parts: Vec<&str> = raw.split('.').collect();
-    let Some(kind_idx) = parts.iter().position(|part| *part == identity.kind) else {
-        return false;
-    };
-    if kind_idx + 1 >= parts.len() {
-        return false;
-    }
-    if !allow_dotted_value && parts.len() != kind_idx + 2 {
-        return false;
-    }
-
-    if !identity.segments.is_empty() {
-        let prefix = &parts[..kind_idx];
-        if prefix.len() < identity.segments.len() {
-            return false;
-        }
-        let segment_start = prefix.len() - identity.segments.len();
-        if !prefix[segment_start..]
-            .iter()
-            .copied()
-            .eq(identity.segments.iter().map(String::as_str))
-        {
-            return false;
-        }
-    }
-
-    validate_enum_namespace(raw, identity).is_ok()
-        || parts
-            .get(kind_idx)
-            .is_some_and(|kind| *kind == identity.kind)
-}
-
-/// Return the anonymous-hash feature string for a schema-known enum value.
-///
-/// Only parser-surface `EnumIdentifier` values are canonicalized. All other
-/// values deliberately keep the legacy deterministic representation so deferred
-/// bindings and non-enum hash inputs do not change.
-pub(crate) fn canonical_enum_feature_string(
-    value: &Value,
-    attribute_type: Option<&AttributeType>,
-) -> String {
-    if let Value::Concrete(ConcreteValue::CanonicalEnum(c)) = value {
-        return format!("EnumApiValue({:?})", c.api_value());
-    }
-    let Some(attribute_type) = attribute_type else {
-        return deterministic_value_string(value);
-    };
-    let Value::Concrete(ConcreteValue::EnumIdentifier(raw)) = value else {
-        return deterministic_value_string(value);
-    };
-    let Some((_identity, values, _aliases, _validate, dsl_map)) = attribute_type.enum_parts()
-    else {
-        return deterministic_value_string(value);
-    };
-    if !enum_identifier_segments_match(raw.as_str(), attribute_type, values.is_some()) {
-        return deterministic_value_string(value);
-    }
-
-    let valid_values: Vec<&str> = values.into_iter().flatten().map(String::as_str).collect();
-    let variant = extract_enum_value_with_values(raw.as_str(), &valid_values);
-    let api_value = dsl_map.api_for_hash_feature(variant);
-    if let Some(values) = values
-        && !values.iter().any(|v| v == &api_value)
-    {
-        return deterministic_value_string(value);
-    }
-
-    format!("EnumApiValue({:?})", api_value)
-}
-
-fn canonical_create_only_value_string(
-    value: &Value,
-    attribute_type: Option<&AttributeType>,
-) -> Option<String> {
+fn canonical_create_only_value_string(value: &Value) -> Option<String> {
     match value {
-        Value::Concrete(ConcreteValue::String(s)) => {
-            Some(canonical_create_only_text_string(s, attribute_type))
-        }
-        Value::Concrete(ConcreteValue::EnumIdentifier(_)) => {
-            Some(canonical_enum_feature_string(value, attribute_type))
-        }
+        Value::Concrete(ConcreteValue::String(s)) => Some(s.to_string()),
+        Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => Some(raw.as_str().to_string()),
         Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
             Some(format!("EnumApiValue({:?})", c.api_value()))
         }
         Value::Concrete(ConcreteValue::List(items)) => {
-            let inner_type = attribute_type
-                .and_then(|attr| attr.shape_ref_free().ok())
-                .and_then(|shape| match shape {
-                    crate::schema::Shape::List { element_type, .. } => Some(element_type),
-                    _ => None,
-                });
             let parts: Vec<String> = items
                 .iter()
-                .map(|item| canonical_create_only_feature_string(item, inner_type))
+                .map(canonical_create_only_feature_string)
                 .collect();
             Some(format!("List([{}])", parts.join(", ")))
         }
         Value::Concrete(ConcreteValue::Map(map)) => {
-            let value_type = attribute_type
-                .and_then(|attr| attr.shape_ref_free().ok())
-                .and_then(|shape| match shape {
-                    crate::schema::Shape::Map { value, .. } => Some(value),
-                    _ => None,
-                });
             let mut entries: Vec<(&String, &Value)> = map.iter().collect();
             entries.sort_by_key(|(key, _)| *key);
             let parts: Vec<String> = entries
                 .iter()
                 .map(|(key, item)| {
-                    format!(
-                        "{:?}: {}",
-                        key,
-                        canonical_create_only_feature_string(item, value_type)
-                    )
+                    format!("{:?}: {}", key, canonical_create_only_feature_string(item))
                 })
                 .collect();
             Some(format!("Map({{{}}})", parts.join(", ")))
@@ -371,44 +267,19 @@ fn canonical_create_only_value_string(
     }
 }
 
-fn canonical_create_only_feature_string(
-    value: &Value,
-    attribute_type: Option<&AttributeType>,
-) -> String {
-    canonical_create_only_value_string(value, attribute_type)
-        .unwrap_or_else(|| canonical_enum_feature_string(value, attribute_type))
-}
-
-fn canonical_create_only_text_string(
-    value: &str,
-    attribute_type: Option<&AttributeType>,
-) -> String {
-    if attribute_type.and_then(AttributeType::enum_parts).is_none() {
-        return value.to_string();
-    }
-
-    let enum_value = Value::Concrete(ConcreteValue::enum_identifier(value.to_string()));
-    let canonical = canonical_enum_feature_string(&enum_value, attribute_type);
-    if canonical == deterministic_value_string(&enum_value) {
-        value.to_string()
-    } else {
-        canonical
-    }
+fn canonical_create_only_feature_string(value: &Value) -> String {
+    canonical_create_only_value_string(value).unwrap_or_else(|| deterministic_value_string(value))
 }
 
 /// Convert a persisted state JSON create-only attribute into the same canonical
 /// feature string used for desired-side anonymous identifier reconciliation.
 ///
-/// The JSON reader preserves typed enum objects as `CanonicalEnum` and ordinary
-/// legacy enum strings remain strings; `canonical_create_only_value_string`
-/// then applies schema-known List/Map/Enum normalization symmetrically.
-pub fn canonical_create_only_state_json_string(
-    value: &serde_json::Value,
-    attribute_type: Option<&AttributeType>,
-) -> Option<String> {
+/// The JSON reader preserves typed enum objects as `CanonicalEnum`; ordinary
+/// legacy enum strings remain strings and are not schema-resolved here.
+pub fn canonical_create_only_state_json_string(value: &serde_json::Value) -> Option<String> {
     crate::value::json_to_dsl_value(value)
         .as_ref()
-        .and_then(|value| canonical_create_only_value_string(value, attribute_type))
+        .and_then(canonical_create_only_value_string)
 }
 
 /// Maximum Hamming distance (out of 64 bits) for SimHash-based reconciliation.
@@ -458,26 +329,22 @@ pub(crate) fn flatten_value_for_simhash(
     prefix: &str,
     value: &Value,
     out: &mut std::collections::BTreeMap<String, String>,
-    attribute_type: Option<&AttributeType>,
 ) {
     match value {
         Value::Concrete(ConcreteValue::Map(map)) => {
             for (k, v) in map {
                 let key = format!("{}.{}", prefix, k);
-                flatten_value_for_simhash(&key, v, out, None);
+                flatten_value_for_simhash(&key, v, out);
             }
         }
         Value::Concrete(ConcreteValue::List(items)) => {
             for (i, item) in items.iter().enumerate() {
                 let key = format!("{}[{}]", prefix, i);
-                flatten_value_for_simhash(&key, item, out, None);
+                flatten_value_for_simhash(&key, item, out);
             }
         }
         _ => {
-            out.insert(
-                prefix.to_string(),
-                canonical_enum_feature_string(value, attribute_type),
-            );
+            out.insert(prefix.to_string(), deterministic_value_string(value));
         }
     }
 }
@@ -531,40 +398,39 @@ pub(crate) fn extract_hash_from_identifier(identifier: &str) -> Option<u64> {
 /// Build a SimHash over the combined set of provider identity values plus
 /// a resource's user-specified attributes (non-`_`-prefixed, flattened).
 ///
-/// This is the shared feature set used by both `compute_anonymous_identifiers`
+/// This is the shared feature set used by both anonymous identifier computation
 /// (when the schema has no create-only attributes) and `compute_resource_simhash`
 /// so the two always agree on what a resource's anonymous ID would be.
 fn simhash_from_identity_and_resource(
     identity_values: &BTreeMap<String, String>,
     resource: &Resource,
-    schema: Option<&ResourceSchema>,
 ) -> u64 {
     let mut simhash_values = identity_values.clone();
     for (key, value) in &resource.attributes {
         if key.starts_with('_') {
             continue;
         }
-        let attribute_type = schema
-            .and_then(|schema| schema.attributes.get(key))
-            .map(|attr| &attr.attr_type);
-        flatten_value_for_simhash(key, value, &mut simhash_values, attribute_type);
+        flatten_value_for_simhash(key, value, &mut simhash_values);
     }
     compute_simhash(&simhash_values)
 }
 
-/// Compute the SimHash `compute_anonymous_identifiers` would produce for a
+/// Compute the SimHash anonymous identifier generation would produce for a
 /// single resource. Used by `detect_anonymous_to_named_renames` to recover the
 /// anonymous ID of a resource that has since been wrapped in a `let` binding.
 fn compute_resource_simhash(
     resource: &Resource,
-    providers: &[ProviderConfig],
-    registry: &SchemaRegistry,
+    providers: &CanonicalizedProviderConfigs,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
 ) -> u64 {
     let mut identity_values: BTreeMap<String, String> = BTreeMap::new();
     if !resource.id.provider.is_empty() {
         let identity_attrs = identity_attributes_fn(&resource.id.provider);
-        if let Some(pc) = providers.iter().find(|p| p.name == resource.id.provider) {
+        if let Some(pc) = providers
+            .as_slice()
+            .iter()
+            .find(|p| p.name == resource.id.provider)
+        {
             for attr_name in &identity_attrs {
                 if let Some(value) = pc.attributes.get(attr_name.as_str()) {
                     identity_values.insert(attr_name.clone(), deterministic_value_string(value));
@@ -573,37 +439,35 @@ fn compute_resource_simhash(
         }
     }
 
-    simhash_from_identity_and_resource(&identity_values, resource, registry.get_for(resource))
+    simhash_from_identity_and_resource(&identity_values, resource)
 }
 
-type ProviderConfigAttributeTypeFn<'a> = dyn Fn(&str, &str) -> Option<AttributeType> + 'a;
+#[cfg(test)]
+pub fn compute_anonymous_identifiers_for_test(
+    resources: &mut [Resource],
+    providers: &[ProviderConfig],
+    registry: &SchemaRegistry,
+    identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
+) -> Result<(), String> {
+    let providers = CanonicalizedProviderConfigs::from_configs_for_test(providers.to_vec());
+    compute_anonymous_identifiers_with_provider_configs(
+        resources,
+        &providers,
+        registry,
+        identity_attributes_fn,
+    )
+}
 
 /// Compute stable identifiers for anonymous resources (those with empty ResourceId.name).
 /// Uses create-only properties and provider identity attributes to generate a deterministic hash.
 ///
 /// `identity_attributes_fn` takes a provider name and returns the list of identity attribute names
 /// for that provider (e.g., `["region"]`).
-pub fn compute_anonymous_identifiers(
+pub fn compute_anonymous_identifiers_with_provider_configs(
     resources: &mut [Resource],
-    providers: &[ProviderConfig],
+    providers: &CanonicalizedProviderConfigs,
     registry: &SchemaRegistry,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
-) -> Result<(), String> {
-    compute_anonymous_identifiers_with_provider_config_types(
-        resources,
-        providers,
-        registry,
-        identity_attributes_fn,
-        &|_, _| None,
-    )
-}
-
-pub fn compute_anonymous_identifiers_with_provider_config_types(
-    resources: &mut [Resource],
-    providers: &[ProviderConfig],
-    registry: &SchemaRegistry,
-    identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
-    provider_config_attribute_type_fn: &ProviderConfigAttributeTypeFn<'_>,
 ) -> Result<(), String> {
     use std::collections::BTreeMap;
     use std::hash::{Hash, Hasher};
@@ -632,15 +496,14 @@ pub fn compute_anonymous_identifiers_with_provider_config_types(
         // Collect identity attribute values (e.g., region) from provider config
         let mut identity_values: BTreeMap<String, String> = BTreeMap::new();
         let identity_attrs = identity_attributes_fn(provider_name);
-        if let Some(pc) = providers.iter().find(|p| p.name == *provider_name) {
+        if let Some(pc) = providers
+            .as_slice()
+            .iter()
+            .find(|p| p.name == *provider_name)
+        {
             for attr_name in &identity_attrs {
                 if let Some(value) = pc.attributes.get(attr_name.as_str()) {
-                    let attribute_type =
-                        provider_config_attribute_type_fn(provider_name, attr_name);
-                    identity_values.insert(
-                        attr_name.clone(),
-                        canonical_enum_feature_string(value, attribute_type.as_ref()),
-                    );
+                    identity_values.insert(attr_name.clone(), deterministic_value_string(value));
                 }
             }
         }
@@ -658,14 +521,7 @@ pub fn compute_anonymous_identifiers_with_provider_config_types(
                 // Use the prefix for hashing to produce a stable identifier
                 hash_values.insert(attr_name, format!("Prefix({:?})", prefix));
             } else if let Some(value) = resource.get_attr(attr_name) {
-                let attribute_type = schema
-                    .attributes
-                    .get(*attr_name)
-                    .map(|attr| &attr.attr_type);
-                hash_values.insert(
-                    attr_name,
-                    canonical_enum_feature_string(value, attribute_type),
-                );
+                hash_values.insert(attr_name, deterministic_value_string(value));
             }
         }
         // Also include schema-level identity attributes in the hash.
@@ -675,14 +531,7 @@ pub fn compute_anonymous_identifiers_with_provider_config_types(
             if !hash_values.contains_key(attr_name)
                 && let Some(value) = resource.get_attr(attr_name)
             {
-                let attribute_type = schema
-                    .attributes
-                    .get(*attr_name)
-                    .map(|attr| &attr.attr_type);
-                hash_values.insert(
-                    attr_name,
-                    canonical_enum_feature_string(value, attribute_type),
-                );
+                hash_values.insert(attr_name, deterministic_value_string(value));
             }
         }
 
@@ -691,8 +540,7 @@ pub fn compute_anonymous_identifiers_with_provider_config_types(
         let hash_str = if use_simhash {
             // Use SimHash for locality-sensitive hashing: similar inputs produce
             // similar hashes, enabling Hamming distance reconciliation.
-            let simhash =
-                simhash_from_identity_and_resource(&identity_values, resource, Some(schema));
+            let simhash = simhash_from_identity_and_resource(&identity_values, resource);
             format!("{:016x}", simhash)
         } else {
             // Use standard hash for create-only properties
@@ -771,6 +619,22 @@ pub fn compute_anonymous_identifiers_with_provider_config_types(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+pub fn compute_anonymous_identifiers_with_provider_configs_for_test(
+    resources: &mut [Resource],
+    providers: &[ProviderConfig],
+    registry: &SchemaRegistry,
+    identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
+) -> Result<(), String> {
+    let providers = CanonicalizedProviderConfigs::from_configs_for_test(providers.to_vec());
+    compute_anonymous_identifiers_with_provider_configs(
+        resources,
+        &providers,
+        registry,
+        identity_attributes_fn,
+    )
 }
 
 /// State information needed for anonymous identifier reconciliation.
@@ -853,14 +717,10 @@ pub fn reconcile_anonymous_identifiers(
         // Collect this resource's create-only values
         let mut resource_co_values: HashMap<&str, String> = HashMap::new();
         for attr_name in &create_only_attrs {
-            if let Some(value) = resource.get_attr(attr_name) {
-                let attribute_type = schema
-                    .attributes
-                    .get(*attr_name)
-                    .map(|attr| &attr.attr_type);
-                if let Some(value) = canonical_create_only_value_string(value, attribute_type) {
-                    resource_co_values.insert(attr_name, value);
-                }
+            if let Some(value) = resource.get_attr(attr_name)
+                && let Some(value) = canonical_create_only_value_string(value)
+            {
+                resource_co_values.insert(attr_name, value);
             }
         }
 
@@ -940,9 +800,7 @@ pub fn reconcile_anonymous_identifiers(
             let mut mismatched = 0;
             for (attr, value) in &resource_co_values {
                 if let Some(state_value) = entry.create_only_values.get(*attr) {
-                    let attribute_type = schema.attributes.get(*attr).map(|attr| &attr.attr_type);
-                    let state_value =
-                        canonical_create_only_text_string(state_value, attribute_type);
+                    let state_value = state_value.to_string();
                     if &state_value == value {
                         matched += 1;
                     } else {
@@ -1012,7 +870,7 @@ pub fn detect_anonymous_to_named_renames(
     resources: &[Resource],
     registry: &SchemaRegistry,
     find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
-    providers: &[ProviderConfig],
+    providers: &CanonicalizedProviderConfigs,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
 ) -> Vec<(ResourceId, ResourceId)> {
     // Collect the set of resource names currently used in the DSL per
@@ -1099,7 +957,7 @@ pub fn detect_anonymous_to_named_renames(
             // SimHash fallback (rule 4 in the function doc). Pick the orphan
             // entry closest to the computed SimHash; tie → ambiguous, skip.
             let resource_hash =
-                compute_resource_simhash(resource, providers, registry, identity_attributes_fn);
+                compute_resource_simhash(resource, providers, identity_attributes_fn);
             let candidates = state_entries
                 .iter()
                 .filter(|e| !used_in_dsl.contains(&e.name))
@@ -1126,6 +984,24 @@ pub fn detect_anonymous_to_named_renames(
     }
 
     renames
+}
+
+#[cfg(test)]
+pub fn detect_anonymous_to_named_renames_for_test(
+    resources: &[Resource],
+    registry: &SchemaRegistry,
+    find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
+    providers: &[ProviderConfig],
+    identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
+) -> Vec<(ResourceId, ResourceId)> {
+    let providers = CanonicalizedProviderConfigs::from_configs_for_test(providers.to_vec());
+    detect_anonymous_to_named_renames(
+        resources,
+        registry,
+        find_state_by_type,
+        &providers,
+        identity_attributes_fn,
+    )
 }
 
 #[cfg(test)]
