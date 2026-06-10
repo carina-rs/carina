@@ -238,8 +238,15 @@ impl<'a> EnumValueResolver<'a> {
     ) -> Result<CanonicalEnumValue, TypeError> {
         let (identity, values, dsl_aliases, validate, dsl_map) = self.parts()?;
         let valid: Vec<&str> = values.into_iter().flatten().map(String::as_str).collect();
+        let prefix_escaped_value = if phase == EnumInputPhase::RawDsl {
+            raw_dsl_prefix_escaped_value(text, identity, values)
+        } else {
+            None
+        };
         let direct_match = valid.iter().any(|v| enum_value_matches(text, v));
-        let variant = if phase == EnumInputPhase::StateText && values.is_none() {
+        let variant = if let Some(value) = prefix_escaped_value {
+            value.to_string()
+        } else if phase == EnumInputPhase::StateText && values.is_none() {
             state_text_open_enum_value(text, identity)
         } else if direct_match {
             text.to_string()
@@ -249,6 +256,7 @@ impl<'a> EnumValueResolver<'a> {
 
         if phase == EnumInputPhase::RawDsl
             && !direct_match
+            && prefix_escaped_value.is_none()
             && let Err(message) = validate_enum_namespace(text, identity)
         {
             return Err(TypeError::ValidationFailed {
@@ -278,10 +286,16 @@ impl<'a> EnumValueResolver<'a> {
         };
 
         let enumerated = values.is_some();
-        let matched_value = values
+        let exact_value = values
             .into_iter()
             .flatten()
-            .find(|v| enum_value_matches(&api_value, v));
+            .find(|v| v.as_str() == api_value);
+        let matched_value = exact_value.or_else(|| {
+            values
+                .into_iter()
+                .flatten()
+                .find(|v| enum_value_matches(&api_value, v))
+        });
         let valid_value = matched_value.is_some();
         let api_value = matched_value.map_or(api_value, Clone::clone);
         // NOTE(carina#3438 PR3): validate receives the bare api_value here; the legacy
@@ -309,6 +323,20 @@ impl<'a> EnumValueResolver<'a> {
             ))
         }
     }
+}
+
+fn raw_dsl_prefix_escaped_value<'a>(
+    text: &str,
+    identity: &TypeIdentity,
+    values: Option<&'a [String]>,
+) -> Option<&'a str> {
+    let namespace = identity.dotted_prefix()?;
+    let expected_prefix = format!("{}.{}.", namespace, identity.kind);
+    let tail = text.strip_prefix(&expected_prefix)?;
+    values?
+        .iter()
+        .map(String::as_str)
+        .find(|value| *value == tail)
 }
 
 fn state_text_open_enum_value(text: &str, identity: &TypeIdentity) -> String {
@@ -495,6 +523,10 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(canonical.api_value(), "Allow");
+        let bare_alias = EnumValueResolver::new(&effect)
+            .resolve_raw(&RawEnumIdentifier::parse("allow"))
+            .unwrap();
+        assert_eq!(bare_alias.api_value(), "Allow");
     }
 
     #[test]
@@ -527,6 +559,22 @@ mod tests {
             .resolve_state_text("ap_northeast_1")
             .unwrap();
         assert_eq!(canonical.api_value(), "ap-northeast-1");
+    }
+
+    #[test]
+    fn resolve_text_keeps_exact_member_before_fuzzy_sibling() {
+        let attr = AttributeType::enum_(
+            enum_identity("Example", Some("aws")),
+            Some(vec!["foo-bar".to_string(), "foo_bar".to_string()]),
+            vec![],
+            None,
+            None,
+        );
+
+        let canonical = EnumValueResolver::new(&attr)
+            .resolve_state_text("foo_bar")
+            .unwrap();
+        assert_eq!(canonical.api_value(), "foo_bar");
     }
 
     #[test]
@@ -567,6 +615,31 @@ mod tests {
                 .api_value(),
             "ipsec.1"
         );
+        assert_eq!(
+            resolver
+                .resolve_state_text("aws.ec2.vpn_gateway.Type.ipsec.1")
+                .unwrap()
+                .api_value(),
+            "ipsec.1"
+        );
+    }
+
+    #[test]
+    fn resolve_raw_accepts_fully_qualified_dotted_value_member() {
+        let attr = AttributeType::enum_(
+            enum_identity("Type", Some("awscc.ec2.vpn_gateway")),
+            Some(vec!["ipsec.1".to_string()]),
+            vec![],
+            None,
+            None,
+        );
+
+        let canonical = EnumValueResolver::new(&attr)
+            .resolve_raw(&RawEnumIdentifier::parse(
+                "awscc.ec2.vpn_gateway.Type.ipsec.1",
+            ))
+            .unwrap();
+        assert_eq!(canonical.api_value(), "ipsec.1");
     }
 
     #[test]
