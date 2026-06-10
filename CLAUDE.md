@@ -267,10 +267,6 @@ testing only `carina-core` would miss downstream regressions; **(2) unknown
 path** — a new top-level directory or unclassified file is treated as
 workspace-wide until the helper learns about it.
 
-For rigorous transitive impact analysis ("which crates' *tests* are affected
-when I change a function in `carina-core`?"), use dagayn's `get_impact_radius`,
-which walks the call graph rather than relying on the directory mapping.
-
 ## Plan Display Testing
 
 When modifying plan display code (`display.rs`, `carina-tui`), use fixture-based testing:
@@ -721,9 +717,7 @@ High-value patterns in this repo:
 - **Blast-radius investigation before a typed reshape.** When deciding
   whether a newtype/typestate reshape lands in-PR or as a follow-up,
   fan out readers across the affected crates to enumerate every call site
-  in parallel. Prefer dagayn's `get_impact_radius` first; escalate to a
-  workflow only when the graph result is ambiguous or needs source-level
-  confirmation at many sites.
+  in parallel.
 - **Multi-repo checks.** pick-issue / meta-tracker work that must scan
   all three carina-rs repos — one agent per repo, then synthesize.
 - **Adversarial self-review.** The 5-round self-review can be structured
@@ -741,43 +735,3 @@ Constraints specific to this repo:
   to avoid clobbering each other; read-only finders do not need it.
 - Have agents return structured output (the `schema` option) rather
   than prose when you will post-process their results.
-
----
-
-# Part 6 — Tooling
-
-## MCP Tools: dagayn
-
-<!-- dagayn MCP tools -->
-
-**This project has a knowledge graph. ALWAYS use the dagayn MCP tools
-BEFORE Grep/Glob/Read to explore the codebase** — the graph is faster,
-cheaper, and gives structural context (callers, dependents, test coverage)
-that file scanning cannot. The full tool surface, the FIRST-choice tool
-table, the drill-down table, and the recommended workflow live in the
-global `~/.claude/CLAUDE.md` "MCP Tools: dagayn" section — follow that.
-The short version for this repo:
-
-- Start any new task with `get_minimal_context(task=...)`.
-- Review changes with `detect_changes` (read its `analysis_summary` first);
-  pull source snippets with `get_review_context`.
-- Trace relationships with `query_graph` (callers_of / callees_of /
-  imports_of / tests_for); check coverage with pattern="tests_for" before
-  claiming a path is untested.
-- Understand blast radius with `get_impact_radius`; architecture with
-  `get_architecture_overview` (read `architecture_health` first).
-- Fall back to Grep/Glob/Read only when the graph result is missing, stale,
-  ambiguous, or lacks the exact source text needed.
-
-## Markdown documentation policy
-
-<!-- dagayn markdown policy -->
-
-The full policy — declaring inter-section / inter-document dependencies as
-`<!-- <kind> <target> -->` directive comments so dagayn captures
-`DEPENDS_ON` / `IMPORTS_FROM` edges — is defined in the global
-`~/.claude/CLAUDE.md` "Markdown documentation policy" section and applies
-verbatim here. In brief: `<kind>` ∈ {`constrained-by`, `blocked-by`,
-`supersedes`, `derived-from`}; targets are `#section-slug`,
-`./path.md`, or `./path.md#slug`; place the directive immediately under the
-heading that depends on the target; do not invent dependencies.
