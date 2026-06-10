@@ -239,10 +239,12 @@ impl<'a> EnumValueResolver<'a> {
         let (identity, values, dsl_aliases, validate, dsl_map) = self.parts()?;
         let valid: Vec<&str> = values.into_iter().flatten().map(String::as_str).collect();
         let direct_match = valid.iter().any(|v| enum_value_matches(text, v));
-        let variant = if direct_match {
-            text
+        let variant = if phase == EnumInputPhase::StateText && values.is_none() {
+            state_text_open_enum_value(text, identity)
+        } else if direct_match {
+            text.to_string()
         } else {
-            extract_enum_value_with_values(text, &valid)
+            extract_enum_value_with_values(text, &valid).to_string()
         };
 
         if phase == EnumInputPhase::RawDsl
@@ -254,7 +256,7 @@ impl<'a> EnumValueResolver<'a> {
             });
         }
 
-        if phase == EnumInputPhase::RawDsl && api_spelling_rejected_in_dsl(variant, dsl_aliases) {
+        if phase == EnumInputPhase::RawDsl && api_spelling_rejected_in_dsl(&variant, dsl_aliases) {
             return Err(invalid_enum_variant(
                 text,
                 identity,
@@ -265,29 +267,32 @@ impl<'a> EnumValueResolver<'a> {
         }
 
         let api_value = match phase {
-            EnumInputPhase::RawDsl => dsl_map.api_for_hash_feature(variant),
+            EnumInputPhase::RawDsl => dsl_map.api_for_hash_feature(&variant),
             EnumInputPhase::StateText => {
                 if valid.contains(&text) {
                     text.to_string()
                 } else {
-                    dsl_map.api_for_hash_feature(variant)
+                    dsl_map.api_for_hash_feature(&variant)
                 }
             }
         };
 
         let enumerated = values.is_some();
-        let valid_value = values
+        let matched_value = values
             .into_iter()
             .flatten()
-            .any(|v| enum_value_matches(&api_value, v));
+            .find(|v| enum_value_matches(&api_value, v));
+        let valid_value = matched_value.is_some();
+        let api_value = matched_value.map_or(api_value, Clone::clone);
+        // NOTE(carina#3438 PR3): validate receives the bare api_value here; the legacy
+        // validate_enum path passes the expanded namespaced text. Verify provider
+        // validators accept both before swapping consumers.
         let validation_result = validate.map(|validate| {
             validate(&crate::resource::Value::Concrete(
                 crate::resource::ConcreteValue::String(api_value.clone()),
             ))
         });
-        let validation_ok = validation_result
-            .as_ref()
-            .map_or(!enumerated, Result::is_ok);
+        let validation_ok = !enumerated && validation_result.as_ref().is_none_or(Result::is_ok);
 
         if valid_value || validation_ok {
             Ok(CanonicalEnumValue::new_resolved(
@@ -303,6 +308,19 @@ impl<'a> EnumValueResolver<'a> {
                 dsl_map,
             ))
         }
+    }
+}
+
+fn state_text_open_enum_value(text: &str, identity: &TypeIdentity) -> String {
+    match RawEnumIdentifier::parse(text).parsed() {
+        RawEnumIdentifierParts::TypeQualified { type_name, value }
+        | RawEnumIdentifierParts::ProviderQualified {
+            type_name, value, ..
+        }
+        | RawEnumIdentifierParts::FullyQualified {
+            type_name, value, ..
+        } if type_name == &identity.kind => value.clone(),
+        _ => text.to_string(),
     }
 }
 
@@ -373,7 +391,7 @@ fn expected_variants(
 mod tests {
     use super::*;
     use crate::resource::ConcreteValue;
-    use crate::schema::{DslTransform, enum_identity};
+    use crate::schema::{DslTransform, enum_identity, validator};
 
     #[test]
     fn raw_parse_classifies_identifier_shapes() {
@@ -410,6 +428,28 @@ mod tests {
         assert_eq!(
             RawEnumIdentifier::parse("some.random.string").parsed(),
             &RawEnumIdentifierParts::Unclassified
+        );
+    }
+
+    #[test]
+    fn raw_parse_preserves_pre_existing_namespaced_id_edge_semantics() {
+        // These shapes come from NamespacedId's pre-existing parser semantics.
+        assert_eq!(
+            RawEnumIdentifier::parse("").parsed(),
+            &RawEnumIdentifierParts::Bare {
+                value: String::new()
+            }
+        );
+        assert_eq!(
+            RawEnumIdentifier::parse("...").parsed(),
+            &RawEnumIdentifierParts::Unclassified
+        );
+        assert_eq!(
+            RawEnumIdentifier::parse("A.").parsed(),
+            &RawEnumIdentifierParts::TypeQualified {
+                type_name: "A".to_string(),
+                value: String::new()
+            }
         );
     }
 
@@ -455,6 +495,112 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(canonical.api_value(), "Allow");
+    }
+
+    #[test]
+    fn resolve_text_normalizes_fuzzy_matches_to_values_list_entry() {
+        let effect = AttributeType::enum_(
+            enum_identity("Effect", Some("aws.iam.PolicyDocument")),
+            Some(vec!["Allow".to_string()]),
+            vec![("Allow".to_string(), "allow".to_string())],
+            None,
+            None,
+        );
+        let resolver = EnumValueResolver::new(&effect);
+        let state = resolver.resolve_state_text("ALLOW").unwrap();
+        let raw = resolver
+            .resolve_raw(&RawEnumIdentifier::parse(
+                "aws.iam.PolicyDocument.Effect.allow",
+            ))
+            .unwrap();
+        assert_eq!(state, raw);
+        assert_eq!(state.api_value(), "Allow");
+
+        let region = AttributeType::enum_(
+            enum_identity("Region", Some("aws")),
+            Some(vec!["ap-northeast-1".to_string()]),
+            vec![],
+            None,
+            None,
+        );
+        let canonical = EnumValueResolver::new(&region)
+            .resolve_state_text("ap_northeast_1")
+            .unwrap();
+        assert_eq!(canonical.api_value(), "ap-northeast-1");
+    }
+
+    #[test]
+    fn resolve_text_does_not_allow_validator_to_override_enumerated_values() {
+        let attr = AttributeType::enum_(
+            enum_identity("Example", Some("aws")),
+            Some(vec!["a".to_string()]),
+            vec![],
+            Some(validator(|_| Ok(()))),
+            None,
+        );
+
+        assert!(matches!(
+            EnumValueResolver::new(&attr).resolve_state_text("zzz"),
+            Err(TypeError::InvalidEnumVariant { .. })
+        ));
+    }
+
+    #[test]
+    fn resolve_state_text_open_enum_preserves_dotted_values() {
+        let open = AttributeType::enum_(
+            enum_identity("Type", Some("awscc.ec2.vpn_gateway")),
+            None,
+            vec![],
+            None,
+            None,
+        );
+        let resolver = EnumValueResolver::new(&open);
+
+        assert_eq!(
+            resolver.resolve_state_text("ipsec.1").unwrap().api_value(),
+            "ipsec.1"
+        );
+        assert_eq!(
+            resolver
+                .resolve_state_text("awscc.ec2.vpn_gateway.Type.ipsec.1")
+                .unwrap()
+                .api_value(),
+            "ipsec.1"
+        );
+    }
+
+    #[test]
+    fn resolve_text_open_enum_validator_parity() {
+        let open = AttributeType::enum_(
+            enum_identity("Dynamic", Some("aws")),
+            None,
+            vec![],
+            None,
+            None,
+        );
+        assert_eq!(
+            EnumValueResolver::new(&open)
+                .resolve_state_text("whatever")
+                .unwrap()
+                .api_value(),
+            "whatever"
+        );
+
+        let rejected = AttributeType::enum_(
+            enum_identity("Dynamic", Some("aws")),
+            None,
+            vec![],
+            Some(validator(|_| {
+                Err(TypeError::ValidationFailed {
+                    message: "no".to_string(),
+                })
+            })),
+            None,
+        );
+        assert!(matches!(
+            EnumValueResolver::new(&rejected).resolve_state_text("whatever"),
+            Err(TypeError::InvalidEnumVariant { .. })
+        ));
     }
 
     #[test]
