@@ -479,6 +479,8 @@ pub fn validate_and_resolve_errors_with_factories(
         }
     }
 
+    carina_core::value::canonicalize_resources_with_schemas(&mut parsed.resources, ctx.schemas());
+
     // Compute anonymous identifiers — downstream plan code assumes
     // every resource has a stable id, so a collision error must stop
     // the pipeline here.

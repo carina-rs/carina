@@ -6,8 +6,10 @@ use argon2::Argon2;
 use indexmap::IndexMap;
 use thiserror::Error;
 
-use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value};
-use crate::schema::{AttrTypeKind, AttributeType};
+use crate::resource::{
+    CanonicalEnumValue, ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value,
+};
+use crate::schema::{AttrTypeKind, AttributeType, TypeIdentity};
 use crate::utils::{convert_enum_value, extract_enum_value_with_values, is_dsl_enum_format};
 
 /// Where in the pipeline a `Value` is being serialized. Used so the
@@ -231,10 +233,7 @@ pub fn value_to_json_with_context(
         Value::Concrete(ConcreteValue::EnumIdentifier(s)) => {
             Ok(serde_json::Value::String(s.to_string()))
         }
-        Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
-            // TODO(carina#3438): PR3 — state-facing serialization must use the typed enum object per design doc §Serialization; this flat string is a dormant placeholder.
-            Ok(serde_json::Value::String(c.api_value().to_string()))
-        }
+        Value::Concrete(ConcreteValue::CanonicalEnum(c)) => Ok(canonical_enum_to_json(c)),
         Value::Concrete(ConcreteValue::Int(n)) => Ok(serde_json::Value::Number((*n).into())),
         Value::Concrete(ConcreteValue::Duration(d)) => {
             Ok(serde_json::Value::Number((d.as_secs() as i64).into()))
@@ -315,6 +314,20 @@ pub fn value_to_json_with_context(
     }
 }
 
+pub fn canonical_enum_to_json(c: &CanonicalEnumValue) -> serde_json::Value {
+    let identity = c.identity();
+    serde_json::json!({
+        "Enum": {
+            "identity": {
+                "provider": identity.provider.clone(),
+                "segments": identity.segments.clone(),
+                "kind": identity.kind.clone(),
+            },
+            "api_value": c.api_value(),
+        }
+    })
+}
+
 /// Convert `serde_json::Value` to DSL `Value`.
 ///
 /// Returns `None` for JSON null, since null represents a missing/unset value
@@ -337,6 +350,9 @@ pub fn json_to_dsl_value(json: &serde_json::Value) -> Option<Value> {
             items.iter().filter_map(json_to_dsl_value).collect(),
         ))),
         serde_json::Value::Object(map) => {
+            if let Some(canonical) = json_to_canonical_enum(map) {
+                return Some(Value::Concrete(ConcreteValue::CanonicalEnum(canonical)));
+            }
             let m: IndexMap<_, _> = map
                 .iter()
                 .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
@@ -345,6 +361,43 @@ pub fn json_to_dsl_value(json: &serde_json::Value) -> Option<Value> {
         }
         serde_json::Value::Null => None,
     }
+}
+
+fn json_to_canonical_enum(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Option<CanonicalEnumValue> {
+    let serde_json::Value::Object(payload) = map.get("Enum")? else {
+        return None;
+    };
+    if map.len() != 1 {
+        return None;
+    }
+
+    let serde_json::Value::Object(identity) = payload.get("identity")? else {
+        return None;
+    };
+    let provider = match identity.get("provider")? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Null => None,
+        _ => return None,
+    };
+    let serde_json::Value::Array(segments) = identity.get("segments")? else {
+        return None;
+    };
+    let segments: Vec<String> = segments
+        .iter()
+        .map(|segment| match segment {
+            serde_json::Value::String(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let kind = identity.get("kind")?.as_str()?.to_string();
+    let api_value = payload.get("api_value")?.as_str()?.to_string();
+
+    Some(CanonicalEnumValue::from_trusted_state(
+        TypeIdentity::new(provider, segments, kind),
+        api_value,
+    ))
 }
 
 /// Format a `Value` for display
@@ -1449,10 +1502,19 @@ pub(crate) fn canonicalize_with_type(
         // the ranker/canonicalizer path looked correct for other
         // branches while this leaf silently skipped normalization.
         (val, crate::schema::Shape::Enum { .. }) => {
-            // Thread `defs` here too to preserve the invariant for every
-            // `canonicalize_with_type` arm, even though the resolved Enum
-            // leaf itself does not contain a Ref.
-            crate::utils::lift_enum_leaves_with_defs(&val, unwrapped, defs).unwrap_or(val)
+            let resolver = crate::resource::EnumValueResolver::with_defs(unwrapped, defs);
+            match val {
+                Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => resolver
+                    .resolve_raw(&raw)
+                    .map(|c| Value::Concrete(ConcreteValue::CanonicalEnum(c)))
+                    .unwrap_or_else(|_| Value::Concrete(ConcreteValue::EnumIdentifier(raw))),
+                Value::Concrete(ConcreteValue::String(s)) => resolver
+                    .resolve_state_text(&s)
+                    .map(|c| Value::Concrete(ConcreteValue::CanonicalEnum(c)))
+                    .unwrap_or_else(|_| Value::Concrete(ConcreteValue::String(s))),
+                Value::Concrete(ConcreteValue::CanonicalEnum(_)) => val,
+                other => other,
+            }
         }
         // Union: the missing nesting kind (List/Map/Struct/Secret
         // already recurse; Union was the lone gap — carina#3080).
@@ -2509,6 +2571,117 @@ mod tests {
             ),
         ));
         assert_eq!(format_value(&v), "ap-northeast-1");
+    }
+
+    #[test]
+    fn value_to_json_serializes_canonical_enum_as_typed_object() {
+        let v = Value::Concrete(ConcreteValue::CanonicalEnum(
+            crate::resource::CanonicalEnumValue::new_for_test(
+                crate::schema::TypeIdentity::new(Some("aws"), ["ec2", "Eip"], "Domain"),
+                "vpc",
+            ),
+        ));
+
+        assert_eq!(
+            value_to_json(&v).unwrap(),
+            serde_json::json!({
+                "Enum": {
+                    "identity": {
+                        "provider": "aws",
+                        "segments": ["ec2", "Eip"],
+                        "kind": "Domain"
+                    },
+                    "api_value": "vpc"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn json_to_dsl_value_round_trips_canonical_enum_typed_object() {
+        let v = Value::Concrete(ConcreteValue::CanonicalEnum(
+            crate::resource::CanonicalEnumValue::new_for_test(
+                crate::schema::TypeIdentity::new(Some("aws"), ["ec2", "Eip"], "Domain"),
+                "vpc",
+            ),
+        ));
+        let json = value_to_json(&v).unwrap();
+
+        assert_eq!(json_to_dsl_value(&json), Some(v));
+    }
+
+    #[test]
+    fn canonicalize_resources_with_schemas_replaces_enum_leaves_recursively() {
+        use crate::schema::{
+            AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, TypeIdentity,
+        };
+
+        let domain = AttributeType::enum_(
+            TypeIdentity::new(Some("aws"), ["ec2", "Eip"], "Domain"),
+            Some(vec!["vpc".to_string(), "standard".to_string()]),
+            Vec::new(),
+            None,
+            None,
+        );
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "aws",
+            ResourceSchema::new("ec2.Eip")
+                .attribute(AttributeSchema::new("domain", domain.clone()))
+                .attribute(AttributeSchema::new(
+                    "domains",
+                    AttributeType::list(domain.clone()),
+                ))
+                .attribute(AttributeSchema::new(
+                    "domain_by_name",
+                    AttributeType::map(domain),
+                )),
+        );
+        let mut resource = crate::resource::Resource::with_provider("aws", "ec2.Eip", "eip", None);
+        resource.set_attr(
+            "domain",
+            Value::Concrete(ConcreteValue::enum_identifier("aws.ec2.Eip.Domain.vpc")),
+        );
+        resource.set_attr(
+            "domains",
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::enum_identifier("aws.ec2.Eip.Domain.standard"),
+            )])),
+        );
+        resource.set_attr(
+            "domain_by_name",
+            Value::Concrete(ConcreteValue::Map(indexmap::indexmap! {
+                "primary".to_string() => Value::Concrete(ConcreteValue::enum_identifier("aws.ec2.Eip.Domain.vpc")),
+            })),
+        );
+        let mut resources = vec![resource];
+
+        canonicalize_resources_with_schemas(&mut resources, &registry);
+
+        let domain = resources[0].attributes.get("domain").unwrap();
+        match domain {
+            Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
+                assert_eq!(c.api_value(), "vpc");
+                assert_eq!(c.identity().to_string(), "aws.ec2.Eip.Domain");
+            }
+            other => panic!("expected CanonicalEnum, got {other:?}"),
+        }
+        let domains = resources[0].attributes.get("domains").unwrap();
+        let Value::Concrete(ConcreteValue::List(items)) = domains else {
+            panic!("expected list, got {domains:?}");
+        };
+        assert!(matches!(
+            &items[0],
+            Value::Concrete(ConcreteValue::CanonicalEnum(c)) if c.api_value() == "standard"
+        ));
+        let map = resources[0].attributes.get("domain_by_name").unwrap();
+        let Value::Concrete(ConcreteValue::Map(map)) = map else {
+            panic!("expected map, got {map:?}");
+        };
+        assert!(matches!(
+            map.get("primary").unwrap(),
+            Value::Concrete(ConcreteValue::CanonicalEnum(c)) if c.api_value() == "vpc"
+        ));
     }
 
     #[test]
@@ -3695,7 +3868,7 @@ mod tests {
     }
 
     #[test]
-    fn canonicalize_enum_lifts_state_string_to_dsl_identifier() {
+    fn canonicalize_enum_lifts_state_string_to_canonical_enum() {
         let t = AttributeType::enum_(
             crate::schema::enum_identity("Effect", Some("aws.iam.PolicyDocument")),
             Some(vec!["Allow".to_string(), "Deny".to_string()]),
@@ -3708,12 +3881,13 @@ mod tests {
         );
         let v = Value::Concrete(ConcreteValue::String("Allow".to_string()));
         let canon = canonicalize_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
-        assert_eq!(
-            canon,
-            Value::Concrete(ConcreteValue::enum_identifier(
-                "aws.iam.PolicyDocument.Effect.allow".to_string()
-            ))
-        );
+        match canon {
+            Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
+                assert_eq!(c.identity().to_string(), "aws.iam.PolicyDocument.Effect");
+                assert_eq!(c.api_value(), "Allow");
+            }
+            other => panic!("expected CanonicalEnum, got {other:?}"),
+        }
     }
 
     #[test]

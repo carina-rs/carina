@@ -167,7 +167,7 @@ fn deterministic_value_string(value: &Value) -> String {
             format!("EnumIdentifier({:?})", s.as_str())
         }
         Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
-            format!("CanonicalEnum({:?}, {:?})", c.identity(), c.api_value())
+            format!("EnumApiValue({:?})", c.api_value())
         }
         Value::Concrete(ConcreteValue::Int(i)) => format!("Int({})", i),
         Value::Concrete(ConcreteValue::Float(f)) => format!("Float({})", f),
@@ -290,6 +290,9 @@ pub(crate) fn canonical_enum_feature_string(
     value: &Value,
     attribute_type: Option<&AttributeType>,
 ) -> String {
+    if let Value::Concrete(ConcreteValue::CanonicalEnum(c)) = value {
+        return format!("EnumApiValue({:?})", c.api_value());
+    }
     let Some(attribute_type) = attribute_type else {
         return deterministic_value_string(value);
     };
@@ -327,8 +330,53 @@ fn canonical_create_only_value_string(
         Value::Concrete(ConcreteValue::EnumIdentifier(_)) => {
             Some(canonical_enum_feature_string(value, attribute_type))
         }
+        Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
+            Some(format!("EnumApiValue({:?})", c.api_value()))
+        }
+        Value::Concrete(ConcreteValue::List(items)) => {
+            let inner_type = attribute_type
+                .and_then(|attr| attr.shape_ref_free().ok())
+                .and_then(|shape| match shape {
+                    crate::schema::Shape::List { element_type, .. } => Some(element_type),
+                    _ => None,
+                });
+            let parts: Vec<String> = items
+                .iter()
+                .map(|item| canonical_create_only_feature_string(item, inner_type))
+                .collect();
+            Some(format!("List([{}])", parts.join(", ")))
+        }
+        Value::Concrete(ConcreteValue::Map(map)) => {
+            let value_type = attribute_type
+                .and_then(|attr| attr.shape_ref_free().ok())
+                .and_then(|shape| match shape {
+                    crate::schema::Shape::Map { value, .. } => Some(value),
+                    _ => None,
+                });
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by_key(|(key, _)| *key);
+            let parts: Vec<String> = entries
+                .iter()
+                .map(|(key, item)| {
+                    format!(
+                        "{:?}: {}",
+                        key,
+                        canonical_create_only_feature_string(item, value_type)
+                    )
+                })
+                .collect();
+            Some(format!("Map({{{}}})", parts.join(", ")))
+        }
         _ => None,
     }
+}
+
+fn canonical_create_only_feature_string(
+    value: &Value,
+    attribute_type: Option<&AttributeType>,
+) -> String {
+    canonical_create_only_value_string(value, attribute_type)
+        .unwrap_or_else(|| canonical_enum_feature_string(value, attribute_type))
 }
 
 fn canonical_create_only_text_string(
@@ -346,6 +394,21 @@ fn canonical_create_only_text_string(
     } else {
         canonical
     }
+}
+
+/// Convert a persisted state JSON create-only attribute into the same canonical
+/// feature string used for desired-side anonymous identifier reconciliation.
+///
+/// The JSON reader preserves typed enum objects as `CanonicalEnum` and ordinary
+/// legacy enum strings remain strings; `canonical_create_only_value_string`
+/// then applies schema-known List/Map/Enum normalization symmetrically.
+pub fn canonical_create_only_state_json_string(
+    value: &serde_json::Value,
+    attribute_type: Option<&AttributeType>,
+) -> Option<String> {
+    crate::value::json_to_dsl_value(value)
+        .as_ref()
+        .and_then(|value| canonical_create_only_value_string(value, attribute_type))
 }
 
 /// Maximum Hamming distance (out of 64 bits) for SimHash-based reconciliation.
@@ -742,6 +805,20 @@ pub fn reconcile_anonymous_identifiers(
     find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
 ) -> Vec<(String, String)> {
     let mut renames: Vec<(String, String)> = Vec::new();
+    let mut used_names: HashMap<(String, String), HashSet<String>> = HashMap::new();
+    for resource in resources.iter() {
+        let key = (
+            resource.id.provider.clone(),
+            resource.id.resource_type.clone(),
+        );
+        used_names
+            .entry(key)
+            .or_default()
+            .insert(resource.id.name_str().to_string());
+    }
+
+    let mut claimed_names: HashMap<(String, String), HashSet<String>> = HashMap::new();
+
     for resource in resources.iter_mut() {
         if resource.id.name.is_pending() {
             continue;
@@ -760,6 +837,10 @@ pub fn reconcile_anonymous_identifiers(
 
         let create_only_attrs = schema.create_only_attributes();
         let state_entries = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
+        let key = (
+            resource.id.provider.clone(),
+            resource.id.resource_type.clone(),
+        );
 
         // If the resource's name already exists in state, no reconciliation is needed.
         if state_entries
@@ -795,6 +876,15 @@ pub fn reconcile_anonymous_identifiers(
                 if entry.name == resource.id.name_str() {
                     continue;
                 }
+                if used_names
+                    .get(&key)
+                    .is_some_and(|names| names.contains(&entry.name))
+                    || claimed_names
+                        .get(&key)
+                        .is_some_and(|names| names.contains(&entry.name))
+                {
+                    continue;
+                }
                 let Some(state_hash) = extract_hash_from_identifier(&entry.name) else {
                     continue;
                 };
@@ -812,17 +902,36 @@ pub fn reconcile_anonymous_identifiers(
                 // name on the resource and record a rename so the wiring
                 // layer can re-key the state entry.
                 renames.push((state_name.to_string(), resource.id.name_str().to_string()));
+                claimed_names
+                    .entry(key)
+                    .or_default()
+                    .insert(state_name.to_string());
             }
             continue;
         }
 
-        // Collect all partial matches (at least one create-only property matches
-        // and at least one differs). If there are multiple partial matches, skip
-        // reconciliation to avoid rebinding to the wrong state entry.
+        // Full matches handle no-edit upgrades where the hash input changed
+        // across Carina versions but every create-only value is unchanged.
+        // Prefer a unique full match over partial matches; if full matches are
+        // ambiguous, skip rather than guessing. Partial matches keep the
+        // existing "some create-only values changed" reconciliation behavior.
+        // Entries already used by another current resource are live and must
+        // not be stolen; entries claimed earlier in this pass are also excluded
+        // so two resources cannot collapse onto the same state row.
+        let mut full_matches: Vec<&str> = Vec::new();
         let mut partial_matches: Vec<&str> = Vec::new();
         for entry in &state_entries {
             if entry.name == resource.id.name_str() {
                 // Same identifier, no reconciliation needed
+                continue;
+            }
+            if used_names
+                .get(&key)
+                .is_some_and(|names| names.contains(&entry.name))
+                || claimed_names
+                    .get(&key)
+                    .is_some_and(|names| names.contains(&entry.name))
+            {
                 continue;
             }
 
@@ -842,21 +951,32 @@ pub fn reconcile_anonymous_identifiers(
                 }
             }
 
-            // Partial match = same resource with changes to some create-only properties
-            if matched > 0 && mismatched > 0 {
+            if matched > 0 && mismatched == 0 {
+                full_matches.push(&entry.name);
+            } else if matched > 0 && mismatched > 0 {
                 partial_matches.push(&entry.name);
             }
         }
 
-        // Only reconcile if there is exactly one partial match (unique best match).
-        // Multiple partial matches are ambiguous - skip to avoid rebinding wrong.
-        if partial_matches.len() == 1 {
+        let matched_name = if full_matches.len() == 1 {
+            Some(full_matches[0])
+        } else if full_matches.is_empty() && partial_matches.len() == 1 {
+            Some(partial_matches[0])
+        } else {
+            None
+        };
+
+        if let Some(matched_name) = matched_name {
             resource.id = ResourceId::with_provider(
                 &resource.id.provider,
                 &resource.id.resource_type,
-                partial_matches[0],
+                matched_name,
                 resource.id.provider_instance.clone(),
             );
+            claimed_names
+                .entry(key)
+                .or_default()
+                .insert(matched_name.to_string());
         }
     }
     renames

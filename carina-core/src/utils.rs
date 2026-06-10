@@ -1,7 +1,7 @@
 //! Shared utility functions for value normalization and conversion
 
 use crate::resource::{ConcreteValue, Value};
-use crate::schema::{AttributeType, EnumParts, TypeIdentity};
+use crate::schema::{AttributeType, EnumParts};
 
 /// A namespaced DSL enum identifier, parsed once and reused.
 ///
@@ -1001,20 +1001,16 @@ fn lift_enum_leaves_projected(
             _ => None,
         };
         if let Some((s, source)) = raw
-            && enum_member_accepts(identity, values, validate, dsl_map, s, source)
+            && enum_member_is_recognized_for_state_lift(
+                identity, values, validate, dsl_map, s, source,
+            )
+            && let Ok(canonical) = match defs {
+                Some(defs) => crate::resource::EnumValueResolver::with_defs(attr_type, defs)
+                    .resolve_state_text(s),
+                None => crate::resource::EnumValueResolver::new(attr_type).resolve_state_text(s),
+            }
         {
-            // Normalize to the DSL spelling: the strict validator
-            // requires the alias form when one rewrites the API
-            // value. `dsl_for` is identity for non-aliased members
-            // and idempotent when the stored value is already the
-            // DSL spelling.
-            let trailing = enum_trailing_segment(s, values);
-            let dsl = dsl_map.dsl_for(trailing);
-            let full = identity
-                .dotted_prefix()
-                .map(|prefix| format!("{}.{}.{}", prefix, identity.kind, dsl))
-                .unwrap_or_else(|| format!("{}.{}", identity.kind, dsl));
-            return Some(Value::Concrete(ConcreteValue::enum_identifier(full)));
+            return Some(Value::Concrete(ConcreteValue::CanonicalEnum(canonical)));
         }
         // Recognized-or-not, an Enum leaf has no children.
         return None;
@@ -1085,38 +1081,28 @@ fn lift_enum_leaves_projected(
     }
 }
 
-fn enum_trailing_segment<'a>(value: &'a str, values: Option<&[String]>) -> &'a str {
-    let valid: Vec<&str> = values.into_iter().flatten().map(String::as_str).collect();
-    extract_enum_value_with_values(value, &valid)
-}
-
-fn enum_member_accepts(
-    identity: &TypeIdentity,
+fn enum_member_is_recognized_for_state_lift(
+    identity: &crate::schema::TypeIdentity,
     values: Option<&[String]>,
     validate: Option<&crate::schema::CustomValidator>,
     dsl_map: crate::schema::DslMap<'_>,
     value: &str,
     source: EnumLeafSource,
 ) -> bool {
-    let trailing = enum_trailing_segment(value, values);
-    let dsl = dsl_map.dsl_for(trailing);
+    let valid: Vec<&str> = values.into_iter().flatten().map(String::as_str).collect();
+    let trailing = extract_enum_value_with_values(value, &valid);
     let api = dsl_map.api_for(trailing);
-    let enumerated = values.map(|_| true).unwrap_or(false);
-    let data_match = values.into_iter().flatten().any(|candidate| {
+    let dsl = dsl_map.dsl_for(trailing);
+    if values.into_iter().flatten().any(|candidate| {
         candidate == value || candidate == trailing || candidate == &api || dsl == *candidate
-    });
-    if data_match {
+    }) {
         return true;
     }
-    if enumerated {
+    if values.is_some() {
         return false;
     }
-    let resolved = expand_enum_shorthand(
-        &Value::Concrete(ConcreteValue::enum_identifier(dsl.to_string())),
-        identity,
-    );
     if let Some(validate) = validate {
-        return validate(&resolved).is_ok();
+        return validate(&Value::Concrete(ConcreteValue::String(api))).is_ok();
     }
     dynamic_enum_member_is_structural(identity, &dsl, value, source)
 }
@@ -1128,7 +1114,7 @@ enum EnumLeafSource {
 }
 
 fn dynamic_enum_member_is_structural(
-    identity: &TypeIdentity,
+    identity: &crate::schema::TypeIdentity,
     dsl: &str,
     original: &str,
     source: EnumLeafSource,
@@ -1136,26 +1122,17 @@ fn dynamic_enum_member_is_structural(
     if NamespacedId::parse(original).is_some_and(|id| id.matches_identity(identity)) {
         return true;
     }
-    let full = enum_full_dsl_identifier(identity, dsl);
+    let full = identity
+        .dotted_prefix()
+        .map(|prefix| format!("{}.{}.{}", prefix, identity.kind, dsl))
+        .unwrap_or_else(|| format!("{}.{}", identity.kind, dsl));
     if !is_dsl_enum_format(&full) || !is_dynamic_dsl_member_segment(dsl) {
         return false;
     }
     match source {
         EnumLeafSource::EnumIdentifier => true,
-        // A plain state string with no data-form values and no host-side
-        // validator is only lifted when the provider-supplied spelling
-        // transform actually changed it. Already-DSL bare strings stay
-        // as strings so provider-side validators can make the final
-        // membership decision.
         EnumLeafSource::String => dsl != original && dsl.chars().any(|c| c.is_ascii_digit()),
     }
-}
-
-fn enum_full_dsl_identifier(identity: &TypeIdentity, dsl: &str) -> String {
-    identity
-        .dotted_prefix()
-        .map(|prefix| format!("{}.{}.{}", prefix, identity.kind, dsl))
-        .unwrap_or_else(|| format!("{}.{}", identity.kind, dsl))
 }
 
 fn is_dynamic_dsl_member_segment(s: &str) -> bool {
@@ -2662,11 +2639,13 @@ mod tests {
         let Value::Concrete(ConcreteValue::Map(pd)) = &saved[&known.id]["policy_document"] else {
             panic!("policy_document map");
         };
-        assert_eq!(
-            pd["version"],
-            Value::Concrete(ConcreteValue::enum_identifier(
-                "aws.iam.PolicyDocument.Version.2012_10_17".to_string()
-            )),
+        assert!(
+            matches!(
+                &pd["version"],
+                Value::Concrete(ConcreteValue::CanonicalEnum(c))
+                    if c.identity().to_string() == "aws.iam.PolicyDocument.Version"
+                        && c.api_value() == "2012-10-17"
+            ),
             "resource present in registry must have its state lifted"
         );
         // Schema-less resource: untouched, no panic.
@@ -2732,12 +2711,14 @@ mod tests {
         else {
             panic!("assume_role_policy_document map");
         };
-        assert_eq!(
-            pd["version"],
-            Value::Concrete(ConcreteValue::enum_identifier(
-                "aws.iam.PolicyDocument.Version.2012_10_17".to_string()
-            )),
-            "provider-read state String must be lifted to EnumIdentifier"
+        assert!(
+            matches!(
+                &pd["version"],
+                Value::Concrete(ConcreteValue::CanonicalEnum(c))
+                    if c.identity().to_string() == "aws.iam.PolicyDocument.Version"
+                        && c.api_value() == "2012-10-17"
+            ),
+            "provider-read state String must be lifted to CanonicalEnum"
         );
     }
 }

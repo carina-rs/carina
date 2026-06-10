@@ -331,8 +331,7 @@ pub(crate) fn dsl_value_to_json(
             Ok(Some(serde_json::Value::String(s.to_string())))
         }
         Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
-            // TODO(carina#3438): PR3 — state-facing serialization must use the typed enum object per design doc §Serialization; this flat string is a dormant placeholder.
-            Ok(Some(serde_json::Value::String(c.api_value().to_string())))
+            Ok(Some(carina_core::value::canonical_enum_to_json(c)))
         }
         Value::Concrete(ConcreteValue::Bool(b)) => Ok(Some(serde_json::Value::Bool(*b))),
         Value::Concrete(ConcreteValue::Int(i)) => Ok(Some(serde_json::Value::Number((*i).into()))),
@@ -858,6 +857,35 @@ mod stage4_unknown_err_tests {
             ConcreteValue::String("password".into()),
         ))));
         assert!(matches!(dsl_value_to_json(&v), Ok(None)));
+    }
+
+    #[test]
+    fn canonical_enum_serializes_as_typed_object() {
+        let attr_type = carina_core::schema::AttributeType::enum_(
+            carina_core::schema::TypeIdentity::new(Some("aws"), ["ec2", "Eip"], "Domain"),
+            Some(vec!["vpc".to_string()]),
+            Vec::new(),
+            None,
+            None,
+        );
+        let canonical = carina_core::resource::EnumValueResolver::new(&attr_type)
+            .resolve_state_text("vpc")
+            .unwrap();
+        let v = Value::Concrete(ConcreteValue::CanonicalEnum(canonical));
+
+        assert_eq!(
+            dsl_value_to_json(&v).unwrap(),
+            Some(serde_json::json!({
+                "Enum": {
+                    "identity": {
+                        "provider": "aws",
+                        "segments": ["ec2", "Eip"],
+                        "kind": "Domain"
+                    },
+                    "api_value": "vpc"
+                }
+            }))
+        );
     }
 
     /// Non-finite floats (NaN / +inf / -inf) cannot be represented in
