@@ -94,6 +94,30 @@ fn route53_state_entry(name: &str) -> AnonymousIdStateInfo {
     }
 }
 
+fn simhash_eip_schema() -> ResourceSchema {
+    ResourceSchema::new("ec2.eip")
+        .attribute(AttributeSchema::new("domain", AttributeType::string()))
+        .attribute(AttributeSchema::new("tag_name", AttributeType::string()))
+        .attribute(AttributeSchema::new("tag_env", AttributeType::string()))
+}
+
+fn simhash_eip_resource(tag_env: &str) -> Resource {
+    let mut resource = Resource::with_provider("awscc", "ec2.eip", "", None);
+    resource.set_attr(
+        "domain".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc".to_string())),
+    );
+    resource.set_attr(
+        "tag_name".to_string(),
+        Value::Concrete(ConcreteValue::String("my-eip".to_string())),
+    );
+    resource.set_attr(
+        "tag_env".to_string(),
+        Value::Concrete(ConcreteValue::String(tag_env.to_string())),
+    );
+    resource
+}
+
 #[test]
 fn test_anonymous_id_stable_across_provider_namespace_change_in_identity() {
     let schema = ResourceSchema::new("ec2.Route")
@@ -1363,6 +1387,94 @@ fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
     // only mechanism for legacy state name reuse.
     assert_eq!(resources2[0].id.name_str(), new_id);
     assert_eq!(renames, vec![(old_id.clone(), new_id.clone())]);
+}
+
+#[test]
+fn test_reconcile_anonymous_id_simhash_does_not_steal_live_entry() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", simhash_eip_schema());
+    let providers = vec![provider_config("awscc", vec![])];
+    let identity_fn = |_: &str| -> Vec<String> { vec![] };
+
+    let mut resources = vec![
+        simhash_eip_resource("production"),
+        simhash_eip_resource("staging"),
+    ];
+    compute_anonymous_identifiers(&mut resources, &providers, &schemas, &identity_fn).unwrap();
+    let live_name = resources[0].id.name_str().to_string();
+    let new_name = resources[1].id.name_str().to_string();
+
+    let state_entries = vec![AnonymousIdStateInfo {
+        name: live_name.clone(),
+        create_only_values: HashMap::new(),
+    }];
+    let renames = reconcile_anonymous_identifiers(&mut resources, &schemas, &|_provider, _rt| {
+        state_entries.clone()
+    });
+
+    assert_eq!(resources[0].id.name_str(), live_name);
+    assert_eq!(resources[1].id.name_str(), new_name);
+    assert!(
+        renames.is_empty(),
+        "SimHash reconcile must not rename a live state row already used by another resource"
+    );
+}
+
+#[test]
+fn test_reconcile_anonymous_id_simhash_claims_state_entry_once() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", simhash_eip_schema());
+    let providers = vec![provider_config("awscc", vec![])];
+    let identity_fn = |_: &str| -> Vec<String> { vec![] };
+
+    let mut old_resources = vec![simhash_eip_resource("production")];
+    compute_anonymous_identifiers(&mut old_resources, &providers, &schemas, &identity_fn).unwrap();
+    let old_name = old_resources[0].id.name_str().to_string();
+    let old_hash = extract_hash_from_identifier(&old_name).unwrap();
+
+    let mut nearby_resources: Vec<Resource> = Vec::new();
+    for tag_env in [
+        "staging",
+        "prod",
+        "development",
+        "qa",
+        "test",
+        "preview",
+        "canary",
+    ] {
+        let mut candidate = vec![simhash_eip_resource(tag_env)];
+        compute_anonymous_identifiers(&mut candidate, &providers, &schemas, &identity_fn).unwrap();
+        let candidate_hash = extract_hash_from_identifier(candidate[0].id.name_str()).unwrap();
+        if candidate[0].id.name_str() != old_name
+            && (old_hash ^ candidate_hash).count_ones() < SIMHASH_HAMMING_THRESHOLD
+        {
+            nearby_resources.push(candidate.remove(0));
+        }
+        if nearby_resources.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        nearby_resources.len(),
+        2,
+        "test setup should find two distinct resources near the same old SimHash"
+    );
+
+    let state_entries = vec![AnonymousIdStateInfo {
+        name: old_name.clone(),
+        create_only_values: HashMap::new(),
+    }];
+    let renames =
+        reconcile_anonymous_identifiers(&mut nearby_resources, &schemas, &|_provider, _rt| {
+            state_entries.clone()
+        });
+
+    assert_eq!(
+        renames.len(),
+        1,
+        "only one resource may claim a SimHash-matched state row"
+    );
+    assert_eq!(renames[0].0, old_name);
 }
 
 #[test]

@@ -876,6 +876,15 @@ pub fn reconcile_anonymous_identifiers(
                 if entry.name == resource.id.name_str() {
                     continue;
                 }
+                if used_names
+                    .get(&key)
+                    .is_some_and(|names| names.contains(&entry.name))
+                    || claimed_names
+                        .get(&key)
+                        .is_some_and(|names| names.contains(&entry.name))
+                {
+                    continue;
+                }
                 let Some(state_hash) = extract_hash_from_identifier(&entry.name) else {
                     continue;
                 };
@@ -893,6 +902,10 @@ pub fn reconcile_anonymous_identifiers(
                 // name on the resource and record a rename so the wiring
                 // layer can re-key the state entry.
                 renames.push((state_name.to_string(), resource.id.name_str().to_string()));
+                claimed_names
+                    .entry(key)
+                    .or_default()
+                    .insert(state_name.to_string());
             }
             continue;
         }
