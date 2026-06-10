@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(test)]
 use crate::parser::ProviderConfig;
 use crate::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, Value};
-use crate::schema::{AttributeType, SchemaRegistry};
+use crate::schema::SchemaRegistry;
 use crate::validation::is_string_compatible_type;
 use crate::value::CanonicalizedProviderConfigs;
 
@@ -238,10 +238,7 @@ fn deterministic_value_string(value: &Value) -> String {
     }
 }
 
-fn canonical_create_only_value_string(
-    value: &Value,
-    attribute_type: Option<&AttributeType>,
-) -> Option<String> {
+fn canonical_create_only_value_string(value: &Value) -> Option<String> {
     match value {
         Value::Concrete(ConcreteValue::String(s)) => Some(s.to_string()),
         Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => Some(raw.as_str().to_string()),
@@ -249,35 +246,19 @@ fn canonical_create_only_value_string(
             Some(format!("EnumApiValue({:?})", c.api_value()))
         }
         Value::Concrete(ConcreteValue::List(items)) => {
-            let inner_type = attribute_type
-                .and_then(|attr| attr.shape_ref_free().ok())
-                .and_then(|shape| match shape {
-                    crate::schema::Shape::List { element_type, .. } => Some(element_type),
-                    _ => None,
-                });
             let parts: Vec<String> = items
                 .iter()
-                .map(|item| canonical_create_only_feature_string(item, inner_type))
+                .map(canonical_create_only_feature_string)
                 .collect();
             Some(format!("List([{}])", parts.join(", ")))
         }
         Value::Concrete(ConcreteValue::Map(map)) => {
-            let value_type = attribute_type
-                .and_then(|attr| attr.shape_ref_free().ok())
-                .and_then(|shape| match shape {
-                    crate::schema::Shape::Map { value, .. } => Some(value),
-                    _ => None,
-                });
             let mut entries: Vec<(&String, &Value)> = map.iter().collect();
             entries.sort_by_key(|(key, _)| *key);
             let parts: Vec<String> = entries
                 .iter()
                 .map(|(key, item)| {
-                    format!(
-                        "{:?}: {}",
-                        key,
-                        canonical_create_only_feature_string(item, value_type)
-                    )
+                    format!("{:?}: {}", key, canonical_create_only_feature_string(item))
                 })
                 .collect();
             Some(format!("Map({{{}}})", parts.join(", ")))
@@ -286,12 +267,8 @@ fn canonical_create_only_value_string(
     }
 }
 
-fn canonical_create_only_feature_string(
-    value: &Value,
-    attribute_type: Option<&AttributeType>,
-) -> String {
-    canonical_create_only_value_string(value, attribute_type)
-        .unwrap_or_else(|| deterministic_value_string(value))
+fn canonical_create_only_feature_string(value: &Value) -> String {
+    canonical_create_only_value_string(value).unwrap_or_else(|| deterministic_value_string(value))
 }
 
 /// Convert a persisted state JSON create-only attribute into the same canonical
@@ -299,13 +276,10 @@ fn canonical_create_only_feature_string(
 ///
 /// The JSON reader preserves typed enum objects as `CanonicalEnum`; ordinary
 /// legacy enum strings remain strings and are not schema-resolved here.
-pub fn canonical_create_only_state_json_string(
-    value: &serde_json::Value,
-    attribute_type: Option<&AttributeType>,
-) -> Option<String> {
+pub fn canonical_create_only_state_json_string(value: &serde_json::Value) -> Option<String> {
     crate::value::json_to_dsl_value(value)
         .as_ref()
-        .and_then(|value| canonical_create_only_value_string(value, attribute_type))
+        .and_then(canonical_create_only_value_string)
 }
 
 /// Maximum Hamming distance (out of 64 bits) for SimHash-based reconciliation.
@@ -743,14 +717,10 @@ pub fn reconcile_anonymous_identifiers(
         // Collect this resource's create-only values
         let mut resource_co_values: HashMap<&str, String> = HashMap::new();
         for attr_name in &create_only_attrs {
-            if let Some(value) = resource.get_attr(attr_name) {
-                let attribute_type = schema
-                    .attributes
-                    .get(*attr_name)
-                    .map(|attr| &attr.attr_type);
-                if let Some(value) = canonical_create_only_value_string(value, attribute_type) {
-                    resource_co_values.insert(attr_name, value);
-                }
+            if let Some(value) = resource.get_attr(attr_name)
+                && let Some(value) = canonical_create_only_value_string(value)
+            {
+                resource_co_values.insert(attr_name, value);
             }
         }
 
