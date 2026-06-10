@@ -62,6 +62,12 @@ fn single_schema_map(schema: ResourceSchema) -> SchemaRegistry {
     schemas
 }
 
+fn fixture_enum_segment_as_aws_value(s: &str) -> String {
+    // Mirrors the old last-dot-segment semantics for these dot-free fixture
+    // values, then rewrites DSL underscores to AWS hyphens.
+    s.split('.').next_back().unwrap_or(s).replace('_', "-")
+}
+
 /// Build a `ProviderFactory` set covering every provider name implied by
 /// the schemas. The CLI pipeline keys schemas by provider, so each
 /// distinct prefix (`test`, `aws`, ...) needs its own factory entry.
@@ -338,7 +344,7 @@ fn region_schemas() -> SchemaRegistry {
     fn validate_region(v: &Value) -> Result<(), String> {
         const VALID: &[&str] = &["ap-northeast-1", "us-west-2"];
         if let Value::Concrete(ConcreteValue::String(s)) = v {
-            let normalized = carina_core::utils::extract_enum_value(s).replace('_', "-");
+            let normalized = fixture_enum_segment_as_aws_value(s);
             if VALID.contains(&normalized.as_str()) {
                 return Ok(());
             }
