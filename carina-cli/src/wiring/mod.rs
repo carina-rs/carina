@@ -414,6 +414,15 @@ fn identity_attributes_for_provider(ctx: &WiringContext, name: &str) -> Vec<Stri
         .unwrap_or_default()
 }
 
+fn provider_config_attribute_type_for(
+    ctx: &WiringContext,
+    provider_name: &str,
+    attr_name: &str,
+) -> Option<carina_core::schema::AttributeType> {
+    provider_mod::find_factory(ctx.factories(), provider_name)
+        .and_then(|factory| factory.provider_config_attribute_types().remove(attr_name))
+}
+
 /// Detect and apply anonymous → let-bound resource renames.
 ///
 /// Mirrors `materialize_moved_states` but for synthetic rename pairs produced
@@ -557,9 +566,15 @@ pub fn compute_anonymous_identifiers_with_ctx(
     resources: &mut [Resource],
     providers: &[ProviderConfig],
 ) -> Vec<AppError> {
-    match identifier::compute_anonymous_identifiers(resources, providers, ctx.schemas(), &|name| {
-        identity_attributes_for_provider(ctx, name)
-    }) {
+    match identifier::compute_anonymous_identifiers_with_provider_config_types(
+        resources,
+        providers,
+        ctx.schemas(),
+        &|name| identity_attributes_for_provider(ctx, name),
+        &|provider_name, attr_name| {
+            provider_config_attribute_type_for(ctx, provider_name, attr_name)
+        },
+    ) {
         Ok(()) => Vec::new(),
         Err(msg) => vec![AppError::Config(msg)],
     }

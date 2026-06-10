@@ -979,7 +979,7 @@ pub fn instance_prefix_for_call(call: &ModuleCall) -> String {
     let mut features: BTreeMap<String, String> = BTreeMap::new();
     features.insert("_module".to_string(), call.module_name.clone());
     for (k, v) in &call.arguments {
-        crate::identifier::flatten_value_for_simhash(k, v, &mut features);
+        crate::identifier::flatten_value_for_simhash(k, v, &mut features, None);
     }
     let simhash = crate::identifier::compute_simhash(&features);
     format!("{}_{:016x}", call.module_name, simhash)
