@@ -331,6 +331,7 @@ pub(crate) fn dsl_value_to_json(
             Ok(Some(serde_json::Value::String(s.to_string())))
         }
         Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
+            // TODO(carina#3438): PR3 — state-facing serialization must use the typed enum object per design doc §Serialization; this flat string is a dormant placeholder.
             Ok(Some(serde_json::Value::String(c.api_value().to_string())))
         }
         Value::Concrete(ConcreteValue::Bool(b)) => Ok(Some(serde_json::Value::Bool(*b))),

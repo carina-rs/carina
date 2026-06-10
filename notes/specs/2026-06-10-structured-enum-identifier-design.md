@@ -230,9 +230,13 @@ impl EnumValueResolver<'_> {
 
 `resolve_raw` is for parser-fed desired values. `resolve_state_text` is for
 provider-read and state-file text that reaches an enum-typed schema position.
-Both paths apply namespace checks, valid-value extraction, alias inversion, and
-provider custom validation. Tests can use an explicit test-only constructor, but
-production code should not mint `CanonicalEnumValue` without schema.
+The RawDsl path applies namespace checks, valid-value extraction, alias
+inversion, and provider custom validation. The StateText path applies
+valid-value extraction, alias inversion, and provider custom validation, but
+does not apply namespace checks because state may still carry pre-bump
+foreign-namespace DSL text such as `awscc.ec2.Eip.Domain.vpc` after the schema
+identity has moved to `aws.*`. Tests can use an explicit test-only constructor,
+but production code should not mint `CanonicalEnumValue` without schema.
 
 ### Equality and display
 

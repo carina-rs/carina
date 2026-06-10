@@ -232,6 +232,7 @@ pub fn value_to_json_with_context(
             Ok(serde_json::Value::String(s.to_string()))
         }
         Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
+            // TODO(carina#3438): PR3 — state-facing serialization must use the typed enum object per design doc §Serialization; this flat string is a dormant placeholder.
             Ok(serde_json::Value::String(c.api_value().to_string()))
         }
         Value::Concrete(ConcreteValue::Int(n)) => Ok(serde_json::Value::Number((*n).into())),
