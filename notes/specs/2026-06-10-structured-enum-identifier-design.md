@@ -511,6 +511,10 @@ config identity attributes and resource attributes are canonicalized before
 identity generation, and the hash feature path renders only
 `ConcreteValue::CanonicalEnum` as `EnumApiValue(...)`. Raw enum identifiers that
 somehow reach the hash path use the deterministic fallback representation.
+Provider config canonicalization is also represented as the
+`CanonicalizedProviderConfigs` typestate wrapper, so anonymous hash and
+anonymous-to-named rename code cannot be called with raw provider configs in
+normal builds.
 
 The cleanup makes several hazards unrepresentable or harder to write by
 accident:

@@ -442,13 +442,13 @@ pub fn apply_anonymous_to_named_renames(
         return Vec::new();
     };
 
-    let mut canonical_providers = providers.to_vec();
-    carina_core::value::canonicalize_provider_configs_with_attribute_types(
-        &mut canonical_providers,
-        &|provider_name, attr_name| {
-            provider_config_attribute_type_for(ctx, provider_name, attr_name)
-        },
-    );
+    let canonical_providers =
+        carina_core::value::canonicalize_provider_configs_with_attribute_types(
+            providers,
+            &|provider_name, attr_name| {
+                provider_config_attribute_type_for(ctx, provider_name, attr_name)
+            },
+        );
 
     let renames = identifier::detect_anonymous_to_named_renames(
         resources,
@@ -598,13 +598,13 @@ pub fn compute_anonymous_identifiers_with_ctx(
     resources: &mut [Resource],
     providers: &[ProviderConfig],
 ) -> Vec<AppError> {
-    let mut canonical_providers = providers.to_vec();
-    carina_core::value::canonicalize_provider_configs_with_attribute_types(
-        &mut canonical_providers,
-        &|provider_name, attr_name| {
-            provider_config_attribute_type_for(ctx, provider_name, attr_name)
-        },
-    );
+    let canonical_providers =
+        carina_core::value::canonicalize_provider_configs_with_attribute_types(
+            providers,
+            &|provider_name, attr_name| {
+                provider_config_attribute_type_for(ctx, provider_name, attr_name)
+            },
+        );
 
     match identifier::compute_anonymous_identifiers_with_provider_configs(
         resources,

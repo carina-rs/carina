@@ -1602,6 +1602,27 @@ pub fn canonicalize_resources_with_schemas(
 
 type ProviderConfigAttributeTypeFn<'a> = dyn Fn(&str, &str) -> Option<AttributeType> + 'a;
 
+/// Provider configs whose schema-known attributes have been canonicalized.
+///
+/// Durable identity code accepts this wrapper rather than raw
+/// `ProviderConfig` slices, so callers cannot skip provider config enum
+/// canonicalization at the hash seam.
+#[derive(Debug, Clone)]
+pub struct CanonicalizedProviderConfigs {
+    providers: Vec<crate::parser::ProviderConfig>,
+}
+
+impl CanonicalizedProviderConfigs {
+    pub fn as_slice(&self) -> &[crate::parser::ProviderConfig] {
+        &self.providers
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_configs_for_test(providers: Vec<crate::parser::ProviderConfig>) -> Self {
+        Self { providers }
+    }
+}
+
 fn canonicalize_provider_config_with_type(value: Value, attr_type: &AttributeType) -> Value {
     let defs = crate::schema::empty_defs_for_schema_walks();
     let unwrapped = peel_custom(attr_type);
@@ -1680,9 +1701,10 @@ fn canonicalize_provider_config_with_type(value: Value, attr_type: &AttributeTyp
 /// such as provider identity `region` before those values feed durable
 /// identity hashing.
 pub fn canonicalize_provider_configs_with_attribute_types(
-    providers: &mut [crate::parser::ProviderConfig],
+    providers: &[crate::parser::ProviderConfig],
     provider_config_attribute_type_fn: &ProviderConfigAttributeTypeFn<'_>,
-) {
+) -> CanonicalizedProviderConfigs {
+    let mut providers = providers.to_vec();
     for provider in providers.iter_mut() {
         let mut new_attrs = indexmap::IndexMap::new();
         for (key, value) in std::mem::take(&mut provider.attributes) {
@@ -1694,6 +1716,7 @@ pub fn canonicalize_provider_configs_with_attribute_types(
         }
         provider.attributes = new_attrs;
     }
+    CanonicalizedProviderConfigs { providers }
 }
 
 /// [`DataSource`](crate::resource::DataSource) counterpart of
@@ -2785,7 +2808,7 @@ mod tests {
         use crate::parser::ProviderConfig;
         use crate::schema::{AttributeType, DslTransform, TypeIdentity};
 
-        let mut providers = vec![
+        let providers = vec![
             ProviderConfig {
                 name: "aws".to_string(),
                 attributes: indexmap::indexmap! {
@@ -2818,19 +2841,21 @@ mod tests {
             },
         ];
 
-        canonicalize_provider_configs_with_attribute_types(&mut providers, &|provider, attr| {
-            (attr == "region").then(|| {
-                AttributeType::enum_(
-                    TypeIdentity::new(Some(provider), Vec::<String>::new(), "Region"),
-                    None,
-                    Vec::new(),
-                    None,
-                    Some(DslTransform::HyphenToUnderscore),
-                )
-            })
-        });
+        let providers =
+            canonicalize_provider_configs_with_attribute_types(&providers, &|provider, attr| {
+                (attr == "region").then(|| {
+                    AttributeType::enum_(
+                        TypeIdentity::new(Some(provider), Vec::<String>::new(), "Region"),
+                        None,
+                        Vec::new(),
+                        None,
+                        Some(DslTransform::HyphenToUnderscore),
+                    )
+                })
+            });
 
         let api_values: Vec<_> = providers
+            .as_slice()
             .iter()
             .map(
                 |provider| match provider.attributes.get("region").unwrap() {

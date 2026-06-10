@@ -5,10 +5,12 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+#[cfg(test)]
 use crate::parser::ProviderConfig;
 use crate::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, Value};
 use crate::schema::{AttributeType, ResourceSchema, SchemaRegistry};
 use crate::validation::is_string_compatible_type;
+use crate::value::CanonicalizedProviderConfigs;
 
 /// Generate a random 8-character lowercase hex suffix using UUID v4.
 pub fn generate_random_suffix() -> String {
@@ -477,14 +479,18 @@ fn simhash_from_identity_and_resource(
 /// anonymous ID of a resource that has since been wrapped in a `let` binding.
 fn compute_resource_simhash(
     resource: &Resource,
-    providers: &[ProviderConfig],
+    providers: &CanonicalizedProviderConfigs,
     registry: &SchemaRegistry,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
 ) -> u64 {
     let mut identity_values: BTreeMap<String, String> = BTreeMap::new();
     if !resource.id.provider.is_empty() {
         let identity_attrs = identity_attributes_fn(&resource.id.provider);
-        if let Some(pc) = providers.iter().find(|p| p.name == resource.id.provider) {
+        if let Some(pc) = providers
+            .as_slice()
+            .iter()
+            .find(|p| p.name == resource.id.provider)
+        {
             for attr_name in &identity_attrs {
                 if let Some(value) = pc.attributes.get(attr_name.as_str()) {
                     identity_values.insert(attr_name.clone(), deterministic_value_string(value));
@@ -503,7 +509,7 @@ fn compute_resource_simhash(
 /// for that provider (e.g., `["region"]`).
 pub fn compute_anonymous_identifiers(
     resources: &mut [Resource],
-    providers: &[ProviderConfig],
+    providers: &CanonicalizedProviderConfigs,
     registry: &SchemaRegistry,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
 ) -> Result<(), String> {
@@ -515,9 +521,20 @@ pub fn compute_anonymous_identifiers(
     )
 }
 
-pub fn compute_anonymous_identifiers_with_provider_configs(
+#[cfg(test)]
+pub fn compute_anonymous_identifiers_for_test(
     resources: &mut [Resource],
     providers: &[ProviderConfig],
+    registry: &SchemaRegistry,
+    identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
+) -> Result<(), String> {
+    let providers = CanonicalizedProviderConfigs::from_configs_for_test(providers.to_vec());
+    compute_anonymous_identifiers(resources, &providers, registry, identity_attributes_fn)
+}
+
+pub fn compute_anonymous_identifiers_with_provider_configs(
+    resources: &mut [Resource],
+    providers: &CanonicalizedProviderConfigs,
     registry: &SchemaRegistry,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
 ) -> Result<(), String> {
@@ -548,7 +565,11 @@ pub fn compute_anonymous_identifiers_with_provider_configs(
         // Collect identity attribute values (e.g., region) from provider config
         let mut identity_values: BTreeMap<String, String> = BTreeMap::new();
         let identity_attrs = identity_attributes_fn(provider_name);
-        if let Some(pc) = providers.iter().find(|p| p.name == *provider_name) {
+        if let Some(pc) = providers
+            .as_slice()
+            .iter()
+            .find(|p| p.name == *provider_name)
+        {
             for attr_name in &identity_attrs {
                 if let Some(value) = pc.attributes.get(attr_name.as_str()) {
                     identity_values.insert(
@@ -685,6 +706,22 @@ pub fn compute_anonymous_identifiers_with_provider_configs(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+pub fn compute_anonymous_identifiers_with_provider_configs_for_test(
+    resources: &mut [Resource],
+    providers: &[ProviderConfig],
+    registry: &SchemaRegistry,
+    identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
+) -> Result<(), String> {
+    let providers = CanonicalizedProviderConfigs::from_configs_for_test(providers.to_vec());
+    compute_anonymous_identifiers_with_provider_configs(
+        resources,
+        &providers,
+        registry,
+        identity_attributes_fn,
+    )
 }
 
 /// State information needed for anonymous identifier reconciliation.
@@ -926,7 +963,7 @@ pub fn detect_anonymous_to_named_renames(
     resources: &[Resource],
     registry: &SchemaRegistry,
     find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
-    providers: &[ProviderConfig],
+    providers: &CanonicalizedProviderConfigs,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
 ) -> Vec<(ResourceId, ResourceId)> {
     // Collect the set of resource names currently used in the DSL per
@@ -1040,6 +1077,24 @@ pub fn detect_anonymous_to_named_renames(
     }
 
     renames
+}
+
+#[cfg(test)]
+pub fn detect_anonymous_to_named_renames_for_test(
+    resources: &[Resource],
+    registry: &SchemaRegistry,
+    find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
+    providers: &[ProviderConfig],
+    identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
+) -> Vec<(ResourceId, ResourceId)> {
+    let providers = CanonicalizedProviderConfigs::from_configs_for_test(providers.to_vec());
+    detect_anonymous_to_named_renames(
+        resources,
+        registry,
+        find_state_by_type,
+        &providers,
+        identity_attributes_fn,
+    )
 }
 
 #[cfg(test)]
