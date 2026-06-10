@@ -10,7 +10,7 @@ use crate::resource::{
     CanonicalEnumValue, ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value,
 };
 use crate::schema::{AttrTypeKind, AttributeType, TypeIdentity};
-use crate::utils::{convert_enum_value, extract_enum_value_with_values, is_dsl_enum_format};
+use crate::utils::{enum_display_value, extract_enum_value_with_values};
 
 /// Where in the pipeline a `Value` is being serialized. Used so the
 /// caller of a failing serialization (e.g. `--out plan.json`) can
@@ -524,10 +524,8 @@ pub(crate) fn format_value_into<S: FormatSink>(
             if s.starts_with(SECRET_PREFIX) {
                 return sink.write_str("(secret)");
             }
-            // DSL enum format (namespaced identifiers): resolve to
-            // provider value before quoting.
-            if is_dsl_enum_format(s) {
-                let resolved = convert_enum_value(s);
+            // Namespaced enum text: shorten for display before quoting.
+            if let Some(resolved) = enum_display_value(s) {
                 sink.write_str("\"")?;
                 sink.write_str(resolved)?;
                 return sink.write_str("\"");
@@ -1814,27 +1812,24 @@ pub fn resolve_value_alias_with_schemas(
     schemas: &[crate::schema::ResourceSchema],
 ) {
     match value {
-        Value::Concrete(ConcreteValue::String(s)) if is_dsl_enum_format(s) => {
+        Value::Concrete(ConcreteValue::String(s)) if enum_display_value(s).is_some() => {
             let valid_values: Vec<String> = schemas
                 .iter()
                 .filter(|schema| schema.resource_type == resource_type)
                 .flat_map(|schema| schema.enum_valid_values_for_attr_alias(attr_name, s))
                 .collect();
-            let raw = if valid_values.is_empty() {
-                // Schema-free fallback for attributes that are not known enum
-                // fields in the schema snapshot. This is fail-closed: unknown
-                // `(resource_type, attr_name)` pairs should not have reverse
-                // alias entries, so even a lossy extraction leaves `s`
-                // unchanged. Keep `convert_enum_value` here rather than
-                // last-segment extraction to preserve dotted enum values like
-                // `awscc.ec2.vpn_gateway.Type.ipsec.1`.
-                convert_enum_value(s)
-            } else {
+            // If the schema snapshot does not know `(resource_type, attr_name)`
+            // as an enum field, a reverse-alias hit would mean the schema and
+            // factory have drifted. Do not heal that silently with schema-free
+            // extraction; leave the value unchanged.
+            if !valid_values.is_empty() {
                 let valid_refs: Vec<&str> = valid_values.iter().map(String::as_str).collect();
-                extract_enum_value_with_values(s, &valid_refs)
-            };
-            if let Some(canonical) = factory.get_enum_alias_reverse(resource_type, attr_name, raw) {
-                *s = canonical;
+                let raw = extract_enum_value_with_values(s, &valid_refs);
+                if let Some(canonical) =
+                    factory.get_enum_alias_reverse(resource_type, attr_name, raw)
+                {
+                    *s = canonical;
+                }
             }
         }
         Value::Concrete(ConcreteValue::List(items)) => {
@@ -1992,28 +1987,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_value_alias_fail_closed_when_valid_values_empty() {
-        let schema = schema_with_attr(
-            "s3.BucketLifecycleConfiguration",
-            "known_status",
-            status_enum(Some("aws.s3.BucketLifecycleConfiguration.Rules")),
-        );
+    fn resolve_value_alias_skips_schema_free_fallback_when_valid_values_empty() {
         let factory = SchemaAliasFactory {
-            schemas: vec![schema],
-            resource_type: "s3.BucketLifecycleConfiguration",
-            attr_name: "missing_status",
-            alias_value: "disabled",
-            canonical: None,
+            schemas: Vec::new(),
+            resource_type: "ec2.Subnet",
+            attr_name: "hostname_type",
+            alias_value: "HostnameType.ip_name",
+            canonical: Some("ip-name"),
         };
-        let original = "aws.s3.BucketLifecycleConfiguration.Rules.Status.disabled";
+        let original = "aws.ec2.Subnet.PrivateDnsNameOptionsOnLaunch.HostnameType.ip_name";
         let mut value = Value::Concrete(ConcreteValue::String(original.to_string()));
 
-        resolve_value_alias(
-            &mut value,
-            "s3.BucketLifecycleConfiguration",
-            "missing_status",
-            &factory,
-        );
+        resolve_value_alias_with_schemas(&mut value, "ec2.Subnet", "hostname_type", &factory, &[]);
 
         assert_eq!(
             value,
@@ -2026,7 +2011,7 @@ mod tests {
         let schema = schema_with_attr(
             "svc.Resource",
             "statuses",
-            AttributeType::list(status_enum(Some("aws.svc.Resource.Status"))),
+            AttributeType::list(status_enum(Some("aws.svc.Resource"))),
         );
 
         assert_eq!(
@@ -2045,7 +2030,7 @@ mod tests {
         let schema = schema_with_attr(
             "svc.Resource",
             "status_by_name",
-            AttributeType::map(status_enum(Some("aws.svc.Resource.Status"))),
+            AttributeType::map(status_enum(Some("aws.svc.Resource"))),
         );
 
         assert_eq!(
@@ -2066,7 +2051,7 @@ mod tests {
             "status",
             AttributeType::union(vec![
                 AttributeType::string(),
-                status_enum(Some("aws.svc.Resource.Status")),
+                status_enum(Some("aws.svc.Resource")),
             ]),
         );
 
@@ -2657,7 +2642,7 @@ mod tests {
     #[test]
     fn test_format_value_two_part_enum_string() {
         // Two-part enum strings like "InstanceTenancy.dedicated" are formatted
-        // through convert_enum_value which extracts the value part
+        // through the display-shortening helper, which extracts the value part.
         let v = Value::Concrete(ConcreteValue::String(
             "InstanceTenancy.dedicated".to_string(),
         ));

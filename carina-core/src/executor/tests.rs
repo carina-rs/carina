@@ -360,7 +360,18 @@ impl ProviderFactory for AliasFactory {
         unreachable!("test factory does not create providers")
     }
     fn schemas(&self) -> Vec<crate::schema::ResourceSchema> {
-        Vec::new()
+        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, enum_identity};
+
+        vec![ResourceSchema::new("sg").attribute(AttributeSchema::new(
+            "ip_protocol",
+            AttributeType::enum_(
+                enum_identity("IpProtocol", Some("test.ec2.SecurityGroup")),
+                Some(vec!["all".to_string(), "tcp".to_string()]),
+                Vec::new(),
+                None,
+                None,
+            ),
+        ))]
     }
     fn get_enum_alias_reverse(
         &self,

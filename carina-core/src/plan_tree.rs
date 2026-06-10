@@ -13,7 +13,7 @@ use crate::deps::get_resource_value_ref_dependencies;
 use crate::effect::Effect;
 use crate::plan::Plan;
 use crate::resource::{ConcreteValue, DeferredValue, Value};
-use crate::utils::{convert_enum_value, is_dsl_enum_format};
+use crate::utils::enum_display_value;
 
 /// Intermediate data for tree-building: maps from effect indices to their
 /// bindings, dependency sets, and resource types.
@@ -301,12 +301,8 @@ pub fn extract_compact_hint(
         {
             let short_key = shorten_attr_name(key);
             // Strip namespace from DSL enum identifiers (e.g., awscc.AvailabilityZone.ap_northeast_1a -> "ap_northeast_1a")
-            let resolved = if is_dsl_enum_format(s) {
-                Cow::Borrowed(convert_enum_value(s))
-            } else {
-                Cow::Borrowed(s.as_str())
-            };
-            let display_value = shorten_service_name(key, &resolved);
+            let resolved = enum_display_value(s).unwrap_or(s);
+            let display_value = shorten_service_name(key, resolved);
             return Some(format!("{}: {}", short_key, display_value));
         }
     }
