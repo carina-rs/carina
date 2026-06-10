@@ -34,6 +34,12 @@ fn messages_of(diags: &[tower_lsp::lsp_types::Diagnostic]) -> Vec<&String> {
     diags.iter().map(|d| &d.message).collect()
 }
 
+fn fixture_enum_segment_as_aws_value(s: &str) -> String {
+    // Mirrors the old last-dot-segment semantics for these dot-free fixture
+    // values, then rewrites DSL underscores to AWS hyphens.
+    s.split('.').next_back().unwrap_or(s).replace('_', "-")
+}
+
 // ---------------------------------------------------------------
 // Scenario 1: Enum with bare / TypeQualified / fully-qualified
 // ---------------------------------------------------------------
@@ -124,7 +130,7 @@ fn region_schemas() -> SchemaRegistry {
         {
             // Same shape as `aws_region()`: strip any namespace prefix
             // (DSL form) and rewrite `_` → `-` to get the AWS form.
-            let normalized = carina_core::utils::extract_enum_value(s).replace('_', "-");
+            let normalized = fixture_enum_segment_as_aws_value(s);
             if VALID.contains(&normalized.as_str()) {
                 return Ok(());
             }

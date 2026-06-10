@@ -345,20 +345,10 @@ fn is_type_name_segment(s: &str) -> bool {
 /// wire-value extractor. It mis-splits enum values that themselves contain
 /// dots, such as `awscc.ec2.vpn_gateway.Type.ipsec.1` -> `1`; use
 /// `extract_enum_value_with_values` internally when valid enum values are
-/// available. It must not be used for provider wire-out paths. Its remaining
-/// legitimate consumers are the provider read-normalize seam, and demotion is
-/// deferred to the carina#3409 enum-state-coherence implementation.
-///
-/// # Examples
-///
-/// ```
-/// use carina_core::utils::extract_enum_value;
-///
-/// assert_eq!(extract_enum_value("aws.Region.ap_northeast_1"), "ap_northeast_1");
-/// assert_eq!(extract_enum_value("aws.s3.Bucket.VersioningStatus.Enabled"), "Enabled");
-/// assert_eq!(extract_enum_value("Enabled"), "Enabled");
-/// ```
-pub fn extract_enum_value(s: &str) -> &str {
+/// available. It must not be used for provider wire-out paths. This helper is
+/// crate-internal and is used only as the no-match fallback of
+/// `extract_enum_value_with_values`.
+pub(crate) fn extract_enum_value(s: &str) -> &str {
     if s.contains('.') {
         s.split('.').next_back().unwrap_or(s)
     } else {
