@@ -144,7 +144,7 @@ schema-bearing shapes instead of wildcard-matching raw representation details.
 Parser output should retain source-shape information explicitly:
 
 ```rust
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RawEnumIdentifier {
     text: String,
     parsed: RawEnumIdentifierParts,
@@ -184,6 +184,11 @@ pub enum ConcreteValue {
 dotted shapes and store owned structured parts. The raw `text` field remains the
 source for `Display`, formatter, LSP, and diagnostics. `Unclassified` is allowed
 because only the schema can decide whether some text is a valid enum member.
+
+`RawEnumIdentifier` should serialize as the plain source text string and
+deserialize by re-running `parse`. The `parsed` field is derived entirely from
+`text`, so persisting it would add redundant state-file data while changing the
+legacy `EnumIdentifier` payload shape.
 
 ### Canonical enum value
 
@@ -225,9 +230,13 @@ impl EnumValueResolver<'_> {
 
 `resolve_raw` is for parser-fed desired values. `resolve_state_text` is for
 provider-read and state-file text that reaches an enum-typed schema position.
-Both paths apply namespace checks, valid-value extraction, alias inversion, and
-provider custom validation. Tests can use an explicit test-only constructor, but
-production code should not mint `CanonicalEnumValue` without schema.
+The RawDsl path applies namespace checks, valid-value extraction, alias
+inversion, and provider custom validation. The StateText path applies
+valid-value extraction, alias inversion, and provider custom validation, but
+does not apply namespace checks because state may still carry pre-bump
+foreign-namespace DSL text such as `awscc.ec2.Eip.Domain.vpc` after the schema
+identity has moved to `aws.*`. Tests can use an explicit test-only constructor,
+but production code should not mint `CanonicalEnumValue` without schema.
 
 ### Equality and display
 

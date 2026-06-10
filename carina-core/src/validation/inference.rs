@@ -336,6 +336,7 @@ fn infer_type_from_value_with_visiting(
         // layer — the value-layer distinction matters only inside the
         // `Enum` validator. See carina#2986.
         Value::Concrete(ConcreteValue::EnumIdentifier(_)) => Ok(TypeExpr::String),
+        Value::Concrete(ConcreteValue::CanonicalEnum(_)) => Ok(TypeExpr::String),
         Value::Concrete(ConcreteValue::Int(_)) => Ok(TypeExpr::Int),
         Value::Concrete(ConcreteValue::Float(_)) => Ok(TypeExpr::Float),
         Value::Concrete(ConcreteValue::Bool(_)) => Ok(TypeExpr::Bool),

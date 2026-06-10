@@ -51,6 +51,7 @@ pub(crate) fn value_type_name(value: &Value) -> &'static str {
     match value {
         Value::Concrete(ConcreteValue::String(_)) => "string",
         Value::Concrete(ConcreteValue::EnumIdentifier(_)) => "enum identifier",
+        Value::Concrete(ConcreteValue::CanonicalEnum(_)) => "canonical enum",
         Value::Concrete(ConcreteValue::Int(_)) => "int",
         Value::Concrete(ConcreteValue::Float(_)) => "float",
         Value::Concrete(ConcreteValue::Bool(_)) => "bool",

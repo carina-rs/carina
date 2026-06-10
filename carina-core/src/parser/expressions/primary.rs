@@ -249,7 +249,7 @@ fn parse_namespaced_id_value(
     }
 
     Ok(EvalValue::from_value(Value::Concrete(
-        ConcreteValue::EnumIdentifier(full_str.to_string()),
+        ConcreteValue::enum_identifier(full_str.to_string()),
     )))
 }
 
@@ -473,7 +473,7 @@ pub(crate) fn parse_primary_eval(
                 match ctx.get_variable(first_ident) {
                     Some(val) => Ok(val.clone()),
                     None => Ok(EvalValue::from_value(Value::Concrete(
-                        ConcreteValue::EnumIdentifier(first_ident.to_string()),
+                        ConcreteValue::enum_identifier(first_ident.to_string()),
                     ))),
                 }
             } else {

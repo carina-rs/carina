@@ -183,7 +183,7 @@ fn parse_resource_with_namespaced_type() {
     );
     assert_eq!(
         resource.get_attr("region"),
-        Some(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        Some(&Value::Concrete(ConcreteValue::enum_identifier(
             "aws.Region.ap_northeast_1".to_string()
         )))
     );
@@ -222,7 +222,7 @@ fn parse_variable_and_resource() {
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("region"),
-        Some(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        Some(&Value::Concrete(ConcreteValue::enum_identifier(
             "aws.Region.ap_northeast_1".to_string()
         )))
     );
@@ -412,7 +412,7 @@ fn parse_and_resolve_resource_reference() {
     );
     assert_eq!(
         policy.get_attr("bucket_region"),
-        Some(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        Some(&Value::Concrete(ConcreteValue::enum_identifier(
             "aws.Region.ap_northeast_1".to_string()
         )))
     );
@@ -481,7 +481,7 @@ fn parse_bare_identifier_becomes_enum_identifier() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.resources[0].get_attr("instance_tenancy"),
-        Some(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        Some(&Value::Concrete(ConcreteValue::enum_identifier(
             "dedicated".to_string()
         )))
     );
@@ -500,7 +500,7 @@ fn resource_reference_preserves_namespaced_id() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.resources[0].get_attr("region"),
-        Some(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        Some(&Value::Concrete(ConcreteValue::enum_identifier(
             "aws.Region.ap_northeast_1".to_string()
         )))
     );
@@ -519,7 +519,7 @@ fn namespaced_id_with_digit_segment() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.resources[0].get_attr("type"),
-        Some(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        Some(&Value::Concrete(ConcreteValue::enum_identifier(
             "awscc.ec2.vpn_gateway.Type.ipsec.1".to_string()
         )))
     );
@@ -548,7 +548,7 @@ fn namespaced_id_with_numeric_tail() {
     };
     assert_eq!(
         map.get("version"),
-        Some(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        Some(&Value::Concrete(ConcreteValue::enum_identifier(
             "aws.iam.PolicyDocument.Version.2012_10_17".to_string()
         )))
     );
@@ -568,7 +568,7 @@ fn namespaced_id_numeric_tail_preserves_pure_digits() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.resources[0].get_attr("kind"),
-        Some(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        Some(&Value::Concrete(ConcreteValue::enum_identifier(
             "Type.1".to_string()
         )))
     );
@@ -1244,7 +1244,7 @@ fn parse_backend_block() {
     );
     assert_eq!(
         backend.attributes.get("region"),
-        Some(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        Some(&Value::Concrete(ConcreteValue::enum_identifier(
             "aws.Region.ap_northeast_1".to_string()
         )))
     );

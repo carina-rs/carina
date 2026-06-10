@@ -497,7 +497,7 @@ fn collect_reference_roots(
             // Bare-identifier fallback (`EnumIdentifier("B")`) and dotted-access
             // fallback (`EnumIdentifier("B.attr")`) both appear before the parser
             // classifies the RHS as a binding ref or resource ref.
-            push_root(name, variables, structural, roots);
+            push_root(name.as_str(), variables, structural, roots);
             if let Some((root, _)) = name.split_once('.') {
                 push_root(root, variables, structural, roots);
             }
@@ -539,6 +539,7 @@ fn collect_reference_roots(
             | ConcreteValue::Bool(_)
             | ConcreteValue::Duration(_)
             | ConcreteValue::String(_)
+            | ConcreteValue::CanonicalEnum(_)
             | ConcreteValue::StringList(_),
         )
         | Value::Deferred(DeferredValue::Unknown(_)) => {}

@@ -224,28 +224,29 @@ pub fn validate_custom_type(
 ) -> Result<(), String> {
     // Built-in DSL custom types carry no provider axis — match on `kind`.
     let builtin = identity.provider.is_none() && identity.segments.is_empty();
+    fn text(value: &Value) -> Option<&str> {
+        value
+            .as_concrete()
+            .and_then(|concrete| concrete.as_string_like())
+    }
     match (builtin.then_some(identity.kind.as_str()), value) {
-        (
-            Some("Ipv4Cidr"),
-            Value::Concrete(ConcreteValue::String(s) | ConcreteValue::EnumIdentifier(s)),
-        ) => validate_ipv4_cidr(s),
-        (
-            Some("Ipv4Address"),
-            Value::Concrete(ConcreteValue::String(s) | ConcreteValue::EnumIdentifier(s)),
-        ) => validate_ipv4_address(s),
-        (
-            Some("Ipv6Cidr"),
-            Value::Concrete(ConcreteValue::String(s) | ConcreteValue::EnumIdentifier(s)),
-        ) => validate_ipv6_cidr(s),
-        (
-            Some("Ipv6Address"),
-            Value::Concrete(ConcreteValue::String(s) | ConcreteValue::EnumIdentifier(s)),
-        ) => validate_ipv6_address(s),
+        (Some("Ipv4Cidr"), value) if text(value).is_some() => {
+            validate_ipv4_cidr(text(value).unwrap())
+        }
+        (Some("Ipv4Address"), value) if text(value).is_some() => {
+            validate_ipv4_address(text(value).unwrap())
+        }
+        (Some("Ipv6Cidr"), value) if text(value).is_some() => {
+            validate_ipv6_cidr(text(value).unwrap())
+        }
+        (Some("Ipv6Address"), value) if text(value).is_some() => {
+            validate_ipv6_address(text(value).unwrap())
+        }
         (_, Value::Deferred(DeferredValue::ResourceRef { .. })) => Ok(()), // will be resolved later
         (_, Value::Deferred(DeferredValue::FunctionCall { .. })) => Ok(()), // will be resolved later
         (_, Value::Deferred(DeferredValue::Interpolation(_))) => Ok(()), // will be resolved later
         (_, Value::Deferred(DeferredValue::Unknown(_))) => Ok(()), // resolved at upstream apply
-        (_, Value::Concrete(ConcreteValue::String(s) | ConcreteValue::EnumIdentifier(s))) => {
+        (_, value) if text(value).is_some() => {
             // Both `String` (quoted-literal source) and `EnumIdentifier`
             // (bare or namespaced identifier source) are accepted: this
             // lookup runs from `walk_custom_lookup`, which is reached
@@ -257,6 +258,7 @@ pub fn validate_custom_type(
             // Check custom validators from config (schema-extracted),
             // keyed by the full structured identity so two providers'
             // same-named types do not collide.
+            let s = text(value).unwrap();
             if let Some(validator) = config.validators.get(identity) {
                 validator(s)?;
             }

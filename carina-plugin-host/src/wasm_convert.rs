@@ -47,12 +47,17 @@ use crate::wasm_bindings::carina::provider::types as wit;
 /// equivalent to the pre-#2387 `ResourceRef` debug-string.
 pub fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, SerializationError> {
     match v {
-        CoreValue::Concrete(ConcreteValue::String(s))
-        | CoreValue::Concrete(ConcreteValue::EnumIdentifier(s)) => {
+        CoreValue::Concrete(ConcreteValue::String(s)) => {
             // Enum identifiers lower to the WIT boundary as plain
             // strings — the WASM plugin sees the same wire shape as
             // any other string value. See carina#2986.
             Ok(wit::Value::StrVal(s.clone()))
+        }
+        CoreValue::Concrete(ConcreteValue::EnumIdentifier(s)) => {
+            Ok(wit::Value::StrVal(s.to_string()))
+        }
+        CoreValue::Concrete(ConcreteValue::CanonicalEnum(c)) => {
+            Ok(wit::Value::StrVal(c.api_value().to_string()))
         }
         CoreValue::Concrete(ConcreteValue::Int(i)) => Ok(wit::Value::IntVal(*i)),
         CoreValue::Concrete(ConcreteValue::Float(f)) => Ok(wit::Value::FloatVal(*f)),
@@ -185,9 +190,12 @@ pub fn wit_to_core_value(v: &wit::Value) -> CoreValue {
 /// pass that keeps these arms unreachable in legitimate flows.
 fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationError> {
     match v {
-        CoreValue::Concrete(ConcreteValue::String(s))
-        | CoreValue::Concrete(ConcreteValue::EnumIdentifier(s)) => {
-            Ok(serde_json::Value::String(s.clone()))
+        CoreValue::Concrete(ConcreteValue::String(s)) => Ok(serde_json::Value::String(s.clone())),
+        CoreValue::Concrete(ConcreteValue::EnumIdentifier(s)) => {
+            Ok(serde_json::Value::String(s.to_string()))
+        }
+        CoreValue::Concrete(ConcreteValue::CanonicalEnum(c)) => {
+            Ok(serde_json::Value::String(c.api_value().to_string()))
         }
         CoreValue::Concrete(ConcreteValue::Int(i)) => Ok(serde_json::Value::Number((*i).into())),
         CoreValue::Concrete(ConcreteValue::Float(f)) => Ok(serde_json::Number::from_f64(*f)
@@ -1982,7 +1990,7 @@ mod tests {
         assert_eq!(
             lifted,
             carina_core::resource::Value::Concrete(
-                carina_core::resource::ConcreteValue::EnumIdentifier(
+                carina_core::resource::ConcreteValue::enum_identifier(
                     "aws.AvailabilityZone.ZoneName.ap_northeast_1a".to_string()
                 )
             )
@@ -2027,12 +2035,12 @@ mod tests {
         );
 
         let already_dsl = carina_core::resource::Value::Concrete(
-            carina_core::resource::ConcreteValue::EnumIdentifier("ap_northeast_1a".to_string()),
+            carina_core::resource::ConcreteValue::enum_identifier("ap_northeast_1a".to_string()),
         );
         assert_eq!(
             carina_core::utils::lift_enum_leaves(&already_dsl, &core_attr),
             Some(carina_core::resource::Value::Concrete(
-                carina_core::resource::ConcreteValue::EnumIdentifier(
+                carina_core::resource::ConcreteValue::enum_identifier(
                     "aws.AvailabilityZone.ZoneName.ap_northeast_1a".to_string()
                 )
             )),
@@ -2056,7 +2064,7 @@ mod tests {
         assert_eq!(
             carina_core::utils::lift_enum_leaves(&valid, &core_attr),
             Some(carina_core::resource::Value::Concrete(
-                carina_core::resource::ConcreteValue::EnumIdentifier(
+                carina_core::resource::ConcreteValue::enum_identifier(
                     "aws.AvailabilityZone.ZoneName.ap_northeast_1a".to_string()
                 )
             )),

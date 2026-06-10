@@ -491,8 +491,8 @@ impl Effect {
 pub fn format_import_identifier(identifier: &crate::resource::Value) -> String {
     use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
     match identifier {
-        Value::Concrete(ConcreteValue::String(s))
-        | Value::Concrete(ConcreteValue::EnumIdentifier(s)) => s.clone(),
+        Value::Concrete(ConcreteValue::String(s)) => s.clone(),
+        Value::Concrete(ConcreteValue::EnumIdentifier(s)) => s.to_string(),
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             let mut out = String::new();
             for part in parts {
@@ -615,7 +615,7 @@ mod tests {
             "unexpected error message: {err}"
         );
         // Sanity: still passes for a concrete String/EnumIdentifier.
-        let s = Value::Concrete(ConcreteValue::EnumIdentifier("ENUM_X".into()));
+        let s = Value::Concrete(ConcreteValue::enum_identifier("ENUM_X"));
         assert_eq!(resolve_import_identifier(&s).unwrap(), "ENUM_X");
     }
 

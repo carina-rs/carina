@@ -53,25 +53,25 @@ fn validate_enum_type() {
         None,
     );
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        t.validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "awscc.ec2.ipam_pool.AddressFamily.IPv4".to_string()
         )))
         .is_ok()
     );
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        t.validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "IPv6".to_string()
         )))
         .is_ok()
     );
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        t.validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "ipv4".to_string()
         )))
         .is_ok()
     );
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        t.validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "IPv5".to_string()
         )))
         .is_err()
@@ -132,14 +132,14 @@ fn validate_enum_accepts_dsl_alias() {
     // not accept the API form when an alias is registered. Users
     // write `all`. Updated for carina#2980 / carina#2986.
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        t.validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "-1".to_string()
         )))
         .is_err()
     );
     // DSL alias "all" should be accepted
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        t.validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "awscc.ec2.SecurityGroup.IpProtocol.all".to_string()
         )))
         .is_ok()
@@ -148,14 +148,14 @@ fn validate_enum_accepts_dsl_alias() {
     // which is already snake_case) keep working — the API spelling
     // *is* the DSL spelling for them.
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        t.validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "tcp".to_string()
         )))
         .is_ok()
     );
     // Invalid values should still be rejected
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        t.validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "invalid".to_string()
         )))
         .is_err()
@@ -197,7 +197,7 @@ fn assert_iam_policy_version_candidates(expected: &[ExpectedEnumVariant]) {
 #[test]
 fn invalid_enum_variant_candidates_use_dsl_spelling_for_enum_aliases() {
     let err = iam_policy_version_enum()
-        .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        .validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "bad_version".to_string(),
         )))
         .unwrap_err();
@@ -264,7 +264,7 @@ fn enum_candidates_preserve_genuine_extra_aliases() {
         None,
     );
     let err = t
-        .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        .validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "bad_mode".to_string(),
         )))
         .unwrap_err();
@@ -304,7 +304,7 @@ fn validate_enum_all_without_dsl_aliases_requires_explicit_variant() {
     // Without "all" in values and no dsl_aliases entry mapping to "all", it is rejected
     assert!(
         without_all
-            .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+            .validate(&Value::Concrete(ConcreteValue::enum_identifier(
                 "all".to_string()
             )))
             .is_err()
@@ -327,7 +327,7 @@ fn validate_enum_all_without_dsl_aliases_requires_explicit_variant() {
     );
     assert!(
         with_all
-            .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+            .validate(&Value::Concrete(ConcreteValue::enum_identifier(
                 "all".to_string()
             )))
             .is_ok()
@@ -350,21 +350,21 @@ fn validate_enum_accepts_values_with_dots() {
     // "Quoted string" for historical reasons but values are written
     // unquoted in real DSL).
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        t.validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "ipsec.1".to_string()
         )))
         .is_ok()
     );
     // Fully qualified form should also be accepted
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        t.validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "awscc.ec2.vpn_gateway.Type.ipsec.1".to_string()
         )))
         .is_ok()
     );
     // Invalid value should still be rejected
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        t.validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "ipsec.2".to_string()
         )))
         .is_err()
@@ -466,7 +466,7 @@ fn with_attribute_adds_attribute_name_to_enum_error() {
     // Identifier path (`InvalidEnumVariant`): the message keeps the
     // single-quoted form for the bare value.
     let err = t
-        .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        .validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "aaa".to_string(),
         )))
         .unwrap_err()
@@ -694,7 +694,7 @@ fn schema_validate_with_origins_emits_string_literal_diagnostic_for_quoted_enum(
     let mut attrs = HashMap::new();
     attrs.insert(
         "target_type".to_string(),
-        Value::Concrete(ConcreteValue::EnumIdentifier("aaa".to_string())),
+        Value::Concrete(ConcreteValue::enum_identifier("aaa".to_string())),
     );
     let errs = schema
         .validate_with_origins(&attrs, &|_| false)
@@ -727,7 +727,7 @@ fn schema_validate_with_origins_leaves_valid_values_alone() {
     let mut attrs = HashMap::new();
     attrs.insert(
         "target_type".to_string(),
-        Value::Concrete(ConcreteValue::EnumIdentifier("AWS_ACCOUNT".to_string())),
+        Value::Concrete(ConcreteValue::enum_identifier("AWS_ACCOUNT".to_string())),
     );
     assert!(
         schema.validate_with_origins(&attrs, &|_| true).is_ok(),
@@ -4276,7 +4276,7 @@ fn expected_includes_to_dsl_aliases_with_alias_flag() {
     // be rejected earlier as `StringLiteralExpectedEnum` — that path is
     // covered by `validate_enum_rejects_quoted_string_literal`.
     let err = t
-        .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        .validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "zzz".to_string(),
         )))
         .unwrap_err();
@@ -4441,7 +4441,7 @@ fn union_string_vs_enum_picks_enum_error_for_string_input() {
         ),
     ]);
     let err = union_type
-        .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        .validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "zzz".to_string(),
         )))
         .unwrap_err();
@@ -5028,7 +5028,7 @@ fn dsl_aliases_validator_accepts_dsl_spellings_only() {
     // input as `EnumIdentifier` because the user wrote it as a bare
     // identifier, not a quoted string.
     let err = t
-        .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        .validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "BucketOwnerEnforced".to_string(),
         )))
         .unwrap_err();
@@ -5040,21 +5040,21 @@ fn dsl_aliases_validator_accepts_dsl_spellings_only() {
 
     // Bare DSL spelling: accepted (alias).
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        t.validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "bucket_owner_enforced".to_string()
         )))
         .is_ok()
     );
     // Fully-qualified API spelling: REJECTED under strict mode.
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        t.validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "awscc.s3.Bucket.ObjectOwnership.BucketOwnerEnforced".to_string()
         )))
         .is_err()
     );
     // Fully-qualified DSL spelling: accepted (the awscc#199 case).
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        t.validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "awscc.s3.Bucket.ObjectOwnership.bucket_owner_enforced".to_string()
         )))
         .is_ok()
@@ -5063,7 +5063,7 @@ fn dsl_aliases_validator_accepts_dsl_spellings_only() {
     // An unrelated value: rejected, listing only the DSL spellings
     // that `validate` accepts and users can type.
     let err = t
-        .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        .validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "garbage".to_string(),
         )))
         .unwrap_err();
@@ -5098,7 +5098,7 @@ fn enum_without_dsl_aliases_accepts_api_spelling_as_before() {
         None,
     );
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        t.validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "ALL".to_string()
         )))
         .is_ok(),
@@ -5126,7 +5126,7 @@ fn dsl_aliases_diagnostic_tags_alias_entries_distinct_from_canonical() {
     // pin). A `String` here would take the `StringLiteralExpectedEnum`
     // path which is covered by sibling tests.
     let err = t
-        .validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        .validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "zzz".to_string(),
         )))
         .unwrap_err();
@@ -5161,13 +5161,13 @@ fn dsl_aliases_empty_keeps_api_only_validation() {
         None,
     );
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        t.validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "active".to_string()
         )))
         .is_ok()
     );
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::EnumIdentifier(
+        t.validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "nope".to_string()
         )))
         .is_err()
@@ -5308,7 +5308,7 @@ mod enum_binding_collision {
         // — the validator resolves it against the `dsl_aliases` table
         // for `ResourceType` and accepts.
         let t = flow_log_resource_type();
-        let value = Value::Concrete(ConcreteValue::EnumIdentifier("vpc".to_string()));
+        let value = Value::Concrete(ConcreteValue::enum_identifier("vpc".to_string()));
         assert!(t.validate(&value).is_ok());
     }
 
@@ -5318,7 +5318,7 @@ mod enum_binding_collision {
         // validator as `ConcreteValue::EnumIdentifier` (carina#2986
         // Phase 3 parser routing).
         let t = flow_log_resource_type();
-        let value = Value::Concrete(ConcreteValue::EnumIdentifier(
+        let value = Value::Concrete(ConcreteValue::enum_identifier(
             "awscc.ec2.FlowLog.ResourceType.vpc".to_string(),
         ));
         assert!(t.validate(&value).is_ok());
@@ -5593,7 +5593,7 @@ fn lift_state_enum_leaves_fixes_awscc251() {
     };
     assert_eq!(
         policy["version"],
-        Value::Concrete(ConcreteValue::EnumIdentifier(
+        Value::Concrete(ConcreteValue::enum_identifier(
             "aws.iam.PolicyDocument.Version.2012_10_17".to_string()
         ))
     );
@@ -5605,7 +5605,7 @@ fn lift_state_enum_leaves_fixes_awscc251() {
     };
     assert_eq!(
         stmt["effect"],
-        Value::Concrete(ConcreteValue::EnumIdentifier(
+        Value::Concrete(ConcreteValue::enum_identifier(
             "aws.iam.PolicyDocument.Effect.allow".to_string()
         ))
     );
@@ -5634,7 +5634,7 @@ fn lift_state_enums_is_idempotent_and_preserves_invalid() {
     let mut already = IndexMap::new();
     already.insert(
         "version".to_string(),
-        Value::Concrete(ConcreteValue::EnumIdentifier("2012_10_17".to_string())),
+        Value::Concrete(ConcreteValue::enum_identifier("2012_10_17".to_string())),
     );
     let mut attrs: HashMap<String, Value> = HashMap::new();
     attrs.insert(
@@ -5647,7 +5647,7 @@ fn lift_state_enums_is_idempotent_and_preserves_invalid() {
     };
     assert_eq!(
         p["version"],
-        Value::Concrete(ConcreteValue::EnumIdentifier(
+        Value::Concrete(ConcreteValue::enum_identifier(
             "aws.iam.PolicyDocument.Version.2012_10_17".to_string()
         )),
         "already-lifted EnumIdentifier must normalize to fully-qualified DSL spelling"
@@ -5719,7 +5719,7 @@ fn dynamic_enum_lift_raw_string_requires_transform_and_structural_dsl_member() {
     );
     assert_eq!(
         lifted_value("ap-northeast-1z"),
-        Value::Concrete(ConcreteValue::EnumIdentifier(
+        Value::Concrete(ConcreteValue::enum_identifier(
             "aws.AvailabilityZone.ZoneName.ap_northeast_1z".to_string()
         )),
         "structural API-form dynamic enum strings must lift"

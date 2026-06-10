@@ -163,7 +163,12 @@ pub fn reconcile_prefixed_names(
 fn deterministic_value_string(value: &Value) -> String {
     match value {
         Value::Concrete(ConcreteValue::String(s)) => format!("String({:?})", s),
-        Value::Concrete(ConcreteValue::EnumIdentifier(s)) => format!("EnumIdentifier({:?})", s),
+        Value::Concrete(ConcreteValue::EnumIdentifier(s)) => {
+            format!("EnumIdentifier({:?})", s.as_str())
+        }
+        Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
+            format!("CanonicalEnum({:?}, {:?})", c.identity(), c.api_value())
+        }
         Value::Concrete(ConcreteValue::Int(i)) => format!("Int({})", i),
         Value::Concrete(ConcreteValue::Float(f)) => format!("Float({})", f),
         Value::Concrete(ConcreteValue::Bool(b)) => format!("Bool({})", b),
@@ -295,12 +300,12 @@ pub(crate) fn canonical_enum_feature_string(
     else {
         return deterministic_value_string(value);
     };
-    if !enum_identifier_segments_match(raw, attribute_type, values.is_some()) {
+    if !enum_identifier_segments_match(raw.as_str(), attribute_type, values.is_some()) {
         return deterministic_value_string(value);
     }
 
     let valid_values: Vec<&str> = values.into_iter().flatten().map(String::as_str).collect();
-    let variant = extract_enum_value_with_values(raw, &valid_values);
+    let variant = extract_enum_value_with_values(raw.as_str(), &valid_values);
     let api_value = dsl_map.api_for_hash_feature(variant);
     if let Some(values) = values
         && !values.iter().any(|v| v == &api_value)
@@ -334,20 +339,13 @@ fn canonical_create_only_text_string(
         return value.to_string();
     }
 
-    let enum_value = Value::Concrete(ConcreteValue::EnumIdentifier(value.to_string()));
+    let enum_value = Value::Concrete(ConcreteValue::enum_identifier(value.to_string()));
     let canonical = canonical_enum_feature_string(&enum_value, attribute_type);
     if canonical == deterministic_value_string(&enum_value) {
         value.to_string()
     } else {
         canonical
     }
-}
-
-fn canonical_state_create_only_value_string(
-    value: &str,
-    attribute_type: Option<&AttributeType>,
-) -> String {
-    canonical_create_only_text_string(value, attribute_type)
 }
 
 /// Maximum Hamming distance (out of 64 bits) for SimHash-based reconciliation.
@@ -835,7 +833,7 @@ pub fn reconcile_anonymous_identifiers(
                 if let Some(state_value) = entry.create_only_values.get(*attr) {
                     let attribute_type = schema.attributes.get(*attr).map(|attr| &attr.attr_type);
                     let state_value =
-                        canonical_state_create_only_value_string(state_value, attribute_type);
+                        canonical_create_only_text_string(state_value, attribute_type);
                     if &state_value == value {
                         matched += 1;
                     } else {

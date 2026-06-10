@@ -321,7 +321,7 @@ pub(crate) fn parse_for_expr(
             // proper UndefinedIdentifier with the did-you-mean machinery
             // from #2038 / #2100. See #2101 / #2138.
             let bare_ident_text: Option<String> = match &iterable {
-                Value::Concrete(ConcreteValue::EnumIdentifier(s)) => Some(s.clone()),
+                Value::Concrete(ConcreteValue::EnumIdentifier(s)) => Some(s.to_string()),
                 Value::Concrete(ConcreteValue::String(s)) if is_bare_identifier(s) => {
                     Some(s.clone())
                 }

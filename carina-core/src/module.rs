@@ -131,9 +131,10 @@ fn format_value(value: &Value) -> String {
             if s.len() > 50 {
                 format!("{}...", &s[..47])
             } else {
-                s.clone()
+                s.to_string()
             }
         }
+        Value::Concrete(ConcreteValue::CanonicalEnum(c)) => c.api_value().to_string(),
         Value::Concrete(ConcreteValue::Int(n)) => n.to_string(),
         Value::Concrete(ConcreteValue::Float(f)) => {
             let s = f.to_string();

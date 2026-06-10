@@ -14,6 +14,7 @@ pub(crate) fn is_static_value(value: &Value) -> bool {
     match value {
         Value::Concrete(ConcreteValue::String(_))
         | Value::Concrete(ConcreteValue::EnumIdentifier(_))
+        | Value::Concrete(ConcreteValue::CanonicalEnum(_))
         | Value::Concrete(ConcreteValue::Int(_))
         | Value::Concrete(ConcreteValue::Float(_))
         | Value::Concrete(ConcreteValue::Bool(_))
