@@ -879,9 +879,12 @@ pub fn reconcile_anonymous_identifiers(
             continue;
         }
 
-        // Collect all partial matches (at least one create-only property matches
-        // and at least one differs). If there are multiple partial matches, skip
-        // reconciliation to avoid rebinding to the wrong state entry.
+        // Full matches handle no-edit upgrades where the hash input changed
+        // across Carina versions but every create-only value is unchanged.
+        // Prefer a unique full match over partial matches; if full matches are
+        // ambiguous, skip rather than guessing. Partial matches keep the
+        // existing "some create-only values changed" reconciliation behavior.
+        let mut full_matches: Vec<&str> = Vec::new();
         let mut partial_matches: Vec<&str> = Vec::new();
         for entry in &state_entries {
             if entry.name == resource.id.name_str() {
@@ -905,15 +908,21 @@ pub fn reconcile_anonymous_identifiers(
                 }
             }
 
-            // Partial match = same resource with changes to some create-only properties
-            if matched > 0 && mismatched > 0 {
+            if matched > 0 && mismatched == 0 {
+                full_matches.push(&entry.name);
+            } else if matched > 0 && mismatched > 0 {
                 partial_matches.push(&entry.name);
             }
         }
 
-        // Only reconcile if there is exactly one partial match (unique best match).
-        // Multiple partial matches are ambiguous - skip to avoid rebinding wrong.
-        if partial_matches.len() == 1 {
+        if full_matches.len() == 1 {
+            resource.id = ResourceId::with_provider(
+                &resource.id.provider,
+                &resource.id.resource_type,
+                full_matches[0],
+                resource.id.provider_instance.clone(),
+            );
+        } else if full_matches.is_empty() && partial_matches.len() == 1 {
             resource.id = ResourceId::with_provider(
                 &resource.id.provider,
                 &resource.id.resource_type,

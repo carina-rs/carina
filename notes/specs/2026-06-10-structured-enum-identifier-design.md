@@ -249,7 +249,7 @@ comparison is needed for assignability, it should be a named method rather than
 
 `Display` for `RawEnumIdentifier` should return source text. Display for
 `CanonicalEnumValue` can render `identity.api_value`, but display consumers
-should usually choose raw source where available.
+should choose deliberately per surface.
 
 ### Value projection
 
@@ -311,12 +311,15 @@ They should not perform schema resolution.
 
 ### Display, format, and LSP
 
-Formatter, LSP diagnostics, code actions, `detail_rows`, and plan display should
+Formatter, LSP diagnostics, code actions, and source-facing diagnostics should
 generally keep raw enum spelling when the source spelling is what the user needs
 to see.
 
-They should not use canonical API values as a blanket replacement for source
-text. API spelling is often not the DSL spelling users are expected to write.
+Plan display uses bare canonical `api_value` for resolved enum leaves, rendered
+unquoted. The alternative of mapping `api_value` back through `DslMap` was not
+chosen for plan output because it would make display depend on carrying schema
+context through more rendering surfaces. Source-facing paths can still preserve
+raw spelling where that is the clearer user contract.
 
 ### Validation
 
@@ -399,15 +402,19 @@ Recommended JSON shape:
 }
 ```
 
-The exact serde tag can follow the surrounding `ConcreteValue` convention, but
-the payload must include both:
+State attribute JSON uses the hand-written `{"Enum": ...}` tag shown above so
+schema-free state loading can recover a `CanonicalEnumValue` directly from the
+trusted persisted payload.
+
+Saved plans use the serde representation of the `ConcreteValue::CanonicalEnum`
+variant. That means the state JSON object and saved-plan serde object are not
+byte-identical tags, but both are typed objects and both carry the same semantic
+payload:
 
 - the enum type identity; and
 - the provider API value.
 
-The saved plan should use the same representation for value trees that carry
-resolved enum semantics. Plan display can still render DSL spelling by mapping
-`api_value` through the enum's `DslMap` when schema is available.
+Plan display renders canonical enum leaves as bare unquoted `api_value`.
 
 Provider wire JSON remains a plain string. The typed enum object is a Carina
 state/plan representation, not a provider protocol change.
@@ -433,19 +440,26 @@ Their output type changes from `EnumIdentifier(String)` to `CanonicalEnumValue`.
 
 ## Differ and reconciliation
 
-The differ currently has schema-aware enum comparison that accepts both
-`String` and `EnumIdentifier`, extracts a trailing enum value with known values,
-and folds aliases through `DslMap`.
-
-That logic should collapse to canonical comparison:
+The differ has schema-aware enum comparison that accepts `String`,
+`EnumIdentifier`, and `CanonicalEnum` during the migration. For canonical values
+it first tries strict typed equality:
 
 ```rust
 CanonicalEnumValue { identity, api_value } == CanonicalEnumValue { identity, api_value }
 ```
 
-If provider-read strings enter before resolution, that is a pipeline bug. The
-differ should not keep a fallback that re-parses raw dotted strings once the
-resolver is wired.
+If strict equality fails, differ comparison falls through to canonical API-text
+comparison before deciding an update is required. This is intentionally looser
+than `CanonicalEnumValue`'s `PartialEq`: cross-identity export flows can carry a
+producer identity such as `aws.Region` into a consumer schema such as
+`awscc.Region`, and those providers share a unified API value space for the enum
+member. The question for the differ is whether applying would change provider
+API text, not whether the two typed values have identical identity axes.
+
+String and raw enum fallback remains a migration compatibility path while some
+provider-read or state leaves can still arrive before schema resolution. The
+desired steady state is still that schema-known enum leaves are canonical before
+they reach durable identity or differ logic.
 
 Anonymous reconciliation should likewise compare canonical enum values. The
 string helpers added by #3437 become temporary shims until all identity inputs
@@ -485,7 +499,10 @@ Recommended chain:
    bump revisions in Carina.
 5. Shim removal PR. Remove string-out hash helpers, raw-string enum extraction
    APIs from durable identity paths, and any temporary constructors that let
-   production code mint canonical enum values without schema.
+   production code mint canonical enum values without schema. This must happen
+   after provider config attributes such as `region` are canonicalized; otherwise
+   removing raw fallback and `api_for_hash_feature` would regress provider
+   config hash stability.
 
 This mirrors the #3371-style split: design first, core types second, consumers
 third, external repo follow-up fourth, cleanup last.
