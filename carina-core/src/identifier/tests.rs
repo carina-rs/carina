@@ -1,9 +1,42 @@
 use super::*;
+use crate::parser::StateBlockAddress;
 use crate::resource::Resource;
 use crate::schema::{
     AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry, enum_identity,
 };
 use indexmap::IndexMap;
+
+fn reconcile_anonymous_identifiers(
+    resources: &mut [Resource],
+    registry: &SchemaRegistry,
+    find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
+    find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
+) -> Vec<(String, String)> {
+    super::reconcile_anonymous_identifiers(
+        resources,
+        registry,
+        find_state_by_type,
+        find_state_by_binding,
+        &StateBlockClaims::empty(),
+    )
+}
+
+fn detect_anonymous_to_named_renames_for_test(
+    resources: &[Resource],
+    registry: &SchemaRegistry,
+    find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
+    providers: &[ProviderConfig],
+    identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
+) -> Vec<(ResourceId, ResourceId)> {
+    super::detect_anonymous_to_named_renames_for_test(
+        resources,
+        registry,
+        find_state_by_type,
+        providers,
+        identity_attributes_fn,
+        &StateBlockClaims::empty(),
+    )
+}
 
 fn make_s3_bucket_schema() -> ResourceSchema {
     ResourceSchema::new("s3.Bucket")
@@ -1612,6 +1645,127 @@ fn test_reconcile_resolves_deferred_create_only_via_state_bindings() {
 }
 
 #[test]
+fn test_reconcile_skips_state_entry_claimed_by_moved_from() {
+    let mut simhash_schemas = SchemaRegistry::new();
+    simhash_schemas.insert("awscc", simhash_eip_schema());
+    let mut simhash_resources = vec![Resource::with_provider(
+        "awscc",
+        "ec2.eip",
+        "awscc_ec2_eip_0000000000000002",
+        None,
+    )];
+    let simhash_state = vec![AnonymousIdStateInfo {
+        name: "awscc_ec2_eip_0000000000000003".to_string(),
+        create_only_values: HashMap::new(),
+    }];
+    let claims = StateBlockClaims::new(
+        [StateBlockAddress::new(
+            "awscc",
+            "ec2.eip",
+            "awscc_ec2_eip_0000000000000003",
+        )]
+        .into_iter()
+        .collect(),
+        HashSet::new(),
+    );
+
+    let simhash_renames = super::reconcile_anonymous_identifiers(
+        &mut simhash_resources,
+        &simhash_schemas,
+        &|_, _| simhash_state.clone(),
+        &|_| Vec::new(),
+        &claims,
+    );
+    assert!(
+        simhash_renames.is_empty(),
+        "claimed moved.from state row must be excluded from SimHash candidates"
+    );
+
+    let mut create_only_schemas = SchemaRegistry::new();
+    create_only_schemas.insert("awscc", route_schema_with_create_only_route_table());
+    let mut create_only_resources = vec![route_with_deferred_route_table(
+        "awscc_ec2_route_aaaaaaaa",
+        "private_rtb",
+    )];
+    let create_only_state = vec![route_state_entry("awscc_ec2_route_11111111", "rtb-private")];
+    let binding_entries = [binding_state_entry(
+        "private_rtb",
+        "private_rtb",
+        &[("id", "rtb-private")],
+    )];
+    let claims = StateBlockClaims::new(
+        [StateBlockAddress::new(
+            "awscc",
+            "ec2.Route",
+            "awscc_ec2_route_11111111",
+        )]
+        .into_iter()
+        .collect(),
+        HashSet::new(),
+    );
+
+    let create_only_renames = super::reconcile_anonymous_identifiers(
+        &mut create_only_resources,
+        &create_only_schemas,
+        &|_, _| create_only_state.clone(),
+        &|binding| {
+            binding_entries
+                .iter()
+                .filter(|(entry_binding, _)| entry_binding == binding)
+                .map(|(_, entry)| entry.clone())
+                .collect()
+        },
+        &claims,
+    );
+    assert!(create_only_renames.is_empty());
+    assert_eq!(
+        create_only_resources[0].id.name_str(),
+        "awscc_ec2_route_aaaaaaaa",
+        "claimed moved.from state row must be excluded from create-only full matches"
+    );
+}
+
+#[test]
+fn test_reconcile_skips_desired_name_claimed_by_moved_to() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", route_schema_with_create_only_route_table());
+    let desired_name = "awscc_ec2_route_aaaaaaaa";
+    let mut resources = vec![route_with_deferred_route_table(desired_name, "private_rtb")];
+    let state_entries = vec![route_state_entry("awscc_ec2_route_11111111", "rtb-private")];
+    let binding_entries = [binding_state_entry(
+        "private_rtb",
+        "private_rtb",
+        &[("id", "rtb-private")],
+    )];
+    let claims = StateBlockClaims::new(
+        HashSet::new(),
+        [StateBlockAddress::new("awscc", "ec2.Route", desired_name)]
+            .into_iter()
+            .collect(),
+    );
+
+    super::reconcile_anonymous_identifiers(
+        &mut resources,
+        &schemas,
+        &|_, _| state_entries.clone(),
+        &|binding| {
+            binding_entries
+                .iter()
+                .filter(|(entry_binding, _)| entry_binding == binding)
+                .map(|(_, entry)| entry.clone())
+                .collect()
+        },
+        &claims,
+    );
+
+    assert_eq!(
+        resources[0].id.name_str(),
+        desired_name,
+        "desired name claimed as moved.to must skip heuristic reconciliation"
+    );
+}
+
+#[test]
 fn test_reconcile_deferred_create_only_ambiguous_refuses() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", subnet_route_table_association_schema());
@@ -3159,6 +3313,128 @@ fn test_detect_rename_unique_match_by_create_only_attrs() {
     assert_eq!(renames.len(), 1);
     assert_eq!(renames[0].0.name_str(), "sso_instance_0ac0620303071530");
     assert_eq!(renames[0].1.name_str(), "sso");
+}
+
+#[test]
+fn test_detect_anonymous_to_named_skips_claimed_from() {
+    let schemas = make_sso_instance_registry();
+
+    let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso", None);
+    resource.binding = Some("sso".to_string());
+    resource.set_attr(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("carina-rs".to_string())),
+    );
+    let resources = vec![resource];
+    let state_name = "sso_instance_0ac0620303071530";
+    let state_entries = vec![AnonymousIdStateInfo {
+        name: state_name.to_string(),
+        create_only_values: vec![("name".to_string(), "carina-rs".to_string())]
+            .into_iter()
+            .collect(),
+    }];
+    let claims = StateBlockClaims::new(
+        [StateBlockAddress::new("awscc", "sso.Instance", state_name)]
+            .into_iter()
+            .collect(),
+        HashSet::new(),
+    );
+
+    let renames = super::detect_anonymous_to_named_renames_for_test(
+        &resources,
+        &schemas,
+        &|_provider, _rt| state_entries.clone(),
+        &[],
+        &|_provider| Vec::new(),
+        &claims,
+    );
+
+    assert!(
+        renames.is_empty(),
+        "anonymous-to-named detector must not synthesize a rename from a claimed from"
+    );
+}
+
+#[test]
+fn test_detect_anonymous_to_named_skips_claimed_to() {
+    let schemas = make_sso_instance_registry();
+
+    let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso", None);
+    resource.binding = Some("sso".to_string());
+    resource.set_attr(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("carina-rs".to_string())),
+    );
+    let resources = vec![resource];
+    let state_entries = vec![AnonymousIdStateInfo {
+        name: "sso_instance_0ac0620303071530".to_string(),
+        create_only_values: vec![("name".to_string(), "carina-rs".to_string())]
+            .into_iter()
+            .collect(),
+    }];
+    let claims = StateBlockClaims::new(
+        HashSet::new(),
+        [StateBlockAddress::new("awscc", "sso.Instance", "sso")]
+            .into_iter()
+            .collect(),
+    );
+
+    let renames = super::detect_anonymous_to_named_renames_for_test(
+        &resources,
+        &schemas,
+        &|_provider, _rt| state_entries.clone(),
+        &[],
+        &|_provider| Vec::new(),
+        &claims,
+    );
+
+    assert!(
+        renames.is_empty(),
+        "anonymous-to-named detector must not synthesize a rename onto a claimed to"
+    );
+}
+
+#[test]
+fn test_reconcile_skips_state_entry_claimed_by_removed_from() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", route_schema_with_create_only_route_table());
+    let mut resources = vec![route_with_deferred_route_table(
+        "awscc_ec2_route_aaaaaaaa",
+        "private_rtb",
+    )];
+    let state_name = "awscc_ec2_route_11111111";
+    let state_entries = vec![route_state_entry(state_name, "rtb-private")];
+    let binding_entries = [binding_state_entry(
+        "private_rtb",
+        "private_rtb",
+        &[("id", "rtb-private")],
+    )];
+    let claims = StateBlockClaims::new(
+        [StateBlockAddress::new("awscc", "ec2.Route", state_name)]
+            .into_iter()
+            .collect(),
+        HashSet::new(),
+    );
+
+    super::reconcile_anonymous_identifiers(
+        &mut resources,
+        &schemas,
+        &|_, _| state_entries.clone(),
+        &|binding| {
+            binding_entries
+                .iter()
+                .filter(|(entry_binding, _)| entry_binding == binding)
+                .map(|(_, entry)| entry.clone())
+                .collect()
+        },
+        &claims,
+    );
+
+    assert_eq!(
+        resources[0].id.name_str(),
+        "awscc_ec2_route_aaaaaaaa",
+        "effective removed.from state row must be excluded from heuristic matching"
+    );
 }
 
 #[test]

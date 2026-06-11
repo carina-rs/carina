@@ -1,0 +1,35 @@
+{
+  "version": 7,
+  "serial": 1,
+  "lineage": "test-moved-claims-precede-heuristics",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "test.Widget",
+      "name": "test_widget_11111111",
+      "provider": "awscc",
+      "identifier": "widget-live-1",
+      "attributes": {
+        "id": "widget-live-1",
+        "external_name": "claimed-widget"
+      },
+      "protected": false,
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false
+      },
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": null,
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "external_name": {
+            "kind": "leaf"
+          }
+        }
+      }
+    }
+  ]
+}

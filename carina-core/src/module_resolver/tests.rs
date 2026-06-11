@@ -16,6 +16,17 @@ use crate::parser::{ArgumentParameter, ModuleCall, ParsedFile, ProviderContext, 
 use crate::resource::{ConcreteValue, DeferredValue, Directives, Resource, ResourceId, Value};
 use crate::schema::TypeIdentity;
 
+fn reconcile_anonymous_module_instances(
+    resources: &mut [Resource],
+    find_state_names_by_type: &dyn Fn(&str, &str) -> Vec<String>,
+) {
+    crate::module_resolver::reconcile_anonymous_module_instances(
+        resources,
+        find_state_names_by_type,
+        &crate::identifier::StateBlockClaims::empty(),
+    );
+}
+
 fn create_test_module() -> ParsedFile {
     ParsedFile {
         providers: vec![],
@@ -1259,6 +1270,105 @@ thing { name = 'after-edit' }
         role.binding.as_deref(),
         Some(format!("thing_{:016x}.role", state_hash).as_str()),
         "binding should be remapped too",
+    );
+}
+
+#[test]
+fn test_module_instance_reconcile_skips_claimed_prefix() {
+    let mut claimed_from = resolve_thing_fixture(
+        r#"
+let thing = use { source = '../modules/thing' }
+
+thing { name = 'after-edit' }
+"#,
+    );
+    let before_name = claimed_from
+        .resources
+        .iter()
+        .find(|r| r.id.resource_type == "iam.Role")
+        .unwrap()
+        .id
+        .name_str()
+        .to_string();
+    let (current_prefix, _) = before_name.split_once('.').unwrap();
+    let (_, current_hash) = parse_synthetic_instance_prefix(current_prefix).unwrap();
+    let state_hash = current_hash.with_flipped_mask_for_test(1);
+    let state_name = format!("thing_{:016x}.role", state_hash);
+    let state_lookup = |_: &str, _: &str| vec![state_name.clone()];
+    let claims = crate::identifier::StateBlockClaims::new(
+        [crate::parser::StateBlockAddress::new(
+            "awscc",
+            "iam.Role",
+            &state_name,
+        )]
+        .into_iter()
+        .collect(),
+        HashSet::new(),
+    );
+
+    crate::module_resolver::reconcile_anonymous_module_instances(
+        &mut claimed_from.resources,
+        &state_lookup,
+        &claims,
+    );
+    assert_eq!(
+        claimed_from
+            .resources
+            .iter()
+            .find(|r| r.id.resource_type == "iam.Role")
+            .unwrap()
+            .id
+            .name_str(),
+        before_name,
+        "a claimed state child must exclude the whole state prefix from orphan candidates",
+    );
+
+    let mut claimed_to = resolve_thing_fixture(
+        r#"
+let thing = use { source = '../modules/thing' }
+
+thing { name = 'after-edit' }
+"#,
+    );
+    let before_name = claimed_to
+        .resources
+        .iter()
+        .find(|r| r.id.resource_type == "iam.Role")
+        .unwrap()
+        .id
+        .name_str()
+        .to_string();
+    let (current_prefix, _) = before_name.split_once('.').unwrap();
+    let (_, current_hash) = parse_synthetic_instance_prefix(current_prefix).unwrap();
+    let state_hash = current_hash.with_flipped_mask_for_test(1);
+    let state_name = format!("thing_{:016x}.role", state_hash);
+    let state_lookup = |_: &str, _: &str| vec![state_name.clone()];
+    let claims = crate::identifier::StateBlockClaims::new(
+        HashSet::new(),
+        [crate::parser::StateBlockAddress::new(
+            "awscc",
+            "iam.Role",
+            &before_name,
+        )]
+        .into_iter()
+        .collect(),
+    );
+
+    crate::module_resolver::reconcile_anonymous_module_instances(
+        &mut claimed_to.resources,
+        &state_lookup,
+        &claims,
+    );
+    assert_eq!(
+        claimed_to
+            .resources
+            .iter()
+            .find(|r| r.id.resource_type == "iam.Role")
+            .unwrap()
+            .id
+            .name_str(),
+        before_name,
+        "a claimed desired child must pin the whole current prefix",
     );
 }
 

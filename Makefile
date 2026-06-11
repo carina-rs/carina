@@ -72,6 +72,8 @@ plan-moved-prev-keys:
 	$(PLAN_FIXTURE) moved_prev_keys
 plan-moved-pure:
 	$(PLAN_FIXTURE) moved_pure
+plan-moved-claims-precede-heuristics:
+	$(PLAN_FIXTURE) moved_claims_precede_heuristics
 plan-map-diff-tui:
 	$(PLAN_FIXTURE) map_key_diff --tui
 plan-all-create-tui:
@@ -172,6 +174,9 @@ plan-fixtures:
 	@echo ""
 	@echo "=== moved_pure ==="
 	@$(MAKE) plan-moved-pure
+	@echo ""
+	@echo "=== moved_claims_precede_heuristics ==="
+	@$(MAKE) plan-moved-claims-precede-heuristics
 	@echo ""
 	@echo "=== upstream_state ==="
 	@$(MAKE) plan-upstream-state
@@ -278,6 +283,7 @@ plan-multi-instance-module:
         plan-enum-display plan-destroy-full plan-destroy-orphans plan-read-only-attrs \
         plan-default-values plan-explicit plan-default-tags \
         plan-state-blocks plan-secret-values plan-moved-with-changes plan-moved-prev-keys plan-moved-pure \
+        plan-moved-claims-precede-heuristics \
         plan-upstream-state plan-upstream-state-unresolved plan-upstream-state-empty-exports \
         plan-upstream-state-map-subscript plan-upstream-state-map-dot-notation \
         plan-deferred-for plan-exports plan-exports-multifile \
