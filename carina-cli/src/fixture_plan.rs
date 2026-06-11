@@ -100,7 +100,10 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         assert!(errors.is_empty(), "{errors:?}");
     }
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
-    let state_block_claims = crate::wiring::resolve_state_block_claims(
+    let crate::wiring::StateBlockResolution {
+        claims: state_block_claims,
+        targets: resolved_state_block_targets,
+    } = crate::wiring::resolve_state_blocks(
         &parsed.state_blocks,
         &state_file,
         &parsed.resources,
@@ -305,6 +308,13 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &parsed.state_blocks,
         &state_file,
     );
+    crate::wiring::validate_plan_time_state_block_collisions(
+        &sorted_resources,
+        &moved_pairs,
+        &resolved_state_block_targets,
+        &state_file,
+    )
+    .expect("state block collision validation failed");
 
     // carina#3358: resolve `until` predicate enum aliases before the
     // differ lowers the wait, the same step the plan/apply pipelines run.

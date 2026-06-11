@@ -814,7 +814,10 @@ async fn run_apply_locked(
     let mut state_file = load_state_persist_if_migrated(backend, lock).await?;
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
-    let state_block_claims = crate::wiring::resolve_state_block_claims(
+    let crate::wiring::StateBlockResolution {
+        claims: state_block_claims,
+        targets: resolved_state_block_targets,
+    } = crate::wiring::resolve_state_blocks(
         &parsed.state_blocks,
         &state_file,
         &parsed.resources,
@@ -1038,7 +1041,6 @@ async fn run_apply_locked(
         ));
         pairs
     };
-
     // Wait bindings become passthrough aliases to their targets
     // (carina#3085). Built once here so every resolution phase below
     // (data-source refresh, initial bindings, ref resolution, exports)
@@ -1126,6 +1128,12 @@ async fn run_apply_locked(
     })
     .await?;
     sorted_resources = resorted;
+    crate::wiring::validate_plan_time_state_block_collisions(
+        &sorted_resources,
+        &moved_pairs,
+        &resolved_state_block_targets,
+        &state_file,
+    )?;
     // Expansion borrows `parsed` immutably (expands a clone), so
     // `parsed.deferred_for_expressions` is NOT drained of resolved
     // loops the way the old `&mut self` call drained it. `print_plan`

@@ -811,6 +811,345 @@ fn test_materialize_moved_states_warns_on_missing_from() {
     );
 }
 
+fn bucket_id(name: &str) -> ResourceId {
+    ResourceId::with_provider("awscc", "s3.Bucket", name, None)
+}
+
+fn bucket_resource(name: &str) -> Resource {
+    Resource::with_provider("awscc", "s3.Bucket", name, None)
+}
+
+fn bucket_state_file(names: &[&str]) -> carina_state::state::StateFile {
+    use carina_state::state::{ResourceState, StateFile};
+
+    let mut state_file = StateFile::new();
+    for name in names {
+        state_file
+            .resources
+            .push(ResourceState::new("s3.Bucket", *name, "awscc"));
+    }
+    state_file
+}
+
+fn assert_collision_contains(result: Result<(), AppError>, needle: &str) {
+    let err = result.expect_err("expected collision error");
+    assert!(
+        matches!(err, AppError::Validation(_)),
+        "collision errors must be validation errors, got {err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains(needle),
+        "expected error to contain {needle:?}, got {message:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_plan_fails_on_moved_from_colliding_with_desired() {
+    use carina_core::parser::{ProviderContext, parse};
+
+    let source = r#"
+let live = awscc.s3.Bucket {
+    bucket_name = "live"
+}
+
+moved {
+    from = awscc.s3.Bucket "live"
+    to   = awscc.s3.Bucket "renamed"
+}
+"#;
+    let parsed = parse(source, &ProviderContext::default()).expect("parse fixture");
+    let state_file = Some(bucket_state_file(&["live"]));
+    let StateBlockResolution {
+        claims: state_block_claims,
+        targets: resolved_state_block_targets,
+    } = resolve_state_blocks(
+        &parsed.state_blocks,
+        &state_file,
+        &parsed.resources,
+        &carina_core::schema::SchemaRegistry::new(),
+    );
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let err = match create_plan_from_parsed_with_upstream(
+        &parsed,
+        &state_file,
+        false,
+        &HashMap::new(),
+        &state_block_claims,
+        &resolved_state_block_targets,
+        tmp.path(),
+    )
+    .await
+    {
+        Ok(_) => panic!("plan must fail before producing a green move plan"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(
+        matches!(err, AppError::Validation(_)),
+        "plan collision errors must be validation errors, got {err:?}"
+    );
+    assert!(
+        message.contains(
+            "moved/rename pair from awscc.s3.Bucket live collides with a desired resource"
+        ),
+        "unexpected plan error: {message}"
+    );
+}
+
+#[tokio::test]
+async fn test_plan_fails_on_removed_from_colliding_with_expanded_loop_child() {
+    use carina_core::parser::{ProviderContext, parse};
+    use carina_state::state::{ResourceState, StateFile};
+
+    let source = r#"
+let cert = aws.acm.Certificate {
+    domain_name       = "r.example.com"
+    validation_method = "DNS"
+}
+
+let records = for (_, opt) in cert.domain_validation_options {
+    aws.route53.RecordSet {
+        name             = opt.resource_record.name
+        type             = "CNAME"
+        resource_records = [opt.resource_record.value]
+    }
+}
+
+removed {
+    from = aws.route53.RecordSet "records[0]"
+}
+"#;
+    let parsed = parse(source, &ProviderContext::default()).expect("parse removed fixture");
+    let state_file = {
+        let mut sf = StateFile::new();
+        sf.resources.push(
+            ResourceState::new("acm.Certificate", "cert", "aws")
+                .with_identifier("cert-arn")
+                .with_attribute(
+                    "domain_validation_options",
+                    serde_json::json!([
+                        {
+                            "resource_record": {
+                                "name": "_a1.r.example.com",
+                                "value": "_a1.acm-validations.aws."
+                            }
+                        }
+                    ]),
+                ),
+        );
+        sf.resources.push(
+            ResourceState::new("route53.RecordSet", "records[0]", "aws")
+                .with_identifier("record-set-id"),
+        );
+        Some(sf)
+    };
+    let StateBlockResolution {
+        claims: state_block_claims,
+        targets: resolved_state_block_targets,
+    } = resolve_state_blocks(
+        &parsed.state_blocks,
+        &state_file,
+        &parsed.resources,
+        &carina_core::schema::SchemaRegistry::new(),
+    );
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let err = match create_plan_from_parsed_with_upstream(
+        &parsed,
+        &state_file,
+        false,
+        &HashMap::new(),
+        &state_block_claims,
+        &resolved_state_block_targets,
+        tmp.path(),
+    )
+    .await
+    {
+        Ok(_) => panic!("plan must fail once deferred-for children are in the desired set"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("removed block from aws.route53.RecordSet"),
+        "unexpected plan error: {message}"
+    );
+    assert!(
+        message.contains("collides with desired resource"),
+        "unexpected plan error: {message}"
+    );
+}
+
+#[test]
+fn test_plan_fails_on_two_moves_to_same_target() {
+    let desired = Vec::new();
+    let state_file = Some(bucket_state_file(&["old_a", "old_b"]));
+    let moved_pairs = vec![
+        (bucket_id("old_a"), bucket_id("target")),
+        (bucket_id("old_b"), bucket_id("target")),
+    ];
+
+    assert_collision_contains(
+        validate_plan_time_state_block_collisions(
+            &desired,
+            &moved_pairs,
+            &ResolvedStateBlockTargets::default(),
+            &state_file,
+        ),
+        "two moved/rename pairs resolve to the same target awscc.s3.Bucket target",
+    );
+}
+
+#[test]
+fn test_plan_fails_on_two_moves_from_same_source() {
+    let desired = Vec::new();
+    let state_file = Some(bucket_state_file(&["old"]));
+    let moved_pairs = vec![
+        (bucket_id("old"), bucket_id("target_a")),
+        (bucket_id("old"), bucket_id("target_b")),
+    ];
+
+    assert_collision_contains(
+        validate_plan_time_state_block_collisions(
+            &desired,
+            &moved_pairs,
+            &ResolvedStateBlockTargets::default(),
+            &state_file,
+        ),
+        "two moved/rename pairs share the same source awscc.s3.Bucket old",
+    );
+}
+
+#[test]
+fn test_plan_fails_on_removed_from_colliding_with_desired() {
+    let desired = vec![bucket_resource("live")];
+    let state_file = Some(bucket_state_file(&["live"]));
+    let blocks = vec![StateBlock::Removed {
+        from: StateBlockAddress::new("awscc", "s3.Bucket", "live"),
+    }];
+    let resolution = resolve_state_blocks(
+        &blocks,
+        &state_file,
+        &desired,
+        &carina_core::schema::SchemaRegistry::new(),
+    );
+
+    assert_collision_contains(
+        validate_plan_time_state_block_collisions(&desired, &[], &resolution.targets, &state_file),
+        "removed block from awscc.s3.Bucket live collides with desired resource awscc.s3.Bucket live",
+    );
+}
+
+#[test]
+fn test_plan_fails_on_move_onto_occupied_state_entry() {
+    let desired = Vec::new();
+    let state_file = Some(bucket_state_file(&["old", "occupied"]));
+    let moved_pairs = vec![(bucket_id("old"), bucket_id("occupied"))];
+
+    assert_collision_contains(
+        validate_plan_time_state_block_collisions(
+            &desired,
+            &moved_pairs,
+            &ResolvedStateBlockTargets::default(),
+            &state_file,
+        ),
+        "moved/rename pair awscc.s3.Bucket old -> awscc.s3.Bucket occupied would overwrite an existing state entry",
+    );
+}
+
+#[test]
+fn test_plan_allows_from_absent_to_present_idempotent_noop() {
+    let desired = Vec::new();
+    let state_file = Some(bucket_state_file(&["already_moved"]));
+    let state_blocks = vec![StateBlock::Moved {
+        from: StateBlockAddress::new("awscc", "s3.Bucket", "old_name"),
+        to: StateBlockAddress::new("awscc", "s3.Bucket", "already_moved"),
+    }];
+    let mut warnings = Vec::new();
+
+    let moved_pairs = materialize_moved_states_with_warning_sink(
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &state_blocks,
+        &state_file,
+        &mut |warning| warnings.push(warning),
+    );
+    assert!(
+        moved_pairs.is_empty(),
+        "already-applied moved block must not produce a move pair"
+    );
+    assert!(
+        warnings.is_empty(),
+        "already-applied moved block must stay silent"
+    );
+
+    validate_plan_time_state_block_collisions(
+        &desired,
+        &moved_pairs,
+        &ResolvedStateBlockTargets::default(),
+        &state_file,
+    )
+    .expect("from-absent/to-present no-op must not error");
+}
+
+#[test]
+fn test_plan_fails_on_synthesized_rename_colliding_with_moved_to() {
+    let desired = Vec::new();
+    let state_file = Some(bucket_state_file(&["operator_source", "anonymous_source"]));
+    let operator_moved_pair = (bucket_id("operator_source"), bucket_id("named"));
+    let synthesized_rename_pair = (bucket_id("anonymous_source"), bucket_id("named"));
+    let moved_pairs = vec![operator_moved_pair, synthesized_rename_pair];
+
+    assert_collision_contains(
+        validate_plan_time_state_block_collisions(
+            &desired,
+            &moved_pairs,
+            &ResolvedStateBlockTargets::default(),
+            &state_file,
+        ),
+        "two moved/rename pairs resolve to the same target awscc.s3.Bucket named",
+    );
+}
+
+#[test]
+fn test_plan_fails_on_orphan_self_move() {
+    let desired = Vec::new();
+    let state_file = Some(bucket_state_file(&["orphan"]));
+    let moved_pairs = vec![(bucket_id("orphan"), bucket_id("orphan"))];
+
+    assert_collision_contains(
+        validate_plan_time_state_block_collisions(
+            &desired,
+            &moved_pairs,
+            &ResolvedStateBlockTargets::default(),
+            &state_file,
+        ),
+        "moved block from and to name the same address awscc.s3.Bucket orphan: a self-move cannot transfer state",
+    );
+}
+
+#[test]
+fn test_plan_fails_on_rotation_shape() {
+    let desired = vec![bucket_resource("b"), bucket_resource("c")];
+    let state_file = Some(bucket_state_file(&["a", "b"]));
+    let moved_pairs = vec![
+        (bucket_id("a"), bucket_id("b")),
+        (bucket_id("b"), bucket_id("c")),
+    ];
+
+    assert_collision_contains(
+        validate_plan_time_state_block_collisions(
+            &desired,
+            &moved_pairs,
+            &ResolvedStateBlockTargets::default(),
+            &state_file,
+        ),
+        "moved/rename pair from awscc.s3.Bucket b collides with a desired resource",
+    );
+}
+
 struct AssociationCreateOnlyFactory;
 
 impl ProviderFactory for AssociationCreateOnlyFactory {
@@ -1285,7 +1624,10 @@ moved {{
     }
 
     let parsed = parse(&source, &ProviderContext::default()).expect("parse fixture");
-    let state_block_claims = resolve_state_block_claims(
+    let StateBlockResolution {
+        claims: state_block_claims,
+        targets: resolved_state_block_targets,
+    } = resolve_state_blocks(
         &parsed.state_blocks,
         &Some(state_file.clone()),
         &parsed.resources,
@@ -1298,6 +1640,7 @@ moved {{
         false,
         &HashMap::new(),
         &state_block_claims,
+        &resolved_state_block_targets,
         tmp.path(),
     )
     .await

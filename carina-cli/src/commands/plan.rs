@@ -559,7 +559,10 @@ pub async fn run_plan(
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
     let wiring = WiringContext::new(factories);
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
-    let state_block_claims = crate::wiring::resolve_state_block_claims(
+    let crate::wiring::StateBlockResolution {
+        claims: state_block_claims,
+        targets: resolved_state_block_targets,
+    } = crate::wiring::resolve_state_blocks(
         &parsed.state_blocks,
         &state_file,
         &parsed.resources,
@@ -627,6 +630,7 @@ pub async fn run_plan(
         refresh,
         &remote_bindings,
         &state_block_claims,
+        &resolved_state_block_targets,
         base_dir,
     )
     .await?;
