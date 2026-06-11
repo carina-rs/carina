@@ -220,11 +220,15 @@ resolution step before comparison instead of giving up:
 
 - Exactly one form is resolved: a single-hop
   `ResourceRef(<binding>.<attr>)`. Find the state entry whose `binding`
-  field equals `<binding>` (scoped to the same module instance prefix
-  when the referring resource has one), and read `<attr>` from its
-  `attributes`, converted through the same canonical string used for
-  state-side create-only values
+  field equals `<binding>`, and read `<attr>` from its `attributes`,
+  converted through the same canonical string used for state-side
+  create-only values
   (`canonical_create_only_state_json_string`).
+  Scope is decided from the binding string itself: a dotted binding
+  (`inst.x`) is already instance-qualified by construction, so equality
+  suffices; a bare binding is a root binding and must match a dot-free
+  state entry name. Referrer-based scoping was rejected because
+  argument-passed root refs keep the bare root binding and would be excluded.
 - Everything else stays unresolved by design: `Interpolation`,
   `BindingRef`, multi-hop paths (`binding.attr.sub`), function calls.
   Unresolved means no value for that attribute, exactly like an

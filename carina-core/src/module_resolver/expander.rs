@@ -5,6 +5,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use indexmap::IndexMap;
 
+use crate::identifier::SimHash;
 use crate::parser::{
     ArgumentParameter, BindingName, DeferredForExpression, ModuleCall, ParsedFile, WaitBinding,
 };
@@ -988,12 +989,9 @@ pub fn instance_prefix_for_call(call: &ModuleCall) -> String {
 /// Split a module-instance prefix into `(module_name, simhash)` when the
 /// tail looks like a 16-hex SimHash. Returns `None` for non-synthetic prefixes
 /// (user-written binding names, pre-SimHash state formats, etc.).
-pub(super) fn parse_synthetic_instance_prefix(prefix: &str) -> Option<(&str, u64)> {
+pub(super) fn parse_synthetic_instance_prefix(prefix: &str) -> Option<(&str, SimHash)> {
     let (module, hex) = prefix.rsplit_once('_')?;
-    if hex.len() != 16 {
-        return None;
-    }
-    let simhash = u64::from_str_radix(hex, 16).ok()?;
+    let simhash = SimHash::parse_16_hex(hex)?;
     if module.is_empty() {
         return None;
     }
@@ -1043,7 +1041,7 @@ pub fn reconcile_anonymous_module_instances(
     // Current DSL synthetic prefixes per module — only one entry per
     // distinct prefix (a multi-resource module instance shares one prefix
     // across all of its resources).
-    let mut current_synthetic_by_module: HashMap<String, HashSet<u64>> = HashMap::new();
+    let mut current_synthetic_by_module: HashMap<String, HashSet<SimHash>> = HashMap::new();
     for r in resources.iter() {
         let Some((prefix, _)) = split_instance_prefix(r.id.name_str()) else {
             continue;
@@ -1063,7 +1061,7 @@ pub fn reconcile_anonymous_module_instances(
     // Vec the same hash would appear N times and the Hamming-distance
     // search below would mistake duplicates for ambiguous candidates and
     // refuse to remap (#2211).
-    let mut state_synthetic_by_module: HashMap<String, HashSet<u64>> = HashMap::new();
+    let mut state_synthetic_by_module: HashMap<String, HashSet<SimHash>> = HashMap::new();
 
     for (provider, resource_type) in &touched_types {
         for name in find_state_names_by_type(provider, resource_type) {
@@ -1085,12 +1083,12 @@ pub fn reconcile_anonymous_module_instances(
     // exclude any prefix already used by a current DSL instance — without
     // that filter, two distinct anonymous calls could collapse onto the same
     // state entry when only one of them existed before.
-    let mut prefix_remap: HashMap<(String, u64), u64> = HashMap::new();
+    let mut prefix_remap: HashMap<(String, SimHash), SimHash> = HashMap::new();
     for (module, current_hashes) in &current_synthetic_by_module {
         let Some(state_hashes) = state_synthetic_by_module.get(module) else {
             continue;
         };
-        let orphan_state_hashes: Vec<u64> = state_hashes
+        let orphan_state_hashes: Vec<SimHash> = state_hashes
             .iter()
             .copied()
             .filter(|h| !current_hashes.contains(h))
@@ -1163,7 +1161,7 @@ pub fn reconcile_anonymous_module_instances(
 
 fn rewrite_ref_prefixes(
     value: &Value,
-    remap: &std::collections::HashMap<(String, u64), u64>,
+    remap: &std::collections::HashMap<(String, SimHash), SimHash>,
 ) -> Value {
     match value {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {

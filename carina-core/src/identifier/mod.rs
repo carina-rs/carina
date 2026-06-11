@@ -245,12 +245,23 @@ fn canonical_create_only_value_string(value: &Value) -> Option<String> {
         Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
             Some(format!("EnumApiValue({:?})", c.api_value()))
         }
+        Value::Concrete(ConcreteValue::Int(i)) => Some(format!("Int({})", i)),
+        Value::Concrete(ConcreteValue::Float(f)) => Some(format!("Float({})", f)),
+        Value::Concrete(ConcreteValue::Bool(b)) => Some(format!("Bool({})", b)),
+        // State JSON stores durations as integer seconds, so the comparison
+        // channel must use the same form as the state-side Int round-trip.
+        Value::Concrete(ConcreteValue::Duration(d)) => Some(format!("Int({})", d.as_secs())),
         Value::Concrete(ConcreteValue::List(items)) => {
             let parts: Vec<String> = items
                 .iter()
                 .map(canonical_create_only_feature_string)
                 .collect();
             Some(format!("List([{}])", parts.join(", ")))
+        }
+        // State JSON cannot distinguish StringList from List, so the
+        // canonical comparison channel uses the List form.
+        Value::Concrete(ConcreteValue::StringList(items)) => {
+            Some(format!("List([{}])", items.join(", ")))
         }
         Value::Concrete(ConcreteValue::Map(map)) => {
             let mut entries: Vec<(&String, &Value)> = map.iter().collect();
@@ -287,6 +298,46 @@ pub fn canonical_create_only_state_json_string(value: &serde_json::Value) -> Opt
 /// with modified attributes.
 pub(crate) const SIMHASH_HAMMING_THRESHOLD: u32 = 20;
 
+/// A 64-bit SimHash value. The field is private so standard create-only
+/// hashes cannot be smuggled into Hamming-distance comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SimHash(u64);
+
+impl SimHash {
+    pub(crate) fn parse_16_hex(identifier_suffix: &str) -> Option<Self> {
+        if identifier_suffix.len() != 16 {
+            return None;
+        }
+        u64::from_str_radix(identifier_suffix, 16).ok().map(Self)
+    }
+
+    pub(crate) fn distance(self, other: SimHash) -> u32 {
+        (self.0 ^ other.0).count_ones()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_flipped_mask_for_test(self, mask: u64) -> Self {
+        Self(self.0 ^ mask)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_zero_for_test(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl std::fmt::LowerHex for SimHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::LowerHex::fmt(&self.0, f)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnonymousHashSuffix {
+    Standard(u32),
+    SimHash(SimHash),
+}
+
 /// Find the unique candidate closest (by Hamming distance) to `target` SimHash
 /// among `candidates`, below `SIMHASH_HAMMING_THRESHOLD`. Returns `None` when
 /// no candidate qualifies, or when two or more candidates tie at the minimum
@@ -294,14 +345,14 @@ pub(crate) const SIMHASH_HAMMING_THRESHOLD: u32 = 20;
 /// commit to (rebinding to the wrong state entry would silently corrupt
 /// addresses).
 pub(crate) fn closest_unique_simhash_match<C: Copy>(
-    target: u64,
+    target: SimHash,
     candidates: impl IntoIterator<Item = C>,
-    hash_of: impl Fn(C) -> u64,
+    hash_of: impl Fn(C) -> SimHash,
 ) -> Option<C> {
     let mut best: Option<(C, u32)> = None;
     let mut unique = true;
     for c in candidates {
-        let distance = (target ^ hash_of(c)).count_ones();
+        let distance = target.distance(hash_of(c));
         if distance >= SIMHASH_HAMMING_THRESHOLD {
             continue;
         }
@@ -356,7 +407,7 @@ pub(crate) fn flatten_value_for_simhash(
 /// using Hamming distance on the identifier alone.
 pub(crate) fn compute_simhash<K: std::fmt::Display>(
     attributes: &std::collections::BTreeMap<K, String>,
-) -> u64 {
+) -> SimHash {
     use std::hash::{Hash, Hasher};
 
     let mut v = [0i32; 64];
@@ -379,18 +430,20 @@ pub(crate) fn compute_simhash<K: std::fmt::Display>(
             result |= 1 << i;
         }
     }
-    result
+    SimHash(result)
 }
 
 /// Extract the hash portion from an anonymous resource identifier.
 ///
 /// Supports both 8 hex chars (standard hash, u32) and 16 hex chars (SimHash, u64).
 /// Identifier format: `{resource_type}_{hex}` (e.g., `ec2_eip_a3f2b1c8d79f1524`).
-pub(crate) fn extract_hash_from_identifier(identifier: &str) -> Option<u64> {
+pub(crate) fn extract_hash_from_identifier(identifier: &str) -> Option<AnonymousHashSuffix> {
     let hex_part = identifier.rsplit('_').next()?;
     match hex_part.len() {
-        16 => u64::from_str_radix(hex_part, 16).ok(),
-        8 => u32::from_str_radix(hex_part, 16).ok().map(|v| v as u64),
+        16 => SimHash::parse_16_hex(hex_part).map(AnonymousHashSuffix::SimHash),
+        8 => u32::from_str_radix(hex_part, 16)
+            .ok()
+            .map(AnonymousHashSuffix::Standard),
         _ => None,
     }
 }
@@ -404,7 +457,7 @@ pub(crate) fn extract_hash_from_identifier(identifier: &str) -> Option<u64> {
 fn simhash_from_identity_and_resource(
     identity_values: &BTreeMap<String, String>,
     resource: &Resource,
-) -> u64 {
+) -> SimHash {
     let mut simhash_values = identity_values.clone();
     for (key, value) in &resource.attributes {
         if key.starts_with('_') {
@@ -422,7 +475,7 @@ fn compute_resource_simhash(
     resource: &Resource,
     providers: &CanonicalizedProviderConfigs,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
-) -> u64 {
+) -> SimHash {
     let mut identity_values: BTreeMap<String, String> = BTreeMap::new();
     if !resource.id.provider.is_empty() {
         let identity_attrs = identity_attributes_fn(&resource.id.provider);
@@ -646,6 +699,51 @@ pub struct AnonymousIdStateInfo {
     pub create_only_values: HashMap<String, String>,
 }
 
+/// Cross-resource state information used to resolve simple deferred
+/// create-only references like `route_table_id = private_rtb.id`.
+#[derive(Clone)]
+pub struct AnonymousIdBindingStateInfo {
+    /// The resource name stored in state. Let-bound resources are usually
+    /// named by their binding (`private_rtb`, `inst.x`).
+    pub name: String,
+    /// Canonical attribute values from state, keyed by DSL attribute name
+    /// (the state JSON attribute key).
+    pub attribute_values: HashMap<String, String>,
+}
+
+fn state_entry_matches_binding_scope(binding: &str, state_name: &str) -> bool {
+    binding.contains('.') || !state_name.contains('.')
+}
+
+fn resolve_deferred_create_only_value_string(
+    value: &Value,
+    find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
+) -> Option<String> {
+    let Value::Deferred(DeferredValue::ResourceRef { path }) = value else {
+        return None;
+    };
+    if !path.segments().is_empty() {
+        return None;
+    }
+
+    let candidates: Vec<AnonymousIdBindingStateInfo> = find_state_by_binding(path.binding())
+        .into_iter()
+        .filter(|entry| state_entry_matches_binding_scope(path.binding(), &entry.name))
+        .collect();
+    let [entry] = candidates.as_slice() else {
+        return None;
+    };
+    entry.attribute_values.get(path.attribute()).cloned()
+}
+
+fn canonical_or_resolved_create_only_value_string(
+    value: &Value,
+    find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
+) -> Option<String> {
+    canonical_create_only_value_string(value)
+        .or_else(|| resolve_deferred_create_only_value_string(value, find_state_by_binding))
+}
+
 /// Reconcile anonymous resource identifiers with existing state.
 ///
 /// When a create-only property changes on an anonymous resource, the computed
@@ -656,6 +754,14 @@ pub struct AnonymousIdStateInfo {
 ///
 /// `find_state_by_type` takes (provider, resource_type) and returns all state
 /// entries for that resource type with their create-only attribute values.
+/// `find_state_by_binding` takes a binding name and returns state entries
+/// carrying that binding across resource types, for resolving single-hop
+/// deferred create-only refs of the exact form `binding.attr`. Binding
+/// resolution is unresolvable when zero state entries match and ambiguous when
+/// multiple state entries with the same binding are visible in scope; both
+/// cases yield no value and are not errors. Dotted bindings are already
+/// module-qualified by their binding string, while bare bindings only resolve
+/// against dot-free root state entry names.
 ///
 /// Returns a list of `(old_state_name, new_resource_name)` pairs that the
 /// caller should apply to state-keyed maps. These are emitted when a SimHash
@@ -667,6 +773,7 @@ pub fn reconcile_anonymous_identifiers(
     resources: &mut [Resource],
     registry: &SchemaRegistry,
     find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
+    find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
 ) -> Vec<(String, String)> {
     let mut renames: Vec<(String, String)> = Vec::new();
     let mut used_names: HashMap<(String, String), HashSet<String>> = HashMap::new();
@@ -718,7 +825,8 @@ pub fn reconcile_anonymous_identifiers(
         let mut resource_co_values: HashMap<&str, String> = HashMap::new();
         for attr_name in &create_only_attrs {
             if let Some(value) = resource.get_attr(attr_name)
-                && let Some(value) = canonical_create_only_value_string(value)
+                && let Some(value) =
+                    canonical_or_resolved_create_only_value_string(value, find_state_by_binding)
             {
                 resource_co_values.insert(attr_name, value);
             }
@@ -727,36 +835,31 @@ pub fn reconcile_anonymous_identifiers(
         if create_only_attrs.is_empty() || resource_co_values.is_empty() {
             // No create-only properties or none set: use SimHash-based Hamming distance
             // matching to find the closest state entry.
-            let Some(resource_hash) = extract_hash_from_identifier(resource.id.name_str()) else {
+            let Some(AnonymousHashSuffix::SimHash(resource_hash)) =
+                extract_hash_from_identifier(resource.id.name_str())
+            else {
                 continue;
             };
 
-            let mut best_match: Option<(&str, u32)> = None;
-            for entry in &state_entries {
-                if entry.name == resource.id.name_str() {
-                    continue;
-                }
-                if used_names
-                    .get(&key)
-                    .is_some_and(|names| names.contains(&entry.name))
-                    || claimed_names
+            let candidates = state_entries
+                .iter()
+                .filter(|entry| entry.name != resource.id.name_str())
+                .filter(|entry| {
+                    !used_names
                         .get(&key)
                         .is_some_and(|names| names.contains(&entry.name))
-                {
-                    continue;
-                }
-                let Some(state_hash) = extract_hash_from_identifier(&entry.name) else {
-                    continue;
-                };
-                let distance = (resource_hash ^ state_hash).count_ones();
-                if distance < SIMHASH_HAMMING_THRESHOLD
-                    && (best_match.is_none() || distance < best_match.unwrap().1)
-                {
-                    best_match = Some((&entry.name, distance));
-                }
-            }
+                        && !claimed_names
+                            .get(&key)
+                            .is_some_and(|names| names.contains(&entry.name))
+                })
+                .filter_map(|entry| match extract_hash_from_identifier(&entry.name) {
+                    Some(AnonymousHashSuffix::SimHash(hash)) => Some((entry.name.as_str(), hash)),
+                    _ => None,
+                });
 
-            if let Some((state_name, _)) = best_match {
+            if let Some((state_name, _)) =
+                closest_unique_simhash_match(resource_hash, candidates, |(_, hash)| hash)
+            {
                 // The state entry may use an older identifier format (e.g.
                 // pre-provider-prefix). Keep our freshly-computed new-format
                 // name on the resource and record a rename so the wiring
@@ -961,12 +1064,9 @@ pub fn detect_anonymous_to_named_renames(
             let candidates = state_entries
                 .iter()
                 .filter(|e| !used_in_dsl.contains(&e.name))
-                // Only consider state entries written via the SimHash path
-                // (16-hex suffix). 8-hex entries come from the create-only
-                // hash scheme and are meaningless to XOR with a 64-bit SimHash.
-                .filter(|e| e.name.rsplit('_').next().map(str::len) == Some(16))
-                .filter_map(|e| {
-                    extract_hash_from_identifier(&e.name).map(|h| (e.name.as_str(), h))
+                .filter_map(|e| match extract_hash_from_identifier(&e.name) {
+                    Some(AnonymousHashSuffix::SimHash(hash)) => Some((e.name.as_str(), hash)),
+                    _ => None,
                 });
             closest_unique_simhash_match(resource_hash, candidates, |(_, h)| h)
                 .map(|(name, _)| name)
