@@ -893,6 +893,35 @@ fn snapshot_moved_pure() {
     insta::assert_snapshot!(output);
 }
 
+/// Production-ordered fixture for RC2 claims precedence: the state row's
+/// create-only values would make anonymous reconciliation adopt the old hash
+/// name if the moved block did not claim it first.
+#[test]
+fn snapshot_moved_claims_precede_heuristics() {
+    let (plan, schemas, moved_origins) = build_plan_from_fixture("moved_claims_precede_heuristics");
+    assert_eq!(plan.summary().create, 0);
+    assert_eq!(plan.summary().delete, 0);
+    assert_eq!(plan.summary().moved, 1);
+    assert!(
+        plan.effects()
+            .iter()
+            .any(|e| matches!(e, carina_core::effect::Effect::Move { .. })),
+        "claims-precedence fixture should produce a Move effect"
+    );
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &moved_origins,
+        &[],
+        &[],
+        None,
+        None,
+    ));
+    insta::assert_snapshot!(output);
+}
+
 /// Compact (`DetailLevel::None`) rendering of a moved Update effect.
 ///
 /// Locks in the `(moved from: <name>)` annotation form on the

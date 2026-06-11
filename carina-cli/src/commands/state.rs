@@ -912,8 +912,19 @@ pub(crate) async fn run_state_refresh_locked(
     }
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
+    let state_block_claims = crate::wiring::resolve_state_block_claims(
+        &parsed.state_blocks,
+        &state_file,
+        &parsed.resources,
+        ctx.schemas(),
+    );
     if let Some(sf) = state_file.as_mut() {
-        reconcile_anonymous_identifiers_with_ctx(&ctx, &mut parsed.resources, sf);
+        reconcile_anonymous_identifiers_with_ctx(
+            &ctx,
+            &mut parsed.resources,
+            sf,
+            &state_block_claims,
+        );
     }
     apply_name_overrides(&mut parsed.resources, &state_file);
 

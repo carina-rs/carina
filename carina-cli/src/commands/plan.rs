@@ -559,6 +559,12 @@ pub async fn run_plan(
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
     let wiring = WiringContext::new(factories);
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
+    let state_block_claims = crate::wiring::resolve_state_block_claims(
+        &parsed.state_blocks,
+        &state_file,
+        &parsed.resources,
+        wiring.schemas(),
+    );
     if let Some(sf) = state_file.as_ref() {
         carina_core::module_resolver::reconcile_anonymous_module_instances(
             &mut parsed.resources,
@@ -568,10 +574,16 @@ pub async fn run_plan(
                     .map(|r| r.name.clone())
                     .collect()
             },
+            &state_block_claims,
         );
     }
     if let Some(sf) = state_file.as_mut() {
-        reconcile_anonymous_identifiers_with_ctx(&wiring, &mut parsed.resources, sf);
+        reconcile_anonymous_identifiers_with_ctx(
+            &wiring,
+            &mut parsed.resources,
+            sf,
+            &state_block_claims,
+        );
     }
     apply_name_overrides(&mut parsed.resources, &state_file);
 
@@ -614,6 +626,7 @@ pub async fn run_plan(
         &state_file,
         refresh,
         &remote_bindings,
+        &state_block_claims,
         base_dir,
     )
     .await?;

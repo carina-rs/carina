@@ -1021,6 +1021,7 @@ pub(super) fn split_instance_prefix(name: &str) -> Option<(&str, &str)> {
 pub fn reconcile_anonymous_module_instances(
     resources: &mut [Resource],
     find_state_names_by_type: &dyn Fn(&str, &str) -> Vec<String>,
+    claims: &crate::identifier::StateBlockClaims,
 ) {
     use std::collections::{HashMap, HashSet};
 
@@ -1042,6 +1043,7 @@ pub fn reconcile_anonymous_module_instances(
     // distinct prefix (a multi-resource module instance shares one prefix
     // across all of its resources).
     let mut current_synthetic_by_module: HashMap<String, HashSet<SimHash>> = HashMap::new();
+    let mut claimed_current_by_module: HashMap<String, HashSet<SimHash>> = HashMap::new();
     for r in resources.iter() {
         let Some((prefix, _)) = split_instance_prefix(r.id.name_str()) else {
             continue;
@@ -1053,6 +1055,12 @@ pub fn reconcile_anonymous_module_instances(
             .entry(module.to_string())
             .or_default()
             .insert(simhash);
+        if claims.claims_to(&r.id.provider, &r.id.resource_type, r.id.name_str()) {
+            claimed_current_by_module
+                .entry(module.to_string())
+                .or_default()
+                .insert(simhash);
+        }
     }
 
     // State synthetic prefixes per module. Use a set so a multi-resource
@@ -1062,6 +1070,7 @@ pub fn reconcile_anonymous_module_instances(
     // search below would mistake duplicates for ambiguous candidates and
     // refuse to remap (#2211).
     let mut state_synthetic_by_module: HashMap<String, HashSet<SimHash>> = HashMap::new();
+    let mut claimed_state_by_module: HashMap<String, HashSet<SimHash>> = HashMap::new();
 
     for (provider, resource_type) in &touched_types {
         for name in find_state_names_by_type(provider, resource_type) {
@@ -1075,6 +1084,12 @@ pub fn reconcile_anonymous_module_instances(
                 .entry(module.to_string())
                 .or_default()
                 .insert(simhash);
+            if claims.claims_from(provider, resource_type, &name) {
+                claimed_state_by_module
+                    .entry(module.to_string())
+                    .or_default()
+                    .insert(simhash);
+            }
         }
     }
 
@@ -1092,12 +1107,23 @@ pub fn reconcile_anonymous_module_instances(
             .iter()
             .copied()
             .filter(|h| !current_hashes.contains(h))
+            .filter(|h| {
+                !claimed_state_by_module
+                    .get(module)
+                    .is_some_and(|hashes| hashes.contains(h))
+            })
             .collect();
         if orphan_state_hashes.is_empty() {
             continue;
         }
         for current_hash in current_hashes {
             if state_hashes.contains(current_hash) {
+                continue;
+            }
+            if claimed_current_by_module
+                .get(module)
+                .is_some_and(|hashes| hashes.contains(current_hash))
+            {
                 continue;
             }
             if let Some(state_hash) = crate::identifier::closest_unique_simhash_match(

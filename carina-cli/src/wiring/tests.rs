@@ -711,6 +711,106 @@ fn import_fallback_skips_when_already_in_state_by_name_attribute() {
     );
 }
 
+#[test]
+fn import_claims_resolve_name_attribute_target_and_skip_noop_targets() {
+    use carina_core::schema::ResourceSchema;
+    use carina_state::state::{ResourceState, StateFile};
+
+    let bucket_schema = ResourceSchema::new("s3.Bucket").with_name_attribute("bucket_name");
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", bucket_schema);
+
+    let mut desired = Resource::with_provider("awscc", "s3.Bucket", "s3_bucket_1d43a664", None);
+    desired.set_attr(
+        "bucket_name".to_string(),
+        Value::Concrete(ConcreteValue::String("carina-rs-state".to_string())),
+    );
+    let block = StateBlock::Import {
+        to: StateBlockAddress::new("awscc", "s3.Bucket", "carina-rs-state"),
+        id: Value::Concrete(ConcreteValue::String("carina-rs-state".to_string())),
+    };
+
+    let claims = resolve_state_block_claims(
+        std::slice::from_ref(&block),
+        &None,
+        std::slice::from_ref(&desired),
+        &schemas,
+    );
+    assert!(
+        claims.claims_to("awscc", "s3.Bucket", "s3_bucket_1d43a664"),
+        "name_attribute import target must claim the resolved desired address"
+    );
+
+    let mut state_file = StateFile::new();
+    state_file.resources.push(ResourceState::new(
+        "s3.Bucket",
+        "s3_bucket_1d43a664",
+        "awscc",
+    ));
+    let claims = resolve_state_block_claims(
+        std::slice::from_ref(&block),
+        &Some(state_file),
+        std::slice::from_ref(&desired),
+        &schemas,
+    );
+    assert!(
+        !claims.claims_to("awscc", "s3.Bucket", "s3_bucket_1d43a664"),
+        "already-in-state import target must claim nothing"
+    );
+
+    let claims = resolve_state_block_claims(&[block], &None, &[], &schemas);
+    assert!(
+        !claims.claims_to("awscc", "s3.Bucket", "s3_bucket_1d43a664"),
+        "unresolvable import target must claim nothing"
+    );
+}
+
+#[test]
+fn test_materialize_moved_states_warns_on_missing_from() {
+    use carina_state::state::{ResourceState, StateFile};
+
+    let state_blocks = vec![StateBlock::Moved {
+        from: StateBlockAddress::new("awscc", "s3.Bucket", "old_bucket"),
+        to: StateBlockAddress::new("awscc", "s3.Bucket", "new_bucket"),
+    }];
+    let mut warnings = Vec::new();
+    let moved_pairs = materialize_moved_states_with_warning_sink(
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &state_blocks,
+        &Some(StateFile::new()),
+        &mut |warning| warnings.push(warning),
+    );
+    assert!(moved_pairs.is_empty());
+    assert_eq!(
+        warnings,
+        vec![
+            "warning: moved block from awscc.s3.Bucket 'old_bucket' to awscc.s3.Bucket 'new_bucket' was not applied: old_bucket not found in state"
+                .to_string()
+        ],
+    );
+
+    let mut state_file = StateFile::new();
+    state_file
+        .resources
+        .push(ResourceState::new("s3.Bucket", "new_bucket", "awscc"));
+    let mut warnings = Vec::new();
+    let moved_pairs = materialize_moved_states_with_warning_sink(
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &state_blocks,
+        &Some(state_file),
+        &mut |warning| warnings.push(warning),
+    );
+    assert!(moved_pairs.is_empty());
+    assert!(
+        warnings.is_empty(),
+        "already-applied from-absent/to-present moved block stays silent"
+    );
+}
+
 struct AssociationCreateOnlyFactory;
 
 impl ProviderFactory for AssociationCreateOnlyFactory {
@@ -765,6 +865,11 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
         use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
         vec![
+            ResourceSchema::new("s3.Bucket")
+                .with_name_attribute("bucket_name")
+                .attribute(
+                    AttributeSchema::new("bucket_name", AttributeType::string()).create_only(),
+                ),
             ResourceSchema::new("ec2.SubnetRouteTableAssociation")
                 .attribute(
                     AttributeSchema::new("route_table_id", AttributeType::string()).create_only(),
@@ -821,6 +926,121 @@ fn desired_association(name: &str, route_table_binding: &str, subnet_id: &str) -
     resource
 }
 
+fn bucket_state(name: &str, bucket_name: &str) -> carina_state::state::ResourceState {
+    let mut state = carina_state::state::ResourceState::new("s3.Bucket", name, "awscc");
+    state.attributes.insert(
+        "bucket_name".to_string(),
+        serde_json::Value::String(bucket_name.to_string()),
+    );
+    state
+}
+
+fn desired_bucket(name: &str, bucket_name: &str) -> Resource {
+    let mut resource = Resource::with_provider("awscc", "s3.Bucket", name, None);
+    resource.set_attr(
+        "bucket_name".to_string(),
+        Value::Concrete(ConcreteValue::String(bucket_name.to_string())),
+    );
+    resource
+}
+
+#[test]
+fn import_claimed_name_attribute_target_excludes_desired_from_reconciliation() {
+    use carina_state::state::StateFile;
+
+    let ctx = WiringContext::new(vec![Box::new(AssociationCreateOnlyFactory)]);
+    let old_name = "s3_bucket_1d43a664";
+    let desired_name = "s3_bucket_desired";
+    let bucket_name = "carina-rs-state";
+    let mut state_file = StateFile::new();
+    state_file
+        .resources
+        .push(bucket_state(old_name, bucket_name));
+    let mut resources = vec![desired_bucket(desired_name, bucket_name)];
+    let state_blocks = vec![StateBlock::Import {
+        to: StateBlockAddress::new("awscc", "s3.Bucket", bucket_name),
+        id: Value::Concrete(ConcreteValue::String(bucket_name.to_string())),
+    }];
+
+    let claims = resolve_state_block_claims(
+        &state_blocks,
+        &Some(state_file.clone()),
+        &resources,
+        ctx.schemas(),
+    );
+    assert!(
+        claims.claims_to("awscc", "s3.Bucket", desired_name),
+        "name_attribute import target must claim the resolved desired resource"
+    );
+
+    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &mut state_file, &claims);
+
+    assert_eq!(
+        resources[0].id.name_str(),
+        desired_name,
+        "import-claimed desired resource must not adopt the matching old hash name"
+    );
+    assert!(
+        state_file
+            .find_resource("awscc", "s3.Bucket", old_name)
+            .is_some(),
+        "old hash state entry must stay put for the orphan path"
+    );
+}
+
+fn assert_claimed_association_stays_orphaned_after_reconcile() {
+    use carina_state::state::StateFile;
+
+    let ctx = WiringContext::new(vec![Box::new(AssociationCreateOnlyFactory)]);
+    let old_name = "ec2_subnet_route_table_association_11111111";
+    let desired_name = "ec2_subnet_route_table_association_aaaaaaaa";
+    let mut state_file = StateFile::new();
+    state_file
+        .resources
+        .push(route_table_state("private_rtb", "rtb-private"));
+    state_file
+        .resources
+        .push(association_state(old_name, "rtb-private", "subnet-a"));
+    let mut resources = vec![desired_association(desired_name, "private_rtb", "subnet-a")];
+    let state_blocks = vec![StateBlock::Removed {
+        from: StateBlockAddress::new("awscc", "ec2.SubnetRouteTableAssociation", old_name),
+    }];
+    let claims = resolve_state_block_claims(
+        &state_blocks,
+        &Some(state_file.clone()),
+        &resources,
+        ctx.schemas(),
+    );
+
+    assert!(
+        claims.claims_from("awscc", "ec2.SubnetRouteTableAssociation", old_name),
+        "effective removed block must claim its state entry"
+    );
+    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &mut state_file, &claims);
+
+    assert_eq!(
+        resources[0].id.name_str(),
+        desired_name,
+        "claimed state entry must not be rebound to the desired resource"
+    );
+    assert!(
+        state_file
+            .find_resource("awscc", "ec2.SubnetRouteTableAssociation", old_name)
+            .is_some(),
+        "claimed state entry must survive under its old name for the orphan path"
+    );
+}
+
+#[test]
+fn claimed_state_entry_survives_orphan_reconcile_for_destroy_and_refresh() {
+    // Both command shapes reach the same
+    // `reconcile_anonymous_identifiers_with_ctx` exclusion seam:
+    // destroy sends the claimed entry through the orphan-delete path under
+    // its old name, while state refresh refreshes it in place under that
+    // old name.
+    assert_claimed_association_stays_orphaned_after_reconcile();
+}
+
 #[test]
 fn reconcile_anonymous_identifiers_with_ctx_resolves_deferred_create_only_from_state_bindings() {
     use carina_state::state::StateFile;
@@ -867,7 +1087,12 @@ fn reconcile_anonymous_identifiers_with_ctx_resolves_deferred_create_only_from_s
         ),
     ];
 
-    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &mut state_file);
+    reconcile_anonymous_identifiers_with_ctx(
+        &ctx,
+        &mut resources,
+        &mut state_file,
+        &carina_core::identifier::StateBlockClaims::empty(),
+    );
 
     let names: Vec<_> = resources
         .iter()
@@ -881,6 +1106,223 @@ fn reconcile_anonymous_identifiers_with_ctx_resolves_deferred_create_only_from_s
             "ec2_subnet_route_table_association_33333333",
         ],
         "desired anonymous associations must adopt state names by resolved create-only values",
+    );
+}
+
+#[test]
+fn test_stale_moved_block_releases_claims() {
+    use carina_state::state::StateFile;
+
+    let ctx = WiringContext::new(vec![Box::new(AssociationCreateOnlyFactory)]);
+    let mut state_file = StateFile::new();
+    state_file
+        .resources
+        .push(route_table_state("private_rtb", "rtb-private"));
+    state_file.resources.push(association_state(
+        "ec2_subnet_route_table_association_11111111",
+        "rtb-private",
+        "subnet-a",
+    ));
+
+    let mut resources = vec![desired_association(
+        "ec2_subnet_route_table_association_aaaaaaaa",
+        "private_rtb",
+        "subnet-a",
+    )];
+    let state_blocks = vec![StateBlock::Moved {
+        from: StateBlockAddress::new("awscc", "ec2.SubnetRouteTableAssociation", "does_not_exist"),
+        to: StateBlockAddress::new(
+            "awscc",
+            "ec2.SubnetRouteTableAssociation",
+            "ec2_subnet_route_table_association_aaaaaaaa",
+        ),
+    }];
+    let claims = resolve_state_block_claims(
+        &state_blocks,
+        &Some(state_file.clone()),
+        &resources,
+        ctx.schemas(),
+    );
+
+    assert!(
+        !claims.claims_to(
+            "awscc",
+            "ec2.SubnetRouteTableAssociation",
+            "ec2_subnet_route_table_association_aaaaaaaa",
+        ),
+        "ineffective moved block must not pin its to address"
+    );
+    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &mut state_file, &claims);
+
+    assert_eq!(
+        resources[0].id.name_str(),
+        "ec2_subnet_route_table_association_11111111",
+        "stale moved block must release claims so meaning-based matching can preserve the no-op"
+    );
+}
+
+#[test]
+fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
+    use carina_core::resource::{ResourceId, State};
+    use carina_state::state::StateFile;
+
+    let ctx = WiringContext::new(vec![Box::new(AssociationCreateOnlyFactory)]);
+    let mut state_file = StateFile::new();
+    let mut resources = Vec::new();
+    let mut state_blocks = Vec::new();
+    let mut current_states = HashMap::new();
+    let mut old_names = Vec::new();
+    let mut desired_names = Vec::new();
+
+    for idx in 0..5 {
+        let binding = format!("rtb_{idx}");
+        let route_table_id = format!("rtb-{idx}");
+        let subnet_id = format!("subnet-{idx}");
+        let old_name = format!("ec2_subnet_route_table_association_old_{idx:08x}");
+        let desired_name = format!("ec2_subnet_route_table_association_new_{idx:08x}");
+
+        state_file
+            .resources
+            .push(route_table_state(&binding, &route_table_id));
+        state_file
+            .resources
+            .push(association_state(&old_name, &route_table_id, &subnet_id));
+        resources.push(desired_association(&desired_name, &binding, &subnet_id));
+        state_blocks.push(StateBlock::Moved {
+            from: StateBlockAddress::new("awscc", "ec2.SubnetRouteTableAssociation", &old_name),
+            to: StateBlockAddress::new("awscc", "ec2.SubnetRouteTableAssociation", &desired_name),
+        });
+
+        let old_id =
+            ResourceId::with_provider("awscc", "ec2.SubnetRouteTableAssociation", &old_name, None);
+        current_states.insert(old_id.clone(), State::not_found(old_id));
+        old_names.push(old_name);
+        desired_names.push(desired_name);
+    }
+
+    let claims = resolve_state_block_claims(
+        &state_blocks,
+        &Some(state_file.clone()),
+        &resources,
+        ctx.schemas(),
+    );
+    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &mut state_file, &claims);
+    assert_eq!(
+        resources
+            .iter()
+            .map(|resource| resource.id.name_str().to_string())
+            .collect::<Vec<_>>(),
+        desired_names,
+        "heuristics must not re-key desired resources whose names are moved.to claims"
+    );
+
+    let moved_pairs = materialize_moved_states(
+        &mut current_states,
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &state_blocks,
+        &Some(state_file),
+    );
+    assert_eq!(moved_pairs.len(), 5);
+    for (idx, (from, to)) in moved_pairs.iter().enumerate() {
+        assert_eq!(from.name_str(), old_names[idx]);
+        assert_eq!(to.name_str(), desired_names[idx]);
+    }
+    for name in old_names {
+        let id = ResourceId::with_provider("awscc", "ec2.SubnetRouteTableAssociation", name, None);
+        assert!(
+            !current_states.contains_key(&id),
+            "old state key must be removed after materialized move"
+        );
+    }
+    for name in desired_names {
+        let id = ResourceId::with_provider("awscc", "ec2.SubnetRouteTableAssociation", name, None);
+        assert!(
+            current_states.contains_key(&id),
+            "desired state key must exist after materialized move"
+        );
+    }
+}
+
+#[tokio::test]
+async fn moved_blocks_plan_level_fixture_emits_five_moves_only() {
+    use carina_core::effect::Effect;
+    use carina_core::parser::{ProviderContext, parse};
+    use carina_state::state::{ResourceState, StateFile};
+
+    // This plan-level fixture pins moved materialization and Move-effect
+    // emission at the `create_plan_from_parsed_with_upstream` seam. The
+    // claims-precedence ordering itself is covered by
+    // `moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames`.
+    let mut source = String::new();
+    let mut state_file = StateFile::new();
+    for idx in 0..5 {
+        let old_name = format!("old_assoc_{idx}");
+        let desired_name = format!("desired_assoc_{idx}");
+        let route_table_id = format!("rtb-{idx}");
+        let subnet_id = format!("subnet-{idx}");
+
+        source.push_str(&format!(
+            r#"
+let {desired_name} = awscc.ec2.SubnetRouteTableAssociation {{
+    route_table_id = "{route_table_id}"
+    subnet_id      = "{subnet_id}"
+}}
+
+moved {{
+    from = awscc.ec2.SubnetRouteTableAssociation "{old_name}"
+    to   = awscc.ec2.SubnetRouteTableAssociation "{desired_name}"
+}}
+"#
+        ));
+
+        state_file.resources.push(
+            ResourceState::new("ec2.SubnetRouteTableAssociation", &old_name, "awscc")
+                .with_identifier(format!("assoc-{idx}"))
+                .with_attribute("route_table_id", serde_json::Value::String(route_table_id))
+                .with_attribute("subnet_id", serde_json::Value::String(subnet_id)),
+        );
+    }
+
+    let parsed = parse(&source, &ProviderContext::default()).expect("parse fixture");
+    let state_block_claims = resolve_state_block_claims(
+        &parsed.state_blocks,
+        &Some(state_file.clone()),
+        &parsed.resources,
+        &carina_core::schema::SchemaRegistry::new(),
+    );
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ctx = create_plan_from_parsed_with_upstream(
+        &parsed,
+        &Some(state_file),
+        false,
+        &HashMap::new(),
+        &state_block_claims,
+        tmp.path(),
+    )
+    .await
+    .expect("plan fixture");
+
+    let summary = ctx.plan.summary();
+    assert_eq!(summary.create, 0, "moved fixture must not add resources");
+    assert_eq!(
+        summary.delete, 0,
+        "moved fixture must not destroy resources"
+    );
+    assert_eq!(
+        summary.replace, 0,
+        "moved fixture must not replace resources"
+    );
+    assert_eq!(summary.update, 0, "moved fixture must not update resources");
+    assert_eq!(summary.moved, 5, "all five moved blocks must be honored");
+    assert_eq!(ctx.plan.mutation_count(), 5);
+    assert!(
+        ctx.plan
+            .effects()
+            .iter()
+            .all(|effect| matches!(effect, Effect::Move { .. })),
+        "plan must contain only Move effects, got {:?}",
+        ctx.plan.effects()
     );
 }
 
@@ -1176,6 +1618,7 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
         &mut prev_explicit,
         &mut saved_attrs,
         &Some(state_file),
+        &carina_core::identifier::StateBlockClaims::empty(),
     );
 
     assert_eq!(

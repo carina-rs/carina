@@ -814,6 +814,12 @@ async fn run_apply_locked(
     let mut state_file = load_state_persist_if_migrated(backend, lock).await?;
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
+    let state_block_claims = crate::wiring::resolve_state_block_claims(
+        &parsed.state_blocks,
+        &state_file,
+        &parsed.resources,
+        ctx.schemas(),
+    );
     if let Some(sf) = state_file.as_ref() {
         carina_core::module_resolver::reconcile_anonymous_module_instances(
             &mut parsed.resources,
@@ -823,10 +829,16 @@ async fn run_apply_locked(
                     .map(|r| r.name.clone())
                     .collect()
             },
+            &state_block_claims,
         );
     }
     if let Some(sf) = state_file.as_mut() {
-        reconcile_anonymous_identifiers_with_ctx(ctx, &mut parsed.resources, sf);
+        reconcile_anonymous_identifiers_with_ctx(
+            ctx,
+            &mut parsed.resources,
+            sf,
+            &state_block_claims,
+        );
     }
     apply_name_overrides(&mut parsed.resources, &state_file);
 
@@ -1022,6 +1034,7 @@ async fn run_apply_locked(
             &mut prev_explicit,
             &mut saved_attrs,
             &state_file,
+            &state_block_claims,
         ));
         pairs
     };

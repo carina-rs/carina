@@ -15,7 +15,7 @@ use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
 use carina_core::effect::Effect;
 use carina_core::identifier::{
-    self, AnonymousIdBindingStateInfo, AnonymousIdStateInfo, PrefixStateInfo,
+    self, AnonymousIdBindingStateInfo, AnonymousIdStateInfo, PrefixStateInfo, StateBlockClaims,
 };
 use carina_core::module_resolver;
 use carina_core::parser::{ProviderConfig, StateBlock, StateBlockAddress};
@@ -431,6 +431,7 @@ fn provider_config_attribute_type_for(
 /// by `identifier::detect_anonymous_to_named_renames`. Transfers state,
 /// `prev_explicit`, and `saved_attrs` from the old anonymous name to the
 /// new binding name so the differ sees the resource under its new identity.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_anonymous_to_named_renames(
     ctx: &WiringContext,
     resources: &[Resource],
@@ -439,6 +440,7 @@ pub fn apply_anonymous_to_named_renames(
     prev_explicit: &mut HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     saved_attrs: &mut HashMap<ResourceId, HashMap<String, Value>>,
     state_file: &Option<StateFile>,
+    claims: &StateBlockClaims,
 ) -> Vec<(ResourceId, ResourceId)> {
     let Some(sf) = state_file.as_ref() else {
         return Vec::new();
@@ -486,6 +488,7 @@ pub fn apply_anonymous_to_named_renames(
         },
         &canonical_providers,
         &|name| identity_attributes_for_provider(ctx, name),
+        claims,
     );
 
     for (from, to) in &renames {
@@ -508,6 +511,7 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
     ctx: &WiringContext,
     resources: &mut [Resource],
     state_file: &mut StateFile,
+    claims: &StateBlockClaims,
 ) {
     let state_by_binding: HashMap<String, Vec<AnonymousIdBindingStateInfo>> = state_file
         .resources
@@ -569,6 +573,7 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
                 .collect()
         },
         &|binding| state_by_binding.get(binding).cloned().unwrap_or_default(),
+        claims,
     );
 
     apply_provider_prefix_renames(&renames, state_file);
@@ -1692,10 +1697,18 @@ pub async fn create_plan_from_parsed<E: Clone>(
     parsed: &carina_core::parser::File<E>,
     state_file: &Option<StateFile>,
     refresh: bool,
+    state_block_claims: &StateBlockClaims,
     base_dir: &Path,
 ) -> Result<PlanContext, AppError> {
-    create_plan_from_parsed_with_upstream(parsed, state_file, refresh, &HashMap::new(), base_dir)
-        .await
+    create_plan_from_parsed_with_upstream(
+        parsed,
+        state_file,
+        refresh,
+        &HashMap::new(),
+        state_block_claims,
+        base_dir,
+    )
+    .await
 }
 
 pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
@@ -1703,6 +1716,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     state_file: &Option<StateFile>,
     refresh: bool,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    state_block_claims: &StateBlockClaims,
     base_dir: &Path,
 ) -> Result<PlanContext, AppError> {
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
@@ -1895,6 +1909,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
             &mut prev_explicit,
             &mut saved_attrs,
             state_file,
+            state_block_claims,
         ));
 
         // Phase 2: resolve data source refs against the consolidated
@@ -1974,6 +1989,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
                 &mut prev_explicit,
                 &mut saved_attrs,
                 state_file,
+                state_block_claims,
             ));
         } else {
             // No state file: all resources are new (not found)
@@ -2239,6 +2255,24 @@ pub fn materialize_moved_states(
     state_blocks: &[StateBlock],
     state_file: &Option<StateFile>,
 ) -> Vec<(ResourceId, ResourceId)> {
+    materialize_moved_states_with_warning_sink(
+        current_states,
+        prev_explicit,
+        saved_attrs,
+        state_blocks,
+        state_file,
+        &mut |warning| eprintln!("{}", warning.yellow()),
+    )
+}
+
+fn materialize_moved_states_with_warning_sink(
+    current_states: &mut HashMap<ResourceId, State>,
+    prev_explicit: &mut HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
+    saved_attrs: &mut HashMap<ResourceId, HashMap<String, Value>>,
+    state_blocks: &[StateBlock],
+    state_file: &Option<StateFile>,
+    warn_missing: &mut dyn FnMut(String),
+) -> Vec<(ResourceId, ResourceId)> {
     let mut moved_pairs = Vec::new();
 
     for block in state_blocks {
@@ -2266,6 +2300,20 @@ pub fn materialize_moved_states(
                     })
             });
             let Some(resolved_from) = resolved_from else {
+                let to_exists = state_file.as_ref().is_some_and(|sf| {
+                    sf.find_resource(&to.provider, &to.resource_type, to.name_str())
+                        .is_some()
+                });
+                if !to_exists {
+                    warn_missing(format!(
+                        "warning: moved block from {} '{}' to {} '{}' was not applied: {} not found in state",
+                        from.display_type(),
+                        from.name_str(),
+                        to.display_type(),
+                        to.name_str(),
+                        from.name_str()
+                    ));
+                }
                 continue;
             };
             // For `to`, look up the destination key by
@@ -2311,6 +2359,69 @@ pub fn materialize_moved_states(
     moved_pairs
 }
 
+pub fn resolve_state_block_claims(
+    blocks: &[StateBlock],
+    state_file: &Option<StateFile>,
+    desired: &[Resource],
+    registry: &SchemaRegistry,
+) -> StateBlockClaims {
+    let mut from = HashSet::new();
+    let mut to = HashSet::new();
+
+    for block in blocks {
+        match block {
+            StateBlock::Moved {
+                from: moved_from,
+                to: moved_to,
+            } => {
+                if state_file.as_ref().is_some_and(|sf| {
+                    sf.find_resource(
+                        &moved_from.provider,
+                        &moved_from.resource_type,
+                        moved_from.name_str(),
+                    )
+                    .is_some()
+                }) {
+                    from.insert(moved_from.clone());
+                    to.insert(moved_to.clone());
+                }
+            }
+            StateBlock::Removed { from: removed_from } => {
+                if state_file.as_ref().is_some_and(|sf| {
+                    sf.find_resource(
+                        &removed_from.provider,
+                        &removed_from.resource_type,
+                        removed_from.name_str(),
+                    )
+                    .is_some()
+                }) {
+                    from.insert(removed_from.clone());
+                }
+            }
+            StateBlock::Import { to: import_to, .. } => {
+                let Some(resolved_to) =
+                    resolve_import_target_in_desired(import_to, desired, registry)
+                else {
+                    continue;
+                };
+                let already_in_state = state_file.as_ref().is_some_and(|sf| {
+                    sf.find_resource(
+                        &resolved_to.provider,
+                        &resolved_to.resource_type,
+                        resolved_to.name_str(),
+                    )
+                    .is_some()
+                });
+                if !already_in_state {
+                    to.insert(resolved_to);
+                }
+            }
+        }
+    }
+
+    StateBlockClaims::new(from, to)
+}
+
 /// Look up `to`'s full id (with any routed `provider_instance`) in
 /// `desired` by matching a [`StateBlockAddress`] against the routed
 /// `ResourceId` keys. `StateBlockAddress` is routing-agnostic by
@@ -2330,6 +2441,21 @@ fn find_desired_id<V>(
                 && k.name_str() == to.name_str()
         })
         .cloned()
+}
+
+fn resolve_import_target_in_desired(
+    to: &StateBlockAddress,
+    desired: &[Resource],
+    registry: &SchemaRegistry,
+) -> Option<StateBlockAddress> {
+    let name_attr = import_target_name_attribute(to, registry);
+    match_import_target(to, name_attr, desired.iter()).map(|resource| {
+        StateBlockAddress::new(
+            &resource.id.provider,
+            &resource.id.resource_type,
+            resource.id.name_str(),
+        )
+    })
 }
 
 /// Add state block effects (import/removed/moved) to the plan.
@@ -2511,47 +2637,16 @@ fn resolve_import_target(
     state_file: &Option<StateFile>,
     registry: &SchemaRegistry,
 ) -> ResourceId {
-    let name_attr = registry
-        .get(
-            &to.provider,
-            &to.resource_type,
-            carina_core::schema::SchemaKind::Resource,
-        )
-        .and_then(|s| s.name_attribute.as_deref());
-
-    // Address-equality test: `StateBlockAddress` has no
-    // `provider_instance`, so equality is naturally the 3-tuple match
-    // we want — no risk of `Eq` silently including routing.
-    let same_address = |id: &ResourceId| {
-        id.provider == to.provider
-            && id.resource_type == to.resource_type
-            && id.name_str() == to.name_str()
-    };
-
-    // Single pass: prefer exact id match, otherwise remember the first name_attribute match.
-    let mut fallback_id: Option<ResourceId> = None;
-    for effect in plan.effects() {
-        let Effect::Create(resource) = effect else {
-            continue;
-        };
-        if same_address(&resource.id) {
-            return resource.id.clone();
-        }
-        if fallback_id.is_some() {
-            continue;
-        }
-        if resource.id.provider != to.provider || resource.id.resource_type != to.resource_type {
-            continue;
-        }
-        if let Some(attr) = name_attr
-            && let Some(Value::Concrete(ConcreteValue::String(s))) = resource.get_attr(attr)
-            && s == to.name_str()
-        {
-            fallback_id = Some(resource.id.clone());
-        }
-    }
-    if let Some(id) = fallback_id {
-        return id;
+    let name_attr = import_target_name_attribute(to, registry);
+    if let Some(resource) = match_import_target(
+        to,
+        name_attr,
+        plan.effects().iter().filter_map(|effect| match effect {
+            Effect::Create(resource) => Some(resource),
+            _ => None,
+        }),
+    ) {
+        return resource.id.clone();
     }
 
     // Fallback: match by name_attribute value in state file (already-imported case)
@@ -2573,6 +2668,43 @@ fn resolve_import_target(
     }
 
     to.to_unrouted_resource_id()
+}
+
+fn import_target_name_attribute<'a>(
+    to: &StateBlockAddress,
+    registry: &'a SchemaRegistry,
+) -> Option<&'a str> {
+    registry
+        .get(
+            &to.provider,
+            &to.resource_type,
+            carina_core::schema::SchemaKind::Resource,
+        )
+        .and_then(|s| s.name_attribute.as_deref())
+}
+
+fn match_import_target<'a>(
+    to: &StateBlockAddress,
+    name_attr: Option<&str>,
+    resources: impl Iterator<Item = &'a Resource>,
+) -> Option<&'a Resource> {
+    let mut fallback = None;
+    for resource in resources {
+        if resource.id.provider != to.provider || resource.id.resource_type != to.resource_type {
+            continue;
+        }
+        if resource.id.name_str() == to.name_str() {
+            return Some(resource);
+        }
+        if fallback.is_none()
+            && let Some(attr) = name_attr
+            && let Some(Value::Concrete(ConcreteValue::String(s))) = resource.get_attr(attr)
+            && s == to.name_str()
+        {
+            fallback = Some(resource);
+        }
+    }
+    fallback
 }
 
 /// Check whether a `ProviderError` is an AWS throttling error that should be retried.

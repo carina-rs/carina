@@ -7,10 +7,53 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[cfg(test)]
 use crate::parser::ProviderConfig;
+use crate::parser::StateBlockAddress;
 use crate::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, Value};
 use crate::schema::SchemaRegistry;
 use crate::validation::is_string_compatible_type;
 use crate::value::CanonicalizedProviderConfigs;
+
+/// Addresses claimed by operator-written state blocks. Heuristic rename
+/// passes must not consume a claimed `from` state entry nor synthesize a
+/// rename onto a claimed `to` name — operator intent always wins over
+/// similarity heuristics.
+///
+/// `from` claims: `moved.from`, `removed.from`.
+/// `to` claims: `moved.to`, `import.to`.
+#[derive(Debug, Clone, Default)]
+pub struct StateBlockClaims {
+    from: HashSet<StateBlockAddress>,
+    to: HashSet<StateBlockAddress>,
+}
+
+impl StateBlockClaims {
+    pub fn new(from: HashSet<StateBlockAddress>, to: HashSet<StateBlockAddress>) -> Self {
+        Self { from, to }
+    }
+
+    // Test-only convenience. Production call sites must resolve operator
+    // claims from parsed state blocks instead of defaulting to no claims.
+    #[doc(hidden)]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn claims_from(&self, provider: &str, resource_type: &str, name: &str) -> bool {
+        if self.from.is_empty() {
+            return false;
+        }
+        self.from
+            .contains(&StateBlockAddress::new(provider, resource_type, name))
+    }
+
+    pub fn claims_to(&self, provider: &str, resource_type: &str, name: &str) -> bool {
+        if self.to.is_empty() {
+            return false;
+        }
+        self.to
+            .contains(&StateBlockAddress::new(provider, resource_type, name))
+    }
+}
 
 /// Generate a random 8-character lowercase hex suffix using UUID v4.
 pub fn generate_random_suffix() -> String {
@@ -774,6 +817,7 @@ pub fn reconcile_anonymous_identifiers(
     registry: &SchemaRegistry,
     find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
+    claims: &StateBlockClaims,
 ) -> Vec<(String, String)> {
     let mut renames: Vec<(String, String)> = Vec::new();
     let mut used_names: HashMap<(String, String), HashSet<String>> = HashMap::new();
@@ -799,6 +843,14 @@ pub fn reconcile_anonymous_identifiers(
         // meaningful for anonymous hash-derived identifiers. Named resources
         // should never be rebound to a different state entry.
         if resource.binding.is_some() {
+            continue;
+        }
+
+        if claims.claims_to(
+            &resource.id.provider,
+            &resource.id.resource_type,
+            resource.id.name_str(),
+        ) {
             continue;
         }
 
@@ -844,6 +896,13 @@ pub fn reconcile_anonymous_identifiers(
             let candidates = state_entries
                 .iter()
                 .filter(|entry| entry.name != resource.id.name_str())
+                .filter(|entry| {
+                    !claims.claims_from(
+                        &resource.id.provider,
+                        &resource.id.resource_type,
+                        &entry.name,
+                    )
+                })
                 .filter(|entry| {
                     !used_names
                         .get(&key)
@@ -894,6 +953,11 @@ pub fn reconcile_anonymous_identifiers(
                 || claimed_names
                     .get(&key)
                     .is_some_and(|names| names.contains(&entry.name))
+                || claims.claims_from(
+                    &resource.id.provider,
+                    &resource.id.resource_type,
+                    &entry.name,
+                )
             {
                 continue;
             }
@@ -975,6 +1039,7 @@ pub fn detect_anonymous_to_named_renames(
     find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
     providers: &CanonicalizedProviderConfigs,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
+    claims: &StateBlockClaims,
 ) -> Vec<(ResourceId, ResourceId)> {
     // Collect the set of resource names currently used in the DSL per
     // (provider, resource_type). Any state entry not in this set is an orphan.
@@ -995,6 +1060,13 @@ pub fn detect_anonymous_to_named_renames(
     for resource in resources {
         // Only rename let-bound resources whose binding was previously anonymous.
         if resource.binding.is_none() {
+            continue;
+        }
+        if claims.claims_to(
+            &resource.id.provider,
+            &resource.id.resource_type,
+            resource.id.name_str(),
+        ) {
             continue;
         }
 
@@ -1037,6 +1109,13 @@ pub fn detect_anonymous_to_named_renames(
                 if used_in_dsl.contains(&entry.name) {
                     continue;
                 }
+                if claims.claims_from(
+                    &resource.id.provider,
+                    &resource.id.resource_type,
+                    &entry.name,
+                ) {
+                    continue;
+                }
                 if extract_hash_from_identifier(&entry.name).is_none() {
                     continue;
                 }
@@ -1064,6 +1143,9 @@ pub fn detect_anonymous_to_named_renames(
             let candidates = state_entries
                 .iter()
                 .filter(|e| !used_in_dsl.contains(&e.name))
+                .filter(|e| {
+                    !claims.claims_from(&resource.id.provider, &resource.id.resource_type, &e.name)
+                })
                 .filter_map(|e| match extract_hash_from_identifier(&e.name) {
                     Some(AnonymousHashSuffix::SimHash(hash)) => Some((e.name.as_str(), hash)),
                     _ => None,
@@ -1093,6 +1175,7 @@ pub fn detect_anonymous_to_named_renames_for_test(
     find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
     providers: &[ProviderConfig],
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
+    claims: &StateBlockClaims,
 ) -> Vec<(ResourceId, ResourceId)> {
     let providers = CanonicalizedProviderConfigs::from_configs_for_test(providers.to_vec());
     detect_anonymous_to_named_renames(
@@ -1101,6 +1184,7 @@ pub fn detect_anonymous_to_named_renames_for_test(
         find_state_by_type,
         &providers,
         identity_attributes_fn,
+        claims,
     )
 }
 

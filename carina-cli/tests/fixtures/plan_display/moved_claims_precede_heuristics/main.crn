@@ -1,0 +1,15 @@
+# Moved block must win before meaning-based anonymous reconciliation.
+# The state row has matching create-only values under an old hash name.
+
+provider awscc {
+  region = "ap-northeast-1"
+}
+
+moved {
+  from = awscc.test.Widget "test_widget_11111111"
+  to   = awscc.test.Widget "awscc_test_widget_58cf4fed"
+}
+
+awscc.test.Widget {
+  external_name = "claimed-widget"
+}

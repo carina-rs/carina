@@ -21,8 +21,8 @@ use carina_state::{StateFile, check_and_migrate};
 
 use crate::commands::validate_and_resolve;
 use crate::wiring::{
-    WiringContext, normalize_desired_with_ctx, normalize_state_with_ctx,
-    reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
+    WiringContext, compute_anonymous_identifiers_with_ctx, normalize_desired_with_ctx,
+    normalize_state_with_ctx, reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
     resolve_enum_aliases_in_states, resolve_enum_aliases_with_ctx,
 };
 
@@ -85,7 +85,27 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     };
 
     let wiring = WiringContext::new(fixture_provider_factories(&fixture_pathbuf));
+    if fixture_pathbuf
+        .file_name()
+        .is_some_and(|name| name == "moved_claims_precede_heuristics")
+    {
+        // This fixture writes moved.to as the literal schema-derived anonymous
+        // hash name, so compute the desired anonymous id before claims resolve.
+        let canonical_resources = carina_core::value::canonicalize_resources_with_schemas(
+            &mut parsed.resources,
+            wiring.schemas(),
+        );
+        let errors =
+            compute_anonymous_identifiers_with_ctx(&wiring, canonical_resources, &parsed.providers);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
+    let state_block_claims = crate::wiring::resolve_state_block_claims(
+        &parsed.state_blocks,
+        &state_file,
+        &parsed.resources,
+        wiring.schemas(),
+    );
     if let Some(sf) = state_file.as_ref() {
         carina_core::module_resolver::reconcile_anonymous_module_instances(
             &mut parsed.resources,
@@ -95,10 +115,16 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
                     .map(|r| r.name.clone())
                     .collect()
             },
+            &state_block_claims,
         );
     }
     if let Some(sf) = state_file.as_mut() {
-        reconcile_anonymous_identifiers_with_ctx(&wiring, &mut parsed.resources, sf);
+        reconcile_anonymous_identifiers_with_ctx(
+            &wiring,
+            &mut parsed.resources,
+            sf,
+            &state_block_claims,
+        );
     }
 
     // carina#3181: `parsed.resources` is managed-only; data sources live
@@ -356,10 +382,54 @@ fn fixture_provider_factories(fixture_path: &Path) -> Vec<Box<dyn ProviderFactor
     match fixture_path.file_name().and_then(|name| name.to_str()) {
         Some("dynamic_enum_az_no_diff") => vec![Box::new(DynamicEnumFixtureFactory)],
         Some("enum_display") => vec![Box::new(EnumDisplayFixtureFactory)],
+        Some("moved_claims_precede_heuristics") => {
+            vec![Box::new(MovedClaimsPrecedeHeuristicsFixtureFactory)]
+        }
         Some("route53_hosted_zone_name_strip_suffix_no_diff") => {
             vec![Box::new(Route53HostedZoneFixtureFactory)]
         }
         _ => vec![],
+    }
+}
+
+struct MovedClaimsPrecedeHeuristicsFixtureFactory;
+
+impl ProviderFactory for MovedClaimsPrecedeHeuristicsFixtureFactory {
+    fn name(&self) -> &str {
+        "awscc"
+    }
+
+    fn display_name(&self) -> &str {
+        "AWS Cloud Control fixture provider"
+    }
+
+    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+        HashMap::new()
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &indexmap::IndexMap<String, Value>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
+        "ap-northeast-1".to_string()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _attributes: &indexmap::IndexMap<String, Value>,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
+    }
+
+    fn schemas(&self) -> Vec<ResourceSchema> {
+        vec![ResourceSchema::new("test.Widget").attribute(
+            AttributeSchema::new("external_name", AttributeType::string()).create_only(),
+        )]
     }
 }
 
