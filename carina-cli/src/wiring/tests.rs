@@ -711,6 +711,179 @@ fn import_fallback_skips_when_already_in_state_by_name_attribute() {
     );
 }
 
+struct AssociationCreateOnlyFactory;
+
+impl ProviderFactory for AssociationCreateOnlyFactory {
+    fn name(&self) -> &str {
+        "awscc"
+    }
+
+    fn display_name(&self) -> &str {
+        "AWSCC association create-only test provider"
+    }
+
+    fn provider_config_attribute_types(
+        &self,
+    ) -> HashMap<String, carina_core::schema::AttributeType> {
+        HashMap::new()
+    }
+
+    fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+        "ap-northeast-1".to_string()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _attributes: &IndexMap<String, Value>,
+    ) -> carina_core::provider::BoxFuture<
+        '_,
+        carina_core::provider::ProviderResult<Box<dyn carina_core::provider::Provider>>,
+    > {
+        Box::pin(async {
+            Ok(Box::new(MockProvider::new()) as Box<dyn carina_core::provider::Provider>)
+        })
+    }
+
+    fn create_normalizer(
+        &self,
+        _binding: Option<&str>,
+        _attributes: &IndexMap<String, Value>,
+    ) -> carina_core::provider::BoxFuture<'_, Box<dyn carina_core::provider::ProviderNormalizer>>
+    {
+        Box::pin(async {
+            Box::new(carina_core::provider::NoopNormalizer)
+                as Box<dyn carina_core::provider::ProviderNormalizer>
+        })
+    }
+
+    fn schemas(&self) -> Vec<carina_core::schema::ResourceSchema> {
+        use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+        vec![
+            ResourceSchema::new("ec2.SubnetRouteTableAssociation")
+                .attribute(
+                    AttributeSchema::new("route_table_id", AttributeType::string()).create_only(),
+                )
+                .attribute(
+                    AttributeSchema::new("subnet_id", AttributeType::string()).create_only(),
+                ),
+        ]
+    }
+}
+
+fn route_table_state(binding: &str, id: &str) -> carina_state::state::ResourceState {
+    let mut state = carina_state::state::ResourceState::new("ec2.RouteTable", binding, "awscc");
+    state.binding = Some(binding.to_string());
+    state
+        .attributes
+        .insert("id".to_string(), serde_json::Value::String(id.to_string()));
+    state
+}
+
+fn association_state(
+    name: &str,
+    route_table_id: &str,
+    subnet_id: &str,
+) -> carina_state::state::ResourceState {
+    let mut state =
+        carina_state::state::ResourceState::new("ec2.SubnetRouteTableAssociation", name, "awscc");
+    state.attributes.insert(
+        "route_table_id".to_string(),
+        serde_json::Value::String(route_table_id.to_string()),
+    );
+    state.attributes.insert(
+        "subnet_id".to_string(),
+        serde_json::Value::String(subnet_id.to_string()),
+    );
+    state
+}
+
+fn desired_association(name: &str, route_table_binding: &str, subnet_id: &str) -> Resource {
+    use carina_core::resource::AccessPath;
+
+    let mut resource =
+        Resource::with_provider("awscc", "ec2.SubnetRouteTableAssociation", name, None);
+    resource.set_attr(
+        "route_table_id".to_string(),
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new(route_table_binding, "id"),
+        }),
+    );
+    resource.set_attr(
+        "subnet_id".to_string(),
+        Value::Concrete(ConcreteValue::String(subnet_id.to_string())),
+    );
+    resource
+}
+
+#[test]
+fn reconcile_anonymous_identifiers_with_ctx_resolves_deferred_create_only_from_state_bindings() {
+    use carina_state::state::StateFile;
+
+    let ctx = WiringContext::new(vec![Box::new(AssociationCreateOnlyFactory)]);
+    let mut state_file = StateFile::new();
+    state_file
+        .resources
+        .push(route_table_state("private_rtb", "rtb-private"));
+    state_file
+        .resources
+        .push(route_table_state("public_rtb", "rtb-public"));
+    state_file.resources.push(association_state(
+        "ec2_subnet_route_table_association_11111111",
+        "rtb-private",
+        "subnet-a",
+    ));
+    state_file.resources.push(association_state(
+        "ec2_subnet_route_table_association_22222222",
+        "rtb-public",
+        "subnet-a",
+    ));
+    state_file.resources.push(association_state(
+        "ec2_subnet_route_table_association_33333333",
+        "rtb-private",
+        "subnet-c",
+    ));
+
+    let mut resources = vec![
+        desired_association(
+            "ec2_subnet_route_table_association_aaaaaaaa",
+            "private_rtb",
+            "subnet-a",
+        ),
+        desired_association(
+            "ec2_subnet_route_table_association_bbbbbbbb",
+            "public_rtb",
+            "subnet-a",
+        ),
+        desired_association(
+            "ec2_subnet_route_table_association_cccccccc",
+            "private_rtb",
+            "subnet-c",
+        ),
+    ];
+
+    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &mut state_file);
+
+    let names: Vec<_> = resources
+        .iter()
+        .map(|resource| resource.id.name_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "ec2_subnet_route_table_association_11111111",
+            "ec2_subnet_route_table_association_22222222",
+            "ec2_subnet_route_table_association_33333333",
+        ],
+        "desired anonymous associations must adopt state names by resolved create-only values",
+    );
+}
+
 /// Regression test for carina#1683: data source input attributes that
 /// reference another resource must be resolved against current state
 /// *before* being passed to `read_data_source_with_retry`. Without

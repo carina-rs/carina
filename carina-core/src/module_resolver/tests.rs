@@ -370,8 +370,9 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
     // assert that the named-instance routing survives the rewrite.
     use crate::resource::{ConcreteValue, Resource, ResourceId, Value};
 
-    let current_prefix = format!("thing_{:016x}", 0xABCDu64);
-    let state_hash = 0xABCDu64 ^ 1; // flip one bit — within SimHash threshold
+    let current_hash = crate::identifier::SimHash::parse_16_hex("000000000000abcd").unwrap();
+    let current_prefix = format!("thing_{:016x}", current_hash);
+    let state_hash = current_hash.with_flipped_mask_for_test(1);
     let state_name = format!("thing_{:016x}.role", state_hash);
 
     let mut resources = vec![Resource {
@@ -1135,7 +1136,7 @@ fn test_anonymous_module_call_prefix_is_locality_sensitive() {
     let a = instance_prefix_for_call(&make("carina-rs/infra"));
     let b = instance_prefix_for_call(&make("carina-rs/other"));
     let parse = |p: &str| parse_synthetic_instance_prefix(p).unwrap().1;
-    let distance = (parse(&a) ^ parse(&b)).count_ones();
+    let distance = parse(&a).distance(parse(&b));
     assert!(
         distance < crate::identifier::SIMHASH_HAMMING_THRESHOLD,
         "small edit should stay inside the reconciliation threshold, got distance {distance}",
@@ -1232,7 +1233,7 @@ thing { name = 'after-edit' }
 
     // Fabricate a state entry whose SimHash is within threshold of the
     // current one (flip one bit).
-    let state_hash = new_hash ^ 1;
+    let state_hash = new_hash.with_flipped_mask_for_test(1);
     let state_name = format!("thing_{:016x}.role", state_hash);
     let state_lookup = |_: &str, _: &str| vec![state_name.clone()];
 
@@ -1358,7 +1359,7 @@ thing { name = 'after-edit' }
 
     // State holds the *same* instance prefix at two resource types, one
     // bit away from the current SimHash — i.e. a small argument edit.
-    let state_hash = new_hash ^ 1;
+    let state_hash = new_hash.with_flipped_mask_for_test(1);
     let state_lookup = move |_: &str, resource_type: &str| match resource_type {
         "iam.OidcProvider" => vec![format!("thing_{:016x}.provider_res", state_hash)],
         "iam.Role" => vec![format!("thing_{:016x}.role", state_hash)],
@@ -1416,8 +1417,14 @@ thing { name = 'a' }
     // Two state entries at the same Hamming distance — ambiguous.
     let state_lookup = move |_: &str, _: &str| {
         vec![
-            format!("thing_{:016x}.role", cur_hash ^ 0b1),
-            format!("thing_{:016x}.role", cur_hash ^ 0b10),
+            format!(
+                "thing_{:016x}.role",
+                cur_hash.with_flipped_mask_for_test(0b1)
+            ),
+            format!(
+                "thing_{:016x}.role",
+                cur_hash.with_flipped_mask_for_test(0b10)
+            ),
         ]
     };
     reconcile_anonymous_module_instances(&mut parsed.resources, &state_lookup);

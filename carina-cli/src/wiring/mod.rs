@@ -14,7 +14,9 @@ use carina_core::binding_index::{PreApplyInputs, ResolvedBindings, WaitAliasSpec
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
 use carina_core::effect::Effect;
-use carina_core::identifier::{self, AnonymousIdStateInfo, PrefixStateInfo};
+use carina_core::identifier::{
+    self, AnonymousIdBindingStateInfo, AnonymousIdStateInfo, PrefixStateInfo,
+};
 use carina_core::module_resolver;
 use carina_core::parser::{ProviderConfig, StateBlock, StateBlockAddress};
 use carina_core::plan::Plan;
@@ -507,6 +509,31 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
     resources: &mut [Resource],
     state_file: &mut StateFile,
 ) {
+    let state_by_binding: HashMap<String, Vec<AnonymousIdBindingStateInfo>> = state_file
+        .resources
+        .iter()
+        .filter_map(|sr| {
+            let binding = sr.binding.as_ref()?;
+            Some((
+                binding.clone(),
+                AnonymousIdBindingStateInfo {
+                    name: sr.name.clone(),
+                    attribute_values: sr
+                        .attributes
+                        .iter()
+                        .filter_map(|(attr, value)| {
+                            identifier::canonical_create_only_state_json_string(value)
+                                .map(|s| (attr.clone(), s))
+                        })
+                        .collect(),
+                },
+            ))
+        })
+        .fold(HashMap::new(), |mut acc, (binding, info)| {
+            acc.entry(binding).or_default().push(info);
+            acc
+        });
+
     let renames = identifier::reconcile_anonymous_identifiers(
         resources,
         ctx.schemas(),
@@ -541,6 +568,7 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
                 })
                 .collect()
         },
+        &|binding| state_by_binding.get(binding).cloned().unwrap_or_default(),
     );
 
     apply_provider_prefix_renames(&renames, state_file);
