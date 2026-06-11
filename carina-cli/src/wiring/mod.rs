@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::Path;
@@ -66,6 +67,22 @@ pub struct PlanContext {
     /// that produced them (#3306, #3307). Forwarded to the display
     /// layer so the rendered tree folds leaves under composition rows.
     pub expansion_trace: carina_core::resource::ExpansionTrace,
+}
+
+/// State-block targets resolved while constructing [`StateBlockClaims`].
+///
+/// This keeps plan-time collision checks on the same effectiveness
+/// resolution as the heuristic-claim pass. In particular, `removed`
+/// targets are resolved here once and then consumed by the RC3 predicate.
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedStateBlockTargets {
+    pub removed_from: Vec<ResourceId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StateBlockResolution {
+    pub claims: StateBlockClaims,
+    pub targets: ResolvedStateBlockTargets,
 }
 
 /// Cached provider factories and schemas, constructed once per CLI invocation.
@@ -1698,6 +1715,7 @@ pub async fn create_plan_from_parsed<E: Clone>(
     state_file: &Option<StateFile>,
     refresh: bool,
     state_block_claims: &StateBlockClaims,
+    resolved_state_block_targets: &ResolvedStateBlockTargets,
     base_dir: &Path,
 ) -> Result<PlanContext, AppError> {
     create_plan_from_parsed_with_upstream(
@@ -1706,6 +1724,7 @@ pub async fn create_plan_from_parsed<E: Clone>(
         refresh,
         &HashMap::new(),
         state_block_claims,
+        resolved_state_block_targets,
         base_dir,
     )
     .await
@@ -1717,6 +1736,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     refresh: bool,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     state_block_claims: &StateBlockClaims,
+    resolved_state_block_targets: &ResolvedStateBlockTargets,
     base_dir: &Path,
 ) -> Result<PlanContext, AppError> {
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
@@ -1911,7 +1931,6 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
             state_file,
             state_block_claims,
         ));
-
         // Phase 2: resolve data source refs against the consolidated
         // `current_states`, then refresh each via `read_data_source`.
         let ds_wait_aliases: Vec<WaitAliasSpec> = parsed
@@ -2029,6 +2048,12 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         &orphan_refreshed_ids,
     )?;
     sorted_resources = resorted;
+    validate_plan_time_state_block_collisions(
+        &sorted_resources,
+        &moved_pairs,
+        resolved_state_block_targets,
+        state_file,
+    )?;
 
     // A printed `⚠` warning is newline-terminated and is written on top of
     // indicatif's open spinner bar line, so it closes the bar region the
@@ -2365,8 +2390,18 @@ pub fn resolve_state_block_claims(
     desired: &[Resource],
     registry: &SchemaRegistry,
 ) -> StateBlockClaims {
+    resolve_state_blocks(blocks, state_file, desired, registry).claims
+}
+
+pub fn resolve_state_blocks(
+    blocks: &[StateBlock],
+    state_file: &Option<StateFile>,
+    desired: &[Resource],
+    registry: &SchemaRegistry,
+) -> StateBlockResolution {
     let mut from = HashSet::new();
     let mut to = HashSet::new();
+    let mut resolved_removed_from = Vec::new();
 
     for block in blocks {
         match block {
@@ -2387,15 +2422,23 @@ pub fn resolve_state_block_claims(
                 }
             }
             StateBlock::Removed { from: removed_from } => {
-                if state_file.as_ref().is_some_and(|sf| {
+                if let Some(id) = state_file.as_ref().and_then(|sf| {
                     sf.find_resource(
                         &removed_from.provider,
                         &removed_from.resource_type,
                         removed_from.name_str(),
                     )
-                    .is_some()
+                    .map(|rs| {
+                        ResourceId::with_provider(
+                            &rs.provider,
+                            &rs.resource_type,
+                            &rs.name,
+                            rs.directives.provider_instance.clone(),
+                        )
+                    })
                 }) {
                     from.insert(removed_from.clone());
+                    resolved_removed_from.push(id);
                 }
             }
             StateBlock::Import { to: import_to, .. } => {
@@ -2419,7 +2462,106 @@ pub fn resolve_state_block_claims(
         }
     }
 
-    StateBlockClaims::new(from, to)
+    StateBlockResolution {
+        claims: StateBlockClaims::new(from, to),
+        targets: ResolvedStateBlockTargets {
+            removed_from: resolved_removed_from,
+        },
+    }
+}
+
+pub fn validate_plan_time_state_block_collisions(
+    desired: &[Resource],
+    moved_pairs: &[(ResourceId, ResourceId)],
+    resolved_targets: &ResolvedStateBlockTargets,
+    state_file: &Option<StateFile>,
+) -> Result<(), AppError> {
+    let desired_ids: HashSet<ResourceId> =
+        desired.iter().map(|resource| resource.id.clone()).collect();
+
+    for (from, _to) in moved_pairs {
+        if desired_ids.contains(from) {
+            return Err(AppError::Validation(format!(
+                "moved/rename pair from {} collides with a desired resource: applying this plan would both upsert and clean up the same resource id",
+                from.human()
+            )));
+        }
+    }
+
+    for from in &resolved_targets.removed_from {
+        if desired_ids.contains(from) {
+            return Err(AppError::Validation(format!(
+                "removed block from {} collides with desired resource {}: applying this plan would both upsert and clean up the same resource id",
+                from.human(),
+                from.human()
+            )));
+        }
+    }
+
+    let mut seen_to: HashMap<&ResourceId, &ResourceId> = HashMap::new();
+    let mut seen_from: HashMap<&ResourceId, &ResourceId> = HashMap::new();
+    for (from, to) in moved_pairs {
+        match seen_to.entry(to) {
+            Entry::Occupied(first) => {
+                return Err(AppError::Validation(format!(
+                    "two moved/rename pairs resolve to the same target {}: {} -> {} and {} -> {} would overwrite state during plan application",
+                    to.human(),
+                    first.get().human(),
+                    to.human(),
+                    from.human(),
+                    to.human()
+                )));
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(from);
+            }
+        }
+
+        match seen_from.entry(from) {
+            Entry::Occupied(first_to) => {
+                return Err(AppError::Validation(format!(
+                    "two moved/rename pairs share the same source {}: {} -> {} and {} -> {} cannot both transfer the same state entry",
+                    from.human(),
+                    from.human(),
+                    first_to.get().human(),
+                    from.human(),
+                    to.human()
+                )));
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(to);
+            }
+        }
+    }
+
+    let Some(sf) = state_file.as_ref() else {
+        return Ok(());
+    };
+
+    for (from, to) in moved_pairs {
+        let from_exists = sf
+            .find_resource(&from.provider, &from.resource_type, from.name_str())
+            .is_some();
+        if from == to && from_exists {
+            return Err(AppError::Validation(format!(
+                "moved block from and to name the same address {}: a self-move cannot transfer state",
+                from.human()
+            )));
+        }
+        let to_exists = sf
+            .find_resource(&to.provider, &to.resource_type, to.name_str())
+            .is_some();
+        if from_exists && to_exists {
+            return Err(AppError::Validation(format!(
+                "moved/rename pair {} -> {} would overwrite an existing state entry at {}: applying this plan would drop the occupied target state row",
+                from.human(),
+                to.human(),
+                to.human()
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// Look up `to`'s full id (with any routed `provider_instance`) in

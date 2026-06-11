@@ -465,7 +465,9 @@ Introduce a collision predicate over plan-time data — the desired
 resource id set, the combined `(from, to)` move-pair vector (operator
 `moved` pairs plus synthesized anonymous→named rename pairs), and the
 resolved `removed` targets. `plan` and `apply` call it right after the
-pairs are produced and **fail** (hard error, not a warning) on:
+pairs are produced and deferred-for expansion has finalized the desired
+id set, so loop-child addresses are present, then **fail** (hard error,
+not a warning) on:
 
 - a move `from` that is also a desired resource id (the infra#138 shape:
   upsert and cleanup of the same id at writeback);
@@ -480,8 +482,10 @@ pairs are produced and **fail** (hard error, not a warning) on:
   vector scan to detect);
 - a pair whose `from` resolves in state while its `to` is *also* already
   occupied in state (the transfer would overwrite a live, refreshed row —
-  today an unwarned state-row drop; distinct from the from-absent /
-  to-present shape, which stays the idempotent already-applied no-op).
+  today an unwarned state-row drop; a pair whose `from == to` resolves in
+  state errors as a self-move with a dedicated message; distinct from the
+  from-absent / to-present shape, which stays the idempotent
+  already-applied no-op).
 
 This is a new early check, not an extraction: writeback's structural
 `WritebackPlan` enforcement is interwoven with apply-only inputs
