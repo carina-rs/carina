@@ -295,8 +295,6 @@ pub(crate) fn resolve_exports(
     let mut exports = HashMap::new();
     for param in export_params {
         if let Some(ref value) = param.value {
-            // Resolve both ResourceRef and cross-file dot-notation strings
-            // (e.g., "registry_prod.account_id" parsed from a different .crn file).
             let resolved = crate::commands::plan::resolve_export_value(value, &bindings);
             if let Some(json) = dsl_value_to_json(&resolved)? {
                 exports.insert(param.name.clone(), json);

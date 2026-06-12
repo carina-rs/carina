@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::deps::sort_resources_by_dependencies;
 use crate::parser::{File, ResourceRef};
-use crate::validation::{collect_dot_notation_refs, collect_resource_refs};
+use crate::validation::collect_resource_refs;
 
 /// Severity of a depends_on diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,7 +121,6 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
         let mut value_ref_deps: HashSet<String> = HashSet::new();
         for value in resource.attributes().values() {
             collect_resource_refs(value, &mut value_ref_deps);
-            collect_dot_notation_refs(value, &mut value_ref_deps);
         }
         for name in resource.dependency_bindings() {
             value_ref_deps.insert(name.clone());
@@ -419,13 +418,9 @@ mod tests {
     }
 
     #[test]
-    fn redundant_edge_via_dot_notation_string_is_diagnosed_as_warning() {
-        // Ensures the redundant-edge check matches what `check_unused_bindings`
-        // sees: dot-notation strings inside collections (e.g.
-        // `principals = [role.arn]`) survive resolution as
-        // `Value::Concrete(ConcreteValue::String("role.arn"))`, not `Value::Deferred(DeferredValue::ResourceRef)`. Without
-        // `collect_dot_notation_refs` here, the warning would silently
-        // miss this shape.
+    fn redundant_edge_via_value_ref_is_diagnosed_as_warning() {
+        // The redundant-edge check walks structural value references,
+        // including nested map/list attribute values.
         let src = r#"
             let role = aws.iam.Role {
                 role_name = "r"
@@ -444,7 +439,7 @@ mod tests {
             warnings
                 .iter()
                 .any(|m| m.contains("redundant") && m.contains("'role'")),
-            "expected redundant-edge warning for dot-notation ref, got {:?}",
+            "expected redundant-edge warning for value ref, got {:?}",
             warnings
         );
     }

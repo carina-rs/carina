@@ -9,7 +9,7 @@ use super::types::parse_type_expr;
 use super::util::{snake_to_pascal, value_type_name};
 use super::{ProviderContext, Rule, parse_expression};
 use crate::eval_value::EvalValue;
-use crate::resource::{ConcreteValue, DeferredValue, Value};
+use crate::resource::{ConcreteValue, DeferredValue, UnknownReason, Value};
 use crate::schema::{
     TypeIdentity, validate_ipv4_address, validate_ipv4_cidr, validate_ipv6_address,
     validate_ipv6_cidr,
@@ -91,7 +91,9 @@ pub(super) fn parse_fn_def(
     for p in &params {
         body_ctx.set_variable(
             p.name.clone(),
-            Value::Concrete(ConcreteValue::String(format!("__fn_param_{}", p.name))),
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::FnParam {
+                name: p.name.clone(),
+            })),
         );
     }
 
@@ -108,7 +110,9 @@ pub(super) fn parse_fn_def(
                 )?;
                 body_ctx.set_variable(
                     let_name.clone(),
-                    Value::Concrete(ConcreteValue::String(format!("__fn_local_{let_name}"))),
+                    Value::Deferred(DeferredValue::Unknown(UnknownReason::FnLocal {
+                        name: let_name.clone(),
+                    })),
                 );
                 local_lets.push((let_name, let_expr));
             }
@@ -559,7 +563,7 @@ pub(crate) fn evaluate_user_function(
 
     let UserFunctionBody(body) = &func.body;
     let substituted_body = substitute_fn_params(body, &substitutions);
-    let result = try_evaluate_fn_value(substituted_body, &child_ctx)?;
+    let result = try_evaluate_fn_value(substituted_body, &child_ctx)?.canonicalize();
     // Check return type if annotated
     if let Some(ref return_type) = func.return_type {
         check_fn_return_type(&func.name, return_type, &result, child_ctx.config)?;
@@ -570,20 +574,11 @@ pub(crate) fn evaluate_user_function(
 /// Recursively substitute function parameter placeholders with actual values
 fn substitute_fn_params(value: &Value, substitutions: &HashMap<String, Value>) -> Value {
     match value {
-        Value::Concrete(ConcreteValue::String(s)) => {
-            // Check if this is a parameter placeholder
-            if let Some(param_name) = s.strip_prefix("__fn_param_")
-                && let Some(sub) = substitutions.get(param_name)
-            {
-                return sub.clone();
-            }
-            if let Some(local_name) = s.strip_prefix("__fn_local_")
-                && let Some(sub) = substitutions.get(local_name)
-            {
-                return sub.clone();
-            }
-            Value::Concrete(ConcreteValue::String(s.clone()))
-        }
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::FnParam { name }))
+        | Value::Deferred(DeferredValue::Unknown(UnknownReason::FnLocal { name })) => substitutions
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| value.clone()),
         Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
             items
                 .iter()
@@ -623,7 +618,6 @@ fn substitute_fn_params(value: &Value, substitutions: &HashMap<String, Value>) -
         Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
             Box::new(substitute_fn_params(inner, substitutions)),
         )),
-        // `Value::Deferred(DeferredValue::Unknown)` is not a function-param placeholder. Pass through.
         Value::Deferred(DeferredValue::Unknown(_)) => value.clone(),
         other => other.clone(),
     }

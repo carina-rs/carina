@@ -839,7 +839,7 @@ pub(crate) fn resolve_export_values_for_display(
         .collect()
 }
 
-/// Resolve a single export value, handling both ResourceRef and dot-notation strings.
+/// Resolve a single export value, walking ResourceRef values inside lists and maps.
 pub(crate) fn resolve_export_value(
     value: &Value,
     bindings: &carina_core::binding_index::ResolvedBindings,
@@ -849,17 +849,6 @@ pub(crate) fn resolve_export_value(
     match value {
         Value::Deferred(DeferredValue::ResourceRef { .. }) => {
             resolve_ref_value(value, bindings).unwrap_or_else(|_| value.clone())
-        }
-        // Cross-file: "binding.attr" parsed as String instead of ResourceRef
-        Value::Concrete(ConcreteValue::String(s)) if s.contains('.') && !s.contains(' ') => {
-            let parts: Vec<&str> = s.splitn(2, '.').collect();
-            if parts.len() == 2
-                && let Some(attrs) = bindings.get(parts[0])
-                && let Some(resolved) = attrs.get(parts[1])
-            {
-                return resolved.clone();
-            }
-            value.clone()
         }
         Value::Concrete(ConcreteValue::List(items)) => {
             let resolved: Vec<Value> = items
@@ -1698,6 +1687,29 @@ mod export_diff_tests {
         assert_eq!(changes[0].name(), "added");
         assert_eq!(changes[1].name(), "modified");
         assert_eq!(changes[2].name(), "removed");
+    }
+
+    #[test]
+    fn resolve_export_value_preserves_dotted_string_literal() {
+        let resource = Resource::with_provider("test", "r.Vpc", "vpc", None)
+            .with_binding("vpc")
+            .with_attribute(
+                "vpc_id",
+                Value::Concrete(ConcreteValue::String("vpc-123".to_string())),
+            );
+        let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
+            carina_core::binding_index::PreApplyInputs {
+                managed: &[resource],
+                compositions: &[],
+                data_sources: &[],
+                current_states: &HashMap::new(),
+                remote_bindings: &HashMap::new(),
+                wait_aliases: &[],
+            },
+        );
+        let value = Value::Concrete(ConcreteValue::String("vpc.vpc_id".to_string()));
+
+        assert_eq!(resolve_export_value(&value, &bindings), value);
     }
 }
 

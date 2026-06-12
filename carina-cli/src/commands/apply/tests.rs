@@ -1127,9 +1127,9 @@ fn format_duration_zero() {
 }
 
 #[test]
-fn resolve_exports_resolves_cross_file_dot_notation_strings() {
+fn resolve_exports_resolves_cross_file_resource_refs() {
     use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
-    use carina_core::resource::{ConcreteValue, Value};
+    use carina_core::resource::Value;
     use carina_state::StateFile;
 
     // Build a state file with a resource that has a binding and attributes
@@ -1156,15 +1156,16 @@ fn resolve_exports_resolves_cross_file_dot_notation_strings() {
         serde_json::from_value::<StateFile>(json).unwrap()
     };
 
-    // Export param references registry_prod.account_id as a dot-notation string
-    // (this is how cross-file references are parsed: exports.crn doesn't see
-    // the let binding in main.crn, so the parser emits a plain string)
+    // Export param references registry_prod.account_id using the
+    // parser-produced ResourceRef shape.
     let export_params = vec![ExportParameter {
         name: "account_id".to_string(),
         type_expr: TypeExpr::Unknown,
-        value: Some(Value::Concrete(ConcreteValue::String(
-            "registry_prod.account_id".to_string(),
-        ))),
+        value: Some(Value::resource_ref(
+            "registry_prod".to_string(),
+            "account_id".to_string(),
+            vec![],
+        )),
     }];
 
     // Mirror production callers: the resource is in sorted_resources
@@ -1193,7 +1194,7 @@ fn resolve_exports_resolves_cross_file_dot_notation_strings() {
     assert_eq!(
         exports.get("account_id"),
         Some(&serde_json::Value::String("459524413166".to_string())),
-        "resolve_exports should resolve dot-notation strings to actual values. Got: {:?}",
+        "resolve_exports should resolve ResourceRef values to actual values. Got: {:?}",
         exports
     );
 }

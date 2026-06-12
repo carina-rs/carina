@@ -1165,15 +1165,6 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
     // Collect all referenced binding names. Walk both top-level resources
     // and for-body template resources so bindings referenced only inside a
     // `for` loop are counted as used.
-    //
-    // `collect_dot_notation_refs` also runs on resource attributes: when
-    // a resource in file A references `binding.attr` where `binding` is
-    // declared in sibling file B, per-file parse stores it as
-    // `Value::Concrete(ConcreteValue::String("binding.attr"))`. `resolve_resource_refs_with_config`
-    // lifts those to `ResourceRef` only when the value sits at the top
-    // level of an attribute; inside a list / map / interpolation the
-    // string form survives, so a reference nested in
-    // `principals = [binding.attr]` would otherwise be missed.
     let mut referenced: HashSet<String> = HashSet::new();
     for rref in parsed.iter_all_resources() {
         let attrs = rref.attributes();
@@ -1182,7 +1173,6 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
                 continue;
             }
             collect_resource_refs(value, &mut referenced);
-            collect_dot_notation_refs(value, &mut referenced);
         }
         // `Composition` has no directives — `directives()` is `None`
         // for that arm, so the depends_on walk is simply skipped.
@@ -1193,7 +1183,6 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
     for call in &parsed.module_calls {
         for value in call.arguments.values() {
             collect_resource_refs(value, &mut referenced);
-            collect_dot_notation_refs(value, &mut referenced);
         }
     }
     for attr_param in &parsed.attribute_params {
@@ -1204,15 +1193,6 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
     for export_param in &parsed.export_params {
         if let Some(value) = export_param.value() {
             collect_resource_refs(value, &mut referenced);
-            // Cross-file: when exports.crn is parsed without the binding context,
-            // "vpc.vpc_id" becomes String("vpc.vpc_id") instead of ResourceRef.
-            // Extract the binding name from such dot-notation strings.
-            collect_dot_notation_refs(value, &mut referenced);
-        }
-    }
-    for attr_param in &parsed.attribute_params {
-        if let Some(value) = &attr_param.value {
-            collect_dot_notation_refs(value, &mut referenced);
         }
     }
     // Each `wait <target> { ... }` declaration references its target
@@ -1252,39 +1232,6 @@ pub(crate) fn collect_resource_refs(value: &Value, refs: &mut HashSet<String>) {
         Value::Concrete(ConcreteValue::Map(map)) => {
             for v in map.values() {
                 collect_resource_refs(v, refs);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Extract binding names from dot-notation string values (e.g., "vpc.vpc_id" → "vpc").
-///
-/// When files are parsed independently, cross-file references like `vpc.vpc_id`
-/// become `String("vpc.vpc_id")` instead of `ResourceRef`. This function extracts
-/// the first component as a potential binding name.
-pub(crate) fn collect_dot_notation_refs(value: &Value, refs: &mut HashSet<String>) {
-    match value {
-        Value::Concrete(ConcreteValue::String(s))
-            if s.contains('.') && !s.contains(' ') && !s.starts_with('/') =>
-        {
-            if let Some(binding) = s.split('.').next()
-                && !binding.is_empty()
-                && binding
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
-            {
-                refs.insert(binding.to_string());
-            }
-        }
-        Value::Concrete(ConcreteValue::List(items)) => {
-            for item in items {
-                collect_dot_notation_refs(item, refs);
-            }
-        }
-        Value::Concrete(ConcreteValue::Map(map)) => {
-            for v in map.values() {
-                collect_dot_notation_refs(v, refs);
             }
         }
         _ => {}

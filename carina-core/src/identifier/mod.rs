@@ -272,6 +272,12 @@ fn deterministic_value_string(value: &Value) -> String {
                 UnknownReason::ForKey => "Unknown(ForKey)".to_string(),
                 UnknownReason::ForIndex => "Unknown(ForIndex)".to_string(),
                 UnknownReason::ForValue => "Unknown(ForValue)".to_string(),
+                UnknownReason::FnParam { name } => {
+                    format!("Unknown(FnParam({name}))")
+                }
+                UnknownReason::FnLocal { name } => {
+                    format!("Unknown(FnLocal({name}))")
+                }
                 UnknownReason::ForValuePath { path } => {
                     format!("Unknown(ForValuePath({}))", path.to_dot_string())
                 }

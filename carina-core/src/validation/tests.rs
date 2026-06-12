@@ -97,6 +97,24 @@ fn unused_binding_warns() {
 }
 
 #[test]
+fn dotted_string_literal_does_not_count_as_binding_use() {
+    let mut parsed = empty_parsed();
+
+    let publish =
+        Resource::with_provider("test", "r.Source", "publish", None).with_binding("publish");
+    parsed.resources.push(publish); // allow: direct — fixture test inspection
+
+    let target = Resource::with_provider("test", "r.Target", "target", None).with_attribute(
+        "x",
+        Value::Concrete(ConcreteValue::String("publish.example.com".to_string())),
+    );
+    parsed.resources.push(target); // allow: direct — fixture test inspection
+
+    let unused = check_unused_bindings(&parsed);
+    assert_eq!(unused, vec!["publish"]);
+}
+
+#[test]
 fn anonymous_resource_no_warning() {
     let mut parsed = empty_parsed();
 

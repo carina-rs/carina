@@ -3,7 +3,7 @@
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
 use super::ProviderContext;
-use super::ast::{AttributeParameter, ExportParameter, ModuleCall, ParsedFile};
+use super::ast::ParsedFile;
 use super::entry::BindingSeed;
 use super::error::{ParseError, undefined_identifier_error};
 use super::static_eval::is_static_value;
@@ -79,122 +79,6 @@ fn iter_pre_apply_resources_mut(
                 .iter_mut()
                 .map(|d| d as &mut dyn PreApplyResourceMut),
         )
-}
-
-/// Resolve forward references after the full binding set is known.
-///
-/// During single-pass parsing, `identifier.member` forms where `identifier` is
-/// not yet a known binding are stored as `String("identifier.member")`.
-/// This function walks all resource attributes, module call arguments, and attribute
-/// parameter values, converting matching strings to `ResourceRef`.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn resolve_forward_references(
-    resource_bindings: &HashSet<String>,
-    resources: &mut [Resource],
-    data_sources: &mut [DataSource],
-    attribute_params: &mut [AttributeParameter],
-    module_calls: &mut [ModuleCall],
-    export_params: &mut [ExportParameter],
-) {
-    for resource in resources.iter_mut() {
-        // In-place replace via `iter_mut`: avoids the O(n²) cost of
-        // `shift_remove` + re-insert per key, and naturally preserves
-        // the user-authored attribute order without a key-collection
-        // round-trip. The placeholder is overwritten on the next line,
-        // so its identity doesn't matter.
-        for (_, attr) in resource.attributes.iter_mut() {
-            let placeholder = Value::Concrete(ConcreteValue::Bool(false));
-            let value = std::mem::replace(attr, placeholder);
-            *attr = resolve_forward_ref_in_value(value, resource_bindings);
-        }
-    }
-    for data_source in data_sources.iter_mut() {
-        for (_, attr) in data_source.attributes.iter_mut() {
-            let placeholder = Value::Concrete(ConcreteValue::Bool(false));
-            let value = std::mem::replace(attr, placeholder);
-            *attr = resolve_forward_ref_in_value(value, resource_bindings);
-        }
-    }
-    for attr_param in attribute_params.iter_mut() {
-        if let Some(value) = attr_param.value.take() {
-            attr_param.value = Some(resolve_forward_ref_in_value(value, resource_bindings));
-        }
-    }
-    for call in module_calls.iter_mut() {
-        let keys: Vec<String> = call.arguments.keys().cloned().collect();
-        for key in keys {
-            if let Some(value) = call.arguments.remove(&key) {
-                let resolved = resolve_forward_ref_in_value(value, resource_bindings);
-                call.arguments.insert(key, resolved);
-            }
-        }
-    }
-    for export_param in export_params.iter_mut() {
-        if let Some(value) = export_param.value.take() {
-            export_param.value = Some(resolve_forward_ref_in_value(value, resource_bindings));
-        }
-    }
-}
-
-/// Recursively resolve forward references in a single Value.
-///
-/// Strings in `"name.member"` format where `name` is a known resource binding
-/// are resolved to `ResourceRef`. This handles forward references that were
-/// stored as strings during single-pass parsing.
-fn resolve_forward_ref_in_value(value: Value, resource_bindings: &HashSet<String>) -> Value {
-    match value {
-        Value::Concrete(ConcreteValue::String(ref s)) => {
-            // A dotted string like "vpc.vpc_id" or "vpc.attr.nested" may be a
-            // forward reference that was stored as a string during single-pass
-            // parsing. Resolve it to ResourceRef if the first segment is a known
-            // resource binding. Parts after the second become field_path.
-            let parts: Vec<&str> = s.splitn(3, '.').collect();
-            if parts.len() >= 2 && resource_bindings.contains(parts[0]) {
-                let field_path = parts
-                    .get(2)
-                    .map(|rest| rest.split('.').map(|s| s.to_string()).collect())
-                    .unwrap_or_default();
-                return Value::resource_ref(parts[0].to_string(), parts[1].to_string(), field_path);
-            }
-            value
-        }
-        Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
-            items
-                .into_iter()
-                .map(|v| resolve_forward_ref_in_value(v, resource_bindings))
-                .collect(),
-        )),
-        Value::Concrete(ConcreteValue::Map(map)) => Value::Concrete(ConcreteValue::Map(
-            map.into_iter()
-                .map(|(k, v)| (k, resolve_forward_ref_in_value(v, resource_bindings)))
-                .collect(),
-        )),
-        Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            use crate::resource::InterpolationPart;
-            Value::Deferred(DeferredValue::Interpolation(
-                parts
-                    .into_iter()
-                    .map(|p| match p {
-                        InterpolationPart::Expr(v) => InterpolationPart::Expr(
-                            resolve_forward_ref_in_value(v, resource_bindings),
-                        ),
-                        other => other,
-                    })
-                    .collect(),
-            ))
-            .canonicalize()
-        }
-        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
-            Value::Deferred(DeferredValue::FunctionCall {
-                name,
-                args: args
-                    .into_iter()
-                    .map(|v| resolve_forward_ref_in_value(v, resource_bindings))
-                    .collect(),
-            })
-        }
-        other => other,
-    }
 }
 
 /// Resolve resource references in a ParsedFile
@@ -319,24 +203,6 @@ pub fn resolve_resource_refs_with_config(
         let expr = parsed.variables[&key].clone();
         let resolved = resolve_function_calls_only(&expr, &binding_map, &fn_ctx)?;
         parsed.variables[&key] = resolved;
-    }
-
-    // Resolve cross-file forward references in export_params.
-    // During per-file parsing, "binding.attribute" strings from sibling files
-    // remain as Value::Concrete(ConcreteValue::String). Convert them to ResourceRef now that the full
-    // binding map is available.
-    // carina#3181: include data sources and compositions — a sibling-file
-    // export can forward-reference any top-level binding. Only the
-    // binding-name set is needed (forward-ref resolution is keyed on
-    // the name).
-    let resource_bindings: HashSet<String> = parsed
-        .iter_top_level_resources()
-        .filter_map(|rref| rref.binding().map(|b| b.to_string()))
-        .collect();
-    for export_param in &mut parsed.export_params {
-        if let Some(value) = export_param.value.take() {
-            export_param.value = Some(resolve_forward_ref_in_value(value, &resource_bindings));
-        }
     }
 
     // Provider attribute resolution lives in
