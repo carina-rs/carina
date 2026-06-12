@@ -13,9 +13,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::deps::sort_resources_by_dependencies;
+use crate::deps::{collect_dependencies, sort_resources_by_dependencies};
 use crate::parser::{File, ResourceRef};
-use crate::validation::collect_resource_refs;
 
 /// Severity of a depends_on diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,7 +119,7 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
 
         let mut value_ref_deps: HashSet<String> = HashSet::new();
         for value in resource.attributes().values() {
-            collect_resource_refs(value, &mut value_ref_deps);
+            collect_dependencies(value, &mut value_ref_deps);
         }
         for name in resource.dependency_bindings() {
             value_ref_deps.insert(name.clone());
@@ -224,7 +223,7 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::parse_and_resolve;
+    use crate::parser::{ProviderContext, parse, parse_and_resolve};
 
     fn diag_messages(diags: &[DependsOnDiagnostic], sev: Severity) -> Vec<String> {
         diags
@@ -440,6 +439,30 @@ mod tests {
                 .iter()
                 .any(|m| m.contains("redundant") && m.contains("'role'")),
             "expected redundant-edge warning for value ref, got {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn redundant_edge_via_interpolation_ref_is_diagnosed_as_warning() {
+        let src = r#"
+            let role = aws.iam.Role {
+                role_name = "r"
+                assume_role_policy_document = "{}"
+            }
+            let bucket = aws.s3.Bucket {
+                bucket_name = "acct-${role.arn}"
+                directives { depends_on = [role] }
+            }
+        "#;
+        let parsed = parse(src, &ProviderContext::default()).unwrap();
+        let diags = validate_depends_on(&parsed);
+        let warnings = diag_messages(&diags, Severity::Warning);
+        assert!(
+            warnings
+                .iter()
+                .any(|m| m.contains("redundant") && m.contains("'role'")),
+            "expected redundant-edge warning for interpolation ref, got {:?}",
             warnings
         );
     }

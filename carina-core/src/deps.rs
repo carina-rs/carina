@@ -377,7 +377,7 @@ pub fn find_failed_dependent<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::{Directives, Resource, ResourceId, Value};
+    use crate::resource::{DeferredValue, Directives, Resource, ResourceId, Value};
 
     fn make_resource(binding: &str, deps: &[&str]) -> Resource {
         let mut r = Resource::new("test", binding);
@@ -444,6 +444,22 @@ mod tests {
             "expected pre-recorded dependency `explicit_dep`, got {deps:?}",
         );
         assert_eq!(deps.len(), 2);
+    }
+
+    #[test]
+    fn collect_dependencies_recurses_into_secret_inner_value() {
+        // `Deferred(Secret(_))` is reachable after resolution wraps a value
+        // (for example in parser/resolve.rs), so pin this walker arm directly.
+        let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::resource_ref(
+            "role",
+            "arn",
+            vec![],
+        ))));
+        let mut deps = HashSet::new();
+
+        collect_dependencies(&value, &mut deps);
+
+        assert_eq!(deps, HashSet::from(["role".to_string()]));
     }
 
     // Closure-in-attribute regression test deleted: `Value::Closure` no
