@@ -1,6 +1,7 @@
 //! Conversions between carina-core types and Wasmtime-generated WIT types.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use carina_core::provider::{
     CreateRequest as CoreCreateRequest, DeleteRequest as CoreDeleteRequest,
@@ -21,6 +22,34 @@ use carina_core::value::{SerializationContext, SerializationError};
 use carina_provider_protocol::types as proto;
 
 use crate::wasm_bindings::carina::provider::types as wit;
+
+/// Error raised when provider-emitted schema wire data cannot be decoded.
+///
+/// External provider metadata is version-gated but still untrusted at this
+/// boundary; carina#3459 makes unsupported wire shapes explicit errors instead
+/// of panics so callers can attach provider context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaDecodeError {
+    detail: String,
+}
+
+impl SchemaDecodeError {
+    fn unsupported_custom_base(enclosing_custom_name: &str, base: &proto::AttributeType) -> Self {
+        Self {
+            detail: format!(
+                "legacy Custom wire type '{enclosing_custom_name}' has unsupported base {base:?}"
+            ),
+        }
+    }
+}
+
+impl fmt::Display for SchemaDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for SchemaDecodeError {}
 
 // -- Value --
 
@@ -624,32 +653,36 @@ pub fn check_protocol_version(info_json: &str) -> Result<(), String> {
 }
 
 /// Deserialize JSON to a Vec of core ResourceSchemas.
-pub fn json_to_schemas(json: &str) -> Vec<CoreResourceSchema> {
+pub fn json_to_schemas(json: &str) -> Result<Vec<CoreResourceSchema>, SchemaDecodeError> {
     let proto_schemas: Vec<proto::ResourceSchema> = serde_json::from_str(json).unwrap_or_default();
     proto_schemas.iter().map(proto_schema_to_core).collect()
 }
 
 /// Deserialize a JSON-encoded `HashMap<String, AttributeType>` from a WASM
 /// guest and convert it to core `AttributeType` values.
-pub fn json_to_attribute_types(json: &str) -> HashMap<String, CoreAttributeType> {
+pub fn json_to_attribute_types(
+    json: &str,
+) -> Result<HashMap<String, CoreAttributeType>, SchemaDecodeError> {
     let proto_types: HashMap<String, proto::AttributeType> =
         serde_json::from_str(json).unwrap_or_default();
     proto_types
         .into_iter()
-        .map(|(k, v)| (k, proto_attr_type_to_core(&v)))
+        .map(|(k, v)| proto_attr_type_to_core(&v).map(|attr_type| (k, attr_type)))
         .collect()
 }
 
 // -- Protocol schema to core schema conversion --
 
-fn proto_schema_to_core(s: &proto::ResourceSchema) -> CoreResourceSchema {
-    CoreResourceSchema {
+fn proto_schema_to_core(
+    s: &proto::ResourceSchema,
+) -> Result<CoreResourceSchema, SchemaDecodeError> {
+    Ok(CoreResourceSchema {
         resource_type: s.resource_type.clone(),
         attributes: s
             .attributes
             .iter()
-            .map(|(name, a)| (name.clone(), proto_attr_schema_to_core(a)))
-            .collect(),
+            .map(|(name, a)| proto_attr_schema_to_core(a).map(|schema| (name.clone(), schema)))
+            .collect::<Result<_, _>>()?,
         description: s.description.clone(),
         validator: build_validator_from_types(&s.validators),
         kind: match s.kind {
@@ -680,9 +713,9 @@ fn proto_schema_to_core(s: &proto::ResourceSchema) -> CoreResourceSchema {
         defs: s
             .defs
             .iter()
-            .map(|(k, v)| (k.clone(), proto_attr_type_to_core(v)))
-            .collect(),
-    }
+            .map(|(k, v)| proto_attr_type_to_core(v).map(|attr_type| (k.clone(), attr_type)))
+            .collect::<Result<_, _>>()?,
+    })
 }
 
 /// Reconstruct a validator function from serializable `ValidatorType` declarations.
@@ -723,10 +756,12 @@ fn validate_tags_key_value(
     Ok(())
 }
 
-fn proto_attr_schema_to_core(a: &proto::AttributeSchema) -> CoreAttributeSchema {
-    CoreAttributeSchema {
+fn proto_attr_schema_to_core(
+    a: &proto::AttributeSchema,
+) -> Result<CoreAttributeSchema, SchemaDecodeError> {
+    Ok(CoreAttributeSchema {
         name: a.name.clone(),
-        attr_type: proto_attr_type_to_core(&a.attr_type),
+        attr_type: proto_attr_type_to_core(&a.attr_type)?,
         required: a.required,
         default: None,
         description: a.description.clone(),
@@ -742,11 +777,13 @@ fn proto_attr_schema_to_core(a: &proto::AttributeSchema) -> CoreAttributeSchema 
         // the annotation lives entirely in the host-side schema; see
         // `proto_struct_field_to_core` for the rationale.
         deferred_populate: false,
-    }
+    })
 }
 
-fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
-    match t {
+fn proto_attr_type_to_core(
+    t: &proto::AttributeType,
+) -> Result<CoreAttributeType, SchemaDecodeError> {
+    Ok(match t {
         proto::AttributeType::String {
             pattern,
             length,
@@ -806,22 +843,28 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
             length,
             ..
         } => CoreAttributeType::refined_list(
-            proto_attr_type_to_core(element_type),
+            proto_attr_type_to_core(element_type)?,
             *ordered,
             *length,
             legacy_validator(|_| Ok(())),
         ),
         proto::AttributeType::Map { inner, key } => CoreAttributeType::map_with_key(
-            proto_attr_type_to_core(key),
-            proto_attr_type_to_core(inner),
+            proto_attr_type_to_core(key)?,
+            proto_attr_type_to_core(inner)?,
         ),
         proto::AttributeType::Struct { name, fields } => CoreAttributeType::struct_(
             name.clone(),
-            fields.iter().map(proto_struct_field_to_core).collect(),
+            fields
+                .iter()
+                .map(proto_struct_field_to_core)
+                .collect::<Result<_, _>>()?,
         ),
-        proto::AttributeType::Union { members } => {
-            CoreAttributeType::union(members.iter().map(proto_attr_type_to_core).collect())
-        }
+        proto::AttributeType::Union { members } => CoreAttributeType::union(
+            members
+                .iter()
+                .map(proto_attr_type_to_core)
+                .collect::<Result<_, _>>()?,
+        ),
         proto::AttributeType::Custom {
             name,
             base,
@@ -829,44 +872,7 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
             length,
             to_dsl,
             ..
-        } => {
-            let identity = if name.is_empty() {
-                None
-            } else {
-                Some(carina_core::schema::TypeIdentity::from_dotted(name))
-            };
-            let validate = legacy_validator(|_| Ok(())); // Validation is handled via ProviderContext.validators
-            match base.as_ref() {
-                proto::AttributeType::String { .. } => {
-                    CoreAttributeType::refined_string_with_validator(
-                        identity,
-                        pattern.clone(),
-                        *length,
-                        validate,
-                        to_dsl.clone(),
-                    )
-                }
-                proto::AttributeType::Int { .. } => CoreAttributeType::refined_int_with_validator(
-                    identity,
-                    length.map(|(min, max)| (min.map(|v| v as i64), max.map(|v| v as i64))),
-                    validate,
-                ),
-                proto::AttributeType::Float { .. } => {
-                    CoreAttributeType::refined_float_with_validator(identity, None, validate)
-                }
-                proto::AttributeType::List {
-                    element_type,
-                    ordered,
-                    ..
-                } => CoreAttributeType::refined_list(
-                    proto_attr_type_to_core(element_type),
-                    *ordered,
-                    *length,
-                    validate,
-                ),
-                other => panic!("legacy Custom wire type has unsupported base {other:?}"),
-            }
-        }
+        } => proto_legacy_custom_to_core(name, base, pattern.clone(), *length, to_dsl.clone())?,
         proto::AttributeType::CustomEnum {
             name,
             base,
@@ -880,7 +886,7 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
             // structured form from the wire's flat `namespace + name`
             // shape.
             carina_core::schema::enum_identity(name, Some(namespace.as_str())),
-            proto_attr_type_to_core(base),
+            proto_attr_type_to_core(base)?,
             None,
             vec![],
             None, // Validation is handled via ProviderContext.validators
@@ -891,13 +897,83 @@ fn proto_attr_type_to_core(t: &proto::AttributeType) -> CoreAttributeType {
         // `ResourceSchema.defs` map is converted alongside in
         // `proto_schema_to_core` so resolution at walk-sites succeeds.
         proto::AttributeType::Ref { name } => CoreAttributeType::ref_(name.clone()),
+    })
+}
+
+fn proto_legacy_custom_to_core(
+    enclosing_name: &str,
+    base: &proto::AttributeType,
+    pattern: Option<String>,
+    length: Option<(Option<u64>, Option<u64>)>,
+    to_dsl: Option<proto::DslTransform>,
+) -> Result<CoreAttributeType, SchemaDecodeError> {
+    if let proto::AttributeType::Custom {
+        base,
+        pattern: inner_pattern,
+        length: inner_length,
+        to_dsl: inner_to_dsl,
+        ..
+    } = base
+    {
+        // carina#3459: pre-namespace-adoption providers can encode resource
+        // IDs as Custom -> Custom -> primitive refinement chains. The outer
+        // name remains the only identity, with no inner-name fallback even if
+        // empty; pattern/length/to_dsl use outer-first fallback.
+        return proto_legacy_custom_to_core(
+            enclosing_name,
+            base,
+            pattern.or_else(|| inner_pattern.clone()),
+            length.or(*inner_length),
+            to_dsl.or_else(|| inner_to_dsl.clone()),
+        );
+    }
+
+    let identity = if enclosing_name.is_empty() {
+        None
+    } else {
+        Some(carina_core::schema::TypeIdentity::from_dotted(
+            enclosing_name,
+        ))
+    };
+    let validate = legacy_validator(|_| Ok(())); // Validation is handled via ProviderContext.validators
+
+    match base {
+        proto::AttributeType::String { .. } => {
+            Ok(CoreAttributeType::refined_string_with_validator(
+                identity, pattern, length, validate, to_dsl,
+            ))
+        }
+        proto::AttributeType::Int { .. } => Ok(CoreAttributeType::refined_int_with_validator(
+            identity,
+            length.map(|(min, max)| (min.map(|v| v as i64), max.map(|v| v as i64))),
+            validate,
+        )),
+        proto::AttributeType::Float { .. } => Ok(CoreAttributeType::refined_float_with_validator(
+            identity, None, validate,
+        )),
+        proto::AttributeType::List {
+            element_type,
+            ordered,
+            ..
+        } => Ok(CoreAttributeType::refined_list(
+            proto_attr_type_to_core(element_type)?,
+            *ordered,
+            length,
+            validate,
+        )),
+        other => Err(SchemaDecodeError::unsupported_custom_base(
+            enclosing_name,
+            other,
+        )),
     }
 }
 
-fn proto_struct_field_to_core(f: &proto::StructField) -> CoreStructField {
-    CoreStructField {
+fn proto_struct_field_to_core(
+    f: &proto::StructField,
+) -> Result<CoreStructField, SchemaDecodeError> {
+    Ok(CoreStructField {
         name: f.name.clone(),
-        field_type: proto_attr_type_to_core(&f.field_type),
+        field_type: proto_attr_type_to_core(&f.field_type)?,
         required: f.required,
         description: f.description.clone(),
         provider_name: f.provider_name.clone(),
@@ -909,7 +985,7 @@ fn proto_struct_field_to_core(f: &proto::StructField) -> CoreStructField {
         // which is loaded directly via the SchemaRegistry rather
         // than crossing the WASM boundary. carina#3034.
         deferred_populate: false,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -923,6 +999,22 @@ mod tests {
             validate: None,
             to_dsl: None,
             identity: None,
+        }
+    }
+
+    fn proto_custom(
+        name: &str,
+        base: proto::AttributeType,
+        pattern: Option<&str>,
+        length: Option<(Option<u64>, Option<u64>)>,
+    ) -> proto::AttributeType {
+        proto::AttributeType::Custom {
+            name: name.to_string(),
+            base: Box::new(base),
+            pattern: pattern.map(str::to_string),
+            length,
+            validate: None,
+            to_dsl: None,
         }
     }
 
@@ -1530,7 +1622,7 @@ mod tests {
 
     #[test]
     fn test_json_to_schemas_empty() {
-        let schemas = json_to_schemas("[]");
+        let schemas = json_to_schemas("[]").unwrap();
         assert!(schemas.is_empty());
     }
 
@@ -1617,7 +1709,7 @@ mod tests {
           }
         ]"#;
 
-        let schemas = json_to_schemas(json);
+        let schemas = json_to_schemas(json).unwrap();
         assert_eq!(schemas.len(), 1);
 
         let schema = &schemas[0];
@@ -1752,7 +1844,7 @@ mod tests {
         // `CoreAttributeType::duration()` so the host's type checker
         // accepts `duration = 30min` against that declaration.
         let json = r#"{"timeout":{"type":"Duration"}}"#;
-        let types = json_to_attribute_types(json);
+        let types = json_to_attribute_types(json).unwrap();
         assert!(matches!(
             types
                 .get("timeout")
@@ -1831,7 +1923,7 @@ mod tests {
             exclusive_required: vec![],
             defs: Default::default(),
         };
-        let core_schema = proto_schema_to_core(&proto_schema);
+        let core_schema = proto_schema_to_core(&proto_schema).unwrap();
         assert!(core_schema.validator.is_some());
     }
 
@@ -1849,7 +1941,7 @@ mod tests {
             exclusive_required: vec![],
             defs: Default::default(),
         };
-        let core_schema = proto_schema_to_core(&proto_schema);
+        let core_schema = proto_schema_to_core(&proto_schema).unwrap();
         assert!(core_schema.validator.is_none());
     }
 
@@ -1872,7 +1964,7 @@ mod tests {
             ]],
             defs: Default::default(),
         };
-        let core_schema = proto_schema_to_core(&proto_schema);
+        let core_schema = proto_schema_to_core(&proto_schema).unwrap();
         assert_eq!(
             core_schema.exclusive_required,
             vec![vec![
@@ -1909,7 +2001,7 @@ mod tests {
             defs: Default::default(),
         };
         let json = serde_json::to_string(&vec![proto_schema]).unwrap();
-        let schemas = json_to_schemas(&json);
+        let schemas = json_to_schemas(&json).unwrap();
         assert_eq!(schemas.len(), 1);
         assert_eq!(
             schemas[0].exclusive_required,
@@ -1939,7 +2031,7 @@ mod tests {
                 ),
             ],
         };
-        let core_attr = proto_attr_type_to_core(&proto_attr);
+        let core_attr = proto_attr_type_to_core(&proto_attr).unwrap();
         match core_attr.shape_ref_free().expect("test schema is Ref-free") {
             carina_core::schema::Shape::Enum { dsl_aliases, .. } => {
                 assert_eq!(dsl_aliases.len(), 2);
@@ -1962,7 +2054,7 @@ mod tests {
     fn proto_enum_without_aliases_yields_empty_core_aliases() {
         let json = r#"{"type":"string_enum","values":["A","B"],"name":"X"}"#;
         let proto_attr: proto::AttributeType = serde_json::from_str(json).unwrap();
-        let core_attr = proto_attr_type_to_core(&proto_attr);
+        let core_attr = proto_attr_type_to_core(&proto_attr).unwrap();
         match core_attr.shape_ref_free().expect("test schema is Ref-free") {
             carina_core::schema::Shape::Enum { dsl_aliases, .. } => {
                 assert!(dsl_aliases.is_empty());
@@ -1979,7 +2071,7 @@ mod tests {
             namespace: "aws.AvailabilityZone".to_string(),
             dsl_transform: Some(proto::DslTransform::HyphenToUnderscore),
         };
-        let core_attr = proto_attr_type_to_core(&proto_attr);
+        let core_attr = proto_attr_type_to_core(&proto_attr).unwrap();
         let state = carina_core::resource::Value::Concrete(
             carina_core::resource::ConcreteValue::String("ap-northeast-1a".to_string()),
         );
@@ -2015,7 +2107,7 @@ mod tests {
             namespace: "aws.AvailabilityZone".to_string(),
             dsl_transform: Some(proto::DslTransform::HyphenToUnderscore),
         };
-        let core_attr = proto_attr_type_to_core(&proto_attr);
+        let core_attr = proto_attr_type_to_core(&proto_attr).unwrap();
 
         let garbage = carina_core::resource::Value::Concrete(
             carina_core::resource::ConcreteValue::String("garbage-not-an-az".to_string()),
@@ -2087,7 +2179,7 @@ mod tests {
             namespace: "test.Dynamic".to_string(),
             dsl_transform: Some(proto::DslTransform::StripSuffix(".".to_string())),
         };
-        let core_attr = proto_attr_type_to_core(&proto_attr);
+        let core_attr = proto_attr_type_to_core(&proto_attr).unwrap();
         match core_attr.shape_ref_free().expect("test schema is Ref-free") {
             carina_core::schema::Shape::Enum {
                 to_dsl: Some(transform),
@@ -2122,7 +2214,7 @@ mod tests {
             other => panic!("expected proto CustomEnum, got {other:?}"),
         }
 
-        let core_attr = proto_attr_type_to_core(&proto_attr);
+        let core_attr = proto_attr_type_to_core(&proto_attr).unwrap();
         match core_attr.shape_ref_free().expect("test schema is Ref-free") {
             carina_core::schema::Shape::Enum { to_dsl, .. } => {
                 assert_eq!(
@@ -2145,7 +2237,7 @@ mod tests {
             namespace: "aws.AvailabilityZone".to_string(),
             dsl_transform: None,
         };
-        let core_attr = proto_attr_type_to_core(&proto_attr);
+        let core_attr = proto_attr_type_to_core(&proto_attr).unwrap();
         match core_attr.shape_ref_free().expect("test schema is Ref-free") {
             carina_core::schema::Shape::Enum { to_dsl, .. } => {
                 assert!(to_dsl.is_none(), "None transform must remain no transform");
@@ -2164,7 +2256,7 @@ mod tests {
             validate: None,
             to_dsl: None,
         };
-        let core_attr = proto_attr_type_to_core(&proto_attr);
+        let core_attr = proto_attr_type_to_core(&proto_attr).unwrap();
         match core_attr.shape_ref_free().expect("test schema is Ref-free") {
             carina_core::schema::Shape::String {
                 identity,
@@ -2194,7 +2286,7 @@ mod tests {
             "to_dsl":{"type":"StripSuffix","value":"."}
         }"#;
         let proto_attr: proto::AttributeType = serde_json::from_str(json).unwrap();
-        let core_attr = proto_attr_type_to_core(&proto_attr);
+        let core_attr = proto_attr_type_to_core(&proto_attr).unwrap();
 
         match core_attr.shape_ref_free().expect("test schema is Ref-free") {
             carina_core::schema::Shape::String {
@@ -2222,7 +2314,7 @@ mod tests {
             "length":[0,65535]
         }"#;
         let proto_attr: proto::AttributeType = serde_json::from_str(json).unwrap();
-        let core_attr = proto_attr_type_to_core(&proto_attr);
+        let core_attr = proto_attr_type_to_core(&proto_attr).unwrap();
 
         match core_attr.shape_ref_free().expect("test schema is Ref-free") {
             carina_core::schema::Shape::Int {
@@ -2243,7 +2335,7 @@ mod tests {
             "base":{"type":"Float"}
         }"#;
         let proto_attr: proto::AttributeType = serde_json::from_str(json).unwrap();
-        let core_attr = proto_attr_type_to_core(&proto_attr);
+        let core_attr = proto_attr_type_to_core(&proto_attr).unwrap();
 
         match core_attr.shape_ref_free().expect("test schema is Ref-free") {
             carina_core::schema::Shape::Float {
@@ -2253,6 +2345,206 @@ mod tests {
                 assert!(range.is_none());
             }
             other => panic!("expected refined Float, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_nested_custom_resource_id_decodes_like_flat_custom() {
+        let nested = proto_custom(
+            "aws.ec2.VpcCidrBlockAssociation.Id",
+            proto_custom("aws.ResourceId", proto_string(), None, None),
+            None,
+            None,
+        );
+        let flat = proto_custom(
+            "aws.ec2.VpcCidrBlockAssociation.Id",
+            proto_string(),
+            None,
+            None,
+        );
+
+        let nested_core = proto_attr_type_to_core(&nested).unwrap();
+        let flat_core = proto_attr_type_to_core(&flat).unwrap();
+
+        match (
+            nested_core
+                .shape_ref_free()
+                .expect("test schema is Ref-free"),
+            flat_core.shape_ref_free().expect("test schema is Ref-free"),
+        ) {
+            (
+                carina_core::schema::Shape::String {
+                    identity: nested_identity,
+                    pattern: nested_pattern,
+                    length: nested_length,
+                    ..
+                },
+                carina_core::schema::Shape::String {
+                    identity: flat_identity,
+                    pattern: flat_pattern,
+                    length: flat_length,
+                    ..
+                },
+            ) => {
+                assert_eq!(
+                    nested_identity.map(|id| id.to_string()),
+                    flat_identity.map(|id| id.to_string())
+                );
+                assert_eq!(nested_identity.map(|id| id.kind.as_str()), Some("Id"));
+                assert_eq!(nested_pattern, flat_pattern);
+                assert_eq!(nested_length, flat_length);
+            }
+            other => panic!("expected matching refined String shapes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_nested_custom_outer_refinements_win_with_inner_fallback() {
+        let nested = proto_custom(
+            "aws.ec2.Vpc.Id",
+            proto_custom(
+                "aws.ResourceId",
+                proto_string(),
+                Some("^generic-"),
+                Some((Some(1), Some(64))),
+            ),
+            Some("^vpc-"),
+            Some((Some(4), Some(32))),
+        );
+        let core_attr = proto_attr_type_to_core(&nested).unwrap();
+        match core_attr.shape_ref_free().expect("test schema is Ref-free") {
+            carina_core::schema::Shape::String {
+                pattern, length, ..
+            } => {
+                assert_eq!(pattern, Some("^vpc-"));
+                assert_eq!(length, Some((Some(4), Some(32))));
+            }
+            other => panic!("expected refined String, got {other:?}"),
+        }
+
+        let fallback = proto_custom(
+            "aws.ec2.Vpc.Id",
+            proto_custom(
+                "aws.ResourceId",
+                proto_string(),
+                Some("^generic-"),
+                Some((Some(1), Some(64))),
+            ),
+            None,
+            None,
+        );
+        let core_attr = proto_attr_type_to_core(&fallback).unwrap();
+        match core_attr.shape_ref_free().expect("test schema is Ref-free") {
+            carina_core::schema::Shape::String {
+                pattern, length, ..
+            } => {
+                assert_eq!(pattern, Some("^generic-"));
+                assert_eq!(length, Some((Some(1), Some(64))));
+            }
+            other => panic!("expected refined String, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_nested_custom_non_string_terminal_decodes_to_refined_int() {
+        let proto_attr = proto_custom(
+            "aws.ec2.Port",
+            proto_custom(
+                "aws.GenericPort",
+                proto::AttributeType::Int {
+                    range: None,
+                    identity: None,
+                },
+                None,
+                Some((Some(0), Some(65535))),
+            ),
+            None,
+            None,
+        );
+        let core_attr = proto_attr_type_to_core(&proto_attr).unwrap();
+        match core_attr.shape_ref_free().expect("test schema is Ref-free") {
+            carina_core::schema::Shape::Int {
+                identity, range, ..
+            } => {
+                assert_eq!(identity.map(|id| id.kind.as_str()), Some("Port"));
+                assert_eq!(range, Some((Some(0), Some(65535))));
+            }
+            other => panic!("expected refined Int, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_nested_custom_depth_three_resolves_terminal_primitive() {
+        let proto_attr = proto_custom(
+            "aws.ec2.Subnet.Id",
+            proto_custom(
+                "aws.ResourceId",
+                proto_custom("aws.StringId", proto_string(), Some("^subnet-"), None),
+                None,
+                None,
+            ),
+            None,
+            None,
+        );
+        let core_attr = proto_attr_type_to_core(&proto_attr).unwrap();
+        match core_attr.shape_ref_free().expect("test schema is Ref-free") {
+            carina_core::schema::Shape::String {
+                identity, pattern, ..
+            } => {
+                assert_eq!(identity.map(|id| id.kind.as_str()), Some("Id"));
+                assert_eq!(pattern, Some("^subnet-"));
+            }
+            other => panic!("expected refined String, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_nested_custom_unsupported_terminal_returns_error() {
+        let proto_attr = proto_custom(
+            "aws.ec2.Unsupported.Id",
+            proto_custom("aws.ResourceId", proto::AttributeType::Bool, None, None),
+            None,
+            None,
+        );
+        let err = proto_attr_type_to_core(&proto_attr).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("aws.ec2.Unsupported.Id"), "{msg}");
+        assert!(msg.contains("Bool"), "{msg}");
+    }
+
+    #[test]
+    fn json_to_schemas_decodes_real_nested_custom_wire_shape() {
+        let json = r#"[
+            {
+                "resource_type":"aws.ec2.VpcCidrBlockAssociation",
+                "attributes":{
+                    "id":{
+                        "name":"id",
+                        "attr_type":{
+                            "type":"custom",
+                            "name":"aws.ec2.VpcCidrBlockAssociation.Id",
+                            "base":{
+                                "type":"custom",
+                                "name":"aws.ResourceId",
+                                "base":{"type":"String"}
+                            }
+                        },
+                        "required":false
+                    }
+                }
+            }
+        ]"#;
+
+        let schemas = json_to_schemas(json).unwrap();
+        let attr_type = &schemas[0].attributes["id"].attr_type;
+        match attr_type.shape_ref_free().expect("test schema is Ref-free") {
+            carina_core::schema::Shape::String { identity, .. } => {
+                assert_eq!(
+                    identity.map(|id| id.to_string()),
+                    Some("aws.ec2.VpcCidrBlockAssociation.Id".to_string())
+                );
+            }
+            other => panic!("expected refined String, got {other:?}"),
         }
     }
 
@@ -2270,7 +2562,7 @@ mod tests {
             "validate":true
         }"#;
         let proto_attr: proto::AttributeType = serde_json::from_str(json).unwrap();
-        let core_attr = proto_attr_type_to_core(&proto_attr);
+        let core_attr = proto_attr_type_to_core(&proto_attr).unwrap();
 
         match core_attr.shape_ref_free().expect("test schema is Ref-free") {
             carina_core::schema::Shape::List {
@@ -2313,7 +2605,7 @@ mod tests {
 
         for json in cases {
             let proto_attr: proto::AttributeType = serde_json::from_str(json).unwrap();
-            let core_attr = proto_attr_type_to_core(&proto_attr);
+            let core_attr = proto_attr_type_to_core(&proto_attr).unwrap();
             match core_attr.shape_ref_free().expect("test schema is Ref-free") {
                 carina_core::schema::Shape::String {
                     identity,
@@ -2364,7 +2656,7 @@ mod tests {
             exclusive_required: vec![],
             defs: Default::default(),
         };
-        let core_schema = proto_schema_to_core(&proto_schema);
+        let core_schema = proto_schema_to_core(&proto_schema).unwrap();
         let validator = core_schema.validator.unwrap();
 
         // key/value pattern should fail

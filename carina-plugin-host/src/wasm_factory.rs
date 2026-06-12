@@ -54,6 +54,16 @@ fn expect_unresolvable_absent<T>(r: Result<T, SerializationError>, what: &'stati
     r.unwrap_or_else(|e| panic!("{what} must not see an unserializable Value ({e})"))
 }
 
+fn provider_schema_decode_error(
+    provider_name: &str,
+    provider_version: &str,
+    detail: wasm_convert::SchemaDecodeError,
+) -> String {
+    format!(
+        "provider '{provider_name}' {provider_version} emitted an attribute type this host cannot decode: {detail}; the provider revision may predate this host — bump the provider lock with `carina init --upgrade`"
+    )
+}
+
 // -- HTTP allow-list hooks --
 
 /// HTTP allow-list suffix patterns for outgoing requests from WASM plugins.
@@ -1286,16 +1296,22 @@ impl WasmProviderFactory {
         dirs::home_dir().map(|h| h.join(".carina").join("cache"))
     }
 
-    /// Load provider metadata from WIT functions. Returns empty defaults on failure.
+    /// Load provider metadata from WIT functions. Optional endpoints still default on call/JSON
+    /// failures, but type decode failures are reported with provider context.
     async fn load_metadata(
         bindings: &WasmBindings,
         store: &mut Store<HostState>,
-    ) -> (
-        HashMap<String, Vec<CompletionValue>>,
-        Vec<String>,
-        HashMap<String, HashMap<String, HashMap<String, String>>>,
-        HashMap<String, carina_core::schema::AttributeType>,
-    ) {
+        provider_name: &str,
+        provider_version: &str,
+    ) -> Result<
+        (
+            HashMap<String, Vec<CompletionValue>>,
+            Vec<String>,
+            HashMap<String, HashMap<String, HashMap<String, String>>>,
+            HashMap<String, carina_core::schema::AttributeType>,
+        ),
+        String,
+    > {
         let config_completions_json = bindings
             .call_provider_config_completions(store)
             .await
@@ -1320,14 +1336,15 @@ impl WasmProviderFactory {
             .await
             .unwrap_or_else(|_| "{}".to_string());
         let provider_config_types =
-            wasm_convert::json_to_attribute_types(&provider_config_types_json);
+            wasm_convert::json_to_attribute_types(&provider_config_types_json)
+                .map_err(|e| provider_schema_decode_error(provider_name, provider_version, e))?;
 
-        (
+        Ok((
             config_completions,
             identity_attributes,
             enum_aliases,
             provider_config_types,
-        )
+        ))
     }
 
     /// Compute a cache-safe filename for the given wasm path.
@@ -1444,14 +1461,15 @@ impl WasmProviderFactory {
             .map_err(|e| format!("Failed to call schemas(): {e}"))?;
 
         let (name, display_name, version) = wasm_convert::json_to_provider_info(&info_json);
-        let schemas: Vec<ResourceSchema> = wasm_convert::json_to_schemas(&schemas_json);
+        let schemas: Vec<ResourceSchema> = wasm_convert::json_to_schemas(&schemas_json)
+            .map_err(|e| provider_schema_decode_error(&name, &version, e))?;
 
         let (
             cached_config_completions,
             cached_identity_attributes,
             cached_enum_aliases,
             cached_provider_config_types,
-        ) = Self::load_metadata(&bindings, &mut store).await;
+        ) = Self::load_metadata(&bindings, &mut store, &name, &version).await?;
 
         Ok(Self {
             engine,
@@ -1554,14 +1572,15 @@ impl WasmProviderFactory {
             .map_err(|e| format!("Failed to call schemas(): {e}"))?;
 
         let (name, display_name, version) = wasm_convert::json_to_provider_info(&info_json);
-        let schemas: Vec<ResourceSchema> = wasm_convert::json_to_schemas(&schemas_json);
+        let schemas: Vec<ResourceSchema> = wasm_convert::json_to_schemas(&schemas_json)
+            .map_err(|e| provider_schema_decode_error(&name, &version, e))?;
 
         let (
             cached_config_completions,
             cached_identity_attributes,
             cached_enum_aliases,
             cached_provider_config_types,
-        ) = Self::load_metadata(&bindings, &mut store).await;
+        ) = Self::load_metadata(&bindings, &mut store, &name, &version).await?;
 
         Ok(Self {
             engine,
