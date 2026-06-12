@@ -1829,9 +1829,9 @@ target_id = caller.account_id
 #[test]
 fn exports_cross_file_ref_no_false_positive() {
     // Regression: when exports.crn references a binding from a sibling file,
-    // single-file parsing leaves the reference as Value::Concrete(ConcreteValue::String("binding.attr")).
+    // the parser produces a ResourceRef for `binding.attr`.
     // The custom type validator (e.g., aws_account_id: 12-digit check) must
-    // skip these dot-notation strings to avoid false positives.
+    // skip ResourceRefs to avoid false positives.
     use carina_core::resource::{ConcreteValue, Value};
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
@@ -1859,7 +1859,6 @@ fn exports_cross_file_ref_no_false_positive() {
     schemas.insert("awscc", schema);
     let engine = custom_engine(schemas);
 
-    // exports.crn parsed alone: "registry_prod.account_id" stays as String
     let doc = create_document(
         r#"exports {
   accounts: list(AwsAccountId) = [
@@ -1876,6 +1875,39 @@ fn exports_cross_file_ref_no_false_positive() {
     assert!(
         false_positive.is_none(),
         "Dot-notation cross-file ref should be skipped by type validator. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn exports_dotted_string_literal_is_not_ref_type_checked() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let schema = ResourceSchema::new("organizations.account")
+        .attribute(AttributeSchema::new("account_id", AttributeType::int()));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", schema);
+    let engine = custom_engine(schemas);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("downstream");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(
+        base.join("main.crn"),
+        "let registry_prod = awscc.organizations.account {\n  name = 'prod'\n}\n",
+    )
+    .unwrap();
+    let exports = "exports {\n  account: String = \"registry_prod.account_id\"\n}\n";
+    std::fs::write(base.join("exports.crn"), exports).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "exports.crn", exports);
+
+    let ref_type_warning = diagnostics.iter().find(|d| {
+        d.message.contains("type mismatch") && d.message.contains("registry_prod.account_id")
+    });
+    assert!(
+        ref_type_warning.is_none(),
+        "quoted dotted string literal must not be checked as a ResourceRef. Got: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
@@ -2040,12 +2072,9 @@ fn exports_type_warning_after_format_with_cross_file_ref() {
     );
     let diagnostics = engine.analyze(&doc, None);
 
-    // "registry_prod.account_id" is a cross-file ref (dot-notation string).
-    // It should NOT produce a false positive (12-digit check etc.).
-    // But list(bool) is wrong because the ref resolves to a string, not bool.
-    // For now, since we can't resolve cross-file refs in the LSP,
-    // at minimum we should NOT crash or hang.
-    // The type mismatch may or may not be caught depending on schema availability.
+    // The entries parse as ResourceRef values. At minimum, this path
+    // must not crash or produce custom-validator false positives.
+    // A type mismatch may or may not be caught depending on schema availability.
     eprintln!(
         "diagnostics after format+type-change: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()

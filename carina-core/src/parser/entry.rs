@@ -23,8 +23,7 @@ use super::expressions::pipe::parse_coalesce_expr;
 use super::functions::parse_fn_def;
 use super::let_binding::parse_let_binding_extended;
 use super::resolve::{
-    finalize_provider_configs, resolve_forward_references, resolve_provider_unresolved_attributes,
-    resolve_resource_refs,
+    finalize_provider_configs, resolve_provider_unresolved_attributes, resolve_resource_refs,
 };
 use crate::eval_value::EvalValue;
 use crate::resource::{DataSource, DeferredValue, Resource, Value};
@@ -392,21 +391,6 @@ pub fn parse_with_seeded_bindings(
     }
 
     providers.extend(std::mem::take(&mut ctx.named_provider_instances));
-
-    // Second pass: resolve forward references.
-    // During parsing, unknown 2-part identifiers (e.g., vpc.vpc_id where vpc is
-    // declared later) become String values like "vpc.vpc_id". Now that we have the
-    // full binding set, convert matching ones to ResourceRef.
-    let resource_binding_names: std::collections::HashSet<String> =
-        ctx.resource_bindings.keys().cloned().collect();
-    resolve_forward_references(
-        &resource_binding_names,
-        &mut resources,
-        &mut data_sources,
-        &mut attribute_params,
-        &mut module_calls,
-        &mut export_params,
-    );
 
     // "Is every ResourceRef root declared somewhere?" is a semantic
     // question the per-file parse cannot answer: the referent may live

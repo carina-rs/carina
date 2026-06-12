@@ -154,20 +154,6 @@ fn deferred_in_current_file(
         == Some(current)
 }
 
-/// Check if a string looks like an unresolved cross-file reference ("binding.attribute").
-fn is_dot_notation_ref(s: &str) -> bool {
-    let parts: Vec<&str> = s.split('.').collect();
-    parts.len() == 2
-        && !s.contains(' ')
-        && !s.starts_with('/')
-        && parts[0]
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && parts[1]
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
 impl DiagnosticEngine {
     /// Flag `arguments` blocks placed in a root configuration.
     ///
@@ -1206,17 +1192,6 @@ impl DiagnosticEngine {
         sibling_bindings: &HashMap<String, String>,
     ) -> Option<String> {
         match (type_expr, value) {
-            // Cross-file ref: look up schema type via sibling bindings.
-            // Two shapes reach this arm. The string form covers values
-            // not produced by the .crn parser — synthetic test inputs
-            // and any caller that hands us a raw `"binding.attr"` —
-            // since the parser itself now lowers dotted IDs to
-            // `Value::Deferred(DeferredValue::ResourceRef)` (#2447). The ResourceRef arm below
-            // is the parser-produced path; both must agree.
-            (_, Value::Concrete(ConcreteValue::String(s))) if is_dot_notation_ref(s) => {
-                let parts: Vec<&str> = s.split('.').collect();
-                self.check_cross_file_ref_type(type_expr, parts[0], parts[1], sibling_bindings)
-            }
             // Bare `binding.attribute` ref: check the head's schema type.
             // Refs with subscripts or a field_path narrow inside the
             // head's type and would need a positional walker to compare

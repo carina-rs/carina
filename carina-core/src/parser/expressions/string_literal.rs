@@ -84,14 +84,13 @@ pub(crate) fn parse_string_value(
     }
 
     if has_interpolation {
-        // Deliberately do *not* call `Value::canonicalize` here. The
-        // deferred-for placeholder substitution in
-        // `parser/ast.rs::substitute_placeholder` walks the `Expr`
-        // parts to replace `Value::Deferred(DeferredValue::Unknown(For*))` placeholders with the
-        // resolved iterable element, so the parts must stay intact
-        // through parse → for-expansion. Canonicalization runs later,
-        // after resolution (see #2227).
-        Ok(Value::Deferred(DeferredValue::Interpolation(parts)))
+        // Canonicalization only folds concrete scalar interpolation
+        // parts and preserves deferred refs/placeholders as Expr parts,
+        // so for-expansion substitution still finds them intact
+        // (covered by expand_deferred_for_substitutes_placeholder_inside_interpolation).
+        // Folding fully concrete interpolations here preserves #2227's
+        // canonical shape without the removed #3464 forward-ref pass.
+        Ok(Value::Deferred(DeferredValue::Interpolation(parts)).canonicalize())
     } else {
         // No interpolation — collapse to a plain String
         let s = parts

@@ -2213,8 +2213,8 @@ fn forward_reference_in_nested_value() {
 
 #[test]
 fn forward_reference_chained_three_parts() {
-    // Issue #1259: Chained forward references like "later.attr.nested" should
-    // be resolved to ResourceRef with field_path, not left as a plain string.
+    // Issue #1259: chained forward references parse as ResourceRef
+    // values with a field path.
     let input = r#"
         let subnet = awscc.ec2.Subnet {
             vpc_id     = vpc.encryption_specification.status
@@ -2241,8 +2241,8 @@ fn forward_reference_chained_three_parts() {
 
 #[test]
 fn forward_reference_chained_four_parts() {
-    // Issue #1259: Deep chained forward references like "later.attr.deep.nested"
-    // should be resolved to ResourceRef with multiple field_path entries.
+    // Issue #1259: deep chained forward references parse as ResourceRef
+    // values with multiple field path entries.
     let input = r#"
         let subnet = awscc.ec2.Subnet {
             vpc_id     = vpc.config.deep.nested
@@ -5781,6 +5781,49 @@ fn user_fn_with_string_interpolation() {
 }
 
 #[test]
+fn user_fn_interpolation_substitutes_param_inside_string() {
+    let input = r#"
+        fn bucket_name(env) {
+            "myapp-${env}-bucket"
+        }
+
+        let bucket = aws.s3_bucket {
+            name = bucket_name("prod")
+        }
+    "#;
+
+    let result = parse(input, &ProviderContext::default()).unwrap();
+    assert_eq!(
+        result.resources[0].get_attr("name"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "myapp-prod-bucket".to_string()
+        ))),
+    );
+}
+
+#[test]
+fn user_fn_interpolation_substitutes_local_inside_string() {
+    let input = r#"
+        fn bucket_name(env) {
+            let prefix = "myapp-${env}"
+            "${prefix}-bucket"
+        }
+
+        let bucket = aws.s3_bucket {
+            name = bucket_name("prod")
+        }
+    "#;
+
+    let result = parse(input, &ProviderContext::default()).unwrap();
+    assert_eq!(
+        result.resources[0].get_attr("name"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "myapp-prod-bucket".to_string()
+        ))),
+    );
+}
+
+#[test]
 fn user_fn_typed_param_string() {
     let input = r#"
         fn greet(name: String) {
@@ -8098,8 +8141,7 @@ fn bare_identifier_iterable_is_reported_as_undefined_not_string() {
 #[test]
 fn forward_reference_to_later_let_is_allowed() {
     // `foo.id` refers to `let foo = ...` declared after the first resource.
-    // This is a legitimate forward reference that the second-pass resolver
-    // handles.
+    // This is a legitimate forward reference parsed structurally as a ResourceRef.
     let input = r#"
         let bucket = aws.s3_bucket {
             name = foo.id
@@ -8998,6 +9040,209 @@ fn parse_directory_files_preserves_sibling_resource_ref_rhs() {
     }
 }
 
+#[test]
+fn parse_directory_preserves_module_arg_dotted_string_literal() {
+    use crate::config_loader::parse_directory;
+    use crate::module_resolver::resolve_modules;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let module_dir = tmp.path().join("uc");
+    std::fs::create_dir_all(&module_dir).unwrap();
+    std::fs::write(
+        module_dir.join("main.crn"),
+        r#"
+            arguments {
+                domain_name: String
+            }
+
+            test.r.record {
+                domain_name = domain_name
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("main.crn"),
+        r#"
+            provider test {
+                source = "x/y"
+                version = "0.1"
+            }
+
+            let publish = use { source = "./uc" }
+            let r = publish {
+                domain_name = 'publish.example.com'
+            }
+        "#,
+    )
+    .unwrap();
+
+    let mut parsed = parse_directory(tmp.path(), &ProviderContext::default())
+        .expect("directory fixture must parse");
+    resolve_modules(&mut parsed, tmp.path()).expect("module expansion must succeed");
+    let record = parsed
+        .resources
+        .iter()
+        .find(|r| r.id.resource_type == "r.record")
+        .expect("expanded module resource present");
+
+    assert_eq!(
+        record.attributes.get("domain_name"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "publish.example.com".to_string()
+        )))
+    );
+}
+
+#[test]
+fn parse_directory_preserves_direct_attr_dotted_string_literal() {
+    use crate::config_loader::parse_directory;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("main.crn"),
+        r#"
+            provider test {
+                source = "x/y"
+                version = "0.1"
+            }
+
+            let publish = test.r.source {
+                name = "publish"
+            }
+
+            test.r.target {
+                x = "publish.example.com"
+            }
+        "#,
+    )
+    .unwrap();
+
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
+        .expect("directory fixture must parse");
+    let target = parsed
+        .resources
+        .iter()
+        .find(|r| r.id.resource_type == "r.target")
+        .expect("target resource present");
+
+    assert_eq!(
+        target.attributes.get("x"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "publish.example.com".to_string()
+        )))
+    );
+}
+
+#[test]
+fn parse_directory_preserves_export_param_dotted_string_literal() {
+    use crate::config_loader::parse_directory;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("main.crn"),
+        r#"
+            provider test {
+                source = "x/y"
+                version = "0.1"
+            }
+
+            let publish = test.r.source {
+                name = "publish"
+            }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("exports.crn"),
+        r#"
+            exports {
+                domain = 'publish.example.com'
+            }
+        "#,
+    )
+    .unwrap();
+
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
+        .expect("directory fixture must parse");
+    let export = parsed
+        .export_params
+        .iter()
+        .find(|export| export.name == "domain")
+        .expect("domain export present");
+
+    assert_eq!(
+        export.value.as_ref(),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "publish.example.com".to_string()
+        )))
+    );
+}
+
+#[test]
+fn parse_preserves_data_source_attr_dotted_string_literal() {
+    let input = r#"
+        provider test {
+            source = "x/y"
+            version = "0.1"
+        }
+
+        let publish = test.r.source {
+            name = "publish"
+        }
+
+        let lookup = read test.r.lookup {
+            x = 'publish.example.com'
+        }
+    "#;
+
+    let parsed = parse(input, &ProviderContext::default()).expect("fixture must parse");
+    let data_source = parsed
+        .data_sources
+        .iter()
+        .find(|r| r.id.resource_type == "r.lookup")
+        .expect("data source present");
+
+    assert_eq!(
+        data_source.attributes.get("x"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "publish.example.com".to_string()
+        )))
+    );
+}
+
+#[test]
+fn parse_preserves_attribute_param_default_dotted_string_literal() {
+    let input = r#"
+        attributes {
+            domain: String = "publish.example.com"
+        }
+
+        provider test {
+            source = "x/y"
+            version = "0.1"
+        }
+
+        let publish = test.r.source {
+            name = "publish"
+        }
+    "#;
+
+    let parsed = parse(input, &ProviderContext::default()).expect("fixture must parse");
+    let attr = parsed
+        .attribute_params
+        .iter()
+        .find(|attr| attr.name == "domain")
+        .expect("domain attribute param present");
+
+    assert_eq!(
+        attr.value.as_ref(),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "publish.example.com".to_string()
+        )))
+    );
+}
+
 // ================================================================
 // #2435: upstream_state map subscript across sibling files
 //
@@ -9136,9 +9381,7 @@ fn parse_subscript_on_upstream_state_inside_string_interpolation_sibling_file() 
 //
 // Symmetric with the #2435 subscript fixes above: `${orgs.accounts.k}` must
 // also lower to `Value::Deferred(DeferredValue::ResourceRef)` when the `let orgs = upstream_state{...}`
-// declaration lives in a sibling .crn. Without this, the dotted form falls
-// through to a `Value::Concrete(ConcreteValue::String("orgs.accounts.k"))` literal and the literal
-// flows through the resolver into the rendered plan.
+// declaration lives in a sibling .crn.
 // ================================================================
 
 #[test]

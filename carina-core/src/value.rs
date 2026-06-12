@@ -115,6 +115,8 @@ impl std::fmt::Display for UnknownReason {
             UnknownReason::ForKey => write!(f, "deferred for-binding key"),
             UnknownReason::ForIndex => write!(f, "deferred for-binding index"),
             UnknownReason::ForValue => write!(f, "deferred for-binding value"),
+            UnknownReason::FnParam { name } => write!(f, "function parameter {name}"),
+            UnknownReason::FnLocal { name } => write!(f, "function local {name}"),
             UnknownReason::ForValuePath { path } => {
                 write!(f, "deferred for-binding value {}", path.to_dot_string())
             }
@@ -135,6 +137,8 @@ pub fn render_unknown(reason: &UnknownReason) -> String {
         UnknownReason::ForKey => "(known after upstream apply: key)".to_string(),
         UnknownReason::ForIndex => "(known after upstream apply: index)".to_string(),
         UnknownReason::ForValue => "(known after upstream apply)".to_string(),
+        UnknownReason::FnParam { name } => format!("(unresolved function parameter: {name})"),
+        UnknownReason::FnLocal { name } => format!("(unresolved function local: {name})"),
         UnknownReason::ForValuePath { path } => {
             format!("(known after upstream apply: {})", path.to_dot_string())
         }

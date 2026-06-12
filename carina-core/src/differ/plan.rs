@@ -406,7 +406,7 @@ pub fn create_plan(
     //
     // Target resolution: the parser has already pinned the target name;
     // here we look it up in `desired` (the live resource set after
-    // forward-ref resolution) to recover the resolved `ResourceId`. If
+    // `resolve_resource_refs`) to recover the resolved `ResourceId`. If
     // the target is missing — typo, scoped-out binding, etc. — the
     // wait is skipped with a plan-level error so downstream resources
     // referencing the wait binding still fail loudly.

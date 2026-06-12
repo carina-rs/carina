@@ -1446,35 +1446,40 @@ pub(super) fn substitute_placeholder(
     value: &Value,
 ) {
     match v {
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)) => {
-            *v = value.clone();
-        }
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValuePath { path })) => {
-            // carina#3136: a field access on the loop variable
-            // (`opt.resource_record.name`). The element is now known
-            // (`value`); re-navigate it along the remembered path via
-            // the *same* navigator the parse-time resolved case uses
-            // (single source of truth). If it does not navigate (the
-            // element genuinely lacks that path), leave the placeholder
-            // so the existing "unresolved" surfacing applies rather
-            // than silently substituting a wrong value.
-            if let Some(resolved) = crate::resource::navigate_value_path(value, path) {
-                *v = resolved;
+        Value::Deferred(DeferredValue::Unknown(reason)) => match reason.clone() {
+            UnknownReason::ForValue => {
+                *v = value.clone();
             }
-        }
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey)) => {
-            if let Some(k) = key {
-                *v = Value::Concrete(ConcreteValue::String(k.to_string()));
+            UnknownReason::ForValuePath { path } => {
+                // carina#3136: a field access on the loop variable
+                // (`opt.resource_record.name`). The element is now known
+                // (`value`); re-navigate it along the remembered path via
+                // the *same* navigator the parse-time resolved case uses
+                // (single source of truth). If it does not navigate (the
+                // element genuinely lacks that path), leave the placeholder
+                // so the existing "unresolved" surfacing applies rather
+                // than silently substituting a wrong value.
+                if let Some(resolved) = crate::resource::navigate_value_path(value, &path) {
+                    *v = resolved;
+                }
             }
-        }
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)) => {
-            if let Some(i) = index {
-                *v = Value::Concrete(ConcreteValue::Int(i));
+            UnknownReason::ForKey => {
+                if let Some(k) = key {
+                    *v = Value::Concrete(ConcreteValue::String(k.to_string()));
+                }
             }
-        }
-        // Explicit arm (not wildcard) so a new `UnknownReason` variant
-        // forces a compile-error decision here.
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef { .. })) => {}
+            UnknownReason::ForIndex => {
+                if let Some(i) = index {
+                    *v = Value::Concrete(ConcreteValue::Int(i));
+                }
+            }
+            // Upstream and empty-interpolation unknowns are not for-expansion placeholders.
+            UnknownReason::UpstreamRef { .. }
+            | UnknownReason::UpstreamBareRef { .. }
+            | UnknownReason::EmptyInterpolation => {}
+            // Function placeholders are substituted by user-function evaluation, not for expansion.
+            UnknownReason::FnParam { .. } | UnknownReason::FnLocal { .. } => {}
+        },
         Value::Concrete(ConcreteValue::List(items)) => {
             for item in items.iter_mut() {
                 substitute_placeholder(item, index, key, value);

@@ -167,11 +167,8 @@ pub fn load_configuration_with_config(
             return Err(parse_errors.join("\n"));
         }
 
-        // Resolve cross-file forward references on the merged result.
-        // Per-file resolve_resource_refs_with_config (line 78) only sees
-        // bindings within each file; cross-file dot-notation strings in
-        // export_params (e.g., "registry_prod.account_id") remain as
-        // Value::Concrete(ConcreteValue::String). This second pass converts them to ResourceRef.
+        // Resolve references on the merged result so cross-file
+        // `ResourceRef`s can see every sibling binding.
         if let Err(e) = parser::resolve_resource_refs_with_config(&mut merged, config) {
             return Err(e.to_string());
         }
@@ -213,9 +210,6 @@ pub fn load_configuration_with_config(
 /// individually, results are merged, and cross-file references are
 /// resolved against the combined binding map. Both CLI and LSP should
 /// use this to ensure consistent results.
-///
-/// Returns `None` for `export_params` values that are cross-file string
-/// references (e.g. `"registry_prod.account_id"`) resolved to `ResourceRef`.
 pub fn parse_directory(dir: &Path, config: &ProviderContext) -> Result<ParsedFile, String> {
     parse_directory_with_overrides(dir, config, &HashMap::new())
 }

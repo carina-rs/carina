@@ -825,6 +825,14 @@ pub enum UnknownReason {
     /// Loop-variable value in a deferred for-expression
     /// (`for v in iterable`). Substituted with the actual element.
     ForValue,
+    /// Function parameter placeholder while parsing a user-defined
+    /// function body. Substituted with the call argument when the
+    /// function is evaluated.
+    FnParam { name: String },
+    /// Function-local let placeholder while parsing a user-defined
+    /// function body. Substituted after local lets are evaluated for a
+    /// call.
+    FnLocal { name: String },
     /// Field access on a deferred for-expression's loop variable
     /// (`for (_, opt) in iterable { … opt.resource_record.name … }`).
     /// Carries the navigation path past the loop variable. The
@@ -1306,6 +1314,9 @@ impl Value {
                     // allocation.
                     UnknownReason::UpstreamRef { path } => path.hash(hasher),
                     UnknownReason::UpstreamBareRef { binding } => binding.hash(hasher),
+                    UnknownReason::FnParam { name } | UnknownReason::FnLocal { name } => {
+                        name.hash(hasher);
+                    }
                     // Carries an `AccessPath` payload — hash it like
                     // `UpstreamRef` so two distinct loop-var paths get
                     // distinct hashes.
