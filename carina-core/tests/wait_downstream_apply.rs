@@ -30,7 +30,7 @@ use std::sync::Mutex;
 use carina_core::config_loader::parse_directory;
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::create_plan;
-use carina_core::executor::{ExecutionInput, ExecutionObserver, execute_plan};
+use carina_core::executor::{ExecutionInput, ExecutionObserver, UnresolvedResource, execute_plan};
 use carina_core::module_resolver::resolve_modules;
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{
@@ -255,7 +255,12 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
 
     let unresolved_resources: HashMap<ResourceId, _> = sorted_resources
         .iter()
-        .map(|r| (r.id.clone(), r.clone()))
+        .map(|r| {
+            (
+                r.id.clone(),
+                UnresolvedResource::from_pre_resolve(r.clone()),
+            )
+        })
         .collect();
 
     let provider = MockProvider;
@@ -273,6 +278,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         provider_configs: &[],
         factories: &[],
         schemas: &schemas,
+        parallelism: carina_core::executor::TEST_UNCAPPED,
     };
 
     let result = execute_plan(&provider, input, &observer).await;
@@ -396,7 +402,12 @@ async fn nested_module_wait_binding_survives_two_expansions() {
 
     let unresolved_resources: HashMap<ResourceId, _> = sorted_resources
         .iter()
-        .map(|r| (r.id.clone(), r.clone()))
+        .map(|r| {
+            (
+                r.id.clone(),
+                UnresolvedResource::from_pre_resolve(r.clone()),
+            )
+        })
         .collect();
 
     let provider = MockProvider;
@@ -414,6 +425,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         provider_configs: &[],
         factories: &[],
         schemas: &schemas,
+        parallelism: carina_core::executor::TEST_UNCAPPED,
     };
 
     let result = execute_plan(&provider, input, &observer).await;

@@ -53,6 +53,13 @@ pub struct PlanFile {
     pub plan: Plan,
     /// Resources sorted by dependencies (for post-apply state saving)
     pub sorted_resources: Vec<Resource>,
+    /// Pre-resolution resources captured before ResourceRef substitution.
+    ///
+    /// The saved-plan apply path uses this snapshot for dependency analysis
+    /// and apply-time reference re-resolution. `sorted_resources` is already
+    /// resolved by plan time, so using it here would erase attribute-level
+    /// read information and disable update-update relaxation.
+    pub unresolved_resources: Vec<Resource>,
     /// Virtual resources (module-call attribute containers) emitted
     /// by module expansion at plan time (carina#3248). Persisted so
     /// the saved-plan apply path builds the same `ResolvedBindings`
@@ -157,6 +164,7 @@ pub struct CurrentStateEntry {
 fn build_plan_file<E>(
     path: &Path,
     parsed: &carina_core::parser::File<E>,
+    unresolved_resources: &[Resource],
     backend_config: Option<BackendConfig>,
     state_file: &Option<StateFile>,
     ctx: &crate::wiring::PlanContext,
@@ -168,6 +176,10 @@ fn build_plan_file<E>(
         .to_string();
 
     Ok(PlanFile {
+        // carina#3486: bumped 5→6 — saved plans now persist
+        // `unresolved_resources`, the pre-resolution snapshot needed by
+        // apply-time dependency analysis and reference re-resolution.
+        //
         // carina#3329: bumped 4→5 — `Effect::Import.identifier` is now
         // a tagged `Value`, not a plain string, so a pre-#3329 v4 plan
         // would otherwise fail to deserialize with an opaque serde
@@ -179,7 +191,7 @@ fn build_plan_file<E>(
         // the same `ResolvedBindings` view as the live-apply path.
         // Older plans (version below current) are rejected with a
         // clear message pointing the user at re-running `plan`.
-        version: 5,
+        version: 6,
         carina_version: env!("CARGO_PKG_VERSION").to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
         source_path,
@@ -190,6 +202,10 @@ fn build_plan_file<E>(
         plan: redact_secrets_in_plan(&ctx.plan)?,
         sorted_resources: ctx
             .sorted_resources
+            .iter()
+            .map(redact_secrets_in_resource)
+            .collect::<Result<Vec<_>, _>>()?,
+        unresolved_resources: unresolved_resources
             .iter()
             .map(redact_secrets_in_resource)
             .collect::<Result<Vec<_>, _>>()?,
@@ -397,12 +413,13 @@ pub async fn run_plan(
     json: bool,
     provider_context: &ProviderContext,
 ) -> Result<bool, AppError> {
-    let mut parsed = load_configuration_with_config(
+    let loaded = load_configuration_with_config(
         path,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
-    )?
-    .parsed;
+    )?;
+    let mut parsed = loaded.parsed;
+    let mut unresolved_parsed = loaded.unresolved_parsed;
 
     let base_dir = get_base_dir(path);
     validate_and_resolve_with_config(&mut parsed, base_dir, false)?;
@@ -559,6 +576,7 @@ pub async fn run_plan(
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
     let wiring = WiringContext::new(factories);
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
+    reconcile_prefixed_names(&mut unresolved_parsed.resources, &state_file);
     let crate::wiring::StateBlockResolution {
         claims: state_block_claims,
         targets: resolved_state_block_targets,
@@ -579,6 +597,16 @@ pub async fn run_plan(
             },
             &state_block_claims,
         );
+        carina_core::module_resolver::reconcile_anonymous_module_instances(
+            &mut unresolved_parsed.resources,
+            &|provider, resource_type| {
+                sf.resources_by_type(provider, resource_type)
+                    .into_iter()
+                    .map(|r| r.name.clone())
+                    .collect()
+            },
+            &state_block_claims,
+        );
     }
     if let Some(sf) = state_file.as_mut() {
         reconcile_anonymous_identifiers_with_ctx(
@@ -587,8 +615,15 @@ pub async fn run_plan(
             sf,
             &state_block_claims,
         );
+        reconcile_anonymous_identifiers_with_ctx(
+            &wiring,
+            &mut unresolved_parsed.resources,
+            sf,
+            &state_block_claims,
+        );
     }
     apply_name_overrides(&mut parsed.resources, &state_file);
+    apply_name_overrides(&mut unresolved_parsed.resources, &state_file);
 
     if !refresh {
         eprintln!(
@@ -708,6 +743,7 @@ pub async fn run_plan(
         let plan_file = build_plan_file(
             path,
             &parsed,
+            &unresolved_parsed.resources,
             plan_file_backend_config.clone(),
             &state_file,
             &ctx,
@@ -765,6 +801,7 @@ pub async fn run_plan(
         let plan_file = build_plan_file(
             path,
             &parsed,
+            &unresolved_parsed.resources,
             plan_file_backend_config.clone(),
             &state_file,
             &ctx,

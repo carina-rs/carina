@@ -10,6 +10,7 @@ use crate::differ::{
     AttrComparison, TypedAttr, key_should_enter_patch, secret_grafted_comparison_view,
 };
 use crate::effect::{BasicEffect, Effect};
+use crate::executor::UnresolvedResource;
 use crate::executor::normalized::{NormalizedResource, apply_desired_normalization};
 use crate::parser::ProviderConfig;
 use crate::provider::{
@@ -464,7 +465,7 @@ pub(super) fn count_actionable_effects(effects: &[Effect]) -> usize {
 pub(super) struct BasicEffectCtx<'a> {
     pub(super) provider: &'a dyn Provider,
     pub(super) bindings: &'a ResolvedBindings,
-    pub(super) unresolved: &'a HashMap<ResourceId, Resource>,
+    pub(super) unresolved: &'a HashMap<ResourceId, UnresolvedResource>,
     pub(super) pipeline: &'a RenormalizePipeline<'a>,
     pub(super) completed: &'a AtomicUsize,
     pub(super) total: usize,
@@ -561,7 +562,9 @@ pub(super) async fn execute_basic_effect<'a>(
             changed_attributes,
             ..
         } => {
-            let resolve_source = unresolved.get(id).unwrap_or(to);
+            let resolve_source = unresolved
+                .get(id)
+                .map_or(to, UnresolvedResource::as_resource);
             let resolved_to =
                 match resolve_resource_with_source(to, resolve_source, bindings, pipeline).await {
                     Ok(r) => r,

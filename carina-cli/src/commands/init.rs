@@ -51,7 +51,7 @@ pub async fn run_init(
         .parsed
         .providers
         .iter()
-        .filter(|p| p.is_default && p.source.is_none())
+        .filter(|p| p.is_default && p.source.is_none() && p.name != "mock")
         .map(|p| crate::commands::missing_provider_source_message(&p.name))
         .collect();
     if !missing_source.is_empty() {

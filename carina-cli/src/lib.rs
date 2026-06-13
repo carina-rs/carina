@@ -17,6 +17,9 @@ mod plan_snapshot_tests;
 mod tests;
 
 use clap::ValueEnum;
+use std::num::NonZeroUsize;
+
+pub const DEFAULT_PARALLELISM: NonZeroUsize = NonZeroUsize::new(8).unwrap();
 
 /// Controls how much detail is shown in plan output (CLI-facing enum with clap support).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

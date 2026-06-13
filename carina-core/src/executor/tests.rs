@@ -5,7 +5,8 @@ use crate::provider::{
     ReadRequest, UpdateRequest,
 };
 use crate::resource::{ConcreteValue, DataSource, DeferredValue, Directives, Resource, Value};
-use parallel::{build_dependency_levels, build_dependency_map};
+use parallel::{build_dependency_analysis, build_dependency_levels};
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -592,6 +593,7 @@ async fn test_simple_create() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -643,6 +645,7 @@ async fn test_apply_renormalizes_after_resolution() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -699,6 +702,7 @@ async fn test_apply_reapplies_enum_alias_stage() {
         provider_configs: &[],
         factories: &factories,
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -760,6 +764,7 @@ async fn test_apply_reapplies_enum_alias_stage_update_path() {
         provider_configs: &[],
         factories: &factories,
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -813,6 +818,7 @@ async fn test_apply_reapplies_canonicalize_stage() {
         provider_configs: &[],
         factories: &[],
         schemas: &CANON_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -872,6 +878,7 @@ async fn test_apply_renormalizes_update_path() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -957,6 +964,7 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
         provider_configs: &provider_configs,
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -1065,6 +1073,7 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
         provider_configs: &[],
         factories: &[],
         schemas: &AUGMENT_COMPARISON_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -1123,6 +1132,7 @@ async fn test_apply_effective_changed_skips_internal_and_write_only_attributes()
         provider_configs: &[],
         factories: &[],
         schemas: &AUGMENT_COMPARISON_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -1182,6 +1192,7 @@ async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
         provider_configs: &[],
         factories: &[],
         schemas: &AUGMENT_COMPARISON_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -1246,6 +1257,7 @@ async fn test_apply_effective_changed_skips_secret_shape_divergence() {
         provider_configs: &[],
         factories: &[],
         schemas: &AUGMENT_COMPARISON_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -1301,6 +1313,7 @@ async fn test_apply_renormalizes_nested_value_under_ref_bearing_resource() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -1438,6 +1451,7 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -1501,6 +1515,7 @@ async fn test_simple_delete() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -1534,6 +1549,7 @@ async fn test_failed_effect_propagates_to_dependent() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -1587,6 +1603,7 @@ async fn test_cbd_creates_before_deletes() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -1661,6 +1678,7 @@ async fn test_cbd_cascade_update_patch_uses_plan_time_comparison_semantics() {
         provider_configs: &[],
         factories: &[],
         schemas: &AUGMENT_COMPARISON_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -1707,6 +1725,7 @@ async fn test_dbd_deletes_before_creates() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -1788,6 +1807,7 @@ async fn test_phased_cbd_creates_in_forward_order_deletes_in_reverse() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -1868,6 +1888,7 @@ async fn test_phased_noncbd_creates_after_deletes() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -1906,6 +1927,7 @@ async fn test_observer_events_emitted_correctly() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -1935,6 +1957,7 @@ async fn test_read_effect_is_no_op() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -1977,6 +2000,7 @@ async fn test_independent_effects_run_in_parallel() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -2029,6 +2053,7 @@ async fn test_parallel_failure_skips_dependents() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -2078,6 +2103,7 @@ async fn test_dependency_levels_sequential_chain() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -2306,6 +2332,7 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -2329,6 +2356,311 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
     );
 }
 
+struct DelayedUpdateProvider {
+    delay: std::time::Duration,
+    change_unrelated_id: bool,
+    active: Arc<std::sync::atomic::AtomicUsize>,
+    max_active: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl DelayedUpdateProvider {
+    fn new(delay: std::time::Duration) -> Self {
+        Self {
+            delay,
+            change_unrelated_id: false,
+            active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    fn violates_unrelated_id(delay: std::time::Duration) -> Self {
+        Self {
+            delay,
+            change_unrelated_id: true,
+            active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    fn max_active(&self) -> usize {
+        self.max_active.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Provider for DelayedUpdateProvider {
+    fn name(&self) -> &str {
+        "delayed-update"
+    }
+
+    fn read(
+        &self,
+        _id: &ResourceId,
+        _identifier: Option<&str>,
+        _request: ReadRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        Box::pin(async { Err(ProviderError::internal("not implemented")) })
+    }
+
+    fn read_data_source(&self, _resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+        Box::pin(async { Err(ProviderError::internal("not implemented")) })
+    }
+
+    fn create(
+        &self,
+        _id: &ResourceId,
+        _request: CreateRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        Box::pin(async { Err(ProviderError::internal("not implemented")) })
+    }
+
+    fn update(
+        &self,
+        id: &ResourceId,
+        identifier: &str,
+        request: UpdateRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let id = id.clone();
+        let identifier = identifier.to_string();
+        let delay = self.delay;
+        let change_unrelated_id = self.change_unrelated_id;
+        let active = self.active.clone();
+        let max_active = self.max_active.clone();
+        Box::pin(async move {
+            let now_active = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            max_active.fetch_max(now_active, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(delay).await;
+            active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+
+            let mut attrs = request.from.attributes.clone();
+            attrs.insert(
+                "tags".to_string(),
+                Value::Concrete(ConcreteValue::String("new".to_string())),
+            );
+            if change_unrelated_id && id.name_str() == "vpc" {
+                attrs.insert(
+                    "id".to_string(),
+                    Value::Concrete(ConcreteValue::String("provider-violated-id".to_string())),
+                );
+            }
+            Ok(State::existing(id, attrs).with_identifier(&identifier))
+        })
+    }
+
+    fn delete(
+        &self,
+        _id: &ResourceId,
+        _identifier: &str,
+        _request: DeleteRequest,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
+        Box::pin(async { Err(ProviderError::internal("not implemented")) })
+    }
+}
+
+fn tag_update_resource(binding: &str, parent_ref: Option<&str>) -> Resource {
+    let mut resource = Resource::new("test", binding);
+    resource.binding = Some(binding.to_string());
+    resource.set_attr(
+        "id",
+        Value::Concrete(ConcreteValue::String(format!("{binding}-id"))),
+    );
+    resource.set_attr(
+        "tags",
+        Value::Concrete(ConcreteValue::String("new".to_string())),
+    );
+    if let Some(parent) = parent_ref {
+        resource.set_attr("vpc_id", Value::resource_ref(parent, "id", vec![]));
+    }
+    resource
+}
+
+fn tag_update_state(id: &ResourceId, binding: &str) -> State {
+    State::existing(
+        id.clone(),
+        HashMap::from([
+            (
+                "id".to_string(),
+                Value::Concrete(ConcreteValue::String(format!("{binding}-id"))),
+            ),
+            (
+                "tags".to_string(),
+                Value::Concrete(ConcreteValue::String("old".to_string())),
+            ),
+        ]),
+    )
+    .with_identifier(format!("{binding}-id"))
+}
+
+async fn run_tag_sweep(parallelism: NonZeroUsize) -> (std::time::Duration, usize) {
+    let mut resources = Vec::new();
+    resources.push(tag_update_resource("vpc", None));
+    for idx in 0..12 {
+        resources.push(tag_update_resource(&format!("child{idx}"), Some("vpc")));
+    }
+
+    let mut current_states = HashMap::new();
+    let mut plan = Plan::new();
+    for resource in &resources {
+        let binding = resource.binding.as_deref().unwrap();
+        let from = tag_update_state(&resource.id, binding);
+        current_states.insert(resource.id.clone(), from.clone());
+        plan.add(Effect::Update {
+            id: resource.id.clone(),
+            from: Box::new(from),
+            to: resource.clone(),
+            changed_attributes: vec!["tags".to_string()],
+        });
+    }
+
+    let unresolved_resources: HashMap<ResourceId, UnresolvedResource> = resources
+        .iter()
+        .map(|resource| {
+            (
+                resource.id.clone(),
+                UnresolvedResource::from_pre_resolve(resource.clone()),
+            )
+        })
+        .collect();
+    let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+        managed: &resources,
+        compositions: &[],
+        data_sources: &[],
+        current_states: &current_states,
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
+
+    let provider = DelayedUpdateProvider::new(std::time::Duration::from_millis(200));
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &unresolved_resources,
+        compositions: &[],
+        bindings,
+        current_states,
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism,
+    };
+
+    let observer = MockObserver::new();
+    let started = Instant::now();
+    let result = execute_plan(&provider, input, &observer).await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(result.success_count, 13);
+    assert_eq!(result.failure_count, 0);
+    (elapsed, provider.max_active())
+}
+
+async fn run_provider_contract_case(unknown_read: bool) -> usize {
+    let mut parent = tag_update_resource("vpc", None);
+    let mut child = tag_update_resource("child", None);
+    if unknown_read {
+        child.directives.depends_on.push("vpc".to_string());
+    } else {
+        child.set_attr("vpc_id", Value::resource_ref("vpc", "id", vec![]));
+    }
+    parent.binding = Some("vpc".to_string());
+    child.binding = Some("child".to_string());
+    let resources = vec![parent, child];
+
+    let mut current_states = HashMap::new();
+    let mut plan = Plan::new();
+    for resource in &resources {
+        let binding = resource.binding.as_deref().unwrap();
+        let from = tag_update_state(&resource.id, binding);
+        current_states.insert(resource.id.clone(), from.clone());
+        plan.add(Effect::Update {
+            id: resource.id.clone(),
+            from: Box::new(from),
+            to: resource.clone(),
+            changed_attributes: vec!["tags".to_string()],
+        });
+    }
+
+    let unresolved_resources: HashMap<ResourceId, UnresolvedResource> = resources
+        .iter()
+        .map(|resource| {
+            (
+                resource.id.clone(),
+                UnresolvedResource::from_pre_resolve(resource.clone()),
+            )
+        })
+        .collect();
+    let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
+        managed: &resources,
+        compositions: &[],
+        data_sources: &[],
+        current_states: &current_states,
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
+
+    let provider =
+        DelayedUpdateProvider::violates_unrelated_id(std::time::Duration::from_millis(100));
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &unresolved_resources,
+        compositions: &[],
+        bindings,
+        current_states,
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(2).unwrap(),
+    };
+
+    let observer = MockObserver::new();
+    let result = execute_plan(&provider, input, &observer).await;
+    assert_eq!(result.success_count, 2);
+    assert_eq!(result.failure_count, 0);
+    provider.max_active()
+}
+
+#[tokio::test]
+async fn provider_contract_violation_does_not_relax_unknown_read_edges() {
+    let max_active = run_provider_contract_case(true).await;
+    assert_eq!(
+        max_active, 1,
+        "unknown reads must keep the child update serialized even if the provider mutates unrelated attrs",
+    );
+}
+
+#[tokio::test]
+async fn provider_contract_violation_known_disjoint_edge_still_relaxes_by_static_invariant() {
+    let max_active = run_provider_contract_case(false).await;
+    assert_eq!(
+        max_active, 2,
+        "known disjoint reads should relax by the static read/write invariant even under a violating mock provider",
+    );
+}
+
+#[tokio::test]
+async fn test_parallel_update_relaxation_with_cap_eight_finishes_in_two_rounds() {
+    let (_elapsed, max_active) = run_tag_sweep(NonZeroUsize::new(8).unwrap()).await;
+    assert!(
+        max_active <= 8,
+        "scheduler must not dispatch more than the cap, max_active={max_active}",
+    );
+    assert!(
+        max_active > 1,
+        "relaxed update edges should allow concurrent updates, max_active={max_active}",
+    );
+}
+
+#[tokio::test]
+async fn test_parallelism_one_keeps_update_sweep_serial() {
+    let (elapsed, max_active) = run_tag_sweep(NonZeroUsize::new(1).unwrap()).await;
+
+    assert!(
+        elapsed >= std::time::Duration::from_millis(2400),
+        "cap=1 should serialize thirteen 200ms updates, got {elapsed:?}",
+    );
+    assert_eq!(max_active, 1);
+}
+
 #[tokio::test]
 async fn test_waiting_events_emitted_for_dependent_effects() {
     // Setup: A has no deps, C depends on A.
@@ -2350,6 +2682,7 @@ async fn test_waiting_events_emitted_for_dependent_effects() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -2405,7 +2738,7 @@ async fn test_waiting_events_emitted_for_dependent_effects() {
 ///
 /// When deleting resources, children must be deleted before parents.
 /// If subnet depends on vpc, the vpc delete must wait for subnet delete.
-/// Before the fix, `build_dependency_map` returned empty deps for deletes,
+/// Before the fix, dependency analysis returned empty deps for deletes,
 /// allowing parent and child deletes to run concurrently.
 #[test]
 fn test_build_dependency_levels_respects_delete_dependencies() {
@@ -2448,9 +2781,9 @@ fn test_build_dependency_levels_respects_delete_dependencies() {
     );
 }
 
-/// Characterization test for #1306: build_dependency_levels and build_dependency_map
+/// Characterization test for #1306: build_dependency_levels and dependency analysis
 /// must produce consistent results. This test verifies that after refactoring
-/// build_dependency_levels to reuse build_dependency_map, the level assignments
+/// build_dependency_levels to reuse the same dependency analysis, the level assignments
 /// remain the same.
 #[test]
 fn test_build_dependency_levels_consistent_with_dependency_map() {
@@ -2467,7 +2800,7 @@ fn test_build_dependency_levels_consistent_with_dependency_map() {
     plan.add(Effect::Create(d));
 
     let levels = build_dependency_levels(plan.effects(), &HashMap::new(), &[]);
-    let dep_map = build_dependency_map(plan.effects(), &HashMap::new(), &[]);
+    let dep_map = build_dependency_analysis(plan.effects(), &HashMap::new(), &[]).into_deps_of();
 
     // Verify levels are consistent with the dependency map:
     // For every effect, its level must be greater than all its dependencies' levels.
@@ -2526,6 +2859,7 @@ async fn test_update_effect_binding_map_propagation() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -2540,9 +2874,9 @@ async fn test_update_effect_binding_map_propagation() {
     assert!(events.iter().any(|e| e.starts_with("succeeded:")));
 }
 
-/// Regression test for #1195: build_dependency_map also respects delete dependencies.
+/// Regression test for #1195: dependency analysis also respects delete dependencies.
 #[test]
-fn test_build_dependency_map_respects_delete_dependencies() {
+fn test_dependency_analysis_respects_delete_dependencies() {
     let mut plan = Plan::new();
     plan.add(Effect::Delete {
         id: ResourceId::new("ec2.Vpc", "my-vpc"),
@@ -2561,7 +2895,7 @@ fn test_build_dependency_map_respects_delete_dependencies() {
         explicit_dependencies: std::collections::HashSet::new(),
     });
 
-    let deps = build_dependency_map(plan.effects(), &HashMap::new(), &[]);
+    let deps = build_dependency_analysis(plan.effects(), &HashMap::new(), &[]).into_deps_of();
 
     // vpc delete (idx 0) must depend on subnet delete (idx 1)
     // because subnet must be deleted before vpc (reverse dependency)
@@ -2646,6 +2980,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -2834,6 +3169,7 @@ async fn test_delete_waits_for_replace_cbd_of_dependent() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -2928,6 +3264,7 @@ async fn test_delete_waits_for_replace_cbd_even_when_delete_binding_is_none() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -3020,6 +3357,7 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -3169,6 +3507,7 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -3249,6 +3588,7 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -3367,6 +3707,7 @@ async fn test_chained_index_then_field_unresolved_at_apply_fails_with_clear_erro
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -3548,6 +3889,7 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -3754,6 +4096,7 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -3846,6 +4189,7 @@ async fn test_phased_move_with_interdependent_replace_does_not_panic() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();
@@ -3978,6 +4322,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
     };
 
     let observer = MockObserver::new();

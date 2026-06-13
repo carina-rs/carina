@@ -976,6 +976,7 @@ dependencies = [
  "carina-provider-protocol",
  "serde_json",
  "tempfile",
+ "tokio",
  "wit-bindgen 0.51.0",
 ]
 

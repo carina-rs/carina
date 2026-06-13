@@ -20,9 +20,11 @@ mod phased;
 mod replace;
 pub(crate) mod wait;
 
+pub use parallel::UnresolvedResource;
 pub use replace::compute_full_diff_patch;
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use crate::binding_index::ResolvedBindings;
@@ -34,10 +36,12 @@ use crate::resource::{ResourceId, State};
 use parallel::execute_effects_sequential;
 use phased::{execute_effects_phased, has_interdependent_replaces};
 
+pub const TEST_UNCAPPED: NonZeroUsize = NonZeroUsize::new(usize::MAX).unwrap();
+
 /// Input data required to execute a plan.
 pub struct ExecutionInput<'a> {
     pub plan: &'a crate::plan::Plan,
-    pub unresolved_resources: &'a HashMap<ResourceId, crate::resource::Resource>,
+    pub unresolved_resources: &'a HashMap<ResourceId, UnresolvedResource>,
     /// Virtual resources (module attribute containers). carina#3181:
     /// compositions are a distinct typestate from managed resources, so the
     /// executor's dependency walk receives them as their own slice. A
@@ -70,6 +74,8 @@ pub struct ExecutionInput<'a> {
     /// pipeline stage 1, also undone by apply-time re-resolution
     /// (carina#3063).
     pub schemas: &'a crate::schema::SchemaRegistry,
+    /// Maximum concurrent provider operations.
+    pub parallelism: NonZeroUsize,
 }
 
 /// Result of executing a plan's effects.

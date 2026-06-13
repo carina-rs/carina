@@ -17,7 +17,10 @@ use super::basic::{
     refresh_pending_states, resolve_resource, resolve_resource_with_source,
 };
 use super::replace::{compute_full_diff_patch, single_attribute_patch};
-use super::{ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, ProgressInfo};
+use super::{
+    ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, ProgressInfo,
+    UnresolvedResource,
+};
 
 /// Check if the plan contains multiple Replace effects that depend on each other.
 pub(super) fn has_interdependent_replaces(effects: &[Effect]) -> bool {
@@ -141,7 +144,7 @@ pub(super) fn topological_sort_replaces(
 pub(super) fn build_phase_dependency_map(
     effects: &[Effect],
     phase_indices: &[usize],
-    unresolved_resources: &HashMap<ResourceId, Resource>,
+    unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
     compositions: &[crate::resource::Composition],
 ) -> HashMap<usize, HashSet<usize>> {
     // Build binding -> effect index mapping for effects in this phase
@@ -162,7 +165,7 @@ pub(super) fn build_phase_dependency_map(
         if effect.as_resource_ref().is_some() {
             resolver.collect_from_effect(effect, &mut dep_indices);
             if let Some(unresolved) = unresolved_resources.get(effect.resource_id()) {
-                resolver.collect_from_resource(unresolved, &mut dep_indices);
+                resolver.collect_from_resource(unresolved.as_resource(), &mut dep_indices);
             }
         }
         deps_of.insert(idx, dep_indices);
@@ -587,7 +590,9 @@ pub(super) async fn execute_effects_phased(
                         let started = Instant::now();
                         observer.on_event(&ExecutionEvent::EffectStarted { effect });
 
-                        let resolve_source = unresolved.get(&to.id).unwrap_or(to);
+                        let resolve_source = unresolved
+                            .get(&to.id)
+                            .map_or(to, UnresolvedResource::as_resource);
                         let resolved = match resolve_resource_with_source(
                             to,
                             resolve_source,
@@ -862,7 +867,7 @@ pub(super) async fn execute_effects_phased(
             if effect.as_resource_ref().is_some() {
                 resolver.collect_from_effect(effect, &mut dep_indices);
                 if let Some(unresolved) = input.unresolved_resources.get(effect.resource_id()) {
-                    resolver.collect_from_resource(unresolved, &mut dep_indices);
+                    resolver.collect_from_resource(unresolved.as_resource(), &mut dep_indices);
                 }
             }
             deps_of.insert(idx, dep_indices);
@@ -1195,7 +1200,9 @@ pub(super) async fn execute_effects_phased(
                         in_flight.push(Box::pin(async move {
                             if let Effect::Replace { to, .. } = effect {
                                 let started = effect_started;
-                                let resolve_source = unresolved.get(&to.id).unwrap_or(to);
+                                let resolve_source = unresolved
+                                    .get(&to.id)
+                                    .map_or(to, UnresolvedResource::as_resource);
                                 let resolved = match resolve_resource_with_source(
                                     to,
                                     resolve_source,
@@ -1416,9 +1423,15 @@ mod tests {
         ];
         let phase_indices: Vec<usize> = vec![0, 1];
 
-        let mut unresolved: HashMap<ResourceId, Resource> = HashMap::new();
-        unresolved.insert(role.id.clone(), role.clone());
-        unresolved.insert(role_policy.id.clone(), role_policy.clone());
+        let mut unresolved: HashMap<ResourceId, UnresolvedResource> = HashMap::new();
+        unresolved.insert(
+            role.id.clone(),
+            UnresolvedResource::from_pre_resolve(role.clone()),
+        );
+        unresolved.insert(
+            role_policy.id.clone(),
+            UnresolvedResource::from_pre_resolve(role_policy.clone()),
+        );
 
         let deps_of = build_phase_dependency_map(&effects, &phase_indices, &unresolved, &[virt]);
 
@@ -1455,9 +1468,12 @@ mod tests {
         let effects = vec![Effect::Create(role.clone()), Effect::Create(caller.clone())];
         let phase_indices: Vec<usize> = vec![0, 1];
 
-        let mut unresolved: HashMap<ResourceId, Resource> = HashMap::new();
-        unresolved.insert(role.id.clone(), role);
-        unresolved.insert(caller.id.clone(), caller);
+        let mut unresolved: HashMap<ResourceId, UnresolvedResource> = HashMap::new();
+        unresolved.insert(role.id.clone(), UnresolvedResource::from_pre_resolve(role));
+        unresolved.insert(
+            caller.id.clone(),
+            UnresolvedResource::from_pre_resolve(caller),
+        );
 
         let deps_of = build_phase_dependency_map(
             &effects,

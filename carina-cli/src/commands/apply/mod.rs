@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -13,7 +14,7 @@ use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
 use carina_core::effect::Effect;
 use carina_core::executor::normalized::apply_desired_normalization;
-use carina_core::executor::{ExecutionInput, ExecutionResult};
+use carina_core::executor::{ExecutionInput, ExecutionResult, UnresolvedResource};
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ReadRequest};
 use carina_core::resolver::resolve_refs_with_state_and_remote;
@@ -71,8 +72,9 @@ pub async fn execute_effects(
     schemas: &carina_core::schema::SchemaRegistry,
     bindings: &mut ResolvedBindings,
     current_states: &mut HashMap<ResourceId, State>,
-    unresolved_resources: &HashMap<ResourceId, Resource>,
+    unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
     compositions: &[carina_core::resource::Composition],
+    parallelism: NonZeroUsize,
 ) -> ApplyResult {
     let input = ExecutionInput {
         plan,
@@ -84,6 +86,7 @@ pub async fn execute_effects(
         provider_configs,
         factories,
         schemas,
+        parallelism,
     };
 
     let observer = CliObserver::new(plan);
@@ -546,6 +549,7 @@ pub async fn run_apply(
     path: &Path,
     auto_approve: bool,
     lock: bool,
+    parallelism: NonZeroUsize,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
     let loaded = load_configuration_with_config(
@@ -554,6 +558,7 @@ pub async fn run_apply(
         &carina_core::schema::SchemaRegistry::new(),
     )?;
     let mut parsed = loaded.parsed;
+    let mut unresolved_parsed = loaded.unresolved_parsed;
     let backend_file = loaded.backend_file;
 
     let base_dir = get_base_dir(path);
@@ -787,11 +792,13 @@ pub async fn run_apply(
     let op_result = crate::signal::run_with_ctrl_c(run_apply_locked(
         &ctx,
         &mut parsed,
+        &mut unresolved_parsed,
         auto_approve,
         backend.as_ref(),
         lock_info.as_ref(),
         base_dir,
         provider_context,
+        parallelism,
     ))
     .await;
 
@@ -819,14 +826,17 @@ pub async fn run_apply(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_apply_locked(
     ctx: &WiringContext,
     parsed: &mut carina_core::parser::InferredFile,
+    unresolved_parsed: &mut carina_core::parser::ParsedFile,
     auto_approve: bool,
     backend: &dyn StateBackend,
     lock: Option<&LockInfo>,
     base_dir: &std::path::Path,
     provider_context: &ProviderContext,
+    parallelism: NonZeroUsize,
 ) -> Result<Option<Duration>, AppError> {
     // Read current state from backend. carina#3315: if `check_and_migrate`
     // lifted an older on-disk schema in memory, persist the upgrade
@@ -836,6 +846,7 @@ async fn run_apply_locked(
     let mut state_file = load_state_persist_if_migrated(backend, lock).await?;
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
+    reconcile_prefixed_names(&mut unresolved_parsed.resources, &state_file);
     let crate::wiring::StateBlockResolution {
         claims: state_block_claims,
         targets: resolved_state_block_targets,
@@ -856,6 +867,16 @@ async fn run_apply_locked(
             },
             &state_block_claims,
         );
+        carina_core::module_resolver::reconcile_anonymous_module_instances(
+            &mut unresolved_parsed.resources,
+            &|provider, resource_type| {
+                sf.resources_by_type(provider, resource_type)
+                    .into_iter()
+                    .map(|r| r.name.clone())
+                    .collect()
+            },
+            &state_block_claims,
+        );
     }
     if let Some(sf) = state_file.as_mut() {
         reconcile_anonymous_identifiers_with_ctx(
@@ -864,8 +885,15 @@ async fn run_apply_locked(
             sf,
             &state_block_claims,
         );
+        reconcile_anonymous_identifiers_with_ctx(
+            ctx,
+            &mut unresolved_parsed.resources,
+            sf,
+            &state_block_claims,
+        );
     }
     apply_name_overrides(&mut parsed.resources, &state_file);
+    apply_name_overrides(&mut unresolved_parsed.resources, &state_file);
 
     // Upstream state bindings are loaded up front so refs that target
     // `upstream_state` blocks can be resolved during refresh (#1683) and
@@ -1432,9 +1460,15 @@ async fn run_apply_locked(
     println!();
 
     // Build unresolved resource map for re-resolution at apply time
-    let unresolved_resources: HashMap<ResourceId, Resource> = sorted_resources
+    let unresolved_resources: HashMap<ResourceId, UnresolvedResource> = unresolved_parsed
+        .resources
         .iter()
-        .map(|r| (r.id.clone(), r.clone()))
+        .map(|r| {
+            (
+                r.id.clone(),
+                UnresolvedResource::from_pre_resolve(r.clone()),
+            )
+        })
         .collect();
 
     // `provider` is a `ProviderRouter`, which impls both `Provider` and
@@ -1452,6 +1486,7 @@ async fn run_apply_locked(
         &mut current_states,
         &unresolved_resources,
         &parsed.compositions,
+        parallelism,
     )
     .await;
 
@@ -1532,6 +1567,7 @@ pub async fn run_apply_from_plan(
     plan_path: &PathBuf,
     auto_approve: bool,
     lock: bool,
+    parallelism: NonZeroUsize,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
     // Read and deserialize the plan file
@@ -1540,7 +1576,11 @@ pub async fn run_apply_from_plan(
     let plan_file: PlanFile =
         serde_json::from_str(&content).map_err(|e| format!("Failed to parse plan file: {}", e))?;
 
-    // Validate version compatibility. Plan-file version 5
+    // Validate version compatibility. Plan-file version 6
+    // (carina#3486) persists the pre-resolution resource snapshot used
+    // by apply-time dependency analysis and reference re-resolution.
+    //
+    // Plan-file version 5
     // (carina#3329) changed `Effect::Import.identifier`'s on-disk shape
     // from a plain string to a tagged `Value`, so a deferred upstream-
     // state reference inside the import id can survive plan→apply as
@@ -1555,9 +1595,9 @@ pub async fn run_apply_from_plan(
     // view as the live-apply path (carina#3246). Older plans cannot be
     // applied by the post-#3248 binding-construction path and are
     // rejected outright per the repo's no-backward-compat policy.
-    if plan_file.version != 5 {
+    if plan_file.version != 6 {
         return Err(AppError::Config(format!(
-            "Unsupported plan file version: {} (expected 5). \
+            "Unsupported plan file version: {} (expected 6). \
              Re-run 'carina plan' to produce a plan in the current format.",
             plan_file.version
         )));
@@ -1632,6 +1672,7 @@ pub async fn run_apply_from_plan(
         backend.as_ref(),
         lock_info.as_ref(),
         base_dir,
+        parallelism,
     ))
     .await;
 
@@ -1665,6 +1706,7 @@ async fn run_apply_from_plan_locked(
     backend: &dyn StateBackend,
     lock: Option<&LockInfo>,
     base_dir: &std::path::Path,
+    parallelism: NonZeroUsize,
 ) -> Result<Option<Duration>, AppError> {
     // Read current state and validate lineage. carina#3315: a
     // pending in-memory schema migration must be persisted under
@@ -1870,10 +1912,18 @@ async fn run_apply_from_plan_locked(
     println!("{}", "Applying changes...".cyan().bold());
     println!();
 
-    // Build unresolved resource map for re-resolution at apply time
-    let unresolved_resources: HashMap<ResourceId, Resource> = sorted_resources
+    // Build unresolved resource map for re-resolution at apply time from
+    // the saved pre-resolution snapshot. `sorted_resources` has already
+    // had ResourceRef values substituted during plan creation.
+    let unresolved_resources: HashMap<ResourceId, UnresolvedResource> = plan_file
+        .unresolved_resources
         .iter()
-        .map(|r| (r.id.clone(), r.clone()))
+        .map(|r| {
+            (
+                r.id.clone(),
+                UnresolvedResource::from_pre_resolve(r.clone()),
+            )
+        })
         .collect();
 
     // Same object in both positions: `ProviderRouter` is both the
@@ -1890,6 +1940,7 @@ async fn run_apply_from_plan_locked(
         &mut current_states,
         &unresolved_resources,
         plan_compositions,
+        parallelism,
     )
     .await;
 

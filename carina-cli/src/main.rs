@@ -1,10 +1,10 @@
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{CompleteEnv, Shell, generate};
 use colored::Colorize;
 
-use carina_cli::DetailLevel;
 use carina_cli::commands;
 use carina_cli::commands::apply::{run_apply, run_apply_from_plan};
 use carina_cli::commands::destroy::run_destroy;
@@ -17,6 +17,7 @@ use carina_cli::commands::skills;
 use carina_cli::commands::state::{StateCommands, run_force_unlock, run_state_command};
 use carina_cli::commands::validate::run_validate;
 use carina_cli::error;
+use carina_cli::{DEFAULT_PARALLELISM, DetailLevel};
 
 /// Version string assembled at build time by `build.rs`. Formatted as
 /// `<pkg> (<git-hash>[-dirty] <build-date>)`, or just `<pkg>` when the
@@ -88,6 +89,10 @@ enum Commands {
         /// Enable/disable state locking (default: true)
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         lock: bool,
+
+        /// Maximum concurrent provider operations
+        #[arg(long, default_value_t = DEFAULT_PARALLELISM)]
+        parallelism: NonZeroUsize,
     },
     /// Destroy all resources defined in the configuration file
     Destroy {
@@ -110,6 +115,10 @@ enum Commands {
         /// Force destroy even if resources have prevent_destroy set
         #[arg(long)]
         force: bool,
+
+        /// Maximum concurrent provider operations
+        #[arg(long, default_value_t = DEFAULT_PARALLELISM)]
+        parallelism: NonZeroUsize,
     },
     /// Show export values from the state
     Export {
@@ -344,11 +353,12 @@ async fn main() {
             path,
             auto_approve,
             lock,
+            parallelism,
         } => {
             if path.extension().is_some_and(|ext| ext == "json") {
-                run_apply_from_plan(&path, auto_approve, lock, &provider_context).await
+                run_apply_from_plan(&path, auto_approve, lock, parallelism, &provider_context).await
             } else {
-                run_apply(&path, auto_approve, lock, &provider_context).await
+                run_apply(&path, auto_approve, lock, parallelism, &provider_context).await
             }
         }
         Commands::Destroy {
@@ -357,7 +367,19 @@ async fn main() {
             lock,
             refresh,
             force,
-        } => run_destroy(&path, auto_approve, lock, refresh, force, &provider_context).await,
+            parallelism,
+        } => {
+            run_destroy(
+                &path,
+                auto_approve,
+                lock,
+                refresh,
+                force,
+                parallelism,
+                &provider_context,
+            )
+            .await
+        }
         Commands::Export { name, json, raw } => {
             let format = if raw {
                 commands::export::OutputFormat::Raw

@@ -1,6 +1,9 @@
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use carina_core::provider::{
     BoxFuture, CreateRequest, DeleteRequest, PatchOpKind, Provider, ProviderError, ProviderResult,
@@ -13,11 +16,37 @@ pub struct MockProvider {
     state_file: PathBuf,
 }
 
+static ACTIVE_UPDATES: AtomicUsize = AtomicUsize::new(0);
+static MAX_ACTIVE_UPDATES: AtomicUsize = AtomicUsize::new(0);
+
+struct ActiveUpdateGuard;
+
+impl ActiveUpdateGuard {
+    fn enter() -> Self {
+        let active = ACTIVE_UPDATES.fetch_add(1, Ordering::SeqCst) + 1;
+        MAX_ACTIVE_UPDATES.fetch_max(active, Ordering::SeqCst);
+        write_max_active();
+        Self
+    }
+}
+
+impl Drop for ActiveUpdateGuard {
+    fn drop(&mut self) {
+        ACTIVE_UPDATES.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl MockProvider {
     pub fn new() -> Self {
-        Self {
-            state_file: PathBuf::from(".carina/state.json"),
+        let state_file = env::var_os("CARINA_MOCK_STATE_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(".carina/state.json"));
+        if env::var_os("CARINA_MOCK_MAX_ACTIVE_PATH").is_some() {
+            ACTIVE_UPDATES.store(0, Ordering::SeqCst);
+            MAX_ACTIVE_UPDATES.store(0, Ordering::SeqCst);
+            write_max_active();
         }
+        Self { state_file }
     }
 
     fn load_states(&self) -> HashMap<String, HashMap<String, serde_json::Value>> {
@@ -42,6 +71,24 @@ impl MockProvider {
     fn resource_key(id: &ResourceId) -> String {
         format!("{}.{}", id.resource_type, id.name)
     }
+}
+
+fn update_delay() -> Option<Duration> {
+    env::var("CARINA_MOCK_UPDATE_DELAY_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+}
+
+fn write_max_active() {
+    let Some(path) = env::var_os("CARINA_MOCK_MAX_ACTIVE_PATH").map(PathBuf::from) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, MAX_ACTIVE_UPDATES.load(Ordering::SeqCst).to_string());
 }
 
 impl Default for MockProvider {
@@ -116,6 +163,10 @@ impl Provider for MockProvider {
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id = id.clone();
         Box::pin(async move {
+            let _active = ActiveUpdateGuard::enter();
+            if let Some(delay) = update_delay() {
+                tokio::time::sleep(delay).await;
+            }
             // Apply the patch on top of `from` to construct the post-update
             // attribute map. The mock writes only what the user changed —
             // matching the Level 3 contract that providers MUST NOT touch

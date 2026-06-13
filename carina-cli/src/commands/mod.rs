@@ -344,7 +344,7 @@ pub fn validate_and_resolve_errors_with_factories(
             }
             if let Some(reason) = load_errors.get(&provider.name) {
                 errors.push(AppError::Validation(reason.clone()));
-            } else if provider.is_default && provider.source.is_none() {
+            } else if provider.is_default && provider.source.is_none() && provider.name != "mock" {
                 errors.push(AppError::Validation(missing_provider_source_message(
                     &provider.name,
                 )));
