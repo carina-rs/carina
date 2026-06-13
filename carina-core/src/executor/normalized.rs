@@ -7,6 +7,13 @@
 //! let s: State = unimplemented!();
 //! build_update_patch(&[], &r, &s);   // must not compile
 //! ```
+//!
+//! ```compile_fail
+//! use carina_core::provider::CreateRequest;
+//! use carina_core::resource::Resource;
+//! let r: Resource = unimplemented!();
+//! let _ = CreateRequest { resource: r };   // must not compile
+//! ```
 
 use crate::parser::ProviderConfig;
 use crate::provider::{ProviderFactory, ProviderNormalizer};

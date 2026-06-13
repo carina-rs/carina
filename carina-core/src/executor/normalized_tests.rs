@@ -282,6 +282,30 @@ async fn merge_default_tags_runs_only_for_non_empty_provider_default_tags() {
 }
 
 #[tokio::test]
+async fn in_place_desired_normalization_does_not_canonicalize_resources() {
+    let normalizer = RecordingNormalizer::new();
+    let mut resource = Resource::with_provider("test", "thing", "example", None);
+    resource.set_attr("subjects", string_value("one"));
+    let mut resources = vec![resource];
+    let schemas = order_schema();
+
+    crate::executor::normalized::apply_desired_normalization_in_place(
+        &mut resources,
+        &[],
+        &normalizer,
+        &[],
+        &schemas,
+    )
+    .await;
+
+    assert_eq!(
+        resources[0].get_attr("subjects"),
+        Some(&string_value("one")),
+        "in-place desired normalization must leave canonicalize to the caller so plan code can run it before strip/restore"
+    );
+}
+
+#[tokio::test]
 async fn apply_desired_normalization_is_idempotent() {
     let mut resource = Resource::new("test", "thing");
     resource.set_attr("name", string_value("v1"));
