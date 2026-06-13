@@ -2012,22 +2012,21 @@ fn format_cascading_update_diff(
     lines.join("\n")
 }
 
-/// Check whether a Value references the given binding name.
-///
-/// Returns true for `Value::Deferred(DeferredValue::ResourceRef)` with matching `binding_name`,
-/// or `Value::Concrete(ConcreteValue::List)` / `Value::Concrete(ConcreteValue::Map)` containing such a reference.
 #[cfg(test)]
+/// Check whether a Value references the given binding name (either ResourceRef or bare BindingRef).
 fn value_references_binding(value: &Value, binding: &str) -> bool {
-    match value {
-        Value::Deferred(DeferredValue::ResourceRef { path }) => path.binding() == binding,
-        Value::Concrete(ConcreteValue::List(items)) => {
-            items.iter().any(|v| value_references_binding(v, binding))
+    let mut found = false;
+    value.visit_resource_refs(&mut |path| {
+        if path.binding() == binding {
+            found = true;
         }
-        Value::Concrete(ConcreteValue::Map(map)) => {
-            map.values().any(|v| value_references_binding(v, binding))
+    });
+    value.visit_binding_refs(&mut |bare_binding| {
+        if bare_binding == binding {
+            found = true;
         }
-        _ => false,
-    }
+    });
+    found
 }
 
 #[cfg(test)]

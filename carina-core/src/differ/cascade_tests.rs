@@ -718,6 +718,106 @@ fn cascade_generates_replace_when_create_only_list_contains_nested_ref() {
 }
 
 #[test]
+fn cascade_hint_prefers_resource_ref_over_binding_ref_in_mixed_list() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
+    let attachment_id = ResourceId::new("ec2.RouteTableAssociation", "my-assoc");
+
+    let vpc = Resource::new("ec2.Vpc", "my-vpc")
+        .with_binding("vpc")
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+        );
+
+    let attachment = Resource::new("ec2.RouteTableAssociation", "my-assoc")
+        .with_binding("attachment")
+        .with_attribute(
+            "targets",
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Deferred(DeferredValue::BindingRef {
+                    binding: "vpc".to_string(),
+                }),
+                Value::resource_ref("vpc".to_string(), "id".to_string(), vec![]),
+            ])),
+        );
+
+    let unresolved_resources = vec![vpc.clone(), attachment.clone()];
+
+    let mut current_states = HashMap::new();
+    let mut vpc_attrs = HashMap::new();
+    vpc_attrs.insert(
+        "cidr_block".to_string(),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+    );
+    vpc_attrs.insert(
+        "id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+    );
+    current_states.insert(
+        vpc_id.clone(),
+        State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
+    );
+
+    let mut attachment_attrs = HashMap::new();
+    attachment_attrs.insert(
+        "targets".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+            Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+        ])),
+    );
+    current_states.insert(
+        attachment_id.clone(),
+        State::existing(attachment_id.clone(), attachment_attrs).with_identifier("assoc-123"),
+    );
+
+    let attachment_schema = ResourceSchema::new("ec2.RouteTableAssociation").attribute(
+        AttributeSchema::new("targets", AttributeType::list(AttributeType::string()))
+            .required()
+            .create_only(),
+    );
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("", attachment_schema);
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Replace {
+        id: vpc_id.clone(),
+        from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
+        to: vpc.clone().with_binding("vpc"),
+        directives: Directives {
+            create_before_destroy: true,
+            ..Default::default()
+        },
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
+            .unwrap(),
+        cascading_updates: vec![],
+        temporary_name: None,
+        cascade_ref_hints: vec![],
+    });
+
+    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
+
+    match &plan.effects()[1] {
+        Effect::Replace {
+            cascade_ref_hints, ..
+        } => {
+            assert!(
+                cascade_ref_hints.contains(&("targets".to_string(), "vpc.id".to_string())),
+                "ResourceRef hint should win over BindingRef fallback, got: {:?}",
+                cascade_ref_hints
+            );
+        }
+        other => panic!(
+            "Expected mixed-list dependent to be Replace, got {}",
+            other.kind()
+        ),
+    }
+}
+
+#[test]
 fn cascade_generates_replace_when_create_only_map_contains_nested_ref() {
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 

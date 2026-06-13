@@ -404,7 +404,7 @@ pub fn check_upstream_state_field_references<E: crate::parser::ExportParamLike>(
     // errors directly below.
     {
         let mut check = |value: &Value, location: &str| {
-            value.visit_refs(&mut |path| {
+            value.visit_resource_refs(&mut |path| {
                 let binding = path.binding();
                 let field = path.attribute();
                 let Some(keys) = exports.get(binding) else {
@@ -1096,7 +1096,7 @@ fn visit_attribute_access(
     location: &str,
     errors: &mut Vec<UpstreamAttributeAccessShapeError>,
 ) {
-    value.visit_refs(&mut |path| {
+    value.visit_resource_refs(&mut |path| {
         let leading: Vec<String> = path.leading_field_path();
         if leading.is_empty() {
             return;
@@ -1256,7 +1256,7 @@ fn visit_subscript_access(
     location: &str,
     errors: &mut Vec<UpstreamSubscriptShapeError>,
 ) {
-    value.visit_refs(&mut |path| {
+    value.visit_resource_refs(&mut |path| {
         // Chained access (`cert.foo[0].bar`) is not yet exercised by
         // this checker — see #3025 for the planned segments-driven
         // walker. Skip the path here; the resolver still surfaces

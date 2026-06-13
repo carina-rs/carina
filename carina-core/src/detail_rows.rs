@@ -1649,8 +1649,13 @@ fn string_list_inner_type(attr_type: &AttributeType) -> Option<&AttributeType> {
 /// Check whether a Value references the given binding name.
 fn value_references_binding(value: &Value, binding: &str) -> bool {
     let mut found = false;
-    value.visit_refs(&mut |path| {
+    value.visit_resource_refs(&mut |path| {
         if path.binding() == binding {
+            found = true;
+        }
+    });
+    value.visit_binding_refs(&mut |bare_binding| {
+        if bare_binding == binding {
             found = true;
         }
     });
@@ -2371,7 +2376,7 @@ mod tests {
     /// so a ResourceRef nested inside `Interpolation` / `FunctionCall` /
     /// `Secret` / `Closure` would fail to mark the attribute as referencing
     /// the binding. Guard against regressing that after migrating to
-    /// `Value::visit_refs`.
+    /// `Value::visit_resource_refs` / `Value::visit_binding_refs`.
     #[test]
     fn value_references_binding_covers_non_container_variants() {
         use crate::resource::InterpolationPart;
@@ -2395,6 +2400,39 @@ mod tests {
 
         let secret = Value::Deferred(DeferredValue::Secret(Box::new(refs_vpc)));
         assert!(value_references_binding(&secret, "vpc"));
+
+        let binding_ref = || {
+            Value::Deferred(DeferredValue::BindingRef {
+                binding: "vpc".to_string(),
+            })
+        };
+
+        let list_binding = Value::Concrete(ConcreteValue::List(vec![binding_ref()]));
+        assert!(value_references_binding(&list_binding, "vpc"));
+
+        let map_binding = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "k".to_string(),
+            binding_ref(),
+        )])));
+        assert!(value_references_binding(&map_binding, "vpc"));
+
+        let interpolation_binding = Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Literal("vpc-".to_string()),
+            InterpolationPart::Expr(binding_ref()),
+        ]));
+        assert!(value_references_binding(&interpolation_binding, "vpc"));
+
+        let function_call_binding = Value::Deferred(DeferredValue::FunctionCall {
+            name: "join".to_string(),
+            args: vec![
+                Value::Concrete(ConcreteValue::String(",".to_string())),
+                binding_ref(),
+            ],
+        });
+        assert!(value_references_binding(&function_call_binding, "vpc"));
+
+        let secret_binding = Value::Deferred(DeferredValue::Secret(Box::new(binding_ref())));
+        assert!(value_references_binding(&secret_binding, "vpc"));
 
         // Closure variant removed from `Value` (issue #2230): closures
         // live on `EvalValue` and never reach this code path.

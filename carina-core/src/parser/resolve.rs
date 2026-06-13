@@ -556,7 +556,7 @@ fn accumulate_undefined_reference_errors(
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     let mut check = |value: &Value| {
-        value.visit_refs(&mut |path| {
+        value.visit_resource_refs(&mut |path| {
             let root = path.binding();
             let root_ident = root.split(['[', ']']).next().unwrap_or(root);
             if !known.contains(root_ident) && seen.insert(root_ident.to_string()) {

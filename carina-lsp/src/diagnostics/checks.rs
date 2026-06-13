@@ -1783,7 +1783,7 @@ impl DiagnosticEngine {
         binding_schema_map: &HashMap<&str, &ResourceSchema>,
         diagnostics: &mut Vec<Diagnostic>,
     ) {
-        value.visit_refs(&mut |path| {
+        value.visit_resource_refs(&mut |path| {
             let binding_name = path.binding();
             let attribute_name = path.attribute();
             let Some(ref_schema) = binding_schema_map.get(binding_name) else {
