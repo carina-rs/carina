@@ -298,6 +298,52 @@ impl crate::provider::ProviderNormalizer for CanonicalizingNormalizer {
     }
 }
 
+struct DefaultTagsNormalizer;
+
+impl crate::provider::ProviderNormalizer for DefaultTagsNormalizer {
+    fn normalize_desired<'a>(
+        &'a self,
+        _resources: &'a mut [Resource],
+    ) -> crate::provider::BoxFuture<'a, ()> {
+        crate::provider::ready_noop()
+    }
+
+    fn normalize_state<'a>(
+        &'a self,
+        _current_states: &'a mut HashMap<ResourceId, State>,
+    ) -> crate::provider::BoxFuture<'a, ()> {
+        crate::provider::ready_noop()
+    }
+
+    fn hydrate_read_state<'a>(
+        &'a self,
+        _current_states: &'a mut HashMap<ResourceId, State>,
+        _saved_attrs: &'a crate::provider::SavedAttrs,
+    ) -> crate::provider::BoxFuture<'a, ()> {
+        crate::provider::ready_noop()
+    }
+
+    fn merge_default_tags<'a>(
+        &'a self,
+        resources: &'a mut [Resource],
+        default_tags: &'a indexmap::IndexMap<String, Value>,
+        _registry: &'a crate::schema::SchemaRegistry,
+    ) -> crate::provider::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            for resource in resources {
+                let mut tags = match resource.get_attr("tags") {
+                    Some(Value::Concrete(ConcreteValue::Map(tags))) => tags.clone(),
+                    _ => indexmap::IndexMap::new(),
+                };
+                for (key, value) in default_tags {
+                    tags.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+                resource.set_attr("tags", Value::Concrete(ConcreteValue::Map(tags)));
+            }
+        })
+    }
+}
+
 // -----------------------------------------------------------------------
 // Mock ProviderFactory + shared test fixtures
 // -----------------------------------------------------------------------
@@ -415,6 +461,22 @@ fn ok_state(id: &ResourceId) -> State {
         Value::Concrete(ConcreteValue::String("id-123".to_string())),
     );
     State::existing(id.clone(), attrs).with_identifier("id-123")
+}
+
+fn provider_config_with_default_tags(
+    tags: indexmap::IndexMap<String, Value>,
+) -> crate::parser::ProviderConfig {
+    crate::parser::ProviderConfig {
+        name: "test".to_string(),
+        attributes: indexmap::IndexMap::new(),
+        default_tags: tags,
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: indexmap::IndexMap::new(),
+        binding: None,
+        is_default: true,
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -736,6 +798,98 @@ async fn test_apply_renormalizes_update_path() {
             "CANONICAL".to_string()
         ))),
         "Update patch must carry the re-normalized value, not raw DSL"
+    );
+}
+
+#[tokio::test]
+async fn test_apply_update_patch_preserves_provider_default_tags() {
+    let provider = MockProvider::new();
+    let mut to_resource = make_resource("tagged", &[]);
+    let rid = to_resource.id.clone();
+    let mut desired_tags = indexmap::IndexMap::new();
+    desired_tags.insert(
+        "Name".to_string(),
+        Value::Concrete(ConcreteValue::String("v1".to_string())),
+    );
+    to_resource.set_attr("tags", Value::Concrete(ConcreteValue::Map(desired_tags)));
+
+    let mut current_tags = indexmap::IndexMap::new();
+    current_tags.insert(
+        "Name".to_string(),
+        Value::Concrete(ConcreteValue::String("old".to_string())),
+    );
+    current_tags.insert(
+        "ManagedBy".to_string(),
+        Value::Concrete(ConcreteValue::String("carina".to_string())),
+    );
+    current_tags.insert(
+        "Project".to_string(),
+        Value::Concrete(ConcreteValue::String("issue-3480".to_string())),
+    );
+    let mut from_attrs = HashMap::new();
+    from_attrs.insert("tags".to_string(), Value::Concrete(ConcreteValue::Map(current_tags)));
+    let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
+
+    let mut default_tags = indexmap::IndexMap::new();
+    default_tags.insert(
+        "ManagedBy".to_string(),
+        Value::Concrete(ConcreteValue::String("carina".to_string())),
+    );
+    default_tags.insert(
+        "Project".to_string(),
+        Value::Concrete(ConcreteValue::String("issue-3480".to_string())),
+    );
+    let provider_configs = vec![provider_config_with_default_tags(default_tags)];
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        id: rid.clone(),
+        from: Box::new(from_state),
+        to: to_resource,
+        changed_attributes: vec!["tags".to_string()],
+    });
+    provider.push_update(Ok(ok_state(&rid)));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &DefaultTagsNormalizer,
+        provider_configs: &provider_configs,
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+    };
+
+    let observer = MockObserver::new();
+    let result = execute_plan(&provider, input, &observer).await;
+    assert_eq!(result.success_count, 1);
+
+    let reqs = provider.captured_update_requests();
+    assert_eq!(reqs.len(), 1);
+    let tags_op = reqs[0]
+        .patch
+        .ops
+        .iter()
+        .find(|op| op.key == "tags")
+        .expect("patch must contain the changed `tags` attribute");
+    let Some(Value::Concrete(ConcreteValue::Map(tags))) = tags_op.value.as_ref() else {
+        panic!("expected tags Replace value to be a map, got {:?}", tags_op.value);
+    };
+    assert_eq!(
+        tags.get("Name"),
+        Some(&Value::Concrete(ConcreteValue::String("v1".to_string())))
+    );
+    assert_eq!(
+        tags.get("ManagedBy"),
+        Some(&Value::Concrete(ConcreteValue::String("carina".to_string())))
+    );
+    assert_eq!(
+        tags.get("Project"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "issue-3480".to_string()
+        )))
     );
 }
 

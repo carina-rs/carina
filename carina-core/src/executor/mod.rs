@@ -12,6 +12,9 @@
 //! - `phased`: Interdependent Replace ordering (4-phase execution)
 
 mod basic;
+pub mod normalized;
+#[cfg(test)]
+mod normalized_tests;
 mod parallel;
 mod phased;
 mod replace;
