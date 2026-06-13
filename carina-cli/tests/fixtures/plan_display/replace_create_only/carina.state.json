@@ -10,7 +10,6 @@
       "provider": "test",
       "identifier": "widget-alpha-live",
       "attributes": {
-        "id": "widget-alpha-live",
         "external_name": "old"
       },
       "protected": false,
@@ -37,7 +36,6 @@
       "provider": "test",
       "identifier": "widget-beta-live",
       "attributes": {
-        "id": "widget-beta-live",
         "legacy_token": "tok"
       },
       "protected": false,

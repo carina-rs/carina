@@ -388,7 +388,9 @@ fn fixture_provider_factories(fixture_path: &Path) -> Vec<Box<dyn ProviderFactor
         Some("moved_claims_precede_heuristics") => {
             vec![Box::new(MovedClaimsPrecedeHeuristicsFixtureFactory)]
         }
-        Some("replace_create_only") => vec![Box::new(ReplaceCreateOnlyFixtureFactory)],
+        Some("replace_create_only") | Some("replace_with_non_forcing_diffs") => {
+            vec![Box::new(ReplaceCreateOnlyFixtureFactory)]
+        }
         Some("route53_hosted_zone_name_strip_suffix_no_diff") => {
             vec![Box::new(Route53HostedZoneFixtureFactory)]
         }
@@ -440,7 +442,10 @@ impl ProviderFactory for ReplaceCreateOnlyFixtureFactory {
                     AttributeSchema::new("legacy_token", AttributeType::string())
                         .create_only()
                         .removable(),
-                ),
+                )
+                .attribute(AttributeSchema::new("description", AttributeType::string()))
+                .attribute(AttributeSchema::new("metric_name", AttributeType::string()))
+                .attribute(AttributeSchema::new("scope", AttributeType::string())),
         ]
     }
 }

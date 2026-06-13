@@ -429,6 +429,23 @@ fn snapshot_replace_create_only() {
 }
 
 #[test]
+fn snapshot_replace_with_non_forcing_diffs() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("replace_with_non_forcing_diffs");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+        None,
+    ));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
 fn snapshot_delete_orphan() {
     use carina_core::resource::Value;
     let (plan, current_states, schemas, _moved) =

@@ -55,24 +55,51 @@ pub enum DetailRow {
         old: String,
         new: String,
     },
-    /// A map attribute with key-level diffs (for Update effects).
-    /// `entries` is `NonEmptyVec`: a Map with no displayable entries
-    /// is dropped at the IR builder (#2910), not rendered as an empty
-    /// header.
+    /// An attribute that changed and forces replacement.
+    ChangedForcesReplacement {
+        key: String,
+        old: String,
+        new: String,
+    },
+    /// A map attribute with key-level diffs.
     MapDiff {
         key: String,
+        /// `entries` is `NonEmptyVec`: a Map with no displayable entries
+        /// is dropped at the IR builder (#2910).
         entries: NonEmptyVec<MapDiffEntryIR>,
     },
-    /// A list-of-maps diff (for Update effects)
+    /// A map attribute with key-level diffs that force replacement.
+    MapDiffForcesReplacement {
+        key: String,
+        /// `entries` is `NonEmptyVec`: a Map with no displayable entries
+        /// is dropped at the IR builder (#2910).
+        entries: NonEmptyVec<MapDiffEntryIR>,
+    },
+    /// A list-of-maps diff.
     ListOfMapsDiff {
         key: String,
-        unchanged: Vec<String>,
-        modified: Vec<ListOfMapsDiffModified>,
-        added: Vec<ListOfMapsDiffItem>,
-        removed: Vec<ListOfMapsDiffItem>,
+        /// `block` enforces at least one displayable section (#2910).
+        block: NonEmptyListOfMapsBlock,
     },
-    /// Per-element `List<String>` diff for Update effects (#2943).
+    /// A list-of-maps diff that forces replacement.
+    ListOfMapsDiffForcesReplacement {
+        key: String,
+        /// `block` enforces at least one displayable section (#2910).
+        block: NonEmptyListOfMapsBlock,
+    },
+    /// A replacement-forcing map whose nested diff has no displayable entries.
+    ForceReplaceMapHeader { key: String },
+    /// A replacement-forcing list-of-maps whose nested diff has no displayable entries.
+    ForceReplaceListOfMapsHeader { key: String },
+    /// Per-element `List<String>` diff (#2943).
     StringListDiff {
+        key: String,
+        unchanged: Vec<String>,
+        added: Vec<String>,
+        removed: Vec<String>,
+    },
+    /// Per-element `List<String>` diff that forces replacement.
+    StringListDiffForcesReplacement {
         key: String,
         unchanged: Vec<String>,
         added: Vec<String>,
@@ -86,12 +113,6 @@ pub enum DetailRow {
     ReadOnly { key: String },
     /// Summary of hidden unchanged attributes (for Update/Replace effects in Full mode)
     HiddenUnchanged { count: usize },
-    /// A changed create-only attribute that forces replacement
-    ReplaceChanged {
-        key: String,
-        old: String,
-        new: String,
-    },
     /// A removed create-only attribute that forces replacement.
     ReplaceRemoved { key: String, old: String },
     /// A cascade-triggered create-only attribute (value not yet known)
@@ -99,26 +120,6 @@ pub enum DetailRow {
         key: String,
         old: String,
         new: String,
-    },
-    /// A list-of-maps diff that forces replacement
-    ReplaceListOfMapsDiff {
-        key: String,
-        unchanged: Vec<String>,
-        modified: Vec<ListOfMapsDiffModified>,
-        added: Vec<ListOfMapsDiffItem>,
-        removed: Vec<ListOfMapsDiffItem>,
-    },
-    /// A map diff that forces replacement
-    ReplaceMapDiff {
-        key: String,
-        entries: Vec<MapDiffEntryIR>,
-    },
-    /// Per-element `List<String>` diff that forces replacement (#2943).
-    ReplaceStringListDiff {
-        key: String,
-        unchanged: Vec<String>,
-        added: Vec<String>,
-        removed: Vec<String>,
     },
     /// Temporary name note for create-before-destroy replacement
     TemporaryNameNote {
@@ -613,15 +614,187 @@ fn build_update_rows(
     let defs = schema
         .map(|s| &s.defs)
         .unwrap_or(empty_defs_for_schema_walks());
+    let from_attrs_projected = project_from_attrs(from, explicit);
 
+    let attr_rows = build_attribute_diff_rows(
+        to,
+        AttributeDiffContext::for_update(
+            &from.attributes,
+            &from_attrs_projected,
+            schema,
+            defs,
+            detail,
+        ),
+    );
+    rows.extend(attr_rows.rows);
+
+    // Show removed attributes (in changed_attributes but not in to).
+    // Use the projected map so we don't surface unauthored leaves as
+    // removals (refs awscc#206).
+    let mut removed_keys: Vec<_> = changed_attributes
+        .iter()
+        .filter(|k| !to.attributes.contains_key(k.as_str()))
+        .collect();
+    removed_keys.sort();
+    for key in removed_keys {
+        if let Some(old_value) = from_attrs_projected.get(key.as_str()) {
+            let attr_type = schema
+                .and_then(|s| s.attributes.get(key.as_str()))
+                .map(|a| &a.attr_type);
+            rows.push(build_removed_attr_row(
+                key, old_value, attr_type, defs, detail,
+            ));
+        }
+    }
+
+    // In Full mode, show count of unchanged attributes hidden
+    if detail == DetailLevel::Full {
+        let unchanged_count = compute_unchanged_count(
+            &from_attrs_projected,
+            &to.resolved_attributes(),
+            None,
+            schema,
+        ) + attr_rows.effectively_unchanged;
+        if unchanged_count > 0 {
+            rows.push(DetailRow::HiddenUnchanged {
+                count: unchanged_count,
+            });
+        }
+    }
+
+    rows
+}
+
+struct AttributeDiffRows {
+    rows: Vec<DetailRow>,
+    effectively_unchanged: usize,
+}
+
+fn changed_row(key: String, old: String, new: String, forces_replacement: bool) -> DetailRow {
+    if forces_replacement {
+        DetailRow::ChangedForcesReplacement { key, old, new }
+    } else {
+        DetailRow::Changed { key, old, new }
+    }
+}
+
+fn map_diff_row(
+    key: String,
+    entries: NonEmptyVec<MapDiffEntryIR>,
+    forces_replacement: bool,
+) -> DetailRow {
+    if forces_replacement {
+        DetailRow::MapDiffForcesReplacement { key, entries }
+    } else {
+        DetailRow::MapDiff { key, entries }
+    }
+}
+
+fn list_of_maps_diff_row(
+    key: String,
+    block: NonEmptyListOfMapsBlock,
+    forces_replacement: bool,
+) -> DetailRow {
+    if forces_replacement {
+        DetailRow::ListOfMapsDiffForcesReplacement { key, block }
+    } else {
+        DetailRow::ListOfMapsDiff { key, block }
+    }
+}
+
+fn string_list_diff_row(
+    key: String,
+    unchanged: Vec<String>,
+    added: Vec<String>,
+    removed: Vec<String>,
+    forces_replacement: bool,
+) -> DetailRow {
+    if forces_replacement {
+        DetailRow::StringListDiffForcesReplacement {
+            key,
+            unchanged,
+            added,
+            removed,
+        }
+    } else {
+        DetailRow::StringListDiff {
+            key,
+            unchanged,
+            added,
+            removed,
+        }
+    }
+}
+
+struct AttributeDiffContext<'a> {
+    from_attrs_raw: &'a HashMap<String, Value>,
+    from_attrs_projected: &'a HashMap<String, Value>,
+    schema: Option<&'a ResourceSchema>,
+    defs: &'a std::collections::BTreeMap<String, AttributeType>,
+    detail: DetailLevel,
+    forces_replacement_keys: Option<&'a HashSet<&'a str>>,
+    cascade_ref_hints: &'a [(String, String)],
+}
+
+impl<'a> AttributeDiffContext<'a> {
+    fn for_update(
+        from_attrs_raw: &'a HashMap<String, Value>,
+        from_attrs_projected: &'a HashMap<String, Value>,
+        schema: Option<&'a ResourceSchema>,
+        defs: &'a std::collections::BTreeMap<String, AttributeType>,
+        detail: DetailLevel,
+    ) -> Self {
+        Self {
+            from_attrs_raw,
+            from_attrs_projected,
+            schema,
+            defs,
+            detail,
+            forces_replacement_keys: None,
+            cascade_ref_hints: &[],
+        }
+    }
+
+    fn for_replace(
+        from_attrs_raw: &'a HashMap<String, Value>,
+        from_attrs_projected: &'a HashMap<String, Value>,
+        schema: Option<&'a ResourceSchema>,
+        defs: &'a std::collections::BTreeMap<String, AttributeType>,
+        detail: DetailLevel,
+        forces_replacement_keys: &'a HashSet<&'a str>,
+        cascade_ref_hints: &'a [(String, String)],
+    ) -> Self {
+        Self {
+            from_attrs_raw,
+            from_attrs_projected,
+            schema,
+            defs,
+            detail,
+            forces_replacement_keys: Some(forces_replacement_keys),
+            cascade_ref_hints,
+        }
+    }
+}
+
+fn project_from_attrs(
+    from: &crate::resource::State,
+    explicit: Option<&crate::explicit::ExplicitFields>,
+) -> HashMap<String, Value> {
     // Project `from.attributes` through the user-authoring tree so
     // server-side default fields the user never wrote don't inflate
     // the unchanged-count summary (refs awscc#206). Idempotent and a
     // no-op when `explicit` is None.
-    let from_attrs_projected: HashMap<String, Value> = match explicit {
+    match explicit {
         Some(e) => crate::explicit::project_attributes(from.attributes.clone(), e),
         None => from.attributes.clone(),
-    };
+    }
+}
+
+fn build_attribute_diff_rows(
+    to: &crate::resource::Resource,
+    ctx: AttributeDiffContext<'_>,
+) -> AttributeDiffRows {
+    let mut rows = Vec::new();
 
     let mut keys: Vec<_> = to
         .attributes
@@ -647,40 +820,86 @@ fn build_update_rows(
         // unchanged-count computation below uses, kept consistent so a
         // field that's "unchanged after projection" is also "unchanged
         // for display".
-        let old_value = from_attrs_projected.get(key);
-        let attr_type = schema
+        let forces_replacement = ctx
+            .forces_replacement_keys
+            .is_some_and(|keys| keys.contains(key.as_str()));
+        let old_value = if forces_replacement {
+            ctx.from_attrs_raw.get(key)
+        } else {
+            ctx.from_attrs_projected.get(key)
+        };
+        let attr_type = ctx
+            .schema
             .and_then(|s| s.attributes.get(key.as_str()))
             .map(|a| &a.attr_type);
-        // Site 1 (carina#3073): schema-aware top-level equality. When
-        // the only diffs inside this attribute are enum-equal leaves
-        // (the IAM-policy phantom), `type_aware_equal` recurses
-        // Struct/List/Map internally and returns true, so no row is
-        // built at all and sites 3/4/5 never run for this attribute.
+        // Sites 1/2 (carina#3073): schema-aware top-level equality.
+        // When the only diffs inside this attribute are enum-equal
+        // leaves, `type_aware_equal` recurses Struct/List/Map
+        // internally and returns true, so no row is built at all.
         let is_same = old_value
-            .map(|ov| schema_aware_equal(ov, new_value, attr_type, defs))
+            .map(|ov| schema_aware_equal(ov, new_value, attr_type, ctx.defs))
             .unwrap_or(false);
 
         if is_same {
+            if forces_replacement {
+                let old_str = old_value
+                    .map(|v| format_value_with_key(v, Some(key)))
+                    .unwrap_or_else(|| "(none)".to_string());
+                let new_str = ctx
+                    .cascade_ref_hints
+                    .iter()
+                    .find(|(attr, _)| attr == key)
+                    .map(|(_, hint)| hint.clone())
+                    .unwrap_or_else(|| format_value_with_key(new_value, Some(key)));
+                rows.push(DetailRow::ReplaceCascade {
+                    key: key.to_string(),
+                    old: old_str,
+                    new: new_str,
+                });
+            }
             continue;
         }
 
         if is_list_of_maps(new_value) {
-            match build_list_of_maps_diff_row(key, old_value, new_value, attr_type, defs, detail) {
+            match build_list_of_maps_diff_row(
+                key,
+                old_value,
+                new_value,
+                attr_type,
+                ctx.defs,
+                ctx.detail,
+                forces_replacement,
+            ) {
                 Some(row) => rows.push(row),
+                None if forces_replacement => rows.push(DetailRow::ForceReplaceListOfMapsHeader {
+                    key: key.to_string(),
+                }),
                 None => effectively_unchanged += 1,
             }
         } else if should_render_as_map_diff(old_value, new_value) {
-            match build_map_diff_row(key, old_value, new_value, attr_type, defs, detail) {
+            match build_map_diff_row(
+                key,
+                old_value,
+                new_value,
+                attr_type,
+                ctx.defs,
+                ctx.detail,
+                forces_replacement,
+            ) {
                 Some(row) => rows.push(row),
+                None if forces_replacement => rows.push(DetailRow::ForceReplaceMapHeader {
+                    key: key.to_string(),
+                }),
                 None => effectively_unchanged += 1,
             }
         } else if let Some(diff) = compute_string_list_change(old_value, new_value, attr_type) {
-            rows.push(DetailRow::StringListDiff {
-                key: key.to_string(),
-                unchanged: diff.unchanged,
-                added: diff.added,
-                removed: diff.removed,
-            });
+            rows.push(string_list_diff_row(
+                key.to_string(),
+                diff.unchanged,
+                diff.added,
+                diff.removed,
+                forces_replacement,
+            ));
         } else {
             let old_str = old_value
                 .map(|v| format_value_with_key(v, Some(key)))
@@ -699,94 +918,28 @@ fn build_update_rows(
             // Skip the guard when either side contains a secret:
             // `format_value` collapses every secret to the literal
             // `"(secret)"`, so display equality is meaningless and
-            // suppression would hide a real secret rotation
-            // (e.g. `Secret(hash_A) → Secret(hash_B)`) — pre-fix the
-            // user saw an uninformative `~ … (secret) → (secret)` row;
-            // suppressing it would silently hide the rotation.
-            if old_str == new_str
+            // suppression would hide a real secret rotation.
+            if !forces_replacement
+                && old_str == new_str
                 && old_value.is_none_or(|v| !crate::value::contains_secret(v))
                 && !crate::value::contains_secret(new_value)
             {
                 effectively_unchanged += 1;
                 continue;
             }
-            rows.push(DetailRow::Changed {
-                key: key.to_string(),
-                old: old_str,
-                new: new_str,
-            });
+            rows.push(changed_row(
+                key.to_string(),
+                old_str,
+                new_str,
+                forces_replacement,
+            ));
         }
     }
 
-    // Show removed attributes (in changed_attributes but not in to).
-    // Use the projected map so we don't surface unauthored leaves as
-    // removals (refs awscc#206).
-    let mut removed_keys: Vec<_> = changed_attributes
-        .iter()
-        .filter(|k| !to.attributes.contains_key(k.as_str()))
-        .collect();
-    removed_keys.sort();
-    for key in removed_keys {
-        if let Some(old_value) = from_attrs_projected.get(key.as_str()) {
-            let attr_type = schema
-                .and_then(|s| s.attributes.get(key.as_str()))
-                .map(|a| &a.attr_type);
-            // Mirror the addition direction (#2936): when a Map
-            // attribute is dropped entirely, route through `MapDiff`
-            // so each key renders on its own line as `- key: "value"`
-            // instead of overflowing on a single inline `{...} → (removed)`
-            // row (#2939).
-            if let Some(row) = build_map_removed_row(key, old_value) {
-                rows.push(row);
-                continue;
-            }
-            if is_list_of_maps(old_value) {
-                let empty_list = Value::Concrete(ConcreteValue::List(Vec::new()));
-                let (unchanged, modified, added, removed) = compute_list_of_maps_diff_parts(
-                    Some(old_value),
-                    &empty_list,
-                    attr_type,
-                    defs,
-                    detail,
-                );
-                if !(unchanged.is_empty()
-                    && modified.is_empty()
-                    && added.is_empty()
-                    && removed.is_empty())
-                {
-                    rows.push(DetailRow::ListOfMapsDiff {
-                        key: key.to_string(),
-                        unchanged,
-                        modified,
-                        added,
-                        removed,
-                    });
-                    continue;
-                }
-            }
-            rows.push(DetailRow::Removed {
-                key: key.to_string(),
-                old: format_value_with_key(old_value, Some(key)),
-            });
-        }
+    AttributeDiffRows {
+        rows,
+        effectively_unchanged,
     }
-
-    // In Full mode, show count of unchanged attributes hidden
-    if detail == DetailLevel::Full {
-        let unchanged_count = compute_unchanged_count(
-            &from_attrs_projected,
-            &to.resolved_attributes(),
-            None,
-            schema,
-        ) + effectively_unchanged;
-        if unchanged_count > 0 {
-            rows.push(DetailRow::HiddenUnchanged {
-                count: unchanged_count,
-            });
-        }
-    }
-
-    rows
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -805,77 +958,54 @@ fn build_replace_rows(
     let defs = schema
         .map(|s| &s.defs)
         .unwrap_or(empty_defs_for_schema_walks());
+    let from_attrs_projected = project_from_attrs(from, explicit);
+    let force_keys: HashSet<&str> = changed_create_only.iter().map(|s| s.as_str()).collect();
 
-    // Show changed create-only attributes
-    let mut keys: Vec<_> = changed_create_only.iter().collect();
-    keys.sort();
+    let attr_rows = build_attribute_diff_rows(
+        to,
+        AttributeDiffContext::for_replace(
+            &from.attributes,
+            &from_attrs_projected,
+            schema,
+            defs,
+            detail,
+            &force_keys,
+            cascade_ref_hints,
+        ),
+    );
+    rows.extend(attr_rows.rows);
 
-    for key in keys {
+    // Show removed create-only attributes.
+    let mut removed_force_keys: Vec<_> = changed_create_only
+        .iter()
+        .filter(|key| !to.attributes.contains_key(key.as_str()))
+        .collect();
+    removed_force_keys.sort();
+    for key in removed_force_keys {
         let old_value = from.attributes.get(key.as_str());
-        let Some(new_value) = to.attributes.get(key.as_str()) else {
-            let attr_type = schema
-                .and_then(|s| s.attributes.get(key.as_str()))
-                .map(|a| &a.attr_type);
-            rows.push(build_replace_removed_row(
-                key, old_value, attr_type, defs, detail,
-            ));
-            continue;
-        };
         let attr_type = schema
             .and_then(|s| s.attributes.get(key.as_str()))
             .map(|a| &a.attr_type);
-        // Site 2 (carina#3073): schema-aware, mirrors site 1.
-        let is_same = old_value
-            .map(|ov| schema_aware_equal(ov, new_value, attr_type, defs))
-            .unwrap_or(false);
+        rows.push(build_replace_removed_row(
+            key, old_value, attr_type, defs, detail,
+        ));
+    }
 
-        if is_same {
-            // Cascade-triggered: value not yet known
-            let old_str = old_value
-                .map(|v| format_value_with_key(v, Some(key)))
-                .unwrap_or_else(|| "(none)".to_string());
-            let new_str = cascade_ref_hints
-                .iter()
-                .find(|(attr, _)| attr == key)
-                .map(|(_, hint)| hint.clone())
-                .unwrap_or_else(|| format_value_with_key(new_value, Some(key)));
-            rows.push(DetailRow::ReplaceCascade {
-                key: key.to_string(),
-                old: old_str,
-                new: new_str,
-            });
-        } else if is_list_of_maps(new_value) {
-            let (unchanged, modified, added, removed) =
-                compute_list_of_maps_diff_parts(old_value, new_value, attr_type, defs, detail);
-            rows.push(DetailRow::ReplaceListOfMapsDiff {
-                key: key.to_string(),
-                unchanged,
-                modified,
-                added,
-                removed,
-            });
-        } else if should_render_as_map_diff(old_value, new_value) {
-            let entries = compute_map_diff_entries(old_value, new_value, attr_type, defs, detail);
-            rows.push(DetailRow::ReplaceMapDiff {
-                key: key.to_string(),
-                entries,
-            });
-        } else if let Some(diff) = compute_string_list_change(old_value, new_value, attr_type) {
-            rows.push(DetailRow::ReplaceStringListDiff {
-                key: key.to_string(),
-                unchanged: diff.unchanged,
-                added: diff.added,
-                removed: diff.removed,
-            });
-        } else {
-            let old_str = old_value
-                .map(|v| format_value_with_key(v, Some(key)))
-                .unwrap_or_else(|| "(none)".to_string());
-            rows.push(DetailRow::ReplaceChanged {
-                key: key.to_string(),
-                old: old_str,
-                new: format_value_with_key(new_value, Some(key)),
-            });
+    let mut removed_non_force_keys: Vec<_> = from_attrs_projected
+        .keys()
+        .filter(|key| {
+            !to.attributes.contains_key(key.as_str()) && !force_keys.contains(key.as_str())
+        })
+        .collect();
+    removed_non_force_keys.sort();
+    for key in removed_non_force_keys {
+        if let Some(old_value) = from_attrs_projected.get(key.as_str()) {
+            let attr_type = schema
+                .and_then(|s| s.attributes.get(key.as_str()))
+                .map(|a| &a.attr_type);
+            rows.push(build_removed_attr_row(
+                key, old_value, attr_type, defs, detail,
+            ));
         }
     }
 
@@ -890,20 +1020,13 @@ fn build_replace_rows(
     }
 
     // In Full mode, show count of unchanged attributes hidden.
-    // Project `from.attributes` so server-side defaults don't inflate
-    // the count (refs awscc#206).
     if detail == DetailLevel::Full {
-        let from_attrs_projected: HashMap<String, Value> = match explicit {
-            Some(e) => crate::explicit::project_attributes(from.attributes.clone(), e),
-            None => from.attributes.clone(),
-        };
-        let changed_set: HashSet<&str> = changed_create_only.iter().map(|s| s.as_str()).collect();
         let unchanged_count = compute_unchanged_count(
             &from_attrs_projected,
             &to.resolved_attributes(),
-            Some(&changed_set),
+            Some(&force_keys),
             schema,
-        );
+        ) + attr_rows.effectively_unchanged;
         if unchanged_count > 0 {
             rows.push(DetailRow::HiddenUnchanged {
                 count: unchanged_count,
@@ -918,30 +1041,12 @@ fn build_replace_rows(
         let mut updates = Vec::new();
         for cascade in cascading_updates {
             let mut changed_attrs = Vec::new();
-            let mut cascade_keys: Vec<_> = cascade
-                .to
-                .attributes
-                .keys()
-                .filter(|k| !k.starts_with('_'))
-                .collect();
-            cascade_keys.sort();
-
-            for key in cascade_keys {
-                let new_value = &cascade.to.attributes[key];
-                if !value_references_binding(new_value, replaced_binding) {
-                    continue;
-                }
-                let old_value = cascade.from.attributes.get(key);
-                let old_str = old_value
-                    .map(|v| format_value_with_key(v, Some(key)))
-                    .unwrap_or_else(|| "(none)".to_string());
-                let new_str = format_value_with_key(new_value, Some(key));
-                changed_attrs.push(CascadingUpdateAttr {
-                    key: key.to_string(),
-                    old: old_str,
-                    new: new_str,
-                });
-            }
+            collect_cascading_update_attrs(
+                &cascade.from.attributes,
+                &cascade.to.attributes,
+                replaced_binding,
+                &mut changed_attrs,
+            );
 
             updates.push(CascadingUpdateIR {
                 display_type: cascade.id.display_type(),
@@ -974,9 +1079,9 @@ fn build_replace_removed_row(
     };
 
     if let Some(DetailRow::MapDiff { entries, .. }) = build_map_removed_row(key, old_value) {
-        return DetailRow::ReplaceMapDiff {
+        return DetailRow::MapDiffForcesReplacement {
             key: key.to_string(),
-            entries: entries.into_vec(),
+            entries,
         };
     }
 
@@ -984,19 +1089,48 @@ fn build_replace_removed_row(
         let empty_list = Value::Concrete(ConcreteValue::List(Vec::new()));
         let (unchanged, modified, added, removed) =
             compute_list_of_maps_diff_parts(Some(old_value), &empty_list, attr_type, defs, detail);
-        if !(unchanged.is_empty() && modified.is_empty() && added.is_empty() && removed.is_empty())
+        if let Some(block) =
+            NonEmptyListOfMapsBlock::from_parts(unchanged, modified, added, removed)
         {
-            return DetailRow::ReplaceListOfMapsDiff {
+            return DetailRow::ListOfMapsDiffForcesReplacement {
                 key: key.to_string(),
-                unchanged,
-                modified,
-                added,
-                removed,
+                block,
             };
         }
     }
 
     DetailRow::ReplaceRemoved {
+        key: key.to_string(),
+        old: format_value_with_key(old_value, Some(key)),
+    }
+}
+
+fn build_removed_attr_row(
+    key: &str,
+    old_value: &Value,
+    attr_type: Option<&AttributeType>,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+    detail: DetailLevel,
+) -> DetailRow {
+    if let Some(row) = build_map_removed_row(key, old_value) {
+        return row;
+    }
+
+    if is_list_of_maps(old_value) {
+        let empty_list = Value::Concrete(ConcreteValue::List(Vec::new()));
+        let (unchanged, modified, added, removed) =
+            compute_list_of_maps_diff_parts(Some(old_value), &empty_list, attr_type, defs, detail);
+        if let Some(block) =
+            NonEmptyListOfMapsBlock::from_parts(unchanged, modified, added, removed)
+        {
+            return DetailRow::ListOfMapsDiff {
+                key: key.to_string(),
+                block,
+            };
+        }
+    }
+
+    DetailRow::Removed {
         key: key.to_string(),
         old: format_value_with_key(old_value, Some(key)),
     }
@@ -1089,14 +1223,12 @@ fn build_map_diff_row(
     attr_type: Option<&AttributeType>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     detail: DetailLevel,
+    forces_replacement: bool,
 ) -> Option<DetailRow> {
     let entries = NonEmptyVec::from_vec(compute_map_diff_entries(
         old_value, new_value, attr_type, defs, detail,
     ))?;
-    Some(DetailRow::MapDiff {
-        key: key.to_string(),
-        entries,
-    })
+    Some(map_diff_row(key.to_string(), entries, forces_replacement))
 }
 
 fn compute_map_diff_entries(
@@ -1257,19 +1389,16 @@ fn build_list_of_maps_diff_row(
     attr_type: Option<&AttributeType>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     detail: DetailLevel,
+    forces_replacement: bool,
 ) -> Option<DetailRow> {
     let (unchanged, modified, added, removed) =
         compute_list_of_maps_diff_parts(old_value, new_value, attr_type, defs, detail);
-    if unchanged.is_empty() && modified.is_empty() && added.is_empty() && removed.is_empty() {
-        return None;
-    }
-    Some(DetailRow::ListOfMapsDiff {
-        key: key.to_string(),
-        unchanged,
-        modified,
-        added,
-        removed,
-    })
+    let block = NonEmptyListOfMapsBlock::from_parts(unchanged, modified, added, removed)?;
+    Some(list_of_maps_diff_row(
+        key.to_string(),
+        block,
+        forces_replacement,
+    ))
 }
 
 fn compute_list_of_maps_diff_parts(
@@ -1662,6 +1791,93 @@ fn value_references_binding(value: &Value, binding: &str) -> bool {
     found
 }
 
+fn collect_cascading_update_attrs(
+    old_attrs: &HashMap<String, Value>,
+    new_attrs: &IndexMap<String, Value>,
+    replaced_binding: &str,
+    changed_attrs: &mut Vec<CascadingUpdateAttr>,
+) {
+    let mut keys: Vec<_> = new_attrs.keys().filter(|k| !k.starts_with('_')).collect();
+    keys.sort();
+    for key in keys {
+        collect_cascading_update_attrs_for_value(
+            key,
+            old_attrs.get(key),
+            &new_attrs[key],
+            replaced_binding,
+            changed_attrs,
+        );
+    }
+}
+
+fn collect_cascading_update_attrs_for_value(
+    path: &str,
+    old_value: Option<&Value>,
+    new_value: &Value,
+    replaced_binding: &str,
+    changed_attrs: &mut Vec<CascadingUpdateAttr>,
+) {
+    if let Value::Concrete(ConcreteValue::Map(new_map)) = new_value {
+        let old_map = match old_value {
+            Some(Value::Concrete(ConcreteValue::Map(map))) => Some(map),
+            _ => None,
+        };
+        let mut keys: Vec<_> = new_map.keys().filter(|k| !k.starts_with('_')).collect();
+        keys.sort();
+        for key in keys {
+            let nested_path = format!("{path}.{key}");
+            collect_cascading_update_attrs_for_value(
+                &nested_path,
+                old_map.and_then(|map| map.get(key)),
+                &new_map[key],
+                replaced_binding,
+                changed_attrs,
+            );
+        }
+        return;
+    }
+
+    if let Value::Concrete(ConcreteValue::List(new_items)) = new_value {
+        let old_items = match old_value {
+            Some(Value::Concrete(ConcreteValue::List(items))) => Some(items),
+            _ => None,
+        };
+        for (idx, new_item) in new_items.iter().enumerate() {
+            let nested_path = format!("{path}[{idx}]");
+            collect_cascading_update_attrs_for_value(
+                &nested_path,
+                old_items.and_then(|items| items.get(idx)),
+                new_item,
+                replaced_binding,
+                changed_attrs,
+            );
+        }
+        return;
+    }
+
+    if !value_references_binding(new_value, replaced_binding) {
+        return;
+    }
+
+    let key_hint = cascade_key_hint(path);
+    let old_str = old_value
+        .map(|v| format_value_with_key(v, key_hint))
+        .unwrap_or_else(|| "(none)".to_string());
+    let new_str = format_value_with_key(new_value, key_hint);
+    changed_attrs.push(CascadingUpdateAttr {
+        key: path.to_string(),
+        old: old_str,
+        new: new_str,
+    });
+}
+
+fn cascade_key_hint(path: &str) -> Option<&str> {
+    debug_assert!(!path.starts_with('['));
+    let segment = path.rsplit('.').next()?;
+    let hint = segment.split('[').next().unwrap_or(segment);
+    if hint.is_empty() { None } else { Some(hint) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1964,21 +2180,24 @@ mod tests {
             rows,
             vec![DetailRow::ListOfMapsDiff {
                 key: "rules".to_string(),
-                unchanged: vec![],
-                modified: vec![],
-                added: vec![],
-                removed: vec![ListOfMapsDiffItem {
-                    fields: vec![
-                        (
-                            "name".to_string(),
-                            Value::Concrete(ConcreteValue::String("legacy".to_string())),
-                        ),
-                        (
-                            "priority".to_string(),
-                            Value::Concrete(ConcreteValue::Int(10))
-                        ),
-                    ],
-                }],
+                block: NonEmptyListOfMapsBlock::from_parts(
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![ListOfMapsDiffItem {
+                        fields: vec![
+                            (
+                                "name".to_string(),
+                                Value::Concrete(ConcreteValue::String("legacy".to_string())),
+                            ),
+                            (
+                                "priority".to_string(),
+                                Value::Concrete(ConcreteValue::Int(10))
+                            ),
+                        ],
+                    }],
+                )
+                .unwrap(),
             }]
         );
     }
@@ -2221,7 +2440,10 @@ mod tests {
         };
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
         assert_eq!(rows.len(), 1);
-        assert!(matches!(&rows[0], DetailRow::ReplaceChanged { key, .. } if key == "cidr_block"));
+        assert!(matches!(
+            &rows[0],
+            DetailRow::ChangedForcesReplacement { key, .. } if key == "cidr_block"
+        ));
     }
 
     #[test]
@@ -2300,9 +2522,9 @@ mod tests {
 
         assert_eq!(
             rows,
-            vec![DetailRow::ReplaceMapDiff {
+            vec![DetailRow::MapDiffForcesReplacement {
                 key: "settings".to_string(),
-                entries: vec![
+                entries: NonEmptyVec::from_vec(vec![
                     MapDiffEntryIR::Removed {
                         key: "mode".to_string(),
                         value: "\"legacy\"".to_string(),
@@ -2311,7 +2533,8 @@ mod tests {
                         key: "version".to_string(),
                         value: "1".to_string(),
                     },
-                ],
+                ])
+                .unwrap(),
             }]
         );
     }
@@ -2351,24 +2574,684 @@ mod tests {
 
         assert_eq!(
             rows,
-            vec![DetailRow::ReplaceListOfMapsDiff {
+            vec![DetailRow::ListOfMapsDiffForcesReplacement {
                 key: "rules".to_string(),
-                unchanged: vec![],
-                modified: vec![],
-                added: vec![],
-                removed: vec![ListOfMapsDiffItem {
-                    fields: vec![
-                        (
-                            "name".to_string(),
-                            Value::Concrete(ConcreteValue::String("legacy".to_string())),
-                        ),
-                        (
-                            "priority".to_string(),
-                            Value::Concrete(ConcreteValue::Int(10))
-                        ),
-                    ],
-                }],
+                block: NonEmptyListOfMapsBlock::from_parts(
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![ListOfMapsDiffItem {
+                        fields: vec![
+                            (
+                                "name".to_string(),
+                                Value::Concrete(ConcreteValue::String("legacy".to_string())),
+                            ),
+                            (
+                                "priority".to_string(),
+                                Value::Concrete(ConcreteValue::Int(10))
+                            ),
+                        ],
+                    }],
+                )
+                .unwrap(),
             }]
+        );
+    }
+
+    #[test]
+    fn replace_rows_include_non_forcing_attribute_diffs_and_count_only_equal_attributes() {
+        let from = State::existing(
+            ResourceId::new("wafv2.WebAcl", "edge"),
+            [
+                (
+                    "name".to_string(),
+                    Value::Concrete(ConcreteValue::String("edge-old".to_string())),
+                ),
+                (
+                    "description".to_string(),
+                    Value::Concrete(ConcreteValue::String("old description".to_string())),
+                ),
+                (
+                    "metric_name".to_string(),
+                    Value::Concrete(ConcreteValue::String("edge-old-metric".to_string())),
+                ),
+                (
+                    "rule_metric_name".to_string(),
+                    Value::Concrete(ConcreteValue::String("rule-old".to_string())),
+                ),
+                (
+                    "scope".to_string(),
+                    Value::Concrete(ConcreteValue::String("CLOUDFRONT".to_string())),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let to = Resource::new("wafv2.WebAcl", "edge")
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("edge-new".to_string())),
+            )
+            .with_attribute(
+                "description",
+                Value::Concrete(ConcreteValue::String("new description".to_string())),
+            )
+            .with_attribute(
+                "metric_name",
+                Value::Concrete(ConcreteValue::String("edge-new-metric".to_string())),
+            )
+            .with_attribute(
+                "rule_metric_name",
+                Value::Concrete(ConcreteValue::String("rule-new".to_string())),
+            )
+            .with_attribute(
+                "scope",
+                Value::Concrete(ConcreteValue::String("CLOUDFRONT".to_string())),
+            );
+        let effect = Effect::Replace {
+            id: ResourceId::new("wafv2.WebAcl", "edge"),
+            from: Box::new(from),
+            to,
+            directives: crate::resource::Directives::default(),
+            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".to_string()])
+                .unwrap(),
+            cascading_updates: vec![],
+            temporary_name: None,
+            cascade_ref_hints: vec![],
+        };
+
+        let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, None);
+
+        assert!(
+            rows.iter().any(|row| matches!(
+                row,
+                DetailRow::ChangedForcesReplacement { key, old, new }
+                    if key == "name" && old == "\"edge-old\"" && new == "\"edge-new\""
+            )),
+            "create-only name diff should still be marked as forcing replacement: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| matches!(
+                row,
+                DetailRow::Changed { key, old, new }
+                    if key == "description"
+                        && old == "\"old description\""
+                        && new == "\"new description\""
+            )),
+            "non-forcing description diff must render as a normal diff row: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| matches!(
+                row,
+                DetailRow::Changed { key, old, new }
+                    if key == "metric_name"
+                        && old == "\"edge-old-metric\""
+                        && new == "\"edge-new-metric\""
+            )),
+            "non-forcing metric_name diff must render as a normal diff row: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter().find_map(|row| match row {
+                DetailRow::HiddenUnchanged { count } => Some(*count),
+                _ => None,
+            }),
+            Some(1),
+            "HiddenUnchanged must count only genuinely equal attributes: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn replace_cascading_updates_render_nested_ref_diffs_with_dotted_paths() {
+        use crate::effect::CascadingUpdate;
+        use crate::resource::InterpolationPart;
+
+        let from = State::existing(
+            ResourceId::new("wafv2.WebAcl", "edge"),
+            [(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("edge-old".to_string())),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let to = Resource::new("wafv2.WebAcl", "edge")
+            .with_binding("web_acl")
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("edge-new".to_string())),
+            );
+
+        let mut old_config = IndexMap::new();
+        old_config.insert(
+            "web_acl_id".to_string(),
+            Value::Concrete(ConcreteValue::String("arn:old-web-acl".to_string())),
+        );
+        old_config.insert(
+            "comment".to_string(),
+            Value::Concrete(ConcreteValue::String("old comment".to_string())),
+        );
+        let cascade_from = State::existing(
+            ResourceId::new("cloudfront.Distribution", "cdn"),
+            [(
+                "distribution_config".to_string(),
+                Value::Concrete(ConcreteValue::Map(old_config)),
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        let mut new_config = IndexMap::new();
+        new_config.insert(
+            "web_acl_id".to_string(),
+            Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
+                Value::resource_ref("web_acl", "arn", vec![]),
+            )])),
+        );
+        new_config.insert(
+            "comment".to_string(),
+            Value::Concrete(ConcreteValue::String("new comment".to_string())),
+        );
+        let cascade_to = Resource::new("cloudfront.Distribution", "cdn").with_attribute(
+            "distribution_config",
+            Value::Concrete(ConcreteValue::Map(new_config)),
+        );
+        let effect = Effect::Replace {
+            id: ResourceId::new("wafv2.WebAcl", "edge"),
+            from: Box::new(from),
+            to,
+            directives: crate::resource::Directives::default(),
+            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".to_string()])
+                .unwrap(),
+            cascading_updates: vec![CascadingUpdate {
+                id: ResourceId::new("cloudfront.Distribution", "cdn"),
+                from: Box::new(cascade_from),
+                to: cascade_to,
+            }],
+            temporary_name: None,
+            cascade_ref_hints: vec![],
+        };
+
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
+
+        let updates = rows
+            .iter()
+            .find_map(|row| match row {
+                DetailRow::CascadingUpdates { updates, .. } => Some(updates),
+                _ => None,
+            })
+            .expect("expected cascading update rows");
+        assert!(
+            updates[0].changed_attrs.iter().any(|attr| {
+                attr.key == "distribution_config.web_acl_id"
+                    && attr.old == "\"arn:old-web-acl\""
+                    && attr.new == "\"${web_acl.arn}\""
+            }),
+            "cascade rendering must surface the nested web_acl_id rewrite: {updates:?}"
+        );
+    }
+
+    #[test]
+    fn replace_cascading_updates_render_list_nested_ref_diffs_with_indexed_paths() {
+        use crate::effect::CascadingUpdate;
+
+        let from = State::existing(
+            ResourceId::new("wafv2.WebAcl", "edge"),
+            [(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("edge-old".to_string())),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let to = Resource::new("wafv2.WebAcl", "edge")
+            .with_binding("web_acl")
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("edge-new".to_string())),
+            );
+
+        let mut old_rule = IndexMap::new();
+        old_rule.insert(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("rule-1".to_string())),
+        );
+        old_rule.insert(
+            "web_acl_id".to_string(),
+            Value::Concrete(ConcreteValue::String("arn:old-web-acl".to_string())),
+        );
+        let cascade_from = State::existing(
+            ResourceId::new("test.RuleSet", "rules"),
+            [(
+                "rules".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::Map(old_rule),
+                )])),
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        let mut new_rule = IndexMap::new();
+        new_rule.insert(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("rule-1".to_string())),
+        );
+        new_rule.insert(
+            "web_acl_id".to_string(),
+            Value::resource_ref("web_acl", "arn", vec![]),
+        );
+        let cascade_to = Resource::new("test.RuleSet", "rules").with_attribute(
+            "rules",
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(new_rule),
+            )])),
+        );
+
+        let effect = Effect::Replace {
+            id: ResourceId::new("wafv2.WebAcl", "edge"),
+            from: Box::new(from),
+            to,
+            directives: crate::resource::Directives::default(),
+            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".to_string()])
+                .unwrap(),
+            cascading_updates: vec![CascadingUpdate {
+                id: ResourceId::new("test.RuleSet", "rules"),
+                from: Box::new(cascade_from),
+                to: cascade_to,
+            }],
+            temporary_name: None,
+            cascade_ref_hints: vec![],
+        };
+
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
+
+        let updates = rows
+            .iter()
+            .find_map(|row| match row {
+                DetailRow::CascadingUpdates { updates, .. } => Some(updates),
+                _ => None,
+            })
+            .expect("expected cascading update rows");
+        assert!(
+            updates[0].changed_attrs.iter().any(|attr| {
+                attr.key == "rules[0].web_acl_id"
+                    && attr.old == "\"arn:old-web-acl\""
+                    && attr.new == "web_acl.arn"
+            }),
+            "cascade rendering must surface the nested list web_acl_id rewrite: {updates:?}"
+        );
+    }
+
+    #[test]
+    fn cascade_key_hint_strips_top_level_list_index() {
+        assert_eq!(cascade_key_hint("rules[0]"), Some("rules"));
+    }
+
+    #[test]
+    fn cascade_key_hint_rejects_index_only_path() {
+        #[cfg(debug_assertions)]
+        {
+            assert!(
+                std::panic::catch_unwind(|| cascade_key_hint("[0]")).is_err(),
+                "index-only paths should trip the debug assertion"
+            );
+        }
+
+        #[cfg(not(debug_assertions))]
+        {
+            assert_eq!(cascade_key_hint("[0]"), None);
+        }
+    }
+
+    #[test]
+    fn replace_same_forcing_key_prefers_cascade_ref_hint() {
+        let from = State::existing(
+            ResourceId::new("test.Widget", "w"),
+            [(
+                "arn".to_string(),
+                Value::Concrete(ConcreteValue::String("arn:old".to_string())),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let to = Resource::new("test.Widget", "w").with_attribute(
+            "arn",
+            Value::Concrete(ConcreteValue::String("arn:old".to_string())),
+        );
+        let effect = Effect::Replace {
+            id: ResourceId::new("test.Widget", "w"),
+            from: Box::new(from),
+            to,
+            directives: crate::resource::Directives::default(),
+            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["arn".to_string()])
+                .unwrap(),
+            cascading_updates: vec![],
+            temporary_name: None,
+            cascade_ref_hints: vec![("arn".to_string(), "${web_acl.arn}".to_string())],
+        };
+
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
+
+        assert!(
+            rows.iter().any(|row| matches!(
+                row,
+                DetailRow::ReplaceCascade { key, old, new }
+                    if key == "arn" && old == "\"arn:old\"" && new == "${web_acl.arn}"
+            )),
+            "same forcing key should render ReplaceCascade with the cascade hint: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn replace_same_forcing_key_without_cascade_ref_hint_formats_new_value() {
+        let from = State::existing(
+            ResourceId::new("test.Widget", "w"),
+            [(
+                "arn".to_string(),
+                Value::Concrete(ConcreteValue::String("arn:old".to_string())),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let to = Resource::new("test.Widget", "w").with_attribute(
+            "arn",
+            Value::Concrete(ConcreteValue::String("arn:old".to_string())),
+        );
+        let effect = Effect::Replace {
+            id: ResourceId::new("test.Widget", "w"),
+            from: Box::new(from),
+            to,
+            directives: crate::resource::Directives::default(),
+            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["arn".to_string()])
+                .unwrap(),
+            cascading_updates: vec![],
+            temporary_name: None,
+            cascade_ref_hints: vec![],
+        };
+
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
+
+        assert!(
+            rows.iter().any(|row| matches!(
+                row,
+                DetailRow::ReplaceCascade { key, old, new }
+                    if key == "arn" && old == "\"arn:old\"" && new == "\"arn:old\""
+            )),
+            "same forcing key should fall back to formatting the new value: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn replace_forcing_list_of_maps_keeps_row_when_nested_diff_collapses() {
+        let mut old_condition = IndexMap::new();
+        old_condition.insert(
+            "string_equals".to_string(),
+            Value::Concrete(ConcreteValue::StringList(vec!["x".to_string()])),
+        );
+        let mut new_condition = IndexMap::new();
+        new_condition.insert(
+            "string_equals".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("x".to_string()),
+            )])),
+        );
+        let mut old_item = IndexMap::new();
+        old_item.insert(
+            "sid".to_string(),
+            Value::Concrete(ConcreteValue::String("shared".to_string())),
+        );
+        old_item.insert(
+            "condition".to_string(),
+            Value::Concrete(ConcreteValue::Map(old_condition)),
+        );
+        let mut new_item = IndexMap::new();
+        new_item.insert(
+            "sid".to_string(),
+            Value::Concrete(ConcreteValue::String("shared".to_string())),
+        );
+        new_item.insert(
+            "condition".to_string(),
+            Value::Concrete(ConcreteValue::Map(new_condition)),
+        );
+        let from = State::existing(
+            ResourceId::new("test.Widget", "w"),
+            [(
+                "rules".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::Map(old_item),
+                )])),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let to = Resource::new("test.Widget", "w").with_attribute(
+            "rules",
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(new_item),
+            )])),
+        );
+        let effect = Effect::Replace {
+            id: ResourceId::new("test.Widget", "w"),
+            from: Box::new(from),
+            to,
+            directives: crate::resource::Directives::default(),
+            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["rules".to_string()])
+                .unwrap(),
+            cascading_updates: vec![],
+            temporary_name: None,
+            cascade_ref_hints: vec![],
+        };
+
+        let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, None);
+
+        assert!(
+            rows.iter().any(|row| matches!(
+                row,
+                DetailRow::ForceReplaceListOfMapsHeader { key } if key == "rules"
+            )),
+            "forcing list-of-maps key must render as a header-only row when nested diffs collapse: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn replace_forcing_map_keeps_row_when_nested_diff_collapses() {
+        let mut old_settings = IndexMap::new();
+        old_settings.insert(
+            "principal".to_string(),
+            Value::Concrete(ConcreteValue::StringList(vec![
+                "arn:aws:iam::123:oidc-provider/x".to_string(),
+            ])),
+        );
+        let mut new_settings = IndexMap::new();
+        new_settings.insert(
+            "principal".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("arn:aws:iam::123:oidc-provider/x".to_string()),
+            )])),
+        );
+        let from = State::existing(
+            ResourceId::new("test.Widget", "w"),
+            [(
+                "settings".to_string(),
+                Value::Concrete(ConcreteValue::Map(old_settings)),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let to = Resource::new("test.Widget", "w").with_attribute(
+            "settings",
+            Value::Concrete(ConcreteValue::Map(new_settings)),
+        );
+        let effect = Effect::Replace {
+            id: ResourceId::new("test.Widget", "w"),
+            from: Box::new(from),
+            to,
+            directives: crate::resource::Directives::default(),
+            changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
+                "settings".to_string(),
+            ])
+            .unwrap(),
+            cascading_updates: vec![],
+            temporary_name: None,
+            cascade_ref_hints: vec![],
+        };
+
+        let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, None);
+
+        assert!(
+            rows.iter().any(|row| matches!(
+                row,
+                DetailRow::ForceReplaceMapHeader { key } if key == "settings"
+            )),
+            "forcing map key must render as a header-only row when nested diffs collapse: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn replace_forcing_display_equal_scalar_still_renders_forcing_row() {
+        let from = State::existing(
+            ResourceId::new("test.Widget", "w"),
+            [(
+                "aliases".to_string(),
+                Value::Concrete(ConcreteValue::StringList(vec!["only-one".to_string()])),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let to = Resource::new("test.Widget", "w").with_attribute(
+            "aliases",
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("only-one".to_string()),
+            )])),
+        );
+        let effect = Effect::Replace {
+            id: ResourceId::new("test.Widget", "w"),
+            from: Box::new(from),
+            to,
+            directives: crate::resource::Directives::default(),
+            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["aliases".to_string()])
+                .unwrap(),
+            cascading_updates: vec![],
+            temporary_name: None,
+            cascade_ref_hints: vec![],
+        };
+
+        let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, None);
+
+        assert!(
+            rows.iter().any(|row| matches!(
+                row,
+                DetailRow::ChangedForcesReplacement { key, old, new }
+                    if key == "aliases" && old == "[\"only-one\"]" && new == "[\"only-one\"]"
+            )),
+            "forcing display-equal scalar key must remain visible: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn replace_forcing_key_uses_raw_old_value_when_explicit_projection_omits_it() {
+        use crate::explicit::ExplicitFields;
+
+        let id = ResourceId::new("test.Widget", "w");
+        let from = State::existing(
+            id.clone(),
+            [
+                (
+                    "server_defaulted_name".to_string(),
+                    Value::Concrete(ConcreteValue::String("old-name".to_string())),
+                ),
+                (
+                    "authored".to_string(),
+                    Value::Concrete(ConcreteValue::String("kept".to_string())),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let to = Resource::new("test.Widget", "w")
+            .with_attribute(
+                "server_defaulted_name",
+                Value::Concrete(ConcreteValue::String("new-name".to_string())),
+            )
+            .with_attribute(
+                "authored",
+                Value::Concrete(ConcreteValue::String("kept".to_string())),
+            );
+        let effect = Effect::Replace {
+            id: id.clone(),
+            from: Box::new(from),
+            to,
+            directives: crate::resource::Directives::default(),
+            changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
+                "server_defaulted_name".to_string(),
+            ])
+            .unwrap(),
+            cascading_updates: vec![],
+            temporary_name: None,
+            cascade_ref_hints: vec![],
+        };
+        let explicit = HashMap::from([(
+            id,
+            ExplicitFields::Struct {
+                children: HashMap::from([("authored".to_string(), ExplicitFields::Leaf)]),
+            },
+        )]);
+
+        let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, Some(&explicit));
+
+        assert!(
+            rows.iter().any(|row| matches!(
+                row,
+                DetailRow::ChangedForcesReplacement { key, old, new }
+                    if key == "server_defaulted_name"
+                        && old == "\"old-name\""
+                        && new == "\"new-name\""
+            )),
+            "forcing key should use raw state old value even when projection omits it: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn replace_rows_include_non_forcing_removed_attributes() {
+        let from = State::existing(
+            ResourceId::new("test.Widget", "w"),
+            [
+                (
+                    "external_name".to_string(),
+                    Value::Concrete(ConcreteValue::String("old-name".to_string())),
+                ),
+                (
+                    "tag".to_string(),
+                    Value::Concrete(ConcreteValue::String("legacy".to_string())),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let to = Resource::new("test.Widget", "w").with_attribute(
+            "external_name",
+            Value::Concrete(ConcreteValue::String("new-name".to_string())),
+        );
+        let effect = Effect::Replace {
+            id: ResourceId::new("test.Widget", "w"),
+            from: Box::new(from),
+            to,
+            directives: crate::resource::Directives::default(),
+            changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
+                "external_name".to_string(),
+            ])
+            .unwrap(),
+            cascading_updates: vec![],
+            temporary_name: None,
+            cascade_ref_hints: vec![],
+        };
+
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
+
+        assert!(
+            rows.iter()
+                .any(|row| matches!(row, DetailRow::Removed { key, old } if key == "tag" && old == "\"legacy\"")),
+            "replace rows must render non-forcing removed attributes alongside forcing changes: {rows:?}"
         );
     }
 
@@ -3257,7 +4140,7 @@ mod tests {
         };
         let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, None);
         for row in &rows {
-            if let DetailRow::Changed { key, old, new } = row {
+            if let DetailRow::Changed { key, old, new, .. } = row {
                 assert_ne!(
                     old, new,
                     "top-level attribute `{key}` rendered as Changed with old == new = {old:?}"

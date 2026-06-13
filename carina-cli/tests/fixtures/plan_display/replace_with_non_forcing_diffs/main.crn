@@ -1,0 +1,12 @@
+provider test {}
+
+let web_acl = test.test.Widget {
+  external_name = "edge-new"
+  description = "new description"
+  metric_name = "edge-new-metric"
+  scope = "CLOUDFRONT"
+}
+
+exports {
+  web_acl_name = web_acl.external_name
+}
