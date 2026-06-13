@@ -8,8 +8,6 @@ use carina_core::detail_rows::{
     ListOfMapsDiffModified, MapDiffEntryIR, build_detail_rows, hidden_unchanged_summary,
 };
 #[cfg(test)]
-use carina_core::diff_helpers::compute_map_diff;
-#[cfg(test)]
 use carina_core::effect::CascadingUpdate;
 use carina_core::effect::Effect;
 use carina_core::plan::Plan;
@@ -22,7 +20,7 @@ use carina_core::resource::{ConcreteValue, DeferredValue, ResourceId, Value};
 use carina_core::schema::SchemaRegistry;
 use carina_core::value::format_value_pretty;
 #[cfg(test)]
-use carina_core::value::{format_value, format_value_with_key, is_list_of_maps, map_similarity};
+use carina_core::value::format_value_with_key;
 
 use crate::DetailLevel;
 
@@ -1516,6 +1514,18 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
             )
             .unwrap();
         }
+        DetailRow::ReplaceRemoved { key, old } => {
+            writeln!(
+                out,
+                "{}{}: {} → {} {}",
+                attr_prefix,
+                key,
+                old.red().strikethrough(),
+                "(removed)".red().strikethrough(),
+                "(forces replacement)".magenta()
+            )
+            .unwrap();
+        }
         DetailRow::ReplaceCascade { key, old, new } => {
             writeln!(
                 out,
@@ -1964,351 +1974,6 @@ pub fn format_effect(effect: &Effect) -> String {
             format!("Wait {} (until {})", binding, until_surface)
         }
     }
-}
-
-/// Check if both old and new values are `Value::Concrete(ConcreteValue::Map)`.
-#[cfg(test)]
-fn is_both_maps(old_value: Option<&Value>, new_value: &Value) -> bool {
-    matches!(
-        (old_value, new_value),
-        (
-            Some(Value::Concrete(ConcreteValue::Map(_))),
-            Value::Concrete(ConcreteValue::Map(_))
-        )
-    )
-}
-
-/// Format a key-level diff between two map values.
-///
-/// Shows only the keys that changed:
-/// - `+ key: "value"` for added keys
-/// - `- key: "value"` for removed keys
-/// - `~ key: "old" -> "new"` for changed keys
-///
-/// Unchanged keys are not shown.
-#[cfg(test)]
-fn format_map_diff(old_value: Option<&Value>, new_value: &Value, attr_prefix: &str) -> String {
-    let new_map = match new_value {
-        Value::Concrete(ConcreteValue::Map(m)) => m,
-        _ => return format_value(new_value),
-    };
-    let old_map = match old_value {
-        Some(Value::Concrete(ConcreteValue::Map(m))) => m,
-        _ => {
-            // No old map; treat all new keys as added
-            let empty = indexmap::IndexMap::new();
-            let diff = compute_map_diff(&empty, new_map);
-            let mut lines = Vec::new();
-            for entry in &diff.added {
-                lines.push(format!(
-                    "{}  {} {}: {}",
-                    attr_prefix,
-                    "+".green(),
-                    entry.key,
-                    format_value_with_key(&entry.value, Some(&entry.key)).green()
-                ));
-            }
-            return lines.join("\n");
-        }
-    };
-
-    let diff = compute_map_diff(old_map, new_map);
-    let mut lines = Vec::new();
-
-    // Merge all entries into a single list sorted by key (preserving original ordering)
-    for entry in diff.iter_by_key() {
-        match entry {
-            carina_core::diff_helpers::MapDiffItem::Changed(e) => {
-                lines.push(format!(
-                    "{}  {} {}: {} → {}",
-                    attr_prefix,
-                    "~".yellow(),
-                    e.key,
-                    format_value_with_key(&e.old_value, Some(&e.key))
-                        .red()
-                        .strikethrough(),
-                    format_value_with_key(&e.new_value, Some(&e.key)).green()
-                ));
-            }
-            carina_core::diff_helpers::MapDiffItem::Added(e) => {
-                lines.push(format!(
-                    "{}  {} {}: {}",
-                    attr_prefix,
-                    "+".green(),
-                    e.key,
-                    format_value_with_key(&e.value, Some(&e.key)).green()
-                ));
-            }
-            carina_core::diff_helpers::MapDiffItem::Removed(e) => {
-                lines.push(format!(
-                    "{}  {} {}: {}",
-                    attr_prefix,
-                    "-".red().strikethrough(),
-                    e.key,
-                    format_value_with_key(&e.value, Some(&e.key))
-                        .red()
-                        .strikethrough()
-                ));
-            }
-        }
-    }
-
-    lines.join("\n")
-}
-
-/// Format a list-of-maps diff for Update effect display.
-/// Uses content-matched comparison (multiset matching) instead of index-based.
-/// 1. Find exact matches between old and new items
-/// 2. Pair remaining unmatched items by similarity for field-level diffs
-/// 3. Display unchanged, modified (~), added (+), and removed (-) items
-#[cfg(test)]
-fn format_list_diff(old_value: Option<&Value>, new_value: &Value, attr_prefix: &str) -> String {
-    let new_items = match new_value {
-        Value::Concrete(ConcreteValue::List(items)) => items,
-        _ => return format_value(new_value),
-    };
-    let old_items = match old_value {
-        Some(Value::Concrete(ConcreteValue::List(items))) => items,
-        _ => &vec![] as &Vec<Value>,
-    };
-
-    let mut old_matched = vec![false; old_items.len()];
-    let mut new_matched = vec![false; new_items.len()];
-
-    // Phase 1: Find exact matches (semantically equal items)
-    for (ni, new_item) in new_items.iter().enumerate() {
-        for (oi, old_item) in old_items.iter().enumerate() {
-            if !old_matched[oi] && old_item.semantically_equal(new_item) {
-                old_matched[oi] = true;
-                new_matched[ni] = true;
-                break;
-            }
-        }
-    }
-
-    // Collect unmatched items
-    let unmatched_old: Vec<usize> = old_matched
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| !**m)
-        .map(|(i, _)| i)
-        .collect();
-    let unmatched_new: Vec<usize> = new_matched
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| !**m)
-        .map(|(i, _)| i)
-        .collect();
-
-    // Phase 2: Pair unmatched items by similarity (most shared key-value pairs)
-    let mut paired: Vec<(usize, usize)> = Vec::new();
-    let mut paired_old = vec![false; unmatched_old.len()];
-    let mut paired_new = vec![false; unmatched_new.len()];
-
-    for (ui_new, &ni) in unmatched_new.iter().enumerate() {
-        let mut best_oi_idx = None;
-        let mut best_sim = 0usize;
-        for (ui_old, &oi) in unmatched_old.iter().enumerate() {
-            if paired_old[ui_old] {
-                continue;
-            }
-            let sim = map_similarity(&old_items[oi], &new_items[ni]);
-            if sim > best_sim {
-                best_sim = sim;
-                best_oi_idx = Some(ui_old);
-            }
-        }
-        if let Some(ui_old) = best_oi_idx.filter(|_| best_sim > 0) {
-            paired.push((unmatched_old[ui_old], ni));
-            paired_old[ui_old] = true;
-            paired_new[ui_new] = true;
-        }
-    }
-
-    // Remaining truly added/removed items
-    let added: Vec<usize> = unmatched_new
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !paired_new[*i])
-        .map(|(_, &ni)| ni)
-        .collect();
-    let removed: Vec<usize> = unmatched_old
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !paired_old[*i])
-        .map(|(_, &oi)| oi)
-        .collect();
-
-    // Phase 3: Build output
-    let mut lines = Vec::new();
-
-    // Show unchanged items (exact matches from new list order)
-    for (ni, new_item) in new_items.iter().enumerate() {
-        if let Value::Concrete(ConcreteValue::Map(map)) = new_item
-            && new_matched[ni]
-        {
-            let mut keys: Vec<_> = map.keys().collect();
-            keys.sort();
-            let fields: Vec<String> = keys
-                .iter()
-                .map(|k| format!("{}: {}", k, format_value(&map[*k])))
-                .collect();
-            lines.push(format!("{}    {{{}}}", attr_prefix, fields.join(", ")));
-        }
-    }
-
-    // Show modified items (paired by similarity)
-    for &(oi, ni) in &paired {
-        if let (
-            Value::Concrete(ConcreteValue::Map(old_map)),
-            Value::Concrete(ConcreteValue::Map(new_map)),
-        ) = (&old_items[oi], &new_items[ni])
-        {
-            let mut keys: Vec<_> = new_map.keys().collect();
-            keys.sort();
-            let fields: Vec<String> = keys
-                .iter()
-                .map(|k| {
-                    let new_v = format_value(&new_map[*k]);
-                    let field_same = old_map
-                        .get(*k)
-                        .map(|ov| ov.semantically_equal(&new_map[*k]))
-                        .unwrap_or(false);
-                    if !field_same {
-                        let old_v = old_map
-                            .get(*k)
-                            .map(format_value)
-                            .unwrap_or_else(|| "(none)".to_string());
-                        format!("{}: {} → {}", k, old_v.red().strikethrough(), new_v.green())
-                    } else {
-                        format!("{}: {}", k, new_v)
-                    }
-                })
-                .collect();
-            lines.push(format!(
-                "{}  {} {{{}}}",
-                attr_prefix,
-                "~".yellow().bold(),
-                fields.join(", ")
-            ));
-        }
-    }
-
-    // Show added items
-    for &ni in &added {
-        if let Value::Concrete(ConcreteValue::Map(map)) = &new_items[ni] {
-            let mut keys: Vec<_> = map.keys().collect();
-            keys.sort();
-            let fields: Vec<String> = keys
-                .iter()
-                .map(|k| format!("{}: {}", k, format_value(&map[*k])))
-                .collect();
-            lines.push(format!(
-                "{}  {} {{{}}}",
-                attr_prefix,
-                "+".green().bold(),
-                fields.join(", ")
-            ));
-        }
-    }
-
-    // Show removed items
-    for &oi in &removed {
-        if let Value::Concrete(ConcreteValue::Map(map)) = &old_items[oi] {
-            let mut keys: Vec<_> = map.keys().collect();
-            keys.sort();
-            let fields: Vec<String> = keys
-                .iter()
-                .map(|k| format!("{}: {}", k, format_value(&map[*k])))
-                .collect();
-            lines.push(format!(
-                "{}  {} {{{}}}",
-                attr_prefix,
-                "-".red().bold().strikethrough(),
-                fields.join(", ").red().strikethrough()
-            ));
-        }
-    }
-
-    lines.join("\n")
-}
-
-/// Format the changed_create_only attributes for a Replace effect.
-///
-/// Only shows attributes listed in `changed_create_only` that exist in `to_attrs`.
-/// When the old and new values are semantically equal (cascade-triggered replacement
-/// where the new value is not yet known), the attribute is shown with
-/// "(forces replacement, known after apply)" instead of being hidden.
-#[cfg(test)]
-fn format_replace_changed_attrs(
-    from_attrs: &std::collections::HashMap<String, Value>,
-    to_attrs: &std::collections::HashMap<String, Value>,
-    changed_create_only: &[String],
-    attr_prefix: &str,
-    cascade_ref_hints: &[(String, String)],
-) -> String {
-    let mut lines = Vec::new();
-    let mut keys: Vec<_> = changed_create_only
-        .iter()
-        .filter(|k| to_attrs.contains_key(k.as_str()))
-        .collect();
-    keys.sort();
-    for key in keys {
-        let new_value = &to_attrs[key.as_str()];
-        let old_value = from_attrs.get(key.as_str());
-        let is_same = old_value
-            .map(|ov| ov.semantically_equal(new_value))
-            .unwrap_or(false);
-        if is_same {
-            // Value hasn't visibly changed yet — this is a cascade-triggered
-            // create-only attr whose new value is unknown until the
-            // depended-upon resource is replaced.
-            let old_str = old_value
-                .map(|v| format_value_with_key(v, Some(key)))
-                .unwrap_or_else(|| "(none)".to_string());
-            // Use the original ResourceRef hint if available, otherwise show the resolved value
-            let new_str = cascade_ref_hints
-                .iter()
-                .find(|(attr, _)| attr == key)
-                .map(|(_, hint)| hint.clone())
-                .unwrap_or_else(|| format_value_with_key(new_value, Some(key)));
-            lines.push(format!(
-                "{}{}: {} → {} {}\n",
-                attr_prefix,
-                key,
-                old_str.red().strikethrough(),
-                new_str.green(),
-                "(forces replacement, known after apply)".magenta()
-            ));
-        } else if is_list_of_maps(new_value) {
-            let suffix = format!(" {}", "(forces replacement)".magenta());
-            lines.push(format!("{}{}:{}\n", attr_prefix, key, suffix));
-            lines.push(format!(
-                "{}\n",
-                format_list_diff(old_value, new_value, attr_prefix)
-            ));
-        } else if is_both_maps(old_value, new_value) {
-            let suffix = format!(" {}", "(forces replacement)".magenta());
-            lines.push(format!("{}{}:{}\n", attr_prefix, key, suffix));
-            lines.push(format!(
-                "{}\n",
-                format_map_diff(old_value, new_value, attr_prefix)
-            ));
-        } else {
-            let old_str = old_value
-                .map(|v| format_value_with_key(v, Some(key)))
-                .unwrap_or_else(|| "(none)".to_string());
-            lines.push(format!(
-                "{}{}: {} → {} {}\n",
-                attr_prefix,
-                key,
-                old_str.red().strikethrough(),
-                format_value_with_key(new_value, Some(key)).green(),
-                "(forces replacement)".magenta()
-            ));
-        }
-    }
-    lines.concat()
 }
 
 #[cfg(test)]

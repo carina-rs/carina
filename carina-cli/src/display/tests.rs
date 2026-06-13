@@ -878,32 +878,32 @@ fn test_format_cascading_update_attr_diff() {
 /// NOT be hidden even though `semantically_equal` returns true.
 #[test]
 fn test_replace_changed_create_only_same_value_shown_as_known_after_apply() {
-    use std::collections::HashMap;
-
-    let from_attrs = HashMap::from([
-        (
-            "vpc_id".to_string(),
+    let id = ResourceId::with_provider("awscc", "ec2.Subnet", "subnet", None);
+    let from = State::existing(
+        id.clone(),
+        [
+            (
+                "vpc_id".to_string(),
+                Value::Concrete(ConcreteValue::String("vpc-123".to_string())),
+            ),
+            (
+                "cidr_block".to_string(),
+                Value::Concrete(ConcreteValue::String("10.0.1.0/24".to_string())),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    let mut to = Resource::new("ec2.Subnet", "subnet")
+        .with_attribute(
+            "vpc_id",
             Value::Concrete(ConcreteValue::String("vpc-123".to_string())),
-        ),
-        (
-            "cidr_block".to_string(),
+        )
+        .with_attribute(
+            "cidr_block",
             Value::Concrete(ConcreteValue::String("10.0.1.0/24".to_string())),
-        ),
-    ]);
-    let to_attrs = HashMap::from([
-        (
-            "_binding".to_string(),
-            Value::Concrete(ConcreteValue::String("subnet".to_string())),
-        ),
-        (
-            "vpc_id".to_string(),
-            Value::Concrete(ConcreteValue::String("vpc-123".to_string())),
-        ),
-        (
-            "cidr_block".to_string(),
-            Value::Concrete(ConcreteValue::String("10.0.1.0/24".to_string())),
-        ),
-    ]);
+        );
+    to.id = id.clone();
 
     // Verify the precondition: the values are semantically equal
     assert!(
@@ -913,8 +913,32 @@ fn test_replace_changed_create_only_same_value_shown_as_known_after_apply() {
         "precondition: old and new vpc_id should be semantically equal"
     );
 
-    let output =
-        format_replace_changed_attrs(&from_attrs, &to_attrs, &["vpc_id".to_string()], "    ", &[]);
+    let effect = Effect::Replace {
+        id,
+        from: Box::new(from),
+        to,
+        directives: Directives::default(),
+        changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec![
+            "vpc_id".to_string(),
+        ])
+        .unwrap(),
+        cascading_updates: Vec::<CascadingUpdate>::new(),
+        temporary_name: None,
+        cascade_ref_hints: Vec::new(),
+    };
+    let mut plan = Plan::new();
+    plan.add(effect);
+    let output = format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        None,
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+        None,
+    );
 
     // vpc_id must appear in output, not be hidden
     assert!(
@@ -946,25 +970,47 @@ fn test_replace_changed_create_only_same_value_shown_as_known_after_apply() {
 /// binding instead of the resolved value for cascade-triggered same-value attributes.
 #[test]
 fn test_replace_cascade_ref_hints_show_binding() {
-    use std::collections::HashMap;
-
-    let from_attrs = HashMap::from([(
-        "vpc_id".to_string(),
+    let id = ResourceId::with_provider("awscc", "ec2.Subnet", "subnet", None);
+    let from = State::existing(
+        id.clone(),
+        [(
+            "vpc_id".to_string(),
+            Value::Concrete(ConcreteValue::String("vpc-0bf023ff87bf1aa0c".to_string())),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    let mut to = Resource::new("ec2.Subnet", "subnet").with_attribute(
+        "vpc_id",
         Value::Concrete(ConcreteValue::String("vpc-0bf023ff87bf1aa0c".to_string())),
-    )]);
-    let to_attrs = HashMap::from([(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-0bf023ff87bf1aa0c".to_string())),
-    )]);
+    );
+    to.id = id.clone();
 
-    let hints = vec![("vpc_id".to_string(), "vpc.vpc_id".to_string())];
-
-    let output = format_replace_changed_attrs(
-        &from_attrs,
-        &to_attrs,
-        &["vpc_id".to_string()],
-        "    ",
-        &hints,
+    let effect = Effect::Replace {
+        id,
+        from: Box::new(from),
+        to,
+        directives: Directives::default(),
+        changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec![
+            "vpc_id".to_string(),
+        ])
+        .unwrap(),
+        cascading_updates: Vec::<CascadingUpdate>::new(),
+        temporary_name: None,
+        cascade_ref_hints: vec![("vpc_id".to_string(), "vpc.vpc_id".to_string())],
+    };
+    let mut plan = Plan::new();
+    plan.add(effect);
+    let output = format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        None,
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+        None,
     );
 
     // Must show the ResourceRef hint instead of the resolved value on the right side
@@ -1364,6 +1410,58 @@ fn format_effect_replace_separates_type_and_name_with_space() {
         cascade_ref_hints: Vec::new(),
     };
     assert_eq!(format_effect(&effect), "Replace awscc.ec2.Vpc vpc");
+}
+
+#[test]
+fn format_replace_with_removed_create_only_attribute_shows_forcing_detail() {
+    let id = ResourceId::with_provider("test", "Widget", "beta", None);
+    let from = State::existing(
+        id.clone(),
+        [(
+            "legacy_token".to_string(),
+            Value::Concrete(ConcreteValue::String("tok".to_string())),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    let mut to = Resource::new("Widget", "beta");
+    to.id = id.clone();
+    let effect = Effect::Replace {
+        id,
+        from: Box::new(from),
+        to,
+        directives: Directives::default(),
+        changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec![
+            "legacy_token".to_string(),
+        ])
+        .unwrap(),
+        cascading_updates: Vec::<CascadingUpdate>::new(),
+        temporary_name: None,
+        cascade_ref_hints: Vec::new(),
+    };
+    let mut plan = Plan::new();
+    plan.add(effect);
+
+    let output = format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        None,
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+        None,
+    );
+
+    assert!(
+        output.contains("legacy_token"),
+        "expected removed create-only key in replace details, got:\n{output}"
+    );
+    assert!(
+        output.contains("(forces replacement)"),
+        "expected forcing annotation in replace details, got:\n{output}"
+    );
 }
 
 #[test]

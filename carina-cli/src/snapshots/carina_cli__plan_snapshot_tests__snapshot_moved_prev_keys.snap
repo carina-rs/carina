@@ -5,7 +5,11 @@ expression: output
 Execution Plan:
 
   ~ awscc.ec2.Vpc new_vpc (moved from: old_vpc)
-      tags: [{key: "Name", value: "old"}] → (removed)
+      tags:
+        - {
+            key: "Name"
+            value: "old"
+          }
       # (1 unchanged attribute hidden)
         │
         └─ + awscc.ec2.Subnet 

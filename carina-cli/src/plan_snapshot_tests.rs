@@ -412,6 +412,23 @@ fn snapshot_mixed_operations() {
 }
 
 #[test]
+fn snapshot_replace_create_only() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("replace_create_only");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+        None,
+    ));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
 fn snapshot_delete_orphan() {
     use carina_core::resource::Value;
     let (plan, current_states, schemas, _moved) =
@@ -970,7 +987,6 @@ fn collect_unused_let_bindings_in_fixtures(
             continue;
         }
         let fixture_name = entry.file_name().to_string_lossy().to_string();
-
         let loaded = load_configuration(&fixture_dir).unwrap();
         let unused = crate::wiring::check_unused_bindings(&loaded.unresolved_parsed);
         if unused.is_empty() {

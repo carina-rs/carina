@@ -395,10 +395,60 @@ fn fixture_provider_factories(fixture_path: &Path) -> Vec<Box<dyn ProviderFactor
         Some("moved_claims_precede_heuristics") => {
             vec![Box::new(MovedClaimsPrecedeHeuristicsFixtureFactory)]
         }
+        Some("replace_create_only") => vec![Box::new(ReplaceCreateOnlyFixtureFactory)],
         Some("route53_hosted_zone_name_strip_suffix_no_diff") => {
             vec![Box::new(Route53HostedZoneFixtureFactory)]
         }
         _ => vec![],
+    }
+}
+
+struct ReplaceCreateOnlyFixtureFactory;
+
+impl ProviderFactory for ReplaceCreateOnlyFixtureFactory {
+    fn name(&self) -> &str {
+        "test"
+    }
+
+    fn display_name(&self) -> &str {
+        "Test fixture provider"
+    }
+
+    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+        HashMap::new()
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &indexmap::IndexMap<String, Value>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
+        "test-region".to_string()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _attributes: &indexmap::IndexMap<String, Value>,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
+    }
+
+    fn schemas(&self) -> Vec<ResourceSchema> {
+        vec![
+            ResourceSchema::new("test.Widget")
+                .attribute(
+                    AttributeSchema::new("external_name", AttributeType::string()).create_only(),
+                )
+                .attribute(
+                    AttributeSchema::new("legacy_token", AttributeType::string())
+                        .create_only()
+                        .removable(),
+                ),
+        ]
     }
 }
 
