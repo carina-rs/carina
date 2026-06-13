@@ -659,8 +659,13 @@ pub(super) async fn execute_effects_phased(
                                     };
                                     let cascade_identifier =
                                         cascade.from.identifier.as_deref().unwrap_or("");
-                                    let cascade_patch =
-                                        compute_full_diff_patch(&cascade.from, &resolved_to);
+                                    let cascade_patch = compute_full_diff_patch(
+                                        &cascade.from,
+                                        &resolved_to,
+                                        &cascade.to,
+                                        pipeline.schemas,
+                                        &cascade.id,
+                                    );
                                     let cascade_request = UpdateRequest {
                                         from: (*cascade.from).clone(),
                                         patch: cascade_patch,

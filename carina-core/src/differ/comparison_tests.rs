@@ -922,6 +922,50 @@ fn secret_in_find_changed_attributes_changed() {
 }
 
 #[test]
+fn key_should_enter_patch_saved_merge_preserves_unmanaged_nested_fields() {
+    let attr_type = AttributeType::map(AttributeType::string());
+    let current = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        (
+            "Name".to_string(),
+            Value::Concrete(ConcreteValue::String("new".to_string())),
+        ),
+        (
+            "ManagedBy".to_string(),
+            Value::Concrete(ConcreteValue::String("carina".to_string())),
+        ),
+    ])));
+    let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "Name".to_string(),
+        Value::Concrete(ConcreteValue::String("new".to_string())),
+    )])));
+    let saved = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        (
+            "Name".to_string(),
+            Value::Concrete(ConcreteValue::String("old".to_string())),
+        ),
+        (
+            "ManagedBy".to_string(),
+            Value::Concrete(ConcreteValue::String("carina".to_string())),
+        ),
+    ])));
+
+    assert!(!key_should_enter_patch(
+        "tags",
+        None,
+        AttrComparison {
+            from: Some(&current),
+            to: &desired,
+            saved: Some(&saved),
+            type_info: Some(TypedAttr {
+                attr_type: &attr_type,
+                defs: crate::schema::empty_defs_for_schema_walks(),
+            }),
+            secret_ctx: None,
+        },
+    ));
+}
+
+#[test]
 fn secret_in_map_no_change_when_hash_matches() {
     use crate::value::value_to_json;
 

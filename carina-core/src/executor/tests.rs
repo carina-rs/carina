@@ -347,6 +347,53 @@ impl crate::provider::ProviderNormalizer for DefaultTagsNormalizer {
     }
 }
 
+struct SecretListToScalarNormalizer;
+
+impl crate::provider::ProviderNormalizer for SecretListToScalarNormalizer {
+    fn normalize_desired<'a>(
+        &'a self,
+        resources: &'a mut [Resource],
+    ) -> crate::provider::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            for resource in resources {
+                if let Some(Value::Concrete(ConcreteValue::List(items))) =
+                    resource.get_attr("master_password")
+                    && let Some(Value::Concrete(ConcreteValue::String(first))) = items.first()
+                {
+                    resource.set_attr(
+                        "master_password",
+                        Value::Concrete(ConcreteValue::String(first.clone())),
+                    );
+                }
+            }
+        })
+    }
+
+    fn normalize_state<'a>(
+        &'a self,
+        _current_states: &'a mut HashMap<ResourceId, State>,
+    ) -> crate::provider::BoxFuture<'a, ()> {
+        crate::provider::ready_noop()
+    }
+
+    fn hydrate_read_state<'a>(
+        &'a self,
+        _current_states: &'a mut HashMap<ResourceId, State>,
+        _saved_attrs: &'a crate::provider::SavedAttrs,
+    ) -> crate::provider::BoxFuture<'a, ()> {
+        crate::provider::ready_noop()
+    }
+
+    fn merge_default_tags<'a>(
+        &'a self,
+        _resources: &'a mut [Resource],
+        _default_tags: &'a indexmap::IndexMap<String, Value>,
+        _registry: &'a crate::schema::SchemaRegistry,
+    ) -> crate::provider::BoxFuture<'a, ()> {
+        crate::provider::ready_noop()
+    }
+}
+
 // -----------------------------------------------------------------------
 // Mock ProviderFactory + shared test fixtures
 // -----------------------------------------------------------------------
@@ -374,6 +421,44 @@ static CANON_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
             AttributeType::list(AttributeType::string()),
         ]),
     ));
+    reg.insert("test", schema);
+    reg
+});
+
+static AUGMENT_COMPARISON_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
+    use crate::schema::{
+        AttributeSchema, AttributeType, ResourceSchema, StructField, enum_identity,
+    };
+
+    let mut reg = SchemaRegistry::new();
+    let schema = ResourceSchema::new("a")
+        .attribute(AttributeSchema::new("description", AttributeType::string()))
+        .attribute(AttributeSchema::new("size", AttributeType::float()))
+        .attribute(AttributeSchema::new(
+            "options",
+            AttributeType::struct_(
+                "Options",
+                vec![
+                    StructField::new("enabled", AttributeType::bool()),
+                    StructField::new("label", AttributeType::string()),
+                ],
+            ),
+        ))
+        .attribute(AttributeSchema::new(
+            "mode",
+            AttributeType::enum_(
+                enum_identity("Mode", Some("test")),
+                Some(vec!["AES256".to_string(), "aws:kms".to_string()]),
+                Vec::new(),
+                None,
+                None,
+            ),
+        ))
+        .attribute(AttributeSchema::new("write_only_token", AttributeType::string()).write_only())
+        .attribute(AttributeSchema::new(
+            "master_password",
+            AttributeType::string(),
+        ));
     reg.insert("test", schema);
     reg
 });
@@ -910,6 +995,271 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
     );
 }
 
+#[tokio::test]
+async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
+    let provider = MockProvider::new();
+    let mut to_resource = Resource::with_provider("test", "a", "a", None);
+    to_resource.binding = Some("a".to_string());
+    let rid = to_resource.id.clone();
+
+    to_resource.set_attr(
+        "description",
+        Value::Concrete(ConcreteValue::String("new".to_string())),
+    );
+    to_resource.set_attr("size", Value::Concrete(ConcreteValue::Float(1.0)));
+    let mut desired_options = indexmap::IndexMap::new();
+    desired_options.insert(
+        "label".to_string(),
+        Value::Concrete(ConcreteValue::String("stable".to_string())),
+    );
+    to_resource.set_attr(
+        "options",
+        Value::Concrete(ConcreteValue::Map(desired_options)),
+    );
+    to_resource.set_attr(
+        "mode",
+        Value::Concrete(ConcreteValue::enum_identifier("test.Mode.AES256")),
+    );
+
+    let mut from_attrs = HashMap::new();
+    from_attrs.insert(
+        "description".to_string(),
+        Value::Concrete(ConcreteValue::String("old".to_string())),
+    );
+    from_attrs.insert("size".to_string(), Value::Concrete(ConcreteValue::Int(1)));
+    let mut current_options = indexmap::IndexMap::new();
+    current_options.insert(
+        "label".to_string(),
+        Value::Concrete(ConcreteValue::String("stable".to_string())),
+    );
+    current_options.insert(
+        "enabled".to_string(),
+        Value::Concrete(ConcreteValue::Bool(false)),
+    );
+    from_attrs.insert(
+        "options".to_string(),
+        Value::Concrete(ConcreteValue::Map(current_options)),
+    );
+    from_attrs.insert(
+        "mode".to_string(),
+        Value::Concrete(ConcreteValue::String("AES256".to_string())),
+    );
+    let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        id: rid.clone(),
+        from: Box::new(from_state),
+        to: to_resource,
+        changed_attributes: vec!["description".to_string()],
+    });
+    provider.push_update(Ok(ok_state(&rid)));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &AUGMENT_COMPARISON_SCHEMAS,
+    };
+
+    let observer = MockObserver::new();
+    let result = execute_plan(&provider, input, &observer).await;
+    assert_eq!(result.success_count, 1);
+
+    let reqs = provider.captured_update_requests();
+    assert_eq!(reqs.len(), 1);
+    let patched_keys: Vec<&str> = reqs[0].patch.ops.iter().map(|op| op.key.as_str()).collect();
+    assert_eq!(patched_keys, vec!["description"]);
+}
+
+#[tokio::test]
+async fn test_apply_effective_changed_skips_internal_and_write_only_attributes() {
+    let provider = MockProvider::new();
+    let mut to_resource = Resource::with_provider("test", "a", "a", None);
+    to_resource.binding = Some("a".to_string());
+    let rid = to_resource.id.clone();
+
+    to_resource.set_attr(
+        "description",
+        Value::Concrete(ConcreteValue::String("new".to_string())),
+    );
+    to_resource.set_attr(
+        "_provider_only",
+        Value::Concrete(ConcreteValue::String("metadata".to_string())),
+    );
+    to_resource.set_attr(
+        "write_only_token",
+        Value::Concrete(ConcreteValue::String("secret-token".to_string())),
+    );
+
+    let mut from_attrs = HashMap::new();
+    from_attrs.insert(
+        "description".to_string(),
+        Value::Concrete(ConcreteValue::String("old".to_string())),
+    );
+    let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        id: rid.clone(),
+        from: Box::new(from_state),
+        to: to_resource,
+        changed_attributes: vec!["description".to_string()],
+    });
+    provider.push_update(Ok(ok_state(&rid)));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &AUGMENT_COMPARISON_SCHEMAS,
+    };
+
+    let observer = MockObserver::new();
+    let result = execute_plan(&provider, input, &observer).await;
+    assert_eq!(result.success_count, 1);
+
+    let reqs = provider.captured_update_requests();
+    assert_eq!(reqs.len(), 1);
+    let patched_keys: Vec<&str> = reqs[0].patch.ops.iter().map(|op| op.key.as_str()).collect();
+    assert_eq!(patched_keys, vec!["description"]);
+}
+
+#[tokio::test]
+async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
+    let provider = MockProvider::new();
+    let mut to_resource = Resource::with_provider("test", "a", "a", None);
+    to_resource.binding = Some("a".to_string());
+    let rid = to_resource.id.clone();
+
+    let secret_value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String("my-password".to_string()),
+    ))));
+    to_resource.set_attr("master_password", secret_value.clone());
+
+    let secret_ctx =
+        crate::value::SecretHashContext::new(rid.display_type(), rid.name_str(), "master_password");
+    let hash_json = crate::value::value_to_json_with_context(&secret_value, Some(&secret_ctx))
+        .expect("secret hash must serialize");
+    let hash_str = hash_json
+        .as_str()
+        .expect("secret hash must serialize to a string")
+        .to_string();
+
+    let mut from_attrs = HashMap::new();
+    from_attrs.insert(
+        "master_password".to_string(),
+        Value::Concrete(ConcreteValue::String(hash_str)),
+    );
+    let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        id: rid.clone(),
+        from: Box::new(from_state),
+        to: to_resource,
+        changed_attributes: vec![],
+    });
+    provider.push_update(Ok(ok_state(&rid)));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &AUGMENT_COMPARISON_SCHEMAS,
+    };
+
+    let observer = MockObserver::new();
+    let result = execute_plan(&provider, input, &observer).await;
+    assert_eq!(result.success_count, 1);
+
+    let reqs = provider.captured_update_requests();
+    assert_eq!(reqs.len(), 1);
+    assert!(reqs[0].patch.ops.is_empty());
+}
+
+#[tokio::test]
+async fn test_apply_effective_changed_skips_secret_shape_divergence() {
+    let provider = MockProvider::new();
+    let mut to_resource = Resource::with_provider("test", "a", "a", None);
+    to_resource.binding = Some("a".to_string());
+    let rid = to_resource.id.clone();
+
+    let secret_value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String("my-password".to_string()),
+    ))));
+    to_resource.set_attr(
+        "master_password",
+        Value::Concrete(ConcreteValue::List(vec![
+            secret_value.clone(),
+            secret_value.clone(),
+        ])),
+    );
+
+    let secret_ctx =
+        crate::value::SecretHashContext::new(rid.display_type(), rid.name_str(), "master_password");
+    let hash_json = crate::value::value_to_json_with_context(&secret_value, Some(&secret_ctx))
+        .expect("secret hash must serialize");
+    let hash_str = hash_json
+        .as_str()
+        .expect("secret hash must serialize to a string")
+        .to_string();
+
+    let mut from_attrs = HashMap::new();
+    from_attrs.insert(
+        "master_password".to_string(),
+        Value::Concrete(ConcreteValue::String(hash_str)),
+    );
+    let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        id: rid.clone(),
+        from: Box::new(from_state),
+        to: to_resource,
+        changed_attributes: vec![],
+    });
+    provider.push_update(Ok(ok_state(&rid)));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &SecretListToScalarNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &AUGMENT_COMPARISON_SCHEMAS,
+    };
+
+    let observer = MockObserver::new();
+    let result = execute_plan(&provider, input, &observer).await;
+    assert_eq!(result.success_count, 1);
+
+    let reqs = provider.captured_update_requests();
+    assert_eq!(reqs.len(), 1);
+    assert!(
+        reqs[0].patch.ops.is_empty(),
+        "shape-divergent secret comparison must fail closed instead of patching plaintext"
+    );
+}
+
 /// carina#3060 acceptance, exact shape: a normalizable value nested
 /// under a struct attribute *on a resource that also has a
 /// ResourceRef*. This is the real aws#315 regression shape — the ref
@@ -1248,6 +1598,79 @@ async fn test_cbd_creates_before_deletes() {
     let calls = provider.calls();
     assert_eq!(calls[0].0, "create");
     assert_eq!(calls[1].0, "delete");
+}
+
+#[tokio::test]
+async fn test_cbd_cascade_update_patch_uses_plan_time_comparison_semantics() {
+    let provider = MockProvider::new();
+    let replace_id = ResourceId::with_provider("test", "replace", "replace", None);
+    let replace_from =
+        State::existing(replace_id.clone(), HashMap::new()).with_identifier("replace-old");
+    let mut replace_to = Resource::with_provider("test", "replace", "replace", None);
+    replace_to.binding = Some("replace".to_string());
+
+    let cascade_id = ResourceId::with_provider("test", "a", "a", None);
+    let mut cascade_from_attrs = HashMap::new();
+    cascade_from_attrs.insert(
+        "description".to_string(),
+        Value::Concrete(ConcreteValue::String("old".to_string())),
+    );
+    cascade_from_attrs.insert("size".to_string(), Value::Concrete(ConcreteValue::Int(1)));
+    let cascade_from =
+        State::existing(cascade_id.clone(), cascade_from_attrs).with_identifier("cascade-old");
+
+    let mut cascade_to = Resource::with_provider("test", "a", "a", None);
+    cascade_to.binding = Some("a".to_string());
+    cascade_to.set_attr(
+        "description",
+        Value::Concrete(ConcreteValue::String("new".to_string())),
+    );
+    cascade_to.set_attr("size", Value::Concrete(ConcreteValue::Float(1.0)));
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Replace {
+        id: replace_id.clone(),
+        from: Box::new(replace_from),
+        to: replace_to,
+        directives: Directives {
+            create_before_destroy: true,
+            ..Default::default()
+        },
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".to_string()])
+            .unwrap(),
+        cascading_updates: vec![crate::effect::CascadingUpdate {
+            id: cascade_id.clone(),
+            from: Box::new(cascade_from),
+            to: cascade_to,
+        }],
+        temporary_name: None,
+        cascade_ref_hints: vec![],
+    });
+
+    provider.push_create(Ok(ok_state(&replace_id)));
+    provider.push_update(Ok(ok_state(&cascade_id)));
+    provider.push_delete(Ok(()));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &AUGMENT_COMPARISON_SCHEMAS,
+    };
+
+    let observer = MockObserver::new();
+    let result = execute_plan(&provider, input, &observer).await;
+    assert_eq!(result.success_count, 1);
+
+    let reqs = provider.captured_update_requests();
+    assert_eq!(reqs.len(), 1);
+    let patched_keys: Vec<&str> = reqs[0].patch.ops.iter().map(|op| op.key.as_str()).collect();
+    assert_eq!(patched_keys, vec!["description"]);
 }
 
 #[tokio::test]
