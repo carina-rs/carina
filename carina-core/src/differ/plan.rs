@@ -8,7 +8,8 @@ use crate::identifier::generate_random_suffix;
 use crate::parser::WaitBinding;
 use crate::plan::{Plan, PlanError};
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, Directives, Resource, ResourceId, State, Value,
+    ConcreteValue, DataSource, DeferredValue, Directives, InterpolationPart, Resource, ResourceId,
+    State, Value,
 };
 use crate::schema::{
     ResourceSchema, SchemaKind, SchemaRegistry, WAIT_DEFAULT_INTERVAL, WAIT_DEFAULT_TIMEOUT,
@@ -23,6 +24,11 @@ struct CascadeMerge {
     create_only_attrs: ChangedCreateOnly,
     directives: Directives,
     ref_hints: Vec<(String, String)>,
+}
+
+struct RefAttr {
+    attribute: String,
+    hint: String,
 }
 
 /// Check which changed attributes are create-only according to the schema
@@ -42,6 +48,75 @@ fn find_changed_create_only(
         .filter(|attr| create_only_attrs.contains(&attr.as_str()))
         .cloned()
         .collect()
+}
+
+fn cascade_ref_attrs(
+    attrs: &indexmap::IndexMap<String, Value>,
+    target_binding: &str,
+) -> Vec<RefAttr> {
+    attrs
+        .iter()
+        .filter_map(|(attribute, value)| {
+            cascade_ref_hint(value, target_binding).map(|hint| RefAttr {
+                attribute: attribute.clone(),
+                hint,
+            })
+        })
+        .collect()
+}
+
+fn cascade_ref_hint(value: &Value, target_binding: &str) -> Option<String> {
+    let mut hit: Option<String> = None;
+
+    // Multi-ref attributes report the first target-binding ref in list/IndexMap/source order.
+    value.visit_refs(&mut |path| {
+        if hit.is_none() && path.binding() == target_binding {
+            hit = Some(format!("{}.{}", path.binding(), path.attribute()));
+        }
+    });
+
+    if hit.is_some() {
+        return hit;
+    }
+
+    visit_binding_refs(value, target_binding)
+}
+
+/// BindingRef companion for the `visit_refs` gap. Tracked by carina#3476 for unification.
+fn visit_binding_refs(value: &Value, target_binding: &str) -> Option<String> {
+    match value {
+        Value::Deferred(DeferredValue::BindingRef { binding }) if binding == target_binding => {
+            Some(binding.clone())
+        }
+        Value::Concrete(ConcreteValue::List(items)) => items
+            .iter()
+            .find_map(|value| visit_binding_refs(value, target_binding)),
+        Value::Concrete(ConcreteValue::Map(map)) => map
+            .values()
+            .find_map(|value| visit_binding_refs(value, target_binding)),
+        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().find_map(|part| {
+            if let InterpolationPart::Expr(value) = part {
+                visit_binding_refs(value, target_binding)
+            } else {
+                None
+            }
+        }),
+        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => args
+            .iter()
+            .find_map(|value| visit_binding_refs(value, target_binding)),
+        Value::Deferred(DeferredValue::Secret(inner)) => visit_binding_refs(inner, target_binding),
+        Value::Deferred(DeferredValue::ResourceRef { .. })
+        | Value::Deferred(DeferredValue::BindingRef { .. })
+        | Value::Concrete(ConcreteValue::String(_))
+        | Value::Concrete(ConcreteValue::EnumIdentifier(_))
+        | Value::Concrete(ConcreteValue::CanonicalEnum(_))
+        | Value::Concrete(ConcreteValue::Int(_))
+        | Value::Concrete(ConcreteValue::Float(_))
+        | Value::Concrete(ConcreteValue::Bool(_))
+        | Value::Concrete(ConcreteValue::Duration(_))
+        | Value::Concrete(ConcreteValue::StringList(_))
+        | Value::Deferred(DeferredValue::Unknown(_)) => None,
+    }
 }
 
 /// Filter out non-removable attribute removals from the changed list.
@@ -689,36 +764,17 @@ pub fn cascade_dependent_updates(
                 continue;
             }
 
-            // Find which attributes on this resource hold a ResourceRef
-            // pointing to the replaced binding, and extract ref hints
-            let ref_attrs: Vec<String> = resource
-                .attributes
+            let ref_attrs = cascade_ref_attrs(&resource.attributes, dep);
+            let ref_attr_names: Vec<String> = ref_attrs
                 .iter()
-                .filter(|(_, v)| matches!(v, Value::Deferred(DeferredValue::ResourceRef{ path }) if path.binding() == dep))
-                .map(|(k, _)| k.clone())
-                .collect();
-
-            let ref_hints: Vec<(String, String)> = resource
-                .attributes
-                .iter()
-                .filter_map(|(k, v)| match v {
-                    Value::Deferred(DeferredValue::ResourceRef { path })
-                        if path.binding() == dep =>
-                    {
-                        Some((
-                            k.clone(),
-                            format!("{}.{}", path.binding(), path.attribute()),
-                        ))
-                    }
-                    _ => None,
-                })
+                .map(|ref_attr| ref_attr.attribute.clone())
                 .collect();
 
             // Check if any of those attributes are create-only
             let create_only_refs = find_changed_create_only(
                 &resource.id.provider,
                 &resource.id.resource_type,
-                &ref_attrs,
+                &ref_attr_names,
                 registry,
             );
 
@@ -740,9 +796,10 @@ pub fn cascade_dependent_updates(
                 }
 
                 // Only keep hints for attributes that are actually create-only
-                let filtered_hints: Vec<(String, String)> = ref_hints
+                let filtered_hints: Vec<(String, String)> = ref_attrs
                     .into_iter()
-                    .filter(|(attr, _)| create_only_attrs.contains(attr))
+                    .filter(|ref_attr| create_only_attrs.contains(&ref_attr.attribute))
+                    .map(|ref_attr| (ref_attr.attribute, ref_attr.hint))
                     .collect();
                 merge_operations.push(CascadeMerge {
                     resource_id: resource.id.clone(),
@@ -782,22 +839,17 @@ pub fn cascade_dependent_updates(
                     continue;
                 }
 
-                // Find which attributes on this dependent hold a ResourceRef
-                // pointing to the replaced binding
-                let ref_attrs: Vec<String> = unresolved
-                    .attributes
+                let ref_attrs = cascade_ref_attrs(&unresolved.attributes, replaced_binding);
+                let ref_attr_names: Vec<String> = ref_attrs
                     .iter()
-                    .filter(|(_, v)| {
-                        matches!(v, Value::Deferred(DeferredValue::ResourceRef{ path }) if path.binding() == replaced_binding)
-                    })
-                    .map(|(k, _)| k.clone())
+                    .map(|ref_attr| ref_attr.attribute.clone())
                     .collect();
 
                 // Check if any of those attributes are create-only
                 let create_only_refs = find_changed_create_only(
                     &unresolved.id.provider,
                     &unresolved.id.resource_type,
-                    &ref_attrs,
+                    &ref_attr_names,
                     registry,
                 );
 
@@ -812,22 +864,10 @@ pub fn cascade_dependent_updates(
                                     .to_string(),
                         });
                     } else {
-                        // Extract ref hints for attributes being promoted
-                        let ref_hints: Vec<(String, String)> = unresolved
-                            .attributes
-                            .iter()
-                            .filter_map(|(k, v)| match v {
-                                Value::Deferred(DeferredValue::ResourceRef { path })
-                                    if path.binding() == replaced_binding
-                                        && changed_create_only.contains(k) =>
-                                {
-                                    Some((
-                                        k.clone(),
-                                        format!("{}.{}", path.binding(), path.attribute()),
-                                    ))
-                                }
-                                _ => None,
-                            })
+                        let ref_hints: Vec<(String, String)> = ref_attrs
+                            .into_iter()
+                            .filter(|ref_attr| changed_create_only.contains(&ref_attr.attribute))
+                            .map(|ref_attr| (ref_attr.attribute, ref_attr.hint))
                             .collect();
 
                         // Promote to a separate Replace effect
