@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use carina_core::config_loader::{get_base_dir, load_configuration};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
+use carina_core::executor::normalized::apply_desired_normalization_slice;
 use carina_core::plan::Plan;
 use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult};
 use carina_core::resolver::resolve_refs_for_plan;
@@ -21,9 +22,9 @@ use carina_state::{StateFile, check_and_migrate};
 
 use crate::commands::validate_and_resolve;
 use crate::wiring::{
-    WiringContext, compute_anonymous_identifiers_with_ctx, normalize_desired_with_ctx,
-    normalize_state_with_ctx, reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
-    resolve_enum_aliases_in_states, resolve_enum_aliases_with_ctx,
+    WiringContext, compute_anonymous_identifiers_with_ctx, normalize_state_with_ctx,
+    reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
+    resolve_enum_aliases_in_states,
 };
 
 /// Fixture root path relative to the `carina-cli` crate manifest.
@@ -246,9 +247,6 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     )
     .expect("Failed to resolve data source refs with state");
 
-    // Type-level canonicalization for `Union[String, list(String)]`
-    // fields. See #2481, #2511, #2513.
-    carina_core::value::canonicalize_resources_with_schemas(&mut resources, wiring.schemas());
     carina_core::value::canonicalize_data_sources_with_schemas(
         &mut data_sources_for_plan,
         wiring.schemas(),
@@ -265,32 +263,27 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     );
     carina_core::value::canonicalize_states_with_schemas(&mut current_states, wiring.schemas());
 
-    normalize_desired_with_ctx(&wiring, &mut resources);
     normalize_state_with_ctx(&wiring, &mut current_states);
 
     {
-        use carina_core::provider::{ProviderNormalizer, ProviderRouter};
+        use carina_core::provider::ProviderRouter;
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
-            .expect("failed to build tokio runtime for merge_default_tags");
+            .expect("failed to build tokio runtime for desired normalization");
         let mut router = ProviderRouter::new();
         for factory in wiring.factories() {
             let attrs = indexmap::IndexMap::new();
             router.add_normalizer(rt.block_on(factory.create_normalizer(None, &attrs)));
         }
-        for provider_config in &parsed.providers {
-            if !provider_config.default_tags.is_empty() {
-                // Outermost runtime (see `normalize_desired_with_ctx`): not nested.
-                rt.block_on(router.merge_default_tags(
-                    &mut resources,
-                    &provider_config.default_tags,
-                    wiring.schemas(),
-                ));
-            }
-        }
+        rt.block_on(apply_desired_normalization_slice(
+            &mut resources,
+            &parsed.providers,
+            &router,
+            wiring.factories(),
+            wiring.schemas(),
+        ));
     }
 
-    resolve_enum_aliases_with_ctx(&wiring, &mut resources);
     resolve_enum_aliases_in_states(&wiring, &mut current_states);
 
     let orphan_dependencies = if let Some(sf) = state_file.as_ref() {

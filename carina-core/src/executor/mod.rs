@@ -12,16 +12,22 @@
 //! - `phased`: Interdependent Replace ordering (4-phase execution)
 
 mod basic;
+pub mod normalized;
+#[cfg(test)]
+mod normalized_tests;
 mod parallel;
 mod phased;
 mod replace;
 pub(crate) mod wait;
+
+pub use replace::compute_full_diff_patch;
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crate::binding_index::ResolvedBindings;
 use crate::effect::Effect;
+use crate::parser::ProviderConfig;
 use crate::provider::{Provider, ProviderNormalizer};
 use crate::resource::{ResourceId, State};
 
@@ -48,6 +54,9 @@ pub struct ExecutionInput<'a> {
     /// provider request — otherwise plan-time normalization is silently
     /// undone (carina#3060).
     pub normalizer: &'a dyn ProviderNormalizer,
+    /// Provider configs whose default_tags participate in desired-side
+    /// normalization before provider patch construction.
+    pub provider_configs: &'a [ProviderConfig],
     /// Provider factories, looked up per-resource by `id.provider`
     /// (same `find_factory` dispatch the plan path uses) to re-apply
     /// enum-alias resolution (`get_enum_alias_reverse`, e.g.

@@ -270,6 +270,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         bindings: carina_core::binding_index::ResolvedBindings::default(),
         current_states,
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &schemas,
     };
@@ -410,6 +411,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         bindings: carina_core::binding_index::ResolvedBindings::default(),
         current_states,
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &schemas,
     };

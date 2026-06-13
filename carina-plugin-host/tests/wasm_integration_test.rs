@@ -10,6 +10,19 @@ use carina_core::provider::{
 use carina_core::resource::{ConcreteValue, DataSource, Resource, ResourceId, Value};
 use carina_plugin_host::WasmProviderFactory;
 
+async fn normalized_for_test(
+    resource: Resource,
+) -> carina_core::executor::normalized::NormalizedResource {
+    carina_core::executor::normalized::apply_desired_normalization(
+        resource,
+        &[],
+        &carina_core::provider::NoopNormalizer,
+        &[],
+        &carina_core::schema::SchemaRegistry::new(),
+    )
+    .await
+}
+
 fn wasm_path() -> Option<PathBuf> {
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     // Cargo uses hyphens in binary names but underscores in library names; check both.
@@ -103,7 +116,7 @@ async fn test_wasm_mock_provider_create_and_read() {
         .create(
             &id,
             CreateRequest {
-                resource: resource.clone(),
+                resource: normalized_for_test(resource.clone()).await,
             },
         )
         .await
@@ -171,7 +184,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
         .create(
             &id,
             CreateRequest {
-                resource: resource.clone(),
+                resource: normalized_for_test(resource.clone()).await,
             },
         )
         .await

@@ -1855,10 +1855,9 @@ pub fn resolve_value_alias_with_schemas(
 
 /// Re-apply enum-alias resolution to every resource, looking up the
 /// factory per resource by `id.provider` (the same `find_factory`
-/// dispatch the plan path uses). Single source of truth shared by the
-/// plan path (carina-cli `resolve_enum_aliases_with_ctx`) and the apply
-/// path (`executor::renormalize`) so the two cannot diverge on this
-/// stage again (carina#3063).
+/// dispatch the plan and apply paths use). Single source of truth for
+/// enum-alias resolution so the two cannot diverge on this stage again
+/// (carina#3063).
 pub fn resolve_enum_aliases_for_resources(
     resources: &mut [crate::resource::Resource],
     factories: &[Box<dyn crate::provider::ProviderFactory>],

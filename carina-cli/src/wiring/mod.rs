@@ -15,6 +15,10 @@ use carina_core::binding_index::{PreApplyInputs, ResolvedBindings, WaitAliasSpec
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
 use carina_core::effect::Effect;
+use carina_core::executor::normalized::{
+    restore_stripped_attributes, run_desired_normalization_stages, states_contain_unknown,
+    strip_provider_boundary_attributes,
+};
 use carina_core::identifier::{
     self, AnonymousIdBindingStateInfo, AnonymousIdStateInfo, PrefixStateInfo, StateBlockClaims,
 };
@@ -26,9 +30,7 @@ use carina_core::provider::{
     ProviderRouter,
 };
 use carina_core::resolver::resolve_refs_for_plan;
-use carina_core::resource::{
-    ConcreteValue, DeferredValue, Resource, ResourceId, State, Value, contains_resource_ref,
-};
+use carina_core::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, State, Value};
 use carina_core::schema::{SchemaRegistry, resolve_block_names};
 use carina_core::validation;
 use carina_provider_mock::MockProvider;
@@ -363,9 +365,9 @@ where
 /// `Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation))`. Returns `true`
 /// when one is found at any depth — inside lists, maps, secrets,
 /// function-call arguments, or as the `Expr` segment of an
-/// `Interpolation`. Mirrors the variant coverage of the sibling
-/// `value_contains_unknown` to keep them in lockstep when new `Value`
-/// variants land.
+/// `Interpolation`. Mirrors the variant coverage of the core
+/// provider-boundary strip pass to keep them in lockstep when new
+/// `Value` variants land.
 fn value_contains_empty_interpolation(value: &Value) -> bool {
     use carina_core::resource::{InterpolationPart, UnknownReason};
     match value {
@@ -681,6 +683,9 @@ impl<'a> PlanPreprocessor<'a> {
         data_sources: &[carina_core::resource::DataSource],
         wait_bindings: &mut [carina_core::parser::WaitBinding],
     ) {
+        let schemas = self.ctx.schemas();
+        carina_core::value::canonicalize_resources_with_schemas(resources, schemas);
+
         // RFC #2371 stage 2 + #2387: strip every attribute the WASM
         // provider boundary refuses to serialize — `Value::Deferred(DeferredValue::Unknown)`
         // (#2378) and `Value::Deferred(DeferredValue::ResourceRef)` plus the wrappers that hide
@@ -688,29 +693,25 @@ impl<'a> PlanPreprocessor<'a> {
         // #2387) — before `normalize_desired` runs, then restore them
         // at their original index. After this pass, `core_to_wit_value`
         // is type-system-enforced to never see either kind.
-        let stripped = strip_attributes_matching(resources, &|v| {
-            value_contains_unknown(v) || contains_resource_ref(v)
-        });
+        let stripped = strip_provider_boundary_attributes(resources);
         // Hard assert (not debug_assert): RFC #2371 constraint b says
         // state files never carry `Value::Deferred(DeferredValue::Unknown)`, and the
         // strip-and-restore design depends on it. A release-mode
         // violation would degrade silently into a WASM-boundary panic
         // far from the source — fail fast here instead.
         assert!(
-            !current_states_contain_unknown(current_states),
+            !states_contain_unknown(current_states),
             "Value::Deferred(DeferredValue::Unknown) found in current_states — RFC #2371 constraint b violated"
         );
-        self.normalizer.normalize_desired(resources).await;
+        run_desired_normalization_stages(
+            resources,
+            provider_configs,
+            self.normalizer,
+            self.ctx.factories(),
+            schemas,
+        )
+        .await;
         self.normalizer.normalize_state(current_states).await;
-        let schemas = self.ctx.schemas();
-        for config in provider_configs {
-            if !config.default_tags.is_empty() {
-                self.normalizer
-                    .merge_default_tags(resources, &config.default_tags, schemas)
-                    .await;
-            }
-        }
-        resolve_enum_aliases_with_ctx(self.ctx, resources);
         resolve_enum_aliases_in_states(self.ctx, current_states);
         // carina#3358: the `until` predicate RHS is the third enum-alias
         // axis. Resolve it here, beside the resource/state passes, so the
@@ -720,139 +721,6 @@ impl<'a> PlanPreprocessor<'a> {
         resolve_enum_aliases_in_wait_bindings(self.ctx, wait_bindings, resources, data_sources);
         restore_stripped_attributes(resources, stripped);
     }
-}
-
-/// One stripped attribute, retained so it can be re-inserted at its
-/// original position after `normalize_desired` returns.
-struct StrippedAttribute {
-    insert_index: usize,
-    key: String,
-    value: carina_core::resource::Value,
-}
-
-/// Remove every attribute whose value matches `predicate` from each
-/// resource's attribute map. Returns a per-resource record of what was
-/// removed, keyed by `ResourceId`, so [`restore_stripped_attributes`]
-/// can put them back at their original `IndexMap` position.
-///
-/// The single caller in `PlanPreprocessor::prepare` passes a unified
-/// predicate that covers two kinds the WASM provider boundary refuses
-/// to serialize:
-///
-/// - `value_contains_unknown` — `Value::Deferred(DeferredValue::Unknown)` (RFC #2371 stage 2 /
-///   #2377)
-/// - `contains_resource_ref` — `Value::Deferred(DeferredValue::ResourceRef)` plus the wrappers
-///   that recursively contain one (`Interpolation` / `FunctionCall` /
-///   `Secret` / nested `List` / `Map`); without this strip the
-///   `core_to_wit_value` `_` debug-format fallback would silently
-///   stringify the ref (#2387).
-fn strip_attributes_matching(
-    resources: &mut [Resource],
-    predicate: &dyn Fn(&Value) -> bool,
-) -> HashMap<ResourceId, Vec<StrippedAttribute>> {
-    let mut out: HashMap<ResourceId, Vec<StrippedAttribute>> = HashMap::new();
-    for resource in resources.iter_mut() {
-        let mut stripped: Vec<StrippedAttribute> = Vec::new();
-        // Collect keys to remove first so we don't mutate while iterating.
-        let to_remove: Vec<(usize, String)> = resource
-            .attributes
-            .iter()
-            .enumerate()
-            .filter_map(|(i, (k, v))| {
-                if predicate(v) {
-                    Some((i, k.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        // Process highest-index-first so each `shift_remove` doesn't
-        // shift the indices of later removals.
-        for (i, key) in to_remove.into_iter().rev() {
-            if let Some(value) = resource.attributes.shift_remove(&key) {
-                stripped.push(StrippedAttribute {
-                    insert_index: i,
-                    key,
-                    value,
-                });
-            }
-        }
-        if !stripped.is_empty() {
-            // Restoration order: lowest insert_index first, so each
-            // `shift_insert` lands the entry at its pre-strip position
-            // without disturbing entries with smaller indices.
-            stripped.sort_by_key(|s| s.insert_index);
-            out.insert(resource.id.clone(), stripped);
-        }
-    }
-    out
-}
-
-/// Counterpart to [`strip_attributes_matching`]. Re-inserts each
-/// stripped attribute at its original index in the resource's
-/// attribute map. Attributes appended by `normalize_desired` (e.g.
-/// provider-injected defaults) end up after the original entries,
-/// which matches behavior pre-#2377 for non-stripped attributes.
-fn restore_stripped_attributes(
-    resources: &mut [Resource],
-    mut stripped: HashMap<ResourceId, Vec<StrippedAttribute>>,
-) {
-    for resource in resources.iter_mut() {
-        if let Some(entries) = stripped.remove(&resource.id) {
-            for entry in entries {
-                let target = entry.insert_index.min(resource.attributes.len());
-                resource
-                    .attributes
-                    .shift_insert(target, entry.key, entry.value);
-            }
-        }
-    }
-}
-
-fn value_contains_unknown(value: &carina_core::resource::Value) -> bool {
-    use carina_core::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
-    match value {
-        Value::Deferred(DeferredValue::Unknown(_)) => true,
-        Value::Concrete(ConcreteValue::List(items)) => items.iter().any(value_contains_unknown),
-        Value::Concrete(ConcreteValue::Map(map)) => map.values().any(value_contains_unknown),
-        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|p| match p {
-            InterpolationPart::Expr(v) => value_contains_unknown(v),
-            _ => false,
-        }),
-        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
-            args.iter().any(value_contains_unknown)
-        }
-        Value::Deferred(DeferredValue::Secret(inner)) => value_contains_unknown(inner),
-        _ => false,
-    }
-}
-
-fn current_states_contain_unknown(states: &HashMap<ResourceId, State>) -> bool {
-    states
-        .values()
-        .any(|state| state.attributes.values().any(value_contains_unknown))
-}
-
-/// Run provider-specific normalization on desired resources.
-///
-/// Creates normalizers from all registered provider factories and applies
-/// `normalize_desired()` to the resources. This resolves enum identifiers
-/// (e.g., bare enum identifiers -> namespaced enum strings) without requiring
-/// actual provider instances or network access.
-pub fn normalize_desired_with_ctx(ctx: &WiringContext, resources: &mut [Resource]) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("failed to build tokio runtime for normalize_desired");
-    let mut router = ProviderRouter::new();
-    for factory in ctx.factories() {
-        let attrs = indexmap::IndexMap::new();
-        router.add_normalizer(rt.block_on(factory.create_normalizer(None, &attrs)));
-    }
-    // `rt` is the outermost runtime here (sync helper for fixture/test
-    // plan paths), so this `block_on` is not a nested one — the
-    // self-deadlock class fixed by carina#3112 only existed when the
-    // sync normalizer's *own* body opened a nested runtime.
-    rt.block_on(router.normalize_desired(resources));
 }
 
 /// Normalize enum values in current states to match DSL format.
@@ -873,27 +741,8 @@ pub fn normalize_state_with_ctx(
         let attrs = indexmap::IndexMap::new();
         router.add_normalizer(rt.block_on(factory.create_normalizer(None, &attrs)));
     }
-    // Outermost runtime (see `normalize_desired_with_ctx`): not nested.
+    // Outermost runtime: not nested.
     rt.block_on(router.normalize_state(current_states));
-}
-
-/// Resolve enum alias values in resources to their canonical AWS form.
-///
-/// After `normalize_desired()` converts DSL identifiers to namespaced strings
-/// (e.g., `IpProtocol.all` -> `"awscc.ec2.security_group_egress.IpProtocol.all"`),
-/// this function resolves aliases to their canonical AWS values
-/// (e.g., `"all"` -> `"-1"`).
-///
-/// This must be called on both desired resources and current states to ensure
-/// the differ sees consistent values and produces no false diffs.
-pub fn resolve_enum_aliases_with_ctx(ctx: &WiringContext, resources: &mut [Resource]) {
-    // Single source of truth shared with the apply path
-    // (`executor::renormalize`) so plan and apply cannot diverge on the
-    // enum-alias stage again (carina#3063). The core helper mutates
-    // `resource.attributes` in place (IndexMap), so unlike the previous
-    // `resolved_attributes()` round-trip it also preserves source key
-    // order.
-    carina_core::value::resolve_enum_aliases_for_resources(resources, ctx.factories());
 }
 
 /// Resolve enum alias values in current states to their canonical AWS form.
@@ -2178,12 +2027,8 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         ctx.schemas(),
     );
 
-    // Type-level canonicalization for `Union[String, list(String)]`
-    // fields (IAM-style `string_or_list_of_strings`). Done after refs
-    // resolve so concrete `String` / `List` shapes can be folded to the
-    // canonical `Value::Concrete(ConcreteValue::StringList)` form before differ / display see
-    // them. See #2481, #2511.
-    carina_core::value::canonicalize_resources_with_schemas(&mut resources, ctx.schemas());
+    // Desired resource canonicalization runs inside PlanPreprocessor before
+    // its strip/restore wrapper; data sources and states remain separate.
     // Same canonicalization for the actual-side state values (#2481, #2513).
     // Existing state files written before this change come back from
     // serde with the legacy `String` / `List` shape; converging both
@@ -3113,7 +2958,7 @@ fn errors_to_legacy_result(errors: Vec<AppError>) -> Result<(), AppError> {
 #[cfg(test)]
 pub fn resolve_enum_aliases(resources: &mut [Resource]) {
     let ctx = WiringContext::new(vec![]);
-    resolve_enum_aliases_with_ctx(&ctx, resources)
+    carina_core::value::resolve_enum_aliases_for_resources(resources, ctx.factories())
 }
 
 #[cfg(test)]
