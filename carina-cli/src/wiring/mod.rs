@@ -15,6 +15,7 @@ use carina_core::binding_index::{PreApplyInputs, ResolvedBindings, WaitAliasSpec
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
 use carina_core::effect::Effect;
+use carina_core::executor::normalized::apply_desired_normalization_in_place;
 use carina_core::identifier::{
     self, AnonymousIdBindingStateInfo, AnonymousIdStateInfo, PrefixStateInfo, StateBlockClaims,
 };
@@ -700,17 +701,16 @@ impl<'a> PlanPreprocessor<'a> {
             !current_states_contain_unknown(current_states),
             "Value::Deferred(DeferredValue::Unknown) found in current_states — RFC #2371 constraint b violated"
         );
-        self.normalizer.normalize_desired(resources).await;
-        self.normalizer.normalize_state(current_states).await;
         let schemas = self.ctx.schemas();
-        for config in provider_configs {
-            if !config.default_tags.is_empty() {
-                self.normalizer
-                    .merge_default_tags(resources, &config.default_tags, schemas)
-                    .await;
-            }
-        }
-        resolve_enum_aliases_with_ctx(self.ctx, resources);
+        apply_desired_normalization_in_place(
+            resources,
+            provider_configs,
+            self.normalizer,
+            self.ctx.factories(),
+            schemas,
+        )
+        .await;
+        self.normalizer.normalize_state(current_states).await;
         resolve_enum_aliases_in_states(self.ctx, current_states);
         // carina#3358: the `until` predicate RHS is the third enum-alias
         // axis. Resolve it here, beside the resource/state passes, so the

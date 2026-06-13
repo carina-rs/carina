@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use crate::binding_index::ResolvedBindings;
 use crate::effect::Effect;
+use crate::executor::normalized::NormalizedResource;
 use crate::provider::{
     CreateRequest, DeleteRequest, PatchOp, PatchOpKind, Provider, UpdatePatch, UpdateRequest,
     build_update_patch,
@@ -21,18 +22,19 @@ use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
 /// path of replacements (cascade has no precomputed
 /// `changed_attributes` list, so the patch is derived from the
 /// from/to comparison directly).
-pub(super) fn compute_full_diff_patch(from: &State, to: &Resource) -> UpdatePatch {
+pub(super) fn compute_full_diff_patch(from: &State, to: &NormalizedResource) -> UpdatePatch {
     use std::collections::HashSet;
 
+    let to_resource = to.as_resource();
     let mut keys: HashSet<&str> = HashSet::new();
     keys.extend(from.attributes.keys().map(String::as_str));
-    keys.extend(to.attributes.keys().map(String::as_str));
+    keys.extend(to_resource.attributes.keys().map(String::as_str));
     let mut sorted_keys: Vec<&str> = keys.into_iter().collect();
     sorted_keys.sort();
 
     let changed: Vec<String> = sorted_keys
         .into_iter()
-        .filter(|k| from.attributes.get(*k) != to.attributes.get(*k))
+        .filter(|k| from.attributes.get(*k) != to_resource.attributes.get(*k))
         .map(|k| k.to_string())
         .collect();
     build_update_patch(&changed, to, from)
@@ -139,7 +141,7 @@ pub(super) async fn execute_cbd_replace_parallel(
         .create(
             &ctx.to.id,
             CreateRequest {
-                resource: resolved.clone(),
+                resource: resolved.as_resource().clone(),
             },
         )
         .await
@@ -149,7 +151,7 @@ pub(super) async fn execute_cbd_replace_parallel(
             let mut local_bindings = ctx.bindings.clone();
             local_bindings.record_applied(
                 ctx.to.binding.as_deref(),
-                &resolved.resolved_attributes(),
+                &resolved.as_resource().resolved_attributes(),
                 &state,
             );
 
@@ -186,7 +188,7 @@ pub(super) async fn execute_cbd_replace_parallel(
                             .on_event(&ExecutionEvent::CascadeUpdateSucceeded { id: &cascade.id });
                         local_bindings.record_applied(
                             cascade.to.binding.as_deref(),
-                            &resolved_to.resolved_attributes(),
+                            &resolved_to.as_resource().resolved_attributes(),
                             &cascade_state,
                         );
                     }
@@ -289,7 +291,7 @@ pub(super) async fn execute_cbd_replace_parallel(
                             success: false,
                             state: Some(final_state),
                             resource_id: ctx.to.id.clone(),
-                            resolved_attrs: Some(resolved.resolved_attributes()),
+                            resolved_attrs: Some(resolved.as_resource().resolved_attributes()),
                             binding: ctx.effect.binding_name(),
                             refreshes,
 
@@ -306,7 +308,7 @@ pub(super) async fn execute_cbd_replace_parallel(
                             success: true,
                             state: Some(final_state),
                             resource_id: ctx.to.id.clone(),
-                            resolved_attrs: Some(resolved.resolved_attributes()),
+                            resolved_attrs: Some(resolved.as_resource().resolved_attributes()),
                             binding: ctx.to.binding.clone(),
                             refreshes,
 
@@ -414,7 +416,7 @@ pub(super) async fn execute_dbd_replace_parallel(
                 .create(
                     &ctx.to.id,
                     CreateRequest {
-                        resource: resolved.clone(),
+                        resource: resolved.as_resource().clone(),
                     },
                 )
                 .await
@@ -430,7 +432,7 @@ pub(super) async fn execute_dbd_replace_parallel(
                         success: true,
                         state: Some(state),
                         resource_id: ctx.to.id.clone(),
-                        resolved_attrs: Some(resolved.resolved_attributes()),
+                        resolved_attrs: Some(resolved.as_resource().resolved_attributes()),
                         binding: ctx.to.binding.clone(),
                         refreshes,
 

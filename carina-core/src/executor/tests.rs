@@ -501,6 +501,7 @@ async fn test_simple_create() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -551,6 +552,7 @@ async fn test_apply_renormalizes_after_resolution() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &CanonicalizingNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -606,6 +608,7 @@ async fn test_apply_reapplies_enum_alias_stage() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &factories,
         schemas: &TEST_SCHEMAS,
     };
@@ -666,6 +669,7 @@ async fn test_apply_reapplies_enum_alias_stage_update_path() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &factories,
         schemas: &TEST_SCHEMAS,
     };
@@ -718,6 +722,7 @@ async fn test_apply_reapplies_canonicalize_stage() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &CANON_SCHEMAS,
     };
@@ -776,6 +781,7 @@ async fn test_apply_renormalizes_update_path() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &CanonicalizingNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -827,7 +833,10 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
         Value::Concrete(ConcreteValue::String("issue-3480".to_string())),
     );
     let mut from_attrs = HashMap::new();
-    from_attrs.insert("tags".to_string(), Value::Concrete(ConcreteValue::Map(current_tags)));
+    from_attrs.insert(
+        "tags".to_string(),
+        Value::Concrete(ConcreteValue::Map(current_tags)),
+    );
     let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
 
     let mut default_tags = indexmap::IndexMap::new();
@@ -875,7 +884,10 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
         .find(|op| op.key == "tags")
         .expect("patch must contain the changed `tags` attribute");
     let Some(Value::Concrete(ConcreteValue::Map(tags))) = tags_op.value.as_ref() else {
-        panic!("expected tags Replace value to be a map, got {:?}", tags_op.value);
+        panic!(
+            "expected tags Replace value to be a map, got {:?}",
+            tags_op.value
+        );
     };
     assert_eq!(
         tags.get("Name"),
@@ -883,7 +895,9 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
     );
     assert_eq!(
         tags.get("ManagedBy"),
-        Some(&Value::Concrete(ConcreteValue::String("carina".to_string())))
+        Some(&Value::Concrete(ConcreteValue::String(
+            "carina".to_string()
+        )))
     );
     assert_eq!(
         tags.get("Project"),
@@ -931,6 +945,7 @@ async fn test_apply_renormalizes_nested_value_under_ref_bearing_resource() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &CanonicalizingNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -1067,6 +1082,7 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &normalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -1129,6 +1145,7 @@ async fn test_simple_delete() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -1161,6 +1178,7 @@ async fn test_failed_effect_propagates_to_dependent() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -1213,6 +1231,7 @@ async fn test_cbd_creates_before_deletes() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -1259,6 +1278,7 @@ async fn test_dbd_deletes_before_creates() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -1339,6 +1359,7 @@ async fn test_phased_cbd_creates_in_forward_order_deletes_in_reverse() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -1418,6 +1439,7 @@ async fn test_phased_noncbd_creates_after_deletes() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -1455,6 +1477,7 @@ async fn test_observer_events_emitted_correctly() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -1483,6 +1506,7 @@ async fn test_read_effect_is_no_op() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -1524,6 +1548,7 @@ async fn test_independent_effects_run_in_parallel() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -1575,6 +1600,7 @@ async fn test_parallel_failure_skips_dependents() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -1623,6 +1649,7 @@ async fn test_dependency_levels_sequential_chain() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -1850,6 +1877,7 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -1893,6 +1921,7 @@ async fn test_waiting_events_emitted_for_dependent_effects() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -2068,6 +2097,7 @@ async fn test_update_effect_binding_map_propagation() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -2187,6 +2217,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -2374,6 +2405,7 @@ async fn test_delete_waits_for_replace_cbd_of_dependent() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -2467,6 +2499,7 @@ async fn test_delete_waits_for_replace_cbd_even_when_delete_binding_is_none() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -2558,6 +2591,7 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -2706,6 +2740,7 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -2785,6 +2820,7 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -2902,6 +2938,7 @@ async fn test_chained_index_then_field_unresolved_at_apply_fails_with_clear_erro
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -3082,6 +3119,7 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -3287,6 +3325,7 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -3378,6 +3417,7 @@ async fn test_phased_move_with_interdependent_replace_does_not_panic() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };
@@ -3509,6 +3549,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
         bindings,
         current_states,
         normalizer: &NoopNormalizer,
+        provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
     };

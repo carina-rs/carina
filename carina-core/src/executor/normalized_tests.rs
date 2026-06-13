@@ -173,7 +173,7 @@ async fn desired_normalization_runs_stages_in_order() {
                     .lock()
                     .unwrap()
                     .push(format!("normalize_desired:{subjects:?}"));
-                resources[0].set_attr("mode", string_value("friendly"));
+                resources[0].set_attr("mode", string_value("Mode.friendly"));
             })
         }
 
@@ -212,7 +212,7 @@ async fn desired_normalization_runs_stages_in_order() {
     let normalizer = OrderNormalizer {
         calls: Arc::clone(&calls),
     };
-    let mut resource = Resource::new("test", "thing");
+    let mut resource = Resource::with_provider("test", "thing", "example", None);
     resource.set_attr("subjects", string_value("one"));
     let mut default_tags = IndexMap::new();
     default_tags.insert("ManagedBy".to_string(), string_value("carina"));
@@ -233,9 +233,14 @@ async fn desired_normalization_runs_stages_in_order() {
         vec![
             format!(
                 "normalize_desired:{:?}",
-                Some(Value::Concrete(ConcreteValue::List(vec![string_value("one")])))
+                Some(Value::Concrete(ConcreteValue::StringList(vec![
+                    "one".to_string()
+                ])))
             ),
-            format!("merge_default_tags:{:?}", Some(string_value("friendly"))),
+            format!(
+                "merge_default_tags:{:?}",
+                Some(string_value("Mode.friendly"))
+            ),
         ],
         "canonicalize must run before normalize_desired and normalize_desired must run before merge_default_tags"
     );
@@ -255,7 +260,10 @@ async fn merge_default_tags_runs_only_for_non_empty_provider_default_tags() {
 
     let _normalized = apply_desired_normalization(
         resource,
-        &[provider_config(IndexMap::new()), provider_config(default_tags)],
+        &[
+            provider_config(IndexMap::new()),
+            provider_config(default_tags),
+        ],
         &normalizer,
         &[],
         &SchemaRegistry::new(),
@@ -278,14 +286,9 @@ async fn apply_desired_normalization_is_idempotent() {
     let mut resource = Resource::new("test", "thing");
     resource.set_attr("name", string_value("v1"));
 
-    let first = apply_desired_normalization(
-        resource,
-        &[],
-        &NoopNormalizer,
-        &[],
-        &SchemaRegistry::new(),
-    )
-    .await;
+    let first =
+        apply_desired_normalization(resource, &[], &NoopNormalizer, &[], &SchemaRegistry::new())
+            .await;
     let second = apply_desired_normalization(
         first.as_resource().clone(),
         &[],

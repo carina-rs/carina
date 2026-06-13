@@ -318,6 +318,7 @@ pub(super) async fn execute_effects_sequential(
             let unresolved = &input.unresolved_resources;
             let pipeline = RenormalizePipeline {
                 normalizer: input.normalizer,
+                provider_configs: input.provider_configs,
                 factories: input.factories,
                 schemas: input.schemas,
             };

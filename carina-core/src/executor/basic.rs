@@ -7,6 +7,8 @@ use std::time::Instant;
 
 use crate::binding_index::ResolvedBindings;
 use crate::effect::{BasicEffect, Effect};
+use crate::executor::normalized::{NormalizedResource, apply_desired_normalization};
+use crate::parser::ProviderConfig;
 use crate::provider::{
     CreateRequest, DeleteRequest, Provider, ProviderNormalizer, ReadRequest, UpdateRequest,
     build_update_patch,
@@ -126,14 +128,21 @@ pub(super) async fn resolve_resource(
     resource: &Resource,
     bindings: &ResolvedBindings,
     pipeline: &RenormalizePipeline<'_>,
-) -> Result<Resource, String> {
+) -> Result<NormalizedResource, String> {
     let mut resolved = resource.clone();
     for (key, expr) in &resource.attributes {
         let resolved_value = unwrap_secret(resolve_ref_value(expr, bindings)?);
         assert_fully_resolved(&resolved_value, key, bindings)?;
         resolved.attributes.insert(key.clone(), resolved_value);
     }
-    renormalize(resolved, pipeline).await
+    Ok(apply_desired_normalization(
+        resolved,
+        pipeline.provider_configs,
+        pipeline.normalizer,
+        pipeline.factories,
+        pipeline.schemas,
+    )
+    .await)
 }
 
 /// Resolve a resource, preferring unresolved source for re-resolution.
@@ -146,14 +155,21 @@ pub(super) async fn resolve_resource_with_source(
     source: &Resource,
     bindings: &ResolvedBindings,
     pipeline: &RenormalizePipeline<'_>,
-) -> Result<Resource, String> {
+) -> Result<NormalizedResource, String> {
     let mut resolved = target.clone();
     for (key, expr) in &source.attributes {
         let resolved_value = unwrap_secret(resolve_ref_value(expr, bindings)?);
         assert_fully_resolved(&resolved_value, key, bindings)?;
         resolved.attributes.insert(key.clone(), resolved_value);
     }
-    renormalize(resolved, pipeline).await
+    Ok(apply_desired_normalization(
+        resolved,
+        pipeline.provider_configs,
+        pipeline.normalizer,
+        pipeline.factories,
+        pipeline.schemas,
+    )
+    .await)
 }
 
 /// The full plan-time normalization pipeline, threaded into the apply
@@ -163,55 +179,9 @@ pub(super) async fn resolve_resource_with_source(
 /// resolve helpers and `BasicEffectCtx` carry a single field.
 pub(super) struct RenormalizePipeline<'a> {
     pub(super) normalizer: &'a dyn ProviderNormalizer,
+    pub(super) provider_configs: &'a [ProviderConfig],
     pub(super) factories: &'a [Box<dyn crate::provider::ProviderFactory>],
     pub(super) schemas: &'a crate::schema::SchemaRegistry,
-}
-
-/// Re-apply the full plan-time normalization pipeline to a freshly
-/// resolved resource.
-///
-/// carina#3060 / carina#3063: reference re-resolution rebuilds
-/// attributes from the un-normalized source, undoing every plan-time
-/// normalization stage. Both resolve helpers funnel through here so
-/// apply-path resolution and the plan-time pipeline can never diverge
-/// again — "resolved" always means "resolved and fully re-normalized"
-/// by construction.
-///
-/// The three desired-side stages, in the same order the plan path runs
-/// them (`canonicalize_resources_with_schemas` at `apply/mod.rs` then
-/// `PlanPreprocessor::prepare`):
-/// 1. `canonicalize_resources_with_schemas` — `Union[String,
-///    list(String)]` coercion (#2481, #2511).
-/// 2. `ProviderNormalizer::normalize_desired` — enum-identifier
-///    resolution (carina#3060).
-/// 3. `resolve_enum_aliases_for_resources` — enum-alias → AWS canonical
-///    (e.g. `IpProtocol.all` → `"-1"`), per-resource factory dispatch
-///    (carina#3063).
-///
-/// Stage 3's *function* is the single core helper the plan path now
-/// calls too, so the alias logic cannot diverge. The *ordering* of the
-/// three stages is, however, still hand-mirrored here vs. the plan
-/// path's own inline sequence (split across `apply/mod.rs` and
-/// `PlanPreprocessor::prepare`, which also interleaves plan-only
-/// state-side passes). Extracting one shared sequencing primitive so a
-/// future reorder of either side cannot desync is tracked in
-/// carina#3068 — it requires restructuring `PlanPreprocessor::prepare`,
-/// a plan-pipeline refactor beyond this fix's scope.
-///
-/// Infallible today (no stage returns an error); the `Result` only
-/// mirrors the caller's signature — `resolve_resource{,_with_source}`
-/// fail-fast earlier on still-`Deferred` values — so this stays the tail
-/// expression without forcing `Ok(...)` at every call site.
-async fn renormalize(
-    resolved: Resource,
-    pipeline: &RenormalizePipeline<'_>,
-) -> Result<Resource, String> {
-    let mut one = [resolved];
-    crate::value::canonicalize_resources_with_schemas(&mut one, pipeline.schemas);
-    pipeline.normalizer.normalize_desired(&mut one).await;
-    crate::value::resolve_enum_aliases_for_resources(&mut one, pipeline.factories);
-    let [resolved] = one;
-    Ok(resolved)
 }
 
 /// Reject a resolved attribute value that still carries an unresolved
@@ -550,7 +520,7 @@ pub(super) async fn execute_basic_effect<'a>(
                 .create(
                     &resource.id,
                     CreateRequest {
-                        resource: resolved.clone(),
+                        resource: resolved.as_resource().clone(),
                     },
                 )
                 .await
@@ -565,7 +535,7 @@ pub(super) async fn execute_basic_effect<'a>(
                     BasicEffectResult::Success {
                         state: Some(state),
                         resource_id: resource.id.clone(),
-                        resolved_attrs: Some(resolved.resolved_attributes()),
+                        resolved_attrs: Some(resolved.as_resource().resolved_attributes()),
                         binding: resource.binding.clone(),
                     }
                 }
@@ -620,7 +590,7 @@ pub(super) async fn execute_basic_effect<'a>(
             // reference value and the provider would never be told
             // to update it.
             let mut effective_changed: Vec<String> = changed_attributes.to_vec();
-            for (key, new_value) in &resolved_to.attributes {
+            for (key, new_value) in &resolved_to.as_resource().attributes {
                 if effective_changed.iter().any(|k| k == key) {
                     continue;
                 }
@@ -644,7 +614,7 @@ pub(super) async fn execute_basic_effect<'a>(
                     BasicEffectResult::Success {
                         state: Some(state),
                         resource_id: id.clone(),
-                        resolved_attrs: Some(resolved_to.resolved_attributes()),
+                        resolved_attrs: Some(resolved_to.as_resource().resolved_attributes()),
                         binding: to.binding.clone(),
                     }
                 }

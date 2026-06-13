@@ -439,6 +439,7 @@ pub(super) async fn execute_effects_phased(
                 let unresolved = &input.unresolved_resources;
                 let pipeline = RenormalizePipeline {
                     normalizer: input.normalizer,
+                    provider_configs: input.provider_configs,
                     factories: input.factories,
                     schemas: input.schemas,
                 };
@@ -571,6 +572,7 @@ pub(super) async fn execute_effects_phased(
                 let unresolved = &input.unresolved_resources;
                 let pipeline = RenormalizePipeline {
                     normalizer: input.normalizer,
+                    provider_configs: input.provider_configs,
                     factories: input.factories,
                     schemas: input.schemas,
                 };
@@ -617,7 +619,7 @@ pub(super) async fn execute_effects_phased(
                             .create(
                                 &to.id,
                                 CreateRequest {
-                                    resource: resolved.clone(),
+                                    resource: resolved.as_resource().clone(),
                                 },
                             )
                             .await
@@ -626,7 +628,7 @@ pub(super) async fn execute_effects_phased(
                                 let mut local_bindings = binding_snapshot.clone();
                                 local_bindings.record_applied(
                                     to.binding.as_deref(),
-                                    &resolved.resolved_attributes(),
+                                    &resolved.as_resource().resolved_attributes(),
                                     &state,
                                 );
 
@@ -679,13 +681,13 @@ pub(super) async fn execute_effects_phased(
                                             );
                                             local_bindings.record_applied(
                                                 cascade.to.binding.as_deref(),
-                                                &resolved_to.resolved_attributes(),
+                                                &resolved_to.as_resource().resolved_attributes(),
                                                 &cascade_state,
                                             );
                                             cascade_states.push((
                                                 cascade.id.clone(),
                                                 cascade_state,
-                                                resolved_to.resolved_attributes(),
+                                                resolved_to.as_resource().resolved_attributes(),
                                                 cascade.to.binding.clone(),
                                             ));
                                         }
@@ -1057,6 +1059,7 @@ pub(super) async fn execute_effects_phased(
                 let unresolved = &input.unresolved_resources;
                 let pipeline = RenormalizePipeline {
                     normalizer: input.normalizer,
+                    provider_configs: input.provider_configs,
                     factories: input.factories,
                     schemas: input.schemas,
                 };
@@ -1220,7 +1223,7 @@ pub(super) async fn execute_effects_phased(
                                     .create(
                                         &to.id,
                                         CreateRequest {
-                                            resource: resolved.clone(),
+                                            resource: resolved.as_resource().clone(),
                                         },
                                     )
                                     .await
@@ -1237,7 +1240,9 @@ pub(super) async fn execute_effects_phased(
                                             PhaseEffectResult::NonCbdCreateSuccess {
                                                 state,
                                                 resource_id: to.id.clone(),
-                                                resolved_attrs: resolved.resolved_attributes(),
+                                                resolved_attrs: resolved
+                                                    .as_resource()
+                                                    .resolved_attributes(),
                                                 binding: to.binding.clone(),
                                             },
                                         )

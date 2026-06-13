@@ -9,6 +9,7 @@ use indexmap::IndexMap;
 use std::future::Future;
 use std::pin::Pin;
 
+use crate::executor::normalized::NormalizedResource;
 use crate::resource::{ConcreteValue, DataSource, Directives, Resource, ResourceId, State, Value};
 use crate::schema::{SchemaRegistry, TypeIdentity};
 
@@ -439,9 +440,10 @@ pub enum PatchOpKind {
 /// value from `to`.
 pub fn build_update_patch(
     changed_attributes: &[String],
-    to: &Resource,
+    to: &NormalizedResource,
     from: &State,
 ) -> UpdatePatch {
+    let to = to.as_resource();
     let ops = changed_attributes
         .iter()
         .map(|key| {
@@ -1993,6 +1995,14 @@ mod tests {
             Value::Concrete(ConcreteValue::String("added".into())),
         );
 
+        let to =
+            futures::executor::block_on(crate::executor::normalized::apply_desired_normalization(
+                to,
+                &[],
+                &NoopNormalizer,
+                &[],
+                &crate::schema::SchemaRegistry::new(),
+            ));
         let changed = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let patch = build_update_patch(&changed, &to, &from);
         assert_eq!(patch.ops.len(), 3);

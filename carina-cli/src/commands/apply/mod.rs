@@ -21,7 +21,7 @@ use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::value::format_value;
 use carina_state::{BackendLock, LockInfo, StateBackend, StateFile};
 
-use carina_core::parser::ProviderContext;
+use carina_core::parser::{ProviderConfig, ProviderContext};
 
 use super::{DriftCommand, validate_and_resolve_with_config, verify_for_mutation};
 use crate::DetailLevel;
@@ -62,6 +62,7 @@ pub async fn execute_effects(
     plan: &Plan,
     provider: &dyn Provider,
     normalizer: &dyn ProviderNormalizer,
+    provider_configs: &[ProviderConfig],
     factories: &[Box<dyn carina_core::provider::ProviderFactory>],
     schemas: &carina_core::schema::SchemaRegistry,
     bindings: &mut ResolvedBindings,
@@ -76,6 +77,7 @@ pub async fn execute_effects(
         bindings: std::mem::take(bindings),
         current_states: std::mem::take(current_states),
         normalizer,
+        provider_configs,
         factories,
         schemas,
     };
@@ -1191,9 +1193,8 @@ async fn run_apply_locked(
     let mut data_sources_for_plan = data_sources.clone();
     carina_core::resolver::resolve_data_source_refs(&mut data_sources_for_plan, &bindings)?;
 
-    // Type-level canonicalization for `Union[String, list(String)]`
-    // fields (IAM-style `string_or_list_of_strings`). See #2481, #2511.
-    carina_core::value::canonicalize_resources_with_schemas(&mut resources_for_plan, ctx.schemas());
+    // Desired resource canonicalization runs inside PlanPreprocessor's
+    // shared desired-side normalization pipeline.
     carina_core::value::canonicalize_data_sources_with_schemas(
         &mut data_sources_for_plan,
         ctx.schemas(),
@@ -1423,6 +1424,7 @@ async fn run_apply_locked(
         &plan,
         &provider,
         &provider,
+        &parsed.providers,
         ctx.factories(),
         ctx.schemas(),
         &mut bindings,
@@ -1853,6 +1855,7 @@ async fn run_apply_from_plan_locked(
         plan,
         &provider,
         &provider,
+        &plan_file.provider_configs,
         ctx.factories(),
         ctx.schemas(),
         &mut bindings,
