@@ -596,6 +596,375 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
 }
 
 #[test]
+fn cascade_generates_replace_when_create_only_list_contains_nested_ref() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
+    let attachment_id = ResourceId::new("ec2.RouteTableAssociation", "my-assoc");
+
+    let vpc = Resource::new("ec2.Vpc", "my-vpc")
+        .with_binding("vpc")
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+        );
+
+    let attachment = Resource::new("ec2.RouteTableAssociation", "my-assoc")
+        .with_binding("attachment")
+        .with_attribute(
+            "subnet_ids",
+            Value::Concrete(ConcreteValue::List(vec![Value::resource_ref(
+                "vpc".to_string(),
+                "vpc_id".to_string(),
+                vec![],
+            )])),
+        )
+        .with_attribute(
+            "name",
+            Value::Concrete(ConcreteValue::String("main".to_string())),
+        );
+
+    let unresolved_resources = vec![vpc.clone(), attachment.clone()];
+
+    let mut current_states = HashMap::new();
+    let mut vpc_attrs = HashMap::new();
+    vpc_attrs.insert(
+        "cidr_block".to_string(),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+    );
+    vpc_attrs.insert(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+    );
+    current_states.insert(
+        vpc_id.clone(),
+        State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
+    );
+
+    let mut attachment_attrs = HashMap::new();
+    attachment_attrs.insert(
+        "subnet_ids".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("vpc-old".to_string()),
+        )])),
+    );
+    attachment_attrs.insert(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("main".to_string())),
+    );
+    current_states.insert(
+        attachment_id.clone(),
+        State::existing(attachment_id.clone(), attachment_attrs).with_identifier("assoc-123"),
+    );
+
+    let attachment_schema = ResourceSchema::new("ec2.RouteTableAssociation")
+        .attribute(
+            AttributeSchema::new("subnet_ids", AttributeType::list(AttributeType::string()))
+                .required()
+                .create_only(),
+        )
+        .attribute(AttributeSchema::new("name", AttributeType::string()).required());
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("", attachment_schema);
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Replace {
+        id: vpc_id.clone(),
+        from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
+        to: vpc.clone().with_binding("vpc"),
+        directives: Directives {
+            create_before_destroy: true,
+            ..Default::default()
+        },
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
+            .unwrap(),
+        cascading_updates: vec![],
+        temporary_name: None,
+        cascade_ref_hints: vec![],
+    });
+
+    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
+
+    let effects = plan.effects();
+    assert_eq!(
+        effects.len(),
+        2,
+        "Expected nested list ref on create-only attribute to promote dependent to Replace, got: {:?}",
+        effects
+            .iter()
+            .map(|e| format!("{} {}", e.kind(), e.resource_id()))
+            .collect::<Vec<_>>()
+    );
+
+    match &effects[1] {
+        Effect::Replace {
+            id,
+            changed_create_only,
+            cascade_ref_hints,
+            ..
+        } => {
+            assert_eq!(id, &attachment_id);
+            assert!(changed_create_only.contains("subnet_ids"));
+            assert!(
+                cascade_ref_hints.contains(&("subnet_ids".to_string(), "vpc.vpc_id".to_string()))
+            );
+        }
+        other => panic!(
+            "Expected nested list dependent to be Replace, got {}",
+            other.kind()
+        ),
+    }
+}
+
+#[test]
+fn cascade_generates_replace_when_create_only_map_contains_nested_ref() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
+    let tagged_id = ResourceId::new("ec2.TaggedResource", "my-tagged");
+
+    let vpc = Resource::new("ec2.Vpc", "my-vpc")
+        .with_binding("vpc")
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+        );
+
+    let mut desired_tags = indexmap::IndexMap::new();
+    desired_tags.insert(
+        "vpc_ref".to_string(),
+        Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
+    );
+    desired_tags.insert(
+        "env".to_string(),
+        Value::Concrete(ConcreteValue::String("prod".to_string())),
+    );
+
+    let tagged = Resource::new("ec2.TaggedResource", "my-tagged")
+        .with_binding("tagged")
+        .with_attribute("tags", Value::Concrete(ConcreteValue::Map(desired_tags)))
+        .with_attribute(
+            "name",
+            Value::Concrete(ConcreteValue::String("main".to_string())),
+        );
+
+    let unresolved_resources = vec![vpc.clone(), tagged.clone()];
+
+    let mut current_states = HashMap::new();
+    let mut vpc_attrs = HashMap::new();
+    vpc_attrs.insert(
+        "cidr_block".to_string(),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+    );
+    vpc_attrs.insert(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+    );
+    current_states.insert(
+        vpc_id.clone(),
+        State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
+    );
+
+    let mut state_tags = indexmap::IndexMap::new();
+    state_tags.insert(
+        "vpc_ref".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+    );
+    state_tags.insert(
+        "env".to_string(),
+        Value::Concrete(ConcreteValue::String("prod".to_string())),
+    );
+    let mut tagged_attrs = HashMap::new();
+    tagged_attrs.insert(
+        "tags".to_string(),
+        Value::Concrete(ConcreteValue::Map(state_tags)),
+    );
+    tagged_attrs.insert(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("main".to_string())),
+    );
+    current_states.insert(
+        tagged_id.clone(),
+        State::existing(tagged_id.clone(), tagged_attrs).with_identifier("tagged-123"),
+    );
+
+    let tagged_schema = ResourceSchema::new("ec2.TaggedResource")
+        .attribute(
+            AttributeSchema::new("tags", AttributeType::map(AttributeType::string()))
+                .required()
+                .create_only(),
+        )
+        .attribute(AttributeSchema::new("name", AttributeType::string()).required());
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("", tagged_schema);
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Replace {
+        id: vpc_id.clone(),
+        from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
+        to: vpc.clone().with_binding("vpc"),
+        directives: Directives {
+            create_before_destroy: true,
+            ..Default::default()
+        },
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
+            .unwrap(),
+        cascading_updates: vec![],
+        temporary_name: None,
+        cascade_ref_hints: vec![],
+    });
+
+    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
+
+    let effects = plan.effects();
+    assert_eq!(
+        effects.len(),
+        2,
+        "Expected nested map ref on create-only attribute to promote dependent to Replace, got: {:?}",
+        effects
+            .iter()
+            .map(|e| format!("{} {}", e.kind(), e.resource_id()))
+            .collect::<Vec<_>>()
+    );
+
+    match &effects[1] {
+        Effect::Replace {
+            id,
+            changed_create_only,
+            cascade_ref_hints,
+            ..
+        } => {
+            assert_eq!(id, &tagged_id);
+            assert!(changed_create_only.contains("tags"));
+            assert!(
+                cascade_ref_hints.contains(&("tags".to_string(), "vpc.vpc_id".to_string())),
+                "Expected tags cascade hint from nested map ref, got: {:?}",
+                cascade_ref_hints
+            );
+        }
+        other => panic!(
+            "Expected nested map dependent to be Replace, got {}",
+            other.kind()
+        ),
+    }
+}
+
+#[test]
+fn cascade_prevent_destroy_blocks_nested_map_ref_promotion_to_replace() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
+    let tagged_id = ResourceId::new("ec2.TaggedResource", "my-tagged");
+
+    let vpc = Resource::new("ec2.Vpc", "my-vpc")
+        .with_binding("vpc")
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+        );
+
+    let mut desired_tags = indexmap::IndexMap::new();
+    desired_tags.insert(
+        "vpc_ref".to_string(),
+        Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
+    );
+
+    let mut tagged = Resource::new("ec2.TaggedResource", "my-tagged")
+        .with_binding("tagged")
+        .with_attribute("tags", Value::Concrete(ConcreteValue::Map(desired_tags)))
+        .with_attribute(
+            "name",
+            Value::Concrete(ConcreteValue::String("main".to_string())),
+        );
+    tagged.directives.prevent_destroy = true;
+
+    let unresolved_resources = vec![vpc.clone(), tagged.clone()];
+
+    let mut current_states = HashMap::new();
+    let mut vpc_attrs = HashMap::new();
+    vpc_attrs.insert(
+        "cidr_block".to_string(),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+    );
+    vpc_attrs.insert(
+        "vpc_id".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+    );
+    current_states.insert(
+        vpc_id.clone(),
+        State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
+    );
+
+    let mut state_tags = indexmap::IndexMap::new();
+    state_tags.insert(
+        "vpc_ref".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
+    );
+    let mut tagged_attrs = HashMap::new();
+    tagged_attrs.insert(
+        "tags".to_string(),
+        Value::Concrete(ConcreteValue::Map(state_tags)),
+    );
+    tagged_attrs.insert(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("main".to_string())),
+    );
+    current_states.insert(
+        tagged_id.clone(),
+        State::existing(tagged_id.clone(), tagged_attrs).with_identifier("tagged-123"),
+    );
+
+    let tagged_schema = ResourceSchema::new("ec2.TaggedResource")
+        .attribute(
+            AttributeSchema::new("tags", AttributeType::map(AttributeType::string()))
+                .required()
+                .create_only(),
+        )
+        .attribute(AttributeSchema::new("name", AttributeType::string()).required());
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("", tagged_schema);
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Replace {
+        id: vpc_id.clone(),
+        from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
+        to: vpc.clone().with_binding("vpc"),
+        directives: Directives {
+            create_before_destroy: true,
+            ..Default::default()
+        },
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
+            .unwrap(),
+        cascading_updates: vec![],
+        temporary_name: None,
+        cascade_ref_hints: vec![],
+    });
+
+    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
+
+    assert!(
+        plan.has_errors(),
+        "Expected PlanError for nested map ref promotion blocked by prevent_destroy"
+    );
+    assert_eq!(plan.errors().len(), 1);
+    assert_eq!(plan.errors()[0].resource_id, tagged_id);
+    assert!(plan.errors()[0].message.contains("prevent_destroy"));
+
+    let tagged_effects: Vec<_> = plan
+        .effects()
+        .iter()
+        .filter(|e| *e.resource_id() == tagged_id)
+        .collect();
+    assert!(
+        tagged_effects.is_empty(),
+        "Dependent should not be promoted when prevent_destroy blocks nested map ref cascade"
+    );
+}
+
+#[test]
 fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
     // Pattern 2: Direct change + cascade
     //

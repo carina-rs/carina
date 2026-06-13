@@ -1151,8 +1151,8 @@ impl Value {
             | Value::Concrete(ConcreteValue::StringList(_)) => {}
             // `BindingRef` carries no attribute, so attribute-walking
             // visitors have nothing to do. Callers that *do* care about
-            // bare-binding references walk them explicitly via
-            // `visit_binding_refs`.
+            // bare-binding references need explicit traversal until a
+            // binding-aware visitor is added.
             Value::Deferred(DeferredValue::BindingRef { .. }) => {}
             // `Value::Unknown` is what a previously-unresolved
             // `ResourceRef` was *replaced with* by `stamp_unresolved_upstream`.
