@@ -66,7 +66,7 @@ impl RefreshProgress {
     /// Finish the spinner with a success checkmark and elapsed time.
     pub fn finish(self) {
         let elapsed = self.start.elapsed();
-        let timing = format!("[{}]", format_duration(elapsed)).dimmed();
+        let timing = format!("took {}", format_duration(elapsed)).dimmed();
         let msg = format!("{} {} {}", "✓".green(), self.pb.message(), timing);
         self.pb
             .set_style(ProgressStyle::with_template("  {msg}").unwrap());
