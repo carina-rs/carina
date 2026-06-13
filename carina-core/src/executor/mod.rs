@@ -20,6 +20,8 @@ mod phased;
 mod replace;
 pub(crate) mod wait;
 
+pub use replace::compute_full_diff_patch;
+
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 

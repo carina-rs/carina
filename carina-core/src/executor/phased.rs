@@ -675,15 +675,17 @@ pub(super) async fn execute_effects_phased(
                                                     id: &cascade.id,
                                                 },
                                             );
+                                            let cascade_attrs =
+                                                resolved_to.as_resource().resolved_attributes();
                                             local_bindings.record_applied(
                                                 cascade.to.binding.as_deref(),
-                                                &resolved_to.as_resource().resolved_attributes(),
+                                                &cascade_attrs,
                                                 &cascade_state,
                                             );
                                             cascade_states.push((
                                                 cascade.id.clone(),
                                                 cascade_state,
-                                                resolved_to.as_resource().resolved_attributes(),
+                                                cascade_attrs,
                                                 cascade.to.binding.clone(),
                                             ));
                                         }

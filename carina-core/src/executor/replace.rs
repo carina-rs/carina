@@ -22,7 +22,7 @@ use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
 /// path of replacements (cascade has no precomputed
 /// `changed_attributes` list, so the patch is derived from the
 /// from/to comparison directly).
-pub(super) fn compute_full_diff_patch(from: &State, to: &NormalizedResource) -> UpdatePatch {
+pub fn compute_full_diff_patch(from: &State, to: &NormalizedResource) -> UpdatePatch {
     use std::collections::HashSet;
 
     let to_resource = to.as_resource();
