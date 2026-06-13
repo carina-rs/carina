@@ -11,8 +11,8 @@ use super::{ProviderContext, Rule, parse_expression};
 use crate::eval_value::EvalValue;
 use crate::resource::{ConcreteValue, DeferredValue, UnknownReason, Value};
 use crate::schema::{
-    TypeIdentity, validate_ipv4_address, validate_ipv4_cidr, validate_ipv6_address,
-    validate_ipv6_cidr,
+    TypeIdentity, validate_http_response_status_code, validate_ipv4_address, validate_ipv4_cidr,
+    validate_ipv6_address, validate_ipv6_cidr,
 };
 use indexmap::IndexMap;
 use std::collections::HashMap;
@@ -245,6 +245,9 @@ pub fn validate_custom_type(
         }
         (Some("Ipv6Address"), value) if text(value).is_some() => {
             validate_ipv6_address(text(value).unwrap())
+        }
+        (Some("HttpResponseStatusCode"), value) if text(value).is_some() => {
+            validate_http_response_status_code(text(value).unwrap())
         }
         (_, Value::Deferred(DeferredValue::ResourceRef { .. })) => Ok(()), // will be resolved later
         (_, Value::Deferred(DeferredValue::FunctionCall { .. })) => Ok(()), // will be resolved later

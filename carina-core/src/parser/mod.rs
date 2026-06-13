@@ -39,6 +39,7 @@ pub use resolve::{
 pub(crate) use resolve::{
     collect_seed_bindings_from_parts, reject_cyclic_let_bindings_in_variables,
 };
+pub use types::BUILTIN_BARE_CUSTOM_TYPES;
 pub use types::parse_type_expr_str;
 pub(crate) use types::{is_known_bare_custom_type, unknown_custom_type_message};
 pub(crate) use util::{eval_type_name, value_type_name};

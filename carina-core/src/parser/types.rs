@@ -71,8 +71,13 @@ pub(super) fn parse_type_expr(
 /// (if any) have registered, because their validators live in
 /// `carina-core` rather than in any provider — see the matching arms in
 /// [`crate::parser::functions::validate_custom_type`].
-const BUILTIN_BARE_CUSTOM_TYPES: &[&str] =
-    &["ipv4_cidr", "ipv4_address", "ipv6_cidr", "ipv6_address"];
+pub const BUILTIN_BARE_CUSTOM_TYPES: &[&str] = &[
+    "ipv4_cidr",
+    "ipv4_address",
+    "ipv6_cidr",
+    "ipv6_address",
+    "http_response_status_code",
+];
 
 /// True iff a snake-cased bare type name resolves to a known custom
 /// type — either a `carina-core` built-in or an identity registered in
@@ -382,26 +387,27 @@ mod tests {
             customs_loaded: true,
             ..Default::default()
         };
-        // No validators registered → only the four built-ins are valid.
-        // A clearly-fake name is rejected.
+        // No validators registered → only the BUILTIN_BARE_CUSTOM_TYPES
+        // set is valid. A clearly-fake name is rejected.
         assert_eq!(parse_type_expr_str("TotallyMadeUpType", &ctx), None);
         // A historical-but-removed name is rejected the same way — the
         // bug-headline example from carina#3239.
         assert_eq!(parse_type_expr_str("IamOidcProviderArn", &ctx), None);
     }
 
-    /// Built-in DSL custom types (`Ipv4Cidr`, `Ipv4Address`, `Ipv6Cidr`,
-    /// `Ipv6Address`) are always accepted, even when no provider has
-    /// registered any validators — they are part of `carina-core` itself.
+    /// Built-in DSL custom types (the `BUILTIN_BARE_CUSTOM_TYPES` set)
+    /// are always accepted, even when no provider has registered any
+    /// validators — they are part of `carina-core` itself.
     #[test]
     fn parse_type_expr_str_accepts_builtins_when_customs_loaded() {
         let ctx = ProviderContext {
             customs_loaded: true,
             ..Default::default()
         };
-        for name in ["Ipv4Cidr", "Ipv4Address", "Ipv6Cidr", "Ipv6Address"] {
+        for snake in BUILTIN_BARE_CUSTOM_TYPES {
+            let name = snake_to_pascal(snake);
             assert!(
-                matches!(parse_type_expr_str(name, &ctx), Some(TypeExpr::Simple(_))),
+                matches!(parse_type_expr_str(&name, &ctx), Some(TypeExpr::Simple(_))),
                 "built-in custom type '{name}' must parse with customs_loaded=true"
             );
         }

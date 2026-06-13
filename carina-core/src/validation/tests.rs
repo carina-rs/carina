@@ -3256,11 +3256,11 @@ fn validate_argument_custom_types_is_independent_of_customs_loaded_flag() {
     // walker delegates to `is_known_bare_custom_type`, whose contract
     // is "true iff snake matches a built-in or a bare-registered
     // validator"; on an empty validator set the only accepted names
-    // are the four built-ins, so an unknown name still produces a
-    // finding even with the parser gate inactive. This pins that the
-    // walker is *independent* of `customs_loaded` — only the parser
-    // is gated; the post-parse walker always reports. Callers that
-    // need the bootstrap-context exemption (e.g. LSP orphaned-file
+    // are the BUILTIN_BARE_CUSTOM_TYPES set, so an unknown name still
+    // produces a finding even with the parser gate inactive. This pins
+    // that the walker is *independent* of `customs_loaded` — only the
+    // parser is gated; the post-parse walker always reports. Callers
+    // that need the bootstrap-context exemption (e.g. LSP orphaned-file
     // diagnostics) must withhold the call themselves.
     let mut ctx = ProviderContext::default();
     assert!(!ctx.customs_loaded);

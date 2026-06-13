@@ -6325,6 +6325,36 @@ fn user_fn_custom_type_ipv6_address_arg_valid() {
 }
 
 #[test]
+fn user_fn_custom_type_http_response_status_code_arg_valid() {
+    let input = r#"
+        fn f(x: HttpResponseStatusCode) { x }
+
+        let b = aws.s3_bucket {
+            name = f("200")
+        }
+    "#;
+    let result = parse(input, &ProviderContext::default());
+    assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
+}
+
+#[test]
+fn user_fn_custom_type_http_response_status_code_arg_invalid() {
+    let input = r#"
+        fn f(x: HttpResponseStatusCode) { x }
+
+        let b = aws.s3_bucket {
+            name = f("nonsense")
+        }
+    "#;
+    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("type 'http_response_status_code' validation failed"),
+        "Expected http_response_status_code validation error, got: {msg}"
+    );
+}
+
+#[test]
 fn user_fn_custom_type_ipv6_address_arg_invalid() {
     let input = r#"
         fn f(x: Ipv6Address) { x }
@@ -6419,6 +6449,36 @@ fn user_fn_custom_type_return_ipv4_address_invalid() {
     assert!(
         msg.contains("return type 'ipv4_address' validation failed"),
         "Expected ipv4_address validation error, got: {msg}"
+    );
+}
+
+#[test]
+fn user_fn_custom_type_return_http_response_status_code_valid() {
+    let input = r#"
+        fn f(): HttpResponseStatusCode { "200" }
+
+        let b = aws.s3_bucket {
+            name = f()
+        }
+    "#;
+    let result = parse(input, &ProviderContext::default());
+    assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
+}
+
+#[test]
+fn user_fn_custom_type_return_http_response_status_code_invalid() {
+    let input = r#"
+        fn f(): HttpResponseStatusCode { "100" }
+
+        let b = aws.s3_bucket {
+            name = f()
+        }
+    "#;
+    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("return type 'http_response_status_code' validation failed"),
+        "Expected http_response_status_code validation error, got: {msg}"
     );
 }
 

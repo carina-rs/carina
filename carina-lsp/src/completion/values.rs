@@ -1711,9 +1711,8 @@ impl CompletionProvider {
 
         // Custom types: built-in types + provider-extracted types (deduplicated).
         // Internal registry is snake_case; the LSP surface is PascalCase.
-        let builtin_custom = ["ipv4_cidr", "ipv4_address", "ipv6_cidr", "ipv6_address"];
         let mut seen_custom = std::collections::HashSet::new();
-        let custom: Vec<CompletionItem> = builtin_custom
+        let custom: Vec<CompletionItem> = carina_core::parser::BUILTIN_BARE_CUSTOM_TYPES
             .iter()
             .map(|s| s.to_string())
             .chain(self.custom_type_names.iter().cloned())
