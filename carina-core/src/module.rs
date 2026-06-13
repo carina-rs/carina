@@ -508,7 +508,25 @@ impl RootConfigSignature {
                     Self::collect_typed_dependencies(from, attr_key, arg, graph, binding_types);
                 }
             }
-            _ => {}
+            Value::Concrete(
+                ConcreteValue::String(_)
+                | ConcreteValue::Int(_)
+                | ConcreteValue::Float(_)
+                | ConcreteValue::Bool(_)
+                | ConcreteValue::Duration(_)
+                | ConcreteValue::EnumIdentifier(_)
+                | ConcreteValue::CanonicalEnum(_)
+                | ConcreteValue::StringList(_),
+            ) => {
+                // Scalar leaves carry no references.
+            }
+            Value::Deferred(DeferredValue::Secret(inner)) => {
+                // Mirror deps::collect_dependencies for secret-wrapped values.
+                Self::collect_typed_dependencies(from, attr_key, inner, graph, binding_types);
+            }
+            Value::Deferred(DeferredValue::Unknown(_)) => {
+                // Unknown is upstream-deferred and carries no resource-binding edge.
+            }
         }
     }
 
@@ -1022,7 +1040,32 @@ impl ModuleSignature {
                     );
                 }
             }
-            _ => {}
+            Value::Concrete(
+                ConcreteValue::String(_)
+                | ConcreteValue::Int(_)
+                | ConcreteValue::Float(_)
+                | ConcreteValue::Bool(_)
+                | ConcreteValue::Duration(_)
+                | ConcreteValue::EnumIdentifier(_)
+                | ConcreteValue::CanonicalEnum(_)
+                | ConcreteValue::StringList(_),
+            ) => {
+                // Scalar leaves carry no references.
+            }
+            Value::Deferred(DeferredValue::Secret(inner)) => {
+                // Mirror deps::collect_dependencies for secret-wrapped values.
+                Self::collect_typed_dependencies(
+                    from,
+                    attr_key,
+                    inner,
+                    graph,
+                    binding_types,
+                    argument_types,
+                );
+            }
+            Value::Deferred(DeferredValue::Unknown(_)) => {
+                // Unknown is upstream-deferred and carries no resource-binding edge.
+            }
         }
     }
 

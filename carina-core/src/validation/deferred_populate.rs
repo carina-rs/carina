@@ -202,7 +202,22 @@ fn collect_unsynchronized_refs(
                 out,
             );
         }
-        _ => {}
+        Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::StringList(_),
+        ) => {
+            // Scalar leaves carry no references.
+        }
+        Value::Deferred(DeferredValue::Unknown(_) | DeferredValue::BindingRef { .. }) => {
+            // BindingRef lacks the attribute path check_ref needs for deferred_populate.
+            // Unknown is parser-deferred and likewise carries no resource attribute path.
+        }
     }
 }
 
