@@ -6,6 +6,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::binding_index::ResolvedBindings;
+use crate::differ::{
+    AttrComparison, TypedAttr, key_should_enter_patch, secret_grafted_comparison_view,
+};
 use crate::effect::{BasicEffect, Effect};
 use crate::executor::normalized::{NormalizedResource, apply_desired_normalization};
 use crate::parser::ProviderConfig;
@@ -15,6 +18,7 @@ use crate::provider::{
 };
 use crate::resolver::resolve_ref_value;
 use crate::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, State, Value};
+use crate::value::SecretHashContext;
 
 use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
 
@@ -586,11 +590,39 @@ pub(super) async fn execute_basic_effect<'a>(
             // reference value and the provider would never be told
             // to update it.
             let mut effective_changed: Vec<String> = changed_attributes.to_vec();
-            for (key, new_value) in &resolved_to.as_resource().attributes {
+            let resolved_resource = resolved_to.as_resource();
+            let schema = pipeline.schemas.get_for(resolved_resource);
+            for (key, new_value) in &resolved_resource.attributes {
                 if effective_changed.iter().any(|k| k == key) {
                     continue;
                 }
-                if from.attributes.get(key) != Some(new_value) {
+                let type_info = schema.and_then(|s| {
+                    s.attributes.get(key).map(|attr| TypedAttr {
+                        attr_type: &attr.attr_type,
+                        defs: &s.defs,
+                    })
+                });
+                let secret_ctx = Some(SecretHashContext::new(
+                    id.display_type(),
+                    id.name_str(),
+                    key,
+                ));
+                let Some(comparison_value) =
+                    secret_grafted_comparison_view(new_value, resolve_source.attributes.get(key))
+                else {
+                    continue;
+                };
+                if key_should_enter_patch(
+                    key,
+                    schema,
+                    AttrComparison {
+                        from: from.attributes.get(key),
+                        to: comparison_value.as_ref(),
+                        saved: None,
+                        type_info,
+                        secret_ctx: secret_ctx.as_ref(),
+                    },
+                ) {
                     effective_changed.push(key.clone());
                 }
             }

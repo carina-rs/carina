@@ -20,7 +20,7 @@
 //! use carina_core::resource::{Resource, State};
 //! let from: State = unimplemented!();
 //! let to: Resource = unimplemented!();
-//! compute_full_diff_patch(&from, &to);   // must not compile
+//! compute_full_diff_patch(&from, &to);   // must not compile: raw Resource has no schema-aware diff
 //! ```
 
 use std::collections::HashMap;

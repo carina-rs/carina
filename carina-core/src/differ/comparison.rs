@@ -1,5 +1,6 @@
 //! Type-aware comparison logic for diffing resource attributes.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 
 use indexmap::IndexMap;
@@ -488,6 +489,129 @@ fn secret_matches_state(
     }
 }
 
+pub(crate) struct TypedAttr<'a> {
+    pub(crate) attr_type: &'a AttributeType,
+    pub(crate) defs: &'a BTreeMap<String, AttributeType>,
+}
+
+pub(crate) struct AttrComparison<'a> {
+    pub(crate) from: Option<&'a Value>,
+    pub(crate) to: &'a Value,
+    pub(crate) saved: Option<&'a Value>,
+    pub(crate) type_info: Option<TypedAttr<'a>>,
+    pub(crate) secret_ctx: Option<&'a SecretHashContext>,
+}
+
+/// Return whether a single attribute's values differ semantically.
+pub(crate) fn should_patch_attr(cmp: AttrComparison<'_>) -> bool {
+    let Some(from_value) = cmp.from else {
+        return true;
+    };
+    let (attr_type, defs) = cmp
+        .type_info
+        .map(|info| (Some(info.attr_type), info.defs))
+        .unwrap_or((None, empty_defs_for_schema_walks()));
+
+    match cmp.saved {
+        Some(saved_value) => {
+            let effective_to = merge_with_saved(cmp.to, saved_value);
+            !type_aware_equal(from_value, &effective_to, attr_type, defs, cmp.secret_ctx)
+        }
+        None => !type_aware_equal(from_value, cmp.to, attr_type, defs, cmp.secret_ctx),
+    }
+}
+
+/// Return whether a key is eligible for a provider patch and semantically changed.
+pub(crate) fn key_should_enter_patch(
+    key: &str,
+    schema: Option<&ResourceSchema>,
+    cmp: AttrComparison<'_>,
+) -> bool {
+    if key.starts_with('_') {
+        return false;
+    }
+    if schema
+        .and_then(|s| s.attributes.get(key))
+        .is_some_and(|attr| attr.write_only && cmp.from.is_none())
+    {
+        return false;
+    }
+    should_patch_attr(cmp)
+}
+
+/// Build a comparison-only view that grafts `Secret` wrappers from source.
+///
+/// Apply-time resolution unwraps secrets before provider calls. Re-wrapping the
+/// comparison view lets the same hash semantics as plan-time diffing run without
+/// changing the normalized value sent to the provider patch.
+///
+/// Matching `(Map, Map)` and equal-length `(List, List)` shapes are walked
+/// recursively. Resolved-only map keys are retained as resolved values; source-only
+/// keys are ignored unless they contain a secret that cannot be grafted. If a
+/// source secret sits behind a divergent shape, there is no unambiguous resolved
+/// position to graft it into, so callers get `None` and must fail closed by not
+/// patching that key. Callers on normalization paths that change container shape
+/// must not assume secret hash comparison remains available.
+pub(crate) fn secret_grafted_comparison_view<'a>(
+    resolved: &'a Value,
+    source: Option<&'a Value>,
+) -> Option<Cow<'a, Value>> {
+    let Some(source) = source else {
+        return Some(Cow::Borrowed(resolved));
+    };
+    if !contains_secret(source) {
+        return Some(Cow::Borrowed(resolved));
+    }
+    let view = match (resolved, source) {
+        (_, Value::Deferred(DeferredValue::Secret(_))) => Cow::Borrowed(source),
+        (
+            Value::Concrete(ConcreteValue::Map(resolved)),
+            Value::Concrete(ConcreteValue::Map(source)),
+        ) => {
+            let mut out = resolved.clone();
+            for (key, resolved_value) in resolved {
+                if let Some(source_value) = source.get(key) {
+                    out.insert(
+                        key.clone(),
+                        secret_grafted_comparison_view(resolved_value, Some(source_value))?
+                            .into_owned(),
+                    );
+                }
+            }
+            if source.iter().any(|(key, source_value)| {
+                !resolved.contains_key(key) && contains_secret(source_value)
+            }) {
+                return None;
+            }
+            Cow::Owned(Value::Concrete(ConcreteValue::Map(out)))
+        }
+        (
+            Value::Concrete(ConcreteValue::List(resolved)),
+            Value::Concrete(ConcreteValue::List(source)),
+        ) if resolved.len() == source.len() => Cow::Owned(Value::Concrete(ConcreteValue::List(
+            resolved
+                .iter()
+                .zip(source)
+                .map(|(resolved_value, source_value)| {
+                    secret_grafted_comparison_view(resolved_value, Some(source_value))
+                        .map(Cow::into_owned)
+                })
+                .collect::<Option<Vec<_>>>()?,
+        ))),
+        _ => return None,
+    };
+    Some(view)
+}
+
+fn contains_secret(value: &Value) -> bool {
+    match value {
+        Value::Deferred(DeferredValue::Secret(_)) => true,
+        Value::Concrete(ConcreteValue::Map(map)) => map.values().any(contains_secret),
+        Value::Concrete(ConcreteValue::List(items)) => items.iter().any(contains_secret),
+        _ => false,
+    }
+}
+
 /// Find changed attributes between desired and current state.
 /// If `saved` is provided, each desired value is merged with the saved value
 /// before comparison, filling in unmanaged nested fields.
@@ -544,52 +668,28 @@ pub(super) fn find_changed_attributes(
     let saved = projected_saved.as_ref().or(saved);
 
     for (key, desired_value) in desired {
-        // Skip internal attributes (starting with _)
-        if key.starts_with('_') {
-            continue;
-        }
-
-        // Skip write-only attributes not present in current state.
-        // CloudControl API does not return write-only properties, so their
-        // absence from state is expected and should not trigger a diff.
-        if schema
-            .and_then(|s| s.attributes.get(key))
-            .is_some_and(|attr| attr.write_only && !projected_current.contains_key(key))
-        {
-            continue;
-        }
-
-        let attr_type = schema
-            .and_then(|s| s.attributes.get(key))
-            .map(|a| &a.attr_type);
+        let type_info = schema.and_then(|s| {
+            s.attributes.get(key).map(|attr| TypedAttr {
+                attr_type: &attr.attr_type,
+                defs,
+            })
+        });
 
         // Build secret hash context from resource ID and attribute key
         let secret_ctx =
             resource_id.map(|id| SecretHashContext::new(id.display_type(), id.name_str(), key));
 
-        let is_equal = match saved.and_then(|s| s.get(key)) {
-            Some(saved_value) => {
-                let effective_desired = merge_with_saved(desired_value, saved_value);
-                projected_current
-                    .get(key)
-                    .map(|cv| {
-                        type_aware_equal(
-                            cv,
-                            &effective_desired,
-                            attr_type,
-                            defs,
-                            secret_ctx.as_ref(),
-                        )
-                    })
-                    .unwrap_or(false)
-            }
-            None => projected_current
-                .get(key)
-                .map(|cv| type_aware_equal(cv, desired_value, attr_type, defs, secret_ctx.as_ref()))
-                .unwrap_or(false),
-        };
-
-        if !is_equal {
+        if key_should_enter_patch(
+            key,
+            schema,
+            AttrComparison {
+                from: projected_current.get(key),
+                to: desired_value,
+                saved: saved.and_then(|s| s.get(key)),
+                type_info,
+                secret_ctx: secret_ctx.as_ref(),
+            },
+        ) {
             changed.push(key.clone());
         }
     }

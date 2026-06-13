@@ -4,6 +4,9 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::binding_index::ResolvedBindings;
+use crate::differ::{
+    AttrComparison, TypedAttr, key_should_enter_patch, secret_grafted_comparison_view,
+};
 use crate::effect::Effect;
 use crate::executor::normalized::NormalizedResource;
 use crate::provider::{
@@ -11,6 +14,8 @@ use crate::provider::{
     build_update_patch,
 };
 use crate::resource::{ConcreteValue, Resource, ResourceId, State, Value};
+use crate::schema::SchemaRegistry;
+use crate::value::SecretHashContext;
 
 use super::basic::{
     BasicEffectResult, RenormalizePipeline, resolve_resource, resolve_resource_with_source,
@@ -22,10 +27,17 @@ use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
 /// path of replacements (cascade has no precomputed
 /// `changed_attributes` list, so the patch is derived from the
 /// from/to comparison directly).
-pub fn compute_full_diff_patch(from: &State, to: &NormalizedResource) -> UpdatePatch {
+pub fn compute_full_diff_patch(
+    from: &State,
+    to: &NormalizedResource,
+    to_source: &Resource,
+    schemas: &SchemaRegistry,
+    resource_id: &ResourceId,
+) -> UpdatePatch {
     use std::collections::HashSet;
 
     let to_resource = to.as_resource();
+    let schema = schemas.get_for(to_resource);
     let mut keys: HashSet<&str> = HashSet::new();
     keys.extend(from.attributes.keys().map(String::as_str));
     keys.extend(to_resource.attributes.keys().map(String::as_str));
@@ -34,8 +46,36 @@ pub fn compute_full_diff_patch(from: &State, to: &NormalizedResource) -> UpdateP
 
     let changed: Vec<String> = sorted_keys
         .into_iter()
-        .filter(|k| from.attributes.get(*k) != to_resource.attributes.get(*k))
-        .map(|k| k.to_string())
+        .filter_map(|key| match to_resource.attributes.get(key) {
+            Some(new_value) => {
+                let type_info = schema.and_then(|s| {
+                    s.attributes.get(key).map(|attr| TypedAttr {
+                        attr_type: &attr.attr_type,
+                        defs: &s.defs,
+                    })
+                });
+                let secret_ctx = Some(SecretHashContext::new(
+                    resource_id.display_type(),
+                    resource_id.name_str(),
+                    key,
+                ));
+                let comparison_value =
+                    secret_grafted_comparison_view(new_value, to_source.attributes.get(key))?;
+                key_should_enter_patch(
+                    key,
+                    schema,
+                    AttrComparison {
+                        from: from.attributes.get(key),
+                        to: comparison_value.as_ref(),
+                        saved: None,
+                        type_info,
+                        secret_ctx: secret_ctx.as_ref(),
+                    },
+                )
+                .then(|| key.to_string())
+            }
+            None => (!key.starts_with('_')).then(|| key.to_string()),
+        })
         .collect();
     build_update_patch(&changed, to, from)
 }
@@ -166,7 +206,13 @@ pub(super) async fn execute_cbd_replace_parallel(
                     }
                 };
                 let cascade_identifier = cascade.from.identifier.as_deref().unwrap_or("");
-                let cascade_patch = compute_full_diff_patch(&cascade.from, &resolved_to);
+                let cascade_patch = compute_full_diff_patch(
+                    &cascade.from,
+                    &resolved_to,
+                    &cascade.to,
+                    ctx.pipeline.schemas,
+                    &cascade.id,
+                );
                 let cascade_request = UpdateRequest {
                     from: (*cascade.from).clone(),
                     patch: cascade_patch,
