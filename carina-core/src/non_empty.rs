@@ -18,6 +18,14 @@ impl<T> NonEmptyVec<T> {
         }
     }
 
+    pub fn push(&mut self, item: T) {
+        self.inner.push(item);
+    }
+
+    pub fn into_vec(self) -> Vec<T> {
+        self.inner
+    }
+
     pub fn iter(&self) -> std::slice::Iter<'_, T> {
         self.inner.iter()
     }
@@ -42,5 +50,12 @@ mod tests {
         let collected: Vec<_> = nev.iter().copied().collect();
         assert_eq!(collected, vec![1, 2, 3]);
         assert_eq!(nev.as_slice(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn push_preserves_non_empty_and_into_vec_returns_inner() {
+        let mut nev = NonEmptyVec::from_vec(vec![1]).unwrap();
+        nev.push(2);
+        assert_eq!(nev.into_vec(), vec![1, 2]);
     }
 }

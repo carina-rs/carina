@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::deps::get_resource_dependencies;
-use crate::effect::{CascadingUpdate, Effect, TemporaryName, WaitTarget};
+use crate::effect::{CascadingUpdate, ChangedCreateOnly, Effect, TemporaryName, WaitTarget};
 use crate::identifier::generate_random_suffix;
 use crate::parser::WaitBinding;
 use crate::plan::{Plan, PlanError};
@@ -20,7 +20,7 @@ use super::{Diff, diff};
 /// A pending merge operation: cascade-triggered create-only attributes to add to an existing effect.
 struct CascadeMerge {
     resource_id: ResourceId,
-    create_only_attrs: Vec<String>,
+    create_only_attrs: ChangedCreateOnly,
     directives: Directives,
     ref_hints: Vec<(String, String)>,
 }
@@ -252,23 +252,7 @@ pub fn create_plan(
                     registry,
                 );
 
-                // Check if the resource type forces replacement (no update support)
-                let schema_force_replace = registry
-                    .get(
-                        &resource.id.provider,
-                        &resource.id.resource_type,
-                        SchemaKind::Resource,
-                    )
-                    .is_some_and(|s| s.force_replace);
-
-                if changed_create_only.is_empty() && !schema_force_replace {
-                    plan.add(Effect::Update {
-                        id,
-                        from,
-                        to,
-                        changed_attributes,
-                    });
-                } else {
+                if let Some(changed_create_only) = ChangedCreateOnly::new(changed_create_only) {
                     // Replace involves destroying the old resource
                     if resource.directives.prevent_destroy {
                         plan.add_error(PlanError {
@@ -313,6 +297,13 @@ pub fn create_plan(
                         cascading_updates: vec![],
                         temporary_name,
                         cascade_ref_hints: vec![],
+                    });
+                } else {
+                    plan.add(Effect::Update {
+                        id,
+                        from,
+                        to,
+                        changed_attributes,
                     });
                 }
             }
@@ -731,7 +722,7 @@ pub fn cascade_dependent_updates(
                 registry,
             );
 
-            if !create_only_refs.is_empty() {
+            if let Some(create_only_attrs) = ChangedCreateOnly::new(create_only_refs) {
                 // Check if this merge would upgrade an Update to Replace.
                 // If the resource has prevent_destroy, block the upgrade.
                 let is_update_in_plan = plan
@@ -751,11 +742,11 @@ pub fn cascade_dependent_updates(
                 // Only keep hints for attributes that are actually create-only
                 let filtered_hints: Vec<(String, String)> = ref_hints
                     .into_iter()
-                    .filter(|(attr, _)| create_only_refs.contains(attr))
+                    .filter(|(attr, _)| create_only_attrs.contains(attr))
                     .collect();
                 merge_operations.push(CascadeMerge {
                     resource_id: resource.id.clone(),
-                    create_only_attrs: create_only_refs,
+                    create_only_attrs,
                     directives: resource.directives.clone(),
                     ref_hints: filtered_hints,
                 });
@@ -810,7 +801,48 @@ pub fn cascade_dependent_updates(
                     registry,
                 );
 
-                if create_only_refs.is_empty() {
+                if let Some(changed_create_only) = ChangedCreateOnly::new(create_only_refs) {
+                    if unresolved.directives.prevent_destroy {
+                        // Cascade would promote to Replace (destroy + recreate),
+                        // but prevent_destroy blocks this.
+                        plan.add_error(PlanError {
+                            resource_id: unresolved.id.clone(),
+                            message:
+                                "resource has prevent_destroy set, but cascade from a replaced dependency would replace it (which requires destroying the old resource)"
+                                    .to_string(),
+                        });
+                    } else {
+                        // Extract ref hints for attributes being promoted
+                        let ref_hints: Vec<(String, String)> = unresolved
+                            .attributes
+                            .iter()
+                            .filter_map(|(k, v)| match v {
+                                Value::Deferred(DeferredValue::ResourceRef { path })
+                                    if path.binding() == replaced_binding
+                                        && changed_create_only.contains(k) =>
+                                {
+                                    Some((
+                                        k.clone(),
+                                        format!("{}.{}", path.binding(), path.attribute()),
+                                    ))
+                                }
+                                _ => None,
+                            })
+                            .collect();
+
+                        // Promote to a separate Replace effect
+                        promoted_replaces.push(Effect::Replace {
+                            id: unresolved.id.clone(),
+                            from: Box::new(from),
+                            to: (*unresolved).clone(),
+                            directives: unresolved.directives.clone(),
+                            changed_create_only,
+                            cascading_updates: vec![],
+                            temporary_name: None,
+                            cascade_ref_hints: ref_hints,
+                        });
+                    }
+                } else {
                     // Normal cascading update
                     updates_by_replaced_binding
                         .entry(replaced_binding.clone())
@@ -820,45 +852,6 @@ pub fn cascade_dependent_updates(
                             from: Box::new(from),
                             to: (*unresolved).clone(),
                         });
-                } else if unresolved.directives.prevent_destroy {
-                    // Cascade would promote to Replace (destroy + recreate),
-                    // but prevent_destroy blocks this.
-                    plan.add_error(PlanError {
-                        resource_id: unresolved.id.clone(),
-                        message:
-                            "resource has prevent_destroy set, but cascade from a replaced dependency would replace it (which requires destroying the old resource)"
-                                .to_string(),
-                    });
-                } else {
-                    // Extract ref hints for attributes being promoted
-                    let ref_hints: Vec<(String, String)> = unresolved
-                        .attributes
-                        .iter()
-                        .filter_map(|(k, v)| match v {
-                            Value::Deferred(DeferredValue::ResourceRef { path })
-                                if path.binding() == replaced_binding
-                                    && create_only_refs.contains(k) =>
-                            {
-                                Some((
-                                    k.clone(),
-                                    format!("{}.{}", path.binding(), path.attribute()),
-                                ))
-                            }
-                            _ => None,
-                        })
-                        .collect();
-
-                    // Promote to a separate Replace effect
-                    promoted_replaces.push(Effect::Replace {
-                        id: unresolved.id.clone(),
-                        from: Box::new(from),
-                        to: (*unresolved).clone(),
-                        directives: unresolved.directives.clone(),
-                        changed_create_only: create_only_refs,
-                        cascading_updates: vec![],
-                        temporary_name: None,
-                        cascade_ref_hints: ref_hints,
-                    });
                 }
             }
         }

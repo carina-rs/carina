@@ -618,7 +618,11 @@ fn move_plus_replace_keeps_post_replace_identifier_and_attributes() {
         from: Box::new(State::existing(from_id.clone(), HashMap::new())),
         to: sorted_resources[0].clone(),
         directives: Directives::default(),
-        changed_create_only: vec!["role_name".to_string(), "policy_name".to_string()],
+        changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec![
+            "role_name".to_string(),
+            "policy_name".to_string(),
+        ])
+        .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],

@@ -188,7 +188,8 @@ fn replace_effect_symbols() {
             create_before_destroy: true,
             ..Default::default()
         },
-        changed_create_only: vec!["cidr".to_string()],
+        changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec!["cidr".to_string()])
+            .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],
@@ -200,7 +201,8 @@ fn replace_effect_symbols() {
         from,
         to: Resource::new("ec2.Vpc", "my-vpc2"),
         directives: Directives::default(),
-        changed_create_only: vec!["cidr".to_string()],
+        changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec!["cidr".to_string()])
+            .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],
@@ -746,7 +748,8 @@ fn move_suppressed_when_replace_exists_for_same_target() {
         )),
         to: Resource::new("ec2.Vpc", "new-vpc"),
         directives: Directives::default(),
-        changed_create_only: vec!["cidr".to_string()],
+        changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec!["cidr".to_string()])
+            .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],

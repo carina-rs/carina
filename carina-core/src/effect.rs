@@ -3,10 +3,11 @@
 //! An Effect describes "what to do" without actually performing the side effect.
 //! Side effects only occur when they are executed via a Provider.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, ops::Deref};
 
 use serde::{Deserialize, Serialize};
 
+use crate::non_empty::NonEmptyVec;
 use crate::resource::{DataSource, Directives, Resource, ResourceId, State};
 use crate::wait::predicate::WaitPredicate;
 
@@ -38,6 +39,64 @@ pub struct CascadingUpdate {
     pub id: ResourceId,
     pub from: Box<State>,
     pub to: Resource,
+}
+
+/// Non-empty create-only attribute list for [`Effect::Replace`].
+///
+/// An empty list would render a destroy-and-recreate plan with no visible
+/// reason: the unexplained-replacement bug class (carina#3471) this type makes
+/// unrepresentable.
+///
+/// A replace must name at least one create-only attribute that forced it.
+/// Constructing this type from a possibly empty `Vec<String>` requires the
+/// fallible [`ChangedCreateOnly::new`] constructor:
+///
+/// ```compile_fail
+/// use carina_core::effect::ChangedCreateOnly;
+///
+/// let attrs: Vec<String> = Vec::new();
+/// let _changed = ChangedCreateOnly(attrs);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<String>", into = "Vec<String>")]
+pub struct ChangedCreateOnly(NonEmptyVec<String>);
+
+impl ChangedCreateOnly {
+    pub fn new(attrs: Vec<String>) -> Option<Self> {
+        NonEmptyVec::from_vec(attrs).map(Self)
+    }
+
+    pub fn push(&mut self, attr: String) {
+        self.0.push(attr);
+    }
+
+    pub fn contains(&self, attr: &str) -> bool {
+        self.0.iter().any(|a| a == attr)
+    }
+}
+
+impl Deref for ChangedCreateOnly {
+    type Target = [String];
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_slice()
+    }
+}
+
+impl TryFrom<Vec<String>> for ChangedCreateOnly {
+    type Error = String;
+
+    fn try_from(attrs: Vec<String>) -> Result<Self, Self::Error> {
+        Self::new(attrs).ok_or_else(|| {
+            "Replace effect requires at least one changed create-only attribute".to_string()
+        })
+    }
+}
+
+impl From<ChangedCreateOnly> for Vec<String> {
+    fn from(attrs: ChangedCreateOnly) -> Self {
+        attrs.0.into_vec()
+    }
 }
 
 /// How an [`Effect::Wait`] obtains the cloud provider identifier its
@@ -104,7 +163,7 @@ pub enum Effect {
         #[serde(default)]
         directives: Directives,
         /// Which create-only attributes forced the replacement
-        changed_create_only: Vec<String>,
+        changed_create_only: ChangedCreateOnly,
         /// Dependent resources to update between create and delete (create_before_destroy only)
         #[serde(default)]
         cascading_updates: Vec<CascadingUpdate>,
@@ -719,7 +778,10 @@ mod tests {
                     Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
                 ),
                 directives: Directives::default(),
-                changed_create_only: vec!["cidr_block".to_string()],
+                changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
+                    "cidr_block".to_string(),
+                ])
+                .unwrap(),
                 // carina#3181 PR D: cover `CascadingUpdate.to:
                 // Resource` in the serde round-trip.
                 cascading_updates: vec![CascadingUpdate {
@@ -748,6 +810,80 @@ mod tests {
             let deserialized: Effect = serde_json::from_str(&json).unwrap();
             assert_eq!(effect, deserialized, "Round-trip failed for {:?}", effect);
         }
+    }
+
+    #[test]
+    fn changed_create_only_constructor_rejects_empty() {
+        assert!(ChangedCreateOnly::new(Vec::new()).is_none());
+        assert_eq!(
+            &ChangedCreateOnly::new(vec!["cidr_block".to_string()]).unwrap()[..],
+            ["cidr_block".to_string()]
+        );
+    }
+
+    #[test]
+    fn changed_create_only_push_preserves_non_empty() {
+        let mut changed = ChangedCreateOnly::new(vec!["cidr_block".to_string()]).unwrap();
+        changed.push("vpc_id".to_string());
+        assert_eq!(
+            &changed[..],
+            ["cidr_block".to_string(), "vpc_id".to_string()]
+        );
+    }
+
+    #[test]
+    fn replace_changed_create_only_serializes_as_plain_array() {
+        let effect = Effect::Replace {
+            id: ResourceId::new("test", "x"),
+            from: Box::new(State::not_found(ResourceId::new("test", "x"))),
+            to: Resource::new("test", "x"),
+            directives: Directives::default(),
+            changed_create_only: ChangedCreateOnly::new(vec!["x".to_string()]).unwrap(),
+            cascading_updates: vec![],
+            temporary_name: None,
+            cascade_ref_hints: vec![],
+        };
+
+        let json = serde_json::to_value(&effect).unwrap();
+        assert_eq!(
+            json["Replace"]["changed_create_only"],
+            serde_json::json!(["x"])
+        );
+        let decoded: Effect = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, effect);
+    }
+
+    #[test]
+    fn replace_deserialize_rejects_empty_changed_create_only() {
+        let json = serde_json::json!({
+            "Replace": {
+                "id": {"provider": "", "resource_type": "test", "name": "x"},
+                "from": {
+                    "id": {"provider": "", "resource_type": "test", "name": "x"},
+                    "identifier": "x-1",
+                    "attributes": {},
+                    "exists": true,
+                    "dependency_bindings": []
+                },
+                "to": {
+                    "id": {"provider": "", "resource_type": "test", "name": "x"},
+                    "attributes": {}
+                },
+                "directives": {},
+                "changed_create_only": [],
+                "cascading_updates": [],
+                "temporary_name": null,
+                "cascade_ref_hints": []
+            }
+        });
+
+        let err = serde_json::from_value::<Effect>(json)
+            .expect_err("empty changed_create_only must not deserialize as Replace");
+        assert!(
+            err.to_string()
+                .contains("Replace effect requires at least one changed create-only attribute"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -979,7 +1115,7 @@ mod tests {
             from: Box::new(ResState::not_found(rid.clone())),
             to: Resource::new("test", "x"),
             directives: Directives::default(),
-            changed_create_only: vec![],
+            changed_create_only: ChangedCreateOnly::new(vec!["attr".to_string()]).unwrap(),
             cascading_updates: vec![],
             temporary_name: None,
             cascade_ref_hints: vec![],

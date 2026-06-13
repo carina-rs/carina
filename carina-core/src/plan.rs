@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::effect::Effect;
+use crate::effect::{ChangedCreateOnly, Effect};
 use crate::module::DependencyGraph;
 pub use crate::resource::ModuleSource;
 use crate::resource::ResourceId;
@@ -114,7 +114,7 @@ impl Plan {
     pub fn merge_cascade_create_only(
         &mut self,
         resource_id: &crate::resource::ResourceId,
-        cascade_attrs: Vec<String>,
+        cascade_attrs: ChangedCreateOnly,
         directives: crate::resource::Directives,
         ref_hints: Vec<(String, String)>,
     ) {
@@ -126,9 +126,9 @@ impl Plan {
                     cascade_ref_hints,
                     ..
                 } if id == resource_id => {
-                    for attr in &cascade_attrs {
+                    for attr in cascade_attrs.iter() {
                         if !changed_create_only.contains(attr) {
-                            changed_create_only.push(attr.clone());
+                            changed_create_only.push(attr.to_string());
                         }
                     }
                     for hint in &ref_hints {
@@ -649,7 +649,10 @@ mod tests {
             from: Box::new(from),
             to,
             directives: Directives::default(),
-            changed_create_only: vec!["cidr_block".to_string()],
+            changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
+                "cidr_block".to_string(),
+            ])
+            .unwrap(),
             cascading_updates: vec![cascading],
             temporary_name: None,
             cascade_ref_hints: vec![],
@@ -685,7 +688,10 @@ mod tests {
             from: Box::new(from),
             to,
             directives: Directives::default(),
-            changed_create_only: vec!["cidr_block".to_string()],
+            changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
+                "cidr_block".to_string(),
+            ])
+            .unwrap(),
             cascading_updates: vec![cascading],
             temporary_name: None,
             cascade_ref_hints: vec![],

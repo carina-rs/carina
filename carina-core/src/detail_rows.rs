@@ -2078,7 +2078,10 @@ mod tests {
             from: Box::new(from),
             to,
             directives: crate::resource::Directives::default(),
-            changed_create_only: vec!["cidr_block".to_string()],
+            changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
+                "cidr_block".to_string(),
+            ])
+            .unwrap(),
             cascading_updates: vec![],
             temporary_name: None,
             cascade_ref_hints: vec![],

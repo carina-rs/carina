@@ -350,7 +350,7 @@ fn replace_when_create_only_attr_changed() {
             changed_create_only,
             ..
         } => {
-            assert_eq!(changed_create_only, &vec!["cidr_block".to_string()]);
+            assert_eq!(&changed_create_only[..], &["cidr_block".to_string()]);
         }
         other => panic!("Expected Replace, got {:?}", other),
     }
@@ -404,75 +404,6 @@ fn normal_update_when_non_create_only_attr_changed() {
     assert!(
         matches!(plan.effects()[0], Effect::Update { .. }),
         "Expected Update, got {:?}",
-        plan.effects()[0]
-    );
-}
-
-#[test]
-fn replace_when_schema_force_replace() {
-    use crate::schema::AttributeType;
-
-    // Resource has changed attributes but NO create-only attributes
-    let resources = vec![
-        Resource::new("ec2.internet_gateway", "my-igw").with_attribute(
-            "tags",
-            Value::Concrete(ConcreteValue::Map(
-                vec![(
-                    "Name".to_string(),
-                    Value::Concrete(ConcreteValue::String("new-name".to_string())),
-                )]
-                .into_iter()
-                .collect(),
-            )),
-        ),
-    ];
-
-    let mut current_states = HashMap::new();
-    let mut attrs = HashMap::new();
-    attrs.insert(
-        "tags".to_string(),
-        Value::Concrete(ConcreteValue::Map(
-            vec![(
-                "Name".to_string(),
-                Value::Concrete(ConcreteValue::String("old-name".to_string())),
-            )]
-            .into_iter()
-            .collect(),
-        )),
-    );
-    current_states.insert(
-        ResourceId::new("ec2.internet_gateway", "my-igw"),
-        State::existing(ResourceId::new("ec2.internet_gateway", "my-igw"), attrs),
-    );
-
-    // Schema has force_replace=true (no create-only attributes)
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert(
-        "",
-        crate::schema::ResourceSchema::new("ec2.internet_gateway")
-            .attribute(crate::schema::AttributeSchema::new(
-                "tags",
-                AttributeType::string(),
-            ))
-            .force_replace(),
-    );
-
-    let plan = create_plan(
-        &resources,
-        &[],
-        &current_states,
-        &HashMap::new(),
-        &schemas,
-        &HashMap::new(),
-        &HashMap::new(),
-        &HashMap::new(),
-        &[],
-    );
-
-    assert_eq!(plan.effects().len(), 1);
-    assert!(
-        matches!(plan.effects()[0], Effect::Replace { .. }),
-        "Expected Replace for force_replace schema, got {:?}",
         plan.effects()[0]
     );
 }
@@ -537,7 +468,7 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
             changed_create_only,
             ..
         } => {
-            assert_eq!(changed_create_only, &vec!["cidr_block".to_string()]);
+            assert_eq!(&changed_create_only[..], &["cidr_block".to_string()]);
         }
         other => panic!("Expected Replace, got {:?}", other),
     }
@@ -593,7 +524,7 @@ fn replace_carries_create_before_destroy_directives() {
             ..
         } => {
             assert!(directives.create_before_destroy);
-            assert_eq!(changed_create_only, &vec!["cidr_block".to_string()]);
+            assert_eq!(&changed_create_only[..], &["cidr_block".to_string()]);
         }
         other => panic!("Expected Replace, got {:?}", other),
     }

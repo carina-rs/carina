@@ -1495,7 +1495,10 @@ mod tests {
             from: Box::new(role_state),
             to: role.clone(),
             directives: Directives::default(),
-            changed_create_only: vec!["role_name".to_string()],
+            changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
+                "role_name".to_string(),
+            ])
+            .unwrap(),
             cascading_updates: vec![],
             temporary_name: None,
             cascade_ref_hints: vec![],
@@ -1505,7 +1508,10 @@ mod tests {
             from: Box::new(bucket_state),
             to: bucket.clone(),
             directives: Directives::default(),
-            changed_create_only: vec!["bucket_name".to_string()],
+            changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
+                "bucket_name".to_string(),
+            ])
+            .unwrap(),
             cascading_updates: vec![],
             temporary_name: None,
             cascade_ref_hints: vec![],

@@ -446,7 +446,6 @@ fn make_schema(resource_type: &str, attrs: Vec<(&str, AttributeType)>) -> Resour
         validator: None,
         kind: crate::schema::SchemaKind::Resource,
         name_attribute: None,
-        force_replace: false,
         operation_config: None,
         exclusive_required: Vec::new(),
         default_wait_timeout: None,
