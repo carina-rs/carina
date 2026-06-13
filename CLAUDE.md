@@ -456,6 +456,18 @@ Carina is split across multiple repositories under [carina-rs](https://github.co
 
 Provider repositories depend on this repo's crates via `git` dependencies.
 
+**Cross-repo changes: never assume the sibling provider is unaffected.**
+When touching anything that crosses the provider boundary — WIT / wasi:http
+protocol, `carina-provider-protocol`, `carina-aws-types`, host↔plugin
+serialization, shared schema or differ logic — explicitly check whether
+`carina-provider-aws` *and* `carina-provider-awscc` both need a
+counterpart PR (and a rev bump in this repo afterwards). Past breakage
+(carina#3364, awscc#346) was a wasi:http / protocol mismatch where one
+provider had pinned an older rev and silently degraded; "this only
+touches aws" / "awscc looks unrelated" intuitions kept being wrong.
+Search both provider repos for the symbol or protocol surface you
+changed before declaring a PR complete.
+
 ## Crate Structure (this repo)
 
 - **carina-core**: Core library with parser, types, and traits. No AWS dependencies.
