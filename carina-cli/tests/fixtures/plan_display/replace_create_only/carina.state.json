@@ -1,0 +1,62 @@
+{
+  "version": 7,
+  "serial": 1,
+  "lineage": "test-replace-create-only",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "test.Widget",
+      "name": "alpha",
+      "provider": "test",
+      "identifier": "widget-alpha-live",
+      "attributes": {
+        "id": "widget-alpha-live",
+        "external_name": "old"
+      },
+      "protected": false,
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false
+      },
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "alpha",
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "external_name": {
+            "kind": "leaf"
+          }
+        }
+      }
+    },
+    {
+      "resource_type": "test.Widget",
+      "name": "beta",
+      "provider": "test",
+      "identifier": "widget-beta-live",
+      "attributes": {
+        "id": "widget-beta-live",
+        "legacy_token": "tok"
+      },
+      "protected": false,
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false
+      },
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "beta",
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "legacy_token": {
+            "kind": "leaf"
+          }
+        }
+      }
+    }
+  ]
+}

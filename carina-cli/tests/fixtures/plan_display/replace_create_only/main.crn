@@ -1,0 +1,12 @@
+provider test {}
+
+let alpha = test.test.Widget {
+  external_name = "new"
+}
+
+let beta = test.test.Widget {}
+
+exports {
+  alpha_name = alpha.external_name
+  beta_token = beta.legacy_token
+}

@@ -276,6 +276,28 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
             }
             lines.push(line);
         }
+        DetailRow::ReplaceRemoved { key, old } => {
+            let mut line = Line::from(vec![
+                Span::raw(format!("  {}: ", key)),
+                Span::styled(
+                    old.clone(),
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::CROSSED_OUT),
+                ),
+                Span::raw(" -> "),
+                Span::styled(
+                    "(removed)",
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::CROSSED_OUT),
+                ),
+            ]);
+            if is_selected {
+                line = line.style(Style::default().bg(Color::DarkGray));
+            }
+            lines.push(line);
+        }
         DetailRow::ReplaceCascade { key, old, new } => {
             let mut line = Line::from(vec![
                 Span::raw(format!("  {}: ", key)),

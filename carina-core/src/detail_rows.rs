@@ -92,6 +92,8 @@ pub enum DetailRow {
         old: String,
         new: String,
     },
+    /// A removed create-only attribute that forces replacement.
+    ReplaceRemoved { key: String, old: String },
     /// A cascade-triggered create-only attribute (value not yet known)
     ReplaceCascade {
         key: String,
@@ -726,6 +728,9 @@ fn build_update_rows(
     removed_keys.sort();
     for key in removed_keys {
         if let Some(old_value) = from_attrs_projected.get(key.as_str()) {
+            let attr_type = schema
+                .and_then(|s| s.attributes.get(key.as_str()))
+                .map(|a| &a.attr_type);
             // Mirror the addition direction (#2936): when a Map
             // attribute is dropped entirely, route through `MapDiff`
             // so each key renders on its own line as `- key: "value"`
@@ -734,6 +739,30 @@ fn build_update_rows(
             if let Some(row) = build_map_removed_row(key, old_value) {
                 rows.push(row);
                 continue;
+            }
+            if is_list_of_maps(old_value) {
+                let empty_list = Value::Concrete(ConcreteValue::List(Vec::new()));
+                let (unchanged, modified, added, removed) = compute_list_of_maps_diff_parts(
+                    Some(old_value),
+                    &empty_list,
+                    attr_type,
+                    defs,
+                    detail,
+                );
+                if !(unchanged.is_empty()
+                    && modified.is_empty()
+                    && added.is_empty()
+                    && removed.is_empty())
+                {
+                    rows.push(DetailRow::ListOfMapsDiff {
+                        key: key.to_string(),
+                        unchanged,
+                        modified,
+                        added,
+                        removed,
+                    });
+                    continue;
+                }
             }
             rows.push(DetailRow::Removed {
                 key: key.to_string(),
@@ -778,15 +807,20 @@ fn build_replace_rows(
         .unwrap_or(empty_defs_for_schema_walks());
 
     // Show changed create-only attributes
-    let mut keys: Vec<_> = changed_create_only
-        .iter()
-        .filter(|k| to.attributes.contains_key(k.as_str()))
-        .collect();
+    let mut keys: Vec<_> = changed_create_only.iter().collect();
     keys.sort();
 
     for key in keys {
-        let new_value = &to.attributes[key.as_str()];
         let old_value = from.attributes.get(key.as_str());
+        let Some(new_value) = to.attributes.get(key.as_str()) else {
+            let attr_type = schema
+                .and_then(|s| s.attributes.get(key.as_str()))
+                .map(|a| &a.attr_type);
+            rows.push(build_replace_removed_row(
+                key, old_value, attr_type, defs, detail,
+            ));
+            continue;
+        };
         let attr_type = schema
             .and_then(|s| s.attributes.get(key.as_str()))
             .map(|a| &a.attr_type);
@@ -923,6 +957,49 @@ fn build_replace_rows(
     }
 
     rows
+}
+
+fn build_replace_removed_row(
+    key: &str,
+    old_value: Option<&Value>,
+    attr_type: Option<&AttributeType>,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+    detail: DetailLevel,
+) -> DetailRow {
+    let Some(old_value) = old_value else {
+        return DetailRow::ReplaceRemoved {
+            key: key.to_string(),
+            old: "(none)".to_string(),
+        };
+    };
+
+    if let Some(DetailRow::MapDiff { entries, .. }) = build_map_removed_row(key, old_value) {
+        return DetailRow::ReplaceMapDiff {
+            key: key.to_string(),
+            entries: entries.into_vec(),
+        };
+    }
+
+    if is_list_of_maps(old_value) {
+        let empty_list = Value::Concrete(ConcreteValue::List(Vec::new()));
+        let (unchanged, modified, added, removed) =
+            compute_list_of_maps_diff_parts(Some(old_value), &empty_list, attr_type, defs, detail);
+        if !(unchanged.is_empty() && modified.is_empty() && added.is_empty() && removed.is_empty())
+        {
+            return DetailRow::ReplaceListOfMapsDiff {
+                key: key.to_string(),
+                unchanged,
+                modified,
+                added,
+                removed,
+            };
+        }
+    }
+
+    DetailRow::ReplaceRemoved {
+        key: key.to_string(),
+        old: format_value_with_key(old_value, Some(key)),
+    }
 }
 
 fn build_delete_rows(
@@ -1851,6 +1928,57 @@ mod tests {
     }
 
     #[test]
+    fn update_removed_list_of_maps_attribute_emits_list_diff_row() {
+        let mut rule = IndexMap::new();
+        rule.insert(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("legacy".to_string())),
+        );
+        rule.insert(
+            "priority".to_string(),
+            Value::Concrete(ConcreteValue::Int(10)),
+        );
+        let old_rules = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(rule.clone()),
+        )]));
+        let from = State::existing(
+            ResourceId::new("test.Widget", "beta"),
+            [("rules".to_string(), old_rules)].into_iter().collect(),
+        );
+        let to = Resource::new("test.Widget", "beta");
+        let effect = Effect::Update {
+            id: ResourceId::new("test.Widget", "beta"),
+            from: Box::new(from),
+            to,
+            changed_attributes: vec!["rules".to_string()],
+        };
+
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
+
+        assert_eq!(
+            rows,
+            vec![DetailRow::ListOfMapsDiff {
+                key: "rules".to_string(),
+                unchanged: vec![],
+                modified: vec![],
+                added: vec![],
+                removed: vec![ListOfMapsDiffItem {
+                    fields: vec![
+                        (
+                            "name".to_string(),
+                            Value::Concrete(ConcreteValue::String("legacy".to_string())),
+                        ),
+                        (
+                            "priority".to_string(),
+                            Value::Concrete(ConcreteValue::Int(10))
+                        ),
+                    ],
+                }],
+            }]
+        );
+    }
+
+    #[test]
     fn test_create_map_expanded() {
         let mut tags = IndexMap::new();
         tags.insert(
@@ -2089,6 +2217,154 @@ mod tests {
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
         assert_eq!(rows.len(), 1);
         assert!(matches!(&rows[0], DetailRow::ReplaceChanged { key, .. } if key == "cidr_block"));
+    }
+
+    #[test]
+    fn replace_removed_create_only_attribute_emits_detail_row() {
+        let from = State::existing(
+            ResourceId::new("test.Widget", "beta"),
+            [(
+                "legacy_token".to_string(),
+                Value::Concrete(ConcreteValue::String("tok".to_string())),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let to = Resource::new("test.Widget", "beta");
+        let effect = Effect::Replace {
+            id: ResourceId::new("test.Widget", "beta"),
+            from: Box::new(from),
+            to,
+            directives: crate::resource::Directives::default(),
+            changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
+                "legacy_token".to_string(),
+            ])
+            .unwrap(),
+            cascading_updates: vec![],
+            temporary_name: None,
+            cascade_ref_hints: vec![],
+        };
+
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
+
+        assert_eq!(
+            rows,
+            vec![DetailRow::ReplaceRemoved {
+                key: "legacy_token".to_string(),
+                old: "\"tok\"".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn replace_removed_create_only_map_attribute_emits_map_diff_row() {
+        let mut settings = IndexMap::new();
+        settings.insert(
+            "mode".to_string(),
+            Value::Concrete(ConcreteValue::String("legacy".to_string())),
+        );
+        settings.insert(
+            "version".to_string(),
+            Value::Concrete(ConcreteValue::Int(1)),
+        );
+        let from = State::existing(
+            ResourceId::new("test.Widget", "beta"),
+            [(
+                "settings".to_string(),
+                Value::Concrete(ConcreteValue::Map(settings)),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let to = Resource::new("test.Widget", "beta");
+        let effect = Effect::Replace {
+            id: ResourceId::new("test.Widget", "beta"),
+            from: Box::new(from),
+            to,
+            directives: crate::resource::Directives::default(),
+            changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
+                "settings".to_string(),
+            ])
+            .unwrap(),
+            cascading_updates: vec![],
+            temporary_name: None,
+            cascade_ref_hints: vec![],
+        };
+
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
+
+        assert_eq!(
+            rows,
+            vec![DetailRow::ReplaceMapDiff {
+                key: "settings".to_string(),
+                entries: vec![
+                    MapDiffEntryIR::Removed {
+                        key: "mode".to_string(),
+                        value: "\"legacy\"".to_string(),
+                    },
+                    MapDiffEntryIR::Removed {
+                        key: "version".to_string(),
+                        value: "1".to_string(),
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn replace_removed_create_only_list_of_maps_attribute_emits_list_diff_row() {
+        let mut rule = IndexMap::new();
+        rule.insert(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("legacy".to_string())),
+        );
+        rule.insert(
+            "priority".to_string(),
+            Value::Concrete(ConcreteValue::Int(10)),
+        );
+        let old_rules = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(rule.clone()),
+        )]));
+        let from = State::existing(
+            ResourceId::new("test.Widget", "beta"),
+            [("rules".to_string(), old_rules)].into_iter().collect(),
+        );
+        let to = Resource::new("test.Widget", "beta");
+        let effect = Effect::Replace {
+            id: ResourceId::new("test.Widget", "beta"),
+            from: Box::new(from),
+            to,
+            directives: crate::resource::Directives::default(),
+            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["rules".to_string()])
+                .unwrap(),
+            cascading_updates: vec![],
+            temporary_name: None,
+            cascade_ref_hints: vec![],
+        };
+
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
+
+        assert_eq!(
+            rows,
+            vec![DetailRow::ReplaceListOfMapsDiff {
+                key: "rules".to_string(),
+                unchanged: vec![],
+                modified: vec![],
+                added: vec![],
+                removed: vec![ListOfMapsDiffItem {
+                    fields: vec![
+                        (
+                            "name".to_string(),
+                            Value::Concrete(ConcreteValue::String("legacy".to_string())),
+                        ),
+                        (
+                            "priority".to_string(),
+                            Value::Concrete(ConcreteValue::Int(10))
+                        ),
+                    ],
+                }],
+            }]
+        );
     }
 
     /// The pre-#1971 hand-rolled walker only descended into `List` and `Map`,
