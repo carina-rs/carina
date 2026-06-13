@@ -4055,11 +4055,6 @@ pub struct ResourceSchema {
     /// Used for automatic unique name generation during create-before-destroy replacement.
     /// (e.g., "bucket_name" for s3.bucket, "log_group_name" for logs.log_group)
     pub name_attribute: Option<String>,
-    /// If true, updates are not supported for this resource type.
-    /// The differ will always generate Replace instead of Update.
-    /// Used for resource types where the provider API rejects updates
-    /// despite the schema indicating update support.
-    pub force_replace: bool,
     /// Per-resource operational config (timeouts, retries).
     /// When None, provider defaults are used.
     pub operation_config: Option<OperationConfig>,
@@ -4110,7 +4105,6 @@ impl ResourceSchema {
             validator: None,
             kind: SchemaKind::Resource,
             name_attribute: None,
-            force_replace: false,
             operation_config: None,
             exclusive_required: Vec::new(),
             default_wait_timeout: None,
@@ -4284,11 +4278,6 @@ impl ResourceSchema {
 
     pub fn with_name_attribute(mut self, attr: impl Into<String>) -> Self {
         self.name_attribute = Some(attr.into());
-        self
-    }
-
-    pub fn force_replace(mut self) -> Self {
-        self.force_replace = true;
         self
     }
 

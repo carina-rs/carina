@@ -71,7 +71,8 @@ fn cascade_dependent_updates_adds_update_for_dependent() {
             create_before_destroy: true,
             ..Default::default()
         },
-        changed_create_only: vec!["cidr_block".to_string()],
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
+            .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],
@@ -169,7 +170,8 @@ fn cascade_skips_resources_already_in_plan() {
             create_before_destroy: true,
             ..Default::default()
         },
-        changed_create_only: vec!["cidr_block".to_string()],
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
+            .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],
@@ -237,7 +239,8 @@ fn cascade_no_op_without_create_before_destroy() {
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: (vpc.clone()),
         directives: Directives::default(), // create_before_destroy = false
-        changed_create_only: vec!["cidr_block".to_string()],
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
+            .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],
@@ -332,7 +335,8 @@ fn cascade_transitive_dependencies() {
             create_before_destroy: true,
             ..Default::default()
         },
-        changed_create_only: vec!["cidr_block".to_string()],
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
+            .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],
@@ -411,7 +415,8 @@ fn cascade_anonymous_resource_dependent() {
             create_before_destroy: true,
             ..Default::default()
         },
-        changed_create_only: vec!["cidr_block".to_string()],
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
+            .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],
@@ -521,7 +526,8 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
             create_before_destroy: true,
             ..Default::default()
         },
-        changed_create_only: vec!["cidr_block".to_string()],
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
+            .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],
@@ -573,7 +579,7 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
     {
         assert_eq!(id, &subnet_id);
         assert!(
-            changed_create_only.contains(&"vpc_id".to_string()),
+            changed_create_only.contains("vpc_id"),
             "Subnet Replace should list vpc_id as a changed create-only attribute"
         );
         assert!(
@@ -692,7 +698,8 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
             create_before_destroy: true,
             ..Default::default()
         },
-        changed_create_only: vec!["cidr_block".to_string()],
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
+            .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],
@@ -702,7 +709,10 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
         from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
         to: (subnet.clone().with_binding("subnet")),
         directives: Directives::default(),
-        changed_create_only: vec!["availability_zone".to_string()],
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
+            "availability_zone".to_string(),
+        ])
+        .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],
@@ -726,12 +736,12 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
     } = subnet_effect.unwrap()
     {
         assert!(
-            changed_create_only.contains(&"availability_zone".to_string()),
+            changed_create_only.contains("availability_zone"),
             "changed_create_only should contain availability_zone (direct change), got: {:?}",
             changed_create_only
         );
         assert!(
-            changed_create_only.contains(&"vpc_id".to_string()),
+            changed_create_only.contains("vpc_id"),
             "changed_create_only should contain vpc_id (cascade from VPC replace), got: {:?}",
             changed_create_only
         );
@@ -834,7 +844,8 @@ fn auto_detect_create_before_destroy_when_resource_has_dependents() {
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: (vpc.clone().with_binding("vpc")),
         directives: Directives::default(), // create_before_destroy = false (user didn't set it)
-        changed_create_only: vec!["cidr_block".to_string()],
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
+            .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],
@@ -962,7 +973,8 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
             create_before_destroy: true,
             ..Default::default()
         },
-        changed_create_only: vec!["cidr_block".to_string()],
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
+            .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],
@@ -990,7 +1002,7 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
             ..
         } => {
             assert!(
-                changed_create_only.contains(&"vpc_id".to_string()),
+                changed_create_only.contains("vpc_id"),
                 "Subnet Replace should list vpc_id as changed create-only (cascade from VPC replace), got: {:?}",
                 changed_create_only
             );
@@ -1087,7 +1099,8 @@ fn cascade_prevent_destroy_blocks_promotion_to_replace() {
             create_before_destroy: true,
             ..Default::default()
         },
-        changed_create_only: vec!["cidr_block".to_string()],
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
+            .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],
@@ -1215,7 +1228,8 @@ fn cascade_prevent_destroy_blocks_merge_upgrade_to_replace() {
             create_before_destroy: true,
             ..Default::default()
         },
-        changed_create_only: vec!["cidr_block".to_string()],
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
+            .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],

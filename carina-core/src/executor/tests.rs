@@ -1042,7 +1042,8 @@ async fn test_cbd_creates_before_deletes() {
             create_before_destroy: true,
             ..Default::default()
         },
-        changed_create_only: vec!["attr".to_string()],
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
+            .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],
@@ -1087,7 +1088,8 @@ async fn test_dbd_deletes_before_creates() {
         from: Box::new(from),
         to,
         directives: Directives::default(),
-        changed_create_only: vec!["attr".to_string()],
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
+            .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],
@@ -1151,7 +1153,8 @@ async fn test_phased_cbd_creates_in_forward_order_deletes_in_reverse() {
         from: Box::new(vpc_from),
         to: vpc_to,
         directives: cbd_directives.clone(),
-        changed_create_only: vec!["attr".to_string()],
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
+            .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],
@@ -1161,7 +1164,8 @@ async fn test_phased_cbd_creates_in_forward_order_deletes_in_reverse() {
         from: Box::new(subnet_from),
         to: subnet_to,
         directives: cbd_directives,
-        changed_create_only: vec!["attr".to_string()],
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
+            .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],
@@ -1228,7 +1232,8 @@ async fn test_phased_noncbd_creates_after_deletes() {
         from: Box::new(vpc_from),
         to: vpc_to,
         directives: dbd_directives.clone(),
-        changed_create_only: vec!["attr".to_string()],
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
+            .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],
@@ -1238,7 +1243,8 @@ async fn test_phased_noncbd_creates_after_deletes() {
         from: Box::new(subnet_from),
         to: subnet_to,
         directives: dbd_directives,
-        changed_create_only: vec!["attr".to_string()],
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
+            .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],
@@ -2189,7 +2195,10 @@ async fn test_delete_waits_for_replace_cbd_of_dependent() {
         from: Box::new(attachment_from),
         to: attachment_to,
         directives: cbd_directives,
-        changed_create_only: vec!["transit_gateway_id".to_string()],
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
+            "transit_gateway_id".to_string(),
+        ])
+        .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],
@@ -2283,7 +2292,10 @@ async fn test_delete_waits_for_replace_cbd_even_when_delete_binding_is_none() {
         from: Box::new(attachment_from),
         to: attachment_to,
         directives: cbd_directives,
-        changed_create_only: vec!["transit_gateway_id".to_string()],
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
+            "transit_gateway_id".to_string(),
+        ])
+        .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],
@@ -3178,7 +3190,8 @@ async fn test_phased_move_with_interdependent_replace_does_not_panic() {
         from: Box::new(role_from),
         to: role_to,
         directives: Directives::default(),
-        changed_create_only: vec!["role_name".to_string()],
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["role_name".to_string()])
+            .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],
@@ -3192,7 +3205,8 @@ async fn test_phased_move_with_interdependent_replace_does_not_panic() {
         from: Box::new(policy_from),
         to: policy_to,
         directives: Directives::default(),
-        changed_create_only: vec!["policy_name".to_string()],
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["policy_name".to_string()])
+            .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],

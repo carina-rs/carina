@@ -1781,7 +1781,10 @@ async fn rename_failure_in_create_before_destroy_counts_as_failure() {
             create_before_destroy: true,
             ..Default::default()
         },
-        changed_create_only: vec!["bucket_name".to_string()],
+        changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec![
+            "bucket_name".to_string(),
+        ])
+        .unwrap(),
         cascading_updates: vec![],
         temporary_name: Some(TemporaryName {
             attribute: "bucket_name".to_string(),
@@ -1911,7 +1914,10 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
             create_before_destroy: true,
             ..Default::default()
         },
-        changed_create_only: vec!["cidr_block".to_string()],
+        changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec![
+            "cidr_block".to_string(),
+        ])
+        .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],

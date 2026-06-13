@@ -690,7 +690,6 @@ fn proto_schema_to_core(
             proto::SchemaKind::DataSource => carina_core::schema::SchemaKind::DataSource,
         },
         name_attribute: s.name_attribute.clone(),
-        force_replace: s.force_replace,
         operation_config: s.operation_config.as_ref().map(|c| {
             carina_core::schema::OperationConfig {
                 delete_timeout_secs: c.delete_timeout_secs,
@@ -1633,7 +1632,6 @@ mod tests {
             "resource_type": "ec2.SecurityGroup",
             "description": "EC2 Security Group",
             "name_attribute": "group_name",
-            "force_replace": true,
             "attributes": {
               "ingress": {
                 "name": "ingress",
@@ -1717,7 +1715,6 @@ mod tests {
         assert_eq!(schema.description.as_deref(), Some("EC2 Security Group"));
         assert!(!schema.is_data_source());
         assert_eq!(schema.name_attribute.as_deref(), Some("group_name"));
-        assert!(schema.force_replace);
 
         // Basic attribute types
         let desc_attr = schema
@@ -1917,7 +1914,6 @@ mod tests {
             description: None,
             kind: proto::SchemaKind::Managed,
             name_attribute: None,
-            force_replace: false,
             operation_config: None,
             validators: vec![proto::ValidatorType::TagsKeyValueCheck],
             exclusive_required: vec![],
@@ -1935,7 +1931,6 @@ mod tests {
             description: None,
             kind: proto::SchemaKind::Managed,
             name_attribute: None,
-            force_replace: false,
             operation_config: None,
             validators: vec![],
             exclusive_required: vec![],
@@ -1955,7 +1950,6 @@ mod tests {
             description: None,
             kind: proto::SchemaKind::Managed,
             name_attribute: None,
-            force_replace: false,
             operation_config: None,
             validators: vec![],
             exclusive_required: vec![vec![
@@ -1994,7 +1988,6 @@ mod tests {
             description: None,
             kind: proto::SchemaKind::Managed,
             name_attribute: None,
-            force_replace: false,
             operation_config: None,
             validators: vec![],
             exclusive_required: vec![vec!["a".to_string(), "b".to_string()]],
@@ -2650,7 +2643,6 @@ mod tests {
             description: None,
             kind: proto::SchemaKind::Managed,
             name_attribute: None,
-            force_replace: false,
             operation_config: None,
             validators: vec![proto::ValidatorType::TagsKeyValueCheck],
             exclusive_required: vec![],

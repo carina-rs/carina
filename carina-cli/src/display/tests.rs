@@ -783,7 +783,10 @@ fn test_cascading_update_shows_attribute_diffs() {
             create_before_destroy: true,
             ..Default::default()
         },
-        changed_create_only: vec!["cidr_block".to_string()],
+        changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec![
+            "cidr_block".to_string(),
+        ])
+        .unwrap(),
         cascading_updates: vec![CascadingUpdate {
             id: ResourceId::new("ec2.Subnet", "subnet"),
             from: Box::new(subnet_from),
@@ -1156,7 +1159,10 @@ fn test_mixed_plan_tree_with_delete_effect() {
         from: Box::new(sg_from),
         to: sg_to,
         directives: Directives::default(),
-        changed_create_only: vec!["ref_vpc".to_string()],
+        changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec![
+            "ref_vpc".to_string(),
+        ])
+        .unwrap(),
         cascading_updates: vec![],
         temporary_name: None,
         cascade_ref_hints: vec![],
@@ -1351,7 +1357,8 @@ fn format_effect_replace_separates_type_and_name_with_space() {
         ))),
         to,
         directives: Directives::default(),
-        changed_create_only: Vec::new(),
+        changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
+            .unwrap(),
         cascading_updates: Vec::<CascadingUpdate>::new(),
         temporary_name: None,
         cascade_ref_hints: Vec::new(),
