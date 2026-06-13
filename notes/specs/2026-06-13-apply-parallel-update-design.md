@@ -130,7 +130,15 @@ conservatively:
   `Known(attribute)`.
 - A bare binding through `Value::visit_binding_refs` /
   `Value::BindingRef` produces `Unknown`.
-- `dependency_bindings` from state produce `Unknown`.
+- `dependency_bindings` from state produce `Unknown` only when the
+  binding is not already classified by `visit_resource_refs` or
+  `visit_binding_refs` in the same resource's attribute walk. The
+  resolver pre-populates `dependency_bindings` with value-ref bindings
+  as well as genuinely state-only bindings; treating every entry as
+  `Unknown` would collapse every value-ref edge to `Unknown` and disable
+  the relaxation entirely on the real CLI path. The guard preserves
+  `Known` reads for the dominant value-ref shape and applies `Unknown`
+  only to state/`depends_on`-only bindings.
 - Explicit `depends_on` from `directives.depends_on` produces
   `Unknown`.
 - Composition expansion through `compositions_by_binding` produces
@@ -226,10 +234,6 @@ struct DependencyAnalysis {
 
 fn build_dependency_analysis(...) -> DependencyAnalysis;
 
-fn build_dependency_map(...) -> HashMap<usize, HashSet<usize>> {
-    build_dependency_analysis(...).deps_of
-}
-
 fn relax_update_update_edges(effects: &[Effect], analysis: &mut DependencyAnalysis);
 ```
 
@@ -238,6 +242,12 @@ the per-edge read information. `relax_update_update_edges` mutates only
 `analysis.deps_of`, using `reads_by_edge` and each parent update's
 `WritesSet`. The scheduler receives the relaxed `deps_of` and remains
 ignorant of read/write analysis details.
+
+Both live apply and saved-plan apply pass the analyzer an
+`UnresolvedResource` map captured before `ResourceRef` substitution.
+Saved plan files persist that pre-resolution snapshot separately from
+`sorted_resources`; the latter is already resolved and must not be used
+for read-set classification.
 
 This keeps the scheduling surface small: `carina-core/src/executor/parallel.rs:236-269`
 continues to reason only about dependency completion and ready queues.

@@ -303,7 +303,7 @@ fn plan_file_serde_round_trip() {
     }];
 
     let plan_file = PlanFile {
-        version: 5,
+        version: 6,
         carina_version: "0.1.0".to_string(),
         timestamp: "2025-01-01T00:00:00Z".to_string(),
         source_path: "example.crn".to_string(),
@@ -339,7 +339,8 @@ fn plan_file_serde_round_trip() {
             ]),
         }),
         plan,
-        sorted_resources,
+        sorted_resources: sorted_resources.clone(),
+        unresolved_resources: sorted_resources,
         current_states,
         compositions: vec![],
         data_sources: vec![],
@@ -351,7 +352,7 @@ fn plan_file_serde_round_trip() {
     let json = serde_json::to_string_pretty(&plan_file).unwrap();
     let deserialized: PlanFile = serde_json::from_str(&json).unwrap();
 
-    assert_eq!(deserialized.version, 5);
+    assert_eq!(deserialized.version, 6);
     assert_eq!(deserialized.carina_version, "0.1.0");
     assert_eq!(deserialized.source_path, "example.crn");
     assert_eq!(deserialized.state_lineage, Some("test-lineage".to_string()));
@@ -361,6 +362,7 @@ fn plan_file_serde_round_trip() {
     assert!(deserialized.backend_config.is_some());
     assert_eq!(deserialized.plan.effects().len(), 2);
     assert_eq!(deserialized.sorted_resources.len(), 1);
+    assert_eq!(deserialized.unresolved_resources.len(), 1);
     assert_eq!(deserialized.current_states.len(), 1);
 }
 
@@ -1801,7 +1803,10 @@ async fn rename_failure_in_create_before_destroy_counts_as_failure() {
     let provider = RenameFailProvider;
     let mut bindings = carina_core::binding_index::ResolvedBindings::default();
     let mut current_states = HashMap::from([(id.clone(), old_state)]);
-    let unresolved_resources = HashMap::from([(id.clone(), new_resource)]);
+    let unresolved_resources = HashMap::from([(
+        id.clone(),
+        carina_core::executor::UnresolvedResource::from_pre_resolve(new_resource),
+    )]);
 
     let result = execute_effects(
         &plan,
@@ -1814,6 +1819,7 @@ async fn rename_failure_in_create_before_destroy_counts_as_failure() {
         &mut current_states,
         &unresolved_resources,
         &[],
+        carina_core::executor::TEST_UNCAPPED,
     )
     .await;
 
@@ -1966,9 +1972,15 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
     );
 
     // --- Unresolved resource map ---
-    let unresolved_resources: HashMap<ResourceId, Resource> = HashMap::from([
-        (vpc_id.clone(), vpc_unresolved),
-        (subnet_id.clone(), subnet_unresolved),
+    let unresolved_resources = HashMap::from([
+        (
+            vpc_id.clone(),
+            carina_core::executor::UnresolvedResource::from_pre_resolve(vpc_unresolved),
+        ),
+        (
+            subnet_id.clone(),
+            carina_core::executor::UnresolvedResource::from_pre_resolve(subnet_unresolved),
+        ),
     ]);
 
     // --- Execute ---
@@ -1984,6 +1996,7 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
         &mut current_states,
         &unresolved_resources,
         &[],
+        carina_core::executor::TEST_UNCAPPED,
     )
     .await;
 
@@ -2836,7 +2849,7 @@ fn plan_file_serialization_redacts_secrets() {
 
     // Redact before building PlanFile (same as production code does)
     let plan_file = PlanFile {
-        version: 5,
+        version: 6,
         carina_version: "0.1.0".to_string(),
         timestamp: "2025-01-01T00:00:00Z".to_string(),
         source_path: "example.crn".to_string(),
@@ -2846,6 +2859,7 @@ fn plan_file_serialization_redacts_secrets() {
         backend_config: None,
         plan: redact_secrets_in_plan(&plan).unwrap(),
         sorted_resources: vec![redact_secrets_in_resource(&resource_with_secret).unwrap()],
+        unresolved_resources: vec![redact_secrets_in_resource(&resource_with_secret).unwrap()],
         compositions: vec![],
         data_sources: vec![],
         current_states: vec![CurrentStateEntry {

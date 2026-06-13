@@ -10,6 +10,11 @@ fn total_apply_line_formats_duration() {
     );
 }
 
+#[test]
+fn apply_parallelism_default_is_eight() {
+    assert_eq!(crate::DEFAULT_PARALLELISM.get(), 8);
+}
+
 fn s3_backend_config_with_encrypt(encrypt: bool) -> carina_core::parser::BackendConfig {
     let mut attributes = HashMap::new();
     attributes.insert(
@@ -2041,7 +2046,7 @@ mod saved_plan_version_tests {
     /// The test writes a minimal v3-shaped JSON to disk and asserts
     /// the rejection. The plan body is deliberately tiny — the
     /// version gate runs first, before any field is consumed, so a
-    /// stub `effects: []` / `sorted_resources: []` is enough.
+    /// stub `effects: []` / resource arrays are enough.
     #[tokio::test]
     async fn version_3_saved_plan_is_rejected() {
         let dir = TempDir::new().expect("tempdir");
@@ -2059,6 +2064,7 @@ mod saved_plan_version_tests {
             "backend_config": null,
             "plan": { "effects": [] },
             "sorted_resources": [],
+            "unresolved_resources": [],
             "current_states": [],
             "upstream_snapshot": {},
             "upstream_sources": [],
@@ -2070,6 +2076,7 @@ mod saved_plan_version_tests {
             &plan_path,
             true,
             false,
+            std::num::NonZeroUsize::new(8).unwrap(),
             &carina_core::parser::ProviderContext::default(),
         )
         .await;
@@ -2081,7 +2088,7 @@ mod saved_plan_version_tests {
             "error must name the rejected version, got: {msg}",
         );
         assert!(
-            msg.contains("expected 5"),
+            msg.contains("expected 6"),
             "error must name the expected version, got: {msg}",
         );
         assert!(

@@ -1,6 +1,6 @@
 //! Dependency computation and parallel effect execution.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -8,6 +8,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::deps::find_failed_dependency;
 use crate::effect::{Effect, WaitTarget};
+use crate::parser::ResourceRef;
 use crate::provider::Provider;
 use crate::resource::{Resource, ResourceId, State, Value};
 
@@ -15,16 +16,311 @@ use super::basic::{
     BasicEffectCtx, ExecutionState, RenormalizePipeline, count_actionable_effects,
     execute_basic_effect, process_basic_result, refresh_pending_states,
 };
-use super::phased::DepResolver;
 use super::replace::{ReplaceContext, SingleEffectResult, execute_replace_parallel};
 use super::{ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, ProgressInfo};
 
-/// Build a dependency map: for each effect index, which other effect indices it depends on.
-pub(super) fn build_dependency_map(
+#[derive(Debug, Clone)]
+pub struct UnresolvedResource(Resource);
+
+impl UnresolvedResource {
+    /// Pre-resolution snapshot used by dependency analysis and apply-time
+    /// reference re-resolution.
+    ///
+    /// The executor deliberately accepts this newtype instead of a raw
+    /// [`Resource`] map so saved-plan and live-apply call sites cannot
+    /// accidentally pass resources after `ResourceRef` substitution. The
+    /// wrapped value may still be cloned from CLI-side parser output, but it
+    /// must cross this constructor seam at the pre-resolve snapshot point.
+    pub fn from_pre_resolve(resource: Resource) -> Self {
+        Self(resource)
+    }
+
+    pub fn as_resource(&self) -> &Resource {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WritesSet {
+    attrs: BTreeSet<String>,
+}
+
+impl WritesSet {
+    /// Build the static scheduler write set from the plan-time update
+    /// effect only.
+    ///
+    /// Apply-time patch augmentation can still recompute the effective
+    /// patch, but after #3490 it uses the same type-aware comparison as
+    /// plan-time `changed_attributes`. Attributes that are equivalent
+    /// under that comparison are not widened into the provider patch, so
+    /// the scheduler's static safety predicate remains tied to this
+    /// plan-time set.
+    pub(crate) fn from_update(effect: &Effect) -> Option<Self> {
+        let Effect::Update {
+            changed_attributes, ..
+        } = effect
+        else {
+            return None;
+        };
+        Some(Self {
+            attrs: changed_attributes.iter().cloned().collect(),
+        })
+    }
+}
+
+mod reads {
+    use std::collections::BTreeSet;
+
+    use crate::resource::AccessPath;
+
+    use super::WritesSet;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct KnownReads {
+        attrs: BTreeSet<String>,
+    }
+
+    impl KnownReads {
+        pub(crate) fn from_walker(path: &AccessPath) -> Self {
+            let mut attrs = BTreeSet::new();
+            attrs.insert(path.attribute().to_string());
+            Self { attrs }
+        }
+
+        #[cfg(test)]
+        pub(crate) fn from_attrs(attrs: &[&str]) -> Self {
+            Self {
+                attrs: attrs.iter().map(|attr| (*attr).to_string()).collect(),
+            }
+        }
+
+        pub(crate) fn attrs(&self) -> &BTreeSet<String> {
+            &self.attrs
+        }
+
+        fn union(mut self, other: KnownReads) -> Self {
+            self.attrs.extend(other.attrs);
+            self
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum ReadsSet {
+        Known(KnownReads),
+        Unknown,
+    }
+
+    impl ReadsSet {
+        pub(crate) fn from_walker(walker_result: KnownReads) -> Self {
+            Self::Known(walker_result)
+        }
+
+        pub(crate) fn unknown() -> Self {
+            Self::Unknown
+        }
+
+        pub(crate) fn merge(self, other: ReadsSet) -> ReadsSet {
+            match (self, other) {
+                (ReadsSet::Known(a), ReadsSet::Known(b)) => ReadsSet::Known(a.union(b)),
+                _ => ReadsSet::Unknown,
+            }
+        }
+
+        pub(crate) fn disjoint(&self, writes: &WritesSet) -> bool {
+            match self {
+                ReadsSet::Known(set) => set.attrs().is_disjoint(&writes.attrs),
+                ReadsSet::Unknown => false,
+            }
+        }
+
+        #[cfg(test)]
+        pub(crate) fn is_unknown(&self) -> bool {
+            matches!(self, ReadsSet::Unknown)
+        }
+    }
+}
+
+use reads::{KnownReads, ReadsSet};
+
+pub(super) struct DependencyAnalysis {
+    deps_of: HashMap<usize, HashSet<usize>>,
+    reads_by_edge: HashMap<usize, HashMap<usize, ReadsSet>>,
+}
+
+impl DependencyAnalysis {
+    fn new(effect_count: usize) -> Self {
+        let deps_of = (0..effect_count).map(|idx| (idx, HashSet::new())).collect();
+        Self {
+            deps_of,
+            reads_by_edge: HashMap::new(),
+        }
+    }
+
+    fn add_edge(&mut self, child: usize, parent: usize, reads: ReadsSet) {
+        self.deps_of.entry(child).or_default().insert(parent);
+        self.reads_by_edge
+            .entry(child)
+            .or_default()
+            .entry(parent)
+            .and_modify(|existing| {
+                let previous = std::mem::replace(existing, ReadsSet::unknown());
+                *existing = previous.merge(reads.clone());
+            })
+            .or_insert(reads);
+    }
+
+    fn remove_edge(&mut self, child: usize, parent: usize) {
+        if let Some(deps) = self.deps_of.get_mut(&child) {
+            deps.remove(&parent);
+        }
+    }
+
+    fn deps_for(&self, child: usize) -> Option<&HashSet<usize>> {
+        self.deps_of.get(&child)
+    }
+
+    fn reads_for_edge(&self, child: usize, parent: usize) -> Option<&ReadsSet> {
+        self.reads_by_edge
+            .get(&child)
+            .and_then(|by_parent| by_parent.get(&parent))
+    }
+
+    pub(super) fn into_deps_of(self) -> HashMap<usize, HashSet<usize>> {
+        self.deps_of
+    }
+}
+
+struct DependencyAnalyzer {
+    binding_to_idx: HashMap<String, usize>,
+    compositions_by_binding: HashMap<String, crate::resource::Composition>,
+}
+
+impl DependencyAnalyzer {
+    fn new(
+        binding_to_idx: HashMap<String, usize>,
+        compositions: &[crate::resource::Composition],
+    ) -> Self {
+        let compositions_by_binding = compositions
+            .iter()
+            .filter_map(|composition| {
+                composition
+                    .binding
+                    .clone()
+                    .map(|binding| (binding, composition.clone()))
+            })
+            .collect();
+        Self {
+            binding_to_idx,
+            compositions_by_binding,
+        }
+    }
+
+    fn collect_from_effect(
+        &self,
+        effect: &Effect,
+        analysis: &mut DependencyAnalysis,
+        child: usize,
+    ) {
+        if let Some(resource) = effect.as_resource_ref() {
+            self.collect_from_resource_ref(resource, analysis, child);
+        }
+        for binding in effect.explicit_dependencies() {
+            self.record_binding_edge(&binding, ReadsSet::unknown(), analysis, child);
+        }
+    }
+
+    fn collect_from_resource_ref(
+        &self,
+        resource: ResourceRef<'_>,
+        analysis: &mut DependencyAnalysis,
+        child: usize,
+    ) {
+        let attrs = resource.attributes();
+        let mut bindings_seen_in_values = HashSet::new();
+        for value in attrs.values() {
+            value.visit_resource_refs(&mut |path| {
+                bindings_seen_in_values.insert(path.binding().to_string());
+                self.record_binding_edge(
+                    path.binding(),
+                    ReadsSet::from_walker(KnownReads::from_walker(path)),
+                    analysis,
+                    child,
+                );
+            });
+            value.visit_binding_refs(&mut |binding| {
+                bindings_seen_in_values.insert(binding.to_string());
+                self.record_binding_edge(binding, ReadsSet::unknown(), analysis, child);
+            });
+        }
+        for binding in resource.dependency_bindings() {
+            if !bindings_seen_in_values.contains(binding) {
+                self.record_binding_edge(binding, ReadsSet::unknown(), analysis, child);
+            }
+        }
+        if let Some(directives) = resource.directives() {
+            for binding in &directives.depends_on {
+                self.record_binding_edge(binding, ReadsSet::unknown(), analysis, child);
+            }
+        }
+    }
+
+    fn collect_from_resource(
+        &self,
+        resource: &Resource,
+        analysis: &mut DependencyAnalysis,
+        child: usize,
+    ) {
+        self.collect_from_resource_ref(ResourceRef::Resource(resource), analysis, child);
+    }
+
+    fn record_binding_edge(
+        &self,
+        binding: &str,
+        reads: ReadsSet,
+        analysis: &mut DependencyAnalysis,
+        child: usize,
+    ) {
+        let mut visited = HashSet::new();
+        self.record_binding_edge_inner(binding, reads, analysis, child, &mut visited);
+    }
+
+    fn record_binding_edge_inner<'a>(
+        &'a self,
+        binding: &'a str,
+        reads: ReadsSet,
+        analysis: &mut DependencyAnalysis,
+        child: usize,
+        visited: &mut HashSet<&'a str>,
+    ) {
+        if !visited.insert(binding) {
+            return;
+        }
+        if let Some(&parent) = self.binding_to_idx.get(binding) {
+            analysis.add_edge(child, parent, reads);
+            return;
+        }
+        let Some(composition) = self.compositions_by_binding.get(binding) else {
+            return;
+        };
+        for inner in crate::deps::get_composition_dependencies(composition) {
+            let key: &'a str =
+                if let Some((k, _)) = self.compositions_by_binding.get_key_value(inner.as_str()) {
+                    k.as_str()
+                } else if let Some((k, _)) = self.binding_to_idx.get_key_value(inner.as_str()) {
+                    k.as_str()
+                } else {
+                    continue;
+                };
+            self.record_binding_edge_inner(key, ReadsSet::unknown(), analysis, child, visited);
+        }
+    }
+}
+
+pub(super) fn build_dependency_analysis(
     effects: &[Effect],
-    unresolved_resources: &HashMap<ResourceId, Resource>,
+    unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
     compositions: &[crate::resource::Composition],
-) -> HashMap<usize, HashSet<usize>> {
+) -> DependencyAnalysis {
     // Build binding -> effect index mapping
     let mut binding_to_idx: HashMap<String, usize> = HashMap::new();
     // Fallback: ResourceId name -> effect index for Delete effects without bindings.
@@ -44,18 +340,17 @@ pub(super) fn build_dependency_map(
         }
     }
 
-    let resolver = DepResolver::new(&binding_to_idx, compositions, None);
+    let analyzer = DependencyAnalyzer::new(binding_to_idx.clone(), compositions);
 
-    let mut deps_of: HashMap<usize, HashSet<usize>> = HashMap::new();
+    let mut analysis = DependencyAnalysis::new(effects.len());
     for (idx, effect) in effects.iter().enumerate() {
-        let mut dep_indices = HashSet::new();
         if effect.as_resource_ref().is_some() {
-            resolver.collect_from_effect(effect, &mut dep_indices);
             if let Some(unresolved) = unresolved_resources.get(effect.resource_id()) {
-                resolver.collect_from_resource(unresolved, &mut dep_indices);
+                analyzer.collect_from_resource(unresolved.as_resource(), &mut analysis, idx);
+            } else {
+                analyzer.collect_from_effect(effect, &mut analysis, idx);
             }
         }
-        deps_of.insert(idx, dep_indices);
     }
 
     // Helper: look up effect index by binding name, falling back to Delete-by-name.
@@ -93,7 +388,7 @@ pub(super) fn build_dependency_map(
         }
     }
     for (parent_idx, child_idx) in reverse_deps {
-        deps_of.entry(parent_idx).or_default().insert(child_idx);
+        analysis.add_edge(parent_idx, child_idx, ReadsSet::unknown());
     }
 
     // Wait dependencies: each `Effect::Wait` depends on the effect that
@@ -109,32 +404,54 @@ pub(super) fn build_dependency_map(
             // start immediately, which is what we want for refresh-only
             // applies.
             if let Some(target_binding) = lookup_idx(target_id.name_str()) {
-                deps_of.entry(idx).or_default().insert(target_binding);
+                analysis.add_edge(idx, target_binding, ReadsSet::unknown());
             }
             // Honour `depends_on = [...]` declared in the wait block.
             for dep_binding in effect.explicit_dependencies() {
                 if let Some(dep_idx) = lookup_idx(&dep_binding) {
-                    deps_of.entry(idx).or_default().insert(dep_idx);
+                    analysis.add_edge(idx, dep_idx, ReadsSet::unknown());
                 }
             }
             // Defensive: ensure the wait has an entry even when it has
             // no resolved deps (an isolated wait still needs to appear
             // in deps_of so the scheduler's `&deps_of[&idx]` lookup
             // doesn't panic).
-            deps_of.entry(idx).or_default();
         }
     }
 
-    deps_of
+    analysis
+}
+
+pub(super) fn relax_update_update_edges(effects: &[Effect], analysis: &mut DependencyAnalysis) {
+    for child in 0..effects.len() {
+        if !matches!(&effects[child], Effect::Update { .. }) {
+            continue;
+        }
+        let Some(parents) = analysis.deps_for(child).cloned() else {
+            continue;
+        };
+        for parent in parents {
+            let Some(writes) = WritesSet::from_update(&effects[parent]) else {
+                continue;
+            };
+            let Some(reads) = analysis.reads_for_edge(child, parent) else {
+                continue;
+            };
+            if reads.disjoint(&writes) {
+                analysis.remove_edge(child, parent);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 pub(super) fn build_dependency_levels(
     effects: &[Effect],
-    unresolved_resources: &HashMap<ResourceId, Resource>,
+    unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
     compositions: &[crate::resource::Composition],
 ) -> Vec<Vec<usize>> {
-    let deps_of = build_dependency_map(effects, unresolved_resources, compositions);
+    let deps_of =
+        build_dependency_analysis(effects, unresolved_resources, compositions).into_deps_of();
 
     // Assign levels: each effect's level is max(deps' levels) + 1, or 0 if no deps
     let mut levels: HashMap<usize, usize> = HashMap::new();
@@ -203,7 +520,10 @@ pub(super) async fn execute_effects_sequential(
     let total = count_actionable_effects(effects);
     let completed = AtomicUsize::new(0);
 
-    let deps_of = build_dependency_map(effects, input.unresolved_resources, input.compositions);
+    let mut analysis =
+        build_dependency_analysis(effects, input.unresolved_resources, input.compositions);
+    relax_update_update_edges(effects, &mut analysis);
+    let deps_of = analysis.into_deps_of();
 
     // Build effect index -> binding name mapping for resolving dependency names
     let idx_to_binding: HashMap<usize, String> = effects
@@ -267,6 +587,9 @@ pub(super) async fn execute_effects_sequential(
                 });
             }
         }
+
+        let available = input.parallelism.get().saturating_sub(in_flight.len());
+        newly_ready.truncate(available);
 
         // Process newly ready effects: skip those with failed deps, spawn the rest
         for idx in newly_ready {
@@ -589,13 +912,334 @@ pub(super) async fn execute_effects_sequential(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::effect::ChangedCreateOnly;
     use crate::resource::{Composition, Value};
+    use std::collections::BTreeSet;
+
+    fn set(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|item| (*item).to_string()).collect()
+    }
+
+    fn state_for(id: &ResourceId) -> State {
+        State::existing(id.clone(), HashMap::new()).with_identifier("id")
+    }
+
+    fn update_effect(binding: &str, reads: &[(&str, &str)], writes: &[&str]) -> Effect {
+        let id = ResourceId::new("test", binding);
+        let mut to = Resource::new("test", binding);
+        to.binding = Some(binding.to_string());
+        for (dep, attr) in reads {
+            to.set_attr(
+                format!("{}_{}", dep, attr),
+                Value::resource_ref(*dep, *attr, vec![]),
+            );
+        }
+        Effect::Update {
+            id: id.clone(),
+            from: Box::new(state_for(&id)),
+            to,
+            changed_attributes: writes.iter().map(|attr| (*attr).to_string()).collect(),
+        }
+    }
+
+    fn replace_effect(binding: &str, reads: &[(&str, &str)]) -> Effect {
+        let id = ResourceId::new("test", binding);
+        let mut to = Resource::new("test", binding);
+        to.binding = Some(binding.to_string());
+        for (dep, attr) in reads {
+            to.set_attr(
+                format!("{}_{}", dep, attr),
+                Value::resource_ref(*dep, *attr, vec![]),
+            );
+        }
+        Effect::Replace {
+            id: id.clone(),
+            from: Box::new(state_for(&id)),
+            to,
+            directives: Default::default(),
+            changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
+            cascading_updates: Vec::new(),
+            temporary_name: None,
+            cascade_ref_hints: Vec::new(),
+        }
+    }
+
+    fn dependency_after_relax(parent: Effect, child: Effect) -> HashSet<usize> {
+        let effects = vec![parent, child];
+        let unresolved: HashMap<ResourceId, UnresolvedResource> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Create(resource)
+                | Effect::Update { to: resource, .. }
+                | Effect::Replace { to: resource, .. } => Some((
+                    resource.id.clone(),
+                    UnresolvedResource::from_pre_resolve(resource.clone()),
+                )),
+                _ => None,
+            })
+            .collect();
+        let mut analysis = build_dependency_analysis(&effects, &unresolved, &[]);
+        relax_update_update_edges(&effects, &mut analysis);
+        analysis.into_deps_of().remove(&1).unwrap()
+    }
+
+    #[test]
+    fn reads_set_merge_and_disjoint_keep_unknown_distinct_from_empty_known() {
+        let known_id = ReadsSet::from_walker(KnownReads::from_attrs(&["id"]));
+        let known_tags = ReadsSet::from_walker(KnownReads::from_attrs(&["tags"]));
+        let merged = known_id.merge(known_tags);
+        assert!(matches!(
+            merged,
+            ReadsSet::Known(attrs) if attrs.attrs() == &set(&["id", "tags"])
+        ));
+
+        let unknown =
+            ReadsSet::from_walker(KnownReads::from_attrs(&["id"])).merge(ReadsSet::unknown());
+        assert!(unknown.is_unknown());
+
+        let update = update_effect("parent", &[], &["tags"]);
+        let writes = WritesSet::from_update(&update).unwrap();
+        assert!(ReadsSet::from_walker(KnownReads::from_attrs(&[])).disjoint(&writes));
+        assert!(ReadsSet::from_walker(KnownReads::from_attrs(&["id"])).disjoint(&writes));
+        assert!(!ReadsSet::from_walker(KnownReads::from_attrs(&["tags"])).disjoint(&writes));
+        assert!(!ReadsSet::unknown().disjoint(&writes));
+        assert!(WritesSet::from_update(&Effect::Create(Resource::new("test", "x"))).is_none());
+    }
+
+    #[test]
+    fn relax_update_update_edge_when_child_reads_disjoint_attribute() {
+        let deps = dependency_after_relax(
+            update_effect("parent", &[], &["tags"]),
+            update_effect("child", &[("parent", "id")], &["tags"]),
+        );
+        assert!(!deps.contains(&0), "disjoint update edge should be relaxed");
+    }
+
+    #[test]
+    fn keep_update_update_edge_when_child_reads_written_attribute() {
+        let deps = dependency_after_relax(
+            update_effect("parent", &[], &["tags"]),
+            update_effect("child", &[("parent", "tags")], &["name"]),
+        );
+        assert!(deps.contains(&0), "overlapping read/write edge must remain");
+    }
+
+    #[test]
+    fn keep_update_update_edge_for_bare_binding_unknown_read() {
+        let parent = update_effect("parent", &[], &["cidr_block"]);
+        let mut child = match update_effect("child", &[], &["name"]) {
+            Effect::Update { to, .. } => to,
+            _ => unreachable!(),
+        };
+        child.set_attr(
+            "whole_parent",
+            Value::Deferred(crate::resource::DeferredValue::BindingRef {
+                binding: "parent".to_string(),
+            }),
+        );
+        let child = Effect::Update {
+            id: child.id.clone(),
+            from: Box::new(state_for(&child.id)),
+            to: child,
+            changed_attributes: vec!["name".to_string()],
+        };
+
+        let deps = dependency_after_relax(parent, child);
+        assert!(deps.contains(&0), "unknown bare-binding read must remain");
+    }
+
+    #[test]
+    fn keep_update_update_edge_when_known_read_also_has_depends_on_unknown() {
+        let parent = update_effect("parent", &[], &["tags"]);
+        let mut child = match update_effect("child", &[("parent", "id")], &["name"]) {
+            Effect::Update { to, .. } => to,
+            _ => unreachable!(),
+        };
+        child.directives.depends_on.push("parent".to_string());
+        let child = Effect::Update {
+            id: child.id.clone(),
+            from: Box::new(state_for(&child.id)),
+            to: child,
+            changed_attributes: vec!["name".to_string()],
+        };
+
+        let deps = dependency_after_relax(parent, child);
+        assert!(
+            deps.contains(&0),
+            "depends_on must promote reads to unknown"
+        );
+    }
+
+    #[test]
+    fn dependency_bindings_only_path_escalates_to_unknown() {
+        let parent = update_effect("parent", &[], &["tags"]);
+        let mut child = match update_effect("child", &[], &["name"]) {
+            Effect::Update { to, .. } => to,
+            _ => unreachable!(),
+        };
+        child.dependency_bindings.insert("parent".to_string());
+        let child_id = child.id.clone();
+        let effects = vec![
+            parent,
+            Effect::Update {
+                id: child_id.clone(),
+                from: Box::new(state_for(&child_id)),
+                to: child.clone(),
+                changed_attributes: vec!["name".to_string()],
+            },
+        ];
+        let unresolved = HashMap::from([
+            (
+                effects[0].resource_id().clone(),
+                UnresolvedResource::from_pre_resolve(match &effects[0] {
+                    Effect::Update { to, .. } => to.clone(),
+                    _ => unreachable!(),
+                }),
+            ),
+            (child_id, UnresolvedResource::from_pre_resolve(child)),
+        ]);
+
+        let analysis = build_dependency_analysis(&effects, &unresolved, &[]);
+        assert!(
+            analysis
+                .reads_for_edge(1, 0)
+                .is_some_and(ReadsSet::is_unknown),
+            "dependency_bindings-only edge must be unknown"
+        );
+
+        let mut analysis = analysis;
+        relax_update_update_edges(&effects, &mut analysis);
+        assert!(
+            analysis.into_deps_of()[&1].contains(&0),
+            "unknown dependency_bindings edge must not be relaxed",
+        );
+    }
+
+    #[test]
+    fn create_parent_update_child_is_not_relaxed() {
+        let mut parent = Resource::new("test", "parent");
+        parent.binding = Some("parent".to_string());
+        let deps = dependency_after_relax(
+            Effect::Create(parent),
+            update_effect("child", &[("parent", "id")], &["tags"]),
+        );
+        assert!(
+            deps.contains(&0),
+            "Create parent is outside relaxation scope"
+        );
+    }
+
+    #[test]
+    fn replace_parent_update_child_is_not_relaxed() {
+        let deps = dependency_after_relax(
+            replace_effect("parent", &[]),
+            update_effect("child", &[("parent", "id")], &["tags"]),
+        );
+        assert!(
+            deps.contains(&0),
+            "Replace parent is outside relaxation scope"
+        );
+    }
+
+    #[test]
+    fn keep_update_update_edge_for_composition_expansion_unknown_read() {
+        let parent = update_effect("parent", &[], &["tags"]);
+        let mut child = match update_effect("child", &[], &["name"]) {
+            Effect::Update { to, .. } => to,
+            _ => unreachable!(),
+        };
+        child.set_attr(
+            "forwarded",
+            Value::resource_ref("module", "parent_id", vec![]),
+        );
+
+        let mut virt_attrs: indexmap::IndexMap<String, crate::resource::CompositionAttribute> =
+            indexmap::IndexMap::new();
+        virt_attrs.insert(
+            "parent_id".to_string(),
+            crate::resource::CompositionAttribute::from_value(Value::resource_ref(
+                "parent",
+                "id",
+                vec![],
+            )),
+        );
+        let virt = Composition {
+            id: ResourceId::with_provider("_virtual", "_virtual", "module", None),
+            signature: crate::resource::Signature {
+                arguments: indexmap::IndexMap::new(),
+                attributes: virt_attrs,
+            },
+            binding: Some("module".to_string()),
+            dependency_bindings: std::collections::BTreeSet::new(),
+            module_name: "network".to_string(),
+            instance: "module".to_string(),
+            quoted_string_attrs: std::collections::HashSet::new(),
+        };
+
+        let child_id = child.id.clone();
+        let effects = vec![
+            parent,
+            Effect::Update {
+                id: child_id.clone(),
+                from: Box::new(state_for(&child_id)),
+                to: child.clone(),
+                changed_attributes: vec!["name".to_string()],
+            },
+        ];
+        let unresolved = HashMap::from([
+            (
+                effects[0].resource_id().clone(),
+                UnresolvedResource::from_pre_resolve(match &effects[0] {
+                    Effect::Update { to, .. } => to.clone(),
+                    _ => unreachable!(),
+                }),
+            ),
+            (child_id, UnresolvedResource::from_pre_resolve(child)),
+        ]);
+        let mut analysis = build_dependency_analysis(&effects, &unresolved, &[virt]);
+        relax_update_update_edges(&effects, &mut analysis);
+        let deps_of = analysis.into_deps_of();
+
+        assert!(
+            deps_of[&1].contains(&0),
+            "composition expansion must promote the edge to unknown and keep it",
+        );
+    }
+
+    #[test]
+    fn relax_update_update_edges_handles_empty_plan() {
+        let effects = Vec::new();
+        let mut analysis = build_dependency_analysis(&effects, &HashMap::new(), &[]);
+        relax_update_update_edges(&effects, &mut analysis);
+        assert!(analysis.into_deps_of().is_empty());
+    }
+
+    #[test]
+    fn relax_update_update_edges_handles_single_update_without_parent() {
+        let effect = update_effect("only", &[], &["tags"]);
+        let effects = vec![effect];
+        let mut analysis = build_dependency_analysis(&effects, &HashMap::new(), &[]);
+        relax_update_update_edges(&effects, &mut analysis);
+        assert!(analysis.into_deps_of()[&0].is_empty());
+    }
+
+    #[test]
+    fn relax_update_update_edges_ignores_parent_update_without_update_children() {
+        let child = Resource::new("test", "child");
+        let effects = vec![
+            update_effect("parent", &[], &["tags"]),
+            Effect::Create(child),
+        ];
+        let mut analysis = build_dependency_analysis(&effects, &HashMap::new(), &[]);
+        relax_update_update_edges(&effects, &mut analysis);
+        assert!(analysis.into_deps_of()[&0].is_empty());
+    }
 
     /// Mirror of #2543's phased-executor test for the unphased dependency map:
     /// composition module-attribute proxies must be transparently followed to the
     /// underlying resources their attributes reference.
     #[test]
-    fn build_dependency_map_follows_virtual_module_binding() {
+    fn build_dependency_analysis_follows_virtual_module_binding() {
         let mut role = Resource::with_provider("awscc", "iam.Role", "bootstrap.role", None);
         role.binding = Some("bootstrap.role".to_string());
 
@@ -634,11 +1278,17 @@ mod tests {
             Effect::Create(role_policy.clone()),
         ];
 
-        let mut unresolved: HashMap<ResourceId, Resource> = HashMap::new();
-        unresolved.insert(role.id.clone(), role.clone());
-        unresolved.insert(role_policy.id.clone(), role_policy);
+        let mut unresolved: HashMap<ResourceId, UnresolvedResource> = HashMap::new();
+        unresolved.insert(
+            role.id.clone(),
+            UnresolvedResource::from_pre_resolve(role.clone()),
+        );
+        unresolved.insert(
+            role_policy.id.clone(),
+            UnresolvedResource::from_pre_resolve(role_policy),
+        );
 
-        let deps_of = build_dependency_map(&effects, &unresolved, &[virt]);
+        let deps_of = build_dependency_analysis(&effects, &unresolved, &[virt]).into_deps_of();
 
         assert!(
             deps_of[&1].contains(&0),

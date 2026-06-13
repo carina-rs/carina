@@ -8,6 +8,7 @@ use crate::differ::{
     AttrComparison, TypedAttr, key_should_enter_patch, secret_grafted_comparison_view,
 };
 use crate::effect::Effect;
+use crate::executor::UnresolvedResource;
 use crate::executor::normalized::NormalizedResource;
 use crate::provider::{
     CreateRequest, DeleteRequest, PatchOp, PatchOpKind, Provider, UpdatePatch, UpdateRequest,
@@ -131,7 +132,7 @@ pub(super) struct ReplaceContext<'a> {
     pub(super) cascading_updates: &'a [crate::effect::CascadingUpdate],
     pub(super) temporary_name: Option<&'a crate::effect::TemporaryName>,
     pub(super) bindings: &'a ResolvedBindings,
-    pub(super) unresolved: &'a HashMap<ResourceId, Resource>,
+    pub(super) unresolved: &'a HashMap<ResourceId, UnresolvedResource>,
     pub(super) pipeline: &'a RenormalizePipeline<'a>,
     pub(super) started: Instant,
     pub(super) progress: ProgressInfo,
@@ -421,7 +422,10 @@ pub(super) async fn execute_dbd_replace_parallel(
         .await
     {
         Ok(()) => {
-            let resolve_source = ctx.unresolved.get(&ctx.to.id).unwrap_or(ctx.to);
+            let resolve_source = ctx
+                .unresolved
+                .get(&ctx.to.id)
+                .map_or(ctx.to, UnresolvedResource::as_resource);
             let resolved = match resolve_resource_with_source(
                 ctx.to,
                 resolve_source,

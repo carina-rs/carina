@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -46,6 +47,7 @@ pub async fn run_destroy(
     lock: bool,
     refresh: bool,
     force: bool,
+    parallelism: NonZeroUsize,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
     let mut parsed = load_configuration_with_config(
@@ -103,6 +105,7 @@ pub async fn run_destroy(
         refresh,
         force,
         base_dir,
+        parallelism,
     ))
     .await;
 
@@ -135,6 +138,7 @@ async fn run_destroy_locked(
     refresh: bool,
     force: bool,
     base_dir: &std::path::Path,
+    parallelism: NonZeroUsize,
 ) -> Result<(), AppError> {
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
     let ctx = WiringContext::new(factories);
@@ -553,6 +557,7 @@ async fn run_destroy_locked(
             }
         }
         newly_ready.sort();
+        newly_ready.truncate(parallelism.get().saturating_sub(in_flight.len()));
 
         // Process newly ready resources
         for idx in newly_ready {
@@ -954,6 +959,11 @@ mod tests {
     use carina_core::provider::{BoxFuture, Provider, ProviderError, ProviderResult};
     use carina_core::resource::DataSource;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn destroy_parallelism_default_is_eight() {
+        assert_eq!(crate::DEFAULT_PARALLELISM.get(), 8);
+    }
 
     /// A mock provider whose `read()` returns a sequence of results.
     struct SequenceProvider {

@@ -1066,6 +1066,13 @@ async fn instantiate_provider_into_router(
                 .await,
         );
         router.add_provider_instance(provider_config.name.clone(), binding, provider);
+    } else if provider_config.name == "mock" {
+        println!("{}", "Using mock provider".cyan());
+        router.add_provider_instance(
+            provider_config.name.clone(),
+            binding,
+            Box::new(MockProvider::new()),
+        );
     } else if !provider_config.name.is_empty() {
         let message = match &binding {
             // Named instance whose kind's default did not register a
