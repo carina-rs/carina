@@ -1114,33 +1114,37 @@ impl Value {
         }
     }
 
-    /// Recursively walk this value, invoking `f` on each `ResourceRef`'s `AccessPath`.
-    pub fn visit_refs(&self, f: &mut impl FnMut(&AccessPath)) {
+    /// Recursively walk this value, invoking `f` on each `ResourceRef` access path.
+    ///
+    /// Companion: `visit_binding_refs` for bare `BindingRef` names. A consumer that
+    /// needs both must call both — drift is visible at the call site.
+    pub fn visit_resource_refs(&self, f: &mut impl FnMut(&AccessPath)) {
         match self {
             Value::Deferred(DeferredValue::ResourceRef { path }) => f(path),
             Value::Concrete(ConcreteValue::List(items)) => {
                 for v in items {
-                    v.visit_refs(f);
+                    v.visit_resource_refs(f);
                 }
             }
             Value::Concrete(ConcreteValue::Map(map)) => {
                 for v in map.values() {
-                    v.visit_refs(f);
+                    v.visit_resource_refs(f);
                 }
             }
             Value::Deferred(DeferredValue::Interpolation(parts)) => {
                 for part in parts {
-                    if let InterpolationPart::Expr(v) = part {
-                        v.visit_refs(f);
+                    match part {
+                        InterpolationPart::Literal(_) => {}
+                        InterpolationPart::Expr(v) => v.visit_resource_refs(f),
                     }
                 }
             }
             Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
                 for arg in args {
-                    arg.visit_refs(f);
+                    arg.visit_resource_refs(f);
                 }
             }
-            Value::Deferred(DeferredValue::Secret(inner)) => inner.visit_refs(f),
+            Value::Deferred(DeferredValue::Secret(inner)) => inner.visit_resource_refs(f),
             Value::Concrete(ConcreteValue::String(_))
             | Value::Concrete(ConcreteValue::EnumIdentifier(_))
             | Value::Concrete(ConcreteValue::CanonicalEnum(_))
@@ -1148,17 +1152,60 @@ impl Value {
             | Value::Concrete(ConcreteValue::Float(_))
             | Value::Concrete(ConcreteValue::Bool(_))
             | Value::Concrete(ConcreteValue::Duration(_))
-            | Value::Concrete(ConcreteValue::StringList(_)) => {}
-            // `BindingRef` carries no attribute, so attribute-walking
-            // visitors have nothing to do. Callers that *do* care about
-            // bare-binding references need explicit traversal until a
-            // binding-aware visitor is added.
-            Value::Deferred(DeferredValue::BindingRef { .. }) => {}
+            | Value::Concrete(ConcreteValue::StringList(_))
+            | Value::Deferred(DeferredValue::BindingRef { .. }) => {}
             // `Value::Unknown` is what a previously-unresolved
             // `ResourceRef` was *replaced with* by `stamp_unresolved_upstream`.
             // It carries an `AccessPath` for display, but it is no longer
             // a live reference to walk — dependency analysis happens
             // upstream of the stamping pass.
+            Value::Deferred(DeferredValue::Unknown(_)) => {}
+        }
+    }
+
+    /// Recursively walk this value, invoking `f` on each bare `BindingRef` name.
+    ///
+    /// Companion: `visit_resource_refs` for `ResourceRef` access paths. A consumer
+    /// that needs both must call both — drift is visible at the call site.
+    pub fn visit_binding_refs(&self, f: &mut impl FnMut(&str)) {
+        match self {
+            Value::Deferred(DeferredValue::BindingRef { binding }) => f(binding),
+            Value::Concrete(ConcreteValue::List(items)) => {
+                for v in items {
+                    v.visit_binding_refs(f);
+                }
+            }
+            Value::Concrete(ConcreteValue::Map(map)) => {
+                for v in map.values() {
+                    v.visit_binding_refs(f);
+                }
+            }
+            Value::Deferred(DeferredValue::Interpolation(parts)) => {
+                for part in parts {
+                    match part {
+                        InterpolationPart::Literal(_) => {}
+                        InterpolationPart::Expr(v) => v.visit_binding_refs(f),
+                    }
+                }
+            }
+            Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+                for arg in args {
+                    arg.visit_binding_refs(f);
+                }
+            }
+            Value::Deferred(DeferredValue::Secret(inner)) => inner.visit_binding_refs(f),
+            Value::Concrete(ConcreteValue::String(_))
+            | Value::Concrete(ConcreteValue::EnumIdentifier(_))
+            | Value::Concrete(ConcreteValue::CanonicalEnum(_))
+            | Value::Concrete(ConcreteValue::Int(_))
+            | Value::Concrete(ConcreteValue::Float(_))
+            | Value::Concrete(ConcreteValue::Bool(_))
+            | Value::Concrete(ConcreteValue::Duration(_))
+            | Value::Concrete(ConcreteValue::StringList(_))
+            | Value::Deferred(DeferredValue::ResourceRef { .. }) => {}
+            // `Value::Unknown` is what a previously-unresolved reference was
+            // *replaced with* by stamping passes. It is no longer a live
+            // reference to walk.
             Value::Deferred(DeferredValue::Unknown(_)) => {}
         }
     }
@@ -1185,7 +1232,7 @@ pub fn attrs_to_hashmap(attrs: &IndexMap<String, Value>) -> HashMap<String, Valu
 /// Check if a Value contains any ResourceRef (possibly nested)
 pub fn contains_resource_ref(value: &Value) -> bool {
     let mut found = false;
-    value.visit_refs(&mut |_| found = true);
+    value.visit_resource_refs(&mut |_| found = true);
     found
 }
 

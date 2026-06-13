@@ -923,7 +923,7 @@ fn value_ref_helpers() {
 // properties of `EvalValue`, exercised in `eval_value.rs`.
 
 #[test]
-fn visit_refs_collects_from_all_nested_variants() {
+fn visit_resource_refs_collects_from_all_nested_variants() {
     let value = Value::Concrete(ConcreteValue::List(vec![
         Value::resource_ref("a", "id", vec![]),
         Value::Concrete(ConcreteValue::Map(IndexMap::from([(
@@ -947,7 +947,7 @@ fn visit_refs_collects_from_all_nested_variants() {
     ]));
 
     let mut collected: Vec<String> = Vec::new();
-    value.visit_refs(&mut |path| {
+    value.visit_resource_refs(&mut |path| {
         collected.push(path.binding().to_string());
     });
     collected.sort();
@@ -955,7 +955,47 @@ fn visit_refs_collects_from_all_nested_variants() {
 }
 
 #[test]
-fn visit_refs_on_leaf_variants_calls_nothing() {
+fn visit_binding_refs_collects_from_all_nested_variants() {
+    let value = Value::Concrete(ConcreteValue::List(vec![
+        Value::Deferred(DeferredValue::BindingRef {
+            binding: "a".to_string(),
+        }),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "k".to_string(),
+            Value::Deferred(DeferredValue::BindingRef {
+                binding: "b".to_string(),
+            }),
+        )]))),
+        Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Literal("x".to_string()),
+            InterpolationPart::Expr(Value::Deferred(DeferredValue::BindingRef {
+                binding: "c".to_string(),
+            })),
+        ])),
+        Value::Deferred(DeferredValue::FunctionCall {
+            name: "join".to_string(),
+            args: vec![Value::Deferred(DeferredValue::BindingRef {
+                binding: "d".to_string(),
+            })],
+        }),
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
+            DeferredValue::BindingRef {
+                binding: "e".to_string(),
+            },
+        )))),
+    ]));
+
+    let mut collected = Vec::new();
+    value.visit_binding_refs(&mut |binding| {
+        collected.push(binding.to_string());
+    });
+    collected.sort();
+
+    assert_eq!(collected, vec!["a", "b", "c", "d", "e"]);
+}
+
+#[test]
+fn visit_resource_refs_on_leaf_variants_calls_nothing() {
     for v in [
         Value::Concrete(ConcreteValue::String("s".into())),
         Value::Concrete(ConcreteValue::Int(1)),
@@ -963,7 +1003,7 @@ fn visit_refs_on_leaf_variants_calls_nothing() {
         Value::Concrete(ConcreteValue::Bool(true)),
     ] {
         let mut count = 0;
-        v.visit_refs(&mut |_| count += 1);
+        v.visit_resource_refs(&mut |_| count += 1);
         assert_eq!(count, 0);
     }
 }

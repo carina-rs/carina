@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::effect::Effect;
-use crate::resource::{ConcreteValue, DeferredValue, Resource, Value};
+use crate::resource::{Resource, Value};
 
 /// Extract binding names that a resource depends on.
 ///
@@ -84,40 +84,12 @@ pub fn get_data_source_dependencies(data_source: &crate::resource::DataSource) -
 /// `Value` variants since #2847 (`ResourceRef` vs. `BindingRef`), so
 /// the walker visits both forms here.
 pub(crate) fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
-    fn walk(value: &Value, deps: &mut HashSet<String>) {
-        match value {
-            Value::Deferred(DeferredValue::ResourceRef { path }) => {
-                deps.insert(path.binding().to_string());
-            }
-            Value::Deferred(DeferredValue::BindingRef { binding }) => {
-                deps.insert(binding.clone());
-            }
-            Value::Concrete(ConcreteValue::List(items)) => items.iter().for_each(|v| walk(v, deps)),
-            Value::Concrete(ConcreteValue::Map(map)) => map.values().for_each(|v| walk(v, deps)),
-            Value::Deferred(DeferredValue::Interpolation(parts)) => {
-                use crate::resource::InterpolationPart;
-                for part in parts {
-                    if let InterpolationPart::Expr(v) = part {
-                        walk(v, deps);
-                    }
-                }
-            }
-            Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
-                args.iter().for_each(|v| walk(v, deps))
-            }
-            Value::Deferred(DeferredValue::Secret(inner)) => walk(inner, deps),
-            Value::Concrete(ConcreteValue::String(_))
-            | Value::Concrete(ConcreteValue::EnumIdentifier(_))
-            | Value::Concrete(ConcreteValue::CanonicalEnum(_))
-            | Value::Concrete(ConcreteValue::Int(_))
-            | Value::Concrete(ConcreteValue::Float(_))
-            | Value::Concrete(ConcreteValue::Bool(_))
-            | Value::Concrete(ConcreteValue::Duration(_))
-            | Value::Concrete(ConcreteValue::StringList(_))
-            | Value::Deferred(DeferredValue::Unknown(_)) => {}
-        }
-    }
-    walk(value, deps);
+    value.visit_resource_refs(&mut |path| {
+        deps.insert(path.binding().to_string());
+    });
+    value.visit_binding_refs(&mut |binding| {
+        deps.insert(binding.to_string());
+    });
 }
 
 /// Like [`get_resource_dependencies`], but excludes `directives.depends_on`.

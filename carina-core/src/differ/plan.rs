@@ -7,10 +7,7 @@ use crate::effect::{CascadingUpdate, ChangedCreateOnly, Effect, TemporaryName, W
 use crate::identifier::generate_random_suffix;
 use crate::parser::WaitBinding;
 use crate::plan::{Plan, PlanError};
-use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, Directives, InterpolationPart, Resource, ResourceId,
-    State, Value,
-};
+use crate::resource::{ConcreteValue, DataSource, Directives, Resource, ResourceId, State, Value};
 use crate::schema::{
     ResourceSchema, SchemaKind, SchemaRegistry, WAIT_DEFAULT_INTERVAL, WAIT_DEFAULT_TIMEOUT,
 };
@@ -69,7 +66,7 @@ fn cascade_ref_hint(value: &Value, target_binding: &str) -> Option<String> {
     let mut hit: Option<String> = None;
 
     // Multi-ref attributes report the first target-binding ref in list/IndexMap/source order.
-    value.visit_refs(&mut |path| {
+    value.visit_resource_refs(&mut |path| {
         if hit.is_none() && path.binding() == target_binding {
             hit = Some(format!("{}.{}", path.binding(), path.attribute()));
         }
@@ -79,44 +76,13 @@ fn cascade_ref_hint(value: &Value, target_binding: &str) -> Option<String> {
         return hit;
     }
 
-    visit_binding_refs(value, target_binding)
-}
-
-/// BindingRef companion for the `visit_refs` gap. Tracked by carina#3476 for unification.
-fn visit_binding_refs(value: &Value, target_binding: &str) -> Option<String> {
-    match value {
-        Value::Deferred(DeferredValue::BindingRef { binding }) if binding == target_binding => {
-            Some(binding.clone())
+    value.visit_binding_refs(&mut |binding| {
+        if hit.is_none() && binding == target_binding {
+            hit = Some(binding.to_string());
         }
-        Value::Concrete(ConcreteValue::List(items)) => items
-            .iter()
-            .find_map(|value| visit_binding_refs(value, target_binding)),
-        Value::Concrete(ConcreteValue::Map(map)) => map
-            .values()
-            .find_map(|value| visit_binding_refs(value, target_binding)),
-        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().find_map(|part| {
-            if let InterpolationPart::Expr(value) = part {
-                visit_binding_refs(value, target_binding)
-            } else {
-                None
-            }
-        }),
-        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => args
-            .iter()
-            .find_map(|value| visit_binding_refs(value, target_binding)),
-        Value::Deferred(DeferredValue::Secret(inner)) => visit_binding_refs(inner, target_binding),
-        Value::Deferred(DeferredValue::ResourceRef { .. })
-        | Value::Deferred(DeferredValue::BindingRef { .. })
-        | Value::Concrete(ConcreteValue::String(_))
-        | Value::Concrete(ConcreteValue::EnumIdentifier(_))
-        | Value::Concrete(ConcreteValue::CanonicalEnum(_))
-        | Value::Concrete(ConcreteValue::Int(_))
-        | Value::Concrete(ConcreteValue::Float(_))
-        | Value::Concrete(ConcreteValue::Bool(_))
-        | Value::Concrete(ConcreteValue::Duration(_))
-        | Value::Concrete(ConcreteValue::StringList(_))
-        | Value::Deferred(DeferredValue::Unknown(_)) => None,
-    }
+    });
+
+    hit
 }
 
 /// Filter out non-removable attribute removals from the changed list.
