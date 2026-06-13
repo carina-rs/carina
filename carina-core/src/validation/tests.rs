@@ -153,6 +153,79 @@ fn binding_referenced_in_nested_value() {
 }
 
 #[test]
+fn binding_referenced_in_interpolation_is_not_unused() {
+    let src = r#"
+        let role = aws.iam.Role {
+            role_name = "r"
+            assume_role_policy_document = "{}"
+        }
+        let _ = aws.s3.Bucket {
+            bucket_name = "acct-${role.arn}"
+        }
+    "#;
+    let parsed = crate::parser::parse(src, &crate::parser::ProviderContext::default()).unwrap();
+
+    assert!(check_unused_bindings(&parsed).is_empty());
+}
+
+#[test]
+fn binding_referenced_in_function_call_arg_is_not_unused() {
+    let src = r#"
+        let role = aws.iam.Role {
+            role_name = "r"
+            assume_role_policy_document = "{}"
+        }
+        let _ = aws.s3.Bucket {
+            bucket_name = sibling_fn(role.arn)
+        }
+    "#;
+    let parsed = crate::parser::parse(src, &crate::parser::ProviderContext::default()).unwrap();
+
+    assert!(check_unused_bindings(&parsed).is_empty());
+}
+
+#[test]
+fn binding_referenced_in_secret_builtin_function_call_is_not_unused() {
+    let src = r#"
+        let role = aws.iam.Role {
+            role_name = "r"
+            assume_role_policy_document = "{}"
+        }
+        let _ = aws.s3.Bucket {
+            bucket_name = secret(role.arn)
+        }
+    "#;
+    // `secret(role.arn)` stays deferred as a FunctionCall while its arg is
+    // unresolved, so this source-level fixture pins function-call recursion.
+    let parsed = crate::parser::parse(src, &crate::parser::ProviderContext::default()).unwrap();
+
+    assert!(check_unused_bindings(&parsed).is_empty());
+}
+
+#[test]
+fn bare_binding_ref_is_not_unused() {
+    let src = r#"
+        let _ = aws.s3.Bucket {
+            bucket_name = role
+        }
+        let role = aws.iam.Role {
+            role_name = "r"
+            assume_role_policy_document = "{}"
+        }
+    "#;
+    // Seeded structural bindings are the directory-loader path that keeps
+    // a bare sibling reference as `Deferred(BindingRef)` in the parsed file.
+    let parsed = crate::parser::parse_with_seeded_bindings(
+        src,
+        &crate::parser::ProviderContext::default(),
+        &[crate::parser::BindingSeed::structural("role")],
+    )
+    .unwrap();
+
+    assert!(check_unused_bindings(&parsed).is_empty());
+}
+
+#[test]
 fn binding_referenced_in_module_call() {
     let mut parsed = empty_parsed();
 

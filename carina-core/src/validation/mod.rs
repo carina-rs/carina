@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use indexmap::IndexMap;
 
 use crate::binding_index::BindingIndex;
+use crate::deps::collect_dependencies;
 use crate::parser::{
     ModuleCall, ProviderContext, ResourceRef, ResourceTypePath, TypeExpr, validate_custom_type,
 };
@@ -1136,8 +1137,11 @@ pub fn validate_export_params(
 
 /// Check for unused `let` bindings and return the unused binding names.
 ///
-/// A binding is unused if its name never appears as a `ResourceRef.binding_name`
-/// in any resource attribute, module call argument, or attribute parameter value.
+/// A binding is unused if its name never appears as a value-carried reference:
+/// attribute refs, bare refs, interpolation expressions, function arguments, or
+/// secret inner values in resource attributes, module call arguments, attribute
+/// parameters, export parameters, `directives.depends_on`, wait targets, or wait
+/// `depends_on` entries.
 ///
 /// Generic over the export-parameter shape so both `ParsedFile` (parser
 /// phase) and `InferredFile` (post-loader phase) can drive it without
@@ -1172,7 +1176,7 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
             if attr_name.starts_with('_') {
                 continue;
             }
-            collect_resource_refs(value, &mut referenced);
+            collect_dependencies(value, &mut referenced);
         }
         // `Composition` has no directives — `directives()` is `None`
         // for that arm, so the depends_on walk is simply skipped.
@@ -1182,17 +1186,17 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
     }
     for call in &parsed.module_calls {
         for value in call.arguments.values() {
-            collect_resource_refs(value, &mut referenced);
+            collect_dependencies(value, &mut referenced);
         }
     }
     for attr_param in &parsed.attribute_params {
         if let Some(value) = &attr_param.value {
-            collect_resource_refs(value, &mut referenced);
+            collect_dependencies(value, &mut referenced);
         }
     }
     for export_param in &parsed.export_params {
         if let Some(value) = export_param.value() {
-            collect_resource_refs(value, &mut referenced);
+            collect_dependencies(value, &mut referenced);
         }
     }
     // Each `wait <target> { ... }` declaration references its target
@@ -1216,26 +1220,6 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
                 && !binding.contains('[')
         })
         .collect()
-}
-
-/// Recursively collect all `ResourceRef` binding names from a value tree.
-pub(crate) fn collect_resource_refs(value: &Value, refs: &mut HashSet<String>) {
-    match value {
-        Value::Deferred(DeferredValue::ResourceRef { path }) => {
-            refs.insert(path.binding().to_string());
-        }
-        Value::Concrete(ConcreteValue::List(items)) => {
-            for item in items {
-                collect_resource_refs(item, refs);
-            }
-        }
-        Value::Concrete(ConcreteValue::Map(map)) => {
-            for v in map.values() {
-                collect_resource_refs(v, refs);
-            }
-        }
-        _ => {}
-    }
 }
 
 /// Validate a value against a TypeExpr, returning an error message if invalid.
