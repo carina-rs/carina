@@ -1770,6 +1770,62 @@ fn delete_pretty_attribute_does_not_strike_indentation() {
     );
 }
 
+#[test]
+fn forcing_changed_uses_plain_green_cli_value() {
+    let row = DetailRow::ChangedForcesReplacement {
+        key: "name".to_string(),
+        old: "\"old\"".to_string(),
+        new: "\"new\"".to_string(),
+    };
+    let effect = Effect::Update {
+        id: ResourceId::new("test.Widget", "w"),
+        from: Box::new(State::existing(
+            ResourceId::new("test.Widget", "w"),
+            HashMap::new(),
+        )),
+        to: Resource::new("test.Widget", "w"),
+        changed_attributes: vec!["name".to_string()],
+    };
+
+    colored::control::set_override(true);
+    let mut out = String::new();
+    render_detail_row(&mut out, &row, &effect, "  ");
+    colored::control::unset_override();
+
+    assert!(
+        out.contains("\u{1b}[32m\"new\"\u{1b}[0m"),
+        "forcing Changed rows must render the new value with plain green: {out:?}"
+    );
+}
+
+#[test]
+fn forcing_changed_multiline_green_style_does_not_cross_newline() {
+    let row = DetailRow::ChangedForcesReplacement {
+        key: "rules".to_string(),
+        old: "[]".to_string(),
+        new: "[\n  \"new\"\n]".to_string(),
+    };
+    let effect = Effect::Update {
+        id: ResourceId::new("test.Widget", "w"),
+        from: Box::new(State::existing(
+            ResourceId::new("test.Widget", "w"),
+            HashMap::new(),
+        )),
+        to: Resource::new("test.Widget", "w"),
+        changed_attributes: vec!["rules".to_string()],
+    };
+
+    colored::control::set_override(true);
+    let mut out = String::new();
+    render_detail_row(&mut out, &row, &effect, "  ");
+    colored::control::unset_override();
+
+    assert!(
+        out.contains("\u{1b}[32m[\u{1b}[0m\n\u{1b}[32m  \"new\"\u{1b}[0m\n\u{1b}[32m]\u{1b}[0m"),
+        "forcing Changed multiline values must reset green styling before each newline: {out:?}"
+    );
+}
+
 /// When a state refresh has been printed above the plan output, a single
 /// blank line must separate the refresh-progress block from the plan's
 /// terminal section (`Execution Plan:` or `No changes.`). See issue #3148.

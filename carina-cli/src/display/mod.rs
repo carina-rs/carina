@@ -1169,6 +1169,14 @@ fn colored_value(rendered: &str, ref_binding: bool) -> String {
     color_atom(rendered, ref_binding)
 }
 
+fn forcing_value(rendered: &str) -> String {
+    rendered
+        .lines()
+        .map(|line| line.green().to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Color a multi-line `format_value_pretty` payload while preserving its
 /// vertical layout. For each line, separate leading whitespace and a trailing
 /// `,`, then color the middle. Atoms that look like list items (`"x"`, `42`)
@@ -1427,19 +1435,41 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
             }
         }
         DetailRow::Changed { key, old, new } => {
-            let new_colored = colored_value(new, false);
             writeln!(
                 out,
                 "{}{}: {} → {}",
                 attr_prefix,
                 key,
                 old.red().strikethrough(),
-                new_colored
+                colored_value(new, false),
+            )
+            .unwrap();
+        }
+        DetailRow::ChangedForcesReplacement { key, old, new } => {
+            writeln!(
+                out,
+                "{}{}: {} → {} {}",
+                attr_prefix,
+                key,
+                old.red().strikethrough(),
+                forcing_value(new),
+                "(forces replacement)".magenta()
             )
             .unwrap();
         }
         DetailRow::MapDiff { key, entries } => {
             writeln!(out, "{}{}:", attr_prefix, key).unwrap();
+            render_map_diff_entries(out, entries.as_slice(), attr_prefix);
+        }
+        DetailRow::MapDiffForcesReplacement { key, entries } => {
+            writeln!(
+                out,
+                "{}{}: {}",
+                attr_prefix,
+                key,
+                "(forces replacement)".magenta()
+            )
+            .unwrap();
             render_map_diff_entries(out, entries.as_slice(), attr_prefix);
         }
         DetailRow::StringListDiff {
@@ -1451,15 +1481,61 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
             writeln!(out, "{}{}:", attr_prefix, key).unwrap();
             render_string_list_diff_entries(out, unchanged, added, removed, attr_prefix);
         }
-        DetailRow::ListOfMapsDiff {
+        DetailRow::StringListDiffForcesReplacement {
             key,
             unchanged,
-            modified,
             added,
             removed,
         } => {
+            writeln!(
+                out,
+                "{}{}: {}",
+                attr_prefix,
+                key,
+                "(forces replacement)".magenta()
+            )
+            .unwrap();
+            render_string_list_diff_entries(out, unchanged, added, removed, attr_prefix);
+        }
+        DetailRow::ListOfMapsDiff { key, block } => {
             writeln!(out, "{}{}:", attr_prefix, key).unwrap();
-            render_list_of_maps_diff(out, unchanged, modified, added, removed, attr_prefix);
+            render_list_of_maps_diff(
+                out,
+                block.unchanged(),
+                block.modified(),
+                block.added(),
+                block.removed(),
+                attr_prefix,
+            );
+        }
+        DetailRow::ListOfMapsDiffForcesReplacement { key, block } => {
+            writeln!(
+                out,
+                "{}{}: {}",
+                attr_prefix,
+                key,
+                "(forces replacement)".magenta()
+            )
+            .unwrap();
+            render_list_of_maps_diff(
+                out,
+                block.unchanged(),
+                block.modified(),
+                block.added(),
+                block.removed(),
+                attr_prefix,
+            );
+        }
+        DetailRow::ForceReplaceMapHeader { key }
+        | DetailRow::ForceReplaceListOfMapsHeader { key } => {
+            writeln!(
+                out,
+                "{}{}: {}",
+                attr_prefix,
+                key,
+                "(forces replacement)".magenta()
+            )
+            .unwrap();
         }
         DetailRow::Removed { key, old } => {
             writeln!(
@@ -1502,18 +1578,6 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
             )
             .unwrap();
         }
-        DetailRow::ReplaceChanged { key, old, new } => {
-            writeln!(
-                out,
-                "{}{}: {} → {} {}",
-                attr_prefix,
-                key,
-                old.red().strikethrough(),
-                new.green(),
-                "(forces replacement)".magenta()
-            )
-            .unwrap();
-        }
         DetailRow::ReplaceRemoved { key, old } => {
             writeln!(
                 out,
@@ -1537,32 +1601,6 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
                 "(forces replacement, known after apply)".magenta()
             )
             .unwrap();
-        }
-        DetailRow::ReplaceListOfMapsDiff {
-            key,
-            unchanged,
-            modified,
-            added,
-            removed,
-        } => {
-            let suffix = format!(" {}", "(forces replacement)".magenta());
-            writeln!(out, "{}{}:{}", attr_prefix, key, suffix).unwrap();
-            render_list_of_maps_diff(out, unchanged, modified, added, removed, attr_prefix);
-        }
-        DetailRow::ReplaceMapDiff { key, entries } => {
-            let suffix = format!(" {}", "(forces replacement)".magenta());
-            writeln!(out, "{}{}:{}", attr_prefix, key, suffix).unwrap();
-            render_map_diff_entries(out, entries, attr_prefix);
-        }
-        DetailRow::ReplaceStringListDiff {
-            key,
-            unchanged,
-            added,
-            removed,
-        } => {
-            let suffix = format!(" {}", "(forces replacement)".magenta());
-            writeln!(out, "{}{}:{}", attr_prefix, key, suffix).unwrap();
-            render_string_list_diff_entries(out, unchanged, added, removed, attr_prefix);
         }
         DetailRow::TemporaryNameNote {
             can_rename,

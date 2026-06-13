@@ -10,6 +10,8 @@ plan-mixed:
 	$(PLAN_FIXTURE) mixed_operations
 plan-replace-create-only:
 	$(PLAN_FIXTURE) replace_create_only
+plan-replace-with-non-forcing-diffs:
+	$(PLAN_FIXTURE) replace_with_non_forcing_diffs
 plan-delete:
 	$(PLAN_FIXTURE) delete_orphan
 plan-delete-list-of-maps:
@@ -279,7 +281,7 @@ plan-multi-instance-create:
 plan-multi-instance-module:
 	$(PLAN_FIXTURE) multi_instance_module
 .PHONY: plan-all-create plan-no-changes plan-empty-explicit-children-no-changes plan-no-changes-enum plan-dynamic-enum-az-no-diff plan-route53-hosted-zone-name-strip-suffix-no-diff plan-mixed plan-delete plan-delete-list-of-maps plan-compact plan-import-deferred-interpolation \
-        plan-map-diff plan-replace-create-only \
+        plan-map-diff plan-replace-create-only plan-replace-with-non-forcing-diffs \
         plan-list-diff-added-struct plan-list-diff-removed-struct \
         plan-list-diff-modified-with-unchanged \
         plan-list-diff-modified-with-unchanged-nested \

@@ -1,0 +1,13 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  -/+ test.test.Widget web_acl (must be replaced)
+      description: "old description" → "new description"
+      external_name: "edge-old" → "edge-new" (forces replacement)
+      metric_name: "edge-old-metric" → "edge-new-metric"
+      # (1 unchanged attribute hidden)
+
+Plan: 0 to add, 0 to change, 1 to replace, 0 to destroy.

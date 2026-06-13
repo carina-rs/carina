@@ -179,8 +179,37 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
             }
             lines.push(line);
         }
+        DetailRow::ChangedForcesReplacement { key, old, new } => {
+            let mut line = Line::from(vec![
+                Span::raw(format!("  {}: ", key)),
+                Span::styled(
+                    old.clone(),
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::CROSSED_OUT),
+                ),
+                Span::raw(" -> "),
+                Span::styled(new.clone(), Style::default().fg(Color::Yellow)),
+                Span::styled(" (forces replacement)", Style::default().fg(Color::Magenta)),
+            ]);
+            if is_selected {
+                line = line.style(Style::default().bg(Color::DarkGray));
+            }
+            lines.push(line);
+        }
         DetailRow::MapDiff { key, entries } => {
-            let mut first_line = Line::from(Span::raw(format!("  {}:", key)));
+            let mut first_line = Line::from(vec![Span::raw(format!("  {}:", key))]);
+            if is_selected {
+                first_line = first_line.style(Style::default().bg(Color::DarkGray));
+            }
+            lines.push(first_line);
+            render_map_diff_entries(lines, entries.as_slice());
+        }
+        DetailRow::MapDiffForcesReplacement { key, entries } => {
+            let mut first_line = Line::from(vec![
+                Span::raw(format!("  {}:", key)),
+                Span::styled(" (forces replacement)", Style::default().fg(Color::Magenta)),
+            ]);
             if is_selected {
                 first_line = first_line.style(Style::default().bg(Color::DarkGray));
             }
@@ -193,21 +222,69 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
             added,
             removed,
         } => {
-            let mut first_line = Line::from(Span::raw(format!("  {}:", key)));
+            let mut first_line = Line::from(vec![Span::raw(format!("  {}:", key))]);
             if is_selected {
                 first_line = first_line.style(Style::default().bg(Color::DarkGray));
             }
             lines.push(first_line);
             render_string_list_diff_entries(lines, unchanged, added, removed);
         }
-        DetailRow::ListOfMapsDiff {
+        DetailRow::StringListDiffForcesReplacement {
             key,
             unchanged,
-            modified,
             added,
             removed,
         } => {
-            render_list_of_maps_diff(lines, key, unchanged, modified, added, removed, is_selected);
+            let mut first_line = Line::from(vec![
+                Span::raw(format!("  {}:", key)),
+                Span::styled(" (forces replacement)", Style::default().fg(Color::Magenta)),
+            ]);
+            if is_selected {
+                first_line = first_line.style(Style::default().bg(Color::DarkGray));
+            }
+            lines.push(first_line);
+            render_string_list_diff_entries(lines, unchanged, added, removed);
+        }
+        DetailRow::ListOfMapsDiff { key, block } => {
+            render_list_of_maps_diff(
+                lines,
+                key,
+                block.unchanged(),
+                block.modified(),
+                block.added(),
+                block.removed(),
+                is_selected,
+            );
+        }
+        DetailRow::ListOfMapsDiffForcesReplacement { key, block } => {
+            let start = lines.len();
+            render_list_of_maps_diff(
+                lines,
+                key,
+                block.unchanged(),
+                block.modified(),
+                block.added(),
+                block.removed(),
+                is_selected,
+            );
+            if let Some(header) = lines.get_mut(start) {
+                header.spans = vec![
+                    Span::raw(format!("  {}: ", key)),
+                    Span::styled("(forces replacement)", Style::default().fg(Color::Magenta)),
+                    Span::raw(" ["),
+                ];
+            }
+        }
+        DetailRow::ForceReplaceMapHeader { key }
+        | DetailRow::ForceReplaceListOfMapsHeader { key } => {
+            let mut line = Line::from(vec![
+                Span::raw(format!("  {}: ", key)),
+                Span::styled("(forces replacement)", Style::default().fg(Color::Magenta)),
+            ]);
+            if is_selected {
+                line = line.style(Style::default().bg(Color::DarkGray));
+            }
+            lines.push(line);
         }
         DetailRow::Removed { key, old } => {
             let mut line = Line::from(vec![
@@ -259,23 +336,6 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
             }
             lines.push(line);
         }
-        DetailRow::ReplaceChanged { key, old, new } => {
-            let mut line = Line::from(vec![
-                Span::raw(format!("  {}: ", key)),
-                Span::styled(
-                    old.clone(),
-                    Style::default()
-                        .fg(Color::Red)
-                        .add_modifier(Modifier::CROSSED_OUT),
-                ),
-                Span::raw(" -> "),
-                Span::styled(new.clone(), Style::default().fg(Color::Yellow)),
-            ]);
-            if is_selected {
-                line = line.style(Style::default().bg(Color::DarkGray));
-            }
-            lines.push(line);
-        }
         DetailRow::ReplaceRemoved { key, old } => {
             let mut line = Line::from(vec![
                 Span::raw(format!("  {}: ", key)),
@@ -314,36 +374,6 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
                 line = line.style(Style::default().bg(Color::DarkGray));
             }
             lines.push(line);
-        }
-        DetailRow::ReplaceListOfMapsDiff {
-            key,
-            unchanged,
-            modified,
-            added,
-            removed,
-        } => {
-            render_list_of_maps_diff(lines, key, unchanged, modified, added, removed, is_selected);
-        }
-        DetailRow::ReplaceMapDiff { key, entries } => {
-            let mut first_line = Line::from(Span::raw(format!("  {}:", key)));
-            if is_selected {
-                first_line = first_line.style(Style::default().bg(Color::DarkGray));
-            }
-            lines.push(first_line);
-            render_map_diff_entries(lines, entries);
-        }
-        DetailRow::ReplaceStringListDiff {
-            key,
-            unchanged,
-            added,
-            removed,
-        } => {
-            let mut first_line = Line::from(Span::raw(format!("  {}:", key)));
-            if is_selected {
-                first_line = first_line.style(Style::default().bg(Color::DarkGray));
-            }
-            lines.push(first_line);
-            render_string_list_diff_entries(lines, unchanged, added, removed);
         }
         DetailRow::TemporaryNameNote {
             can_rename,
@@ -409,7 +439,7 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carina_core::detail_rows::MapExpandedEntry;
+    use carina_core::detail_rows::{ListOfMapsDiffItem, MapExpandedEntry, NonEmptyListOfMapsBlock};
     use carina_core::resource::{ConcreteValue, Value};
     use indexmap::IndexMap;
 
@@ -496,6 +526,59 @@ mod tests {
         assert!(
             !line_text(last).trim().is_empty(),
             "trailing list-of-maps must not leave an orphan blank line: lines={lines:?}",
+        );
+    }
+
+    #[test]
+    fn forcing_changed_renders_new_value_yellow() {
+        let row = DetailRow::ChangedForcesReplacement {
+            key: "name".to_string(),
+            old: "\"old\"".to_string(),
+            new: "\"new\"".to_string(),
+        };
+
+        let mut lines: Vec<Line> = Vec::new();
+        render_detail_row_to_lines(&mut lines, &row, false);
+
+        let line = lines.first().expect("changed row should render one line");
+        let new_span = line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "\"new\"")
+            .expect("new value span should be present");
+        assert_eq!(
+            new_span.style,
+            Style::default().fg(Color::Yellow),
+            "forcing Changed rows must use the forcing yellow value style"
+        );
+    }
+
+    #[test]
+    fn forcing_list_of_maps_suffix_renders_before_open_bracket() {
+        let row = DetailRow::ListOfMapsDiffForcesReplacement {
+            key: "rules".to_string(),
+            block: NonEmptyListOfMapsBlock::from_parts(
+                vec![],
+                vec![],
+                vec![],
+                vec![ListOfMapsDiffItem {
+                    fields: vec![(
+                        "name".to_string(),
+                        Value::Concrete(ConcreteValue::String("legacy".to_string())),
+                    )],
+                }],
+            )
+            .unwrap(),
+        };
+
+        let mut lines: Vec<Line> = Vec::new();
+        render_detail_row_to_lines(&mut lines, &row, false);
+
+        let header = lines.first().expect("list-of-maps header should render");
+        assert_eq!(
+            line_text(header),
+            "  rules: (forces replacement) [",
+            "forcing suffix must appear before the list opening bracket"
         );
     }
 

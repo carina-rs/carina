@@ -1,0 +1,46 @@
+{
+  "version": 7,
+  "serial": 1,
+  "lineage": "test-replace-with-non-forcing-diffs",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "test.Widget",
+      "name": "web_acl",
+      "provider": "test",
+      "identifier": "widget-web-acl-live",
+      "attributes": {
+        "external_name": "edge-old",
+        "description": "old description",
+        "metric_name": "edge-old-metric",
+        "scope": "CLOUDFRONT"
+      },
+      "protected": false,
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false
+      },
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "web_acl",
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "external_name": {
+            "kind": "leaf"
+          },
+          "description": {
+            "kind": "leaf"
+          },
+          "metric_name": {
+            "kind": "leaf"
+          },
+          "scope": {
+            "kind": "leaf"
+          }
+        }
+      }
+    }
+  ]
+}
