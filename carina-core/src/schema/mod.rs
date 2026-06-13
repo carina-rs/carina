@@ -4934,6 +4934,28 @@ pub mod types {
             None,
         )
     }
+
+    /// HTTP response status code restricted to 2XX/4XX/5XX (3-digit string).
+    ///
+    /// Informational (1XX) and redirect (3XX) codes are excluded by design —
+    /// this matches the constraint AWS documents for ELBv2 fixed-response
+    /// actions. A future generic `http_status_code()` covering 1XX–5XX can be
+    /// added as a sibling if a non-restricted consumer appears.
+    pub fn http_response_status_code() -> AttributeType {
+        AttributeType::refined_string_with_validator(
+            Some(TypeIdentity::bare("HttpResponseStatusCode")),
+            None,
+            None,
+            legacy_validator(|value| {
+                if let Value::Concrete(ConcreteValue::String(s)) = value {
+                    validate_http_response_status_code(s)
+                } else {
+                    Err("Expected string".to_string())
+                }
+            }),
+            None,
+        )
+    }
 }
 
 /// Validate an IPv4 address (e.g., "10.0.1.5", "192.168.0.1")
@@ -5131,6 +5153,24 @@ pub fn validate_email(email: &str) -> Result<(), String> {
         }
     }
 
+    Ok(())
+}
+
+/// Validate a 3-digit HTTP response status code restricted to 2XX/4XX/5XX.
+pub fn validate_http_response_status_code(code: &str) -> Result<(), String> {
+    if code.len() != 3 {
+        return Err(format!(
+            "must be exactly 3 digits, got {} characters",
+            code.len()
+        ));
+    }
+    if !code.chars().all(|c| c.is_ascii_digit()) {
+        return Err("must contain only digits".to_string());
+    }
+    let first = code.chars().next().expect("length checked above");
+    if !matches!(first, '2' | '4' | '5') {
+        return Err(format!("must start with 2, 4, or 5 (got '{first}')"));
+    }
     Ok(())
 }
 

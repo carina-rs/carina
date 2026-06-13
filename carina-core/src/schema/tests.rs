@@ -4023,6 +4023,76 @@ fn validate_email_type() {
     );
 }
 
+#[test]
+fn validate_http_response_status_code_function_directly() {
+    // Valid: 2XX/4XX/5XX
+    assert!(validate_http_response_status_code("200").is_ok());
+    assert!(validate_http_response_status_code("299").is_ok());
+    assert!(validate_http_response_status_code("400").is_ok());
+    assert!(validate_http_response_status_code("499").is_ok());
+    assert!(validate_http_response_status_code("500").is_ok());
+    assert!(validate_http_response_status_code("599").is_ok());
+
+    // Invalid: disallowed leading digit (fence-post boundaries pin the
+    // excluded 1XX/3XX/6XX ranges explicitly).
+    assert!(validate_http_response_status_code("100").is_err());
+    assert!(validate_http_response_status_code("199").is_err());
+    assert!(validate_http_response_status_code("300").is_err());
+    assert!(validate_http_response_status_code("301").is_err());
+    assert!(validate_http_response_status_code("399").is_err());
+    assert!(validate_http_response_status_code("600").is_err());
+    // Invalid: wrong length
+    assert!(validate_http_response_status_code("20").is_err());
+    assert!(validate_http_response_status_code("2000").is_err());
+    assert!(validate_http_response_status_code("").is_err());
+    // Invalid: non-digit
+    assert!(validate_http_response_status_code("nonsense").is_err());
+    assert!(validate_http_response_status_code("12a").is_err());
+}
+
+#[test]
+fn validate_http_response_status_code_type() {
+    let t = types::http_response_status_code();
+
+    // Type identity: refined String with kind "HttpResponseStatusCode"
+    match t.kind() {
+        AttrTypeKind::String { identity, .. } => {
+            assert_eq!(
+                identity.as_ref().map(|id| id.kind.as_str()),
+                Some("HttpResponseStatusCode")
+            );
+        }
+        other => panic!("Expected refined String, got: {:?}", other),
+    }
+
+    // Valid
+    for ok in ["200", "299", "400", "499", "500", "599"] {
+        assert!(
+            t.validate(&Value::Concrete(ConcreteValue::String(ok.to_string())))
+                .is_ok(),
+            "Expected {ok} to validate"
+        );
+    }
+
+    // Invalid (includes fence-post boundaries 199/300/399 for the
+    // excluded 1XX/3XX ranges).
+    for bad in [
+        "100", "199", "300", "301", "399", "600", "nonsense", "20", "2000", "12a", "",
+    ] {
+        assert!(
+            t.validate(&Value::Concrete(ConcreteValue::String(bad.to_string())))
+                .is_err(),
+            "Expected {bad} to fail validation"
+        );
+    }
+
+    // Wrong type
+    assert!(
+        t.validate(&Value::Concrete(ConcreteValue::Int(42)))
+            .is_err()
+    );
+}
+
 #[cfg(test)]
 mod validate_collect_tests {
     use super::*;

@@ -1489,8 +1489,7 @@ impl DiagnosticEngine {
     fn check_unknown_type_names(&self, type_expr: &TypeExpr) -> Option<String> {
         match type_expr {
             TypeExpr::Simple(name) => {
-                let builtin = ["ipv4_cidr", "ipv4_address", "ipv6_cidr", "ipv6_address"];
-                if builtin.contains(&name.as_str()) {
+                if carina_core::parser::BUILTIN_BARE_CUSTOM_TYPES.contains(&name.as_str()) {
                     return None;
                 }
                 // `Simple` annotations name a built-in custom type; key

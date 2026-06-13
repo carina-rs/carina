@@ -902,9 +902,10 @@ fn type_completion_includes_basic_types() {
     );
 
     // Built-in custom types should always appear (no provider needed)
-    for builtin_custom in &["Ipv4Cidr", "Ipv4Address", "Ipv6Cidr", "Ipv6Address"] {
+    for snake in carina_core::parser::BUILTIN_BARE_CUSTOM_TYPES {
+        let builtin_custom = carina_core::parser::snake_to_pascal(snake);
         assert!(
-            labels.contains(builtin_custom),
+            labels.contains(&builtin_custom.as_str()),
             "Type completions should include built-in custom type '{}'. Got: {:?}",
             builtin_custom,
             labels
