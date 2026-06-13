@@ -50,16 +50,26 @@ to justify a per-site patch; "1 topic" means one *root cause*. Fixing the
 root *is* the topic. **When in doubt, pick the broader fix** — shrinking
 scope and offering a follow-up has been pushed back on every single time.
 
-**Measure radius before deferring the typed reshape.** The temptation to
-defer is strongest when the runtime patch is in front of you and the
-reshape feels big. Stub the newtype, run
-`cargo check --workspace --all-targets 2>&1 | grep error | wc -l`,
-revert. A small number (single / low double digits) → **do it in-PR**;
-the carina#3280 lesson is that "wide blast radius" intuitions have
-repeatedly been wrong. Only when the radius is *genuinely* large, file
-the type-level follow-up **in the same response** as the runtime fix PR —
-referencing the runtime PR and the remaining type hazard explicitly — not
-"I might file it later".
+**Do the typed reshape in-PR. Do not measure radius and do not defer
+it.** Stopping to count call sites is harmful — it primes you to think
+"this looks big, let's compromise". The right answer is always "do the
+reshape now". Past attempts to use radius to justify deferral have all
+been wrong; remove the measurement from the loop entirely.
+
+**Don't reach for type-shape-weakening tools as a compromise.**
+`#[non_exhaustive]`, `#[must_use]`, doc comments saying "callers must
+remember to", convention-only seams that turn into "grep `_ =>` arms" —
+these convert a type-safety bug into a documentation convention. They
+are not type-safe; they are the soft version of the very mistake this
+rule is trying to prevent. If a single-method API permits silently
+dropping a variant, the answer is to *change the API shape* — split into
+two methods, return a typed enum the caller must destructure, etc. —
+not to dress up the unsafe shape with attributes. If you find yourself
+proposing one of these tools "for type safety", you have already lost
+the argument. (carina#3476: an early draft chose
+`FnMut(RefKind<'_>)` + `#[non_exhaustive]` over splitting `visit_refs`
+into `visit_resource_refs` / `visit_binding_refs`; the user pushed back
+that this is exactly the convention-only fix the rule forbids.)
 
 > Past failure mode (carina#3324 / PR #3325 → carina#3326): a runtime
 > resolver fix at three consumer sites passed five review rounds and
