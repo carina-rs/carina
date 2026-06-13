@@ -94,7 +94,7 @@ fn handle_tty(
             ..
         } => {
             let key = format_effect(effect);
-            let timing = format!("[{}]", format_duration(*duration)).dimmed();
+            let timing = format!("took {}", format_duration(*duration)).dimmed();
             let counter = format_progress(progress).dimmed();
             let msg = format!(
                 "{} {} {} {}",
@@ -118,7 +118,7 @@ fn handle_tty(
             progress,
         } => {
             let key = format_effect(effect);
-            let timing = format!("[{}]", format_duration(*duration)).dimmed();
+            let timing = format!("took {}", format_duration(*duration)).dimmed();
             let counter = format_progress(progress).dimmed();
             let msg = format!(
                 "{} {} {} {}\n      {} {}",
@@ -233,7 +233,7 @@ fn format_plain(event: &ExecutionEvent) -> Vec<String> {
             progress,
             ..
         } => {
-            let timing = format!("[{}]", format_duration(*duration));
+            let timing = format!("took {}", format_duration(*duration));
             let counter = format_progress(progress);
             vec![format!(
                 "  ✓ {} {} {}",
@@ -248,7 +248,7 @@ fn format_plain(event: &ExecutionEvent) -> Vec<String> {
             duration,
             progress,
         } => {
-            let timing = format!("[{}]", format_duration(*duration));
+            let timing = format!("took {}", format_duration(*duration));
             let counter = format_progress(progress);
             vec![
                 format!("  ✗ {} {} {}", format_effect(effect), timing, counter),
@@ -333,6 +333,7 @@ mod tests {
         assert!(line.contains("✓"), "missing check mark: {line}");
         assert!(line.contains("Create"), "missing verb: {line}");
         assert!(line.contains("demo"), "missing resource name: {line}");
+        assert!(line.contains("took"), "missing `took` label: {line}");
         assert!(line.contains("1/3"), "missing counter: {line}");
     }
 
@@ -350,6 +351,11 @@ mod tests {
         });
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("✗"));
+        assert!(
+            lines[0].contains("took"),
+            "missing `took` label: {}",
+            lines[0]
+        );
         assert!(lines[1].contains("boom"));
     }
 

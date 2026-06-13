@@ -2,6 +2,14 @@ use super::*;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 use std::time::Duration;
 
+#[test]
+fn total_apply_line_formats_duration() {
+    assert_eq!(
+        format_total_apply_line(Duration::from_secs(5)),
+        "Done in 5.0s."
+    );
+}
+
 fn s3_backend_config_with_encrypt(encrypt: bool) -> carina_core::parser::BackendConfig {
     let mut attributes = HashMap::new();
     attributes.insert(

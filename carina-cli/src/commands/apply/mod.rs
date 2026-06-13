@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use colored::Colorize;
 
@@ -31,10 +32,8 @@ use crate::commands::shared::effect_execution::{
     execute_import_effects, execute_state_only_effects,
 };
 use crate::commands::shared::observer::CliObserver;
-#[cfg(test)]
-use crate::commands::shared::progress::format_duration;
 use crate::commands::shared::progress::{
-    RefreshProgress, emit_newline_on_interrupt, refresh_multi_progress,
+    RefreshProgress, emit_newline_on_interrupt, format_duration, refresh_multi_progress,
 };
 use crate::commands::shared::state_writeback::{
     ApplyStateSave, FinalizeApplyInput, PostApplyStates, apply_name_overrides,
@@ -53,6 +52,10 @@ use crate::wiring::{
 
 /// Re-export ExecutionResult as the public API for apply results.
 pub type ApplyResult = ExecutionResult;
+
+fn format_total_apply_line(elapsed: Duration) -> String {
+    format!("Done in {}.", format_duration(elapsed))
+}
 
 /// Execute all effects in a plan, resolving references dynamically.
 ///
@@ -802,10 +805,15 @@ pub async fn run_apply(
             println!("  {} Lock released", "✓".green());
         }
 
-        op_result?;
+        let timing = op_result?;
         release_result?;
+        if let Some(elapsed) = timing {
+            println!("{}", format_total_apply_line(elapsed));
+        }
     } else {
-        op_result?;
+        if let Some(timing) = op_result? {
+            println!("{}", format_total_apply_line(timing));
+        }
     }
 
     Ok(())
@@ -819,7 +827,7 @@ async fn run_apply_locked(
     lock: Option<&LockInfo>,
     base_dir: &std::path::Path,
     provider_context: &ProviderContext,
-) -> Result<(), AppError> {
+) -> Result<Option<Duration>, AppError> {
     // Read current state from backend. carina#3315: if `check_and_migrate`
     // lifted an older on-disk schema in memory, persist the upgrade
     // under the current lock before any short-circuit path can return
@@ -1312,7 +1320,7 @@ async fn run_apply_locked(
 
         if export_changes.is_empty() {
             println!("{}", "No changes needed.".green());
-            return Ok(());
+            return Ok(None);
         }
 
         print_plan(
@@ -1332,7 +1340,7 @@ async fn run_apply_locked(
             let _ = tokio::signal::ctrl_c().await;
         };
         if confirm_apply(stdin, interrupt, auto_approve).await? == ApplyConfirmation::Cancelled {
-            return Ok(());
+            return Ok(None);
         }
 
         println!(
@@ -1362,7 +1370,7 @@ async fn run_apply_locked(
             &current_states,
         )
         .await?;
-        return Ok(());
+        return Ok(None);
     }
 
     // Build delete attributes map from current states for display
@@ -1416,9 +1424,10 @@ async fn run_apply_locked(
         let _ = tokio::signal::ctrl_c().await;
     };
     if confirm_apply(stdin, interrupt, auto_approve).await? == ApplyConfirmation::Cancelled {
-        return Ok(());
+        return Ok(None);
     }
 
+    let apply_phase_started = Instant::now();
     println!("{}", "Applying changes...".cyan().bold());
     println!();
 
@@ -1451,6 +1460,7 @@ async fn run_apply_locked(
 
     // Execute remove and move effects (state-only, logged for user feedback)
     execute_state_only_effects(&plan, &mut result);
+    let resources_finished = Instant::now();
 
     // Use `resources_for_plan` (post-default_tags merge, post-canonicalize)
     // for state writeback so the per-resource `explicit` tree includes
@@ -1481,7 +1491,7 @@ async fn run_apply_locked(
                 .green()
                 .bold()
         );
-        Ok(())
+        Ok(Some(resources_finished.duration_since(apply_phase_started)))
     } else {
         let mut parts = vec![format!("{} succeeded", result.success_count)];
         if result.failure_count > 0 {
@@ -1635,10 +1645,15 @@ pub async fn run_apply_from_plan(
             println!("  {} Lock released", "✓".green());
         }
 
-        op_result?;
+        let timing = op_result?;
         release_result?;
+        if let Some(elapsed) = timing {
+            println!("{}", format_total_apply_line(elapsed));
+        }
     } else {
-        op_result?;
+        if let Some(timing) = op_result? {
+            println!("{}", format_total_apply_line(timing));
+        }
     }
 
     Ok(())
@@ -1650,7 +1665,7 @@ async fn run_apply_from_plan_locked(
     backend: &dyn StateBackend,
     lock: Option<&LockInfo>,
     base_dir: &std::path::Path,
-) -> Result<(), AppError> {
+) -> Result<Option<Duration>, AppError> {
     // Read current state and validate lineage. carina#3315: a
     // pending in-memory schema migration must be persisted under
     // the apply lock so the carina#3283 warning text matches
@@ -1771,7 +1786,7 @@ async fn run_apply_from_plan_locked(
         // path's gate (carina#3270 → run_apply_locked).
         // carina#3275.
         println!("{}", "No changes needed.".green());
-        return Ok(());
+        return Ok(None);
     }
 
     // Build delete attributes map from current states for display
@@ -1806,7 +1821,7 @@ async fn run_apply_from_plan_locked(
         let _ = tokio::signal::ctrl_c().await;
     };
     if confirm_apply(stdin, interrupt, auto_approve).await? == ApplyConfirmation::Cancelled {
-        return Ok(());
+        return Ok(None);
     }
 
     // Verify upstream-state bindings have not drifted since `carina
@@ -1851,6 +1866,7 @@ async fn run_apply_from_plan_locked(
         wait_aliases: &wait_aliases,
     });
 
+    let apply_phase_started = Instant::now();
     println!("{}", "Applying changes...".cyan().bold());
     println!();
 
@@ -1882,6 +1898,7 @@ async fn run_apply_from_plan_locked(
 
     // Execute remove and move effects (state-only, logged for user feedback)
     execute_state_only_effects(plan, &mut result);
+    let resources_finished = Instant::now();
 
     // Build schemas for write-only attribute persistence
     let (factories, _) = build_factories_from_providers(&plan_file.provider_configs, base_dir);
@@ -1921,7 +1938,7 @@ async fn run_apply_from_plan_locked(
                 .green()
                 .bold()
         );
-        Ok(())
+        Ok(Some(resources_finished.duration_since(apply_phase_started)))
     } else {
         let mut parts = vec![format!("{} succeeded", result.success_count)];
         if result.failure_count > 0 {

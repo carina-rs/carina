@@ -801,7 +801,7 @@ async fn run_destroy_locked(
 
         match delete_result {
             Ok(()) => {
-                let timing = format!("[{}]", format_duration(started.elapsed())).dimmed();
+                let timing = format!("took {}", format_duration(started.elapsed())).dimmed();
                 let msg = format!(
                     "{} {} {} {}",
                     "✓".green(),
@@ -847,7 +847,7 @@ async fn run_destroy_locked(
                     );
                     finish_spinner(&mut spinners, finished_idx, msg);
                 } else {
-                    let timing = format!("[{}]", format_duration(started.elapsed())).dimmed();
+                    let timing = format!("took {}", format_duration(started.elapsed())).dimmed();
                     let msg = format!(
                         "{} {} {} {}\n      {} {}",
                         "✗".red(),
