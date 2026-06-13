@@ -682,6 +682,9 @@ impl<'a> PlanPreprocessor<'a> {
         data_sources: &[carina_core::resource::DataSource],
         wait_bindings: &mut [carina_core::parser::WaitBinding],
     ) {
+        let schemas = self.ctx.schemas();
+        carina_core::value::canonicalize_resources_with_schemas(resources, schemas);
+
         // RFC #2371 stage 2 + #2387: strip every attribute the WASM
         // provider boundary refuses to serialize — `Value::Deferred(DeferredValue::Unknown)`
         // (#2378) and `Value::Deferred(DeferredValue::ResourceRef)` plus the wrappers that hide
@@ -701,7 +704,6 @@ impl<'a> PlanPreprocessor<'a> {
             !current_states_contain_unknown(current_states),
             "Value::Deferred(DeferredValue::Unknown) found in current_states — RFC #2371 constraint b violated"
         );
-        let schemas = self.ctx.schemas();
         apply_desired_normalization_in_place(
             resources,
             provider_configs,
@@ -2178,12 +2180,8 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         ctx.schemas(),
     );
 
-    // Type-level canonicalization for `Union[String, list(String)]`
-    // fields (IAM-style `string_or_list_of_strings`). Done after refs
-    // resolve so concrete `String` / `List` shapes can be folded to the
-    // canonical `Value::Concrete(ConcreteValue::StringList)` form before differ / display see
-    // them. See #2481, #2511.
-    carina_core::value::canonicalize_resources_with_schemas(&mut resources, ctx.schemas());
+    // Desired resource canonicalization runs inside PlanPreprocessor before
+    // its strip/restore wrapper; data sources and states remain separate.
     // Same canonicalization for the actual-side state values (#2481, #2513).
     // Existing state files written before this change come back from
     // serde with the legacy `String` / `List` shape; converging both

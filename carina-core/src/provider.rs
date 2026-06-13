@@ -348,7 +348,7 @@ pub type ProviderResult<T> = Result<T, ProviderError>;
 #[derive(Debug, Clone)]
 pub struct CreateRequest {
     /// Full desired state for the new resource.
-    pub resource: Resource,
+    pub resource: NormalizedResource,
 }
 
 /// Per-operation request record for [`Provider::read`].
@@ -1314,6 +1314,16 @@ impl Provider for Box<dyn Provider> {
 mod tests {
     use super::*;
 
+    fn normalized_for_test(resource: Resource) -> NormalizedResource {
+        futures::executor::block_on(crate::executor::normalized::apply_desired_normalization(
+            resource,
+            &[],
+            &NoopNormalizer,
+            &[],
+            &crate::schema::SchemaRegistry::new(),
+        ))
+    }
+
     // Mock Provider for testing
     struct MockProvider;
 
@@ -1343,7 +1353,7 @@ mod tests {
             request: CreateRequest,
         ) -> BoxFuture<'_, ProviderResult<State>> {
             let id = id.clone();
-            let attrs = request.resource.attributes.clone();
+            let attrs = request.resource.as_resource().attributes.clone();
             Box::pin(async move {
                 Ok(
                     State::existing(id, crate::resource::attrs_to_hashmap(&attrs))
@@ -1550,7 +1560,12 @@ mod tests {
         let resource = Resource::new("test", "example");
         let id = resource.id.clone();
         let state = provider
-            .create(&id, CreateRequest { resource })
+            .create(
+                &id,
+                CreateRequest {
+                    resource: normalized_for_test(resource),
+                },
+            )
             .await
             .unwrap();
         assert!(state.exists);
@@ -1575,7 +1590,12 @@ mod tests {
         let resource = Resource::with_provider("mock", "test", "example", None);
         let id = resource.id.clone();
         let state = router
-            .create(&id, CreateRequest { resource })
+            .create(
+                &id,
+                CreateRequest {
+                    resource: normalized_for_test(resource),
+                },
+            )
             .await
             .unwrap();
         assert!(state.exists);

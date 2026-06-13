@@ -135,25 +135,17 @@ pub(super) async fn execute_cbd_replace_parallel(
             });
         }
     };
+    let resolved_attrs = resolved.as_resource().resolved_attributes();
     let mut refreshes = Vec::new();
 
     match provider
-        .create(
-            &ctx.to.id,
-            CreateRequest {
-                resource: resolved.as_resource().clone(),
-            },
-        )
+        .create(&ctx.to.id, CreateRequest { resource: resolved })
         .await
     {
         Ok(state) => {
             // Build a local bindings clone for cascade resolution
             let mut local_bindings = ctx.bindings.clone();
-            local_bindings.record_applied(
-                ctx.to.binding.as_deref(),
-                &resolved.as_resource().resolved_attributes(),
-                &state,
-            );
+            local_bindings.record_applied(ctx.to.binding.as_deref(), &resolved_attrs, &state);
 
             // Execute cascading updates
             let mut cascade_failed = false;
@@ -291,7 +283,7 @@ pub(super) async fn execute_cbd_replace_parallel(
                             success: false,
                             state: Some(final_state),
                             resource_id: ctx.to.id.clone(),
-                            resolved_attrs: Some(resolved.as_resource().resolved_attributes()),
+                            resolved_attrs: Some(resolved_attrs.clone()),
                             binding: ctx.effect.binding_name(),
                             refreshes,
 
@@ -308,7 +300,7 @@ pub(super) async fn execute_cbd_replace_parallel(
                             success: true,
                             state: Some(final_state),
                             resource_id: ctx.to.id.clone(),
-                            resolved_attrs: Some(resolved.as_resource().resolved_attributes()),
+                            resolved_attrs: Some(resolved_attrs),
                             binding: ctx.to.binding.clone(),
                             refreshes,
 
@@ -412,13 +404,9 @@ pub(super) async fn execute_dbd_replace_parallel(
                     };
                 }
             };
+            let resolved_attrs = resolved.as_resource().resolved_attributes();
             match provider
-                .create(
-                    &ctx.to.id,
-                    CreateRequest {
-                        resource: resolved.as_resource().clone(),
-                    },
-                )
+                .create(&ctx.to.id, CreateRequest { resource: resolved })
                 .await
             {
                 Ok(state) => {
@@ -432,7 +420,7 @@ pub(super) async fn execute_dbd_replace_parallel(
                         success: true,
                         state: Some(state),
                         resource_id: ctx.to.id.clone(),
-                        resolved_attrs: Some(resolved.as_resource().resolved_attributes()),
+                        resolved_attrs: Some(resolved_attrs),
                         binding: ctx.to.binding.clone(),
                         refreshes,
 

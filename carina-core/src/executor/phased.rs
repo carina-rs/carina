@@ -615,20 +615,16 @@ pub(super) async fn execute_effects_phased(
                             }
                         };
 
+                        let resolved_attrs = resolved.as_resource().resolved_attributes();
                         match provider
-                            .create(
-                                &to.id,
-                                CreateRequest {
-                                    resource: resolved.as_resource().clone(),
-                                },
-                            )
+                            .create(&to.id, CreateRequest { resource: resolved })
                             .await
                         {
                             Ok(state) => {
                                 let mut local_bindings = binding_snapshot.clone();
                                 local_bindings.record_applied(
                                     to.binding.as_deref(),
-                                    &resolved.as_resource().resolved_attributes(),
+                                    &resolved_attrs,
                                     &state,
                                 );
 
@@ -1219,13 +1215,9 @@ pub(super) async fn execute_effects_phased(
                                     }
                                 };
 
+                                let resolved_attrs = resolved.as_resource().resolved_attributes();
                                 match provider
-                                    .create(
-                                        &to.id,
-                                        CreateRequest {
-                                            resource: resolved.as_resource().clone(),
-                                        },
-                                    )
+                                    .create(&to.id, CreateRequest { resource: resolved })
                                     .await
                                 {
                                     Ok(state) => {
@@ -1240,9 +1232,7 @@ pub(super) async fn execute_effects_phased(
                                             PhaseEffectResult::NonCbdCreateSuccess {
                                                 state,
                                                 resource_id: to.id.clone(),
-                                                resolved_attrs: resolved
-                                                    .as_resource()
-                                                    .resolved_attributes(),
+                                                resolved_attrs,
                                                 binding: to.binding.clone(),
                                             },
                                         )

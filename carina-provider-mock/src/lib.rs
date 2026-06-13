@@ -88,7 +88,7 @@ impl Provider for MockProvider {
         request: CreateRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id = id.clone();
-        let resource = request.resource;
+        let resource = request.resource.as_resource().clone();
         Box::pin(async move {
             let mut states = self.load_states();
             let key = Self::resource_key(&id);

@@ -105,7 +105,10 @@ impl Provider for MockProvider {
             .lock()
             .unwrap()
             .push(("create".to_string(), id_str));
-        self.create_resources.lock().unwrap().push(request.resource);
+        self.create_resources
+            .lock()
+            .unwrap()
+            .push(request.resource.as_resource().clone());
         let result = self.create_results.lock().unwrap().remove(0);
         Box::pin(async move { result })
     }
@@ -2298,7 +2301,7 @@ impl Provider for RecordingMockProvider {
         request: CreateRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id_str = id.to_string();
-        let attrs = request.resource.resolved_attributes();
+        let attrs = request.resource.as_resource().resolved_attributes();
         self.create_log.lock().unwrap().push((id_str, attrs));
         let result = self.create_results.lock().unwrap().remove(0);
         Box::pin(async move { result })

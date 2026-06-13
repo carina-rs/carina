@@ -516,13 +516,9 @@ pub(super) async fn execute_basic_effect<'a>(
                     };
                 }
             };
+            let resolved_attrs = resolved.as_resource().resolved_attributes();
             match provider
-                .create(
-                    &resource.id,
-                    CreateRequest {
-                        resource: resolved.as_resource().clone(),
-                    },
-                )
+                .create(&resource.id, CreateRequest { resource: resolved })
                 .await
             {
                 Ok(state) => {
@@ -535,7 +531,7 @@ pub(super) async fn execute_basic_effect<'a>(
                     BasicEffectResult::Success {
                         state: Some(state),
                         resource_id: resource.id.clone(),
-                        resolved_attrs: Some(resolved.as_resource().resolved_attributes()),
+                        resolved_attrs: Some(resolved_attrs),
                         binding: resource.binding.clone(),
                     }
                 }

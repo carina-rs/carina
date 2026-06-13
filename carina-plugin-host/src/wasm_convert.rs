@@ -521,7 +521,7 @@ pub fn core_to_wit_create_request(
     request: &CoreCreateRequest,
 ) -> Result<wit::CreateRequest, SerializationError> {
     Ok(wit::CreateRequest {
-        res: core_to_wit_resource(&request.resource)?,
+        res: core_to_wit_resource(request.resource.as_resource())?,
     })
 }
 

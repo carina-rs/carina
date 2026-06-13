@@ -11,6 +11,7 @@ use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
 use carina_core::effect::Effect;
+use carina_core::executor::normalized::apply_desired_normalization;
 use carina_core::executor::{ExecutionInput, ExecutionResult};
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ReadRequest};
@@ -618,12 +619,23 @@ pub async fn run_apply(
                 let bucket_provider = factory
                     .create_provider(None, &provider_config_attrs)
                     .await?;
+                let bucket_normalizer = factory
+                    .create_normalizer(None, &provider_config_attrs)
+                    .await;
+                let normalized_bucket = apply_desired_normalization(
+                    bucket_resource.clone(),
+                    &parsed.providers,
+                    bucket_normalizer.as_ref(),
+                    ctx.factories(),
+                    ctx.schemas(),
+                )
+                .await;
 
                 match bucket_provider
                     .create(
                         &bucket_resource.id,
                         carina_core::provider::CreateRequest {
-                            resource: bucket_resource.clone(),
+                            resource: normalized_bucket,
                         },
                     )
                     .await

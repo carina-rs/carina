@@ -1640,7 +1640,7 @@ impl Provider for RecordingProvider {
         request: carina_core::provider::CreateRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         // Return a state with a new identifier to simulate resource creation
-        let mut attrs = request.resource.attributes.clone();
+        let mut attrs = request.resource.as_resource().attributes.clone();
         // Simulate AWS returning a new ID
         attrs.insert(
             "vpc_id".to_string(),
@@ -1725,8 +1725,11 @@ impl Provider for RenameFailProvider {
         id: &ResourceId,
         request: carina_core::provider::CreateRequest,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        let state = State::existing(id.clone(), request.resource.resolved_attributes())
-            .with_identifier("temp-name-abc");
+        let state = State::existing(
+            id.clone(),
+            request.resource.as_resource().resolved_attributes(),
+        )
+        .with_identifier("temp-name-abc");
         Box::pin(async move { Ok(state) })
     }
 

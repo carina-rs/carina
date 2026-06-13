@@ -22,12 +22,19 @@ use crate::schema::SchemaRegistry;
 
 /// A `Resource` that has been through the full plan-time desired-side
 /// normalization pipeline.
+#[derive(Debug, Clone, PartialEq)]
 pub struct NormalizedResource(Resource);
 
 impl NormalizedResource {
     /// Borrow the normalized resource for read-only consumers.
     pub fn as_resource(&self) -> &Resource {
         &self.0
+    }
+
+    /// Consume the typestate wrapper at provider boundary translation points
+    /// that must serialize the raw resource shape.
+    pub fn into_resource(self) -> Resource {
+        self.0
     }
 }
 
@@ -41,6 +48,7 @@ pub async fn apply_desired_normalization(
     schemas: &SchemaRegistry,
 ) -> NormalizedResource {
     let mut one = [resource];
+    crate::value::canonicalize_resources_with_schemas(&mut one, schemas);
     apply_desired_normalization_in_place(
         &mut one,
         provider_configs,
@@ -62,7 +70,6 @@ pub async fn apply_desired_normalization_in_place(
     factories: &[Box<dyn ProviderFactory>],
     schemas: &SchemaRegistry,
 ) {
-    crate::value::canonicalize_resources_with_schemas(resources, schemas);
     normalizer.normalize_desired(resources).await;
     for config in provider_configs {
         if !config.default_tags.is_empty() {
