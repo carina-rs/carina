@@ -409,6 +409,21 @@ pub fn format_value(value: &Value) -> String {
     format_value_with_key(value, None)
 }
 
+/// Format a `Value` for user-visible messages where DSL literal quotes
+/// around bare strings get in the way.
+pub fn format_value_user_facing(value: &Value) -> String {
+    let formatted = format_value(value);
+    if matches!(value, Value::Concrete(ConcreteValue::String(_))) {
+        formatted
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .unwrap_or(&formatted)
+            .to_string()
+    } else {
+        formatted
+    }
+}
+
 /// Format a `Value` for display, with an optional key for context
 pub fn format_value_with_key(value: &Value, _key: Option<&str>) -> String {
     let mut sink = StringSink::default();
@@ -2614,6 +2629,23 @@ mod tests {
     fn test_format_value_string() {
         let v = Value::Concrete(ConcreteValue::String("hello".to_string()));
         assert_eq!(format_value(&v), "\"hello\"");
+    }
+
+    #[test]
+    fn test_format_value_user_facing_string_is_unquoted() {
+        let v = Value::Concrete(ConcreteValue::String("hello".to_string()));
+        assert_eq!(format_value_user_facing(&v), "hello");
+    }
+
+    #[test]
+    fn test_format_value_user_facing_non_string_matches_format_value() {
+        for value in [
+            Value::Concrete(ConcreteValue::Bool(true)),
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+            Value::resource_ref("vpc", "id", vec![]),
+        ] {
+            assert_eq!(format_value_user_facing(&value), format_value(&value));
+        }
     }
 
     #[test]

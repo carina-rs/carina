@@ -17,6 +17,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use crate::executor::{ExecutionEvent, ExecutionObserver};
 use crate::provider::{Provider, ProviderError, ReadRequest};
 use crate::resource::{ResourceId, State, Value};
+use crate::value::format_value_user_facing;
 use crate::wait::predicate::WaitPredicate;
 
 /// Outcome of polling a Wait effect. The variants distinguish:
@@ -90,15 +91,30 @@ pub(super) fn wait_failure_message(outcome: &WaitOutcome, target_id: &ResourceId
         WaitOutcome::Timeout {
             last_attrs,
             elapsed,
-        } => format!(
-            "wait on {} timed out after {:?} (last observed attributes: {:?})",
-            target_id, elapsed, last_attrs
-        ),
+        } => {
+            let observed = format_wait_last_attrs(last_attrs);
+            format!(
+                "wait on {} timed out after {:?} (last observed attributes: {})",
+                target_id, elapsed, observed
+            )
+        }
         WaitOutcome::NotFound(err) | WaitOutcome::ReadFailed(err) => err.to_string(),
         WaitOutcome::Satisfied { .. } | WaitOutcome::Cancelled | WaitOutcome::Unsatisfiable(_) => {
             unreachable!("satisfied, cancelled, and unsatisfiable waits are not failures")
         }
     }
+}
+
+fn format_wait_last_attrs(last_attrs: &HashMap<String, Value>) -> String {
+    let mut keys: Vec<_> = last_attrs.keys().collect();
+    keys.sort();
+    if keys.is_empty() {
+        return "no observed attributes".to_string();
+    }
+    keys.into_iter()
+        .map(|key| format!("{key}={}", format_value_user_facing(&last_attrs[key])))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Skip reason emitted on `EffectSkipped` when an effect is dropped or
@@ -375,7 +391,7 @@ mod tests {
     use crate::provider::{
         BoxFuture, CreateRequest, DeleteRequest, ProviderResult, ReadRequest, UpdateRequest,
     };
-    use crate::resource::{ConcreteValue, DataSource, Value};
+    use crate::resource::{ConcreteValue, DataSource, DeferredValue, UnknownReason, Value};
     use crate::wait::predicate::{AttrPath, WaitPredicate};
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -622,6 +638,77 @@ mod tests {
                 "PENDING_VALIDATION".to_string()
             )))
         );
+    }
+
+    #[test]
+    fn wait_timeout_failure_message_uses_display_formatting_for_last_attrs() {
+        let target = ResourceId::new("acm.Certificate", "cert");
+        let outcome = WaitOutcome::Timeout {
+            last_attrs: HashMap::from([
+                (
+                    "status".to_string(),
+                    Value::Concrete(ConcreteValue::String("pending".to_string())),
+                ),
+                (
+                    "arn".to_string(),
+                    Value::Concrete(ConcreteValue::String(
+                        "arn:aws:acm:1:certificate/abc".to_string(),
+                    )),
+                ),
+            ]),
+            elapsed: Duration::from_secs(1),
+        };
+
+        let message = wait_failure_message(&outcome, &target);
+
+        assert!(message.contains(
+            "last observed attributes: arn=arn:aws:acm:1:certificate/abc, status=pending"
+        ));
+        assert!(!message.contains("Concrete"));
+        assert!(!message.contains("String("));
+    }
+
+    #[test]
+    fn wait_timeout_failure_message_handles_empty_last_attrs() {
+        let target = ResourceId::new("acm.Certificate", "cert");
+        let outcome = WaitOutcome::Timeout {
+            last_attrs: HashMap::new(),
+            elapsed: Duration::from_secs(1),
+        };
+
+        let message = wait_failure_message(&outcome, &target);
+
+        assert!(message.contains("last observed attributes: no observed attributes"));
+    }
+
+    #[test]
+    fn wait_timeout_failure_message_handles_unknown_and_deferred_attrs() {
+        let target = ResourceId::new("acm.Certificate", "cert");
+        let outcome = WaitOutcome::Timeout {
+            last_attrs: HashMap::from([
+                (
+                    "status".to_string(),
+                    Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+                ),
+                (
+                    "target".to_string(),
+                    Value::resource_ref("vpc", "id", vec![]),
+                ),
+            ]),
+            elapsed: Duration::from_secs(1),
+        };
+
+        let message = wait_failure_message(&outcome, &target);
+
+        assert!(
+            message.contains(
+                "last observed attributes: status=(known after upstream apply), target=vpc.id"
+            ),
+            "{message}"
+        );
+        assert!(!message.contains("Deferred"));
+        assert!(!message.contains("Unknown("));
+        assert!(!message.contains("ResourceRef"));
     }
 
     #[tokio::test]
