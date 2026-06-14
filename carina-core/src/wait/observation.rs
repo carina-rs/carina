@@ -48,10 +48,6 @@ impl<'a> WaitObservation<'a> {
         }
     }
 
-    // Follow-up: fully closing this typestate would also make
-    // `AttrPath::segments` private and add a fallible constructor that
-    // rejects empty paths. That is wider because AttrPath is serialized.
-
     pub fn binding(&self) -> &str {
         self.binding
     }
@@ -123,9 +119,8 @@ mod tests {
     #[test]
     fn primary_walks_multi_segment_path() {
         let target_id = ResourceId::new("aws.test.Resource", "demo");
-        let renewal_status = AttrPath {
-            segments: vec!["renewal_summary".to_string(), "renewal_status".to_string()],
-        };
+        let renewal_status =
+            AttrPath::try_new(vec!["renewal_summary".into(), "renewal_status".into()]).unwrap();
         let predicate = equals_predicate(renewal_status.clone(), "PENDING");
         let leaf = string_value("PENDING");
         let last_attrs = HashMap::from([(

@@ -1164,9 +1164,7 @@ mod tests {
             target_id: rid.clone(),
             target: WaitTarget::ResolvedAtApply,
             until: WaitPredicate::Equals {
-                attr: crate::wait::predicate::AttrPath {
-                    segments: vec!["status".to_string()],
-                },
+                attr: crate::wait::predicate::AttrPath::single("status"),
                 value: crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
                     "ready".to_string(),
                 )),

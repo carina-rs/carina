@@ -6,8 +6,7 @@ pub mod augment;
 mod observation;
 pub mod predicate;
 pub use observation::WaitObservation;
-
-use predicate::AttrPath;
+pub use predicate::{AttrPath, AttrPathError, WaitPredicate};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BindingPattern {

@@ -2153,7 +2153,7 @@ impl Provider for WasmProvider {
 
     fn satisfier_hint(&self, target_id: &ResourceId, attr_path: &AttrPath) -> Vec<BindingPattern> {
         let wit_id = wasm_convert::core_to_wit_resource_id(target_id);
-        let attr_path = attr_path.segments.clone();
+        let wit_attr_path = attr_path.segments().to_vec();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let mut locked = match LockedStore::acquire(&self.instance, "satisfier_hint").await
@@ -2167,13 +2167,26 @@ impl Provider for WasmProvider {
                 let call = self
                     .instance
                     .bindings
-                    .call_satisfier_hint(locked.store(), &wit_id, &attr_path)
+                    .call_satisfier_hint(locked.store(), &wit_id, &wit_attr_path)
                     .await;
                 locked.disarm();
                 match call {
                     Ok(patterns) => patterns
                         .into_iter()
-                        .map(wasm_convert::wit_to_core_binding_pattern)
+                        .filter_map(|p| match wasm_convert::wit_to_core_binding_pattern(p) {
+                            Ok(pattern) => Some(pattern),
+                            Err(err) => {
+                                log::warn!(
+                                    target: "carina_plugin_host::wasm_factory",
+                                    "provider '{}' returned invalid satisfier-hint pattern for {} (attr: {}); skipping: {}",
+                                    self.name,
+                                    target_id,
+                                    attr_path.segments().join("."),
+                                    err
+                                );
+                                None
+                            }
+                        })
                         .collect(),
                     Err(e) => {
                         log::error!("WASM trap in satisfier_hint: {e}");
