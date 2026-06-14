@@ -66,6 +66,55 @@ fn snapshot_depends_on() {
     insta::assert_snapshot!(output);
 }
 
+#[test]
+fn snapshot_iam_preflight_warning_appears_after_plan_summary() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("depends_on");
+    let mut output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::None,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+        None,
+    ));
+    let warning = crate::commands::iam_preflight::format_warnings(
+        &crate::commands::iam_preflight::IamPreflightResult::Checked(
+            crate::commands::iam_preflight::IamPreflightReport {
+                actor_arn: "arn:aws:sts::123456789012:assumed-role/deploy/session".to_string(),
+                method: crate::commands::iam_preflight::IamCheckMethod::SimulatePrincipalPolicy,
+                source_providers: vec!["aws".to_string(), "awscc".to_string()],
+                missing_by_effect: vec![crate::commands::iam_preflight::MissingEffectActions {
+                    effect: crate::commands::iam_preflight::EffectAddress {
+                        resource: "awscc.elasticloadbalancingv2.LoadBalancer registry_publish.alb"
+                            .to_string(),
+                        op: carina_core::effect::PlanOp::Create,
+                    },
+                    missing_actions: vec!["ec2:DescribeInternetGateways".to_string()],
+                }],
+            },
+        ),
+    )
+    .expect("warning should render");
+    output.push_str(&strip_ansi(&warning));
+    output.push('\n');
+
+    let execution_plan = output.find("Execution Plan:").expect("plan header");
+    let summary = output.find("Plan: ").expect("plan summary");
+    let iam = output
+        .find("IAM preflight findings")
+        .expect("iam warning block");
+
+    assert!(
+        execution_plan < summary,
+        "plan summary should follow header"
+    );
+    assert!(summary < iam, "IAM warning should follow plan summary");
+    insta::assert_snapshot!(output);
+}
+
 /// Plan-display gate for the `wait` construct (carina#2825). The
 /// fixture wires ACM Certificate → Route53 validation record → wait
 /// (blocking on `cert.status == ISSUED`). The snapshot pins:

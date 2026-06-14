@@ -723,7 +723,6 @@ pub async fn run_plan(
         let result =
             crate::commands::iam_preflight::run_iam_preflight(&ctx.plan, &ctx.provider, strict_iam)
                 .await;
-        crate::commands::iam_preflight::emit_warnings(&result);
         Some(result)
     } else {
         None
@@ -732,12 +731,6 @@ pub async fn run_plan(
         && iam_preflight_result
             .as_ref()
             .is_some_and(crate::commands::iam_preflight::should_fail_strict);
-
-    if iam_strict_failed {
-        return Err(AppError::Validation(
-            "IAM preflight check failed in strict mode".to_string(),
-        ));
-    }
 
     // Build delete attributes map from current states for display
     let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = ctx
@@ -774,9 +767,15 @@ pub async fn run_plan(
         let json_str = serde_json::to_string_pretty(&plan_file)
             .map_err(|e| format!("Failed to serialize plan: {}", e))?;
         println!("{}", json_str);
+        if let Some(result) = iam_preflight_result.as_ref() {
+            crate::commands::iam_preflight::emit_warnings(result);
+        }
     } else if tui {
         carina_tui::run(&ctx.plan, wiring.schemas())
             .map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
+        if let Some(result) = iam_preflight_result.as_ref() {
+            crate::commands::iam_preflight::emit_warnings(result);
+        }
     } else {
         // Resolve export values for display
         let export_wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
@@ -816,6 +815,21 @@ pub async fn run_plan(
             println!();
             println!("{}", note.yellow());
         }
+        if let Some(result) = iam_preflight_result.as_ref() {
+            crate::commands::iam_preflight::print_warnings(result);
+        }
+    }
+
+    if iam_strict_failed {
+        eprintln!(
+            "{}",
+            "Error: IAM preflight check failed in strict mode"
+                .red()
+                .bold()
+        );
+        return Err(AppError::Validation(
+            "IAM preflight check failed in strict mode".to_string(),
+        ));
     }
 
     // Save plan to file if --out was specified

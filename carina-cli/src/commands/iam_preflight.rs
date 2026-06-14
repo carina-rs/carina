@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use aws_config::BehaviorVersion;
+use aws_sdk_iam::operation::simulate_principal_policy::SimulatePrincipalPolicyError;
 use aws_sdk_iam::types::PolicyEvaluationDecisionType;
 use carina_core::effect::{Effect, PlanOp};
 use carina_core::plan::Plan;
@@ -25,6 +26,7 @@ pub(crate) struct IamPreflightSkipped {
 pub(crate) struct IamPreflightReport {
     pub actor_arn: String,
     pub method: IamCheckMethod,
+    pub source_providers: Vec<String>,
     pub missing_by_effect: Vec<MissingEffectActions>,
 }
 
@@ -92,6 +94,7 @@ pub(crate) async fn run_iam_preflight(
         return IamPreflightResult::Checked(IamPreflightReport {
             actor_arn: String::new(),
             method: IamCheckMethod::SimulatePrincipalPolicy,
+            source_providers: plan_provider_names(plan),
             missing_by_effect: Vec::new(),
         });
     }
@@ -129,9 +132,13 @@ pub(crate) async fn run_iam_preflight(
                     (IamCheckMethod::DocumentFallback, missing)
                 }
                 Err(e) => {
+                    let actor_role_arn =
+                        role_arn_from_actor_arn(&actor_arn).unwrap_or_else(|| actor_arn.clone());
                     return IamPreflightResult::Skipped(IamPreflightSkipped {
                         reason: format!(
-                            "Warning: IAM preflight check skipped because IAM policies could not be read ({e})."
+                            "Warning: IAM preflight check skipped for actor {actor_arn} because IAM policy simulation was denied and IAM policies could not be read for fallback ({e}). \
+                             The actor needs `iam:SimulatePrincipalPolicy` (with `Resource = {actor_role_arn}`) OR `iam:GetRolePolicy` + `iam:ListAttachedRolePolicies` for the fallback path. \
+                             Add the grant to enable --check-iam."
                         ),
                     });
                 }
@@ -149,6 +156,7 @@ pub(crate) async fn run_iam_preflight(
     let report = IamPreflightReport {
         actor_arn,
         method,
+        source_providers: plan_provider_names(plan),
         missing_by_effect: group_missing_by_effect(&required, &missing_actions),
     };
 
@@ -193,32 +201,59 @@ fn effect_required_ops(effect: &Effect) -> Vec<(&ResourceId, PlanOp)> {
     }
 }
 
+fn effect_resource_ids(effect: &Effect) -> Vec<&ResourceId> {
+    match effect {
+        Effect::Read { resource } => vec![&resource.id],
+        Effect::Create(resource) => vec![&resource.id],
+        Effect::Update { id, .. } => vec![id],
+        Effect::Replace { id, to, .. } => vec![id, &to.id],
+        Effect::Delete { id, .. } => vec![id],
+        Effect::Import { id, .. } => vec![id],
+        Effect::Remove { id, .. } => vec![id],
+        Effect::Move { from, to } => vec![from, to],
+        Effect::Wait { .. } => Vec::new(),
+    }
+}
+
+fn plan_provider_names(plan: &Plan) -> Vec<String> {
+    plan.effects()
+        .iter()
+        .flat_map(effect_resource_ids)
+        .filter_map(|id| (!id.provider.is_empty()).then_some(id.provider.clone()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 pub(crate) fn format_warnings(result: &IamPreflightResult) -> Option<String> {
     match result {
-        IamPreflightResult::Skipped(skipped) => Some(skipped.reason.clone()),
+        IamPreflightResult::Skipped(skipped) => Some(format!(
+            "IAM preflight findings (1 warning):\n  {}",
+            skipped.reason
+        )),
         IamPreflightResult::Checked(report) if report.missing_by_effect.is_empty() => None,
         IamPreflightResult::Checked(report) => {
             let mut out = String::new();
+            out.push_str("IAM preflight findings (1 warning):\n");
+            out.push_str("  Required permissions sourced from each provider:\n");
+            for line in permission_source_lines(report) {
+                out.push_str(&format!("    - {line}\n"));
+            }
             match report.method {
                 IamCheckMethod::SimulatePrincipalPolicy => {
                     out.push_str(&format!(
-                        "Warning: IAM preflight check found missing permissions for {} using iam:SimulatePrincipalPolicy.\n",
+                        "  Check method: iam:SimulatePrincipalPolicy (SCPs, condition keys, exact resource ARN scopes may still affect apply)\n  Actor: {}\n",
                         report.actor_arn
                     ));
-                    out.push_str(
-                        "  Note: SCPs, condition keys, and exact resource ARN scopes may still affect apply.\n",
-                    );
                 }
                 IamCheckMethod::DocumentFallback => {
                     out.push_str(&format!(
-                        "Warning: IAM preflight check found missing permissions for {} using policy document fallback.\n",
+                        "  Check method: policy document fallback (weaker check: identity-policy action names only; does not evaluate SCPs, permission boundaries, condition keys, or resource scopes)\n  Actor: {}\n",
                         report.actor_arn
                     ));
-                    out.push_str(
-                        "  Weaker check: fallback only matches identity-policy action names; it does not evaluate SCPs, permission boundaries, condition keys, or resource scopes.\n",
-                    );
                 }
             }
+            out.push('\n');
             for effect in &report.missing_by_effect {
                 out.push_str(&format!(
                     "  {} ({})\n",
@@ -237,6 +272,12 @@ pub(crate) fn format_warnings(result: &IamPreflightResult) -> Option<String> {
 pub(crate) fn emit_warnings(result: &IamPreflightResult) {
     if let Some(warning) = format_warnings(result) {
         eprintln!("{}", warning.yellow());
+    }
+}
+
+pub(crate) fn print_warnings(result: &IamPreflightResult) {
+    if let Some(warning) = format_warnings(result) {
+        println!("{}", warning.yellow());
     }
 }
 
@@ -283,14 +324,10 @@ async fn simulate(
             request = request.action_names(action);
         }
 
-        let output = request.send().await.map_err(|e| {
-            let msg = e.to_string();
-            if is_access_denied(&msg) {
-                SimulateError::NeedsFallback(msg)
-            } else {
-                SimulateError::Other(msg)
-            }
-        })?;
+        let output = request
+            .send()
+            .await
+            .map_err(|e| classify_simulate_error(e.into_service_error()))?;
 
         denied_actions.extend(
             output
@@ -518,10 +555,69 @@ fn role_name_from_actor_arn(actor_arn: &str) -> Option<String> {
     None
 }
 
-fn is_access_denied(message: &str) -> bool {
-    message.contains("AccessDenied")
-        || message.contains("Access Denied")
-        || message.contains("not authorized")
+fn role_arn_from_actor_arn(actor_arn: &str) -> Option<String> {
+    if actor_arn.contains(":role/") {
+        return Some(actor_arn.to_string());
+    }
+    let account = actor_arn.split(":sts::").nth(1)?.split(':').next()?;
+    let role_name = role_name_from_actor_arn(actor_arn)?;
+    Some(format!("arn:aws:iam::{account}:role/{role_name}"))
+}
+
+fn classify_simulate_error(err: SimulatePrincipalPolicyError) -> SimulateError {
+    let code = err
+        .meta()
+        .code()
+        .map(str::to_string)
+        .unwrap_or_else(|| "unknown".to_string());
+    if code == "AccessDenied" {
+        return SimulateError::NeedsFallback(format_simulate_error(&err));
+    }
+
+    // The generated enum is #[non_exhaustive], and IAM may return operation-level
+    // errors such as AccessDenied through generic metadata instead of a named
+    // variant. Match every known variant, then classify future/generic variants
+    // by their service error code.
+    match err {
+        SimulatePrincipalPolicyError::InvalidInputException(_)
+        | SimulatePrincipalPolicyError::NoSuchEntityException(_)
+        | SimulatePrincipalPolicyError::PolicyEvaluationException(_) => SimulateError::Other(
+            format!("AWS IAM SimulatePrincipalPolicy failed with code {code}"),
+        ),
+        _ => SimulateError::Other(format!(
+            "AWS IAM SimulatePrincipalPolicy failed with code {code}"
+        )),
+    }
+}
+
+fn format_simulate_error(err: &SimulatePrincipalPolicyError) -> String {
+    let code = err.meta().code().unwrap_or("unknown");
+    let message = err.meta().message().unwrap_or("no message");
+    format!("AWS IAM SimulatePrincipalPolicy failed with code {code}: {message}")
+}
+
+fn permission_source_lines(report: &IamPreflightReport) -> Vec<String> {
+    let mut providers: BTreeSet<&str> =
+        report.source_providers.iter().map(String::as_str).collect();
+    if providers.is_empty() {
+        providers = report
+            .missing_by_effect
+            .iter()
+            .filter_map(|effect| effect.effect.resource.split('.').next())
+            .collect();
+    }
+    providers
+        .into_iter()
+        .map(|provider| {
+            // Kept CLI-local for carina#3524 to avoid a provider/WIT contract change;
+            // follow-up issue will move this onto Provider as permission_source().
+            match provider {
+                "awscc" => "awscc -> CloudFormation registry schema `handlers.<op>.permissions` (AWS does not guarantee completeness)".to_string(),
+                "aws" => "aws -> none declared (provider does not currently report required permissions)".to_string(),
+                other => format!("{other} -> provider-declared required permissions"),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -562,6 +658,7 @@ fn plan_op_rank(op: PlanOp) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_sdk_iam::error::ErrorMetadata;
     use carina_core::effect::ChangedCreateOnly;
     use carina_core::provider::{
         BoxFuture, CreateRequest, DeleteRequest, ProviderError, ProviderResult, ReadRequest,
@@ -693,6 +790,7 @@ mod tests {
         let result = IamPreflightResult::Checked(IamPreflightReport {
             actor_arn: "arn:aws:sts::123456789012:assumed-role/deploy/session".to_string(),
             method: IamCheckMethod::DocumentFallback,
+            source_providers: vec!["awscc".to_string()],
             missing_by_effect: vec![MissingEffectActions {
                 effect: EffectAddress {
                     resource: "awscc.elasticloadbalancingv2.LoadBalancer alb".to_string(),
@@ -706,12 +804,50 @@ mod tests {
         });
 
         insta::assert_snapshot!(format_warnings(&result).unwrap(), @r###"
-Warning: IAM preflight check found missing permissions for arn:aws:sts::123456789012:assumed-role/deploy/session using policy document fallback.
-  Weaker check: fallback only matches identity-policy action names; it does not evaluate SCPs, permission boundaries, condition keys, or resource scopes.
+IAM preflight findings (1 warning):
+  Required permissions sourced from each provider:
+    - awscc -> CloudFormation registry schema `handlers.<op>.permissions` (AWS does not guarantee completeness)
+  Check method: policy document fallback (weaker check: identity-policy action names only; does not evaluate SCPs, permission boundaries, condition keys, or resource scopes)
+  Actor: arn:aws:sts::123456789012:assumed-role/deploy/session
+
   awscc.elasticloadbalancingv2.LoadBalancer alb (create)
     -> missing iam:CreateServiceLinkedRole
     -> missing ec2:DescribeInternetGateways
 "###);
+    }
+
+    #[test]
+    fn classify_simulate_access_denied_uses_fallback() {
+        let err = SimulatePrincipalPolicyError::generic(
+            ErrorMetadata::builder()
+                .code("AccessDenied")
+                .message("not authorized to call SimulatePrincipalPolicy")
+                .build(),
+        );
+
+        assert!(matches!(
+            classify_simulate_error(err),
+            SimulateError::NeedsFallback(message)
+                if message.contains("code AccessDenied")
+                    && !message.contains("service error")
+        ));
+    }
+
+    #[test]
+    fn classify_simulate_non_access_denied_reports_service_code() {
+        let err = SimulatePrincipalPolicyError::generic(
+            ErrorMetadata::builder()
+                .code("ThrottlingException")
+                .message("rate exceeded")
+                .build(),
+        );
+
+        assert!(matches!(
+            classify_simulate_error(err),
+            SimulateError::Other(message)
+                if message.contains("code ThrottlingException")
+                    && !message.contains("service error")
+        ));
     }
 
     #[test]
@@ -769,6 +905,14 @@ Warning: IAM preflight check found missing permissions for arn:aws:sts::12345678
         assert_eq!(
             role_name_from_actor_arn("arn:aws:iam::123456789012:user/alice"),
             None
+        );
+    }
+
+    #[test]
+    fn role_arn_parses_assumed_role_for_simulate_resource_hint() {
+        assert_eq!(
+            role_arn_from_actor_arn("arn:aws:sts::123456789012:assumed-role/deploy/session"),
+            Some("arn:aws:iam::123456789012:role/deploy".to_string())
         );
     }
 
