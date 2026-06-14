@@ -18,8 +18,8 @@ use super::basic::{
 };
 use super::replace::{compute_full_diff_patch, single_attribute_patch};
 use super::wait::{
-    InFlightKind, UnsatisfiableReason, WaitOutcome, cancel_waits_if_terminal,
-    unsatisfiable_reason_message, wait_failure_message,
+    UnsatisfiableReason, WaitAwareInFlight, WaitOutcome, unsatisfiable_reason_message,
+    wait_failure_message,
 };
 use super::{
     ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, ProgressInfo,
@@ -393,11 +393,7 @@ pub(super) async fn execute_effects_phased(
         );
         let mut completed_indices: HashSet<usize> = HashSet::new();
         let mut dispatched: HashSet<usize> = HashSet::new();
-        type PhaseFuture<'a> =
-            std::pin::Pin<Box<dyn std::future::Future<Output = (usize, PhaseEffectResult)> + 'a>>;
-        let mut in_flight: FuturesUnordered<PhaseFuture<'_>> = FuturesUnordered::new();
-        let mut in_flight_kinds: HashMap<usize, InFlightKind> = HashMap::new();
-        let mut wait_cancellers: HashMap<usize, tokio::sync::watch::Sender<bool>> = HashMap::new();
+        let mut in_flight: WaitAwareInFlight<'_, PhaseEffectResult> = WaitAwareInFlight::new();
 
         loop {
             let mut newly_ready: Vec<usize> = Vec::new();
@@ -469,34 +465,32 @@ pub(super) async fn execute_effects_phased(
                         completed: c,
                         total,
                     };
-                    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-                    wait_cancellers.insert(idx, cancel_tx);
-                    in_flight_kinds.insert(idx, InFlightKind::Wait);
-
-                    in_flight.push(Box::pin(async move {
-                        let started = Instant::now();
-                        observer.on_event(&ExecutionEvent::EffectStarted { effect });
-                        let outcome = super::wait::execute_wait_effect(
-                            provider,
-                            target_id,
-                            wait_identifier.as_deref(),
-                            until,
-                            *timeout,
-                            *interval,
-                            cancel_rx,
-                            observer,
-                        )
-                        .await;
-                        (
-                            idx,
-                            PhaseEffectResult::Wait {
-                                binding: binding.clone(),
-                                outcome,
-                                duration: started.elapsed(),
-                                progress,
-                            },
-                        )
-                    }));
+                    in_flight.push_wait(idx, |cancel_rx| {
+                        Box::pin(async move {
+                            let started = Instant::now();
+                            observer.on_event(&ExecutionEvent::EffectStarted { effect });
+                            let outcome = super::wait::execute_wait_effect(
+                                provider,
+                                target_id,
+                                wait_identifier.as_deref(),
+                                until,
+                                *timeout,
+                                *interval,
+                                cancel_rx,
+                                observer,
+                            )
+                            .await;
+                            (
+                                idx,
+                                PhaseEffectResult::Wait {
+                                    binding: binding.clone(),
+                                    outcome,
+                                    duration: started.elapsed(),
+                                    progress,
+                                },
+                            )
+                        })
+                    });
                     continue;
                 }
 
@@ -526,9 +520,8 @@ pub(super) async fn execute_effects_phased(
                     schemas: input.schemas,
                 };
                 let completed_ref = &completed;
-                in_flight_kinds.insert(idx, InFlightKind::NonWait);
 
-                in_flight.push(Box::pin(async move {
+                in_flight.push_non_wait(idx, async move {
                     let basic = execute_basic_effect(
                         basic_effect,
                         &BasicEffectCtx {
@@ -543,23 +536,33 @@ pub(super) async fn execute_effects_phased(
                     )
                     .await;
                     (idx, PhaseEffectResult::Basic(basic))
-                }));
+                });
             }
 
-            let undispatched_count = phase1_indices
-                .iter()
-                .filter(|&&idx| !dispatched.contains(&idx))
-                .count();
-            cancel_waits_if_terminal(&in_flight_kinds, undispatched_count, &wait_cancellers);
+            let undispatched_count = || {
+                phase1_indices
+                    .iter()
+                    .filter(|&&idx| !dispatched.contains(&idx))
+                    .count()
+            };
+            in_flight
+                .check_terminal(undispatched_count())
+                .cancel_if_terminal()
+                .drop_without_awaiting();
 
             if in_flight.is_empty() {
                 break;
             }
 
-            let (finished_idx, result) = in_flight.next().await.unwrap();
+            let Some((finished_idx, result)) = in_flight
+                .check_terminal(undispatched_count())
+                .cancel_if_terminal()
+                .next_completed()
+                .await
+            else {
+                break;
+            };
             completed_indices.insert(finished_idx);
-            in_flight_kinds.remove(&finished_idx);
-            wait_cancellers.remove(&finished_idx);
 
             match result {
                 PhaseEffectResult::Basic(basic) => {
@@ -630,11 +633,10 @@ pub(super) async fn execute_effects_phased(
                 _ => unreachable!(),
             }
 
-            let undispatched_count = phase1_indices
-                .iter()
-                .filter(|&&idx| !dispatched.contains(&idx))
-                .count();
-            cancel_waits_if_terminal(&in_flight_kinds, undispatched_count, &wait_cancellers);
+            in_flight
+                .check_terminal(undispatched_count())
+                .cancel_if_terminal()
+                .drop_without_awaiting();
         }
     }
 

@@ -4,8 +4,6 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use futures::stream::{FuturesUnordered, StreamExt};
-
 use crate::deps::find_failed_dependency;
 use crate::effect::{Effect, WaitTarget};
 use crate::parser::ResourceRef;
@@ -18,8 +16,8 @@ use super::basic::{
 };
 use super::replace::{ReplaceContext, SingleEffectResult, execute_replace_parallel};
 use super::wait::{
-    InFlightKind, UnsatisfiableReason, WaitOutcome, cancel_waits_if_terminal,
-    unsatisfiable_reason_message, wait_failure_message,
+    UnsatisfiableReason, WaitAwareInFlight, WaitOutcome, unsatisfiable_reason_message,
+    wait_failure_message,
 };
 use super::{ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, ProgressInfo};
 
@@ -555,9 +553,7 @@ pub(super) async fn execute_effects_sequential(
         }
     }
 
-    let mut in_flight = FuturesUnordered::new();
-    let mut in_flight_kinds: HashMap<usize, InFlightKind> = HashMap::new();
-    let mut wait_cancellers: HashMap<usize, tokio::sync::watch::Sender<bool>> = HashMap::new();
+    let mut in_flight: WaitAwareInFlight<'_, SingleEffectResult> = WaitAwareInFlight::new();
 
     loop {
         // Find newly ready effects: all deps completed and not yet dispatched
@@ -660,17 +656,7 @@ pub(super) async fn execute_effects_sequential(
                 schemas: input.schemas,
             };
             let completed_ref = &completed;
-            let wait_cancel_rx = if effect.is_wait() {
-                let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-                wait_cancellers.insert(idx, cancel_tx);
-                in_flight_kinds.insert(idx, InFlightKind::Wait);
-                Some(cancel_rx)
-            } else {
-                in_flight_kinds.insert(idx, InFlightKind::NonWait);
-                None
-            };
-
-            in_flight.push(async move {
+            let make_future = move |wait_cancel_rx: Option<tokio::sync::watch::Receiver<bool>>| async move {
                 let result = match effect.as_basic() {
                     // `BasicEffect` is the type-level contract for
                     // `execute_basic_effect`: any Create/Update/Delete
@@ -779,14 +765,25 @@ pub(super) async fn execute_effects_sequential(
                     },
                 };
                 (idx, result)
-            });
+            };
+
+            if effect.is_wait() {
+                in_flight.push_wait(idx, |cancel_rx| Box::pin(make_future(Some(cancel_rx))));
+            } else {
+                in_flight.push_non_wait(idx, make_future(None));
+            }
         }
 
-        let undispatched_count = actionable_indices
-            .iter()
-            .filter(|&&idx| !dispatched.contains(&idx))
-            .count();
-        cancel_waits_if_terminal(&in_flight_kinds, undispatched_count, &wait_cancellers);
+        let undispatched_count = || {
+            actionable_indices
+                .iter()
+                .filter(|&&idx| !dispatched.contains(&idx))
+                .count()
+        };
+        in_flight
+            .check_terminal(undispatched_count())
+            .cancel_if_terminal()
+            .drop_without_awaiting();
 
         // If nothing is in flight, we're done (or stuck in a cycle)
         if in_flight.is_empty() {
@@ -809,10 +806,15 @@ pub(super) async fn execute_effects_sequential(
         }
 
         // Wait for the next effect to complete
-        let (finished_idx, result) = in_flight.next().await.unwrap();
+        let Some((finished_idx, result)) = in_flight
+            .check_terminal(undispatched_count())
+            .cancel_if_terminal()
+            .next_completed()
+            .await
+        else {
+            break;
+        };
         completed_indices.insert(finished_idx);
-        in_flight_kinds.remove(&finished_idx);
-        wait_cancellers.remove(&finished_idx);
 
         // Process the result and update shared state immediately
         match result {
@@ -924,11 +926,10 @@ pub(super) async fn execute_effects_sequential(
             },
         }
 
-        let undispatched_count = actionable_indices
-            .iter()
-            .filter(|&&idx| !dispatched.contains(&idx))
-            .count();
-        cancel_waits_if_terminal(&in_flight_kinds, undispatched_count, &wait_cancellers);
+        in_flight
+            .check_terminal(undispatched_count())
+            .cancel_if_terminal()
+            .drop_without_awaiting();
     }
 
     let failed_refreshes = refresh_pending_states(
