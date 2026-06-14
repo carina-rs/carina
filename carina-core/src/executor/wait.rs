@@ -8,7 +8,11 @@
 //! See `notes/specs/2026-05-09-wait-construct-design.md` §Executor logic.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::time::{Duration, Instant};
+
+use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::executor::{ExecutionEvent, ExecutionObserver};
 use crate::provider::{Provider, ProviderError, ReadRequest};
@@ -94,6 +98,114 @@ pub(super) fn cancel_waits_if_terminal(
             let _ = cancel.send(true);
         }
     }
+}
+
+/// Wait-aware in-flight future set with typestate-guarded terminal checks.
+///
+/// You cannot push while a [`TerminalCheck`] or [`NextReady`] is alive because
+/// both hold a mutable borrow of this set. The only way to await the next
+/// completed future is through `cancel_if_terminal().next_completed()`, so the
+/// terminal wait cancellation check cannot be skipped.
+#[allow(clippy::type_complexity)]
+pub(super) struct WaitAwareInFlight<'fut, R> {
+    inner: FuturesUnordered<Pin<Box<dyn Future<Output = (usize, R)> + 'fut>>>,
+    kinds: HashMap<usize, InFlightKind>,
+    cancellers: HashMap<usize, tokio::sync::watch::Sender<bool>>,
+}
+
+impl<'fut, R> WaitAwareInFlight<'fut, R> {
+    /// Create an empty wait-aware in-flight set.
+    pub(super) fn new() -> Self {
+        Self {
+            inner: FuturesUnordered::new(),
+            kinds: HashMap::new(),
+            cancellers: HashMap::new(),
+        }
+    }
+
+    /// Return `true` when no futures are currently in flight.
+    pub(super) fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Return the number of futures currently in flight.
+    pub(super) fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Dispatch a non-wait future and record its in-flight kind.
+    pub(super) fn push_non_wait<F>(&mut self, idx: usize, fut: F)
+    where
+        F: Future<Output = (usize, R)> + 'fut,
+    {
+        self.inner.push(Box::pin(fut));
+        self.kinds.insert(idx, InFlightKind::NonWait);
+    }
+
+    /// Dispatch a wait future and register its cancellation sender.
+    pub(super) fn push_wait<MkFut>(&mut self, idx: usize, mk_fut: MkFut)
+    where
+        MkFut: FnOnce(
+            tokio::sync::watch::Receiver<bool>,
+        ) -> Pin<Box<dyn Future<Output = (usize, R)> + 'fut>>,
+    {
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        self.cancellers.insert(idx, cancel_tx);
+        self.kinds.insert(idx, InFlightKind::Wait);
+        self.inner.push(mk_fut(cancel_rx));
+    }
+
+    /// Begin the required terminal wait cancellation check before awaiting.
+    #[must_use = "TerminalCheck must be consumed via cancel_if_terminal() to advance the loop"]
+    pub(super) fn check_terminal(
+        &mut self,
+        undispatched_count: usize,
+    ) -> TerminalCheck<'_, 'fut, R> {
+        TerminalCheck {
+            parent: self,
+            undispatched_count,
+        }
+    }
+}
+
+/// Terminal-check typestate handle that blocks further pushes while alive.
+#[must_use = "TerminalCheck must be consumed via cancel_if_terminal()"]
+pub(super) struct TerminalCheck<'a, 'fut, R> {
+    parent: &'a mut WaitAwareInFlight<'fut, R>,
+    undispatched_count: usize,
+}
+
+impl<'a, 'fut, R> TerminalCheck<'a, 'fut, R> {
+    /// Cancel waits if only waits remain and no undispatched effects exist.
+    pub(super) fn cancel_if_terminal(self) -> NextReady<'a, 'fut, R> {
+        cancel_waits_if_terminal(
+            &self.parent.kinds,
+            self.undispatched_count,
+            &self.parent.cancellers,
+        );
+        NextReady {
+            parent: self.parent,
+        }
+    }
+}
+
+/// Ready-to-await typestate handle produced after terminal checking.
+#[must_use = "NextReady must be awaited or explicitly dropped"]
+pub(super) struct NextReady<'a, 'fut, R> {
+    parent: &'a mut WaitAwareInFlight<'fut, R>,
+}
+
+impl<'a, 'fut, R> NextReady<'a, 'fut, R> {
+    /// Await the next completion and clean up its wait-aware bookkeeping.
+    pub(super) async fn next_completed(self) -> Option<(usize, R)> {
+        let (idx, result) = self.parent.inner.next().await?;
+        self.parent.kinds.remove(&idx);
+        self.parent.cancellers.remove(&idx);
+        Some((idx, result))
+    }
+
+    /// Explicitly drop this ready handle without awaiting a completion.
+    pub(super) fn drop_without_awaiting(self) {}
 }
 
 /// Run the wait polling loop:
