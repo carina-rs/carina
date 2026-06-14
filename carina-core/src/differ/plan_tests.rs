@@ -1225,7 +1225,7 @@ fn wait_binding_lowers_to_wait_effect() {
     let wait_effect = plan
         .effects()
         .iter()
-        .find(|e| matches!(e, Effect::Wait { .. }))
+        .find(|e| e.is_wait())
         .expect("expected Wait effect");
     let Effect::Wait {
         binding,
@@ -1312,7 +1312,7 @@ fn wait_uses_schema_default_timeout_when_omitted() {
     } = plan
         .effects()
         .iter()
-        .find(|e| matches!(e, Effect::Wait { .. }))
+        .find(|e| e.is_wait())
         .expect("expected Wait effect")
     else {
         unreachable!();
@@ -1369,7 +1369,6 @@ fn wait_with_unknown_target_emits_plan_error() {
 /// distribution (unchanged) referencing `cert_issued`.
 #[test]
 fn wait_omitted_when_all_consumers_unchanged() {
-    use crate::effect::Effect;
     use crate::parser::{UntilPredicateAst, WaitBinding};
 
     let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
@@ -1418,10 +1417,7 @@ fn wait_omitted_when_all_consumers_unchanged() {
     );
 
     assert!(
-        !plan
-            .effects()
-            .iter()
-            .any(|e| matches!(e, Effect::Wait { .. })),
+        !plan.effects().iter().any(|e| e.is_wait()),
         "carina#3101: no Effect::Wait when every consumer is unchanged; \
          effects were {:?}",
         plan.effects()
@@ -1488,7 +1484,6 @@ fn wait_emitted_when_a_consumer_has_a_pending_change() {
 /// in `web_acl_id` while still referencing `cert_issued`.
 #[test]
 fn wait_omitted_when_already_satisfied_and_target_unchanged() {
-    use crate::effect::Effect;
     use crate::parser::{UntilPredicateAst, WaitBinding};
 
     // cert: exists with status == ISSUED and is unchanged (desired
@@ -1543,10 +1538,7 @@ fn wait_omitted_when_already_satisfied_and_target_unchanged() {
     );
 
     assert!(
-        !plan
-            .effects()
-            .iter()
-            .any(|e| matches!(e, Effect::Wait { .. })),
+        !plan.effects().iter().any(|e| e.is_wait()),
         "carina#3358: an already-satisfied wait whose target is unchanged \
          must be elided even when a consumer has a pending change that \
          merely references it; effects were {:?}",

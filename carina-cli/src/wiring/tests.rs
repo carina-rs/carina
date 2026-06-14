@@ -3530,10 +3530,7 @@ mod wait_until_enum_alias {
             &raw_waits,
         );
         assert!(
-            plan_raw
-                .effects()
-                .iter()
-                .any(|e| matches!(e, Effect::Wait { .. })),
+            plan_raw.effects().iter().any(|e| e.is_wait()),
             "precondition: with the raw enum RHS the differ emits the no-op \
              wait (the carina#3358 bug); effects were {:?}",
             plan_raw.effects()
@@ -3554,10 +3551,7 @@ mod wait_until_enum_alias {
             &waits,
         );
         assert!(
-            !plan_fixed
-                .effects()
-                .iter()
-                .any(|e| matches!(e, Effect::Wait { .. })),
+            !plan_fixed.effects().iter().any(|e| e.is_wait()),
             "carina#3358: after enum-alias resolution the already-satisfied \
              wait must be elided; effects were {:?}",
             plan_fixed.effects()
