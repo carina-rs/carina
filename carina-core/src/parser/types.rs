@@ -77,6 +77,11 @@ pub const BUILTIN_BARE_CUSTOM_TYPES: &[&str] = &[
     "ipv6_cidr",
     "ipv6_address",
     "http_response_status_code",
+    "redirect_host",
+    "redirect_path",
+    "redirect_port",
+    "redirect_protocol",
+    "redirect_query",
 ];
 
 /// True iff a snake-cased bare type name resolves to a known custom

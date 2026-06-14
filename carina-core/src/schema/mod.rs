@@ -4956,6 +4956,122 @@ pub mod types {
             None,
         )
     }
+
+    /// ELBv2 redirect protocol restricted to `HTTP`, `HTTPS`, or `#{protocol}`.
+    ///
+    /// ```
+    /// # use carina_core::schema::validate_redirect_protocol;
+    /// assert!(validate_redirect_protocol("HTTPS").is_ok());
+    /// assert!(validate_redirect_protocol("#{protocol}").is_ok());
+    /// assert!(validate_redirect_protocol("#{path}").is_err());
+    /// ```
+    pub fn redirect_protocol() -> AttributeType {
+        AttributeType::refined_string_with_validator(
+            Some(TypeIdentity::bare("RedirectProtocol")),
+            None,
+            None,
+            legacy_validator(|value| {
+                if let Value::Concrete(ConcreteValue::String(s)) = value {
+                    validate_redirect_protocol(s)
+                } else {
+                    Err("Expected string".to_string())
+                }
+            }),
+            None,
+        )
+    }
+
+    /// ELBv2 redirect host, including wildcards and `#{host}`.
+    ///
+    /// ```
+    /// # use carina_core::schema::validate_redirect_host;
+    /// assert!(validate_redirect_host("example.com").is_ok());
+    /// assert!(validate_redirect_host("#{path}").is_err());
+    /// ```
+    pub fn redirect_host() -> AttributeType {
+        AttributeType::refined_string_with_validator(
+            Some(TypeIdentity::bare("RedirectHost")),
+            None,
+            None,
+            legacy_validator(|value| {
+                if let Value::Concrete(ConcreteValue::String(s)) = value {
+                    validate_redirect_host(s)
+                } else {
+                    Err("Expected string".to_string())
+                }
+            }),
+            None,
+        )
+    }
+
+    /// ELBv2 redirect port restricted to `1..=65535` or `#{port}`.
+    ///
+    /// ```
+    /// # use carina_core::schema::validate_redirect_port;
+    /// assert!(validate_redirect_port("443").is_ok());
+    /// assert!(validate_redirect_port("#{path}").is_err());
+    /// ```
+    pub fn redirect_port() -> AttributeType {
+        AttributeType::refined_string_with_validator(
+            Some(TypeIdentity::bare("RedirectPort")),
+            None,
+            None,
+            legacy_validator(|value| {
+                if let Value::Concrete(ConcreteValue::String(s)) = value {
+                    validate_redirect_port(s)
+                } else {
+                    Err("Expected string".to_string())
+                }
+            }),
+            None,
+        )
+    }
+
+    /// ELBv2 redirect path, including wildcards and ELBv2 redirect placeholders.
+    ///
+    /// ```
+    /// # use carina_core::schema::validate_redirect_path;
+    /// assert!(validate_redirect_path("/#{host}/#{path}").is_ok());
+    /// assert!(validate_redirect_path("relative").is_err());
+    /// ```
+    pub fn redirect_path() -> AttributeType {
+        AttributeType::refined_string_with_validator(
+            Some(TypeIdentity::bare("RedirectPath")),
+            None,
+            None,
+            legacy_validator(|value| {
+                if let Value::Concrete(ConcreteValue::String(s)) = value {
+                    validate_redirect_path(s)
+                } else {
+                    Err("Expected string".to_string())
+                }
+            }),
+            None,
+        )
+    }
+
+    /// ELBv2 redirect query string, including ELBv2 redirect placeholders.
+    ///
+    /// ```
+    /// # use carina_core::schema::validate_redirect_query;
+    /// assert!(validate_redirect_query("next=#{path}&q=#{query}").is_ok());
+    /// assert!(validate_redirect_query(&"a".repeat(129)).is_err());
+    /// ```
+    pub fn redirect_query() -> AttributeType {
+        AttributeType::refined_string_with_validator(
+            Some(TypeIdentity::bare("RedirectQuery")),
+            None,
+            None,
+            legacy_validator(|value| {
+                if let Value::Concrete(ConcreteValue::String(s)) = value {
+                    validate_redirect_query(s)
+                } else {
+                    Err("Expected string".to_string())
+                }
+            }),
+            None,
+        )
+    }
 }
 
 /// Validate an IPv4 address (e.g., "10.0.1.5", "192.168.0.1")
@@ -5170,6 +5286,91 @@ pub fn validate_http_response_status_code(code: &str) -> Result<(), String> {
     let first = code.chars().next().expect("length checked above");
     if !matches!(first, '2' | '4' | '5') {
         return Err(format!("must start with 2, 4, or 5 (got '{first}')"));
+    }
+    Ok(())
+}
+
+/// Validate an ELBv2 redirect protocol value.
+pub fn validate_redirect_protocol(protocol: &str) -> Result<(), String> {
+    if matches!(protocol, "HTTP" | "HTTPS" | "#{protocol}") {
+        return Ok(());
+    }
+    Err(format!(
+        "Invalid redirect protocol '{protocol}': expected HTTP, HTTPS, or #{{protocol}}"
+    ))
+}
+
+/// Validate an ELBv2 redirect host value.
+pub fn validate_redirect_host(host: &str) -> Result<(), String> {
+    validate_char_length(host, 1, 128, "redirect host")?;
+    validate_known_placeholders(host, &["#{host}"], "redirect host")
+}
+
+/// Validate an ELBv2 redirect port value.
+pub fn validate_redirect_port(port: &str) -> Result<(), String> {
+    if port == "#{port}" {
+        return Ok(());
+    }
+    if port.starts_with('+') || (port.len() > 1 && port.starts_with('0')) {
+        return Err(format!(
+            "Invalid redirect port '{port}': expected decimal integer or #{{port}}"
+        ));
+    }
+    match port.parse::<u32>() {
+        Ok(value) if (1..=65535).contains(&value) => Ok(()),
+        Ok(value) => Err(format!(
+            "Invalid redirect port '{port}': expected 1..=65535, got {value}"
+        )),
+        Err(_) => Err(format!(
+            "Invalid redirect port '{port}': expected decimal integer or #{{port}}"
+        )),
+    }
+}
+
+/// Validate an ELBv2 redirect path value.
+pub fn validate_redirect_path(path: &str) -> Result<(), String> {
+    validate_char_length(path, 1, 128, "redirect path")?;
+    if !path.starts_with('/') {
+        return Err("Invalid redirect path: must start with '/'".to_string());
+    }
+    let placeholders = ["#{host}", "#{port}", "#{path}"];
+    validate_known_placeholders(path, &placeholders, "redirect path")
+}
+
+/// Validate an ELBv2 redirect query value.
+pub fn validate_redirect_query(query: &str) -> Result<(), String> {
+    validate_char_length(query, 0, 128, "redirect query")?;
+    validate_known_placeholders(
+        query,
+        &["#{protocol}", "#{host}", "#{port}", "#{path}", "#{query}"],
+        "redirect query",
+    )
+}
+
+fn validate_char_length(value: &str, min: usize, max: usize, field: &str) -> Result<(), String> {
+    let len = value.chars().count();
+    if len < min || len > max {
+        return Err(format!(
+            "Invalid {field}: expected {min}..={max} characters, got {len}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_known_placeholders(value: &str, allowed: &[&str], field: &str) -> Result<(), String> {
+    let mut rest = value;
+    while let Some(start) = rest.find("#{") {
+        let candidate = &rest[start..];
+        let Some(end) = candidate.find('}') else {
+            return Err(format!("Invalid {field}: malformed placeholder"));
+        };
+        let placeholder = &candidate[..=end];
+        if !allowed.contains(&placeholder) {
+            return Err(format!(
+                "Invalid {field}: placeholder {placeholder} is not allowed"
+            ));
+        }
+        rest = &candidate[end + 1..];
     }
     Ok(())
 }
