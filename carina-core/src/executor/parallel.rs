@@ -1045,6 +1045,7 @@ pub(super) async fn execute_effects_sequential(
         successfully_deleted,
         permanent_name_overrides,
         current_states: input.current_states.clone(),
+        bindings: input.bindings.clone(),
         failed_refreshes,
     };
     (result, cancelled)

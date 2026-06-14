@@ -1438,6 +1438,7 @@ async fn lock_released_on_write_state_failure() {
         permanent_name_overrides: HashMap::new(),
         successfully_deleted: HashSet::new(),
         current_states: HashMap::new(),
+        bindings: carina_core::binding_index::ResolvedBindings::default(),
         failed_refreshes: HashSet::new(),
     };
 
@@ -1576,6 +1577,7 @@ async fn finalize_apply_uses_write_state_locked() {
         permanent_name_overrides: HashMap::new(),
         successfully_deleted: HashSet::new(),
         current_states: HashMap::new(),
+        bindings: carina_core::binding_index::ResolvedBindings::default(),
         failed_refreshes: HashSet::new(),
     };
 
@@ -1833,7 +1835,7 @@ async fn rename_failure_in_create_before_destroy_counts_as_failure() {
         carina_core::executor::UnresolvedResource::from_pre_resolve(new_resource),
     )]);
 
-    let result = execute_effects(
+    let outcome = execute_effects(
         &plan,
         &provider,
         &carina_core::provider::NoopNormalizer,
@@ -1848,6 +1850,12 @@ async fn rename_failure_in_create_before_destroy_counts_as_failure() {
         carina_core::executor::TEST_UNCAPPED,
     )
     .await;
+    let result = match outcome {
+        carina_core::executor::ExecutionOutcome::Completed(result) => result,
+        carina_core::executor::ExecutionOutcome::Cancelled(_) => {
+            panic!("uncancelled execute_effects returned Cancelled")
+        }
+    };
 
     // The rename failed, so the effect should be counted as a failure
     assert_eq!(
@@ -2011,7 +2019,7 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
 
     // --- Execute ---
     let provider = RecordingProvider::new();
-    let result = execute_effects(
+    let outcome = execute_effects(
         &plan,
         &provider,
         &carina_core::provider::NoopNormalizer,
@@ -2026,6 +2034,12 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
         carina_core::executor::TEST_UNCAPPED,
     )
     .await;
+    let result = match outcome {
+        carina_core::executor::ExecutionOutcome::Completed(result) => result,
+        carina_core::executor::ExecutionOutcome::Cancelled(_) => {
+            panic!("uncancelled execute_effects returned Cancelled")
+        }
+    };
 
     assert_eq!(result.success_count, 2, "Both effects should succeed");
     assert_eq!(result.failure_count, 0, "No effects should fail");
@@ -2210,6 +2224,7 @@ async fn finalize_apply_without_lock_uses_write_state() {
         permanent_name_overrides: HashMap::new(),
         successfully_deleted: HashSet::new(),
         current_states: HashMap::new(),
+        bindings: carina_core::binding_index::ResolvedBindings::default(),
         failed_refreshes: HashSet::new(),
     };
 
@@ -3092,6 +3107,7 @@ async fn finalize_apply_clears_state_exports_when_params_empty() {
         permanent_name_overrides: HashMap::new(),
         successfully_deleted: HashSet::new(),
         current_states: HashMap::new(),
+        bindings: carina_core::binding_index::ResolvedBindings::default(),
         failed_refreshes: HashSet::new(),
     };
 
@@ -3150,6 +3166,7 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
         permanent_name_overrides: HashMap::new(),
         successfully_deleted: HashSet::new(),
         current_states: HashMap::new(),
+        bindings: carina_core::binding_index::ResolvedBindings::default(),
         failed_refreshes: HashSet::new(),
     };
 

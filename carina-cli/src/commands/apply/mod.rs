@@ -15,7 +15,7 @@ use carina_core::differ::{cascade_dependent_updates, create_plan};
 use carina_core::effect::Effect;
 use carina_core::executor::normalized::apply_desired_normalization;
 use carina_core::executor::{
-    ExecutionInput, ExecutionOutcome, ExecutionResult, UnresolvedResource,
+    ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult, UnresolvedResource,
 };
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ReadRequest};
@@ -57,8 +57,48 @@ use crate::wiring::{
 /// Re-export ExecutionResult as the public API for apply results.
 pub type ApplyResult = ExecutionResult;
 
+type ObserverFactory<'a> = dyn Fn(&Plan) -> Box<dyn ExecutionObserver> + 'a;
+
+fn cli_observer_factory(plan: &Plan) -> Box<dyn ExecutionObserver> {
+    Box::new(CliObserver::new(plan))
+}
+
 fn format_total_apply_line(elapsed: Duration) -> String {
     format!("Done in {}.", format_duration(elapsed))
+}
+
+/// Handle the finalize_apply call after execute_effects returns.
+///
+/// Four cases:
+/// 1. not cancelled + finalize Ok    -> Ok(())  (normal completion)
+/// 2. not cancelled + finalize Err   -> Err(finalize_err)  (state save failed mid-run)
+/// 3. cancelled     + finalize Ok    -> Err(Interrupted)  (state saved despite cancel)
+/// 4. cancelled     + finalize Err   -> Err(Interrupted) after logging warning  (cancel + save failed)
+///
+/// On cancellation, the Interrupted error takes precedence so the user sees
+/// "the apply was interrupted" rather than a backend error that happened to
+/// occur during cleanup. The finalize error is still logged to stderr.
+/// Production signal-driven cancellation is wired in T7/T8; T5 only preserves
+/// partial state after the executor observes a cancellation token.
+fn handle_finalize_after_execute(
+    finalize_result: Result<(), AppError>,
+    cancelled: bool,
+) -> Result<(), AppError> {
+    if cancelled {
+        if let Err(err) = finalize_result {
+            eprintln!("warning: state save during cancellation also failed: {err}");
+        }
+        return Err(AppError::Interrupted);
+    }
+
+    finalize_result
+}
+
+fn split_execution_outcome(outcome: ExecutionOutcome) -> (ExecutionResult, bool) {
+    match outcome {
+        ExecutionOutcome::Completed(result) => (result, false),
+        ExecutionOutcome::Cancelled(result) => (result, true),
+    }
 }
 
 /// Execute all effects in a plan, resolving references dynamically.
@@ -79,12 +119,47 @@ pub async fn execute_effects(
     compositions: &[carina_core::resource::Composition],
     cancel: CancellationToken,
     parallelism: NonZeroUsize,
-) -> ApplyResult {
+) -> ExecutionOutcome {
+    let observer = cli_observer_factory(plan);
+    execute_effects_with_observer(
+        plan,
+        provider,
+        normalizer,
+        provider_configs,
+        factories,
+        schemas,
+        bindings,
+        current_states,
+        unresolved_resources,
+        compositions,
+        cancel,
+        parallelism,
+        observer,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_effects_with_observer(
+    plan: &Plan,
+    provider: &dyn Provider,
+    normalizer: &dyn ProviderNormalizer,
+    provider_configs: &[ProviderConfig],
+    factories: &[Box<dyn carina_core::provider::ProviderFactory>],
+    schemas: &carina_core::schema::SchemaRegistry,
+    bindings: &mut ResolvedBindings,
+    current_states: &mut HashMap<ResourceId, State>,
+    unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
+    compositions: &[carina_core::resource::Composition],
+    cancel: CancellationToken,
+    parallelism: NonZeroUsize,
+    observer: Box<dyn ExecutionObserver>,
+) -> ExecutionOutcome {
     let input = ExecutionInput {
         plan,
         unresolved_resources,
         compositions,
-        bindings: std::mem::take(bindings),
+        bindings: bindings.clone(),
         current_states: std::mem::take(current_states),
         normalizer,
         provider_configs,
@@ -93,20 +168,16 @@ pub async fn execute_effects(
         parallelism,
     };
 
-    let observer = CliObserver::new(plan);
-    let outcome = carina_core::executor::execute_plan(provider, input, &observer, cancel).await;
-    // T3: both arms surface the same ExecutionResult so callers see consistent
-    // intermediate state regardless of whether cancellation has been observed yet.
-    // T5 (carina#3505) will rewrap this into the finalize_apply pipeline so the
-    // caller can distinguish Completed from Cancelled at the apply boundary.
-    let result = match outcome {
-        ExecutionOutcome::Completed(result) | ExecutionOutcome::Cancelled(result) => result,
-    };
+    let outcome = carina_core::executor::execute_plan(provider, input, &*observer, cancel).await;
 
     // Write back the updated current_states so callers see refreshes
+    let result = match &outcome {
+        ExecutionOutcome::Completed(result) | ExecutionOutcome::Cancelled(result) => result,
+    };
     *current_states = result.current_states.clone();
+    *bindings = result.bindings.clone();
 
-    result
+    outcome
 }
 
 /// Re-load each upstream declared in the saved plan and verify its
@@ -562,6 +633,30 @@ pub async fn run_apply(
     lock: bool,
     parallelism: NonZeroUsize,
     provider_context: &ProviderContext,
+    cancel: CancellationToken,
+) -> Result<(), AppError> {
+    run_apply_with_observer_factory(
+        path,
+        auto_approve,
+        lock,
+        parallelism,
+        provider_context,
+        cancel,
+        &cli_observer_factory,
+    )
+    .await
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+async fn run_apply_with_observer_factory(
+    path: &Path,
+    auto_approve: bool,
+    lock: bool,
+    parallelism: NonZeroUsize,
+    provider_context: &ProviderContext,
+    cancel: CancellationToken,
+    observer_factory: &ObserverFactory<'_>,
 ) -> Result<(), AppError> {
     let loaded = load_configuration_with_config(
         path,
@@ -809,6 +904,8 @@ pub async fn run_apply(
         lock_info.as_ref(),
         base_dir,
         provider_context,
+        cancel,
+        observer_factory,
         parallelism,
     ))
     .await;
@@ -847,6 +944,8 @@ async fn run_apply_locked(
     lock: Option<&LockInfo>,
     base_dir: &std::path::Path,
     provider_context: &ProviderContext,
+    cancel: CancellationToken,
+    observer_factory: &ObserverFactory<'_>,
     parallelism: NonZeroUsize,
 ) -> Result<Option<Duration>, AppError> {
     // Read current state from backend. carina#3315: if `check_and_migrate`
@@ -1487,7 +1586,8 @@ async fn run_apply_locked(
     // `ProviderNormalizer`; the same object is passed in both positions
     // so apply re-normalizes with exactly the plan-time normalizer
     // (carina#3060). They must stay the same object.
-    let mut result = execute_effects(
+    let observer = observer_factory(&plan);
+    let outcome = execute_effects_with_observer(
         &plan,
         &provider,
         &provider,
@@ -1498,10 +1598,12 @@ async fn run_apply_locked(
         &mut current_states,
         &unresolved_resources,
         &parsed.compositions,
-        CancellationToken::new(),
+        cancel,
         parallelism,
+        observer,
     )
     .await;
+    let (mut result, cancelled) = split_execution_outcome(outcome);
 
     // Execute import effects: read imported resources from the provider
     execute_import_effects(&plan, &provider, &mut result).await;
@@ -1515,7 +1617,7 @@ async fn run_apply_locked(
     // provider-level default tags. Otherwise the next plan projects the
     // tags out of `current` and surfaces a spurious `tags: (none) → ...`
     // diff (refs awscc#206).
-    finalize_apply(FinalizeApplyInput {
+    let finalize_result = finalize_apply(FinalizeApplyInput {
         result: &result,
         state_file,
         sorted_resources: &resources_for_plan,
@@ -1529,7 +1631,8 @@ async fn run_apply_locked(
         wait_aliases: &wait_aliases,
         pre_resolve_compositions: &pre_resolve_compositions,
     })
-    .await?;
+    .await;
+    handle_finalize_after_execute(finalize_result, cancelled)?;
 
     println!();
     if result.failure_count == 0 && result.skip_count == 0 {
@@ -1582,6 +1685,30 @@ pub async fn run_apply_from_plan(
     lock: bool,
     parallelism: NonZeroUsize,
     provider_context: &ProviderContext,
+    cancel: CancellationToken,
+) -> Result<(), AppError> {
+    run_apply_from_plan_with_observer_factory(
+        plan_path,
+        auto_approve,
+        lock,
+        parallelism,
+        provider_context,
+        cancel,
+        &cli_observer_factory,
+    )
+    .await
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+async fn run_apply_from_plan_with_observer_factory(
+    plan_path: &PathBuf,
+    auto_approve: bool,
+    lock: bool,
+    parallelism: NonZeroUsize,
+    provider_context: &ProviderContext,
+    cancel: CancellationToken,
+    observer_factory: &ObserverFactory<'_>,
 ) -> Result<(), AppError> {
     // Read and deserialize the plan file
     let content =
@@ -1685,6 +1812,8 @@ pub async fn run_apply_from_plan(
         backend.as_ref(),
         lock_info.as_ref(),
         base_dir,
+        cancel,
+        observer_factory,
         parallelism,
     ))
     .await;
@@ -1713,12 +1842,15 @@ pub async fn run_apply_from_plan(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_apply_from_plan_locked(
     plan_file: PlanFile,
     auto_approve: bool,
     backend: &dyn StateBackend,
     lock: Option<&LockInfo>,
     base_dir: &std::path::Path,
+    cancel: CancellationToken,
+    observer_factory: &ObserverFactory<'_>,
     parallelism: NonZeroUsize,
 ) -> Result<Option<Duration>, AppError> {
     // Read current state and validate lineage. carina#3315: a
@@ -1942,7 +2074,8 @@ async fn run_apply_from_plan_locked(
     // Same object in both positions: `ProviderRouter` is both the
     // `Provider` and the `ProviderNormalizer`, so apply re-normalizes
     // with the plan-time normalizer (carina#3060).
-    let mut result = execute_effects(
+    let observer = observer_factory(plan);
+    let outcome = execute_effects_with_observer(
         plan,
         &provider,
         &provider,
@@ -1953,10 +2086,12 @@ async fn run_apply_from_plan_locked(
         &mut current_states,
         &unresolved_resources,
         plan_compositions,
-        CancellationToken::new(),
+        cancel,
         parallelism,
+        observer,
     )
     .await;
+    let (mut result, cancelled) = split_execution_outcome(outcome);
 
     // Execute import effects: read imported resources from the provider
     execute_import_effects(plan, &provider, &mut result).await;
@@ -1969,7 +2104,7 @@ async fn run_apply_from_plan_locked(
     let (factories, _) = build_factories_from_providers(&plan_file.provider_configs, base_dir);
     let ctx = WiringContext::new(factories);
 
-    finalize_apply(FinalizeApplyInput {
+    let finalize_result = finalize_apply(FinalizeApplyInput {
         result: &result,
         state_file,
         sorted_resources,
@@ -1993,7 +2128,8 @@ async fn run_apply_from_plan_locked(
         // pre-resolve composition snapshot is needed.
         pre_resolve_compositions: &[],
     })
-    .await?;
+    .await;
+    handle_finalize_after_execute(finalize_result, cancelled)?;
 
     println!();
     if result.failure_count == 0 && result.skip_count == 0 {

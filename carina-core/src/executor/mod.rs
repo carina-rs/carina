@@ -88,6 +88,7 @@ pub struct ExecutionResult {
     pub successfully_deleted: HashSet<ResourceId>,
     pub permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>>,
     pub current_states: HashMap<ResourceId, State>,
+    pub bindings: ResolvedBindings,
     pub failed_refreshes: HashSet<ResourceId>,
 }
 

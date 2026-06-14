@@ -2,6 +2,11 @@ use super::*;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 use std::time::Duration;
 
+#[path = "tests/cancellation_fixture.rs"]
+mod cancellation_fixture;
+
+use cancellation_fixture::ApplyCancellationFixture;
+
 #[test]
 fn total_apply_line_formats_duration() {
     assert_eq!(
@@ -13,6 +18,55 @@ fn total_apply_line_formats_duration() {
 #[test]
 fn apply_parallelism_default_is_eight() {
     assert_eq!(crate::DEFAULT_PARALLELISM.get(), 8);
+}
+
+#[tokio::test]
+async fn run_apply_cancelled_after_partial_execution_persists_state_and_releases_lock() {
+    let fixture = ApplyCancellationFixture::new()
+        .with_resources(["first", "second", "third"])
+        .cancel_after_successes(1);
+    let token = fixture.cancel_token();
+
+    let observer_factory = fixture.observer_factory();
+    let err = run_apply_with_observer_factory(
+        fixture.config_path(),
+        true,
+        true,
+        NonZeroUsize::new(1).unwrap(),
+        fixture.provider_context(),
+        token,
+        &observer_factory,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(err, AppError::Interrupted),
+        "expected Interrupted, got {err:?}"
+    );
+
+    let state = fixture.read_state().await;
+    assert!(fixture.backend().state_path().exists());
+    assert_eq!(
+        state.resources.len(),
+        1,
+        "state must contain exactly the completed resource"
+    );
+    assert_eq!(
+        state.serial, 1,
+        "state serial should advance once from the initial empty state"
+    );
+    assert!(
+        state
+            .find_resource("mock", "test.resource", "first")
+            .is_some()
+    );
+    assert!(
+        state
+            .find_resource("mock", "test.resource", "second")
+            .is_none()
+    );
+    assert!(!fixture.lock_path().exists());
 }
 
 fn s3_backend_config_with_encrypt(encrypt: bool) -> carina_core::parser::BackendConfig {
@@ -2078,6 +2132,7 @@ mod saved_plan_version_tests {
             false,
             std::num::NonZeroUsize::new(8).unwrap(),
             &carina_core::parser::ProviderContext::default(),
+            tokio_util::sync::CancellationToken::new(),
         )
         .await;
 
