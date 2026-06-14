@@ -17,6 +17,8 @@ use std::time::Duration;
 
 use carina_core::executor::{ExecutionEvent, ExecutionObserver};
 use carina_core::plan::Plan;
+use carina_core::resource::Value;
+use carina_core::value::format_value_user_facing;
 use colored::Colorize;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
@@ -322,13 +324,13 @@ fn format_plain(event: &ExecutionEvent) -> Vec<String> {
     }
 }
 
-fn format_wait_observed_attr(last_attrs: &HashMap<String, carina_core::resource::Value>) -> String {
+fn format_wait_observed_attr(last_attrs: &HashMap<String, Value>) -> String {
     let mut observed: Vec<_> = last_attrs.iter().collect();
     observed.sort_by_key(|(key, _)| *key);
     let Some((key, value)) = observed.first() else {
         return "no observed attributes".to_string();
     };
-    format!("{key}={value:?}")
+    format!("{key}={}", format_value_user_facing(value))
 }
 
 #[cfg(test)]
@@ -336,7 +338,7 @@ mod tests {
     use super::*;
     use carina_core::effect::Effect;
     use carina_core::executor::ProgressInfo;
-    use carina_core::resource::{ConcreteValue, Resource, Value};
+    use carina_core::resource::{ConcreteValue, DeferredValue, Resource, UnknownReason};
 
     fn dummy_create_effect() -> Effect {
         Effect::Create(Resource::new("aws.s3.Bucket", "demo"))
@@ -355,9 +357,34 @@ mod tests {
             ),
         ]);
 
+        assert_eq!(format_wait_observed_attr(&attrs), "arn=arn:demo");
+    }
+
+    #[test]
+    fn wait_observed_attr_uses_display_formatting() {
+        let attrs = HashMap::from([(
+            "arn".to_string(),
+            Value::Concrete(ConcreteValue::String(
+                "arn:aws:acm:1:certificate/abc".to_string(),
+            )),
+        )]);
+
         assert_eq!(
             format_wait_observed_attr(&attrs),
-            "arn=Concrete(String(\"arn:demo\"))"
+            "arn=arn:aws:acm:1:certificate/abc"
+        );
+    }
+
+    #[test]
+    fn wait_observed_attr_handles_unknown_value() {
+        let attrs = HashMap::from([(
+            "status".to_string(),
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+        )]);
+
+        assert_eq!(
+            format_wait_observed_attr(&attrs),
+            "status=(known after upstream apply)"
         );
     }
 
