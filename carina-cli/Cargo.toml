@@ -47,6 +47,7 @@ similar = "2"
 thiserror = "2"
 futures = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "io-std", "io-util"] }
+tokio-util = "0.7"
 
 [dev-dependencies]
 async-trait = "0.1"
