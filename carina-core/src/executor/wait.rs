@@ -7,13 +7,15 @@
 //!
 //! See `notes/specs/2026-05-09-wait-construct-design.md` §Executor logic.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use futures::stream::{FuturesUnordered, StreamExt};
 
+use crate::deps::find_failed_dependency;
+use crate::effect::Effect;
 use crate::executor::{ExecutionEvent, ExecutionObserver};
 use crate::provider::{Provider, ProviderError, ReadRequest};
 use crate::resource::{ResourceId, State, Value};
@@ -152,6 +154,25 @@ pub(super) fn cancel_waits_if_terminal(
             let _ = cancel.send(WaitSignal::NoMutatorRemaining);
         }
     }
+}
+
+/// Count effects that are not yet dispatched and not effectively
+/// pre-skipped by a failed dependency. An effect whose direct dependency is
+/// already in `failed_bindings` will be skipped on its next dispatch attempt
+/// without producing work; treating it as still "undispatched" for the
+/// terminal-with-pending-waits check would keep waits polling forever when
+/// their consumer downstream is blocked on a failing sibling. (carina#3544)
+pub(super) fn count_effectively_undispatched(
+    actionable_indices: &[usize],
+    dispatched: &HashSet<usize>,
+    effects: &[Effect],
+    failed_bindings: &HashSet<String>,
+) -> usize {
+    actionable_indices
+        .iter()
+        .filter(|&&idx| !dispatched.contains(&idx))
+        .filter(|&&idx| find_failed_dependency(&effects[idx], failed_bindings).is_none())
+        .count()
 }
 
 /// Wait-aware in-flight future set with typestate-guarded terminal checks.
