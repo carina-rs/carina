@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
 use colored::Colorize;
+use futures::stream::{FuturesUnordered, StreamExt};
+use tokio_util::sync::CancellationToken;
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::sort_resources_by_dependencies;
@@ -227,6 +229,7 @@ pub enum StateCommands {
 pub async fn run_state_command(
     command: StateCommands,
     provider_context: &ProviderContext,
+    cancel: CancellationToken,
 ) -> Result<(), AppError> {
     match command {
         StateCommands::BucketDelete {
@@ -235,7 +238,7 @@ pub async fn run_state_command(
             path,
         } => run_state_bucket_delete(&bucket_name, force, &path, provider_context).await,
         StateCommands::Refresh { path, lock } => {
-            run_state_refresh(&path, lock, provider_context).await
+            run_state_refresh(&path, lock, provider_context, cancel).await
         }
         StateCommands::List { path, state_url } => {
             run_state_list(path.as_deref(), state_url.as_deref(), provider_context).await
@@ -819,6 +822,7 @@ pub async fn run_state_refresh(
     path: &Path,
     lock: bool,
     provider_context: &ProviderContext,
+    cancel: CancellationToken,
 ) -> Result<(), AppError> {
     let loaded = load_configuration_with_config(
         path,
@@ -861,12 +865,13 @@ pub async fn run_state_refresh(
         None
     };
 
-    let op_result = crate::signal::run_with_ctrl_c(run_state_refresh_locked(
+    let op_result = run_state_refresh_locked(
         &mut parsed,
         backend.as_ref(),
         lock_info.as_ref(),
         base_dir,
-    ))
+        cancel,
+    )
     .await;
 
     // Always release lock if it was acquired
@@ -889,6 +894,7 @@ pub(crate) async fn run_state_refresh_locked(
     backend: &dyn StateBackend,
     lock: Option<&LockInfo>,
     base_dir: &std::path::Path,
+    cancel: CancellationToken,
 ) -> Result<(), AppError> {
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
     let ctx = WiringContext::new(factories);
@@ -936,29 +942,22 @@ pub(crate) async fn run_state_refresh_locked(
     println!();
     println!("{}", "Refreshing state...".cyan().bold());
 
-    // Read states for all resources using identifier from state
-    let mut current_states: HashMap<ResourceId, State> = HashMap::new();
-    let mut already_refreshed: HashSet<ResourceId> = HashSet::new();
-    for resource in &sorted_resources {
-        let identifier = state_file
-            .as_ref()
-            .and_then(|sf| sf.get_identifier_for_resource(resource));
-
-        // Skip resources not in state (no identifier means not managed)
-        if identifier.is_none() {
-            continue;
-        }
-
-        let fresh_state = provider
-            .read(
-                &resource.id,
-                identifier.as_deref(),
-                carina_core::provider::ReadRequest,
-            )
-            .await
-            .map_err(AppError::Provider)?;
-        current_states.insert(resource.id.clone(), fresh_state);
-        already_refreshed.insert(resource.id.clone());
+    // Read states for all resources using identifier from state.
+    // Cancel stops dispatching new reads, then waits for in-flight reads to finish
+    // so provider futures are not dropped mid-call.
+    let managed_reads: Vec<(ResourceId, String)> = sorted_resources
+        .iter()
+        .filter_map(|resource| {
+            let identifier = state_file
+                .as_ref()
+                .and_then(|sf| sf.get_identifier_for_resource(resource))?;
+            Some((resource.id.clone(), identifier))
+        })
+        .collect();
+    let (mut current_states, already_refreshed) =
+        refresh_existing_resources_until_cancelled(&provider, managed_reads, &cancel).await?;
+    if cancel.is_cancelled() {
+        return Err(AppError::Interrupted);
     }
 
     // carina#3272: expand `for _, _ in <iter> { ... }` loops the same
@@ -1027,6 +1026,9 @@ pub(crate) async fn run_state_refresh_locked(
     })
     .await?;
     sorted_resources = resorted;
+    if cancel.is_cancelled() {
+        return Err(AppError::Interrupted);
+    }
 
     // Also read states for orphaned resources (in state but removed from config)
     let desired_ids: HashSet<ResourceId> = sorted_resources.iter().map(|r| r.id.clone()).collect();
@@ -1051,16 +1053,12 @@ pub(crate) async fn run_state_refresh_locked(
         })
         .unwrap_or_default();
 
-    for (id, identifier) in &orphan_ids {
-        let fresh_state = provider
-            .read(
-                id,
-                Some(identifier.as_str()),
-                carina_core::provider::ReadRequest,
-            )
-            .await
-            .map_err(AppError::Provider)?;
-        current_states.insert(id.clone(), fresh_state);
+    let orphan_states =
+        refresh_existing_resources_until_cancelled(&provider, orphan_ids.clone(), &cancel)
+            .await?
+            .0;
+    for (id, fresh_state) in orphan_states {
+        current_states.insert(id, fresh_state);
     }
 
     // carina#3271: re-read every `read aws.*` data source. Without
@@ -1091,9 +1089,15 @@ pub(crate) async fn run_state_refresh_locked(
             &wait_aliases,
         )?;
         for resource in &resolved_data_sources {
+            if cancel.is_cancelled() {
+                return Err(AppError::Interrupted);
+            }
             let fresh_state = read_data_source_with_retry(&provider, resource)
                 .await
                 .map_err(AppError::Provider)?;
+            if cancel.is_cancelled() {
+                return Err(AppError::Interrupted);
+            }
             current_states.insert(resource.id.clone(), fresh_state);
         }
     }
@@ -1212,6 +1216,73 @@ pub(crate) async fn run_state_refresh_locked(
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
 
     Ok(())
+}
+
+async fn refresh_existing_resources_until_cancelled(
+    provider: &dyn Provider,
+    reads: Vec<(ResourceId, String)>,
+    cancel: &CancellationToken,
+) -> Result<(HashMap<ResourceId, State>, HashSet<ResourceId>), AppError> {
+    let mut current_states = HashMap::new();
+    let mut refreshed = HashSet::new();
+    let mut read_iter = reads.into_iter();
+    let mut in_flight = FuturesUnordered::new();
+    let mut refresh_cancelled = cancel.is_cancelled();
+
+    loop {
+        while !refresh_cancelled && in_flight.len() < 5 {
+            let Some((id, identifier)) = read_iter.next() else {
+                break;
+            };
+            in_flight.push(async move {
+                let fresh_state = provider
+                    .read(
+                        &id,
+                        Some(identifier.as_str()),
+                        carina_core::provider::ReadRequest,
+                    )
+                    .await
+                    .map_err(AppError::Provider)?;
+                Ok((id, fresh_state))
+            });
+        }
+
+        if in_flight.is_empty() {
+            break;
+        }
+
+        let result: Result<(ResourceId, State), AppError> = if refresh_cancelled {
+            in_flight.next().await.unwrap()
+        } else {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    refresh_cancelled = true;
+                    continue;
+                }
+                result = in_flight.next() => {
+                    result.unwrap()
+                }
+            }
+        };
+
+        if refresh_cancelled {
+            continue;
+        }
+
+        let (id, state) = result?;
+        refreshed.insert(id.clone());
+        current_states.insert(id, state);
+    }
+
+    drop(in_flight);
+    drop(read_iter);
+
+    if refresh_cancelled {
+        return Err(AppError::Interrupted);
+    }
+
+    Ok((current_states, refreshed))
 }
 
 /// Compare old state with fresh provider state for a single resource,

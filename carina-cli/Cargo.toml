@@ -35,13 +35,6 @@ colored = "3"
 indexmap = "2"
 indicatif = "0.17"
 env_logger = "0.11"
-# Async-signal-safe SIGINT/SIGTERM handler that restores the terminal cursor
-# if a refresh spinner was interrupted (#3153). Already present transitively
-# via crossterm, so promoting to a direct dep adds no build cost. `libc` is
-# needed for the raw `write(2)` the handler performs (the only
-# async-signal-safe way to emit `\x1b[?25h` from a signal context).
-signal-hook = "0.3"
-libc = "0.2"
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
