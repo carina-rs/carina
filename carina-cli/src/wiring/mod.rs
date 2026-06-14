@@ -42,6 +42,7 @@ use crate::error::AppError;
 /// Result of creating a plan, with context needed for saving
 pub struct PlanContext {
     pub plan: Plan,
+    pub provider: ProviderRouter,
     pub sorted_resources: Vec<Resource>,
     pub current_states: HashMap<ResourceId, State>,
     /// Maps moved-to resource IDs to their original (moved-from) IDs.
@@ -2104,6 +2105,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
 
     Ok(PlanContext {
         plan,
+        provider,
         sorted_resources,
         current_states,
         moved_origins,
