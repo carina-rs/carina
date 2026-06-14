@@ -9,6 +9,7 @@ use indexmap::IndexMap;
 use std::future::Future;
 use std::pin::Pin;
 
+use crate::effect::PlanOp;
 use crate::executor::normalized::NormalizedResource;
 use crate::resource::{ConcreteValue, DataSource, Directives, Resource, ResourceId, State, Value};
 use crate::schema::{SchemaRegistry, TypeIdentity};
@@ -588,6 +589,10 @@ pub trait Provider: Send + Sync {
         identifier: &str,
         request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>>;
+
+    /// Permissions this provider needs to perform `op` on `id`.
+    /// Empty vec means the provider declares no permissions for this resource/op pair.
+    fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> Vec<String>;
 }
 
 /// Convenience for a `ProviderNormalizer` method that does nothing.
@@ -900,6 +905,13 @@ impl Provider for ProviderRouter {
         match self.get_provider_or_error(id) {
             Ok(provider) => provider.delete(id, identifier, request),
             Err(e) => Box::pin(async move { Err(e) }),
+        }
+    }
+
+    fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> Vec<String> {
+        match self.get_provider_or_error(id) {
+            Ok(provider) => provider.required_permissions(id, op),
+            Err(_) => Vec::new(),
         }
     }
 }
@@ -1308,6 +1320,10 @@ impl Provider for Box<dyn Provider> {
     ) -> BoxFuture<'_, ProviderResult<()>> {
         (**self).delete(id, identifier, request)
     }
+
+    fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> Vec<String> {
+        (**self).required_permissions(id, op)
+    }
 }
 
 #[cfg(test)]
@@ -1395,6 +1411,10 @@ mod tests {
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Ok(()) })
         }
+
+        fn required_permissions(&self, _id: &ResourceId, _op: PlanOp) -> Vec<String> {
+            Vec::new()
+        }
     }
 
     #[tokio::test]
@@ -1468,6 +1488,10 @@ mod tests {
             _request: DeleteRequest,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Ok(()) })
+        }
+
+        fn required_permissions(&self, _id: &ResourceId, _op: PlanOp) -> Vec<String> {
+            Vec::new()
         }
     }
 
@@ -2132,6 +2156,10 @@ mod tests {
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Ok(()) })
         }
+
+        fn required_permissions(&self, _id: &ResourceId, _op: PlanOp) -> Vec<String> {
+            Vec::new()
+        }
     }
 
     #[tokio::test]
@@ -2473,6 +2501,10 @@ mod tests {
                 _request: DeleteRequest,
             ) -> BoxFuture<'_, ProviderResult<()>> {
                 Box::pin(async { Ok(()) })
+            }
+
+            fn required_permissions(&self, _id: &ResourceId, _op: PlanOp) -> Vec<String> {
+                Vec::new()
             }
         }
 

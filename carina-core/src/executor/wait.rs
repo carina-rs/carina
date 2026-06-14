@@ -148,6 +148,14 @@ mod tests {
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async move { Ok(()) })
         }
+
+        fn required_permissions(
+            &self,
+            _id: &ResourceId,
+            _op: crate::effect::PlanOp,
+        ) -> Vec<String> {
+            Vec::new()
+        }
     }
 
     fn state_with_status(status: &str) -> State {

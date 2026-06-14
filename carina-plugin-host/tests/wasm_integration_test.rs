@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use carina_core::effect::PlanOp;
 use carina_core::provider::{
     CreateRequest, DeleteRequest, PatchOp, PatchOpKind, Provider, ProviderFactory, ReadRequest,
     UpdatePatch, UpdateRequest,
@@ -477,5 +478,21 @@ async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
         Some(&Value::Concrete(ConcreteValue::String(
             "alice@example.com".into()
         ))),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_mock_provider_required_permissions_dispatches_through_wit() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &indexmap::IndexMap::new())
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider("mock", "test.resource", "example", None);
+
+    assert_eq!(
+        provider.required_permissions(&id, PlanOp::Create),
+        Vec::<String>::new()
     );
 }

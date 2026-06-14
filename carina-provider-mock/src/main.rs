@@ -160,6 +160,14 @@ impl CarinaProvider for MockProcessProvider {
         Ok(())
     }
 
+    fn required_permissions(
+        &self,
+        _id: &ResourceId,
+        _op: carina_plugin_sdk::PlanOp,
+    ) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Echo the host-provided `default_tags` back into each resource's
     /// attributes under a sentinel `__mock_merged_default_tags__` key so
     /// integration tests can verify the WIT bridge dispatched the call.

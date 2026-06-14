@@ -125,6 +125,14 @@ impl Provider for MockProvider {
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async move { Ok(()) })
     }
+
+    fn required_permissions(
+        &self,
+        _id: &ResourceId,
+        _op: carina_core::effect::PlanOp,
+    ) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 struct CollectingObserver {

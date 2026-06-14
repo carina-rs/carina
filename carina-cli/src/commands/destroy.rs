@@ -1037,6 +1037,14 @@ mod tests {
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { unreachable!() })
         }
+
+        fn required_permissions(
+            &self,
+            _id: &ResourceId,
+            _op: carina_core::effect::PlanOp,
+        ) -> Vec<String> {
+            Vec::new()
+        }
     }
 
     #[test]

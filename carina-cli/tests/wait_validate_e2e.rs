@@ -127,6 +127,14 @@ impl Provider for NoopProvider {
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async move { Ok(()) })
     }
+
+    fn required_permissions(
+        &self,
+        _id: &carina_core::resource::ResourceId,
+        _op: carina_core::effect::PlanOp,
+    ) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 fn factories() -> Vec<Box<dyn ProviderFactory>> {

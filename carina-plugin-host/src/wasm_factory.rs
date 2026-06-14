@@ -20,6 +20,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
+use carina_core::effect::PlanOp;
 use carina_core::provider::{
     BoxFuture, CreateRequest, DeleteRequest, Provider, ProviderError, ProviderFactory,
     ProviderNormalizer, ProviderResult, ReadRequest, SavedAttrs, UpdateRequest,
@@ -863,6 +864,54 @@ impl WasmBindings {
             WasmBindings::Http(b) => {
                 b.carina_provider_provider()
                     .call_delete(store, id, identifier, request)
+                    .await
+            }
+        }
+    }
+
+    async fn call_required_permissions(
+        &self,
+        store: &mut Store<HostState>,
+        id: &wit_types::ResourceId,
+        operation: PlanOp,
+    ) -> wasmtime::Result<Vec<String>> {
+        match self {
+            WasmBindings::Basic(b) => {
+                let operation = match operation {
+                    PlanOp::Create => {
+                        crate::wasm_bindings::exports::carina::provider::provider::PlanOp::Create
+                    }
+                    PlanOp::Read => {
+                        crate::wasm_bindings::exports::carina::provider::provider::PlanOp::Read
+                    }
+                    PlanOp::Update => {
+                        crate::wasm_bindings::exports::carina::provider::provider::PlanOp::Update
+                    }
+                    PlanOp::Delete => {
+                        crate::wasm_bindings::exports::carina::provider::provider::PlanOp::Delete
+                    }
+                };
+                b.carina_provider_provider()
+                    .call_required_permissions(store, id, operation)
+                    .await
+            }
+            WasmBindings::Http(b) => {
+                let operation = match operation {
+                    PlanOp::Create => {
+                        crate::wasm_bindings_http::exports::carina::provider::provider::PlanOp::Create
+                    }
+                    PlanOp::Read => {
+                        crate::wasm_bindings_http::exports::carina::provider::provider::PlanOp::Read
+                    }
+                    PlanOp::Update => {
+                        crate::wasm_bindings_http::exports::carina::provider::provider::PlanOp::Update
+                    }
+                    PlanOp::Delete => {
+                        crate::wasm_bindings_http::exports::carina::provider::provider::PlanOp::Delete
+                    }
+                };
+                b.carina_provider_provider()
+                    .call_required_permissions(store, id, operation)
                     .await
             }
         }
@@ -2049,6 +2098,35 @@ impl Provider for WasmProvider {
                 }
             },
         ))
+    }
+
+    fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> Vec<String> {
+        let wit_id = wasm_convert::core_to_wit_resource_id(id);
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let mut locked =
+                    match LockedStore::acquire(&self.instance, "required_permissions").await {
+                        Ok(locked) => locked,
+                        Err(e) => {
+                            log::error!("WASM required_permissions lock failed: {e}");
+                            return Vec::new();
+                        }
+                    };
+                let call = self
+                    .instance
+                    .bindings
+                    .call_required_permissions(locked.store(), &wit_id, op)
+                    .await;
+                locked.disarm();
+                match call {
+                    Ok(permissions) => permissions,
+                    Err(e) => {
+                        log::error!("WASM trap in required_permissions: {e}");
+                        Vec::new()
+                    }
+                }
+            })
+        })
     }
 }
 

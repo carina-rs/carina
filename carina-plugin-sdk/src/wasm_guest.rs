@@ -338,6 +338,17 @@ macro_rules! export_provider {
                 }
             }
 
+            fn wit_to_sdk_plan_op(
+                op: exports::carina::provider::provider::PlanOp,
+            ) -> $crate::PlanOp {
+                match op {
+                    exports::carina::provider::provider::PlanOp::Create => $crate::PlanOp::Create,
+                    exports::carina::provider::provider::PlanOp::Read => $crate::PlanOp::Read,
+                    exports::carina::provider::provider::PlanOp::Update => $crate::PlanOp::Update,
+                    exports::carina::provider::provider::PlanOp::Delete => $crate::PlanOp::Delete,
+                }
+            }
+
             struct WasmGuest;
 
             impl exports::carina::provider::provider::Guest for WasmGuest {
@@ -461,6 +472,19 @@ macro_rules! export_provider {
                         Ok(()) => Ok(()),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
+                }
+
+                fn required_permissions(
+                    id: wit_types::ResourceId,
+                    operation: exports::carina::provider::provider::PlanOp,
+                ) -> Vec<String> {
+                    let provider = get_provider().lock().unwrap();
+                    let proto_id = wit_to_proto_resource_id(&id);
+                    $crate::CarinaProvider::required_permissions(
+                        &*provider,
+                        &proto_id,
+                        wit_to_sdk_plan_op(operation),
+                    )
                 }
 
                 fn provider_config_completions() -> String {
@@ -833,6 +857,17 @@ macro_rules! export_provider {
                 }
             }
 
+            fn wit_to_sdk_plan_op(
+                op: exports::carina::provider::provider::PlanOp,
+            ) -> $crate::PlanOp {
+                match op {
+                    exports::carina::provider::provider::PlanOp::Create => $crate::PlanOp::Create,
+                    exports::carina::provider::provider::PlanOp::Read => $crate::PlanOp::Read,
+                    exports::carina::provider::provider::PlanOp::Update => $crate::PlanOp::Update,
+                    exports::carina::provider::provider::PlanOp::Delete => $crate::PlanOp::Delete,
+                }
+            }
+
             struct WasmGuest;
 
             impl exports::carina::provider::provider::Guest for WasmGuest {
@@ -956,6 +991,19 @@ macro_rules! export_provider {
                         Ok(()) => Ok(()),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
+                }
+
+                fn required_permissions(
+                    id: wit_types::ResourceId,
+                    operation: exports::carina::provider::provider::PlanOp,
+                ) -> Vec<String> {
+                    let provider = get_provider().lock().unwrap();
+                    let proto_id = wit_to_proto_resource_id(&id);
+                    $crate::CarinaProvider::required_permissions(
+                        &*provider,
+                        &proto_id,
+                        wit_to_sdk_plan_op(operation),
+                    )
                 }
 
                 fn provider_config_completions() -> String {

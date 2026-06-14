@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use carina_core::effect::PlanOp as CorePlanOp;
 use carina_core::provider::{
     CreateRequest as CoreCreateRequest, DeleteRequest as CoreDeleteRequest,
     ErrorDetail as CoreErrorDetail, PatchOp as CorePatchOp, PatchOpKind as CorePatchOpKind,
@@ -22,6 +23,7 @@ use carina_core::value::{SerializationContext, SerializationError};
 use carina_provider_protocol::types as proto;
 
 use crate::wasm_bindings::carina::provider::types as wit;
+use crate::wasm_bindings::exports::carina::provider::provider as wit_provider;
 
 /// Error raised when provider-emitted schema wire data cannot be decoded.
 ///
@@ -209,6 +211,15 @@ pub fn wit_to_core_value(v: &wit::Value) -> CoreValue {
             let inner = json_to_core_value(&inner_json);
             CoreValue::Deferred(DeferredValue::Secret(Box::new(inner)))
         }
+    }
+}
+
+pub fn core_to_wit_plan_op(op: CorePlanOp) -> wit_provider::PlanOp {
+    match op {
+        CorePlanOp::Create => wit_provider::PlanOp::Create,
+        CorePlanOp::Read => wit_provider::PlanOp::Read,
+        CorePlanOp::Update => wit_provider::PlanOp::Update,
+        CorePlanOp::Delete => wit_provider::PlanOp::Delete,
     }
 }
 

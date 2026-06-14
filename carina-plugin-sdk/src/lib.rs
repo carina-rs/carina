@@ -59,6 +59,14 @@ use carina_provider_protocol::types::*;
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PlanOp {
+    Create,
+    Read,
+    Update,
+    Delete,
+}
+
 /// Trait that provider authors implement.
 #[allow(clippy::result_large_err)]
 pub trait CarinaProvider {
@@ -143,6 +151,10 @@ pub trait CarinaProvider {
         identifier: &str,
         request: DeleteRequest,
     ) -> Result<(), ProviderError>;
+
+    /// Permissions this provider needs to perform `op` on `id`.
+    /// Empty vec means the provider declares no permissions for this resource/op pair.
+    fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> Vec<String>;
 
     /// Return provider config attribute completions.
     /// Key is attribute name (e.g., "region"), value is list of completion candidates.
