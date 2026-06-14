@@ -39,6 +39,10 @@ plan 時点では検知されない。partial create が走った後、依存待
 2. **apply role の IAM identity policy** — STS `GetCallerIdentity` で
    特定し、IAM `GetRolePolicy` / `ListAttachedRolePolicies` で実体を
    取るか、`iam:SimulatePrincipalPolicy` で IAM に判定させるか。
+   carina の awscc provider は CloudControl の `RoleArn` パラメータ
+   を使っておらず、handler は caller の権限で動く。actor 決定は
+   STS 一回で済む（provider 設定の `assume_role` がある場合も
+   GetCallerIdentity が assumed role 側の ARN を返すので同じ経路）。
 
 plan が提示する `+ create` / `~ update` / `- destroy` の各 effect に
 対し、provider が「この op にはこの action 群が必要」と申告できれば、
@@ -67,17 +71,53 @@ off。新しい `carina iam-check` サブコマンドにはしない。
 
 ### 解決方式 — Simulate を主、ポリシー解析を fallback
 
-`iam:SimulatePrincipalPolicy` を主の判定経路にする。これは SCP /
-Permission Boundary / 条件式付き grant まで含めて IAM 側で正味の
-可否を返してくれる唯一の API で、ポリシードキュメントを host で
-解析する方式はこれらを silent に見落とす。
+`iam:SimulatePrincipalPolicy` を主の判定経路にする。actor は
+`sts:GetCallerIdentity` で取れる ARN で固定する。awscc provider は
+既に init 時に GetCallerIdentity を一度叩いて account_id を取って
+いるので、同じ呼び出しから ARN フィールドを取り回せばよい。
+provider 設定の `assume_role` がある場合も、SDK の credential が
+assumed role 側になるため、GetCallerIdentity は assumed role の ARN
+を返す。actor 決定は一回の STS 呼び出しで完結する。CloudControl 自
+身は `RoleArn` パラメータを取れるが、carina の awscc provider は
+これを使っておらず、handler は actor の権限で動く。
 
-ただし `iam:SimulatePrincipalPolicy` 自身が actor の権限として
-要る。caller が SimulatePrincipalPolicy を持たない環境のために、
-`GetCallerIdentity` → `GetRolePolicy` / `ListAttachedRolePolicies` で
-ポリシードキュメントを取りに行く解析経路を fallback として用意する。
-fallback が走るときは「SCP/boundary/条件式は考慮しない」旨の注記を
-警告に添える。
+ただし Simulate で完全に判るわけではない。以下を honest に認める:
+
+* **SCP (Organizations Service Control Policy) は見えない。**
+  `SimulatePrincipalPolicy` の評価対象は identity policy と
+  permission boundary と resource policy で、SCP は含まれない。SCP
+  まで含める API は AWS には存在しない。SCP で deny されている権限
+  は事前検知できない。
+* **条件式は `ContextEntries` 次第で false negative になる。** condition
+  key を明示的に渡さない条件式は permissive 扱い（通る）になる。
+  CloudControl handler が内部で何の condition key をセットして呼ぶ
+  か documented されていない以上、ここで false negative（実際には
+  deny されるが Simulate では allow と判定）が出る。
+* **Resource ARN scope は handlers list が持っていない。** registry
+  schema の `handlers.<op>.permissions` は action 名だけで、対象
+  resource ARN は書かれていない。`ResourceArns: ["*"]` で Simulate
+  すると、`Resource: "arn:aws:foo::*:bar/*"` のような特定 ARN
+  scope の grant しか持っていない actor が誤って allow 判定されう
+  る（false positive、実際には CloudControl が触る resource が grant
+  対象外で deny される）。
+
+それでもこの check は価値がある。Issue の motivating example
+（`ec2:DescribeInternetGateways` と `iam:CreateServiceLinkedRole`
+が apply role の inline policy に完全に欠けていた）はどちらも
+「action 完全欠け」のクラスで、Simulate が `["*"]` resource scope
+であっても確実に拾える。Issue 本文「even with careful reading of the
+registry resource type's create-handler section before authoring the
+deploy role grants, two of the permissions were missed」が指す主たる
+失敗モードはこれ。残る穴（SCP / 条件式 / resource scope）は別レイヤ
+で対処されるべきで、本 check の "対象外" として明示する。
+
+fallback の document 解析は Simulate が strict superset というわ
+けではない。actor が `iam:SimulatePrincipalPolicy` を持たない環境
+向けの最低限の代替で、`GetCallerIdentity` →
+`GetRolePolicy` / `ListAttachedRolePolicies` で identity policy だけ
+取って action 名マッチに落とす。boundary / SCP / 条件式 / resource
+scope はどれも見ない。fallback 経路に入ったときは warning に
+「Simulate より弱い判定です」旨を添える。
 
 ### スコープ — Provider trait に申告メソッドを生やす
 
@@ -187,6 +227,21 @@ plan は `commands::plan::run_plan` の中で、plan 計算が終わって displ
 `--out` で saved plan を書く場合の挙動は drift 警告と同じ扱いにする。
 警告は stderr に出すが、plan ファイルは書く。`--strict-iam` で error
 扱いになった場合は plan ファイルも書かない（exit 1）。
+
+## 対象外（この check では拾えないもの）
+
+設計判断「解決方式」のところに書いた制約を以下に再掲する。実装と
+ユーザー向け表示でこれらを silent にしない:
+
+* SCP で deny されているケース。
+* condition key 依存の deny。
+* handler が触る resource ARN scope で deny されているケース。
+* CFN registry schema 自身が permissions list を欠いている / 不完全な
+  resource type。Issue 本文 "Out of scope" で言及済み。
+* awscc 以外の provider（aws namespace）。Issue 本文 "Out of scope"。
+
+これらは Issue#3496 が指す主たる失敗モード（apply role に action
+が完全に欠けている）ではない別クラスの問題で、本 check の枠外。
 
 ## 反対側の検討
 
