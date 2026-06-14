@@ -418,7 +418,7 @@ pub(super) async fn execute_effects_phased(
 
                 if let Some(failed_dep) = find_failed_dependency(effect, &failed_bindings) {
                     let c = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                    let reason = if matches!(effect, Effect::Wait { .. }) {
+                    let reason = if effect.is_wait() {
                         let detail =
                             unsatisfiable_reason_message(&UnsatisfiableReason::DependencyFailed {
                                 binding: failed_dep,

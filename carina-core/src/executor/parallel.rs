@@ -604,7 +604,7 @@ pub(super) async fn execute_effects_sequential(
 
             if let Some(failed_dep) = find_failed_dependency(effect, &failed_bindings) {
                 let c = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                let reason = if matches!(effect, Effect::Wait { .. }) {
+                let reason = if effect.is_wait() {
                     let detail =
                         unsatisfiable_reason_message(&UnsatisfiableReason::DependencyFailed {
                             binding: failed_dep,
@@ -660,7 +660,7 @@ pub(super) async fn execute_effects_sequential(
                 schemas: input.schemas,
             };
             let completed_ref = &completed;
-            let wait_cancel_rx = if matches!(effect, Effect::Wait { .. }) {
+            let wait_cancel_rx = if effect.is_wait() {
                 let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
                 wait_cancellers.insert(idx, cancel_tx);
                 in_flight_kinds.insert(idx, InFlightKind::Wait);
