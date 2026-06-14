@@ -19,7 +19,7 @@ use super::basic::{
 use super::replace::{ReplaceContext, SingleEffectResult, execute_replace_parallel};
 use super::wait::{
     SKIP_REASON_CANCELLED, UnsatisfiableReason, WaitAwareInFlight, WaitOutcome, WaitSignal,
-    unsatisfiable_reason_message, wait_failure_message,
+    count_effectively_undispatched, unsatisfiable_reason_message, wait_failure_message,
 };
 use super::{ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, ProgressInfo};
 
@@ -829,14 +829,17 @@ pub(super) async fn execute_effects_sequential(
             }
         }
 
-        let undispatched_count = || {
-            actionable_indices
-                .iter()
-                .filter(|&&idx| !dispatched.contains(&idx))
-                .count()
-        };
+        let count_undispatched =
+            |dispatched: &HashSet<usize>, failed_bindings: &HashSet<String>| {
+                count_effectively_undispatched(
+                    &actionable_indices,
+                    dispatched,
+                    effects,
+                    failed_bindings,
+                )
+            };
         in_flight
-            .check_terminal(undispatched_count())
+            .check_terminal(count_undispatched(&dispatched, &failed_bindings))
             .cancel_if_terminal()
             .drop_without_awaiting();
 
@@ -876,7 +879,7 @@ pub(super) async fn execute_effects_sequential(
         // Wait for the next effect to complete
         let (finished_idx, result) = if cancelled {
             let Some(finished) = in_flight
-                .check_terminal(undispatched_count())
+                .check_terminal(count_undispatched(&dispatched, &failed_bindings))
                 .cancel_if_terminal()
                 .next_completed()
                 .await
@@ -893,7 +896,7 @@ pub(super) async fn execute_effects_sequential(
                     continue;
                 }
                 finished = in_flight
-                    .check_terminal(undispatched_count())
+                    .check_terminal(count_undispatched(&dispatched, &failed_bindings))
                     .cancel_if_terminal()
                     .next_completed() => {
                     let Some(finished) = finished else {
@@ -1024,7 +1027,7 @@ pub(super) async fn execute_effects_sequential(
         }
 
         in_flight
-            .check_terminal(undispatched_count())
+            .check_terminal(count_undispatched(&dispatched, &failed_bindings))
             .cancel_if_terminal()
             .drop_without_awaiting();
     }
@@ -1342,6 +1345,111 @@ mod tests {
                 .any(|event| event.contains("alb")),
             "test setup should fail alb create; failures: {:?}",
             observer.failures()
+        );
+        assert!(
+            observer.skipped().iter().any(|event| {
+                event.contains("cert") && event.to_ascii_lowercase().contains("unsatisfiable")
+            }),
+            "wait skip reason should contain unsatisfiable, skipped: {:?}",
+            observer.skipped()
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_marked_unsatisfiable_when_failing_sibling_blocks_consumer_inside_wait_subtree() {
+        let provider = TerminalWaitProvider::new();
+
+        let mut cert = Resource::new("test", "cert");
+        cert.binding = Some("cert".to_string());
+        let cert_id = cert.id.clone();
+
+        let mut alb = Resource::new("test", "alb");
+        alb.binding = Some("alb".to_string());
+
+        let mut listener = Resource::new("test", "listener");
+        listener.binding = Some("listener".to_string());
+        listener.set_attr(
+            "load_balancer_arn",
+            Value::resource_ref("alb", "load_balancer_arn", vec![]),
+        );
+        listener.set_attr(
+            "certificate_arn",
+            Value::resource_ref("cert_issued", "arn", vec![]),
+        );
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(cert.clone()));
+        plan.add(Effect::Wait {
+            binding: "cert_issued".to_string(),
+            target_id: cert_id.clone(),
+            target: WaitTarget::ResolvedAtApply,
+            until: WaitPredicate::Equals {
+                attr: AttrPath::single("status"),
+                value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+            },
+            until_surface: "cert.status == ISSUED".to_string(),
+            timeout: std::time::Duration::from_secs(60),
+            interval: std::time::Duration::from_millis(1),
+            explicit_dependencies: std::collections::HashSet::new(),
+        });
+        plan.add(Effect::Create(alb.clone()));
+        plan.add(Effect::Create(listener.clone()));
+
+        let unresolved = HashMap::from([
+            (
+                cert.id.clone(),
+                UnresolvedResource::from_pre_resolve(cert.clone()),
+            ),
+            (
+                alb.id.clone(),
+                UnresolvedResource::from_pre_resolve(alb.clone()),
+            ),
+            (
+                listener.id.clone(),
+                UnresolvedResource::from_pre_resolve(listener.clone()),
+            ),
+        ]);
+        let deps = build_dependency_analysis(plan.effects(), &unresolved, &[]).into_deps_of();
+        assert!(
+            deps.get(&3).is_some_and(|listener_deps| {
+                listener_deps.contains(&1) && listener_deps.contains(&2)
+            }),
+            "listener should depend on both alb and cert_issued; deps: {deps:?}"
+        );
+
+        let schemas = SchemaRegistry::new();
+        let mut input = ExecutionInput {
+            plan: &plan,
+            unresolved_resources: &unresolved,
+            compositions: &[],
+            bindings: Default::default(),
+            current_states: HashMap::new(),
+            normalizer: &NoopNormalizer,
+            provider_configs: &[],
+            factories: &[],
+            schemas: &schemas,
+            parallelism: std::num::NonZeroUsize::new(2).unwrap(),
+        };
+        let observer = RecordingSkipObserver::new();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            execute_effects_sequential(&provider, &mut input, &observer, &CancellationToken::new()),
+        )
+        .await
+        .expect("wait should be skipped as unsatisfiable instead of polling until timeout");
+        let (result, was_cancelled) = result;
+        assert!(!was_cancelled);
+
+        assert!(
+            result.failure_count >= 1,
+            "alb create should fail; failure_count: {}",
+            result.failure_count
+        );
+        assert!(
+            result.skip_count >= 1,
+            "listener and cert_issued should be skipped; skip_count: {}",
+            result.skip_count
         );
         assert!(
             observer.skipped().iter().any(|event| {
