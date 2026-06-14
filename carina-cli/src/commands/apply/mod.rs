@@ -1285,6 +1285,7 @@ async fn run_apply_locked(
     let mut plan = create_plan(
         &resources_for_plan,
         &data_sources_for_plan,
+        &provider,
         &current_states,
         &directives_map,
         schemas,

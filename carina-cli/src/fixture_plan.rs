@@ -324,6 +324,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     let mut plan = create_plan(
         &resources,
         &data_sources_for_plan,
+        &carina_core::provider::ProviderRouter::new(),
         &current_states,
         &directives_map,
         wiring.schemas(),

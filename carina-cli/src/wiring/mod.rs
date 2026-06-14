@@ -2067,6 +2067,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     let mut plan = create_plan(
         &resources,
         &data_sources_for_plan,
+        &provider,
         &current_states,
         &directives_map,
         ctx.schemas(),

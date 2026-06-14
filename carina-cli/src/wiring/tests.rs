@@ -195,6 +195,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
     let plan_without = create_plan(
         &resources_without,
         &[],
+        &carina_core::provider::ProviderRouter::new(),
         &current_states,
         &directives_map,
         &schemas,
@@ -214,6 +215,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
     let plan_with = create_plan(
         &resources_with,
         &[],
+        &carina_core::provider::ProviderRouter::new(),
         &current_states,
         &directives_map,
         &schemas,
@@ -306,6 +308,7 @@ fn test_merge_default_tags_prevents_false_diff() {
     let plan_without = create_plan(
         &resources_without,
         &[],
+        &carina_core::provider::ProviderRouter::new(),
         &current_states,
         &directives_map,
         &schemas,
@@ -336,6 +339,7 @@ fn test_merge_default_tags_prevents_false_diff() {
     let plan_with = create_plan(
         &resources_with,
         &[],
+        &carina_core::provider::ProviderRouter::new(),
         &current_states,
         &directives_map,
         &schemas,
@@ -3521,6 +3525,7 @@ mod wait_until_enum_alias {
         let plan_raw = create_plan(
             &resources,
             &[],
+            &carina_core::provider::ProviderRouter::new(),
             &states,
             &HashMap::new(),
             ctx.schemas(),
@@ -3542,6 +3547,7 @@ mod wait_until_enum_alias {
         let plan_fixed = create_plan(
             &resources,
             &[],
+            &carina_core::provider::ProviderRouter::new(),
             &states,
             &HashMap::new(),
             ctx.schemas(),
