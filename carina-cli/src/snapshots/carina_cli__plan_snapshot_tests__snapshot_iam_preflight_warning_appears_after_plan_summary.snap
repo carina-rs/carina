@@ -1,0 +1,21 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+assertion_line: 115
+expression: output
+---
+Execution Plan:
+
+  + aws.iam.Role role
+        └─ + aws.s3.Bucket (bucket: my-bucket)
+
+Plan: 2 to add, 0 to change, 0 to destroy.
+
+IAM preflight findings (1 warning):
+  Required permissions sourced from each provider:
+    - aws -> none declared (provider does not currently report required permissions)
+    - awscc -> CloudFormation registry schema `handlers.<op>.permissions` (AWS does not guarantee completeness)
+  Check method: iam:SimulatePrincipalPolicy (SCPs, condition keys, exact resource ARN scopes may still affect apply)
+  Actor: arn:aws:sts::123456789012:assumed-role/deploy/session
+
+  awscc.elasticloadbalancingv2.LoadBalancer registry_publish.alb (create)
+    -> missing ec2:DescribeInternetGateways

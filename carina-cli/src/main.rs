@@ -76,9 +76,11 @@ enum Commands {
         #[arg(long)]
         json: bool,
 
+        /// Pre-check apply role's IAM permissions against the actions providers declare. Emits warnings; does not fail the plan.
         #[arg(long)]
         check_iam: bool,
 
+        /// With --check-iam, fail (exit 1) instead of warning when permissions are missing. Requires --check-iam.
         #[arg(long, requires = "check_iam")]
         strict_iam: bool,
     },
@@ -674,6 +676,23 @@ mod error_format_tests {
     #[test]
     fn plan_check_iam_flag_parses() {
         assert!(Cli::try_parse_from(["carina", "plan", "--check-iam"]).is_ok());
+    }
+
+    #[test]
+    fn plan_iam_flags_have_help_text() {
+        let command = Cli::command();
+        let plan = command
+            .get_subcommands()
+            .find(|cmd| cmd.get_name() == "plan")
+            .expect("plan subcommand exists");
+
+        for id in ["check_iam", "strict_iam"] {
+            let arg = plan
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .unwrap_or_else(|| panic!("{id} argument exists"));
+            assert!(arg.get_help().is_some(), "{id} should have help text");
+        }
     }
 
     #[test]
