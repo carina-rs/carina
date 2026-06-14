@@ -12,6 +12,7 @@ use carina_core::plan::Plan;
 use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 use carina_core::schema::SchemaRegistry;
 use carina_state::{LockInfo, ResourceState, StateBackend, StateFile};
+use colored::Colorize;
 
 use crate::error::AppError;
 
@@ -195,6 +196,80 @@ pub(crate) struct FinalizeApplyInput<'a> {
     pub pre_resolve_compositions: &'a [carina_core::resource::Composition],
 }
 
+/// Export writeback result split by per-export outcome.
+///
+/// This deliberately avoids the all-or-nothing `HashMap` shape that
+/// caused carina#3551: a partially failed apply can leave exports that
+/// depend on the failed resource unresolved, but carina#3498 requires
+/// successfully completed resources from the same run to still be
+/// persisted. Resolved exports are written to `state.exports`; skipped
+/// exports are omitted and surfaced to the operator by the caller.
+pub(crate) struct ExportResolution {
+    /// Exports that resolved to concrete JSON and are safe to persist.
+    resolved: HashMap<String, serde_json::Value>,
+    /// Exports omitted because their value still depends on unresolved
+    /// apply-time data.
+    skipped: Vec<SkippedExport>,
+}
+
+impl ExportResolution {
+    /// Persist export resolution into `state.exports` and emit one
+    /// operator-visible stdout line per omitted export.
+    ///
+    /// This is a three-way merge: resolved exports win with their new
+    /// values, skipped exports preserve any prior persisted value, and
+    /// names absent from both sets are dropped so source-side export
+    /// removals still converge (carina#3551, carina#2932).
+    ///
+    /// Consumes `self` so the skipped diagnostics cannot be silently
+    /// dropped by a caller that reads only the resolved half
+    /// (carina#3551 / CLAUDE.md "Long-term view alongside root-cause").
+    pub(crate) fn write_into(self, state: &mut StateFile) {
+        let mut next = HashMap::new();
+        for skipped in &self.skipped {
+            println!("{}", render_skipped(skipped));
+            if let Some(prior) = state.exports.get(&skipped.name) {
+                next.insert(skipped.name.clone(), prior.clone());
+            }
+        }
+        for (name, value) in self.resolved {
+            next.insert(name, value);
+        }
+        state.exports = next;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_parts(self) -> (HashMap<String, serde_json::Value>, Vec<SkippedExport>) {
+        (self.resolved, self.skipped)
+    }
+}
+
+fn render_skipped(skipped: &SkippedExport) -> String {
+    format!(
+        "  {} export {} not written: {}",
+        "!".yellow(),
+        skipped.name,
+        skipped.reason
+    )
+}
+
+/// Diagnostic for an export omitted during state writeback.
+///
+/// carina#3551 showed that unresolved sibling-resource references must
+/// not abort the whole writeback after carina#3498 made partial apply
+/// persistence meaningful. The reason is pre-formatted diagnostic text
+/// for the operator-visible progress log on stdout, not data intended
+/// for programmatic matching.
+#[derive(Debug)]
+pub(crate) struct SkippedExport {
+    /// Export name from the source `exports {}` block.
+    name: String,
+    /// Pre-formatted human reason for the omission. This is
+    /// diagnostic data for the progress log on stdout, not a stable
+    /// machine contract.
+    reason: String,
+}
+
 /// Resolve export expressions using bindings built from applied state.
 ///
 /// `sorted_resources` carries the in-memory resource graph including any
@@ -236,6 +311,16 @@ pub(crate) struct FinalizeApplyInput<'a> {
 /// 5. Layer the re-resolved compositions onto the bindings view via
 ///    `layer_compositions_post_apply` (#3176).
 /// 6. Resolve export expressions against the combined view.
+///
+/// # Partial-apply tolerance (carina#3551 / carina#3498)
+///
+/// Export expressions can reference a resource attribute that remains
+/// unresolved because that resource's Create or Update failed while
+/// earlier resources in the same apply succeeded. Those per-export
+/// resolution failures are reported in [`ExportResolution::skipped`]
+/// and omitted from `state.exports` so the writeback still persists
+/// completed resources. Genuine serialization corruption, such as a
+/// non-finite float, remains an error and aborts writeback.
 pub(crate) fn resolve_exports(
     export_params: &[carina_core::parser::InferredExportParam],
     sorted_resources: &[Resource],
@@ -243,9 +328,10 @@ pub(crate) fn resolve_exports(
     pre_resolve_compositions: &[carina_core::resource::Composition],
     post_apply_states: &PostApplyStates,
     wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
-) -> Result<HashMap<String, serde_json::Value>, AppError> {
+) -> Result<ExportResolution, AppError> {
     use carina_core::binding_index::ResolvedBindings;
     use carina_core::resolver::resolve_virtual_refs_post_apply;
+    use carina_core::value::SerializationError;
 
     // Step 1: the post-apply state view was assembled by
     // [`PostApplyStates::from_current_and_state`] before this call.
@@ -292,16 +378,48 @@ pub(crate) fn resolve_exports(
 
     // Step 6: resolve the export expressions against the combined
     // view.
-    let mut exports = HashMap::new();
+    let mut resolved_exports = HashMap::new();
+    let mut skipped = Vec::new();
     for param in export_params {
         if let Some(ref value) = param.value {
             let resolved = crate::commands::plan::resolve_export_value(value, &bindings);
-            if let Some(json) = dsl_value_to_json(&resolved)? {
-                exports.insert(param.name.clone(), json);
+            match dsl_value_to_json(&resolved) {
+                Ok(Some(json)) => {
+                    resolved_exports.insert(param.name.clone(), json);
+                }
+                Ok(None) => {}
+                Err(SerializationError::UnresolvedResourceRef { path, .. }) => {
+                    skipped.push(SkippedExport {
+                        name: param.name.clone(),
+                        reason: format!("unresolved reference {path}"),
+                    });
+                }
+                Err(SerializationError::UnknownNotAllowed { reason, .. }) => {
+                    skipped.push(SkippedExport {
+                        name: param.name.clone(),
+                        reason: format!("value not yet known ({reason})"),
+                    });
+                }
+                Err(SerializationError::UnresolvedInterpolation { .. }) => {
+                    skipped.push(SkippedExport {
+                        name: param.name.clone(),
+                        reason: "unresolved interpolation".into(),
+                    });
+                }
+                Err(SerializationError::UnresolvedFunctionCall { name, .. }) => {
+                    skipped.push(SkippedExport {
+                        name: param.name.clone(),
+                        reason: format!("unresolved function call {name}(...)"),
+                    });
+                }
+                Err(e @ SerializationError::NonFiniteFloat { .. }) => return Err(e.into()),
             }
         }
     }
-    Ok(exports)
+    Ok(ExportResolution {
+        resolved: resolved_exports,
+        skipped,
+    })
 }
 
 /// Convert a DSL Value to a serde_json::Value for state persistence.
@@ -754,6 +872,168 @@ mod post_apply_states_tests {
             Some(Value::Concrete(ConcreteValue::String(s))) => assert_eq!(s, "Enabled"),
             other => panic!("expected post-apply 'Enabled', got: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod resolve_exports_tests {
+    use super::*;
+    use carina_core::parser::{InferredExportParam, TypeExpr};
+    use carina_core::resource::{
+        AccessPath, ConcreteValue, DeferredValue, InterpolationPart, Value,
+    };
+    use carina_state::StateFile;
+
+    fn export_param(name: &str, value: Value) -> InferredExportParam {
+        InferredExportParam {
+            name: name.to_string(),
+            type_expr: TypeExpr::Unknown,
+            value: Some(value),
+        }
+    }
+
+    fn resolve_export_parts(
+        export_params: &[InferredExportParam],
+    ) -> (HashMap<String, serde_json::Value>, Vec<SkippedExport>) {
+        let state = StateFile::new();
+        let post_apply_states = PostApplyStates::from_current_and_state(&HashMap::new(), &state);
+        resolve_exports(export_params, &[], &[], &[], &post_apply_states, &[])
+            .expect("unresolved exports should be skipped, not abort writeback")
+            .into_parts()
+    }
+
+    #[test]
+    fn unresolved_export_is_skipped_without_dropping_resolved_exports() {
+        let export_params = vec![
+            export_param(
+                "target_group_arn",
+                Value::Deferred(DeferredValue::ResourceRef {
+                    path: AccessPath::with_fields(
+                        "registry_publish",
+                        "target_group",
+                        vec!["arn".into()],
+                    ),
+                }),
+            ),
+            export_param(
+                "ok_export",
+                Value::Concrete(ConcreteValue::String("ok".into())),
+            ),
+        ];
+
+        let (resolved, skipped) = resolve_export_parts(&export_params);
+
+        assert_eq!(resolved.get("ok_export"), Some(&serde_json::json!("ok")));
+        assert!(
+            !resolved.contains_key("target_group_arn"),
+            "unresolved export must be omitted from resolved map"
+        );
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].name, "target_group_arn");
+        assert!(
+            skipped[0]
+                .reason
+                .contains("registry_publish.target_group.arn"),
+            "skip reason should name unresolved path, got: {:?}",
+            skipped[0]
+        );
+        assert_eq!(
+            render_skipped(&skipped[0]),
+            "  ! export target_group_arn not written: unresolved reference registry_publish.target_group.arn"
+        );
+    }
+
+    #[test]
+    fn multiple_unresolved_exports_are_skipped_in_export_order() {
+        let export_params = vec![
+            export_param(
+                "first_missing",
+                Value::Deferred(DeferredValue::ResourceRef {
+                    path: AccessPath::new("first", "id"),
+                }),
+            ),
+            export_param(
+                "ok_export",
+                Value::Concrete(ConcreteValue::String("ok".into())),
+            ),
+            export_param(
+                "second_missing",
+                Value::Deferred(DeferredValue::ResourceRef {
+                    path: AccessPath::new("second", "id"),
+                }),
+            ),
+        ];
+
+        let (resolved, skipped) = resolve_export_parts(&export_params);
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved.get("ok_export"), Some(&serde_json::json!("ok")));
+        assert_eq!(skipped.len(), 2);
+        assert_eq!(skipped[0].name, "first_missing");
+        assert_eq!(skipped[1].name, "second_missing");
+    }
+
+    #[test]
+    fn unresolved_interpolation_export_is_skipped() {
+        let export_params = vec![export_param(
+            "template",
+            Value::Deferred(DeferredValue::Interpolation(vec![
+                InterpolationPart::Literal("x".into()),
+            ])),
+        )];
+
+        let (resolved, skipped) = resolve_export_parts(&export_params);
+
+        assert!(resolved.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].name, "template");
+        assert_eq!(skipped[0].reason, "unresolved interpolation");
+    }
+
+    #[test]
+    fn unresolved_function_call_export_is_skipped() {
+        let export_params = vec![export_param(
+            "joined",
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: "join".into(),
+                args: vec![],
+            }),
+        )];
+
+        let (resolved, skipped) = resolve_export_parts(&export_params);
+
+        assert!(resolved.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].name, "joined");
+        assert_eq!(skipped[0].reason, "unresolved function call join(...)");
+    }
+
+    #[test]
+    fn write_into_preserves_prior_skipped_exports_and_drops_orphans() {
+        let mut state = StateFile::new();
+        state
+            .exports
+            .insert("ax".to_string(), serde_json::json!("old-a"));
+        state
+            .exports
+            .insert("bx".to_string(), serde_json::json!("old-b"));
+        state
+            .exports
+            .insert("orphan".to_string(), serde_json::json!("old-orphan"));
+
+        ExportResolution {
+            resolved: HashMap::from([("ax".to_string(), serde_json::json!("new-a"))]),
+            skipped: vec![SkippedExport {
+                name: "bx".to_string(),
+                reason: "unresolved reference b.name".to_string(),
+            }],
+        }
+        .write_into(&mut state);
+
+        assert_eq!(state.exports.len(), 2);
+        assert_eq!(state.exports.get("ax"), Some(&serde_json::json!("new-a")));
+        assert_eq!(state.exports.get("bx"), Some(&serde_json::json!("old-b")));
+        assert!(!state.exports.contains_key("orphan"));
     }
 }
 

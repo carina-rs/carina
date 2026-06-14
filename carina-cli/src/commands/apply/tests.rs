@@ -1,11 +1,131 @@
 use super::*;
+use carina_core::provider::{
+    BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer, Provider, ProviderError,
+    ProviderFactory, ProviderNormalizer, ProviderResult, ReadRequest, UpdateRequest,
+};
+use carina_core::resource::{DataSource, ResourceId};
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+use indexmap::IndexMap;
+use std::collections::HashMap;
 use std::time::Duration;
 
 #[path = "tests/cancellation_fixture.rs"]
 mod cancellation_fixture;
 
 use cancellation_fixture::ApplyCancellationFixture;
+
+struct FailBCreateFactory;
+
+impl ProviderFactory for FailBCreateFactory {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    fn display_name(&self) -> &str {
+        "Mock provider with B create failure"
+    }
+
+    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+        HashMap::new()
+    }
+
+    fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+        "test-region".to_string()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _attributes: &IndexMap<String, Value>,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        Box::pin(async { Ok(Box::new(FailBCreateProvider) as Box<dyn Provider>) })
+    }
+
+    fn create_normalizer(
+        &self,
+        _binding: Option<&str>,
+        _attributes: &IndexMap<String, Value>,
+    ) -> BoxFuture<'_, Box<dyn ProviderNormalizer>> {
+        Box::pin(async { Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer> })
+    }
+
+    fn schemas(&self) -> Vec<ResourceSchema> {
+        vec![
+            ResourceSchema::new("test.resource")
+                .attribute(AttributeSchema::new("name", AttributeType::string())),
+        ]
+    }
+}
+
+struct FailBCreateProvider;
+
+impl Provider for FailBCreateProvider {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    fn read(
+        &self,
+        id: &ResourceId,
+        _identifier: Option<&str>,
+        _request: ReadRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let id = id.clone();
+        Box::pin(async move { Ok(State::not_found(id)) })
+    }
+
+    fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+        let id = resource.id.clone();
+        Box::pin(async move { Ok(State::not_found(id)) })
+    }
+
+    fn create(
+        &self,
+        id: &ResourceId,
+        request: CreateRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let id = id.clone();
+        Box::pin(async move {
+            if id.name_str() == "b" {
+                return Err(ProviderError::api_error("create failed").for_resource(id));
+            }
+            let resource = request.resource.as_resource().clone();
+            Ok(State::existing(id, resource.resolved_attributes()).with_identifier("mock-id"))
+        })
+    }
+
+    fn update(
+        &self,
+        id: &ResourceId,
+        _identifier: &str,
+        _request: UpdateRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let id = id.clone();
+        Box::pin(async move { Err(ProviderError::internal("unexpected update").for_resource(id)) })
+    }
+
+    fn delete(
+        &self,
+        id: &ResourceId,
+        _identifier: &str,
+        _request: DeleteRequest,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
+        let id = id.clone();
+        Box::pin(async move { Err(ProviderError::internal("unexpected delete").for_resource(id)) })
+    }
+
+    fn required_permissions(
+        &self,
+        _id: &ResourceId,
+        _op: carina_core::effect::PlanOp,
+    ) -> Vec<String> {
+        Vec::new()
+    }
+}
 
 #[test]
 fn total_apply_line_formats_duration() {
@@ -115,6 +235,68 @@ async fn apply_cancel_token_integration_persists_completed_state_releases_lock_a
         "target_group must not be in state (cancelled before completion)"
     );
     assert!(!fixture.lock_path().exists(), "lock file must be released");
+}
+
+#[tokio::test]
+async fn run_apply_locked_with_create_failure_persists_resolved_export_only() {
+    let fixture = ApplyCancellationFixture::new()
+        .with_resources_and_exports(["a", "b"], &[("ax", "a.name"), ("bx", "b.id")]);
+    let loaded = load_configuration_with_config(
+        fixture.config_path(),
+        fixture.provider_context(),
+        &SchemaRegistry::new(),
+    )
+    .expect("fixture must load");
+    let mut parsed = loaded.parsed;
+    let mut unresolved_parsed = loaded.unresolved_parsed;
+    let base_dir = get_base_dir(fixture.config_path());
+    let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+        &mut parsed,
+        base_dir,
+        false,
+        vec![Box::new(FailBCreateFactory)],
+        HashMap::new(),
+    );
+    assert!(
+        validation_errors.is_empty(),
+        "fixture must validate, got: {validation_errors:?}"
+    );
+    let ctx = WiringContext::new(vec![Box::new(FailBCreateFactory)]);
+    let observer_factory = fixture.observer_factory();
+    let err = run_apply_locked(
+        &ctx,
+        &mut parsed,
+        &mut unresolved_parsed,
+        true,
+        fixture.backend(),
+        None,
+        base_dir,
+        fixture.provider_context(),
+        fixture.cancel_token(),
+        &observer_factory,
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("Apply failed. 1 succeeded, 1 failed."),
+        "partial apply must still surface a non-success result, got {err:?}"
+    );
+
+    let state = fixture.read_state().await;
+    assert!(
+        state.find_resource("mock", "test.resource", "a").is_some(),
+        "successful resource A must be persisted"
+    );
+    assert!(
+        state.find_resource("mock", "test.resource", "b").is_none(),
+        "resource B must not be persisted"
+    );
+    assert_eq!(state.exports.get("ax"), Some(&serde_json::json!("a")));
+    assert!(!state.exports.contains_key("bx"));
+    assert_eq!(state.serial, 1);
 }
 
 fn s3_backend_config_with_encrypt(encrypt: bool) -> carina_core::parser::BackendConfig {
@@ -1308,7 +1490,9 @@ fn resolve_exports_resolves_cross_file_resource_refs() {
         &post_apply_states,
         &[],
     )
-    .unwrap();
+    .unwrap()
+    .into_parts()
+    .0;
 
     assert_eq!(
         exports.get("account_id"),
@@ -1405,7 +1589,9 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
         &post_apply_states,
         &[],
     )
-    .unwrap();
+    .unwrap()
+    .into_parts()
+    .0;
 
     assert_eq!(
         exports.get("role_arn"),
@@ -1522,7 +1708,9 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
         &post_apply_states,
         &[],
     )
-    .unwrap();
+    .unwrap()
+    .into_parts()
+    .0;
 
     assert_eq!(
         exports.get("role_arn"),
@@ -1702,7 +1890,9 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
         &post_apply_states,
         &[],
     )
-    .unwrap();
+    .unwrap()
+    .into_parts()
+    .0;
 
     assert_eq!(
         exports.get("role_arn"),
@@ -1810,7 +2000,9 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
         &post_apply_states,
         &[],
     )
-    .unwrap();
+    .unwrap()
+    .into_parts()
+    .0;
 
     let expected_json = serde_json::json!([new_arn]);
     assert_eq!(

@@ -3198,3 +3198,103 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
         state.exports
     );
 }
+
+#[tokio::test]
+async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved() {
+    use carina_core::parser::{InferredExportParam, TypeExpr};
+    use carina_core::resource::AccessPath;
+
+    let captured = Arc::new(Mutex::new(None));
+    let backend = CapturingBackend {
+        captured: captured.clone(),
+    };
+    let lock = LockInfo::new("apply");
+
+    let mut resource_a = Resource::with_provider("mock", "test.resource", "a", None);
+    resource_a.binding = Some("a".to_string());
+    let mut resource_b = Resource::with_provider("mock", "test.resource", "b", None);
+    resource_b.binding = Some("b".to_string());
+    let sorted_resources = vec![resource_a.clone(), resource_b];
+
+    let a_id = resource_a.id.clone();
+    let mut a_attrs = HashMap::new();
+    a_attrs.insert(
+        "id".to_string(),
+        Value::Concrete(ConcreteValue::String("a-id".to_string())),
+    );
+    let a_state = State::existing(a_id.clone(), a_attrs).with_identifier("a-id");
+
+    let result = ApplyResult {
+        success_count: 1,
+        failure_count: 1,
+        skip_count: 0,
+        applied_states: HashMap::from([(a_id.clone(), a_state.clone())]),
+        permanent_name_overrides: HashMap::new(),
+        successfully_deleted: HashSet::new(),
+        current_states: HashMap::from([(a_id, a_state)]),
+        bindings: carina_core::binding_index::ResolvedBindings::default(),
+        failed_refreshes: HashSet::new(),
+    };
+
+    let export_params = vec![
+        InferredExportParam {
+            name: "ax".to_string(),
+            type_expr: TypeExpr::Unknown,
+            value: Some(Value::Deferred(DeferredValue::ResourceRef {
+                path: AccessPath::new("a", "id"),
+            })),
+        },
+        InferredExportParam {
+            name: "bx".to_string(),
+            type_expr: TypeExpr::Unknown,
+            value: Some(Value::Deferred(DeferredValue::ResourceRef {
+                path: AccessPath::new("b", "id"),
+            })),
+        },
+    ];
+
+    let op_result = finalize_apply(FinalizeApplyInput {
+        result: &result,
+        state_file: Some(StateFile::new()),
+        sorted_resources: &sorted_resources,
+        data_sources: &[],
+        current_states: &result.current_states,
+        plan: &Plan::new(),
+        backend: &backend,
+        lock: Some(&lock),
+        schemas: &SchemaRegistry::new(),
+        export_params: Some(&export_params),
+        wait_aliases: &[],
+        pre_resolve_compositions: &[],
+    })
+    .await;
+
+    assert!(
+        op_result.is_ok(),
+        "unresolved export from failed resource must not abort writeback: {op_result:?}"
+    );
+    assert!(
+        result.failure_count > 0,
+        "the modeled apply result must still represent a partial failure"
+    );
+
+    let written = captured.lock().unwrap();
+    let state = written.as_ref().expect("state should be written");
+    assert!(
+        state.find_resource("mock", "test.resource", "a").is_some(),
+        "successful resource A must be persisted"
+    );
+    assert!(
+        state.find_resource("mock", "test.resource", "b").is_none(),
+        "failed resource B must not be persisted"
+    );
+    assert_eq!(state.exports.get("ax"), Some(&serde_json::json!("a-id")));
+    assert!(
+        !state.exports.contains_key("bx"),
+        "unresolved export bx must be omitted"
+    );
+    assert_eq!(
+        state.serial, 1,
+        "writeback should advance serial after persisting partial apply state"
+    );
+}

@@ -47,6 +47,14 @@ impl ApplyCancellationFixture {
     }
 
     pub(super) fn with_resources<const N: usize>(self, names: [&str; N]) -> Self {
+        self.with_resources_and_exports(names, &[])
+    }
+
+    pub(super) fn with_resources_and_exports<const N: usize>(
+        self,
+        names: [&str; N],
+        exports: &[(&str, &str)],
+    ) -> Self {
         let state_path = self.base.state_path().display();
         let mut crn = format!(
             "backend local {{ path = \"{state_path}\" }}\n\
@@ -56,6 +64,13 @@ impl ApplyCancellationFixture {
             crn.push_str(&format!(
                 "let {name} = mock.test.resource {{ name = \"{name}\" }}\n"
             ));
+        }
+        if !exports.is_empty() {
+            crn.push_str("exports {\n");
+            for (name, expr) in exports {
+                crn.push_str(&format!("  {name}: String = {expr}\n"));
+            }
+            crn.push_str("}\n");
         }
         self.base.write_crn(crn);
         self.base.write_backend_lock();
