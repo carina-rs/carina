@@ -102,6 +102,18 @@ See the codex skill for the full subcontracting protocol.
 - When opening/merging a PR, always include the GitHub URL directly in the response.
 - No sycophantic phrasing ('Great question!', 'You're absolutely right!').
 - Do not over-explain hypothetical design options before checking the actual real-world case (screenshots, real output).
+- **Do not ask "how should I proceed" / "1 PR or 2 PRs" / "in what order".**
+  Process choices — PR splitting, implementation order, worktree
+  layout, commit granularity — are mine to decide. Pausing to ask is
+  what the user has called out as "進め方もいちいち聞くな". The
+  separate rule is: **design choices with a real trade-off** (option
+  A/B/C where lenses disagree) get asked once (pick-issue Step 4.5),
+  and the user has equally called out "勝手に設計判断されると困る".
+  The split is sharp — process: decide silently; design with
+  unresolved trade-off: ask once. When in doubt about which side a
+  question falls on, ask whether it changes any artifact the user
+  reviews (PR title, commit history, type shape) — if only the path
+  to the same artifact changes, it is process.
 
 ## 日本語の文章作法
 
