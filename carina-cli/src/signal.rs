@@ -111,18 +111,22 @@ where
     exit.exit(130);
 }
 
-/// Read a single line from `reader`, cancellable by `interrupt`.
+/// Read a single line from `reader`, cancellable by `cancel`.
 ///
 /// Returns the line with any trailing `\n` or `\r\n` stripped, or
-/// `Err(AppError::Interrupted)` if `interrupt` fires first.
-pub async fn read_line_with_interrupt<R, F>(reader: R, interrupt: F) -> Result<String, AppError>
+/// `Err(AppError::Interrupted)` if `cancel` fires first.
+pub async fn read_line_until_cancelled<R>(
+    reader: R,
+    cancel: CancellationToken,
+) -> Result<String, AppError>
 where
     R: AsyncBufRead + Unpin,
-    F: Future<Output = ()>,
 {
     tokio::pin!(reader);
     let mut buf = String::new();
     tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(AppError::Interrupted),
         result = reader.read_line(&mut buf) => {
             result.map_err(|e| AppError::Config(e.to_string()))?;
             if buf.ends_with('\n') {
@@ -133,7 +137,6 @@ where
             }
             Ok(buf)
         }
-        _ = interrupt => Err(AppError::Interrupted),
     }
 }
 
@@ -143,29 +146,39 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[tokio::test]
-    async fn read_line_returns_input_before_interrupt() {
+    async fn read_line_until_cancelled_returns_input_when_token_not_cancelled() {
         let input = &b"yes\n"[..];
-        let interrupt = std::future::pending::<()>();
-        let line = read_line_with_interrupt(input, interrupt).await.unwrap();
+        let token = CancellationToken::new();
+        let line = read_line_until_cancelled(input, token).await.unwrap();
         assert_eq!(line, "yes");
     }
 
     #[tokio::test]
-    async fn read_line_strips_crlf() {
+    async fn read_line_until_cancelled_strips_crlf() {
         let input = &b"no\r\n"[..];
-        let interrupt = std::future::pending::<()>();
-        let line = read_line_with_interrupt(input, interrupt).await.unwrap();
+        let token = CancellationToken::new();
+        let line = read_line_until_cancelled(input, token).await.unwrap();
         assert_eq!(line, "no");
     }
 
     #[tokio::test]
-    async fn read_line_returns_interrupted_when_signal_fires_first() {
+    async fn read_line_until_cancelled_returns_interrupted_when_token_is_cancelled() {
         // Simulates a user who hasn't pressed Enter at the confirmation prompt.
+        let token = CancellationToken::new();
+        token.cancel();
         let reader = tokio::io::BufReader::new(NeverReady);
-        let interrupt = async {};
-        let err = read_line_with_interrupt(reader, interrupt)
-            .await
-            .unwrap_err();
+        let err = read_line_until_cancelled(reader, token).await.unwrap_err();
+        assert!(matches!(err, AppError::Interrupted));
+    }
+
+    #[tokio::test]
+    async fn read_line_until_cancelled_returns_interrupted_when_cancel_fires_after_subscription() {
+        let token = CancellationToken::new();
+        let reader = tokio::io::BufReader::new(NeverReady);
+        let waiting = tokio::spawn(read_line_until_cancelled(reader, token.clone()));
+        tokio::task::yield_now().await;
+        token.cancel();
+        let err = waiting.await.unwrap().unwrap_err();
         assert!(matches!(err, AppError::Interrupted));
     }
 

@@ -1449,10 +1449,8 @@ async fn run_apply_locked(
         );
 
         let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-        let interrupt = async {
-            let _ = tokio::signal::ctrl_c().await;
-        };
-        if confirm_apply(stdin, interrupt, auto_approve).await? == ApplyConfirmation::Cancelled {
+        if confirm_apply(stdin, cancel.clone(), auto_approve).await? == ApplyConfirmation::Cancelled
+        {
             return Ok(None);
         }
 
@@ -1533,10 +1531,7 @@ async fn run_apply_locked(
     );
 
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-    let interrupt = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-    if confirm_apply(stdin, interrupt, auto_approve).await? == ApplyConfirmation::Cancelled {
+    if confirm_apply(stdin, cancel.clone(), auto_approve).await? == ApplyConfirmation::Cancelled {
         return Ok(None);
     }
 
@@ -1978,10 +1973,7 @@ async fn run_apply_from_plan_locked(
     );
 
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-    let interrupt = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-    if confirm_apply(stdin, interrupt, auto_approve).await? == ApplyConfirmation::Cancelled {
+    if confirm_apply(stdin, cancel.clone(), auto_approve).await? == ApplyConfirmation::Cancelled {
         return Ok(None);
     }
 
@@ -2137,14 +2129,13 @@ pub(crate) enum ApplyConfirmation {
 
 /// Prompt the user to confirm an apply. Shared between the resource-change and
 /// export-only paths so both use identical wording and behavior.
-pub(crate) async fn confirm_apply<R, F>(
+pub(crate) async fn confirm_apply<R>(
     reader: R,
-    interrupt: F,
+    cancel: CancellationToken,
     auto_approve: bool,
 ) -> Result<ApplyConfirmation, AppError>
 where
     R: tokio::io::AsyncBufRead + Unpin,
-    F: std::future::Future<Output = ()>,
 {
     if auto_approve {
         return Ok(ApplyConfirmation::Confirmed);
@@ -2165,7 +2156,7 @@ where
         print!("\n  Enter a value: ");
         std::io::Write::flush(&mut std::io::stdout()).map_err(|e| e.to_string())?;
 
-        let read_result = crate::signal::read_line_with_interrupt(reader, interrupt).await;
+        let read_result = crate::signal::read_line_until_cancelled(reader, cancel).await;
         emit_newline_on_interrupt(&mut std::io::stdout(), &read_result);
         read_result?
     };
