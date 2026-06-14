@@ -12,7 +12,8 @@ use crate::eval_value::EvalValue;
 use crate::resource::{ConcreteValue, DeferredValue, UnknownReason, Value};
 use crate::schema::{
     TypeIdentity, validate_http_response_status_code, validate_ipv4_address, validate_ipv4_cidr,
-    validate_ipv6_address, validate_ipv6_cidr,
+    validate_ipv6_address, validate_ipv6_cidr, validate_redirect_host, validate_redirect_path,
+    validate_redirect_port, validate_redirect_protocol, validate_redirect_query,
 };
 use indexmap::IndexMap;
 use std::collections::HashMap;
@@ -248,6 +249,21 @@ pub fn validate_custom_type(
         }
         (Some("HttpResponseStatusCode"), value) if text(value).is_some() => {
             validate_http_response_status_code(text(value).unwrap())
+        }
+        (Some("RedirectHost"), value) if text(value).is_some() => {
+            validate_redirect_host(text(value).unwrap())
+        }
+        (Some("RedirectPath"), value) if text(value).is_some() => {
+            validate_redirect_path(text(value).unwrap())
+        }
+        (Some("RedirectPort"), value) if text(value).is_some() => {
+            validate_redirect_port(text(value).unwrap())
+        }
+        (Some("RedirectProtocol"), value) if text(value).is_some() => {
+            validate_redirect_protocol(text(value).unwrap())
+        }
+        (Some("RedirectQuery"), value) if text(value).is_some() => {
+            validate_redirect_query(text(value).unwrap())
         }
         (_, Value::Deferred(DeferredValue::ResourceRef { .. })) => Ok(()), // will be resolved later
         (_, Value::Deferred(DeferredValue::FunctionCall { .. })) => Ok(()), // will be resolved later

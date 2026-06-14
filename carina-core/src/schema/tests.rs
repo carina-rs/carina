@@ -4051,6 +4051,86 @@ fn validate_http_response_status_code_function_directly() {
 }
 
 #[test]
+fn validate_redirect_protocol_function_directly() {
+    assert!(validate_redirect_protocol("HTTP").is_ok());
+    assert!(validate_redirect_protocol("HTTPS").is_ok());
+    assert!(validate_redirect_protocol("#{protocol}").is_ok());
+
+    assert!(validate_redirect_protocol("").is_err());
+    assert!(validate_redirect_protocol("http").is_err());
+    assert!(validate_redirect_protocol("#{host}").is_err());
+    assert!(validate_redirect_protocol("#{port}").is_err());
+    assert!(validate_redirect_protocol("#{path}").is_err());
+    assert!(validate_redirect_protocol("#{query}").is_err());
+}
+
+#[test]
+fn validate_redirect_host_function_directly() {
+    assert!(validate_redirect_host("example").is_ok());
+    assert!(validate_redirect_host("bad.example.com").is_ok());
+    assert!(validate_redirect_host("www-#{host}").is_ok());
+    assert!(validate_redirect_host("*-api?").is_ok());
+    assert!(validate_redirect_host("https://example.com:443").is_ok());
+
+    assert!(validate_redirect_host("").is_err());
+    assert!(validate_redirect_host(&"a".repeat(128)).is_ok());
+    assert!(validate_redirect_host(&"a".repeat(129)).is_err());
+    assert!(validate_redirect_host("#{protocol}").is_err());
+    assert!(validate_redirect_host("#{path}").is_err());
+}
+
+#[test]
+fn validate_redirect_port_function_directly() {
+    assert!(validate_redirect_port("1").is_ok());
+    assert!(validate_redirect_port("443").is_ok());
+    assert!(validate_redirect_port("65535").is_ok());
+    assert!(validate_redirect_port("#{port}").is_ok());
+
+    assert!(validate_redirect_port("").is_err());
+    assert!(validate_redirect_port("0").is_err());
+    assert!(validate_redirect_port("65536").is_err());
+    // Non-decimal forms must be rejected even though u32::from_str accepts them.
+    assert!(validate_redirect_port("+443").is_err());
+    assert!(validate_redirect_port("0443").is_err());
+    assert!(validate_redirect_port("#{path}").is_err());
+    assert!(validate_redirect_port("443?").is_err());
+}
+
+#[test]
+fn validate_redirect_path_function_directly() {
+    assert!(validate_redirect_path("/").is_ok());
+    assert!(validate_redirect_path("/#{host}:#{port}/#{path}").is_ok());
+    assert!(validate_redirect_path("/a*b?&-._$~\"'@:+/").is_ok());
+    assert!(validate_redirect_path("/encoded/%2F?x=1").is_ok());
+    assert!(validate_redirect_path("/bad#path").is_ok());
+
+    assert!(validate_redirect_path("").is_err());
+    assert!(validate_redirect_path(&format!("/{}", "a".repeat(127))).is_ok());
+    assert!(validate_redirect_path(&format!("/{}", "a".repeat(128))).is_err());
+    assert!(validate_redirect_path("#{path}").is_err());
+    assert!(validate_redirect_path("/#{protocol}").is_err());
+    assert!(validate_redirect_path("/#{query}").is_err());
+}
+
+#[test]
+fn validate_redirect_query_function_directly() {
+    assert!(validate_redirect_query("").is_ok());
+    assert!(validate_redirect_query("next=#{path}&q=#{query}").is_ok());
+    assert!(validate_redirect_query("proto=#{protocol}&host=#{host}&port=#{port}").is_ok());
+    assert!(validate_redirect_query("spaces and arbitrary chars !%[]").is_ok());
+    assert!(validate_redirect_query(&"a".repeat(128)).is_ok());
+    // Confirm every documented placeholder is accepted.
+    assert!(validate_redirect_query("#{protocol}").is_ok());
+    assert!(validate_redirect_query("#{host}").is_ok());
+    assert!(validate_redirect_query("#{port}").is_ok());
+    assert!(validate_redirect_query("#{path}").is_ok());
+    assert!(validate_redirect_query("#{query}").is_ok());
+
+    assert!(validate_redirect_query(&"a".repeat(129)).is_err());
+    assert!(validate_redirect_query("#{bogus}").is_err());
+}
+
+#[test]
 fn validate_http_response_status_code_type() {
     let t = types::http_response_status_code();
 

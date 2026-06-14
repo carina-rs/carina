@@ -6355,6 +6355,141 @@ fn user_fn_custom_type_http_response_status_code_arg_invalid() {
 }
 
 #[test]
+fn user_fn_custom_type_redirect_protocol_arg_valid_invalid() {
+    let valid = r##"
+        fn f(x: RedirectProtocol) { x }
+
+        let b = aws.s3_bucket {
+            name = f("#{protocol}")
+        }
+    "##;
+    let result = parse(valid, &ProviderContext::default());
+    assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
+
+    let invalid = r##"
+        fn f(x: RedirectProtocol) { x }
+
+        let b = aws.s3_bucket {
+            name = f("#{path}")
+        }
+    "##;
+    let err = parse(invalid, &ProviderContext::default()).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("type 'redirect_protocol' validation failed"),
+        "Expected redirect_protocol validation error, got: {msg}"
+    );
+}
+
+#[test]
+fn user_fn_custom_type_redirect_host_arg_valid_invalid() {
+    let valid = r##"
+        fn f(x: RedirectHost) { x }
+
+        let b = aws.s3_bucket {
+            name = f("www-#{host}")
+        }
+    "##;
+    let result = parse(valid, &ProviderContext::default());
+    assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
+
+    let invalid = r##"
+        fn f(x: RedirectHost) { x }
+
+        let b = aws.s3_bucket {
+            name = f("#{path}")
+        }
+    "##;
+    let err = parse(invalid, &ProviderContext::default()).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("type 'redirect_host' validation failed"),
+        "Expected redirect_host validation error, got: {msg}"
+    );
+}
+
+#[test]
+fn user_fn_custom_type_redirect_port_arg_valid_invalid() {
+    let valid = r##"
+        fn f(x: RedirectPort) { x }
+
+        let b = aws.s3_bucket {
+            name = f("#{port}")
+        }
+    "##;
+    let result = parse(valid, &ProviderContext::default());
+    assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
+
+    let invalid = r##"
+        fn f(x: RedirectPort) { x }
+
+        let b = aws.s3_bucket {
+            name = f("65536")
+        }
+    "##;
+    let err = parse(invalid, &ProviderContext::default()).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("type 'redirect_port' validation failed"),
+        "Expected redirect_port validation error, got: {msg}"
+    );
+}
+
+#[test]
+fn user_fn_custom_type_redirect_path_arg_valid_invalid() {
+    let valid = r##"
+        fn f(x: RedirectPath) { x }
+
+        let b = aws.s3_bucket {
+            name = f("/#{host}/#{path}")
+        }
+    "##;
+    let result = parse(valid, &ProviderContext::default());
+    assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
+
+    let invalid = r##"
+        fn f(x: RedirectPath) { x }
+
+        let b = aws.s3_bucket {
+            name = f("#{path}")
+        }
+    "##;
+    let err = parse(invalid, &ProviderContext::default()).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("type 'redirect_path' validation failed"),
+        "Expected redirect_path validation error, got: {msg}"
+    );
+}
+
+#[test]
+fn user_fn_custom_type_redirect_query_arg_valid_invalid() {
+    let valid = r##"
+        fn f(x: RedirectQuery) { x }
+
+        let b = aws.s3_bucket {
+            name = f("next=#{path}&q=#{query}")
+        }
+    "##;
+    let result = parse(valid, &ProviderContext::default());
+    assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
+
+    let invalid = r##"
+        fn f(x: RedirectQuery) { x }
+
+        let b = aws.s3_bucket {
+            name = f("#{bogus}")
+        }
+    "##;
+    let err = parse(invalid, &ProviderContext::default()).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("type 'redirect_query' validation failed"),
+        "Expected redirect_query validation error, got: {msg}"
+    );
+}
+
+#[test]
 fn user_fn_custom_type_ipv6_address_arg_invalid() {
     let input = r#"
         fn f(x: Ipv6Address) { x }
@@ -6479,6 +6614,141 @@ fn user_fn_custom_type_return_http_response_status_code_invalid() {
     assert!(
         msg.contains("return type 'http_response_status_code' validation failed"),
         "Expected http_response_status_code validation error, got: {msg}"
+    );
+}
+
+#[test]
+fn user_fn_custom_type_return_redirect_protocol_valid_invalid() {
+    let valid = r##"
+        fn f(): RedirectProtocol { "HTTPS" }
+
+        let b = aws.s3_bucket {
+            name = f()
+        }
+    "##;
+    let result = parse(valid, &ProviderContext::default());
+    assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
+
+    let invalid = r##"
+        fn f(): RedirectProtocol { "#{path}" }
+
+        let b = aws.s3_bucket {
+            name = f()
+        }
+    "##;
+    let err = parse(invalid, &ProviderContext::default()).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("return type 'redirect_protocol' validation failed"),
+        "Expected redirect_protocol validation error, got: {msg}"
+    );
+}
+
+#[test]
+fn user_fn_custom_type_return_redirect_host_valid_invalid() {
+    let valid = r##"
+        fn f(): RedirectHost { "api-#{host}" }
+
+        let b = aws.s3_bucket {
+            name = f()
+        }
+    "##;
+    let result = parse(valid, &ProviderContext::default());
+    assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
+
+    let invalid = r##"
+        fn f(): RedirectHost { "#{path}" }
+
+        let b = aws.s3_bucket {
+            name = f()
+        }
+    "##;
+    let err = parse(invalid, &ProviderContext::default()).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("return type 'redirect_host' validation failed"),
+        "Expected redirect_host validation error, got: {msg}"
+    );
+}
+
+#[test]
+fn user_fn_custom_type_return_redirect_port_valid_invalid() {
+    let valid = r##"
+        fn f(): RedirectPort { "443" }
+
+        let b = aws.s3_bucket {
+            name = f()
+        }
+    "##;
+    let result = parse(valid, &ProviderContext::default());
+    assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
+
+    let invalid = r##"
+        fn f(): RedirectPort { "0" }
+
+        let b = aws.s3_bucket {
+            name = f()
+        }
+    "##;
+    let err = parse(invalid, &ProviderContext::default()).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("return type 'redirect_port' validation failed"),
+        "Expected redirect_port validation error, got: {msg}"
+    );
+}
+
+#[test]
+fn user_fn_custom_type_return_redirect_path_valid_invalid() {
+    let valid = r##"
+        fn f(): RedirectPath { "/#{path}" }
+
+        let b = aws.s3_bucket {
+            name = f()
+        }
+    "##;
+    let result = parse(valid, &ProviderContext::default());
+    assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
+
+    let invalid = r##"
+        fn f(): RedirectPath { "relative" }
+
+        let b = aws.s3_bucket {
+            name = f()
+        }
+    "##;
+    let err = parse(invalid, &ProviderContext::default()).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("return type 'redirect_path' validation failed"),
+        "Expected redirect_path validation error, got: {msg}"
+    );
+}
+
+#[test]
+fn user_fn_custom_type_return_redirect_query_valid_invalid() {
+    let valid = r##"
+        fn f(): RedirectQuery { "next=#{path}&q=#{query}" }
+
+        let b = aws.s3_bucket {
+            name = f()
+        }
+    "##;
+    let result = parse(valid, &ProviderContext::default());
+    assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
+
+    let invalid = r##"
+        fn f(): RedirectQuery { "#{bogus}" }
+
+        let b = aws.s3_bucket {
+            name = f()
+        }
+    "##;
+    let err = parse(invalid, &ProviderContext::default()).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("return type 'redirect_query' validation failed"),
+        "Expected redirect_query validation error, got: {msg}"
     );
 }
 
