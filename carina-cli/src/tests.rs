@@ -1317,6 +1317,7 @@ fn orphaned_state_resource_produces_delete_effect() {
     let plan = create_plan(
         &desired,
         &[],
+        &carina_core::provider::ProviderRouter::new(),
         &current_states,
         &directives_map,
         &SchemaRegistry::new(),
@@ -2322,6 +2323,7 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
     let plan = create_plan(
         &desired,
         &[],
+        &carina_core::provider::ProviderRouter::new(),
         &current_states,
         &directives_map,
         &SchemaRegistry::new(),
@@ -2408,6 +2410,7 @@ fn refresh_false_uses_cached_state_from_state_file() {
     let plan = create_plan(
         &desired,
         &[],
+        &carina_core::provider::ProviderRouter::new(),
         &current_states,
         &directives_map,
         &SchemaRegistry::new(),
@@ -2456,6 +2459,7 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
     let plan = create_plan(
         &desired,
         &[],
+        &carina_core::provider::ProviderRouter::new(),
         &current_states,
         &directives_map,
         &SchemaRegistry::new(),
@@ -2502,6 +2506,7 @@ fn refresh_false_without_state_file_treats_resources_as_new() {
     let plan = create_plan(
         &desired,
         &[],
+        &carina_core::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -2752,6 +2757,7 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
     let plan = create_plan(
         &[resource],
         &[],
+        &carina_core::provider::ProviderRouter::new(),
         reloaded.as_map(),
         &HashMap::new(),
         &schemas,

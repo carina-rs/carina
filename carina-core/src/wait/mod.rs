@@ -2,6 +2,7 @@
 //!
 //! See `notes/specs/2026-05-09-wait-construct-design.md`.
 
+pub mod augment;
 pub mod predicate;
 
 use predicate::AttrPath;

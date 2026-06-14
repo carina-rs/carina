@@ -437,6 +437,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     let plan = create_plan(
         &resources_for_plan,
         &parsed.data_sources,
+        &carina_core::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         ctx.schemas(),

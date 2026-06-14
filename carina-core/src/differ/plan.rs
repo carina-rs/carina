@@ -7,10 +7,12 @@ use crate::effect::{CascadingUpdate, ChangedCreateOnly, Effect, TemporaryName, W
 use crate::identifier::generate_random_suffix;
 use crate::parser::WaitBinding;
 use crate::plan::{Plan, PlanError};
+use crate::provider::Provider;
 use crate::resource::{ConcreteValue, DataSource, Directives, Resource, ResourceId, State, Value};
 use crate::schema::{
     ResourceSchema, SchemaKind, SchemaRegistry, WAIT_DEFAULT_INTERVAL, WAIT_DEFAULT_TIMEOUT,
 };
+use crate::wait::augment::satisfier_augmentation;
 use crate::wait::predicate::{AttrPath, WaitPredicate};
 
 use super::{Diff, diff};
@@ -201,6 +203,7 @@ fn generate_temporary_name(
 /// let _ = create_plan(
 ///     &compositions,
 ///     &[],
+///     &carina_core::provider::ProviderRouter::new(),
 ///     &HashMap::new(),
 ///     &HashMap::new(),
 ///     &SchemaRegistry::default(),
@@ -214,6 +217,7 @@ fn generate_temporary_name(
 pub fn create_plan(
     managed: &[Resource],
     data_sources: &[DataSource],
+    provider: &dyn Provider,
     current_states: &HashMap<ResourceId, State>,
     directives_map: &HashMap<ResourceId, Directives>,
     registry: &SchemaRegistry,
@@ -223,6 +227,7 @@ pub fn create_plan(
     wait_bindings: &[WaitBinding],
 ) -> Plan {
     let mut plan = Plan::new();
+    let known_bindings = known_binding_names(managed, data_sources);
 
     let desired_ids: std::collections::HashSet<&ResourceId> = managed
         .iter()
@@ -515,7 +520,7 @@ pub fn create_plan(
             segments: wb.until_predicate.lhs_segments[1..].to_vec(),
         };
         let until = WaitPredicate::Equals {
-            attr,
+            attr: attr.clone(),
             value: wb.until_predicate.rhs.clone(),
         };
         let target_id = target_id_resolved;
@@ -578,6 +583,21 @@ pub fn create_plan(
         if !wait_has_work {
             continue;
         }
+        let mut explicit_dependencies: HashSet<String> = wb
+            .depends_on
+            .iter()
+            .map(|d| d.as_str().to_string())
+            .collect();
+        // Provider hints supplement user-authored ordering. They are additive
+        // because `depends_on` is the user's source of truth and must never be
+        // weakened by provider-derived knowledge.
+        explicit_dependencies.extend(satisfier_augmentation(
+            provider,
+            &target_id,
+            &attr,
+            &known_bindings,
+        ));
+
         plan.add(Effect::Wait {
             // Lower BindingName -> String at the AST→Effect seam: the
             // executor IR (Effect) is string-keyed and is the separate
@@ -589,15 +609,23 @@ pub fn create_plan(
             until_surface: wb.until_raw.clone(),
             timeout,
             interval,
-            explicit_dependencies: wb
-                .depends_on
-                .iter()
-                .map(|d| d.as_str().to_string())
-                .collect(),
+            explicit_dependencies,
         });
     }
 
     plan
+}
+
+fn known_binding_names(managed: &[Resource], data_sources: &[DataSource]) -> HashSet<String> {
+    managed
+        .iter()
+        .filter_map(|resource| resource.binding.clone())
+        .chain(
+            data_sources
+                .iter()
+                .filter_map(|resource| resource.binding.clone()),
+        )
+        .collect()
 }
 
 /// Populate cascading updates for Replace effects with create_before_destroy.

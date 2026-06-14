@@ -3,7 +3,7 @@ use super::*;
 use indexmap::IndexMap;
 
 use crate::explicit::ExplicitFields;
-use crate::resource::ConcreteValue;
+use crate::resource::{ConcreteValue, DataSource};
 
 /// Build an `ExplicitFields::Struct` whose children are all `Leaf` —
 /// the shape `state v5 → v6` reads produce, and a convenient way to
@@ -15,6 +15,70 @@ fn explicit_top_level(keys: &[&str]) -> ExplicitFields {
             .iter()
             .map(|k| ((*k).to_string(), ExplicitFields::Leaf))
             .collect(),
+    }
+}
+
+struct HintProvider {
+    hints: Vec<crate::wait::BindingPattern>,
+}
+
+impl crate::provider::Provider for HintProvider {
+    fn name(&self) -> &str {
+        "hint"
+    }
+
+    fn read(
+        &self,
+        _id: &ResourceId,
+        _identifier: Option<&str>,
+        _request: crate::provider::ReadRequest,
+    ) -> crate::provider::BoxFuture<'_, crate::provider::ProviderResult<State>> {
+        Box::pin(async { panic!("unexpected read") })
+    }
+
+    fn read_data_source(
+        &self,
+        _resource: &DataSource,
+    ) -> crate::provider::BoxFuture<'_, crate::provider::ProviderResult<State>> {
+        Box::pin(async { panic!("unexpected read_data_source") })
+    }
+
+    fn create(
+        &self,
+        _id: &ResourceId,
+        _request: crate::provider::CreateRequest,
+    ) -> crate::provider::BoxFuture<'_, crate::provider::ProviderResult<State>> {
+        Box::pin(async { panic!("unexpected create") })
+    }
+
+    fn update(
+        &self,
+        _id: &ResourceId,
+        _identifier: &str,
+        _request: crate::provider::UpdateRequest,
+    ) -> crate::provider::BoxFuture<'_, crate::provider::ProviderResult<State>> {
+        Box::pin(async { panic!("unexpected update") })
+    }
+
+    fn delete(
+        &self,
+        _id: &ResourceId,
+        _identifier: &str,
+        _request: crate::provider::DeleteRequest,
+    ) -> crate::provider::BoxFuture<'_, crate::provider::ProviderResult<()>> {
+        Box::pin(async { panic!("unexpected delete") })
+    }
+
+    fn required_permissions(&self, _id: &ResourceId, _op: crate::effect::PlanOp) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn satisfier_hint(
+        &self,
+        _target_id: &ResourceId,
+        _attr_path: &crate::wait::predicate::AttrPath,
+    ) -> Vec<crate::wait::BindingPattern> {
+        self.hints.clone()
     }
 }
 
@@ -64,6 +128,7 @@ fn create_before_destroy_generates_temporary_name_for_name_attribute() {
     let plan = create_plan(
         &resources,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -150,6 +215,7 @@ fn create_before_destroy_generates_temporary_name_with_can_rename() {
     let plan = create_plan(
         &resources,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -218,6 +284,7 @@ fn no_temporary_name_without_create_before_destroy() {
     let plan = create_plan(
         &resources,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -289,6 +356,7 @@ fn no_temporary_name_when_name_prefix_is_used() {
     let plan = create_plan(
         &resources,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -344,6 +412,7 @@ fn no_temporary_name_without_name_attribute_in_schema() {
     let plan = create_plan(
         &resources,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -413,6 +482,7 @@ fn no_temporary_name_when_name_attribute_changes() {
     let plan = create_plan(
         &resources,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -681,6 +751,7 @@ fn create_plan_detects_attribute_removal() {
     let plan = create_plan(
         &resources,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -748,6 +819,7 @@ fn create_plan_filters_non_removable_attribute_removal() {
     let plan = create_plan(
         &resources,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -818,6 +890,7 @@ fn create_plan_skips_update_when_only_non_removable_removal() {
     let plan = create_plan(
         &resources,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -893,6 +966,7 @@ fn prevent_destroy_blocks_delete_for_orphaned_resource() {
     let plan = create_plan(
         &[],
         &[],
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &directives_map,
         &SchemaRegistry::new(),
@@ -958,6 +1032,7 @@ fn prevent_destroy_blocks_replace() {
     let plan = create_plan(
         &resources,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -1013,6 +1088,7 @@ fn prevent_destroy_does_not_block_update() {
     let plan = create_plan(
         &resources,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -1052,6 +1128,7 @@ fn prevent_destroy_does_not_block_create() {
     let plan = create_plan(
         &resources,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &HashMap::new(), // no current states (resource doesn't exist)
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -1093,6 +1170,7 @@ fn without_prevent_destroy_delete_works_normally() {
     let plan = create_plan(
         &[],
         &[],
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(), // no directives (default = prevent_destroy: false)
         &SchemaRegistry::new(),
@@ -1156,6 +1234,7 @@ fn prevent_destroy_collects_multiple_errors() {
     let plan = create_plan(
         &[],
         &[],
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &directives_map,
         &SchemaRegistry::new(),
@@ -1213,6 +1292,7 @@ fn wait_binding_lowers_to_wait_effect() {
     let plan = create_plan(
         &resources,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &HashMap::new(),
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -1260,6 +1340,127 @@ fn wait_binding_lowers_to_wait_effect() {
 }
 
 #[test]
+fn wait_provider_satisfier_hint_augments_explicit_dependencies() {
+    use crate::effect::Effect;
+    use crate::wait::BindingPattern;
+
+    let parsed = crate::parser::parse_and_resolve(
+        r#"
+        provider aws {
+            region = "us-east-1"
+        }
+
+        let cert = aws.acm.Certificate {
+            domain_name       = "example.com"
+            validation_method = "DNS"
+        }
+
+        let validation_records = aws.route53.RecordSet {
+            name = "_acme.example.com"
+        }
+
+        let cert_issued = wait cert {
+            until = cert.status == "ISSUED"
+        }
+
+        let dist = aws.cloudfront.Distribution {
+            cert_status = cert_issued.status
+        }
+        "#,
+    )
+    .expect("parsed file should be valid");
+    let provider = HintProvider {
+        hints: vec![BindingPattern::Exact("validation_records".to_string())],
+    };
+
+    let plan = create_plan(
+        &parsed.resources,
+        &parsed.data_sources,
+        &provider,
+        &HashMap::new(),
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &parsed.wait_bindings,
+    );
+
+    let Effect::Wait {
+        explicit_dependencies,
+        ..
+    } = plan
+        .effects()
+        .iter()
+        .find(|effect| effect.is_wait())
+        .expect("wait should be emitted for changed downstream consumer")
+    else {
+        unreachable!();
+    };
+    assert!(
+        explicit_dependencies.contains("validation_records"),
+        "provider satisfier hint should add validation_records; got {explicit_dependencies:?}"
+    );
+}
+
+#[test]
+fn wait_user_depends_on_conflict_with_provider_hint_deduplicates() {
+    use crate::effect::Effect;
+    use crate::parser::{UntilPredicateAst, WaitBinding};
+    use crate::wait::BindingPattern;
+
+    let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
+    let dependency = Resource::new("route53.RecordSet", "record").with_binding("something");
+    let mut consumer = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
+    consumer
+        .dependency_bindings
+        .insert("cert_issued".to_string());
+    let resources = vec![cert, dependency, consumer];
+    let wait = WaitBinding {
+        binding: "cert_issued".into(),
+        target: "cert".into(),
+        until_raw: "cert.status == ISSUED".to_string(),
+        until_predicate: UntilPredicateAst {
+            lhs_segments: vec!["cert".to_string(), "status".to_string()],
+            rhs: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+        },
+        timeout_secs: None,
+        depends_on: vec!["something".into()],
+        line: 1,
+    };
+    let provider = HintProvider {
+        hints: vec![BindingPattern::Exact("something".to_string())],
+    };
+
+    let plan = create_plan(
+        &resources,
+        &[],
+        &provider,
+        &HashMap::new(),
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &[wait],
+    );
+
+    let Effect::Wait {
+        explicit_dependencies,
+        ..
+    } = plan
+        .effects()
+        .iter()
+        .find(|effect| effect.is_wait())
+        .expect("wait should be emitted")
+    else {
+        unreachable!();
+    };
+    assert_eq!(explicit_dependencies.len(), 1);
+    assert!(explicit_dependencies.contains("something"));
+}
+
+#[test]
 fn wait_uses_schema_default_timeout_when_omitted() {
     use crate::effect::Effect;
     use crate::parser::{UntilPredicateAst, WaitBinding};
@@ -1299,6 +1500,7 @@ fn wait_uses_schema_default_timeout_when_omitted() {
     let plan = create_plan(
         &resources,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &HashMap::new(),
         &HashMap::new(),
         &schemas,
@@ -1343,6 +1545,7 @@ fn wait_with_unknown_target_emits_plan_error() {
     let plan = create_plan(
         &resources,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &HashMap::new(),
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -1407,6 +1610,7 @@ fn wait_omitted_when_all_consumers_unchanged() {
     let plan = create_plan(
         &resources,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -1455,6 +1659,7 @@ fn wait_emitted_when_a_consumer_has_a_pending_change() {
     let plan = create_plan(
         &resources,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &HashMap::new(),
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -1528,6 +1733,7 @@ fn wait_omitted_when_already_satisfied_and_target_unchanged() {
     let plan = create_plan(
         &resources,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -1579,6 +1785,7 @@ fn wait_emitted_when_target_is_changing_even_if_cached_state_satisfies() {
     let plan = create_plan(
         &resources,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &HashMap::new(),
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -1657,6 +1864,7 @@ fn wait_emitted_when_known_target_has_pending_update_even_if_cached_state_satisf
     let plan = create_plan(
         &resources,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),

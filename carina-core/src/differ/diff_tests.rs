@@ -77,6 +77,7 @@ fn create_plan_from_resources() {
     let plan = create_plan(
         &resources,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -107,6 +108,7 @@ fn create_plan_with_read_only_resource() {
     let plan = create_plan(
         &resources,
         &data_sources,
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -212,6 +214,7 @@ fn create_plan_detects_orphaned_resources_for_deletion() {
     let plan = create_plan(
         &desired,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -263,6 +266,7 @@ fn read_only_resource_always_generates_read_effect() {
     let plan = create_plan(
         &[],
         &data_sources,
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -335,6 +339,7 @@ fn replace_when_create_only_attr_changed() {
     let plan = create_plan(
         &resources,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -391,6 +396,7 @@ fn normal_update_when_non_create_only_attr_changed() {
     let plan = create_plan(
         &resources,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -453,6 +459,7 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
     let plan = create_plan(
         &resources,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -507,6 +514,7 @@ fn replace_carries_create_before_destroy_directives() {
     let plan = create_plan(
         &resources,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -629,6 +637,7 @@ fn replace_with_provider_prefixed_schema_key() {
     let plan = create_plan(
         &resources,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &schemas,
@@ -899,6 +908,7 @@ fn orphan_delete_preserves_binding_and_dependencies() {
     let plan = create_plan(
         &desired,
         &[],
+        &crate::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &SchemaRegistry::new(),

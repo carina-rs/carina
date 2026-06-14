@@ -258,6 +258,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     let plan = create_plan(
         &resources_for_plan,
         &[],
+        &carina_core::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &registry,
@@ -407,6 +408,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     let plan = create_plan(
         &resources_for_plan,
         &[],
+        &carina_core::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &registry,
@@ -564,6 +566,7 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
     let plan = create_plan(
         &resources_for_plan,
         &[],
+        &carina_core::provider::ProviderRouter::new(),
         &current_states,
         &HashMap::new(),
         &registry,
