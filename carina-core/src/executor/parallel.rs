@@ -1087,6 +1087,14 @@ mod tests {
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Err(ProviderError::internal("delete not used")) })
         }
+
+        fn required_permissions(
+            &self,
+            _id: &ResourceId,
+            _op: crate::effect::PlanOp,
+        ) -> Vec<String> {
+            Vec::new()
+        }
     }
 
     struct RecordingSkipObserver {
