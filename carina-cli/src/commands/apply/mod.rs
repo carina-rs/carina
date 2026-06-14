@@ -35,6 +35,7 @@ use crate::commands::plan::PlanFile;
 use crate::commands::shared::effect_execution::{
     execute_import_effects, execute_state_only_effects,
 };
+use crate::commands::shared::finalize::handle_finalize_after_execute;
 use crate::commands::shared::observer::CliObserver;
 use crate::commands::shared::progress::{
     RefreshProgress, emit_newline_on_interrupt, format_duration, refresh_multi_progress,
@@ -65,33 +66,6 @@ fn cli_observer_factory(plan: &Plan) -> Box<dyn ExecutionObserver> {
 
 fn format_total_apply_line(elapsed: Duration) -> String {
     format!("Done in {}.", format_duration(elapsed))
-}
-
-/// Handle the finalize_apply call after execute_effects returns.
-///
-/// Four cases:
-/// 1. not cancelled + finalize Ok    -> Ok(())  (normal completion)
-/// 2. not cancelled + finalize Err   -> Err(finalize_err)  (state save failed mid-run)
-/// 3. cancelled     + finalize Ok    -> Err(Interrupted)  (state saved despite cancel)
-/// 4. cancelled     + finalize Err   -> Err(Interrupted) after logging warning  (cancel + save failed)
-///
-/// On cancellation, the Interrupted error takes precedence so the user sees
-/// "the apply was interrupted" rather than a backend error that happened to
-/// occur during cleanup. The finalize error is still logged to stderr.
-/// Production signal-driven cancellation is wired in T7/T8; T5 only preserves
-/// partial state after the executor observes a cancellation token.
-fn handle_finalize_after_execute(
-    finalize_result: Result<(), AppError>,
-    cancelled: bool,
-) -> Result<(), AppError> {
-    if cancelled {
-        if let Err(err) = finalize_result {
-            eprintln!("warning: state save during cancellation also failed: {err}");
-        }
-        return Err(AppError::Interrupted);
-    }
-
-    finalize_result
 }
 
 fn split_execution_outcome(outcome: ExecutionOutcome) -> (ExecutionResult, bool) {

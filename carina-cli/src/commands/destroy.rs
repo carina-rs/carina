@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use colored::Colorize;
-use futures::stream::{self, FuturesUnordered, StreamExt};
+use futures::stream::{FuturesUnordered, StreamExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
@@ -18,12 +18,14 @@ use carina_core::effect::Effect;
 use carina_core::plan::Plan;
 use carina_core::provider::Provider;
 use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
-use carina_state::{LockInfo, StateBackend};
+use carina_state::{LockInfo, StateBackend, StateFile};
+use tokio_util::sync::CancellationToken;
 
 use carina_core::parser::ProviderContext;
 
 use super::{DriftCommand, validate_and_resolve_with_config, verify_for_mutation};
 use crate::DetailLevel;
+use crate::commands::shared::finalize::handle_finalize_after_execute;
 use crate::commands::shared::progress::{
     RefreshProgress, format_duration, refresh_multi_progress, spinner_style,
 };
@@ -49,6 +51,7 @@ pub async fn run_destroy(
     force: bool,
     parallelism: NonZeroUsize,
     provider_context: &ProviderContext,
+    cancel: CancellationToken,
 ) -> Result<(), AppError> {
     let mut parsed = load_configuration_with_config(
         path,
@@ -106,6 +109,7 @@ pub async fn run_destroy(
         force,
         base_dir,
         parallelism,
+        cancel,
     ))
     .await;
 
@@ -139,6 +143,7 @@ async fn run_destroy_locked(
     force: bool,
     base_dir: &std::path::Path,
     parallelism: NonZeroUsize,
+    cancel: CancellationToken,
 ) -> Result<(), AppError> {
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
     let ctx = WiringContext::new(factories);
@@ -206,26 +211,56 @@ async fn run_destroy_locked(
         // composition resources are not destroyed and never enter this list.
         let resources: Vec<&Resource> = all_resources.iter().collect();
         let provider_ref = &provider;
-        let results: Vec<Result<(ResourceId, State), AppError>> = stream::iter(&resources)
-            .map(|resource| {
+        let mut refresh_cancelled = false;
+        let mut resource_iter = resources.into_iter();
+        let mut refresh_in_flight = FuturesUnordered::new();
+        loop {
+            while !refresh_cancelled && refresh_in_flight.len() < 5 {
+                let Some(resource) = resource_iter.next() else {
+                    break;
+                };
                 let progress = RefreshProgress::begin_multi(&multi, &resource.id);
                 let identifier = state_file
                     .as_ref()
                     .and_then(|sf| sf.get_identifier_for_resource(resource));
-                async move {
+                refresh_in_flight.push(async move {
                     let state = read_with_retry(provider_ref, &resource.id, identifier.as_deref())
                         .await
                         .map_err(AppError::Provider)?;
                     progress.finish();
                     Ok((resource.id.clone(), state))
+                });
+            }
+
+            if refresh_in_flight.is_empty() {
+                break;
+            }
+
+            let result: Result<(ResourceId, State), AppError> = if refresh_cancelled {
+                refresh_in_flight.next().await.unwrap()
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        refresh_cancelled = true;
+                        continue;
+                    }
+                    result = refresh_in_flight.next() => {
+                        result.unwrap()
+                    }
                 }
-            })
-            .buffer_unordered(5)
-            .collect()
-            .await;
-        for result in results {
+            };
+
+            if refresh_cancelled {
+                continue;
+            }
             let (id, state) = result?;
             current_states.insert(id, state);
+        }
+        drop(refresh_in_flight);
+        drop(resource_iter);
+        if refresh_cancelled {
+            return Err(AppError::Interrupted);
         }
 
         // Include orphaned resources (in state but not in .crn).
@@ -235,29 +270,56 @@ async fn run_destroy_locked(
                 all_resources.iter().map(|r| r.id.clone()).collect();
             let orphan_states: Vec<(ResourceId, State)> =
                 sf.build_orphan_states(&desired_ids).into_iter().collect();
-            let orphan_results: Vec<Result<(ResourceId, State), AppError>> =
-                stream::iter(orphan_states)
-                    .map(|(id, state)| {
-                        let progress = RefreshProgress::begin_multi(&multi, &id);
-                        async move {
-                            let refreshed =
-                                read_with_retry(provider_ref, &id, state.identifier.as_deref())
-                                    .await
-                                    .map_err(AppError::Provider)?;
-                            progress.finish();
-                            Ok((id, refreshed))
+            let mut refresh_cancelled = false;
+            let mut orphan_iter = orphan_states.into_iter();
+            let mut orphan_in_flight = FuturesUnordered::new();
+            loop {
+                while !refresh_cancelled && orphan_in_flight.len() < 5 {
+                    let Some((id, state)) = orphan_iter.next() else {
+                        break;
+                    };
+                    let progress = RefreshProgress::begin_multi(&multi, &id);
+                    orphan_in_flight.push(async move {
+                        let refreshed =
+                            read_with_retry(provider_ref, &id, state.identifier.as_deref())
+                                .await
+                                .map_err(AppError::Provider)?;
+                        progress.finish();
+                        Ok((id, refreshed))
+                    });
+                }
+
+                if orphan_in_flight.is_empty() {
+                    break;
+                }
+
+                let result: Result<(ResourceId, State), AppError> = if refresh_cancelled {
+                    orphan_in_flight.next().await.unwrap()
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            refresh_cancelled = true;
+                            continue;
                         }
-                    })
-                    .buffer_unordered(5)
-                    .collect()
-                    .await;
-            for result in orphan_results {
+                        result = orphan_in_flight.next() => {
+                            result.unwrap()
+                        }
+                    }
+                };
+
+                if refresh_cancelled {
+                    continue;
+                }
                 let (id, refreshed) = result?;
                 if refreshed.exists {
                     current_states.insert(id.clone(), refreshed);
                     let orphan_resource = build_orphan_resource(sf, &id);
                     all_resources.push(orphan_resource);
                 }
+            }
+            if refresh_cancelled {
+                return Err(AppError::Interrupted);
             }
         }
     } else if let Some(sf) = state_file.as_ref() {
@@ -476,6 +538,7 @@ async fn run_destroy_locked(
     let mut skip_count = 0;
     let mut destroyed_ids: Vec<ResourceId> = Vec::new();
     let mut failed_bindings: HashSet<String> = HashSet::new();
+    let mut cancelled = false;
     // timed_out_resources: binding -> (ResourceId, identifier)
     let mut timed_out_resources: HashMap<String, (ResourceId, String)> = HashMap::new();
 
@@ -544,190 +607,221 @@ async fn run_destroy_locked(
     let mut in_flight = FuturesUnordered::new();
 
     loop {
-        // Find newly ready resources: all deletion deps completed, not yet
-        // dispatched, and not waiting for a retry gate.
-        let mut newly_ready: Vec<usize> = Vec::new();
-        for &idx in &all_indices {
-            if dispatched.contains(&idx) || retry_pending.contains(&idx) {
-                continue;
-            }
-            let deps = &deletion_deps[&idx];
-            if deps.iter().all(|d| completed_indices.contains(d)) {
-                newly_ready.push(idx);
-            }
+        let undispatched_at_loop_start = all_indices
+            .iter()
+            .filter(|&&idx| !dispatched.contains(&idx))
+            .count();
+        if cancel.is_cancelled()
+            && !cancelled
+            && (undispatched_at_loop_start > 0 || !in_flight.is_empty())
+        {
+            cancelled = true;
         }
-        newly_ready.sort();
-        newly_ready.truncate(parallelism.get().saturating_sub(in_flight.len()));
 
-        // Process newly ready resources
-        for idx in newly_ready {
-            dispatched.insert(idx);
-
-            let (binding, identifier, effect) = &resource_info[idx];
-            let resource = resources_to_destroy[idx];
-
-            // Check if any dependent has actually failed (non-timeout)
-            if let Some(failed_dep) =
-                find_failed_dependent(binding, &dependents_map, &failed_bindings)
-            {
-                let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                let counter = format!("{}/{}", c, destroy_total).dimmed();
-                let msg = format!(
-                    "{} {} - skipped (dependent {} failed) {}",
-                    "⊘".yellow(),
-                    format_effect(effect),
-                    failed_dep,
-                    counter
-                );
-                if let Some(pb) = spinners.remove(&idx) {
-                    pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
-                    pb.finish_with_message(msg);
-                } else {
-                    eprintln!("  {}", msg);
+        if !cancelled {
+            // Find newly ready resources: all deletion deps completed, not yet
+            // dispatched, and not waiting for a retry gate.
+            let mut newly_ready: Vec<usize> = Vec::new();
+            for &idx in &all_indices {
+                if dispatched.contains(&idx) || retry_pending.contains(&idx) {
+                    continue;
                 }
-                skip_count += 1;
-                failed_bindings.insert(binding.clone());
-                completed_indices.insert(idx);
-                continue;
+                let deps = &deletion_deps[&idx];
+                if deps.iter().all(|d| completed_indices.contains(d)) {
+                    newly_ready.push(idx);
+                }
             }
+            newly_ready.sort();
+            newly_ready.truncate(parallelism.get().saturating_sub(in_flight.len()));
 
-            // Check if any dependent timed out -- wait for it to complete
-            let timed_out_deps: Vec<String> = dependents_map
-                .get(binding)
-                .map(|deps| {
-                    deps.iter()
-                        .filter(|d| timed_out_resources.contains_key(d.as_str()))
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default();
+            // Process newly ready resources
+            for idx in newly_ready {
+                if cancel.is_cancelled() {
+                    cancelled = true;
+                    break;
+                }
 
-            let mut wait_failed = false;
-            for dep_binding in &timed_out_deps {
-                if let Some((dep_id, dep_identifier)) =
-                    timed_out_resources.remove(dep_binding.as_str())
+                dispatched.insert(idx);
+
+                let (binding, identifier, effect) = &resource_info[idx];
+                let resource = resources_to_destroy[idx];
+
+                // Check if any dependent has actually failed (non-timeout)
+                if let Some(failed_dep) =
+                    find_failed_dependent(binding, &dependents_map, &failed_bindings)
                 {
-                    multi
-                        .println(format!(
-                            "  {} Waiting for {} to be deleted...",
-                            "⏳".yellow(),
-                            dep_id
-                        ))
-                        .ok();
+                    let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    let counter = format!("{}/{}", c, destroy_total).dimmed();
+                    let msg = format!(
+                        "{} {} - skipped (dependent {} failed) {}",
+                        "⊘".yellow(),
+                        format_effect(effect),
+                        failed_dep,
+                        counter
+                    );
+                    if let Some(pb) = spinners.remove(&idx) {
+                        pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
+                        pb.finish_with_message(msg);
+                    } else {
+                        eprintln!("  {}", msg);
+                    }
+                    skip_count += 1;
+                    failed_bindings.insert(binding.clone());
+                    completed_indices.insert(idx);
+                    continue;
+                }
 
-                    match wait_for_deletion(
-                        &provider,
-                        &dep_id,
-                        &dep_identifier,
-                        180,
-                        std::time::Duration::from_secs(10),
-                    )
-                    .await
+                // Check if any dependent timed out -- wait for it to complete
+                let timed_out_deps: Vec<String> = dependents_map
+                    .get(binding)
+                    .map(|deps| {
+                        deps.iter()
+                            .filter(|d| timed_out_resources.contains_key(d.as_str()))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let mut wait_failed = false;
+                for dep_binding in &timed_out_deps {
+                    if let Some((dep_id, dep_identifier)) =
+                        timed_out_resources.remove(dep_binding.as_str())
                     {
-                        WaitResult::Deleted => {
-                            multi
-                                .println(format!(
-                                    "  {} Delete {} (completed after extended wait)",
-                                    "✓".green(),
-                                    dep_id
-                                ))
-                                .ok();
-                            destroyed_ids.push(dep_id.clone());
-                            success_count += 1;
-                        }
-                        WaitResult::ReadError(msg) => {
-                            multi
-                                .println(format!("  {} Delete {}", "✗".red(), dep_id))
-                                .ok();
-                            multi
-                                .println(format!(
-                                    "      {} {}",
-                                    "→".red(),
-                                    format!("read error during wait: {}", msg).red()
-                                ))
-                                .ok();
-                            failed_bindings.insert(dep_binding.clone());
-                            failure_count += 1;
-                            wait_failed = true;
-                        }
-                        WaitResult::TimedOut => {
-                            multi
-                                .println(format!("  {} Delete {}", "✗".red(), dep_id))
-                                .ok();
-                            multi
-                                .println(format!(
-                                    "      {} {}",
-                                    "→".red(),
-                                    "still exists after extended wait".red()
-                                ))
-                                .ok();
-                            failed_bindings.insert(dep_binding.clone());
-                            failure_count += 1;
-                            wait_failed = true;
+                        multi
+                            .println(format!(
+                                "  {} Waiting for {} to be deleted...",
+                                "⏳".yellow(),
+                                dep_id
+                            ))
+                            .ok();
+
+                        match wait_for_deletion(
+                            &provider,
+                            &dep_id,
+                            &dep_identifier,
+                            180,
+                            std::time::Duration::from_secs(10),
+                        )
+                        .await
+                        {
+                            WaitResult::Deleted => {
+                                multi
+                                    .println(format!(
+                                        "  {} Delete {} (completed after extended wait)",
+                                        "✓".green(),
+                                        dep_id
+                                    ))
+                                    .ok();
+                                destroyed_ids.push(dep_id.clone());
+                                success_count += 1;
+                            }
+                            WaitResult::ReadError(msg) => {
+                                multi
+                                    .println(format!("  {} Delete {}", "✗".red(), dep_id))
+                                    .ok();
+                                multi
+                                    .println(format!(
+                                        "      {} {}",
+                                        "→".red(),
+                                        format!("read error during wait: {}", msg).red()
+                                    ))
+                                    .ok();
+                                failed_bindings.insert(dep_binding.clone());
+                                failure_count += 1;
+                                wait_failed = true;
+                            }
+                            WaitResult::TimedOut => {
+                                multi
+                                    .println(format!("  {} Delete {}", "✗".red(), dep_id))
+                                    .ok();
+                                multi
+                                    .println(format!(
+                                        "      {} {}",
+                                        "→".red(),
+                                        "still exists after extended wait".red()
+                                    ))
+                                    .ok();
+                                failed_bindings.insert(dep_binding.clone());
+                                failure_count += 1;
+                                wait_failed = true;
+                            }
                         }
                     }
                 }
-            }
 
-            if wait_failed {
-                let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                let counter = format!("{}/{}", c, destroy_total).dimmed();
-                let msg = format!(
-                    "{} {} - skipped (dependent deletion did not complete) {}",
-                    "⊘".yellow(),
-                    format_effect(effect),
-                    counter
-                );
-                if let Some(pb) = spinners.remove(&idx) {
-                    pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
-                    pb.finish_with_message(msg);
-                } else {
-                    eprintln!("  {}", msg);
+                if wait_failed {
+                    let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    let counter = format!("{}/{}", c, destroy_total).dimmed();
+                    let msg = format!(
+                        "{} {} - skipped (dependent deletion did not complete) {}",
+                        "⊘".yellow(),
+                        format_effect(effect),
+                        counter
+                    );
+                    if let Some(pb) = spinners.remove(&idx) {
+                        pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
+                        pb.finish_with_message(msg);
+                    } else {
+                        eprintln!("  {}", msg);
+                    }
+                    skip_count += 1;
+                    failed_bindings.insert(binding.clone());
+                    completed_indices.insert(idx);
+                    continue;
                 }
-                skip_count += 1;
-                failed_bindings.insert(binding.clone());
-                completed_indices.insert(idx);
-                continue;
-            }
 
-            // Create a spinner for the in-flight deletion
-            let pb = multi.add(ProgressBar::new_spinner());
-            pb.set_style(spinner_style());
-            pb.set_message(format_effect(effect));
-            pb.enable_steady_tick(Duration::from_millis(80));
-            spinners.insert(idx, pb);
+                // Create a spinner for the in-flight deletion
+                let pb = multi.add(ProgressBar::new_spinner());
+                pb.set_style(spinner_style());
+                pb.set_message(format_effect(effect));
+                pb.enable_steady_tick(Duration::from_millis(80));
+                spinners.insert(idx, pb);
 
-            // Spawn the deletion as a concurrent future
-            let resource_id = resource.id.clone();
-            let identifier = identifier.clone();
-            let directives = resource.directives.clone();
-            let binding = binding.clone();
+                // Spawn the deletion as a concurrent future
+                let resource_id = resource.id.clone();
+                let identifier = identifier.clone();
+                let directives = resource.directives.clone();
+                let binding = binding.clone();
 
-            let provider_ref = &provider;
-            in_flight.push(async move {
-                let started = Instant::now();
-                let delete_result = provider_ref
-                    .delete(
-                        &resource_id,
-                        &identifier,
-                        carina_core::provider::DeleteRequest {
-                            directives: directives.clone(),
-                        },
+                let provider_ref = &provider;
+                in_flight.push(async move {
+                    let started = Instant::now();
+                    let delete_result = provider_ref
+                        .delete(
+                            &resource_id,
+                            &identifier,
+                            carina_core::provider::DeleteRequest {
+                                directives: directives.clone(),
+                            },
+                        )
+                        .await;
+                    (
+                        idx,
+                        binding,
+                        resource_id,
+                        identifier,
+                        started,
+                        delete_result,
                     )
-                    .await;
-                (
-                    idx,
-                    binding,
-                    resource_id,
-                    identifier,
-                    started,
-                    delete_result,
-                )
-            });
+                });
+            }
         }
 
         // If nothing is in flight, we're done (or stuck)
         if in_flight.is_empty() {
+            if cancelled {
+                let remaining: Vec<usize> = all_indices
+                    .iter()
+                    .filter(|idx| !dispatched.contains(idx) && !completed_indices.contains(idx))
+                    .copied()
+                    .collect();
+                for idx in remaining {
+                    dispatched.insert(idx);
+                    completed_indices.insert(idx);
+                    skip_count += 1;
+                }
+                break;
+            }
             let remaining: Vec<usize> = all_indices
                 .iter()
                 .filter(|idx| !dispatched.contains(idx) && !completed_indices.contains(idx))
@@ -775,8 +869,21 @@ async fn run_destroy_locked(
         }
 
         // Wait for the next deletion to complete
-        let (finished_idx, binding, resource_id, identifier, started, delete_result) =
-            in_flight.next().await.unwrap();
+        let (finished_idx, binding, resource_id, identifier, started, delete_result) = if cancelled
+        {
+            in_flight.next().await.unwrap()
+        } else {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    cancelled = true;
+                    continue;
+                }
+                finished = in_flight.next() => {
+                    finished.unwrap()
+                }
+            }
+        };
         completed_indices.insert(finished_idx);
 
         // An effect completed — release all retry-pending indices so they
@@ -816,6 +923,7 @@ async fn run_destroy_locked(
                 );
                 finish_spinner(&mut spinners, finished_idx, msg);
                 success_count += 1;
+                observe_destroy_success_for_tests(success_count, &resource_id, &cancel);
                 destroyed_ids.push(resource_id);
             }
             Err(carina_core::provider::ProviderError::Timeout(_)) => {
@@ -870,71 +978,84 @@ async fn run_destroy_locked(
         }
     }
 
-    // Handle any remaining timed-out resources that no parent waited on
-    for (dep_binding, (dep_id, dep_identifier)) in &timed_out_resources {
-        eprintln!(
-            "  {} Waiting for {} to be deleted...",
-            "⏳".yellow(),
-            dep_id
-        );
+    // Handle any remaining timed-out resources that no parent waited on.
+    if !cancelled {
+        for (dep_binding, (dep_id, dep_identifier)) in &timed_out_resources {
+            if cancel.is_cancelled() {
+                cancelled = true;
+                break;
+            }
 
-        match wait_for_deletion(
-            &provider,
-            dep_id,
-            dep_identifier,
-            180,
-            std::time::Duration::from_secs(10),
-        )
-        .await
-        {
-            WaitResult::Deleted => {
-                eprintln!(
-                    "  {} Delete {} (completed after extended wait)",
-                    "✓".green(),
-                    dep_id
-                );
-                destroyed_ids.push(dep_id.clone());
-                success_count += 1;
-            }
-            WaitResult::ReadError(msg) => {
-                eprintln!("  {} Delete {}", "✗".red(), dep_id);
-                eprintln!(
-                    "      {} {}",
-                    "→".red(),
-                    format!("read error during wait: {}", msg).red()
-                );
-                failed_bindings.insert(dep_binding.clone());
-                failure_count += 1;
-            }
-            WaitResult::TimedOut => {
-                eprintln!("  {} Delete {}", "✗".red(), dep_id);
-                eprintln!(
-                    "      {} {}",
-                    "→".red(),
-                    "still exists after extended wait".red()
-                );
-                failed_bindings.insert(dep_binding.clone());
-                failure_count += 1;
+            eprintln!(
+                "  {} Waiting for {} to be deleted...",
+                "⏳".yellow(),
+                dep_id
+            );
+
+            let outcome = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    cancelled = true;
+                    break;
+                }
+                result = wait_for_deletion(
+                    &provider,
+                    dep_id,
+                    dep_identifier,
+                    180,
+                    std::time::Duration::from_secs(10),
+                ) => result,
+            };
+
+            match outcome {
+                WaitResult::Deleted => {
+                    eprintln!(
+                        "  {} Delete {} (completed after extended wait)",
+                        "✓".green(),
+                        dep_id
+                    );
+                    destroyed_ids.push(dep_id.clone());
+                    success_count += 1;
+                }
+                WaitResult::ReadError(msg) => {
+                    eprintln!("  {} Delete {}", "✗".red(), dep_id);
+                    eprintln!(
+                        "      {} {}",
+                        "→".red(),
+                        format!("read error during wait: {}", msg).red()
+                    );
+                    failed_bindings.insert(dep_binding.clone());
+                    failure_count += 1;
+                }
+                WaitResult::TimedOut => {
+                    eprintln!("  {} Delete {}", "✗".red(), dep_id);
+                    eprintln!(
+                        "      {} {}",
+                        "→".red(),
+                        "still exists after extended wait".red()
+                    );
+                    failed_bindings.insert(dep_binding.clone());
+                    failure_count += 1;
+                }
             }
         }
     }
 
-    // Save state
+    if cancelled && destroyed_ids.is_empty() {
+        return Err(AppError::Interrupted);
+    }
+
     println!();
     println!("{}", "Saving state...".cyan());
 
-    // Get or create state file
-    let mut state = state_file.unwrap_or_default();
-
-    apply_destroy_to_state(&mut state, &destroyed_ids);
-
-    // Save state (with or without lock validation)
-    if let Some(lock) = lock {
-        crate::commands::apply::save_state_locked(backend, lock, &mut state).await?;
-    } else {
-        crate::commands::apply::save_state_unlocked(backend, &mut state).await?;
-    }
-    println!("  {} State saved (serial: {})", "✓".green(), state.serial);
+    let finalize_result = finalize_destroy(FinalizeDestroyInput {
+        backend,
+        lock,
+        state_file,
+        destroyed_ids: &destroyed_ids,
+    })
+    .await;
+    handle_finalize_after_execute(finalize_result, cancelled)?;
 
     println!();
     if failure_count == 0 && skip_count == 0 {
@@ -954,15 +1075,141 @@ async fn run_destroy_locked(
 }
 
 #[cfg(test)]
+static DESTROY_SUCCESS_CANCEL_AFTER: std::sync::Mutex<Option<DestroySuccessCancelHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+struct DestroySuccessCancelHook {
+    threshold: usize,
+    cancel: CancellationToken,
+}
+
+#[cfg(test)]
+pub(crate) fn set_destroy_success_cancel_after(threshold: usize, cancel: CancellationToken) {
+    *DESTROY_SUCCESS_CANCEL_AFTER
+        .lock()
+        .expect("destroy success cancel hook lock") =
+        Some(DestroySuccessCancelHook { threshold, cancel });
+}
+
+#[cfg(test)]
+pub(crate) fn clear_destroy_success_cancel_after() {
+    *DESTROY_SUCCESS_CANCEL_AFTER
+        .lock()
+        .expect("destroy success cancel hook lock") = None;
+}
+
+#[cfg(test)]
+fn observe_destroy_success_for_tests(
+    success_count: usize,
+    _resource_id: &ResourceId,
+    _cancel: &CancellationToken,
+) {
+    if let Some(hook) = DESTROY_SUCCESS_CANCEL_AFTER
+        .lock()
+        .expect("destroy success cancel hook lock")
+        .as_ref()
+        && success_count == hook.threshold
+    {
+        hook.cancel.cancel();
+    }
+}
+
+#[cfg(not(test))]
+fn observe_destroy_success_for_tests(
+    _success_count: usize,
+    _resource_id: &ResourceId,
+    _cancel: &CancellationToken,
+) {
+}
+
+pub(crate) struct FinalizeDestroyInput<'a> {
+    pub backend: &'a dyn StateBackend,
+    pub lock: Option<&'a LockInfo>,
+    pub state_file: Option<StateFile>,
+    pub destroyed_ids: &'a [ResourceId],
+}
+
+pub(crate) async fn finalize_destroy(input: FinalizeDestroyInput<'_>) -> Result<(), AppError> {
+    let mut state = input.state_file.unwrap_or_default();
+
+    // NOTE: apply_destroy_to_state currently clears state.exports unconditionally.
+    // On a cancelled partial destroy, exports for resources that survived are
+    // also wiped. This is pre-existing behavior; downstream consumers should
+    // re-derive exports from a fresh plan. See carina-cli/src/commands/shared/state_writeback.rs.
+    apply_destroy_to_state(&mut state, input.destroyed_ids);
+
+    if let Some(lock) = input.lock {
+        crate::commands::apply::save_state_locked(input.backend, lock, &mut state).await?;
+    } else {
+        crate::commands::apply::save_state_unlocked(input.backend, &mut state).await?;
+    }
+    println!("  {} State saved (serial: {})", "✓".green(), state.serial);
+    Ok(())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use carina_core::provider::{BoxFuture, Provider, ProviderError, ProviderResult};
     use carina_core::resource::DataSource;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[path = "cancellation_fixture.rs"]
+    mod cancellation_fixture;
+
+    use cancellation_fixture::DestroyCancellationFixture;
+
     #[test]
     fn destroy_parallelism_default_is_eight() {
         assert_eq!(crate::DEFAULT_PARALLELISM.get(), 8);
+    }
+
+    #[tokio::test]
+    async fn run_destroy_cancelled_after_partial_execution_persists_deletions_and_releases_lock() {
+        let fixture = DestroyCancellationFixture::new()
+            .with_existing_resources(["first", "second"])
+            .cancel_after_successes(1);
+        let token = fixture.cancel_token();
+
+        let err = run_destroy(
+            fixture.config_path(),
+            true,
+            true,
+            false,
+            false,
+            NonZeroUsize::new(1).unwrap(),
+            fixture.provider_context(),
+            token,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, AppError::Interrupted),
+            "expected Interrupted, got {err:?}"
+        );
+        let state = fixture.read_state().await;
+        assert!(fixture.backend().state_path().exists());
+        assert!(
+            state
+                .find_resource("mock", "test.resource", "first")
+                .is_none(),
+            "first must be deleted from state"
+        );
+        assert!(
+            state
+                .find_resource("mock", "test.resource", "second")
+                .is_some(),
+            "second must remain in state"
+        );
+        assert!(!fixture.lock_path().exists(), "lock file must be released");
+        assert_eq!(state.resources.len(), 1);
+        assert!(state.serial >= 1, "state must be written");
+        assert!(
+            state.exports.is_empty(),
+            "exports must be cleared on partial destroy"
+        );
     }
 
     /// A mock provider whose `read()` returns a sequence of results.
