@@ -1324,9 +1324,7 @@ fn wait_binding_lowers_to_wait_effect() {
     assert_eq!(
         until,
         &WaitPredicate::Equals {
-            attr: AttrPath {
-                segments: vec!["status".to_string()],
-            },
+            attr: AttrPath::single("status"),
             value: Value::Concrete(ConcreteValue::String(
                 "aws.acm.Certificate.Status.Issued".to_string()
             )),
@@ -1336,6 +1334,56 @@ fn wait_binding_lowers_to_wait_effect() {
     assert_eq!(
         until_surface,
         "cert.status == aws.acm.Certificate.Status.Issued"
+    );
+}
+
+#[test]
+fn create_plan_records_error_for_empty_predicate_attr_path() {
+    use crate::parser::{UntilPredicateAst, WaitBinding};
+
+    let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
+    // The wait must gate a pending downstream change, otherwise
+    // create_plan legitimately skips emitting or lowering the wait.
+    let mut consumer = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
+    consumer
+        .dependency_bindings
+        .insert("cert_issued".to_string());
+    let resources = vec![cert, consumer];
+
+    let wait = WaitBinding {
+        binding: "cert_issued".into(),
+        target: "cert".into(),
+        until_raw: "cert == ISSUED".to_string(),
+        until_predicate: UntilPredicateAst {
+            lhs_segments: vec!["cert".to_string()],
+            rhs: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+        },
+        timeout_secs: None,
+        depends_on: vec![],
+        line: 1,
+    };
+
+    let plan = create_plan(
+        &resources,
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &[wait],
+    );
+
+    assert!(
+        plan.errors().iter().any(|err| {
+            err.message.contains("cert_issued")
+                && err.message.contains("invalid predicate attribute path")
+                && err.message.contains("empty")
+        }),
+        "expected invalid empty predicate attr path error, got {:?}",
+        plan.errors()
     );
 }
 

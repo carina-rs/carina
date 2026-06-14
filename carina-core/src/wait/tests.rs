@@ -58,16 +58,13 @@ fn binding_pattern_variants_construct_and_debug_print() {
 
     let attribute_match = BindingPattern::AttributeMatch {
         resource_type: "route53.RecordSet".to_string(),
-        attr: AttrPath {
-            segments: vec!["name".to_string()],
-        },
-        from: AttrPath {
-            segments: vec![
-                "domain_validation_options".to_string(),
-                "resource_record".to_string(),
-                "name".to_string(),
-            ],
-        },
+        attr: AttrPath::single("name"),
+        from: AttrPath::try_new(vec![
+            "domain_validation_options".to_string(),
+            "resource_record".to_string(),
+            "name".to_string(),
+        ])
+        .unwrap(),
     };
     assert!(format!("{attribute_match:?}").contains("AttributeMatch"));
 }

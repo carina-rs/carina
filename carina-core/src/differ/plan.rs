@@ -516,8 +516,22 @@ pub fn create_plan(
         // `lhs_segments` is guaranteed non-empty and the first segment
         // equals `wb.target` (enforced by `parse_wait_expr`). The
         // predicate attribute path is therefore `lhs_segments[1..]`.
-        let attr = AttrPath {
-            segments: wb.until_predicate.lhs_segments[1..].to_vec(),
+        // This `try_new` branch is defense in depth: the parser rejects
+        // bare-target LHS values like `until = cert == ...`, but keep a
+        // plan-level error here in case a future parser path relaxes
+        // that rule or constructs `WaitBinding` directly.
+        let attr = match AttrPath::try_new(wb.until_predicate.lhs_segments[1..].to_vec()) {
+            Ok(attr) => attr,
+            Err(err) => {
+                plan.add_error(PlanError {
+                    resource_id: target_id_resolved.clone(),
+                    message: format!(
+                        "wait `{}`: invalid predicate attribute path: {err}",
+                        wb.binding
+                    ),
+                });
+                continue;
+            }
         };
         let until = WaitPredicate::Equals {
             attr: attr.clone(),

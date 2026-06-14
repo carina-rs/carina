@@ -20,7 +20,7 @@ use carina_core::schema::{
 };
 use carina_core::value::{SerializationContext, SerializationError};
 use carina_core::wait::BindingPattern as CoreBindingPattern;
-use carina_core::wait::predicate::AttrPath as CoreAttrPath;
+use carina_core::wait::predicate::{AttrPath as CoreAttrPath, AttrPathError};
 
 use carina_provider_protocol::types as proto;
 
@@ -237,26 +237,25 @@ pub fn core_to_wit_binding_pattern(p: &CoreBindingPattern) -> wit::BindingPatter
             from,
         } => wit::BindingPattern::AttributeMatch(wit::AttributeMatchPattern {
             resource_type: resource_type.clone(),
-            attr: attr.segments.clone(),
-            from: from.segments.clone(),
+            attr: attr.segments().to_vec(),
+            from: from.segments().to_vec(),
         }),
     }
 }
 
-pub fn wit_to_core_binding_pattern(p: wit::BindingPattern) -> CoreBindingPattern {
-    match p {
+pub fn wit_to_core_binding_pattern(
+    p: wit::BindingPattern,
+) -> Result<CoreBindingPattern, AttrPathError> {
+    let pattern = match p {
         wit::BindingPattern::Exact(name) => CoreBindingPattern::Exact(name),
         wit::BindingPattern::ForLoopChildren(base) => CoreBindingPattern::ForLoopChildren { base },
         wit::BindingPattern::AttributeMatch(pattern) => CoreBindingPattern::AttributeMatch {
             resource_type: pattern.resource_type,
-            attr: CoreAttrPath {
-                segments: pattern.attr,
-            },
-            from: CoreAttrPath {
-                segments: pattern.from,
-            },
+            attr: CoreAttrPath::try_new(pattern.attr)?,
+            from: CoreAttrPath::try_new(pattern.from)?,
         },
-    }
+    };
+    Ok(pattern)
 }
 
 /// Helper: convert a core Value to a serde_json::Value for JSON
@@ -1074,20 +1073,75 @@ mod tests {
             CoreBindingPattern::AttributeMatch {
                 resource_type: "route53.RecordSet".to_string(),
                 attr: CoreAttrPath::single("name"),
-                from: CoreAttrPath {
-                    segments: vec![
-                        "domain_validation_options".to_string(),
-                        "resource_record".to_string(),
-                        "name".to_string(),
-                    ],
-                },
+                from: CoreAttrPath::try_new(vec![
+                    "domain_validation_options".to_string(),
+                    "resource_record".to_string(),
+                    "name".to_string(),
+                ])
+                .unwrap(),
             },
         ];
 
         for pattern in patterns {
             let wit = core_to_wit_binding_pattern(&pattern);
-            assert_eq!(wit_to_core_binding_pattern(wit), pattern);
+            assert_eq!(wit_to_core_binding_pattern(wit).unwrap(), pattern);
         }
+    }
+
+    #[test]
+    fn wit_to_core_binding_pattern_returns_err_for_empty_attr_path() {
+        let wit = wit::BindingPattern::AttributeMatch(wit::AttributeMatchPattern {
+            resource_type: "route53.RecordSet".to_string(),
+            attr: vec![],
+            from: vec!["resource_record_name".to_string()],
+        });
+
+        assert!(matches!(
+            wit_to_core_binding_pattern(wit),
+            Err(AttrPathError::Empty)
+        ));
+    }
+
+    #[test]
+    fn wit_to_core_binding_pattern_returns_err_for_empty_from_path() {
+        let wit = wit::BindingPattern::AttributeMatch(wit::AttributeMatchPattern {
+            resource_type: "route53.RecordSet".to_string(),
+            attr: vec!["name".to_string()],
+            from: vec![],
+        });
+
+        assert!(matches!(
+            wit_to_core_binding_pattern(wit),
+            Err(AttrPathError::Empty)
+        ));
+    }
+
+    #[test]
+    fn wit_to_core_binding_pattern_ok_for_non_empty_paths() {
+        let wit = wit::BindingPattern::AttributeMatch(wit::AttributeMatchPattern {
+            resource_type: "route53.RecordSet".to_string(),
+            attr: vec!["name".to_string()],
+            from: vec!["resource_record_name".to_string()],
+        });
+
+        assert_eq!(
+            wit_to_core_binding_pattern(wit).unwrap(),
+            CoreBindingPattern::AttributeMatch {
+                resource_type: "route53.RecordSet".to_string(),
+                attr: CoreAttrPath::single("name"),
+                from: CoreAttrPath::single("resource_record_name"),
+            }
+        );
+    }
+
+    #[test]
+    fn wit_to_core_binding_pattern_ok_for_exact() {
+        let wit = wit::BindingPattern::Exact("validation_record".to_string());
+
+        assert_eq!(
+            wit_to_core_binding_pattern(wit).unwrap(),
+            CoreBindingPattern::Exact("validation_record".to_string())
+        );
     }
 
     /// RFC #2371 stage 4 contract pin: `Value::Deferred(DeferredValue::Unknown)` reaching either

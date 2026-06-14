@@ -318,7 +318,7 @@ fn format_wait_polling_line(observation: &WaitObservation, elapsed: Duration) ->
 
 fn format_wait_observed_attr(observation: &WaitObservation) -> String {
     if let Some((attr, value)) = observation.primary() {
-        let key = attr.segments.join(".");
+        let key = attr.segments().join(".");
         return format!("{key}={}", format_value_user_facing(value));
     }
 
@@ -402,9 +402,8 @@ mod tests {
     #[test]
     fn wait_observed_attr_formats_multi_segment_predicate_attr() {
         let target_id = ResourceId::new("aws.test.Resource", "demo");
-        let renewal_status = AttrPath {
-            segments: vec!["renewal_summary".to_string(), "renewal_status".to_string()],
-        };
+        let renewal_status =
+            AttrPath::try_new(vec!["renewal_summary".into(), "renewal_status".into()]).unwrap();
         let predicate = equals_predicate(renewal_status, "PENDING");
         let attrs = HashMap::from([(
             "renewal_summary".to_string(),
