@@ -405,6 +405,14 @@ impl Effect {
         }
     }
 
+    /// Returns true iff this effect polls an external state and
+    /// could in principle hang forever — meaning that if it is the
+    /// only kind left in flight while no other effect can dispatch,
+    /// the executor must intervene rather than wait.
+    pub fn is_wait(&self) -> bool {
+        matches!(self, Effect::Wait { .. })
+    }
+
     /// Returns the kind of Effect as a string (for display)
     pub fn kind(&self) -> &'static str {
         match self {
@@ -422,7 +430,7 @@ impl Effect {
 
     /// Returns whether this Effect causes a mutation
     pub fn is_mutating(&self) -> bool {
-        !matches!(self, Effect::Read { .. } | Effect::Wait { .. })
+        !matches!(self, Effect::Read { .. }) && !self.is_wait()
     }
 
     /// Returns whether this is a state-only operation (import/remove/move)

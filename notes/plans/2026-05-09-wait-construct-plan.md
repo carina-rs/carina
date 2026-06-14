@@ -520,7 +520,7 @@ Each task is one TDD cycle. Goal: write failing test → run → see fail → mi
           &HashMap::new(),
           &HashMap::new(),
       );
-      let wait_effect = plan.effects().iter().find(|e| matches!(e, Effect::Wait { .. })).expect("expected Wait effect");
+      let wait_effect = plan.effects().iter().find(|e| e.is_wait()).expect("expected Wait effect");
       let Effect::Wait { binding, target_id, until, .. } = wait_effect else { unreachable!() };
       assert_eq!(binding, "cert_issued");
       assert_eq!(target_id.name, "cert");
@@ -870,7 +870,7 @@ Each task is one TDD cycle. Goal: write failing test → run → see fail → mi
       assert!(resource_types.iter().any(|t| t == &"cloudfront.Distribution"));
   }
   ```
-- **Implementation:** in the executor's "after this effect succeeded, update state file" path, skip when `matches!(effect, Effect::Wait { .. })`. (The synthetic `__wait` ResourceId from Task 4.8 is for in-memory binding resolution only; never persist it.)
+- **Implementation:** in the executor's "after this effect succeeded, update state file" path, skip when `effect.is_wait()`. (The synthetic `__wait` ResourceId from Task 4.8 is for in-memory binding resolution only; never persist it.)
 - **Verification:** `cargo nextest run -p carina-core executor::tests::state_file_has_no_wait_entries_after_apply`.
 
 **Task 5.3: Plan display fixture and snapshot test.**
