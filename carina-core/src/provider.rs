@@ -13,6 +13,8 @@ use crate::effect::PlanOp;
 use crate::executor::normalized::NormalizedResource;
 use crate::resource::{ConcreteValue, DataSource, Directives, Resource, ResourceId, State, Value};
 use crate::schema::{SchemaRegistry, TypeIdentity};
+use crate::wait::BindingPattern;
+use crate::wait::predicate::AttrPath;
 
 /// Contextual metadata attached to every [`ProviderError`] variant.
 ///
@@ -593,6 +595,16 @@ pub trait Provider: Send + Sync {
     /// Permissions this provider needs to perform `op` on `id`.
     /// Empty vec means the provider declares no permissions for this resource/op pair.
     fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> Vec<String>;
+
+    /// Binding-name patterns for resources that can satisfy a wait on `target_id.attr_path`.
+    /// Empty vec means the provider declares no satisfier hint for this target attribute.
+    fn satisfier_hint(
+        &self,
+        _target_id: &ResourceId,
+        _attr_path: &AttrPath,
+    ) -> Vec<BindingPattern> {
+        Vec::new()
+    }
 }
 
 /// Convenience for a `ProviderNormalizer` method that does nothing.
@@ -911,6 +923,13 @@ impl Provider for ProviderRouter {
     fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> Vec<String> {
         match self.get_provider_or_error(id) {
             Ok(provider) => provider.required_permissions(id, op),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn satisfier_hint(&self, target_id: &ResourceId, attr_path: &AttrPath) -> Vec<BindingPattern> {
+        match self.get_provider_or_error(target_id) {
+            Ok(provider) => provider.satisfier_hint(target_id, attr_path),
             Err(_) => Vec::new(),
         }
     }
@@ -1324,6 +1343,10 @@ impl Provider for Box<dyn Provider> {
     fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> Vec<String> {
         (**self).required_permissions(id, op)
     }
+
+    fn satisfier_hint(&self, target_id: &ResourceId, attr_path: &AttrPath) -> Vec<BindingPattern> {
+        (**self).satisfier_hint(target_id, attr_path)
+    }
 }
 
 #[cfg(test)]
@@ -1423,6 +1446,16 @@ mod tests {
         let id = ResourceId::new("test", "example");
         let state = provider.read(&id, None, ReadRequest).await.unwrap();
         assert!(!state.exists);
+    }
+
+    #[test]
+    fn provider_default_satisfier_hint_is_empty() {
+        let provider = MockProvider;
+        let id = ResourceId::new("test", "example");
+        assert_eq!(
+            provider.satisfier_hint(&id, &AttrPath::single("status")),
+            Vec::new()
+        );
     }
 
     /// A provider that only accepts a data source when the full `Resource`

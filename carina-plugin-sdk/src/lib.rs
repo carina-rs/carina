@@ -67,6 +67,19 @@ pub enum PlanOp {
     Delete,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum BindingPattern {
+    Exact(String),
+    ForLoopChildren {
+        base: String,
+    },
+    AttributeMatch {
+        resource_type: String,
+        attr: Vec<String>,
+        from: Vec<String>,
+    },
+}
+
 /// Trait that provider authors implement.
 #[allow(clippy::result_large_err)]
 pub trait CarinaProvider {
@@ -155,6 +168,16 @@ pub trait CarinaProvider {
     /// Permissions this provider needs to perform `op` on `id`.
     /// Empty vec means the provider declares no permissions for this resource/op pair.
     fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> Vec<String>;
+
+    /// Binding-name patterns for resources that can satisfy a wait on `target_id.attr_path`.
+    /// Empty vec means the provider declares no satisfier hint for this target attribute.
+    fn satisfier_hint(
+        &self,
+        _target_id: &ResourceId,
+        _attr_path: &[String],
+    ) -> Vec<BindingPattern> {
+        Vec::new()
+    }
 
     /// Return provider config attribute completions.
     /// Key is attribute name (e.g., "region"), value is list of completion candidates.

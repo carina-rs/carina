@@ -19,6 +19,8 @@ use carina_core::schema::{
     ResourceSchema as CoreResourceSchema, StructField as CoreStructField, legacy_validator,
 };
 use carina_core::value::{SerializationContext, SerializationError};
+use carina_core::wait::BindingPattern as CoreBindingPattern;
+use carina_core::wait::predicate::AttrPath as CoreAttrPath;
 
 use carina_provider_protocol::types as proto;
 
@@ -220,6 +222,40 @@ pub fn core_to_wit_plan_op(op: CorePlanOp) -> wit_provider::PlanOp {
         CorePlanOp::Read => wit_provider::PlanOp::Read,
         CorePlanOp::Update => wit_provider::PlanOp::Update,
         CorePlanOp::Delete => wit_provider::PlanOp::Delete,
+    }
+}
+
+pub fn core_to_wit_binding_pattern(p: &CoreBindingPattern) -> wit::BindingPattern {
+    match p {
+        CoreBindingPattern::Exact(name) => wit::BindingPattern::Exact(name.clone()),
+        CoreBindingPattern::ForLoopChildren { base } => {
+            wit::BindingPattern::ForLoopChildren(base.clone())
+        }
+        CoreBindingPattern::AttributeMatch {
+            resource_type,
+            attr,
+            from,
+        } => wit::BindingPattern::AttributeMatch(wit::AttributeMatchPattern {
+            resource_type: resource_type.clone(),
+            attr: attr.segments.clone(),
+            from: from.segments.clone(),
+        }),
+    }
+}
+
+pub fn wit_to_core_binding_pattern(p: wit::BindingPattern) -> CoreBindingPattern {
+    match p {
+        wit::BindingPattern::Exact(name) => CoreBindingPattern::Exact(name),
+        wit::BindingPattern::ForLoopChildren(base) => CoreBindingPattern::ForLoopChildren { base },
+        wit::BindingPattern::AttributeMatch(pattern) => CoreBindingPattern::AttributeMatch {
+            resource_type: pattern.resource_type,
+            attr: CoreAttrPath {
+                segments: pattern.attr,
+            },
+            from: CoreAttrPath {
+                segments: pattern.from,
+            },
+        },
     }
 }
 
@@ -1025,6 +1061,32 @@ mod tests {
             length,
             validate: None,
             to_dsl: None,
+        }
+    }
+
+    #[test]
+    fn binding_pattern_round_trips_through_wit() {
+        let patterns = vec![
+            CoreBindingPattern::Exact("validation_record".to_string()),
+            CoreBindingPattern::ForLoopChildren {
+                base: "validation_records".to_string(),
+            },
+            CoreBindingPattern::AttributeMatch {
+                resource_type: "route53.RecordSet".to_string(),
+                attr: CoreAttrPath::single("name"),
+                from: CoreAttrPath {
+                    segments: vec![
+                        "domain_validation_options".to_string(),
+                        "resource_record".to_string(),
+                        "name".to_string(),
+                    ],
+                },
+            },
+        ];
+
+        for pattern in patterns {
+            let wit = core_to_wit_binding_pattern(&pattern);
+            assert_eq!(wit_to_core_binding_pattern(wit), pattern);
         }
     }
 
