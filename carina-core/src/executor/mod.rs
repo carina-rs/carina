@@ -35,6 +35,7 @@ use crate::resource::{ResourceId, State, Value};
 
 use parallel::execute_effects_sequential;
 use phased::{execute_effects_phased, has_interdependent_replaces};
+use tokio_util::sync::CancellationToken;
 
 pub const TEST_UNCAPPED: NonZeroUsize = NonZeroUsize::new(usize::MAX).unwrap();
 
@@ -216,12 +217,14 @@ pub async fn execute_plan(
     provider: &dyn Provider,
     mut input: ExecutionInput<'_>,
     observer: &dyn ExecutionObserver,
-) -> ExecutionResult {
-    if has_interdependent_replaces(input.plan.effects()) {
+    _cancel: CancellationToken,
+) -> ExecutionOutcome {
+    let result = if has_interdependent_replaces(input.plan.effects()) {
         execute_effects_phased(provider, &mut input, observer).await
     } else {
         execute_effects_sequential(provider, &mut input, observer).await
-    }
+    };
+    ExecutionOutcome::Completed(result)
 }
 
 #[cfg(test)]

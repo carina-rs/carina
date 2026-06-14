@@ -1843,6 +1843,7 @@ async fn rename_failure_in_create_before_destroy_counts_as_failure() {
         &mut current_states,
         &unresolved_resources,
         &[],
+        tokio_util::sync::CancellationToken::new(),
         carina_core::executor::TEST_UNCAPPED,
     )
     .await;
@@ -2020,6 +2021,7 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
         &mut current_states,
         &unresolved_resources,
         &[],
+        tokio_util::sync::CancellationToken::new(),
         carina_core::executor::TEST_UNCAPPED,
     )
     .await;
