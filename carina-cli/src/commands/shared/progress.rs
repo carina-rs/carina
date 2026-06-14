@@ -92,8 +92,8 @@ pub(crate) fn format_progress(progress: &ProgressInfo) -> String {
 }
 
 /// The confirmation prompt's "Enter a value: " has no trailing newline, and on
-/// Ctrl+C the inner interrupt future fires before the outer run_with_ctrl_c
-/// handler — so nothing else emits a newline before the lock-release message.
+/// Ctrl+C the prompt interrupt can fire before any other path emits a newline
+/// before the lock-release message.
 pub(crate) fn emit_newline_on_interrupt<W: std::io::Write>(
     writer: &mut W,
     result: &Result<String, AppError>,

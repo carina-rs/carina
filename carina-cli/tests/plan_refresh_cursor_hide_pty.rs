@@ -221,20 +221,18 @@ fn plan_error_path_does_not_leave_cursor_hidden_on_pty() {
     assert_cursor_not_left_hidden(&raw);
 }
 
-// NOTE on the SIGINT/SIGTERM restore path:
+// NOTE on SIGINT/SIGTERM coverage:
 //
 // There is intentionally no PTY test that sends Ctrl+C mid-spinner. The
 // mock provider has no delay hook, so the refresh completes in
 // milliseconds: a `0x03` written right after spawn almost always lands
 // *before* the cursor is ever hidden, so the run never enters the guarded
-// state and the test would pass vacuously — identically with or without
-// `install_restore_handlers`. Forcing a deterministic "spinner has started,
-// now signal" handshake would require a test-only delay seam in the
-// provider read path, which does not exist and is out of scope for #3153.
+// state and the test would pass vacuously. Forcing a deterministic "spinner
+// has started, now signal" handshake would require a test-only delay seam in
+// the provider read path, which does not exist and is out of scope for #3153.
 //
-// The signal-handler write path is instead covered deterministically by a
-// unit test that drives `restore_cursor_once(true)` directly (the
-// `async_signal_safe == true` `libc::write` branch the SIGINT/SIGTERM
-// handler runs) in `carina-cli/src/cursor.rs`, alongside the claim-once
-// coordination test. A real end-to-end SIGINT regression test with a
-// readiness handshake is tracked as a follow-up issue (#3157).
+// Cursor restoration for SIGINT/SIGTERM now flows through the unified
+// shutdown listener's second-signal process-exit path, while cursor.rs keeps
+// deterministic unit coverage for the claim-once restore protocol and panic
+// hook. A real end-to-end SIGINT regression test with a readiness handshake
+// is tracked as a follow-up issue (#3157).

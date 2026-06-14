@@ -1,59 +1,114 @@
-//! Graceful shutdown handling for SIGINT (Ctrl+C).
+//! Unified shutdown signal handling.
 //!
-//! Wraps a locked operation with `tokio::select!` so that Ctrl+C cancels the
-//! operation and returns `AppError::Interrupted`, allowing the caller to release
-//! the state lock before exiting.  A second Ctrl+C force-exits the process.
+//! Listens for SIGINT (Ctrl+C) and SIGTERM (e.g. GitHub Actions step cancel)
+//! and fires a CancellationToken on the first signal. A second signal of
+//! either kind force-exits the process with code 130 after restoring the
+//! cursor.
 
 use std::future::Future;
 
-use colored::Colorize;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+use tokio::signal::unix::{Signal, SignalKind, signal};
+use tokio_util::sync::CancellationToken;
 
 use crate::error::AppError;
 
-/// Run `op` until completion, or until the user presses Ctrl+C.
-///
-/// On first Ctrl+C the future is dropped (cancelled) and
-/// `Err(AppError::Interrupted)` is returned so that the caller can clean up
-/// (release locks, save partial state, etc.).
-///
-/// While waiting for the caller to finish cleanup, a *second* Ctrl+C
-/// force-exits the process immediately (exit code 130, the Unix convention for
-/// SIGINT).
-pub async fn run_with_ctrl_c<F, T>(op: F) -> Result<T, AppError>
-where
-    F: Future<Output = Result<T, AppError>>,
-{
-    tokio::select! {
-        result = op => result,
-        _ = tokio::signal::ctrl_c() => {
-            eprintln!(
-                "\n{}",
-                "Interrupted! Cleaning up before exit..."
-                    .yellow()
-                    .bold()
-            );
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShutdownSignal {
+    Interrupt,
+    Terminate,
+}
 
-            // Spawn a background task that listens for a second Ctrl+C.
-            tokio::spawn(async {
-                // The first ctrl_c() was already consumed; wait for another.
-                let _ = tokio::signal::ctrl_c().await;
-                eprintln!(
-                    "\n{}",
-                    "Force exit."
-                        .red()
-                        .bold()
-                );
-                // The SIGINT handler also restores on this second Ctrl+C,
-                // but `process::exit` skips Drop and handler ordering is
-                // not guaranteed — restore explicitly (claim-once, #3158).
-                crate::cursor::restore_cursor();
-                std::process::exit(130);
-            });
+/// Trait for the source of shutdown signals. Production uses
+/// `SignalEvents::unix()`; tests use `SignalEvents::from_receiver(rx)`.
+pub trait ShutdownEvents: Send + 'static {
+    fn recv(&mut self) -> impl Future<Output = Option<ShutdownSignal>> + Send;
+}
 
-            Err(AppError::Interrupted)
+/// Trait for the process exit mechanism. Production uses ProcessExit;
+/// tests use RecordingExit to verify the call without actually exiting.
+pub trait ExitProcess: Send + Sync + 'static {
+    fn exit(&self, code: i32);
+}
+
+pub struct ProcessExit;
+
+impl ExitProcess for ProcessExit {
+    fn exit(&self, code: i32) {
+        crate::cursor::restore_cursor();
+        std::process::exit(code);
+    }
+}
+
+pub enum SignalEvents {
+    Unix {
+        interrupt: Signal,
+        terminate: Signal,
+    },
+    #[cfg(test)]
+    Receiver(tokio::sync::mpsc::UnboundedReceiver<ShutdownSignal>),
+}
+
+impl SignalEvents {
+    pub fn unix() -> std::io::Result<Self> {
+        Ok(Self::Unix {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn from_receiver(rx: tokio::sync::mpsc::UnboundedReceiver<ShutdownSignal>) -> Self {
+        Self::Receiver(rx)
+    }
+}
+
+impl ShutdownEvents for SignalEvents {
+    #[allow(clippy::manual_async_fn)]
+    fn recv(&mut self) -> impl Future<Output = Option<ShutdownSignal>> + Send {
+        async move {
+            match self {
+                Self::Unix {
+                    interrupt,
+                    terminate,
+                } => {
+                    tokio::select! {
+                        _ = interrupt.recv() => Some(ShutdownSignal::Interrupt),
+                        _ = terminate.recv() => Some(ShutdownSignal::Terminate),
+                    }
+                }
+                #[cfg(test)]
+                Self::Receiver(rx) => rx.recv().await,
+            }
         }
     }
+}
+
+pub fn spawn_shutdown_listener(token: CancellationToken) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let events = SignalEvents::unix().expect("install unix signal handlers");
+        listen_for_shutdown_events(token, events, ProcessExit).await;
+    })
+}
+
+async fn listen_for_shutdown_events<E, X>(token: CancellationToken, mut events: E, exit: X)
+where
+    E: ShutdownEvents,
+    X: ExitProcess,
+{
+    if events.recv().await.is_none() {
+        return;
+    }
+
+    eprintln!("\nInterrupted! Cleaning up before exit...");
+    token.cancel();
+
+    if events.recv().await.is_none() {
+        return;
+    }
+
+    eprintln!("\nForce exit.");
+    exit.exit(130);
 }
 
 /// Read a single line from `reader`, cancellable by `interrupt`.
@@ -85,6 +140,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     #[tokio::test]
     async fn read_line_returns_input_before_interrupt() {
@@ -111,6 +167,82 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Interrupted));
+    }
+
+    #[tokio::test]
+    async fn signal_listener_cancels_token_on_interrupt_event() {
+        let token = CancellationToken::new();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let exit_calls = Arc::new(Mutex::new(Vec::<i32>::new()));
+        let exit = RecordingExit {
+            calls: Arc::clone(&exit_calls),
+        };
+
+        let task = tokio::spawn(listen_for_shutdown_events(
+            token.clone(),
+            SignalEvents::from_receiver(rx),
+            exit,
+        ));
+        tx.send(ShutdownSignal::Interrupt).unwrap();
+        token.cancelled().await;
+        drop(tx);
+        task.await.unwrap();
+
+        assert_eq!(*exit_calls.lock().unwrap(), Vec::<i32>::new());
+    }
+
+    #[tokio::test]
+    async fn signal_listener_cancels_token_on_terminate_event() {
+        let token = CancellationToken::new();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let exit_calls = Arc::new(Mutex::new(Vec::<i32>::new()));
+        let exit = RecordingExit {
+            calls: Arc::clone(&exit_calls),
+        };
+
+        let task = tokio::spawn(listen_for_shutdown_events(
+            token.clone(),
+            SignalEvents::from_receiver(rx),
+            exit,
+        ));
+        tx.send(ShutdownSignal::Terminate).unwrap();
+        token.cancelled().await;
+        drop(tx);
+        task.await.unwrap();
+
+        assert_eq!(*exit_calls.lock().unwrap(), Vec::<i32>::new());
+    }
+
+    #[tokio::test]
+    async fn signal_listener_calls_exit_130_on_second_interrupt() {
+        let token = CancellationToken::new();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let exit_calls = Arc::new(Mutex::new(Vec::<i32>::new()));
+        let exit = RecordingExit {
+            calls: Arc::clone(&exit_calls),
+        };
+
+        let task = tokio::spawn(listen_for_shutdown_events(
+            token.clone(),
+            SignalEvents::from_receiver(rx),
+            exit,
+        ));
+        tx.send(ShutdownSignal::Interrupt).unwrap();
+        token.cancelled().await;
+        tx.send(ShutdownSignal::Interrupt).unwrap();
+        task.await.unwrap();
+
+        assert_eq!(*exit_calls.lock().unwrap(), vec![130]);
+    }
+
+    struct RecordingExit {
+        calls: Arc<Mutex<Vec<i32>>>,
+    }
+
+    impl ExitProcess for RecordingExit {
+        fn exit(&self, code: i32) {
+            self.calls.lock().unwrap().push(code);
+        }
     }
 
     struct NeverReady;

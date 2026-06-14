@@ -867,9 +867,9 @@ async fn run_apply_with_observer_factory(
         );
     }
 
-    // All code after lock acquisition is wrapped so that lock release is guaranteed.
-    // Ctrl+C cancels the operation and returns Interrupted so the lock is still released.
-    let op_result = crate::signal::run_with_ctrl_c(run_apply_locked(
+    // All code after lock acquisition observes the shared cancellation token
+    // so lock release is guaranteed after SIGINT/SIGTERM cancellation.
+    let op_result = run_apply_locked(
         &ctx,
         &mut parsed,
         &mut unresolved_parsed,
@@ -881,7 +881,7 @@ async fn run_apply_with_observer_factory(
         cancel,
         observer_factory,
         parallelism,
-    ))
+    )
     .await;
 
     // Always release lock if it was acquired
@@ -1780,7 +1780,7 @@ async fn run_apply_from_plan_with_observer_factory(
         None
     };
 
-    let op_result = crate::signal::run_with_ctrl_c(run_apply_from_plan_locked(
+    let op_result = run_apply_from_plan_locked(
         plan_file,
         auto_approve,
         backend.as_ref(),
@@ -1789,7 +1789,7 @@ async fn run_apply_from_plan_with_observer_factory(
         cancel,
         observer_factory,
         parallelism,
-    ))
+    )
     .await;
 
     // Always release lock if it was acquired

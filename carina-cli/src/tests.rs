@@ -2166,6 +2166,7 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
         &backend,
         Some(&lock),
         std::path::Path::new("."),
+        tokio_util::sync::CancellationToken::new(),
     )
     .await;
     assert!(result.is_ok(), "refresh should succeed: {:?}", result);

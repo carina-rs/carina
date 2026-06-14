@@ -99,7 +99,7 @@ pub async fn run_destroy(
         None
     };
 
-    let op_result = crate::signal::run_with_ctrl_c(run_destroy_locked(
+    let op_result = run_destroy_locked(
         &mut parsed,
         auto_approve,
         backend.as_ref(),
@@ -110,7 +110,7 @@ pub async fn run_destroy(
         base_dir,
         parallelism,
         cancel,
-    ))
+    )
     .await;
 
     // Always release lock if it was acquired

@@ -671,7 +671,7 @@ fn install_panic_restore_hook_restores_hidden_cursor_once() {
 
 **Implementation**:
 
-`install_restore_handlers` を `install_panic_restore_hook` に rename し、`signal_hook::low_level::register` と `emulate_default_handler` の loop を削除する。`signal.rs` の二回目 signal 経路で `crate::cursor::restore_cursor()` を呼ぶため、SIGINT/SIGTERM restore はそこへ集約される。
+cursor startup hook を `install_panic_restore_hook` に絞り、SIGINT/SIGTERM 用の独立 low-level signal 登録と default-handler 再送出 loop を削除する。`signal.rs` の二回目 signal 経路で `crate::cursor::restore_cursor()` を呼ぶため、SIGINT/SIGTERM restore はそこへ集約される。
 
 ```rust
 pub fn install_panic_restore_hook() {
@@ -680,7 +680,7 @@ pub fn install_panic_restore_hook() {
     }
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        restore_cursor_once(false);
+        restore_cursor_once();
         prev(info);
     }));
 }

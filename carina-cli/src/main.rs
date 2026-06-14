@@ -300,16 +300,17 @@ async fn main() {
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
-    // Restore the terminal cursor on the exit paths the command-wide
-    // `CursorGuard`'s `Drop` cannot reach — SIGINT/SIGTERM and panic
-    // (#3153, #3158).
-    carina_cli::cursor::install_restore_handlers();
+    // Restore the terminal cursor on the panic path the command-wide
+    // `CursorGuard`'s `Drop` cannot reach (#3153, #3158).
+    carina_cli::cursor::install_panic_restore_hook();
 
     // Create parser configuration with AWS KMS decryptor.
     // This must happen before any .crn parsing so that decrypt() calls can be evaluated.
     let provider_context = create_provider_context();
 
     let cli = Cli::parse();
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let _shutdown_listener = carina_cli::signal::spawn_shutdown_listener(cancel_token.clone());
 
     // Command-wide cursor hide (#3158 — rationale in `cursor.rs`). Placed
     // after `Cli::parse()` because that exits the process itself on
@@ -367,9 +368,6 @@ async fn main() {
             lock,
             parallelism,
         } => {
-            // TODO(T7/T8): replace this fresh token with one fed by the signal listener.
-            // Until then, real SIGINT/SIGTERM still drops the future via signal::run_with_ctrl_c.
-            let cancel_token = tokio_util::sync::CancellationToken::new();
             if path.extension().is_some_and(|ext| ext == "json") {
                 run_apply_from_plan(
                     &path,
@@ -377,7 +375,7 @@ async fn main() {
                     lock,
                     parallelism,
                     &provider_context,
-                    cancel_token,
+                    cancel_token.clone(),
                 )
                 .await
             } else {
@@ -387,7 +385,7 @@ async fn main() {
                     lock,
                     parallelism,
                     &provider_context,
-                    cancel_token,
+                    cancel_token.clone(),
                 )
                 .await
             }
@@ -400,9 +398,6 @@ async fn main() {
             force,
             parallelism,
         } => {
-            // TODO(T7/T8): replace this fresh token with one fed by the signal listener.
-            // Until then, real SIGINT/SIGTERM still drops the future via signal::run_with_ctrl_c.
-            let cancel_token = tokio_util::sync::CancellationToken::new();
             run_destroy(
                 &path,
                 auto_approve,
@@ -411,7 +406,7 @@ async fn main() {
                 force,
                 parallelism,
                 &provider_context,
-                cancel_token,
+                cancel_token.clone(),
             )
             .await
         }
@@ -436,7 +431,9 @@ async fn main() {
         Commands::ForceUnlock { lock_id, path } => {
             run_force_unlock(&lock_id, &path, &provider_context).await
         }
-        Commands::State { command } => run_state_command(command, &provider_context).await,
+        Commands::State { command } => {
+            run_state_command(command, &provider_context, cancel_token.clone()).await
+        }
         Commands::Init {
             path,
             upgrade,
