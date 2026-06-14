@@ -144,6 +144,10 @@ impl Provider for MockProvider {
         let result = self.delete_results.lock().unwrap().remove(0);
         Box::pin(async move { result })
     }
+
+    fn required_permissions(&self, _id: &ResourceId, _op: crate::effect::PlanOp) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -2305,6 +2309,14 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Err(ProviderError::internal("not implemented")) })
         }
+
+        fn required_permissions(
+            &self,
+            _id: &ResourceId,
+            _op: crate::effect::PlanOp,
+        ) -> Vec<String> {
+            Vec::new()
+        }
     }
 
     let mut delays = HashMap::new();
@@ -2458,6 +2470,10 @@ impl Provider for DelayedUpdateProvider {
         _request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async { Err(ProviderError::internal("not implemented")) })
+    }
+
+    fn required_permissions(&self, _id: &ResourceId, _op: crate::effect::PlanOp) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -3086,6 +3102,10 @@ impl Provider for RecordingMockProvider {
         _request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async { Err(ProviderError::internal("not implemented")) })
+    }
+
+    fn required_permissions(&self, _id: &ResourceId, _op: crate::effect::PlanOp) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -4040,6 +4060,10 @@ impl Provider for IdentifierAwareProvider {
         _request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async move { Err(ProviderError::api_error("delete not expected")) })
+    }
+
+    fn required_permissions(&self, _id: &ResourceId, _op: crate::effect::PlanOp) -> Vec<String> {
+        Vec::new()
     }
 }
 

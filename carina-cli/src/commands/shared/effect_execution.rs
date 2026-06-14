@@ -193,6 +193,14 @@ mod tests {
         ) -> BoxFuture<'_, ProviderResult<()>> {
             unreachable!("import path must not call delete")
         }
+
+        fn required_permissions(
+            &self,
+            _id: &ResourceId,
+            _op: carina_core::effect::PlanOp,
+        ) -> Vec<String> {
+            Vec::new()
+        }
     }
 
     /// carina#3329: an `Effect::Import` whose `identifier` is still a

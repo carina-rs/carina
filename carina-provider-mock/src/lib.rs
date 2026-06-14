@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use carina_core::effect::PlanOp;
 use carina_core::provider::{
     BoxFuture, CreateRequest, DeleteRequest, PatchOpKind, Provider, ProviderError, ProviderResult,
     ReadRequest, UpdateRequest,
@@ -219,6 +220,10 @@ impl Provider for MockProvider {
             Ok(())
         })
     }
+
+    fn required_permissions(&self, _id: &ResourceId, _op: PlanOp) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
@@ -246,6 +251,16 @@ mod tests {
             Some(b'\n'),
             "MockProvider state file must end with a trailing newline; got {:?}",
             bytes.last().map(|b| *b as char),
+        );
+    }
+
+    #[test]
+    fn required_permissions_returns_empty_vec() {
+        let provider = MockProvider::default();
+        let id = ResourceId::with_provider("mock", "foo", "example", None);
+        assert_eq!(
+            provider.required_permissions(&id, carina_core::effect::PlanOp::Create),
+            Vec::<String>::new()
         );
     }
 }

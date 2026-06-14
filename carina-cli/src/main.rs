@@ -75,6 +75,12 @@ enum Commands {
         /// Output plan as JSON
         #[arg(long)]
         json: bool,
+
+        #[arg(long)]
+        check_iam: bool,
+
+        #[arg(long, requires = "check_iam")]
+        strict_iam: bool,
     },
     /// Apply changes to reach the desired state
     Apply {
@@ -318,6 +324,8 @@ async fn main() {
         tui,
         refresh,
         json,
+        check_iam,
+        strict_iam,
     } = cli.command
     {
         match run_plan(
@@ -327,6 +335,8 @@ async fn main() {
             tui,
             refresh,
             json,
+            check_iam,
+            strict_iam,
             &provider_context,
         )
         .await
@@ -659,5 +669,20 @@ mod error_format_tests {
         let r = render_app_error(&error::AppError::Interrupted);
         assert_eq!(r.exit_code, 130);
         assert!(r.stderr.is_empty(), "interrupted stderr: {}", r.stderr);
+    }
+
+    #[test]
+    fn plan_check_iam_flag_parses() {
+        assert!(Cli::try_parse_from(["carina", "plan", "--check-iam"]).is_ok());
+    }
+
+    #[test]
+    fn plan_strict_iam_requires_check_iam() {
+        assert!(Cli::try_parse_from(["carina", "plan", "--strict-iam"]).is_err());
+    }
+
+    #[test]
+    fn plan_check_iam_with_strict_iam_parses() {
+        assert!(Cli::try_parse_from(["carina", "plan", "--check-iam", "--strict-iam"]).is_ok());
     }
 }

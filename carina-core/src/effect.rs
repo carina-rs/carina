@@ -11,6 +11,14 @@ use crate::non_empty::NonEmptyVec;
 use crate::resource::{DataSource, Directives, Resource, ResourceId, State};
 use crate::wait::predicate::WaitPredicate;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PlanOp {
+    Create,
+    Read,
+    Update,
+    Delete,
+}
+
 /// Temporary name used during create-before-destroy replacement.
 ///
 /// When a resource with a unique name constraint is replaced with create-before-destroy,
@@ -602,6 +610,18 @@ pub fn resolve_import_identifier(identifier: &crate::resource::Value) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn plan_op_supports_debug_eq_and_hash() {
+        let op = PlanOp::Create;
+        assert_eq!(op, PlanOp::Create);
+        assert_eq!(format!("{op:?}"), "Create");
+
+        let mut ops = HashSet::new();
+        ops.insert(op);
+        assert!(ops.contains(&PlanOp::Create));
+    }
 
     #[test]
     fn format_import_identifier_recurses_into_nested_interpolation() {

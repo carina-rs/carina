@@ -2302,6 +2302,14 @@ mod read_with_retry_identifier_tests {
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Ok(()) })
         }
+
+        fn required_permissions(
+            &self,
+            _id: &ResourceId,
+            _op: carina_core::effect::PlanOp,
+        ) -> Vec<String> {
+            Vec::new()
+        }
     }
 
     #[tokio::test]
@@ -3412,6 +3420,14 @@ mod wait_until_enum_alias {
             _r: carina_core::provider::DeleteRequest,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async move { Ok(()) })
+        }
+
+        fn required_permissions(
+            &self,
+            _id: &ResourceId,
+            _op: carina_core::effect::PlanOp,
+        ) -> Vec<String> {
+            Vec::new()
         }
     }
 

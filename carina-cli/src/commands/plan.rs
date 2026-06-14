@@ -411,6 +411,8 @@ pub async fn run_plan(
     tui: bool,
     refresh: bool,
     json: bool,
+    _check_iam: bool,
+    _strict_iam: bool,
     provider_context: &ProviderContext,
 ) -> Result<bool, AppError> {
     let loaded = load_configuration_with_config(
@@ -1584,6 +1586,8 @@ exports { region: String = "ap-northeast-1" }"#,
             false,
             false,
             true,
+            false,
+            false,
             &ProviderContext::default(),
         )
         .await
@@ -1644,6 +1648,8 @@ mod run_plan_out_tests {
             false,
             false,
             true,
+            false,
+            false,
             &ProviderContext::default(),
         )
         .await

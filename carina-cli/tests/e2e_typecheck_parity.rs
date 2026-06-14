@@ -25,7 +25,7 @@ use std::sync::Arc;
 use carina_core::provider::{
     BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer,
 };
-use carina_core::resource::{ConcreteValue, DataSource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, DataSource, State, Value};
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField, legacy_validator,
 };
@@ -214,7 +214,7 @@ impl Provider for NoopProvider {
     }
     fn read(
         &self,
-        _id: &ResourceId,
+        _id: &carina_core::resource::ResourceId,
         _identifier: Option<&str>,
         _request: carina_core::provider::ReadRequest,
     ) -> BoxFuture<'_, carina_core::provider::ProviderResult<State>> {
@@ -228,14 +228,14 @@ impl Provider for NoopProvider {
     }
     fn create(
         &self,
-        _id: &ResourceId,
+        _id: &carina_core::resource::ResourceId,
         _request: carina_core::provider::CreateRequest,
     ) -> BoxFuture<'_, carina_core::provider::ProviderResult<State>> {
         Box::pin(async { unimplemented!("e2e parity tests do not exercise apply") })
     }
     fn update(
         &self,
-        _id: &ResourceId,
+        _id: &carina_core::resource::ResourceId,
         _identifier: &str,
         _request: carina_core::provider::UpdateRequest,
     ) -> BoxFuture<'_, carina_core::provider::ProviderResult<State>> {
@@ -243,11 +243,19 @@ impl Provider for NoopProvider {
     }
     fn delete(
         &self,
-        _id: &ResourceId,
+        _id: &carina_core::resource::ResourceId,
         _identifier: &str,
         _request: carina_core::provider::DeleteRequest,
     ) -> BoxFuture<'_, carina_core::provider::ProviderResult<()>> {
         Box::pin(async { unimplemented!("e2e parity tests do not exercise apply") })
+    }
+
+    fn required_permissions(
+        &self,
+        _id: &carina_core::resource::ResourceId,
+        _op: carina_core::effect::PlanOp,
+    ) -> Vec<String> {
+        Vec::new()
     }
 }
 
