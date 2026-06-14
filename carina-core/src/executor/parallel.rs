@@ -4,6 +4,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::deps::find_failed_dependency;
 use crate::effect::{Effect, WaitTarget};
 use crate::parser::ResourceRef;
@@ -16,8 +18,8 @@ use super::basic::{
 };
 use super::replace::{ReplaceContext, SingleEffectResult, execute_replace_parallel};
 use super::wait::{
-    UnsatisfiableReason, WaitAwareInFlight, WaitOutcome, unsatisfiable_reason_message,
-    wait_failure_message,
+    SKIP_REASON_CANCELLED, UnsatisfiableReason, WaitAwareInFlight, WaitOutcome, WaitSignal,
+    unsatisfiable_reason_message, wait_failure_message,
 };
 use super::{ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, ProgressInfo};
 
@@ -143,6 +145,39 @@ mod reads {
 }
 
 use reads::{KnownReads, ReadsSet};
+
+struct CancelSkipCtx<'a> {
+    effects: &'a [Effect],
+    completed: &'a AtomicUsize,
+    total: usize,
+    observer: &'a dyn ExecutionObserver,
+}
+
+fn emit_cancelled_skips(
+    ctx: &CancelSkipCtx<'_>,
+    indices: &[usize],
+    dispatched: &mut HashSet<usize>,
+    completed_indices: &mut HashSet<usize>,
+    skip_count: &mut usize,
+) {
+    for &idx in indices {
+        if dispatched.contains(&idx) {
+            continue;
+        }
+        dispatched.insert(idx);
+        completed_indices.insert(idx);
+        let c = ctx.completed.fetch_add(1, Ordering::Relaxed) + 1;
+        ctx.observer.on_event(&ExecutionEvent::EffectSkipped {
+            effect: &ctx.effects[idx],
+            reason: SKIP_REASON_CANCELLED,
+            progress: ProgressInfo {
+                completed: c,
+                total: ctx.total,
+            },
+        });
+        *skip_count += 1;
+    }
+}
 
 pub(super) struct DependencyAnalysis {
     deps_of: HashMap<usize, HashSet<usize>>,
@@ -508,7 +543,8 @@ pub(super) async fn execute_effects_sequential(
     provider: &dyn Provider,
     input: &mut ExecutionInput<'_>,
     observer: &dyn ExecutionObserver,
-) -> ExecutionResult {
+    cancel: &CancellationToken,
+) -> (ExecutionResult, bool) {
     let mut success_count = 0;
     let mut failure_count = 0;
     let mut skip_count = 0;
@@ -554,39 +590,56 @@ pub(super) async fn execute_effects_sequential(
     }
 
     let mut in_flight: WaitAwareInFlight<'_, SingleEffectResult> = WaitAwareInFlight::new();
+    let mut cancelled = false;
 
     loop {
+        let undispatched_at_loop_start = actionable_indices
+            .iter()
+            .filter(|&&idx| !dispatched.contains(&idx))
+            .count();
+        if cancel.is_cancelled()
+            && !cancelled
+            && (undispatched_at_loop_start > 0 || !in_flight.is_empty())
+        {
+            cancelled = true;
+            in_flight.signal_in_flight_waits();
+        }
+
         // Find newly ready effects: all deps completed and not yet dispatched
         let mut newly_ready: Vec<usize> = Vec::new();
-        for &idx in &actionable_indices {
-            if dispatched.contains(&idx) {
-                continue;
+        if !cancelled {
+            for &idx in &actionable_indices {
+                if dispatched.contains(&idx) {
+                    continue;
+                }
+                let deps = &deps_of[&idx];
+                if deps.iter().all(|d| completed_indices.contains(d)) {
+                    newly_ready.push(idx);
+                }
             }
-            let deps = &deps_of[&idx];
-            if deps.iter().all(|d| completed_indices.contains(d)) {
-                newly_ready.push(idx);
-            }
+            // Sort for deterministic ordering
+            newly_ready.sort();
         }
-        // Sort for deterministic ordering
-        newly_ready.sort();
 
         // Emit Waiting events for effects that have unmet dependencies
-        for &idx in &actionable_indices {
-            if dispatched.contains(&idx) || newly_ready.contains(&idx) {
-                continue;
-            }
-            let deps = &deps_of[&idx];
-            let pending: Vec<String> = deps
-                .iter()
-                .filter(|d| !completed_indices.contains(d))
-                .filter_map(|d| idx_to_binding.get(d).cloned())
-                .collect();
-            if !pending.is_empty() {
-                // Emit on every iteration to update the pending dependency list
-                observer.on_event(&ExecutionEvent::Waiting {
-                    effect: &effects[idx],
-                    pending_dependencies: pending,
-                });
+        if !cancelled {
+            for &idx in &actionable_indices {
+                if dispatched.contains(&idx) || newly_ready.contains(&idx) {
+                    continue;
+                }
+                let deps = &deps_of[&idx];
+                let pending: Vec<String> = deps
+                    .iter()
+                    .filter(|d| !completed_indices.contains(d))
+                    .filter_map(|d| idx_to_binding.get(d).cloned())
+                    .collect();
+                if !pending.is_empty() {
+                    // Emit on every iteration to update the pending dependency list
+                    observer.on_event(&ExecutionEvent::Waiting {
+                        effect: &effects[idx],
+                        pending_dependencies: pending,
+                    });
+                }
             }
         }
 
@@ -656,7 +709,9 @@ pub(super) async fn execute_effects_sequential(
                 schemas: input.schemas,
             };
             let completed_ref = &completed;
-            let make_future = move |wait_cancel_rx: Option<tokio::sync::watch::Receiver<bool>>| async move {
+            let make_future = move |wait_cancel_rx: Option<
+                tokio::sync::watch::Receiver<WaitSignal>,
+            >| async move {
                 let result = match effect.as_basic() {
                     // `BasicEffect` is the type-level contract for
                     // `execute_basic_effect`: any Create/Update/Delete
@@ -792,7 +847,20 @@ pub(super) async fn execute_effects_sequential(
                 .iter()
                 .filter(|idx| !dispatched.contains(idx))
                 .count();
-            if remaining > 0 {
+            if cancelled {
+                emit_cancelled_skips(
+                    &CancelSkipCtx {
+                        effects,
+                        completed: &completed,
+                        total,
+                        observer,
+                    },
+                    &actionable_indices,
+                    &mut dispatched,
+                    &mut completed_indices,
+                    &mut skip_count,
+                );
+            } else if remaining > 0 {
                 // Cycle detected: skip remaining effects as failures
                 for &idx in &actionable_indices {
                     if !dispatched.contains(&idx) {
@@ -806,13 +874,34 @@ pub(super) async fn execute_effects_sequential(
         }
 
         // Wait for the next effect to complete
-        let Some((finished_idx, result)) = in_flight
-            .check_terminal(undispatched_count())
-            .cancel_if_terminal()
-            .next_completed()
-            .await
-        else {
-            break;
+        let (finished_idx, result) = if cancelled {
+            let Some(finished) = in_flight
+                .check_terminal(undispatched_count())
+                .cancel_if_terminal()
+                .next_completed()
+                .await
+            else {
+                break;
+            };
+            finished
+        } else {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    cancelled = true;
+                    in_flight.signal_in_flight_waits();
+                    continue;
+                }
+                finished = in_flight
+                    .check_terminal(undispatched_count())
+                    .cancel_if_terminal()
+                    .next_completed() => {
+                    let Some(finished) = finished else {
+                        break;
+                    };
+                    finished
+                }
+            }
         };
         completed_indices.insert(finished_idx);
 
@@ -910,6 +999,14 @@ pub(super) async fn execute_effects_sequential(
                     skip_count += 1;
                     failed_bindings.insert(binding);
                 }
+                WaitOutcome::Cancelled => {
+                    observer.on_event(&ExecutionEvent::EffectSkipped {
+                        effect: &effects[finished_idx],
+                        reason: SKIP_REASON_CANCELLED,
+                        progress,
+                    });
+                    skip_count += 1;
+                }
                 outcome @ (WaitOutcome::Timeout { .. }
                 | WaitOutcome::NotFound(_)
                 | WaitOutcome::ReadFailed(_)) => {
@@ -940,7 +1037,7 @@ pub(super) async fn execute_effects_sequential(
     )
     .await;
 
-    ExecutionResult {
+    let result = ExecutionResult {
         success_count,
         failure_count,
         skip_count,
@@ -949,7 +1046,8 @@ pub(super) async fn execute_effects_sequential(
         permanent_name_overrides,
         current_states: input.current_states.clone(),
         failed_refreshes,
-    }
+    };
+    (result, cancelled)
 }
 
 #[cfg(test)]
@@ -1224,10 +1322,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            execute_effects_sequential(&provider, &mut input, &observer),
+            execute_effects_sequential(&provider, &mut input, &observer, &CancellationToken::new()),
         )
         .await
         .expect("wait should be skipped as unsatisfiable instead of timing out");
+        let (result, was_cancelled) = result;
+        assert!(!was_cancelled);
 
         assert_eq!(result.failure_count, 1, "alb create should fail");
         assert_eq!(

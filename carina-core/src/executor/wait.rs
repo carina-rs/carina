@@ -19,16 +19,20 @@ use crate::provider::{Provider, ProviderError, ReadRequest};
 use crate::resource::{ResourceId, State, Value};
 use crate::wait::predicate::WaitPredicate;
 
-/// Terminal result of a wait polling loop.
-///
-/// `Satisfied` carries the observed target snapshot, `Unsatisfiable`
-/// represents a static or dynamic skip reason, `Timeout` is real-time
-/// exhaustion, and read-side failures distinguish deletion from other errors.
+/// Outcome of polling a Wait effect. The variants distinguish:
+/// - `Satisfied`: the wait condition was met; carries the resource state.
+/// - `Cancelled`: external cancel observed mid-poll; abort early without failure.
+/// - `Unsatisfiable`: the wait can never be satisfied, such as when no
+///   remaining mutator can change the target.
+/// - `Timeout`: wait window elapsed without satisfying the condition.
+/// - `NotFound`: provider reported the resource missing during polling.
+/// - `ReadFailed`: provider read failed mid-poll.
 #[derive(Debug)]
 pub enum WaitOutcome {
     Satisfied {
         state: State,
     },
+    Cancelled,
     Unsatisfiable(UnsatisfiableReason),
     Timeout {
         last_attrs: HashMap<String, Value>,
@@ -59,6 +63,19 @@ pub(super) enum InFlightKind {
     NonWait,
 }
 
+/// Signal sent on the watch channel that controls an in-flight Wait future.
+/// - `Continue`: initial sentinel, polling proceeds normally.
+/// - `NoMutatorRemaining`: dispatching loop has no other effects that could
+///   resolve the dependency; the Wait should abort as Unsatisfiable.
+/// - `Cancelled`: external cancel observed; the Wait should abort and report
+///   `WaitOutcome::Cancelled`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WaitSignal {
+    Continue,
+    NoMutatorRemaining,
+    Cancelled,
+}
+
 pub(super) fn unsatisfiable_reason_message(reason: &UnsatisfiableReason) -> String {
     match reason {
         UnsatisfiableReason::DependencyFailed { binding } => {
@@ -78,16 +95,37 @@ pub(super) fn wait_failure_message(outcome: &WaitOutcome, target_id: &ResourceId
             target_id, elapsed, last_attrs
         ),
         WaitOutcome::NotFound(err) | WaitOutcome::ReadFailed(err) => err.to_string(),
-        WaitOutcome::Satisfied { .. } | WaitOutcome::Unsatisfiable(_) => {
-            unreachable!("satisfied and unsatisfiable waits are not failures")
+        WaitOutcome::Satisfied { .. } | WaitOutcome::Cancelled | WaitOutcome::Unsatisfiable(_) => {
+            unreachable!("satisfied, cancelled, and unsatisfiable waits are not failures")
         }
+    }
+}
+
+/// Skip reason emitted on `EffectSkipped` when an effect is dropped or
+/// aborted due to cancel observation. Consumers may match on this exact
+/// string to render cancelled effects distinctly from cascade failures.
+pub(super) const SKIP_REASON_CANCELLED: &str = "cancelled";
+
+/// Signal all in-flight Wait effect cancellers, causing their polling to
+/// abort early. Used when cancel observation needs to drain in-flight Wait
+/// effects without waiting for their natural timeout.
+///
+/// `send` errors are intentionally ignored: a dropped receiver means the
+/// Wait future has already completed and removed itself from
+/// `wait_cancellers`, so signaling that channel is a no-op.
+pub(super) fn signal_in_flight_waits(
+    wait_cancellers: &HashMap<usize, tokio::sync::watch::Sender<WaitSignal>>,
+) {
+    for (_idx, tx) in wait_cancellers.iter() {
+        // Receiver dropped == Wait future completed; nothing to cancel.
+        let _ = tx.send(WaitSignal::Cancelled);
     }
 }
 
 pub(super) fn cancel_waits_if_terminal(
     in_flight_kinds: &HashMap<usize, InFlightKind>,
     undispatched_count: usize,
-    wait_cancellers: &HashMap<usize, tokio::sync::watch::Sender<bool>>,
+    wait_cancellers: &HashMap<usize, tokio::sync::watch::Sender<WaitSignal>>,
 ) {
     let only_waits = !in_flight_kinds.is_empty()
         && in_flight_kinds
@@ -95,7 +133,7 @@ pub(super) fn cancel_waits_if_terminal(
             .all(|kind| matches!(kind, InFlightKind::Wait));
     if only_waits && undispatched_count == 0 {
         for cancel in wait_cancellers.values() {
-            let _ = cancel.send(true);
+            let _ = cancel.send(WaitSignal::NoMutatorRemaining);
         }
     }
 }
@@ -110,7 +148,7 @@ pub(super) fn cancel_waits_if_terminal(
 pub(super) struct WaitAwareInFlight<'fut, R> {
     inner: FuturesUnordered<Pin<Box<dyn Future<Output = (usize, R)> + 'fut>>>,
     kinds: HashMap<usize, InFlightKind>,
-    cancellers: HashMap<usize, tokio::sync::watch::Sender<bool>>,
+    cancellers: HashMap<usize, tokio::sync::watch::Sender<WaitSignal>>,
 }
 
 impl<'fut, R> WaitAwareInFlight<'fut, R> {
@@ -133,6 +171,11 @@ impl<'fut, R> WaitAwareInFlight<'fut, R> {
         self.inner.len()
     }
 
+    /// Signal every in-flight wait to stop because external cancellation was observed.
+    pub(super) fn signal_in_flight_waits(&self) {
+        signal_in_flight_waits(&self.cancellers);
+    }
+
     /// Dispatch a non-wait future and record its in-flight kind.
     pub(super) fn push_non_wait<F>(&mut self, idx: usize, fut: F)
     where
@@ -146,10 +189,10 @@ impl<'fut, R> WaitAwareInFlight<'fut, R> {
     pub(super) fn push_wait<MkFut>(&mut self, idx: usize, mk_fut: MkFut)
     where
         MkFut: FnOnce(
-            tokio::sync::watch::Receiver<bool>,
+            tokio::sync::watch::Receiver<WaitSignal>,
         ) -> Pin<Box<dyn Future<Output = (usize, R)> + 'fut>>,
     {
-        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(WaitSignal::Continue);
         self.cancellers.insert(idx, cancel_tx);
         self.kinds.insert(idx, InFlightKind::Wait);
         self.inner.push(mk_fut(cancel_rx));
@@ -229,7 +272,7 @@ pub async fn execute_wait_effect(
     until: &WaitPredicate,
     timeout: Duration,
     interval: Duration,
-    cancel: tokio::sync::watch::Receiver<bool>,
+    cancel: tokio::sync::watch::Receiver<WaitSignal>,
     observer: &dyn ExecutionObserver,
 ) -> WaitOutcome {
     execute_wait_effect_with_heartbeat_gap(
@@ -256,7 +299,7 @@ pub(crate) async fn execute_wait_effect_with_heartbeat_gap(
     until: &WaitPredicate,
     timeout: Duration,
     interval: Duration,
-    mut cancel: tokio::sync::watch::Receiver<bool>,
+    mut cancel: tokio::sync::watch::Receiver<WaitSignal>,
     observer: &dyn ExecutionObserver,
     heartbeat_gap: Duration,
 ) -> WaitOutcome {
@@ -306,9 +349,18 @@ pub(crate) async fn execute_wait_effect_with_heartbeat_gap(
             };
         }
         tokio::select! {
+            biased;
             changed = cancel.changed() => {
-                if changed.is_ok() && *cancel.borrow() {
-                    return WaitOutcome::Unsatisfiable(UnsatisfiableReason::NoMutatorRemaining);
+                if changed.is_ok() {
+                    match *cancel.borrow() {
+                        WaitSignal::Cancelled => return WaitOutcome::Cancelled,
+                        WaitSignal::NoMutatorRemaining => {
+                            return WaitOutcome::Unsatisfiable(
+                                UnsatisfiableReason::NoMutatorRemaining
+                            );
+                        }
+                        WaitSignal::Continue => {}
+                    }
                 }
             }
             () = tokio::time::sleep(interval) => {}
@@ -481,7 +533,7 @@ mod tests {
         let provider = ReadSequenceProvider::new(vec![state_with_status("ISSUED")]);
         let pred = equals_status("ISSUED");
         let target = ResourceId::new("acm.Certificate", "cert");
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let result = execute_wait_effect(
             &provider,
@@ -515,7 +567,7 @@ mod tests {
         ]);
         let pred = equals_status("ISSUED");
         let target = ResourceId::new("acm.Certificate", "cert");
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let result = execute_wait_effect(
             &provider,
@@ -540,7 +592,7 @@ mod tests {
         let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING_VALIDATION")]);
         let pred = equals_status("ISSUED");
         let target = ResourceId::new("acm.Certificate", "cert");
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let result = execute_wait_effect(
             &provider,
@@ -580,7 +632,7 @@ mod tests {
         ]);
         let pred = equals_status("ISSUED");
         let target = ResourceId::new("acm.Certificate", "cert");
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let result = execute_wait_effect(
             &provider,
@@ -604,7 +656,7 @@ mod tests {
         let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING_VALIDATION")]);
         let pred = equals_status("ISSUED");
         let target = ResourceId::new("acm.Certificate", "cert");
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let reads_seen = AtomicUsize::new(0);
 
@@ -613,7 +665,7 @@ mod tests {
                 loop {
                     if provider.read_count() >= 3 {
                         reads_seen.store(provider.read_count(), Ordering::SeqCst);
-                        let _ = cancel_tx.send(true);
+                        let _ = cancel_tx.send(WaitSignal::NoMutatorRemaining);
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(1)).await;
@@ -650,7 +702,7 @@ mod tests {
         let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING_VALIDATION")]);
         let pred = equals_status("ISSUED");
         let target = ResourceId::new("acm.Certificate", "cert");
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = HeartbeatObserver::new();
 
         let result = execute_wait_effect_with_heartbeat_gap(

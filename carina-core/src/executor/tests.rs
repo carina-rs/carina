@@ -7,6 +7,7 @@ use crate::provider::{
 use crate::resource::{ConcreteValue, DataSource, DeferredValue, Directives, Resource, Value};
 use parallel::{build_dependency_analysis, build_dependency_levels};
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -159,6 +160,57 @@ struct MockObserver {
     events: Mutex<Vec<String>>,
 }
 
+fn format_execution_event(event: &ExecutionEvent<'_>) -> String {
+    match event {
+        ExecutionEvent::Waiting {
+            effect,
+            pending_dependencies,
+        } => {
+            format!(
+                "waiting:{}:[{}]",
+                effect.resource_id(),
+                pending_dependencies.join(",")
+            )
+        }
+        ExecutionEvent::EffectStarted { effect } => {
+            format!("started:{}", effect.resource_id())
+        }
+        ExecutionEvent::EffectSucceeded { effect, .. } => {
+            format!("succeeded:{}", effect.resource_id())
+        }
+        ExecutionEvent::EffectFailed { effect, error, .. } => {
+            format!("failed:{}:{}", effect.resource_id(), error)
+        }
+        ExecutionEvent::EffectSkipped { effect, reason, .. } => {
+            format!("skipped:{}:{}", effect.resource_id(), reason)
+        }
+        ExecutionEvent::WaitPolling {
+            binding, target_id, ..
+        } => {
+            format!("wait_polling:{}:{}", binding, target_id)
+        }
+        ExecutionEvent::CascadeUpdateSucceeded { id } => {
+            format!("cascade_ok:{}", id)
+        }
+        ExecutionEvent::CascadeUpdateFailed { id, error } => {
+            format!("cascade_fail:{}:{}", id, error)
+        }
+        ExecutionEvent::RenameSucceeded { id, from, to } => {
+            format!("rename_ok:{}:{}:{}", id, from, to)
+        }
+        ExecutionEvent::RenameFailed { id, error } => {
+            format!("rename_fail:{}:{}", id, error)
+        }
+        ExecutionEvent::RefreshStarted => "refresh_started".to_string(),
+        ExecutionEvent::RefreshSucceeded { id } => {
+            format!("refresh_ok:{}", id)
+        }
+        ExecutionEvent::RefreshFailed { id, error } => {
+            format!("refresh_fail:{}:{}", id, error)
+        }
+    }
+}
+
 impl MockObserver {
     fn new() -> Self {
         Self {
@@ -173,55 +225,10 @@ impl MockObserver {
 
 impl ExecutionObserver for MockObserver {
     fn on_event(&self, event: &ExecutionEvent) {
-        let msg = match event {
-            ExecutionEvent::Waiting {
-                effect,
-                pending_dependencies,
-            } => {
-                format!(
-                    "waiting:{}:[{}]",
-                    effect.resource_id(),
-                    pending_dependencies.join(",")
-                )
-            }
-            ExecutionEvent::EffectStarted { effect } => {
-                format!("started:{}", effect.resource_id())
-            }
-            ExecutionEvent::EffectSucceeded { effect, .. } => {
-                format!("succeeded:{}", effect.resource_id())
-            }
-            ExecutionEvent::EffectFailed { effect, error, .. } => {
-                format!("failed:{}:{}", effect.resource_id(), error)
-            }
-            ExecutionEvent::EffectSkipped { effect, reason, .. } => {
-                format!("skipped:{}:{}", effect.resource_id(), reason)
-            }
-            ExecutionEvent::WaitPolling {
-                binding, target_id, ..
-            } => {
-                format!("wait_polling:{}:{}", binding, target_id)
-            }
-            ExecutionEvent::CascadeUpdateSucceeded { id } => {
-                format!("cascade_ok:{}", id)
-            }
-            ExecutionEvent::CascadeUpdateFailed { id, error } => {
-                format!("cascade_fail:{}:{}", id, error)
-            }
-            ExecutionEvent::RenameSucceeded { id, from, to } => {
-                format!("rename_ok:{}:{}:{}", id, from, to)
-            }
-            ExecutionEvent::RenameFailed { id, error } => {
-                format!("rename_fail:{}:{}", id, error)
-            }
-            ExecutionEvent::RefreshStarted => "refresh_started".to_string(),
-            ExecutionEvent::RefreshSucceeded { id } => {
-                format!("refresh_ok:{}", id)
-            }
-            ExecutionEvent::RefreshFailed { id, error } => {
-                format!("refresh_fail:{}:{}", id, error)
-            }
-        };
-        self.events.lock().unwrap().push(msg);
+        self.events
+            .lock()
+            .unwrap()
+            .push(format_execution_event(event));
     }
 }
 
@@ -601,6 +608,423 @@ fn provider_config_with_default_tags(
     }
 }
 
+fn create_independent_create_plan<const N: usize>(names: [&str; N]) -> Plan {
+    let mut plan = Plan::new();
+    for name in names {
+        plan.add(Effect::Create(make_resource(name, &[])));
+    }
+    plan
+}
+
+fn create_interdependent_replace_plan() -> Plan {
+    let a_id = ResourceId::new("test", "a");
+    let b_id = ResourceId::new("test", "b");
+
+    let a_from = State::existing(a_id.clone(), HashMap::new()).with_identifier("a-old");
+    let mut a_to = Resource::new("test", "a");
+    a_to.binding = Some("a".to_string());
+
+    let b_from = State::existing(b_id.clone(), HashMap::new()).with_identifier("b-old");
+    let mut b_to = Resource::new("test", "b");
+    b_to.binding = Some("b".to_string());
+    b_to.dependency_bindings = std::collections::BTreeSet::from(["a".to_string()]);
+
+    let directives = Directives {
+        create_before_destroy: true,
+        ..Default::default()
+    };
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Replace {
+        id: a_id,
+        from: Box::new(a_from),
+        to: a_to,
+        directives: directives.clone(),
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
+            .unwrap(),
+        cascading_updates: vec![],
+        temporary_name: None,
+        cascade_ref_hints: vec![],
+    });
+    plan.add(Effect::Replace {
+        id: b_id,
+        from: Box::new(b_from),
+        to: b_to,
+        directives,
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
+            .unwrap(),
+        cascading_updates: vec![],
+        temporary_name: None,
+        cascade_ref_hints: vec![],
+    });
+    plan
+}
+
+fn create_interdependent_replace_plan_with_renames<const N: usize>(names: [&str; N]) -> Plan {
+    let directives = Directives {
+        create_before_destroy: true,
+        ..Default::default()
+    };
+    let mut plan = Plan::new();
+    for (idx, name) in names.iter().enumerate() {
+        let id = ResourceId::new("test", *name);
+        let from =
+            State::existing(id.clone(), HashMap::new()).with_identifier(format!("{name}-old"));
+        let mut to = Resource::new("test", *name);
+        to.binding = Some((*name).to_string());
+        if idx > 0 {
+            to.dependency_bindings = std::collections::BTreeSet::from([names[idx - 1].to_string()]);
+        }
+        plan.add(Effect::Replace {
+            id,
+            from: Box::new(from),
+            to,
+            directives: directives.clone(),
+            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
+                .unwrap(),
+            cascading_updates: vec![],
+            temporary_name: Some(crate::effect::TemporaryName {
+                attribute: "name".to_string(),
+                original_value: format!("{name}-final"),
+                temporary_value: format!("{name}-temp"),
+                can_rename: true,
+            }),
+            cascade_ref_hints: vec![],
+        });
+    }
+    plan
+}
+
+struct DelayedCountingProvider {
+    default_delay: std::time::Duration,
+    delays: HashMap<String, std::time::Duration>,
+    cancel_after_create: Option<String>,
+    cancel: Option<CancellationToken>,
+    started: Arc<Mutex<Vec<String>>>,
+}
+
+impl DelayedCountingProvider {
+    fn new(default_delay: std::time::Duration) -> Self {
+        Self {
+            default_delay,
+            delays: HashMap::new(),
+            cancel_after_create: None,
+            cancel: None,
+            started: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn with_delay(mut self, name: &str, delay: std::time::Duration) -> Self {
+        self.delays.insert(name.to_string(), delay);
+        self
+    }
+
+    fn with_cancel_after_create(mut self, name: &str, cancel: CancellationToken) -> Self {
+        self.cancel_after_create = Some(name.to_string());
+        self.cancel = Some(cancel);
+        self
+    }
+
+    fn started_names(&self) -> Vec<String> {
+        self.started.lock().unwrap().clone()
+    }
+
+    fn delay_for(&self, id: &ResourceId) -> std::time::Duration {
+        self.delays
+            .get(id.name_str())
+            .copied()
+            .unwrap_or(self.default_delay)
+    }
+}
+
+impl Provider for DelayedCountingProvider {
+    fn name(&self) -> &str {
+        "delayed-counting"
+    }
+
+    fn read(
+        &self,
+        _id: &ResourceId,
+        _identifier: Option<&str>,
+        _request: ReadRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        Box::pin(async { Err(ProviderError::internal("read not used")) })
+    }
+
+    fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+        self.read(&resource.id, None, ReadRequest)
+    }
+
+    fn create(
+        &self,
+        id: &ResourceId,
+        _request: CreateRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let id = id.clone();
+        let delay = self.delay_for(&id);
+        let started = self.started.clone();
+        let cancel_after_create = self.cancel_after_create.clone();
+        let cancel = self.cancel.clone();
+        Box::pin(async move {
+            started.lock().unwrap().push(id.name_str().to_string());
+            tokio::time::sleep(delay).await;
+            if cancel_after_create.as_deref() == Some(id.name_str())
+                && let Some(cancel) = cancel
+            {
+                cancel.cancel();
+            }
+            Ok(ok_state(&id))
+        })
+    }
+
+    fn update(
+        &self,
+        id: &ResourceId,
+        _identifier: &str,
+        _request: UpdateRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let id = id.clone();
+        let started = self.started.clone();
+        Box::pin(async move {
+            started
+                .lock()
+                .unwrap()
+                .push(format!("update:{}", id.name_str()));
+            let mut attrs = HashMap::new();
+            attrs.insert(
+                "finalized".to_string(),
+                Value::Concrete(ConcreteValue::Bool(true)),
+            );
+            Ok(State::existing(id, attrs).with_identifier("finalized-id"))
+        })
+    }
+
+    fn delete(
+        &self,
+        id: &ResourceId,
+        _identifier: &str,
+        _request: DeleteRequest,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
+        let id = id.clone();
+        let started = self.started.clone();
+        Box::pin(async move {
+            started
+                .lock()
+                .unwrap()
+                .push(format!("delete:{}", id.name_str()));
+            Ok(())
+        })
+    }
+
+    fn required_permissions(&self, _id: &ResourceId, _op: crate::effect::PlanOp) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+struct PendingWaitProvider {
+    reads: AtomicUsize,
+}
+
+impl PendingWaitProvider {
+    fn new() -> Self {
+        Self {
+            reads: AtomicUsize::new(0),
+        }
+    }
+
+    fn read_count(&self) -> usize {
+        self.reads.load(Ordering::Relaxed)
+    }
+}
+
+impl Provider for PendingWaitProvider {
+    fn name(&self) -> &str {
+        "pending-wait"
+    }
+
+    fn read(
+        &self,
+        id: &ResourceId,
+        _identifier: Option<&str>,
+        _request: ReadRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        let id = id.clone();
+        Box::pin(async move {
+            let mut attrs = HashMap::new();
+            attrs.insert(
+                "status".to_string(),
+                Value::Concrete(ConcreteValue::String("PENDING".to_string())),
+            );
+            Ok(State::existing(id, attrs).with_identifier("pending-id"))
+        })
+    }
+
+    fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+        self.read(&resource.id, None, ReadRequest)
+    }
+
+    fn create(
+        &self,
+        id: &ResourceId,
+        _request: CreateRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let id = id.clone();
+        Box::pin(async move { Ok(ok_state(&id)) })
+    }
+
+    fn update(
+        &self,
+        _id: &ResourceId,
+        _identifier: &str,
+        _request: UpdateRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        Box::pin(async { Err(ProviderError::internal("update not used")) })
+    }
+
+    fn delete(
+        &self,
+        _id: &ResourceId,
+        _identifier: &str,
+        _request: DeleteRequest,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
+        Box::pin(async { Err(ProviderError::internal("delete not used")) })
+    }
+
+    fn required_permissions(&self, _id: &ResourceId, _op: crate::effect::PlanOp) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+struct CancelsAfterSuccesses {
+    successes: AtomicUsize,
+    threshold: usize,
+    token: CancellationToken,
+}
+
+impl CancelsAfterSuccesses {
+    fn new(threshold: usize) -> Self {
+        Self {
+            successes: AtomicUsize::new(0),
+            threshold,
+            token: CancellationToken::new(),
+        }
+    }
+
+    fn token(&self) -> CancellationToken {
+        self.token.clone()
+    }
+}
+
+impl ExecutionObserver for CancelsAfterSuccesses {
+    fn on_event(&self, event: &ExecutionEvent) {
+        if matches!(event, ExecutionEvent::EffectSucceeded { .. }) {
+            let successes = self.successes.fetch_add(1, Ordering::Relaxed) + 1;
+            if successes >= self.threshold {
+                self.token.cancel();
+            }
+        }
+    }
+}
+
+struct CancelsWhenStarted {
+    name: String,
+    token: CancellationToken,
+}
+
+impl CancelsWhenStarted {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            token: CancellationToken::new(),
+        }
+    }
+
+    fn token(&self) -> CancellationToken {
+        self.token.clone()
+    }
+}
+
+struct CancelsWhenWaitStarted {
+    binding: String,
+    token: CancellationToken,
+}
+
+impl CancelsWhenWaitStarted {
+    fn new(binding: &str) -> Self {
+        Self {
+            binding: binding.to_string(),
+            token: CancellationToken::new(),
+        }
+    }
+
+    fn token(&self) -> CancellationToken {
+        self.token.clone()
+    }
+}
+
+impl ExecutionObserver for CancelsWhenWaitStarted {
+    fn on_event(&self, event: &ExecutionEvent) {
+        if let ExecutionEvent::EffectStarted {
+            effect: Effect::Wait { binding, .. },
+        } = event
+            && binding == &self.binding
+        {
+            self.token.cancel();
+        }
+    }
+}
+
+struct RecordingCancelsWhenWaitStarted {
+    binding: String,
+    token: CancellationToken,
+    events: Mutex<Vec<String>>,
+}
+
+impl RecordingCancelsWhenWaitStarted {
+    fn new(binding: &str) -> Self {
+        Self {
+            binding: binding.to_string(),
+            token: CancellationToken::new(),
+            events: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn token(&self) -> CancellationToken {
+        self.token.clone()
+    }
+
+    fn events(&self) -> Vec<String> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
+impl ExecutionObserver for RecordingCancelsWhenWaitStarted {
+    fn on_event(&self, event: &ExecutionEvent) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format_execution_event(event));
+        if let ExecutionEvent::EffectStarted {
+            effect: Effect::Wait { binding, .. },
+        } = event
+            && binding == &self.binding
+        {
+            self.token.cancel();
+        }
+    }
+}
+
+impl ExecutionObserver for CancelsWhenStarted {
+    fn on_event(&self, event: &ExecutionEvent) {
+        if let ExecutionEvent::EffectStarted { effect } = event
+            && effect.resource_id().name_str() == self.name
+        {
+            self.token.cancel();
+        }
+    }
+}
+
 // -----------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------
@@ -666,18 +1090,12 @@ async fn execute_plan_returns_completed_when_not_cancelled() {
 }
 
 #[tokio::test]
-async fn execute_plan_with_pre_cancelled_token_still_returns_completed_at_t3() {
-    // T3 contract: execute_plan receives a CancellationToken but does not
-    // observe it. A pre-cancelled token must therefore still yield Completed.
-    // T4 (carina#3504) will flip this expectation to Cancelled and rename the test.
+async fn execute_plan_with_pre_cancelled_token_returns_cancelled_at_t4_or_later() {
     let provider = MockProvider::new();
     let resource = make_resource("one", &[]);
-    let rid = resource.id.clone();
 
     let mut plan = Plan::new();
     plan.add(Effect::Create(resource));
-
-    provider.push_create(Ok(ok_state(&rid)));
 
     let input = ExecutionInput {
         plan: &plan,
@@ -699,13 +1117,351 @@ async fn execute_plan_with_pre_cancelled_token_still_returns_completed_at_t3() {
     let outcome = execute_plan(&provider, input, &observer, cancel).await;
 
     match outcome {
-        ExecutionOutcome::Completed(result) => {
-            assert_eq!(result.success_count, 1, "T3 must not observe cancellation");
+        ExecutionOutcome::Cancelled(result) => {
+            assert_eq!(result.success_count, 0);
+            assert!(result.applied_states.is_empty());
+            assert!(provider.calls().is_empty());
         }
-        ExecutionOutcome::Cancelled(_) => panic!(
-            "T3 must not observe cancellation; if this fires, T4 may have leaked into this PR"
-        ),
+        ExecutionOutcome::Completed(_) => panic!("pre-cancelled execution returned Completed"),
     }
+}
+
+#[tokio::test]
+async fn execute_plan_with_empty_plan_and_pre_cancelled_token_returns_completed() {
+    let provider = MockProvider::new();
+    let plan = Plan::new();
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+    let observer = MockObserver::new();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    let outcome = execute_plan(&provider, input, &observer, cancel).await;
+
+    match outcome {
+        ExecutionOutcome::Completed(result) => {
+            assert_eq!(result.success_count, 0);
+            assert_eq!(result.skip_count, 0);
+        }
+        ExecutionOutcome::Cancelled(_) => panic!("empty pre-cancelled plan returned Cancelled"),
+    }
+}
+
+#[tokio::test]
+async fn execute_plan_cancelled_after_three_completed_keeps_in_flight_and_drops_pending() {
+    let provider = DelayedCountingProvider::new(std::time::Duration::from_millis(1));
+    let observer = CancelsAfterSuccesses::new(3);
+    let cancel = observer.token();
+    let plan = create_independent_create_plan(["r1", "r2", "r3", "r4", "r5"]);
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+    };
+
+    let outcome = execute_plan(&provider, input, &observer, cancel).await;
+
+    let result = match outcome {
+        ExecutionOutcome::Cancelled(result) => result,
+        ExecutionOutcome::Completed(_) => panic!("cancelled run returned Completed"),
+    };
+    assert_eq!(result.applied_states.len(), 3);
+    assert_eq!(provider.started_names(), vec!["r1", "r2", "r3"]);
+}
+
+#[tokio::test]
+async fn execute_plan_cancels_in_flight_wait_effect_promptly() {
+    use crate::wait::predicate::{AttrPath, WaitPredicate};
+
+    let provider = PendingWaitProvider::new();
+    let observer = CancelsWhenWaitStarted::new("cert_ready");
+    let cancel = observer.token();
+
+    let cert = make_resource("cert", &[]);
+    let cert_id = cert.id.clone();
+    let mut dist = make_resource("dist", &[]);
+    dist.set_attr(
+        "ref_cert_ready".to_string(),
+        Value::resource_ref("cert_ready".to_string(), "id".to_string(), vec![]),
+    );
+    dist.dependency_bindings = ["cert_ready".to_string()].into_iter().collect();
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(cert));
+    plan.add(Effect::Wait {
+        binding: "cert_ready".to_string(),
+        target_id: cert_id,
+        target: crate::effect::WaitTarget::ResolvedAtApply,
+        until: WaitPredicate::Equals {
+            attr: AttrPath::single("status"),
+            value: Value::Concrete(ConcreteValue::String("READY".to_string())),
+        },
+        until_surface: "cert.status == READY".to_string(),
+        timeout: std::time::Duration::from_secs(60),
+        interval: std::time::Duration::from_secs(60),
+        explicit_dependencies: std::collections::HashSet::new(),
+    });
+    plan.add(Effect::Create(dist));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+    };
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        execute_plan(&provider, input, &observer, cancel),
+    )
+    .await
+    .expect("cancelled wait should not block until its natural timeout");
+
+    let result = match outcome {
+        ExecutionOutcome::Cancelled(result) => result,
+        ExecutionOutcome::Completed(_) => panic!("cancelled wait returned Completed"),
+    };
+    assert_eq!(result.success_count, 1, "the completed Create is preserved");
+    assert_eq!(
+        result.skip_count, 2,
+        "the in-flight Wait and suppressed downstream Create are skipped"
+    );
+    assert!(
+        provider.read_count() > 0,
+        "wait should have polled at least once"
+    );
+}
+
+#[tokio::test]
+async fn execute_plan_cancelled_wait_emits_cancelled_skip_not_unsatisfiable() {
+    use crate::wait::predicate::{AttrPath, WaitPredicate};
+
+    let provider = PendingWaitProvider::new();
+    let observer = RecordingCancelsWhenWaitStarted::new("cert_ready");
+    let cancel = observer.token();
+
+    let cert = make_resource("cert", &[]);
+    let cert_id = cert.id.clone();
+    let mut dist = make_resource("dist", &[]);
+    dist.set_attr(
+        "ref_cert_ready".to_string(),
+        Value::resource_ref("cert_ready".to_string(), "id".to_string(), vec![]),
+    );
+    dist.dependency_bindings = ["cert_ready".to_string()].into_iter().collect();
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(cert));
+    plan.add(Effect::Wait {
+        binding: "cert_ready".to_string(),
+        target_id: cert_id,
+        target: crate::effect::WaitTarget::ResolvedAtApply,
+        until: WaitPredicate::Equals {
+            attr: AttrPath::single("status"),
+            value: Value::Concrete(ConcreteValue::String("READY".to_string())),
+        },
+        until_surface: "cert.status == READY".to_string(),
+        timeout: std::time::Duration::from_secs(60),
+        interval: std::time::Duration::from_secs(60),
+        explicit_dependencies: std::collections::HashSet::new(),
+    });
+    plan.add(Effect::Create(dist));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+    };
+
+    let outcome = execute_plan(&provider, input, &observer, cancel).await;
+
+    let result = match outcome {
+        ExecutionOutcome::Cancelled(result) => result,
+        ExecutionOutcome::Completed(_) => panic!("cancelled wait returned Completed"),
+    };
+    let events = observer.events();
+    assert!(
+        events.iter().any(|event| event == "succeeded:test.cert"),
+        "cert create should succeed before cancellation; events: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event == "skipped:test.cert:cancelled"),
+        "in-flight Wait should be skipped as cancelled; events: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event == "skipped:test.dist:cancelled"),
+        "downstream Create should be skipped as cancelled; events: {events:?}"
+    );
+    assert!(
+        events.iter().all(|event| !event.contains("unsatisfiable")),
+        "cancelled Wait must not be reported as unsatisfiable; events: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| !event.contains("dependency 'cert_ready' failed")),
+        "cancelled Wait must not mark its binding failed; events: {events:?}"
+    );
+    assert_eq!(result.success_count, 1);
+    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.skip_count, 2);
+}
+
+#[tokio::test]
+async fn execute_plan_cancelled_while_effect_in_flight_records_that_effect() {
+    let provider = DelayedCountingProvider::new(std::time::Duration::ZERO)
+        .with_delay("r2", std::time::Duration::from_millis(10));
+    let observer = CancelsWhenStarted::new("r2");
+    let cancel = observer.token();
+    let plan = create_independent_create_plan(["r1", "r2", "r3"]);
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+    };
+
+    let outcome = execute_plan(&provider, input, &observer, cancel).await;
+
+    let result = match outcome {
+        ExecutionOutcome::Cancelled(result) => result,
+        ExecutionOutcome::Completed(_) => panic!("cancelled run returned Completed"),
+    };
+    assert!(
+        result
+            .applied_states
+            .contains_key(&ResourceId::new("test", "r2"))
+    );
+    assert_eq!(provider.started_names(), vec!["r1", "r2"]);
+}
+
+#[tokio::test]
+async fn execute_plan_phased_cancel_during_phase4_preserves_unprocessed_cbd_creates() {
+    let provider = DelayedCountingProvider::new(std::time::Duration::ZERO);
+    let observer = CancelsAfterSuccesses::new(2);
+    let cancel = observer.token();
+    let plan = create_interdependent_replace_plan_with_renames(["a", "b", "c", "d"]);
+    assert!(has_interdependent_replaces(plan.effects()));
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(2).unwrap(),
+    };
+
+    let outcome = execute_plan(&provider, input, &observer, cancel).await;
+
+    let result = match outcome {
+        ExecutionOutcome::Cancelled(result) => result,
+        ExecutionOutcome::Completed(_) => panic!("phase-4 cancel returned Completed"),
+    };
+    assert_eq!(result.success_count, 4);
+    assert_eq!(result.applied_states.len(), 4);
+    for name in ["a", "b"] {
+        let state = result
+            .applied_states
+            .get(&ResourceId::new("test", name))
+            .expect("finalized resource should be recorded");
+        assert_eq!(
+            state.attributes.get("finalized"),
+            Some(&Value::Concrete(ConcreteValue::Bool(true)))
+        );
+    }
+    for name in ["c", "d"] {
+        let state = result
+            .applied_states
+            .get(&ResourceId::new("test", name))
+            .expect("unprocessed CBD create state should be preserved");
+        assert_eq!(
+            state.attributes.get("finalized"),
+            None,
+            "unprocessed resources must keep Phase-2 create state, not finalize state"
+        );
+    }
+}
+
+#[tokio::test]
+async fn execute_plan_phased_cancelled_between_phases_keeps_completed_resources_in_state() {
+    let cancel = CancellationToken::new();
+    let provider = DelayedCountingProvider::new(std::time::Duration::from_millis(1))
+        .with_cancel_after_create("a", cancel.clone());
+    let observer = MockObserver::new();
+    let plan = create_interdependent_replace_plan();
+    assert!(has_interdependent_replaces(plan.effects()));
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(2).unwrap(),
+    };
+
+    let outcome = execute_plan(&provider, input, &observer, cancel).await;
+
+    let result = match outcome {
+        ExecutionOutcome::Cancelled(result) => result,
+        ExecutionOutcome::Completed(_) => panic!("phased cancel returned Completed"),
+    };
+    assert!(
+        result
+            .applied_states
+            .contains_key(&ResourceId::new("test", "a"))
+    );
+    assert!(
+        !provider
+            .started_names()
+            .iter()
+            .any(|name| name.starts_with("delete:"))
+    );
 }
 
 #[tokio::test]

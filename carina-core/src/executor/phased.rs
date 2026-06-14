@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::stream::{FuturesUnordered, StreamExt};
+use tokio_util::sync::CancellationToken;
 
 use crate::deps::{find_failed_dependency, get_resource_dependencies};
 use crate::effect::{Effect, WaitTarget};
@@ -18,13 +19,39 @@ use super::basic::{
 };
 use super::replace::{compute_full_diff_patch, single_attribute_patch};
 use super::wait::{
-    UnsatisfiableReason, WaitAwareInFlight, WaitOutcome, unsatisfiable_reason_message,
-    wait_failure_message,
+    SKIP_REASON_CANCELLED, UnsatisfiableReason, WaitAwareInFlight, WaitOutcome,
+    unsatisfiable_reason_message, wait_failure_message,
 };
 use super::{
     ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, ProgressInfo,
     UnresolvedResource,
 };
+
+fn emit_cancelled_skips_with_progress<F>(
+    effects: &[Effect],
+    indices: &[usize],
+    dispatched: &mut HashSet<usize>,
+    completed_indices: &mut HashSet<usize>,
+    skip_count: &mut usize,
+    observer: &dyn ExecutionObserver,
+    mut progress_for: F,
+) where
+    F: FnMut(usize) -> ProgressInfo,
+{
+    for &idx in indices {
+        if dispatched.contains(&idx) {
+            continue;
+        }
+        dispatched.insert(idx);
+        completed_indices.insert(idx);
+        observer.on_event(&ExecutionEvent::EffectSkipped {
+            effect: &effects[idx],
+            reason: SKIP_REASON_CANCELLED,
+            progress: progress_for(idx),
+        });
+        *skip_count += 1;
+    }
+}
 
 /// Check if the plan contains multiple Replace effects that depend on each other.
 pub(super) fn has_interdependent_replaces(effects: &[Effect]) -> bool {
@@ -360,7 +387,8 @@ pub(super) async fn execute_effects_phased(
     provider: &dyn Provider,
     input: &mut ExecutionInput<'_>,
     observer: &dyn ExecutionObserver,
-) -> ExecutionResult {
+    cancel: &CancellationToken,
+) -> (ExecutionResult, bool) {
     let mut success_count = 0;
     let mut failure_count = 0;
     let mut skip_count = 0;
@@ -376,6 +404,7 @@ pub(super) async fn execute_effects_phased(
     let effects = input.plan.effects();
     let replace_bindings = collect_replace_bindings(effects);
     let sorted_indices = topological_sort_replaces(effects, &replace_bindings);
+    let mut cancelled = false;
 
     // -----------------------------------------------------------------------
     // Phase 1: Non-Replace effects with parallel execution
@@ -396,17 +425,31 @@ pub(super) async fn execute_effects_phased(
         let mut in_flight: WaitAwareInFlight<'_, PhaseEffectResult> = WaitAwareInFlight::new();
 
         loop {
-            let mut newly_ready: Vec<usize> = Vec::new();
-            for &idx in &phase1_indices {
-                if dispatched.contains(&idx) {
-                    continue;
-                }
-                let deps = &deps_of[&idx];
-                if deps.iter().all(|d| completed_indices.contains(d)) {
-                    newly_ready.push(idx);
-                }
+            let undispatched_at_loop_start = phase1_indices
+                .iter()
+                .filter(|&&idx| !dispatched.contains(&idx))
+                .count();
+            if cancel.is_cancelled()
+                && !cancelled
+                && (undispatched_at_loop_start > 0 || !in_flight.is_empty())
+            {
+                cancelled = true;
+                in_flight.signal_in_flight_waits();
             }
-            newly_ready.sort();
+
+            let mut newly_ready: Vec<usize> = Vec::new();
+            if !cancelled {
+                for &idx in &phase1_indices {
+                    if dispatched.contains(&idx) {
+                        continue;
+                    }
+                    let deps = &deps_of[&idx];
+                    if deps.iter().all(|d| completed_indices.contains(d)) {
+                        newly_ready.push(idx);
+                    }
+                }
+                newly_ready.sort();
+            }
 
             for idx in newly_ready {
                 dispatched.insert(idx);
@@ -551,16 +594,51 @@ pub(super) async fn execute_effects_phased(
                 .drop_without_awaiting();
 
             if in_flight.is_empty() {
+                if cancelled {
+                    emit_cancelled_skips_with_progress(
+                        effects,
+                        &phase1_indices,
+                        &mut dispatched,
+                        &mut completed_indices,
+                        &mut skip_count,
+                        observer,
+                        |_| ProgressInfo {
+                            completed: completed.fetch_add(1, Ordering::Relaxed) + 1,
+                            total,
+                        },
+                    );
+                }
                 break;
             }
 
-            let Some((finished_idx, result)) = in_flight
-                .check_terminal(undispatched_count())
-                .cancel_if_terminal()
-                .next_completed()
-                .await
-            else {
-                break;
+            let (finished_idx, result) = if cancelled {
+                let Some(finished) = in_flight
+                    .check_terminal(undispatched_count())
+                    .cancel_if_terminal()
+                    .next_completed()
+                    .await
+                else {
+                    break;
+                };
+                finished
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        cancelled = true;
+                        in_flight.signal_in_flight_waits();
+                        continue;
+                    }
+                    finished = in_flight
+                        .check_terminal(undispatched_count())
+                        .cancel_if_terminal()
+                        .next_completed() => {
+                        let Some(finished) = finished else {
+                            break;
+                        };
+                        finished
+                    }
+                }
             };
             completed_indices.insert(finished_idx);
 
@@ -615,6 +693,14 @@ pub(super) async fn execute_effects_phased(
                         skip_count += 1;
                         failed_bindings.insert(binding);
                     }
+                    WaitOutcome::Cancelled => {
+                        observer.on_event(&ExecutionEvent::EffectSkipped {
+                            effect: &effects[finished_idx],
+                            reason: SKIP_REASON_CANCELLED,
+                            progress,
+                        });
+                        skip_count += 1;
+                    }
                     outcome @ (WaitOutcome::Timeout { .. }
                     | WaitOutcome::NotFound(_)
                     | WaitOutcome::ReadFailed(_)) => {
@@ -639,7 +725,6 @@ pub(super) async fn execute_effects_phased(
                 .drop_without_awaiting();
         }
     }
-
     // -----------------------------------------------------------------------
     // Phase 2: CBD creates with parallel execution (forward dependency order)
     // -----------------------------------------------------------------------
@@ -687,17 +772,30 @@ pub(super) async fn execute_effects_phased(
         let mut in_flight = FuturesUnordered::new();
 
         loop {
-            let mut newly_ready: Vec<usize> = Vec::new();
-            for &idx in &cbd_indices {
-                if dispatched.contains(&idx) {
-                    continue;
-                }
-                let deps = &deps_of[&idx];
-                if deps.iter().all(|d| completed_indices.contains(d)) {
-                    newly_ready.push(idx);
-                }
+            let undispatched_at_loop_start = cbd_indices
+                .iter()
+                .filter(|&&idx| !dispatched.contains(&idx))
+                .count();
+            if cancel.is_cancelled()
+                && !cancelled
+                && (undispatched_at_loop_start > 0 || !in_flight.is_empty())
+            {
+                cancelled = true;
             }
-            newly_ready.sort();
+
+            let mut newly_ready: Vec<usize> = Vec::new();
+            if !cancelled {
+                for &idx in &cbd_indices {
+                    if dispatched.contains(&idx) {
+                        continue;
+                    }
+                    let deps = &deps_of[&idx];
+                    if deps.iter().all(|d| completed_indices.contains(d)) {
+                        newly_ready.push(idx);
+                    }
+                }
+                newly_ready.sort();
+            }
 
             for idx in newly_ready {
                 dispatched.insert(idx);
@@ -914,10 +1012,32 @@ pub(super) async fn execute_effects_phased(
             }
 
             if in_flight.is_empty() {
+                if cancelled {
+                    emit_cancelled_skips_with_progress(
+                        effects,
+                        &cbd_indices,
+                        &mut dispatched,
+                        &mut completed_indices,
+                        &mut skip_count,
+                        observer,
+                        |idx| replace_progress[&idx],
+                    );
+                }
                 break;
             }
 
-            let (finished_idx, started, result) = in_flight.next().await.unwrap();
+            let (finished_idx, started, result) = if cancelled {
+                in_flight.next().await.unwrap()
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        cancelled = true;
+                        continue;
+                    }
+                    finished = in_flight.next() => finished.unwrap(),
+                }
+            };
             completed_indices.insert(finished_idx);
 
             match result {
@@ -968,11 +1088,10 @@ pub(super) async fn execute_effects_phased(
             }
         }
     }
-
     // -----------------------------------------------------------------------
     // Phase 3: All deletes with parallel execution (reverse dependency order)
     // -----------------------------------------------------------------------
-    {
+    if !cancelled {
         // Collect indices for deletes that should execute: all Replace effects
         // that haven't been failed/skipped. For CBD, skip if create phase failed.
         let delete_indices: Vec<usize> = sorted_indices
@@ -1040,17 +1159,30 @@ pub(super) async fn execute_effects_phased(
         let mut in_flight = FuturesUnordered::new();
 
         loop {
-            let mut newly_ready: Vec<usize> = Vec::new();
-            for &idx in &delete_indices {
-                if dispatched.contains(&idx) {
-                    continue;
-                }
-                let deps = &reverse_deps[&idx];
-                if deps.iter().all(|d| completed_indices.contains(d)) {
-                    newly_ready.push(idx);
-                }
+            let undispatched_at_loop_start = delete_indices
+                .iter()
+                .filter(|&&idx| !dispatched.contains(&idx))
+                .count();
+            if cancel.is_cancelled()
+                && !cancelled
+                && (undispatched_at_loop_start > 0 || !in_flight.is_empty())
+            {
+                cancelled = true;
             }
-            newly_ready.sort();
+
+            let mut newly_ready: Vec<usize> = Vec::new();
+            if !cancelled {
+                for &idx in &delete_indices {
+                    if dispatched.contains(&idx) {
+                        continue;
+                    }
+                    let deps = &reverse_deps[&idx];
+                    if deps.iter().all(|d| completed_indices.contains(d)) {
+                        newly_ready.push(idx);
+                    }
+                }
+                newly_ready.sort();
+            }
 
             for idx in newly_ready {
                 dispatched.insert(idx);
@@ -1127,10 +1259,32 @@ pub(super) async fn execute_effects_phased(
             }
 
             if in_flight.is_empty() {
+                if cancelled {
+                    emit_cancelled_skips_with_progress(
+                        effects,
+                        &delete_indices,
+                        &mut dispatched,
+                        &mut completed_indices,
+                        &mut skip_count,
+                        observer,
+                        |idx| replace_progress[&idx],
+                    );
+                }
                 break;
             }
 
-            let (finished_idx, result) = in_flight.next().await.unwrap();
+            let (finished_idx, result) = if cancelled {
+                in_flight.next().await.unwrap()
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        cancelled = true;
+                        continue;
+                    }
+                    finished = in_flight.next() => finished.unwrap(),
+                }
+            };
             completed_indices.insert(finished_idx);
 
             match result {
@@ -1159,11 +1313,10 @@ pub(super) async fn execute_effects_phased(
             }
         }
     }
-
     // -----------------------------------------------------------------------
     // Phase 4: Non-CBD creates and CBD finalization with parallel execution
     // -----------------------------------------------------------------------
-    {
+    if !cancelled {
         let phase4_indices: Vec<usize> = sorted_indices.clone();
 
         let deps_of = build_phase_dependency_map(
@@ -1176,20 +1329,36 @@ pub(super) async fn execute_effects_phased(
         let mut dispatched: HashSet<usize> = HashSet::new();
         type PhaseFuture<'a> =
             std::pin::Pin<Box<dyn std::future::Future<Output = (usize, PhaseEffectResult)> + 'a>>;
+        // Phase 4 dispatches only Replace finalize/create work from sorted
+        // Replace indices; no Wait effects can appear here, so no wait_cancellers
+        // are needed for cancellation.
         let mut in_flight: FuturesUnordered<PhaseFuture<'_>> = FuturesUnordered::new();
 
         loop {
-            let mut newly_ready: Vec<usize> = Vec::new();
-            for &idx in &phase4_indices {
-                if dispatched.contains(&idx) {
-                    continue;
-                }
-                let deps = &deps_of[&idx];
-                if deps.iter().all(|d| completed_indices.contains(d)) {
-                    newly_ready.push(idx);
-                }
+            let undispatched_at_loop_start = phase4_indices
+                .iter()
+                .filter(|&&idx| !dispatched.contains(&idx))
+                .count();
+            if cancel.is_cancelled()
+                && !cancelled
+                && (undispatched_at_loop_start > 0 || !in_flight.is_empty())
+            {
+                cancelled = true;
             }
-            newly_ready.sort();
+
+            let mut newly_ready: Vec<usize> = Vec::new();
+            if !cancelled {
+                for &idx in &phase4_indices {
+                    if dispatched.contains(&idx) {
+                        continue;
+                    }
+                    let deps = &deps_of[&idx];
+                    if deps.iter().all(|d| completed_indices.contains(d)) {
+                        newly_ready.push(idx);
+                    }
+                }
+                newly_ready.sort();
+            }
 
             for idx in newly_ready {
                 dispatched.insert(idx);
@@ -1234,7 +1403,7 @@ pub(super) async fn execute_effects_phased(
 
                     if directives.create_before_destroy {
                         // CBD finalization: skip if create phase failed
-                        let Some(state) = cbd_create_states.remove(&idx) else {
+                        let Some(state) = cbd_create_states.get(&idx).cloned() else {
                             completed_indices.insert(idx);
                             continue;
                         };
@@ -1423,10 +1592,32 @@ pub(super) async fn execute_effects_phased(
             }
 
             if in_flight.is_empty() {
+                if cancelled {
+                    emit_cancelled_skips_with_progress(
+                        effects,
+                        &phase4_indices,
+                        &mut dispatched,
+                        &mut completed_indices,
+                        &mut skip_count,
+                        observer,
+                        |idx| replace_progress[&idx],
+                    );
+                }
                 break;
             }
 
-            let (finished_idx, result) = in_flight.next().await.unwrap();
+            let (finished_idx, result) = if cancelled {
+                in_flight.next().await.unwrap()
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        cancelled = true;
+                        continue;
+                    }
+                    finished = in_flight.next() => finished.unwrap(),
+                }
+            };
             completed_indices.insert(finished_idx);
 
             match result {
@@ -1435,6 +1626,7 @@ pub(super) async fn execute_effects_phased(
                     resource_id,
                     permanent_overrides,
                 } => {
+                    cbd_create_states.remove(&finished_idx);
                     success_count += 1;
                     applied_states.insert(resource_id, state);
                     if let Some((id, overrides)) = permanent_overrides {
@@ -1446,6 +1638,7 @@ pub(super) async fn execute_effects_phased(
                     resource_id,
                     binding,
                 } => {
+                    cbd_create_states.remove(&finished_idx);
                     failure_count += 1;
                     applied_states.insert(resource_id, state);
                     if let Some(binding) = binding {
@@ -1481,6 +1674,20 @@ pub(super) async fn execute_effects_phased(
         }
     }
 
+    // Preserve CBD create states for any temporary that was created in Phase 2
+    // but did not complete finalize. Phase 4 removes finalized indices from
+    // cbd_create_states, so anything remaining here is genuinely unprocessed.
+    // Do not re-call bindings.record_applied: Phase 2 already recorded the
+    // binding when the create succeeded, matching Phase 4's success path.
+    if cancelled {
+        for (idx, state) in cbd_create_states {
+            if let Effect::Replace { to, .. } = &effects[idx] {
+                success_count += 1;
+                applied_states.insert(to.id.clone(), state);
+            }
+        }
+    }
+
     let failed_refreshes = refresh_pending_states(
         provider,
         &mut input.current_states,
@@ -1489,7 +1696,7 @@ pub(super) async fn execute_effects_phased(
     )
     .await;
 
-    ExecutionResult {
+    let result = ExecutionResult {
         success_count,
         failure_count,
         skip_count,
@@ -1498,7 +1705,8 @@ pub(super) async fn execute_effects_phased(
         permanent_name_overrides,
         current_states: input.current_states.clone(),
         failed_refreshes,
-    }
+    };
+    (result, cancelled)
 }
 
 #[cfg(test)]
@@ -1741,10 +1949,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            execute_effects_phased(&provider, &mut input, &observer),
+            execute_effects_phased(&provider, &mut input, &observer, &CancellationToken::new()),
         )
         .await
         .expect("wait should be skipped as unsatisfiable instead of timing out");
+        let (result, was_cancelled) = result;
+        assert!(!was_cancelled);
 
         assert!(
             result.failure_count >= 1,
