@@ -9,6 +9,7 @@ use parallel::{build_dependency_analysis, build_dependency_levels};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 // -----------------------------------------------------------------------
 // Mock Provider
@@ -221,6 +222,16 @@ impl ExecutionObserver for MockObserver {
             }
         };
         self.events.lock().unwrap().push(msg);
+    }
+}
+
+fn completed_result(outcome: ExecutionOutcome) -> ExecutionResult {
+    match outcome {
+        ExecutionOutcome::Completed(result) => result,
+        ExecutionOutcome::Cancelled(result) => panic!(
+            "uncancelled execution returned Cancelled: success={}, failure={}, skip={}",
+            result.success_count, result.failure_count, result.skip_count
+        ),
     }
 }
 
@@ -617,6 +628,87 @@ fn execution_outcome_completed_and_cancelled_are_matchable() {
 }
 
 #[tokio::test]
+async fn execute_plan_returns_completed_when_not_cancelled() {
+    let provider = MockProvider::new();
+    let resource = make_resource("one", &[]);
+    let rid = resource.id.clone();
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(resource));
+
+    provider.push_create(Ok(ok_state(&rid)));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let observer = MockObserver::new();
+    let cancel = CancellationToken::new();
+
+    let outcome = execute_plan(&provider, input, &observer, cancel).await;
+
+    match outcome {
+        ExecutionOutcome::Completed(result) => {
+            assert_eq!(result.failure_count, 0);
+            assert_eq!(result.success_count, 1);
+        }
+        ExecutionOutcome::Cancelled(_) => panic!("uncancelled execution returned Cancelled"),
+    }
+}
+
+#[tokio::test]
+async fn execute_plan_with_pre_cancelled_token_still_returns_completed_at_t3() {
+    // T3 contract: execute_plan receives a CancellationToken but does not
+    // observe it. A pre-cancelled token must therefore still yield Completed.
+    // T4 (carina#3504) will flip this expectation to Cancelled and rename the test.
+    let provider = MockProvider::new();
+    let resource = make_resource("one", &[]);
+    let rid = resource.id.clone();
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(resource));
+
+    provider.push_create(Ok(ok_state(&rid)));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let observer = MockObserver::new();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    let outcome = execute_plan(&provider, input, &observer, cancel).await;
+
+    match outcome {
+        ExecutionOutcome::Completed(result) => {
+            assert_eq!(result.success_count, 1, "T3 must not observe cancellation");
+        }
+        ExecutionOutcome::Cancelled(_) => panic!(
+            "T3 must not observe cancellation; if this fires, T4 may have leaked into this PR"
+        ),
+    }
+}
+
+#[tokio::test]
 async fn test_simple_create() {
     let provider = MockProvider::new();
     let resource = make_resource("a", &[]);
@@ -641,7 +733,8 @@ async fn test_simple_create() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     assert_eq!(result.success_count, 1);
     assert_eq!(result.failure_count, 0);
@@ -693,7 +786,8 @@ async fn test_apply_renormalizes_after_resolution() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
     assert_eq!(result.success_count, 1);
 
     let captured = provider.captured_create_resources();
@@ -750,7 +844,8 @@ async fn test_apply_reapplies_enum_alias_stage() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
     assert_eq!(result.success_count, 1);
 
     let captured = provider.captured_create_resources();
@@ -812,7 +907,8 @@ async fn test_apply_reapplies_enum_alias_stage_update_path() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
     assert_eq!(result.success_count, 1);
 
     let reqs = provider.captured_update_requests();
@@ -866,7 +962,8 @@ async fn test_apply_reapplies_canonicalize_stage() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
     assert_eq!(result.success_count, 1);
 
     let captured = provider.captured_create_resources();
@@ -926,7 +1023,8 @@ async fn test_apply_renormalizes_update_path() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
     assert_eq!(result.success_count, 1);
 
     let reqs = provider.captured_update_requests();
@@ -1012,7 +1110,8 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
     assert_eq!(result.success_count, 1);
 
     let reqs = provider.captured_update_requests();
@@ -1121,7 +1220,8 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
     assert_eq!(result.success_count, 1);
 
     let reqs = provider.captured_update_requests();
@@ -1180,7 +1280,8 @@ async fn test_apply_effective_changed_skips_internal_and_write_only_attributes()
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
     assert_eq!(result.success_count, 1);
 
     let reqs = provider.captured_update_requests();
@@ -1240,7 +1341,8 @@ async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
     assert_eq!(result.success_count, 1);
 
     let reqs = provider.captured_update_requests();
@@ -1305,7 +1407,8 @@ async fn test_apply_effective_changed_skips_secret_shape_divergence() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
     assert_eq!(result.success_count, 1);
 
     let reqs = provider.captured_update_requests();
@@ -1361,7 +1464,8 @@ async fn test_apply_renormalizes_nested_value_under_ref_bearing_resource() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
     assert_eq!(result.success_count, 2, "both creates should succeed");
 
     let captured = provider.captured_create_resources();
@@ -1507,7 +1611,8 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
     // be reproduced with a real WASM guest (the issue's user-driven
     // real-infra smoke); this test cannot even express the old shape
     // because the trait is now async — that is the point.
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
     assert_eq!(
         result.success_count, 2,
         "both creates must complete — no self-deadlock acquiring the \
@@ -1563,7 +1668,8 @@ async fn test_simple_delete() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     assert_eq!(result.success_count, 1);
     assert!(result.successfully_deleted.contains(&rid));
@@ -1597,7 +1703,8 @@ async fn test_failed_effect_propagates_to_dependent() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     assert_eq!(result.failure_count, 1);
     assert_eq!(result.skip_count, 1);
@@ -1651,7 +1758,8 @@ async fn test_cbd_creates_before_deletes() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     assert_eq!(result.success_count, 1);
     assert_eq!(result.failure_count, 0);
@@ -1726,7 +1834,8 @@ async fn test_cbd_cascade_update_patch_uses_plan_time_comparison_semantics() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
     assert_eq!(result.success_count, 1);
 
     let reqs = provider.captured_update_requests();
@@ -1773,7 +1882,8 @@ async fn test_dbd_deletes_before_creates() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     assert_eq!(result.success_count, 1);
     assert_eq!(result.failure_count, 0);
@@ -1855,7 +1965,8 @@ async fn test_phased_cbd_creates_in_forward_order_deletes_in_reverse() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     assert_eq!(result.success_count, 2);
     assert_eq!(result.failure_count, 0);
@@ -1936,7 +2047,8 @@ async fn test_phased_noncbd_creates_after_deletes() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     assert_eq!(result.success_count, 2);
     assert_eq!(result.failure_count, 0);
@@ -1975,7 +2087,8 @@ async fn test_observer_events_emitted_correctly() {
     };
 
     let observer = MockObserver::new();
-    execute_plan(&provider, input, &observer).await;
+    let _ =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     let events = observer.events();
     assert_eq!(events.len(), 2);
@@ -2005,7 +2118,8 @@ async fn test_read_effect_is_no_op() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     assert_eq!(result.success_count, 0);
     assert_eq!(result.failure_count, 0);
@@ -2048,7 +2162,8 @@ async fn test_independent_effects_run_in_parallel() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     assert_eq!(result.success_count, 3);
     assert_eq!(result.failure_count, 0);
@@ -2101,7 +2216,8 @@ async fn test_parallel_failure_skips_dependents() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     // vpc + subnet_b succeed, subnet_a fails, subnet_c skipped
     assert_eq!(result.success_count, 2);
@@ -2151,7 +2267,8 @@ async fn test_dependency_levels_sequential_chain() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     assert_eq!(result.success_count, 3);
 
@@ -2388,7 +2505,8 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     assert_eq!(result.success_count, 3);
     assert_eq!(result.failure_count, 0);
@@ -2601,7 +2719,8 @@ async fn run_tag_sweep(parallelism: NonZeroUsize) -> (std::time::Duration, usize
 
     let observer = MockObserver::new();
     let started = Instant::now();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
     let elapsed = started.elapsed();
 
     assert_eq!(result.success_count, 13);
@@ -2669,7 +2788,8 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
     assert_eq!(result.success_count, 2);
     assert_eq!(result.failure_count, 0);
     provider.max_active()
@@ -2763,7 +2883,8 @@ async fn test_waiting_events_emitted_for_dependent_effects() {
     provider.push_create(Ok(
         State::existing(c_id, id_attr("id-c")).with_identifier("id-c")
     ));
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     assert_eq!(result.success_count, 2);
 
@@ -2919,7 +3040,8 @@ async fn test_update_effect_binding_map_propagation() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     assert_eq!(result.success_count, 1);
     assert_eq!(result.failure_count, 0);
@@ -3040,7 +3162,8 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     assert_eq!(result.success_count, 2, "Both resources should succeed");
     assert_eq!(result.failure_count, 0, "No failures expected");
@@ -3233,7 +3356,8 @@ async fn test_delete_waits_for_replace_cbd_of_dependent() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     assert_eq!(result.success_count, 3);
     assert_eq!(result.failure_count, 0);
@@ -3328,7 +3452,8 @@ async fn test_delete_waits_for_replace_cbd_even_when_delete_binding_is_none() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     assert_eq!(result.success_count, 3);
     assert_eq!(result.failure_count, 0);
@@ -3421,7 +3546,8 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     assert_eq!(
         result.success_count,
@@ -3571,7 +3697,8 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     assert_eq!(
         result.failure_count,
@@ -3652,7 +3779,8 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
     assert_eq!(result.success_count, 2);
     // The wait's captured State is keyed under a synthetic `__wait`
     // ResourceId. This is what guarantees state writeback never sees
@@ -3771,7 +3899,8 @@ async fn test_chained_index_then_field_unresolved_at_apply_fails_with_clear_erro
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     // Cert succeeds; the record fails at apply-time resolution
     // *before* reaching the provider — no `create` call for the
@@ -3953,7 +4082,8 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     assert_eq!(
         result.failure_count,
@@ -4164,7 +4294,8 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     assert_eq!(
         result.failure_count,
@@ -4257,7 +4388,8 @@ async fn test_phased_move_with_interdependent_replace_does_not_panic() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     assert_eq!(
         result.failure_count, 0,
@@ -4390,7 +4522,8 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
     };
 
     let observer = MockObserver::new();
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     assert_eq!(
         result.failure_count,

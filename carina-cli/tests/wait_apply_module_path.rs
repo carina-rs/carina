@@ -32,7 +32,10 @@ use carina_core::binding_index::ResolvedBindings;
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::create_plan;
-use carina_core::executor::{ExecutionInput, ExecutionObserver, UnresolvedResource, execute_plan};
+use carina_core::executor::{
+    ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult, UnresolvedResource,
+    execute_plan,
+};
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{
     BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer, ProviderResult,
@@ -41,6 +44,17 @@ use carina_core::resource::{DataSource, ResourceId, State, Value};
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 use indexmap::IndexMap;
 use std::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+
+fn completed_result(outcome: ExecutionOutcome) -> ExecutionResult {
+    match outcome {
+        ExecutionOutcome::Completed(result) => result,
+        ExecutionOutcome::Cancelled(result) => panic!(
+            "uncancelled execution returned Cancelled: success={}, failure={}, skip={}",
+            result.success_count, result.failure_count, result.skip_count
+        ),
+    }
+}
 
 // --- Minimal aws provider stub: just enough schema for the fixture's
 // aws.acm.Certificate + aws.cloudfront.Distribution to resolve. ---
@@ -468,7 +482,8 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         schemas: ctx.schemas(),
         parallelism: carina_core::executor::TEST_UNCAPPED,
     };
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
     let failures = observer.failures.lock().unwrap().clone();
     (result.failure_count, result.skip_count, failures)
 }

@@ -14,7 +14,9 @@ use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
 use carina_core::effect::Effect;
 use carina_core::executor::normalized::apply_desired_normalization;
-use carina_core::executor::{ExecutionInput, ExecutionResult, UnresolvedResource};
+use carina_core::executor::{
+    ExecutionInput, ExecutionOutcome, ExecutionResult, UnresolvedResource,
+};
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ReadRequest};
 use carina_core::resolver::resolve_refs_with_state_and_remote;
@@ -23,6 +25,7 @@ use carina_core::resource::ConcreteValue;
 use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::value::format_value;
 use carina_state::{BackendLock, LockInfo, StateBackend, StateFile};
+use tokio_util::sync::CancellationToken;
 
 use carina_core::parser::{ProviderConfig, ProviderContext};
 
@@ -74,6 +77,7 @@ pub async fn execute_effects(
     current_states: &mut HashMap<ResourceId, State>,
     unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
     compositions: &[carina_core::resource::Composition],
+    cancel: CancellationToken,
     parallelism: NonZeroUsize,
 ) -> ApplyResult {
     let input = ExecutionInput {
@@ -90,7 +94,14 @@ pub async fn execute_effects(
     };
 
     let observer = CliObserver::new(plan);
-    let result = carina_core::executor::execute_plan(provider, input, &observer).await;
+    let outcome = carina_core::executor::execute_plan(provider, input, &observer, cancel).await;
+    // T3: both arms surface the same ExecutionResult so callers see consistent
+    // intermediate state regardless of whether cancellation has been observed yet.
+    // T5 (carina#3505) will rewrap this into the finalize_apply pipeline so the
+    // caller can distinguish Completed from Cancelled at the apply boundary.
+    let result = match outcome {
+        ExecutionOutcome::Completed(result) | ExecutionOutcome::Cancelled(result) => result,
+    };
 
     // Write back the updated current_states so callers see refreshes
     *current_states = result.current_states.clone();
@@ -1486,6 +1497,7 @@ async fn run_apply_locked(
         &mut current_states,
         &unresolved_resources,
         &parsed.compositions,
+        CancellationToken::new(),
         parallelism,
     )
     .await;
@@ -1940,6 +1952,7 @@ async fn run_apply_from_plan_locked(
         &mut current_states,
         &unresolved_resources,
         plan_compositions,
+        CancellationToken::new(),
         parallelism,
     )
     .await;

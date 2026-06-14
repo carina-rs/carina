@@ -30,7 +30,10 @@ use std::sync::Mutex;
 use carina_core::config_loader::parse_directory;
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::create_plan;
-use carina_core::executor::{ExecutionInput, ExecutionObserver, UnresolvedResource, execute_plan};
+use carina_core::executor::{
+    ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult, UnresolvedResource,
+    execute_plan,
+};
 use carina_core::module_resolver::resolve_modules;
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{
@@ -40,6 +43,17 @@ use carina_core::provider::{
 use carina_core::resolver::resolve_refs_with_state_and_remote;
 use carina_core::resource::{ConcreteValue, ResourceId, State, Value};
 use carina_core::schema::SchemaRegistry;
+use tokio_util::sync::CancellationToken;
+
+fn completed_result(outcome: ExecutionOutcome) -> ExecutionResult {
+    match outcome {
+        ExecutionOutcome::Completed(result) => result,
+        ExecutionOutcome::Cancelled(result) => panic!(
+            "uncancelled execution returned Cancelled: success={}, failure={}, skip={}",
+            result.success_count, result.failure_count, result.skip_count
+        ),
+    }
+}
 
 /// cert read returns ISSUED (+ certificate_arn) immediately; other
 /// resources create/read trivially. Keeps a correct wait fast.
@@ -289,7 +303,8 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         parallelism: carina_core::executor::TEST_UNCAPPED,
     };
 
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     let failures = observer.failures.lock().unwrap().clone();
     assert_eq!(
@@ -436,7 +451,8 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         parallelism: carina_core::executor::TEST_UNCAPPED,
     };
 
-    let result = execute_plan(&provider, input, &observer).await;
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
     let failures = observer.failures.lock().unwrap().clone();
     assert_eq!(
         result.failure_count, 0,
