@@ -17,6 +17,10 @@ use super::basic::{
     execute_basic_effect, process_basic_result, refresh_pending_states,
 };
 use super::replace::{ReplaceContext, SingleEffectResult, execute_replace_parallel};
+use super::wait::{
+    InFlightKind, UnsatisfiableReason, WaitOutcome, cancel_waits_if_terminal,
+    unsatisfiable_reason_message, wait_failure_message,
+};
 use super::{ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, ProgressInfo};
 
 #[derive(Debug, Clone)]
@@ -552,6 +556,8 @@ pub(super) async fn execute_effects_sequential(
     }
 
     let mut in_flight = FuturesUnordered::new();
+    let mut in_flight_kinds: HashMap<usize, InFlightKind> = HashMap::new();
+    let mut wait_cancellers: HashMap<usize, tokio::sync::watch::Sender<bool>> = HashMap::new();
 
     loop {
         // Find newly ready effects: all deps completed and not yet dispatched
@@ -598,7 +604,15 @@ pub(super) async fn execute_effects_sequential(
 
             if let Some(failed_dep) = find_failed_dependency(effect, &failed_bindings) {
                 let c = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                let reason = format!("dependency '{}' failed", failed_dep);
+                let reason = if matches!(effect, Effect::Wait { .. }) {
+                    let detail =
+                        unsatisfiable_reason_message(&UnsatisfiableReason::DependencyFailed {
+                            binding: failed_dep,
+                        });
+                    format!("unsatisfiable: {detail}")
+                } else {
+                    format!("dependency '{}' failed", failed_dep)
+                };
                 observer.on_event(&ExecutionEvent::EffectSkipped {
                     effect,
                     reason: &reason,
@@ -646,6 +660,15 @@ pub(super) async fn execute_effects_sequential(
                 schemas: input.schemas,
             };
             let completed_ref = &completed;
+            let wait_cancel_rx = if matches!(effect, Effect::Wait { .. }) {
+                let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                wait_cancellers.insert(idx, cancel_tx);
+                in_flight_kinds.insert(idx, InFlightKind::Wait);
+                Some(cancel_rx)
+            } else {
+                in_flight_kinds.insert(idx, InFlightKind::NonWait);
+                None
+            };
 
             in_flight.push(async move {
                 let result = match effect.as_basic() {
@@ -735,43 +758,22 @@ pub(super) async fn execute_effects_sequential(
                                 completed: c,
                                 total,
                             };
-                            match super::wait::execute_wait_effect(
+                            let outcome = super::wait::execute_wait_effect(
                                 provider,
                                 target_id,
                                 wait_identifier.as_deref(),
                                 until,
                                 *timeout,
                                 *interval,
+                                wait_cancel_rx.expect("wait dispatch must have a cancel receiver"),
+                                observer,
                             )
-                            .await
-                            {
-                                Ok(state) => {
-                                    observer.on_event(&ExecutionEvent::EffectSucceeded {
-                                        effect,
-                                        state: Some(&state),
-                                        duration: started.elapsed(),
-                                        progress,
-                                    });
-                                    SingleEffectResult::Wait {
-                                        success: true,
-                                        binding: binding.clone(),
-                                        target_state: Some(state),
-                                    }
-                                }
-                                Err(e) => {
-                                    let err_msg = e.to_string();
-                                    observer.on_event(&ExecutionEvent::EffectFailed {
-                                        effect,
-                                        error: &err_msg,
-                                        duration: started.elapsed(),
-                                        progress,
-                                    });
-                                    SingleEffectResult::Wait {
-                                        success: false,
-                                        binding: binding.clone(),
-                                        target_state: None,
-                                    }
-                                }
+                            .await;
+                            SingleEffectResult::Wait {
+                                binding: binding.clone(),
+                                outcome,
+                                duration: started.elapsed(),
+                                progress,
                             }
                         }
                     },
@@ -779,6 +781,12 @@ pub(super) async fn execute_effects_sequential(
                 (idx, result)
             });
         }
+
+        let undispatched_count = actionable_indices
+            .iter()
+            .filter(|&&idx| !dispatched.contains(&idx))
+            .count();
+        cancel_waits_if_terminal(&in_flight_kinds, undispatched_count, &wait_cancellers);
 
         // If nothing is in flight, we're done (or stuck in a cycle)
         if in_flight.is_empty() {
@@ -803,6 +811,8 @@ pub(super) async fn execute_effects_sequential(
         // Wait for the next effect to complete
         let (finished_idx, result) = in_flight.next().await.unwrap();
         completed_indices.insert(finished_idx);
+        in_flight_kinds.remove(&finished_idx);
+        wait_cancellers.remove(&finished_idx);
 
         // Process the result and update shared state immediately
         match result {
@@ -856,37 +866,69 @@ pub(super) async fn execute_effects_sequential(
             }
             SingleEffectResult::ReadNoOp => {}
             SingleEffectResult::Wait {
-                success,
                 binding,
-                target_state,
-            } => {
-                if success {
+                outcome,
+                duration,
+                progress,
+            } => match outcome {
+                WaitOutcome::Satisfied { state } => {
+                    observer.on_event(&ExecutionEvent::EffectSucceeded {
+                        effect: &effects[finished_idx],
+                        state: Some(&state),
+                        duration,
+                        progress,
+                    });
                     success_count += 1;
-                    if let Some(state) = target_state {
-                        // Register the captured target snapshot under the
-                        // wait's *synthetic* ResourceId so the downstream
-                        // resolution layer can deref `<binding>.<attr>` —
-                        // and under the binding name in `bindings` so
-                        // resolve_refs sees the same attribute map. Wait
-                        // effects do not persist to the state file
-                        // (handled by `state_writeback_should_skip`).
-                        let synthetic = ResourceId::new("__wait", &binding);
-                        let attrs: HashMap<String, Value> = state
-                            .attributes
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect();
-                        input
-                            .bindings
-                            .record_applied(Some(&binding), &attrs, &state);
-                        applied_states.insert(synthetic, state);
-                    }
-                } else {
+                    // Register the captured target snapshot under the
+                    // wait's *synthetic* ResourceId so the downstream
+                    // resolution layer can deref `<binding>.<attr>` —
+                    // and under the binding name in `bindings` so
+                    // resolve_refs sees the same attribute map. Wait
+                    // effects do not persist to the state file
+                    // (handled by `state_writeback_should_skip`).
+                    let synthetic = ResourceId::new("__wait", &binding);
+                    let attrs: HashMap<String, Value> = state
+                        .attributes
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    input
+                        .bindings
+                        .record_applied(Some(&binding), &attrs, &state);
+                    applied_states.insert(synthetic, state);
+                }
+                WaitOutcome::Unsatisfiable(reason) => {
+                    let detail = unsatisfiable_reason_message(&reason);
+                    let reason = format!("unsatisfiable: {detail}");
+                    observer.on_event(&ExecutionEvent::EffectSkipped {
+                        effect: &effects[finished_idx],
+                        reason: &reason,
+                        progress,
+                    });
+                    skip_count += 1;
+                    failed_bindings.insert(binding);
+                }
+                outcome @ (WaitOutcome::Timeout { .. }
+                | WaitOutcome::NotFound(_)
+                | WaitOutcome::ReadFailed(_)) => {
+                    let error = wait_failure_message(&outcome, effects[finished_idx].resource_id());
+                    observer.on_event(&ExecutionEvent::EffectFailed {
+                        effect: &effects[finished_idx],
+                        error: &error,
+                        duration,
+                        progress,
+                    });
                     failure_count += 1;
                     failed_bindings.insert(binding);
                 }
-            }
+            },
         }
+
+        let undispatched_count = actionable_indices
+            .iter()
+            .filter(|&&idx| !dispatched.contains(&idx))
+            .count();
+        cancel_waits_if_terminal(&in_flight_kinds, undispatched_count, &wait_cancellers);
     }
 
     let failed_refreshes = refresh_pending_states(
@@ -913,8 +955,16 @@ pub(super) async fn execute_effects_sequential(
 mod tests {
     use super::*;
     use crate::effect::ChangedCreateOnly;
-    use crate::resource::{Composition, Value};
+    use crate::plan::Plan;
+    use crate::provider::{
+        BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer, ProviderError, ProviderResult,
+        ReadRequest, UpdateRequest,
+    };
+    use crate::resource::{Composition, ConcreteValue, DataSource, Value};
+    use crate::schema::SchemaRegistry;
+    use crate::wait::predicate::{AttrPath, WaitPredicate};
     use std::collections::BTreeSet;
+    use std::sync::Mutex;
 
     fn set(items: &[&str]) -> BTreeSet<String> {
         items.iter().map(|item| (*item).to_string()).collect()
@@ -964,6 +1014,133 @@ mod tests {
         }
     }
 
+    struct TerminalWaitProvider {
+        create_log: Mutex<Vec<String>>,
+    }
+
+    impl TerminalWaitProvider {
+        fn new() -> Self {
+            Self {
+                create_log: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Provider for TerminalWaitProvider {
+        fn name(&self) -> &str {
+            "terminal-wait"
+        }
+
+        fn read(
+            &self,
+            id: &ResourceId,
+            _identifier: Option<&str>,
+            _request: ReadRequest,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            let mut attrs = HashMap::new();
+            attrs.insert(
+                "status".to_string(),
+                Value::Concrete(ConcreteValue::String("PENDING_VALIDATION".to_string())),
+            );
+            let state = State::existing(id.clone(), attrs).with_identifier("cert-id");
+            Box::pin(async move { Ok(state) })
+        }
+
+        fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+            self.read(&resource.id, None, ReadRequest)
+        }
+
+        fn create(
+            &self,
+            id: &ResourceId,
+            _request: CreateRequest,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            self.create_log
+                .lock()
+                .unwrap()
+                .push(id.name_str().to_string());
+            let id = id.clone();
+            Box::pin(async move {
+                if id.name_str() == "alb" {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    Err(ProviderError::api_error("alb create failed"))
+                } else {
+                    Ok(State::existing(id, HashMap::new()).with_identifier("cert-id"))
+                }
+            })
+        }
+
+        fn update(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _request: UpdateRequest,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            Box::pin(async { Err(ProviderError::internal("update not used")) })
+        }
+
+        fn delete(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _request: DeleteRequest,
+        ) -> BoxFuture<'_, ProviderResult<()>> {
+            Box::pin(async { Err(ProviderError::internal("delete not used")) })
+        }
+    }
+
+    struct RecordingSkipObserver {
+        skipped: Mutex<Vec<String>>,
+        failures: Mutex<Vec<String>>,
+    }
+
+    impl RecordingSkipObserver {
+        fn new() -> Self {
+            Self {
+                skipped: Mutex::new(Vec::new()),
+                failures: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn skipped(&self) -> Vec<String> {
+            self.skipped.lock().unwrap().clone()
+        }
+
+        fn failures(&self) -> Vec<String> {
+            self.failures.lock().unwrap().clone()
+        }
+    }
+
+    impl ExecutionObserver for RecordingSkipObserver {
+        fn on_event(&self, event: &ExecutionEvent) {
+            match event {
+                ExecutionEvent::EffectSkipped { effect, reason, .. } => {
+                    self.skipped
+                        .lock()
+                        .unwrap()
+                        .push(format!("{}:{reason}", effect.resource_id()));
+                }
+                ExecutionEvent::EffectFailed { effect, error, .. } => {
+                    self.failures
+                        .lock()
+                        .unwrap()
+                        .push(format!("{}:{error}", effect.resource_id()));
+                }
+                ExecutionEvent::Waiting { .. }
+                | ExecutionEvent::EffectStarted { .. }
+                | ExecutionEvent::EffectSucceeded { .. }
+                | ExecutionEvent::WaitPolling { .. }
+                | ExecutionEvent::CascadeUpdateSucceeded { .. }
+                | ExecutionEvent::CascadeUpdateFailed { .. }
+                | ExecutionEvent::RenameSucceeded { .. }
+                | ExecutionEvent::RenameFailed { .. }
+                | ExecutionEvent::RefreshStarted
+                | ExecutionEvent::RefreshSucceeded { .. }
+                | ExecutionEvent::RefreshFailed { .. } => {}
+            }
+        }
+    }
+
     fn dependency_after_relax(parent: Effect, child: Effect) -> HashSet<usize> {
         let effects = vec![parent, child];
         let unresolved: HashMap<ResourceId, UnresolvedResource> = effects
@@ -981,6 +1158,88 @@ mod tests {
         let mut analysis = build_dependency_analysis(&effects, &unresolved, &[]);
         relax_update_update_edges(&effects, &mut analysis);
         analysis.into_deps_of().remove(&1).unwrap()
+    }
+
+    #[tokio::test]
+    async fn wait_marked_unsatisfiable_when_only_waits_in_flight() {
+        let provider = TerminalWaitProvider::new();
+
+        let mut cert = Resource::new("test", "cert");
+        cert.binding = Some("cert".to_string());
+        let cert_id = cert.id.clone();
+
+        let mut alb = Resource::new("test", "alb");
+        alb.binding = Some("alb".to_string());
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(cert.clone()));
+        plan.add(Effect::Wait {
+            binding: "cert_issued".to_string(),
+            target_id: cert_id.clone(),
+            target: WaitTarget::ResolvedAtApply,
+            until: WaitPredicate::Equals {
+                attr: AttrPath::single("status"),
+                value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+            },
+            until_surface: "cert.status == ISSUED".to_string(),
+            timeout: std::time::Duration::from_secs(60),
+            interval: std::time::Duration::from_millis(1),
+            explicit_dependencies: std::collections::HashSet::new(),
+        });
+        plan.add(Effect::Create(alb.clone()));
+
+        let unresolved = HashMap::from([
+            (
+                cert.id.clone(),
+                UnresolvedResource::from_pre_resolve(cert.clone()),
+            ),
+            (
+                alb.id.clone(),
+                UnresolvedResource::from_pre_resolve(alb.clone()),
+            ),
+        ]);
+        let schemas = SchemaRegistry::new();
+        let mut input = ExecutionInput {
+            plan: &plan,
+            unresolved_resources: &unresolved,
+            compositions: &[],
+            bindings: Default::default(),
+            current_states: HashMap::new(),
+            normalizer: &NoopNormalizer,
+            provider_configs: &[],
+            factories: &[],
+            schemas: &schemas,
+            parallelism: std::num::NonZeroUsize::new(2).unwrap(),
+        };
+        let observer = RecordingSkipObserver::new();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            execute_effects_sequential(&provider, &mut input, &observer),
+        )
+        .await
+        .expect("wait should be skipped as unsatisfiable instead of timing out");
+
+        assert_eq!(result.failure_count, 1, "alb create should fail");
+        assert_eq!(
+            result.skip_count, 1,
+            "wait should be skipped when only waits remain in flight"
+        );
+        assert!(
+            observer
+                .failures()
+                .iter()
+                .any(|event| event.contains("alb")),
+            "test setup should fail alb create; failures: {:?}",
+            observer.failures()
+        );
+        assert!(
+            observer.skipped().iter().any(|event| {
+                event.contains("cert") && event.to_ascii_lowercase().contains("unsatisfiable")
+            }),
+            "wait skip reason should contain unsatisfiable, skipped: {:?}",
+            observer.skipped()
+        );
     }
 
     #[test]

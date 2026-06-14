@@ -31,7 +31,7 @@ use crate::binding_index::ResolvedBindings;
 use crate::effect::Effect;
 use crate::parser::ProviderConfig;
 use crate::provider::{Provider, ProviderNormalizer};
-use crate::resource::{ResourceId, State};
+use crate::resource::{ResourceId, State, Value};
 
 use parallel::execute_effects_sequential;
 use phased::{execute_effects_phased, has_interdependent_replaces};
@@ -126,6 +126,16 @@ pub enum ExecutionEvent<'a> {
         effect: &'a Effect,
         reason: &'a str,
         progress: ProgressInfo,
+    },
+    /// Heartbeat emitted while a wait poll loop is still alive.
+    ///
+    /// Emitted at `max(30s, interval * 5)` cadence with the elapsed time and
+    /// last observed attributes so operators can see what the wait is reading.
+    WaitPolling {
+        binding: &'a str,
+        target_id: &'a ResourceId,
+        elapsed: Duration,
+        last_attrs: &'a HashMap<String, Value>,
     },
     CascadeUpdateSucceeded {
         id: &'a ResourceId,
