@@ -161,6 +161,22 @@ fn handle_tty(
                 eprintln!("  {}", msg);
             }
         }
+        ExecutionEvent::WaitPolling {
+            binding,
+            elapsed,
+            last_attrs,
+            ..
+        } => {
+            let observed = format_wait_observed_attr(last_attrs);
+            multi
+                .println(format!(
+                    "  ~ {}: waited {}, {}",
+                    binding,
+                    format_duration(*elapsed),
+                    observed
+                ))
+                .ok();
+        }
         ExecutionEvent::CascadeUpdateSucceeded { id } => {
             multi
                 .println(format!("  {} Update {} (cascade)", "✓".green(), id))
@@ -268,6 +284,20 @@ fn format_plain(event: &ExecutionEvent) -> Vec<String> {
                 counter
             )]
         }
+        ExecutionEvent::WaitPolling {
+            binding,
+            elapsed,
+            last_attrs,
+            ..
+        } => {
+            let observed = format_wait_observed_attr(last_attrs);
+            vec![format!(
+                "  ~ {}: waited {}, {}",
+                binding,
+                format_duration(*elapsed),
+                observed
+            )]
+        }
         ExecutionEvent::CascadeUpdateSucceeded { id } => {
             vec![format!("  ✓ Update {} (cascade)", id)]
         }
@@ -292,15 +322,43 @@ fn format_plain(event: &ExecutionEvent) -> Vec<String> {
     }
 }
 
+fn format_wait_observed_attr(last_attrs: &HashMap<String, carina_core::resource::Value>) -> String {
+    let mut observed: Vec<_> = last_attrs.iter().collect();
+    observed.sort_by_key(|(key, _)| *key);
+    let Some((key, value)) = observed.first() else {
+        return "no observed attributes".to_string();
+    };
+    format!("{key}={value:?}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use carina_core::effect::Effect;
     use carina_core::executor::ProgressInfo;
-    use carina_core::resource::Resource;
+    use carina_core::resource::{ConcreteValue, Resource, Value};
 
     fn dummy_create_effect() -> Effect {
         Effect::Create(Resource::new("aws.s3.Bucket", "demo"))
+    }
+
+    #[test]
+    fn wait_observed_attr_is_deterministic() {
+        let attrs = HashMap::from([
+            (
+                "status".to_string(),
+                Value::Concrete(ConcreteValue::String("pending".to_string())),
+            ),
+            (
+                "arn".to_string(),
+                Value::Concrete(ConcreteValue::String("arn:demo".to_string())),
+            ),
+        ]);
+
+        assert_eq!(
+            format_wait_observed_attr(&attrs),
+            "arn=Concrete(String(\"arn:demo\"))"
+        );
     }
 
     #[test]

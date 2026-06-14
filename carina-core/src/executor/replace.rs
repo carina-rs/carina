@@ -1,7 +1,7 @@
 //! Replace effect execution: Create-Before-Destroy (CBD) and Destroy-Before-Create (DBD).
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::binding_index::ResolvedBindings;
 use crate::differ::{
@@ -21,6 +21,7 @@ use crate::value::SecretHashContext;
 use super::basic::{
     BasicEffectResult, RenormalizePipeline, resolve_resource, resolve_resource_with_source,
 };
+use super::wait::WaitOutcome;
 use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
 
 /// Build a full attribute-diff [`UpdatePatch`] between an existing
@@ -113,9 +114,10 @@ pub(super) enum SingleEffectResult {
     /// under the wait binding for downstream resolution. On failure
     /// carries the wait binding so dependents can be marked failed.
     Wait {
-        success: bool,
         binding: String,
-        target_state: Option<State>,
+        outcome: WaitOutcome,
+        duration: Duration,
+        progress: ProgressInfo,
     },
 }
 

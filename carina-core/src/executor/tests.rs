@@ -191,6 +191,11 @@ impl ExecutionObserver for MockObserver {
             ExecutionEvent::EffectSkipped { effect, reason, .. } => {
                 format!("skipped:{}:{}", effect.resource_id(), reason)
             }
+            ExecutionEvent::WaitPolling {
+                binding, target_id, ..
+            } => {
+                format!("wait_polling:{}:{}", binding, target_id)
+            }
             ExecutionEvent::CascadeUpdateSucceeded { id } => {
                 format!("cascade_ok:{}", id)
             }
