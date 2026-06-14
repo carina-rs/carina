@@ -3,7 +3,9 @@
 //! See `notes/specs/2026-05-09-wait-construct-design.md`.
 
 pub mod augment;
+mod observation;
 pub mod predicate;
+pub use observation::WaitObservation;
 
 use predicate::AttrPath;
 

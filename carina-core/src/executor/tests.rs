@@ -184,10 +184,12 @@ fn format_execution_event(event: &ExecutionEvent<'_>) -> String {
         ExecutionEvent::EffectSkipped { effect, reason, .. } => {
             format!("skipped:{}:{}", effect.resource_id(), reason)
         }
-        ExecutionEvent::WaitPolling {
-            binding, target_id, ..
-        } => {
-            format!("wait_polling:{}:{}", binding, target_id)
+        ExecutionEvent::WaitPolling { observation, .. } => {
+            format!(
+                "wait_polling:{}:{}",
+                observation.binding(),
+                observation.target_id()
+            )
         }
         ExecutionEvent::CascadeUpdateSucceeded { id } => {
             format!("cascade_ok:{}", id)
