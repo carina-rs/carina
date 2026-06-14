@@ -217,14 +217,18 @@ pub async fn execute_plan(
     provider: &dyn Provider,
     mut input: ExecutionInput<'_>,
     observer: &dyn ExecutionObserver,
-    _cancel: CancellationToken,
+    cancel: CancellationToken,
 ) -> ExecutionOutcome {
-    let result = if has_interdependent_replaces(input.plan.effects()) {
-        execute_effects_phased(provider, &mut input, observer).await
+    let (result, was_cancelled) = if has_interdependent_replaces(input.plan.effects()) {
+        execute_effects_phased(provider, &mut input, observer, &cancel).await
     } else {
-        execute_effects_sequential(provider, &mut input, observer).await
+        execute_effects_sequential(provider, &mut input, observer, &cancel).await
     };
-    ExecutionOutcome::Completed(result)
+    if was_cancelled {
+        ExecutionOutcome::Cancelled(result)
+    } else {
+        ExecutionOutcome::Completed(result)
+    }
 }
 
 #[cfg(test)]
