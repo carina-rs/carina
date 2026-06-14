@@ -552,6 +552,19 @@ fn ok_state(id: &ResourceId) -> State {
     State::existing(id.clone(), attrs).with_identifier("id-123")
 }
 
+fn empty_execution_result() -> ExecutionResult {
+    ExecutionResult {
+        success_count: 0,
+        failure_count: 0,
+        skip_count: 0,
+        applied_states: HashMap::new(),
+        successfully_deleted: HashSet::new(),
+        permanent_name_overrides: HashMap::new(),
+        current_states: HashMap::new(),
+        failed_refreshes: HashSet::new(),
+    }
+}
+
 fn provider_config_with_default_tags(
     tags: indexmap::IndexMap<String, Value>,
 ) -> crate::parser::ProviderConfig {
@@ -571,6 +584,28 @@ fn provider_config_with_default_tags(
 // -----------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------
+
+#[test]
+fn execution_outcome_completed_and_cancelled_are_matchable() {
+    let completed = ExecutionOutcome::Completed(empty_execution_result());
+    let cancelled = ExecutionOutcome::Cancelled(empty_execution_result());
+
+    match completed {
+        ExecutionOutcome::Completed(result) => {
+            assert_eq!(result.success_count, 0);
+            assert!(result.applied_states.is_empty());
+        }
+        ExecutionOutcome::Cancelled(_) => panic!("completed outcome changed variant"),
+    }
+
+    match cancelled {
+        ExecutionOutcome::Cancelled(result) => {
+            assert_eq!(result.failure_count, 0);
+            assert!(result.successfully_deleted.is_empty());
+        }
+        ExecutionOutcome::Completed(_) => panic!("cancelled outcome changed variant"),
+    }
+}
 
 #[tokio::test]
 async fn test_simple_create() {
