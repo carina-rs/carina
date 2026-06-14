@@ -349,6 +349,30 @@ macro_rules! export_provider {
                 }
             }
 
+            fn sdk_to_wit_binding_pattern(
+                pattern: &$crate::BindingPattern,
+            ) -> wit_types::BindingPattern {
+                match pattern {
+                    $crate::BindingPattern::Exact(name) => {
+                        wit_types::BindingPattern::Exact(name.clone())
+                    }
+                    $crate::BindingPattern::ForLoopChildren { base } => {
+                        wit_types::BindingPattern::ForLoopChildren(base.clone())
+                    }
+                    $crate::BindingPattern::AttributeMatch {
+                        resource_type,
+                        attr,
+                        from,
+                    } => wit_types::BindingPattern::AttributeMatch(
+                        wit_types::AttributeMatchPattern {
+                            resource_type: resource_type.clone(),
+                            attr: attr.clone(),
+                            from: from.clone(),
+                        },
+                    ),
+                }
+            }
+
             struct WasmGuest;
 
             impl exports::carina::provider::provider::Guest for WasmGuest {
@@ -485,6 +509,18 @@ macro_rules! export_provider {
                         &proto_id,
                         wit_to_sdk_plan_op(operation),
                     )
+                }
+
+                fn satisfier_hint(
+                    target_id: wit_types::ResourceId,
+                    attr_path: Vec<String>,
+                ) -> Vec<wit_types::BindingPattern> {
+                    let provider = get_provider().lock().unwrap();
+                    let proto_id = wit_to_proto_resource_id(&target_id);
+                    $crate::CarinaProvider::satisfier_hint(&*provider, &proto_id, &attr_path)
+                        .iter()
+                        .map(sdk_to_wit_binding_pattern)
+                        .collect()
                 }
 
                 fn provider_config_completions() -> String {
@@ -868,6 +904,30 @@ macro_rules! export_provider {
                 }
             }
 
+            fn sdk_to_wit_binding_pattern(
+                pattern: &$crate::BindingPattern,
+            ) -> wit_types::BindingPattern {
+                match pattern {
+                    $crate::BindingPattern::Exact(name) => {
+                        wit_types::BindingPattern::Exact(name.clone())
+                    }
+                    $crate::BindingPattern::ForLoopChildren { base } => {
+                        wit_types::BindingPattern::ForLoopChildren(base.clone())
+                    }
+                    $crate::BindingPattern::AttributeMatch {
+                        resource_type,
+                        attr,
+                        from,
+                    } => wit_types::BindingPattern::AttributeMatch(
+                        wit_types::AttributeMatchPattern {
+                            resource_type: resource_type.clone(),
+                            attr: attr.clone(),
+                            from: from.clone(),
+                        },
+                    ),
+                }
+            }
+
             struct WasmGuest;
 
             impl exports::carina::provider::provider::Guest for WasmGuest {
@@ -1004,6 +1064,18 @@ macro_rules! export_provider {
                         &proto_id,
                         wit_to_sdk_plan_op(operation),
                     )
+                }
+
+                fn satisfier_hint(
+                    target_id: wit_types::ResourceId,
+                    attr_path: Vec<String>,
+                ) -> Vec<wit_types::BindingPattern> {
+                    let provider = get_provider().lock().unwrap();
+                    let proto_id = wit_to_proto_resource_id(&target_id);
+                    $crate::CarinaProvider::satisfier_hint(&*provider, &proto_id, &attr_path)
+                        .iter()
+                        .map(sdk_to_wit_binding_pattern)
+                        .collect()
                 }
 
                 fn provider_config_completions() -> String {

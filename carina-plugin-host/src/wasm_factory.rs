@@ -28,6 +28,8 @@ use carina_core::provider::{
 use carina_core::resource::{DataSource, Resource, ResourceId, State, Value};
 use carina_core::schema::{CompletionValue, ResourceSchema, TypeIdentity};
 use carina_core::value::SerializationError;
+use carina_core::wait::BindingPattern;
+use carina_core::wait::predicate::AttrPath;
 
 use crate::wasm_bindings::CarinaProvider;
 use crate::wasm_bindings_http::CarinaProviderWithHttp;
@@ -912,6 +914,26 @@ impl WasmBindings {
                 };
                 b.carina_provider_provider()
                     .call_required_permissions(store, id, operation)
+                    .await
+            }
+        }
+    }
+
+    async fn call_satisfier_hint(
+        &self,
+        store: &mut Store<HostState>,
+        target_id: &wit_types::ResourceId,
+        attr_path: &[String],
+    ) -> wasmtime::Result<Vec<wit_types::BindingPattern>> {
+        match self {
+            WasmBindings::Basic(b) => {
+                b.carina_provider_provider()
+                    .call_satisfier_hint(store, target_id, attr_path)
+                    .await
+            }
+            WasmBindings::Http(b) => {
+                b.carina_provider_provider()
+                    .call_satisfier_hint(store, target_id, attr_path)
                     .await
             }
         }
@@ -2122,6 +2144,39 @@ impl Provider for WasmProvider {
                     Ok(permissions) => permissions,
                     Err(e) => {
                         log::error!("WASM trap in required_permissions: {e}");
+                        Vec::new()
+                    }
+                }
+            })
+        })
+    }
+
+    fn satisfier_hint(&self, target_id: &ResourceId, attr_path: &AttrPath) -> Vec<BindingPattern> {
+        let wit_id = wasm_convert::core_to_wit_resource_id(target_id);
+        let attr_path = attr_path.segments.clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let mut locked = match LockedStore::acquire(&self.instance, "satisfier_hint").await
+                {
+                    Ok(locked) => locked,
+                    Err(e) => {
+                        log::error!("WASM satisfier_hint lock failed: {e}");
+                        return Vec::new();
+                    }
+                };
+                let call = self
+                    .instance
+                    .bindings
+                    .call_satisfier_hint(locked.store(), &wit_id, &attr_path)
+                    .await;
+                locked.disarm();
+                match call {
+                    Ok(patterns) => patterns
+                        .into_iter()
+                        .map(wasm_convert::wit_to_core_binding_pattern)
+                        .collect(),
+                    Err(e) => {
+                        log::error!("WASM trap in satisfier_hint: {e}");
                         Vec::new()
                     }
                 }

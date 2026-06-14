@@ -16,7 +16,7 @@ use crate::resource::Value;
 /// MVP only resolves a single top-level segment; nested-field traversal
 /// (`renewal_summary.renewal_status`) is reserved for a follow-up that
 /// teaches the evaluator to descend into `Value::Concrete(ConcreteValue::Map)`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AttrPath {
     pub segments: Vec<String>,
 }
