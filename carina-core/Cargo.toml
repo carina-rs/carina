@@ -20,7 +20,7 @@ argon2 = "0.5"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 indexmap = { version = "2", features = ["serde"] }
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["macros", "sync", "time"] }
 tokio-util = "0.7"
 
 [dev-dependencies]
