@@ -1188,7 +1188,7 @@ pub(crate) async fn run_state_refresh_locked(
                 &current_states,
                 &state,
             );
-        state.exports = crate::commands::shared::state_writeback::resolve_exports(
+        let resolution = crate::commands::shared::state_writeback::resolve_exports(
             &parsed.export_params,
             &sorted_resources,
             &parsed.data_sources,
@@ -1196,6 +1196,7 @@ pub(crate) async fn run_state_refresh_locked(
             &post_apply_states,
             &wait_aliases,
         )?;
+        resolution.write_into(&mut state);
     }
 
     // Save state (with or without lock validation)

@@ -370,7 +370,7 @@ pub(crate) async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), 
     if let Some(params) = input.export_params {
         let post_apply_states =
             PostApplyStates::from_current_and_state(input.current_states, &state);
-        state.exports = resolve_exports(
+        let resolution = resolve_exports(
             params,
             input.sorted_resources,
             input.data_sources,
@@ -378,6 +378,7 @@ pub(crate) async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), 
             &post_apply_states,
             input.wait_aliases,
         )?;
+        resolution.write_into(&mut state);
     }
 
     if let Some(lock) = input.lock {
@@ -478,7 +479,7 @@ pub(crate) async fn persist_exports_only(
 ) -> Result<(), AppError> {
     let mut state = state_file.unwrap_or_default();
     let post_apply_states = PostApplyStates::from_current_and_state(current_states, &state);
-    let exports = resolve_exports(
+    let resolution = resolve_exports(
         export_params,
         sorted_resources,
         data_sources,
@@ -486,7 +487,7 @@ pub(crate) async fn persist_exports_only(
         &post_apply_states,
         wait_aliases,
     )?;
-    state.exports = exports;
+    resolution.write_into(&mut state);
     if let Some(lk) = lock {
         save_state_locked(backend, lk, &mut state).await?;
     } else {
