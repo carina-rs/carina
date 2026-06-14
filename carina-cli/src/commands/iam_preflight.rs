@@ -78,6 +78,107 @@ struct DocumentFallbackResult {
     allowed_actions: BTreeSet<String>,
 }
 
+/// IAM principal ARN suitable for `iam:SimulatePrincipalPolicy`,
+/// `iam:GetRolePolicy`, and `iam:ListAttachedRolePolicies`.
+///
+/// STS session ARNs are not valid principal ARNs. Construct this value via
+/// `PolicySourceArn::from_caller_identity_arn`, which converts assumed-role and
+/// federated-user session ARNs to their underlying IAM principal ARN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PolicySourceArn(String);
+
+impl PolicySourceArn {
+    pub(crate) fn from_caller_identity_arn(arn: &str) -> Result<Self, String> {
+        let parsed = ParsedArn::parse(arn)?;
+        if parsed.service == "sts" {
+            if let Some(rest) = parsed.resource.strip_prefix("assumed-role/") {
+                let (role_name, _) = rest
+                    .split_once('/')
+                    .ok_or_else(|| format!("unsupported STS caller identity ARN: {arn}"))?;
+                if role_name.is_empty() {
+                    return Err(format!("unsupported STS caller identity ARN: {arn}"));
+                }
+                return Ok(Self(format!(
+                    "arn:{}:iam::{}:role/{}",
+                    parsed.partition, parsed.account, role_name
+                )));
+            }
+            if let Some(user_name) = parsed.resource.strip_prefix("federated-user/") {
+                if user_name.is_empty() {
+                    return Err(format!("unsupported STS caller identity ARN: {arn}"));
+                }
+                return Ok(Self(format!(
+                    "arn:{}:iam::{}:user/{}",
+                    parsed.partition, parsed.account, user_name
+                )));
+            }
+            return Err(format!("unsupported STS caller identity ARN: {arn}"));
+        }
+        if parsed.service == "iam" {
+            let supported = parsed
+                .resource
+                .strip_prefix("role/")
+                .or_else(|| parsed.resource.strip_prefix("user/"))
+                .or_else(|| parsed.resource.strip_prefix("group/"));
+            if supported.is_some_and(|name| !name.is_empty()) {
+                return Ok(Self(arn.to_string()));
+            }
+        }
+        Err(format!("unsupported caller identity ARN: {arn}"))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn role_name(&self) -> Option<&str> {
+        ParsedArn::parse(&self.0)
+            .ok()
+            .and_then(|parsed| parsed.resource.strip_prefix("role/"))
+            .and_then(|name| name.rsplit('/').next())
+            .filter(|name| !name.is_empty())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParsedArn<'a> {
+    partition: &'a str,
+    service: &'a str,
+    account: &'a str,
+    resource: &'a str,
+}
+
+impl<'a> ParsedArn<'a> {
+    fn parse(arn: &'a str) -> Result<Self, String> {
+        let mut parts = arn.splitn(6, ':');
+        let prefix = parts.next();
+        let partition = parts.next();
+        let service = parts.next();
+        let _region = parts.next();
+        let account = parts.next();
+        let resource = parts.next();
+        let (Some(prefix), Some(partition), Some(service), Some(account), Some(resource)) =
+            (prefix, partition, service, account, resource)
+        else {
+            return Err(format!("invalid ARN: {arn}"));
+        };
+        if prefix == "arn"
+            && !partition.is_empty()
+            && !service.is_empty()
+            && !account.is_empty()
+            && !resource.is_empty()
+        {
+            return Ok(Self {
+                partition,
+                service,
+                account,
+                resource,
+            });
+        }
+        Err(format!("invalid ARN: {arn}"))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SimulateError {
     NeedsFallback(String),
@@ -132,13 +233,13 @@ pub(crate) async fn run_iam_preflight(
                     (IamCheckMethod::DocumentFallback, missing)
                 }
                 Err(e) => {
-                    let actor_role_arn =
-                        role_arn_from_actor_arn(&actor_arn).unwrap_or_else(|| actor_arn.clone());
                     return IamPreflightResult::Skipped(IamPreflightSkipped {
                         reason: format!(
-                            "Warning: IAM preflight check skipped for actor {actor_arn} because IAM policy simulation was denied and IAM policies could not be read for fallback ({e}). \
-                             The actor needs `iam:SimulatePrincipalPolicy` (with `Resource = {actor_role_arn}`) OR `iam:GetRolePolicy` + `iam:ListAttachedRolePolicies` for the fallback path. \
-                             Add the grant to enable --check-iam."
+                            "Warning: IAM preflight check skipped for actor {} because IAM policy simulation was denied and IAM policies could not be read for fallback ({e}). \
+                             The actor needs `iam:SimulatePrincipalPolicy` (with `Resource = {}`) OR `iam:GetRolePolicy` + `iam:ListAttachedRolePolicies` for the fallback path. \
+                             Add the grant to enable --check-iam.",
+                            actor_arn.as_str(),
+                            actor_arn.as_str(),
                         ),
                     });
                 }
@@ -154,7 +255,7 @@ pub(crate) async fn run_iam_preflight(
     };
 
     let report = IamPreflightReport {
-        actor_arn,
+        actor_arn: actor_arn.as_str().to_string(),
         method,
         source_providers: plan_provider_names(plan),
         missing_by_effect: group_missing_by_effect(&required, &missing_actions),
@@ -291,16 +392,16 @@ pub(crate) fn should_fail_strict(result: &IamPreflightResult) -> bool {
     )
 }
 
-async fn resolve_actor_arn(sts_client: &aws_sdk_sts::Client) -> Result<String, String> {
+async fn resolve_actor_arn(sts_client: &aws_sdk_sts::Client) -> Result<PolicySourceArn, String> {
     let output = sts_client
         .get_caller_identity()
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    output
+    let arn = output
         .arn()
-        .map(str::to_string)
-        .ok_or_else(|| "GetCallerIdentity returned no ARN".to_string())
+        .ok_or_else(|| "GetCallerIdentity returned no ARN".to_string())?;
+    PolicySourceArn::from_caller_identity_arn(arn)
 }
 
 fn unique_actions(required: &[RequiredAction]) -> BTreeSet<String> {
@@ -308,7 +409,7 @@ fn unique_actions(required: &[RequiredAction]) -> BTreeSet<String> {
 }
 
 async fn simulate(
-    actor_arn: &str,
+    actor_arn: &PolicySourceArn,
     actions: &BTreeSet<String>,
     iam_client: &aws_sdk_iam::Client,
 ) -> Result<SimulationResult, SimulateError> {
@@ -317,7 +418,7 @@ async fn simulate(
     loop {
         let mut request = iam_client
             .simulate_principal_policy()
-            .policy_source_arn(actor_arn)
+            .policy_source_arn(actor_arn.as_str())
             .resource_arns("*")
             .set_marker(marker.clone());
         for action in actions {
@@ -349,17 +450,18 @@ async fn simulate(
 }
 
 async fn document_fallback(
-    actor_arn: &str,
+    actor_arn: &PolicySourceArn,
     actions: &BTreeSet<String>,
     iam_client: &aws_sdk_iam::Client,
 ) -> Result<DocumentFallbackResult, String> {
-    let role_name = role_name_from_actor_arn(actor_arn)
-        .ok_or_else(|| format!("actor ARN is not an IAM role or assumed role: {actor_arn}"))?;
+    let role_name = actor_arn
+        .role_name()
+        .ok_or_else(|| format!("actor ARN is not an IAM role: {}", actor_arn.as_str()))?;
     let mut allowed_actions = BTreeSet::new();
 
     let inline_policy_names = iam_client
         .list_role_policies()
-        .role_name(&role_name)
+        .role_name(role_name)
         .send()
         .await
         .map_err(|e| e.to_string())?
@@ -368,7 +470,7 @@ async fn document_fallback(
     for policy_name in inline_policy_names {
         let output = iam_client
             .get_role_policy()
-            .role_name(&role_name)
+            .role_name(role_name)
             .policy_name(policy_name)
             .send()
             .await
@@ -382,7 +484,7 @@ async fn document_fallback(
 
     let attached = iam_client
         .list_attached_role_policies()
-        .role_name(&role_name)
+        .role_name(role_name)
         .send()
         .await
         .map_err(|e| e.to_string())?
@@ -466,15 +568,17 @@ fn collect_allowed_actions_from_policy(
 }
 
 fn action_patterns(value: Option<&JsonValue>) -> Vec<String> {
-    match value {
-        Some(JsonValue::String(action)) => vec![action.clone()],
-        Some(JsonValue::Array(actions)) => actions
+    if let Some(JsonValue::String(action)) = value {
+        return vec![action.clone()];
+    }
+    if let Some(JsonValue::Array(actions)) = value {
+        return actions
             .iter()
             .filter_map(JsonValue::as_str)
             .map(str::to_string)
-            .collect(),
-        _ => Vec::new(),
+            .collect();
     }
+    Vec::new()
 }
 
 fn action_matches(pattern: &str, action: &str) -> bool {
@@ -545,25 +649,6 @@ fn group_missing_by_effect(
         .collect()
 }
 
-fn role_name_from_actor_arn(actor_arn: &str) -> Option<String> {
-    if let Some(rest) = actor_arn.split(":assumed-role/").nth(1) {
-        return rest.split('/').next().map(str::to_string);
-    }
-    if let Some(rest) = actor_arn.split(":role/").nth(1) {
-        return rest.rsplit('/').next().map(str::to_string);
-    }
-    None
-}
-
-fn role_arn_from_actor_arn(actor_arn: &str) -> Option<String> {
-    if actor_arn.contains(":role/") {
-        return Some(actor_arn.to_string());
-    }
-    let account = actor_arn.split(":sts::").nth(1)?.split(':').next()?;
-    let role_name = role_name_from_actor_arn(actor_arn)?;
-    Some(format!("arn:aws:iam::{account}:role/{role_name}"))
-}
-
 fn classify_simulate_error(err: SimulatePrincipalPolicyError) -> SimulateError {
     let code = err
         .meta()
@@ -574,18 +659,7 @@ fn classify_simulate_error(err: SimulatePrincipalPolicyError) -> SimulateError {
         return SimulateError::NeedsFallback(format_simulate_error(&err));
     }
 
-    // The generated enum is #[non_exhaustive], and IAM may return operation-level
-    // errors such as AccessDenied through generic metadata instead of a named
-    // variant. Match every known variant, then classify future/generic variants
-    // through the same metadata formatter.
-    match err {
-        SimulatePrincipalPolicyError::InvalidInputException(_)
-        | SimulatePrincipalPolicyError::NoSuchEntityException(_)
-        | SimulatePrincipalPolicyError::PolicyEvaluationException(_) => {
-            SimulateError::Other(format_simulate_error(&err))
-        }
-        _ => SimulateError::Other(format_simulate_error(&err)),
-    }
+    SimulateError::Other(format_simulate_error(&err))
 }
 
 fn format_simulate_error(err: &SimulatePrincipalPolicyError) -> String {
@@ -620,13 +694,13 @@ fn permission_source_lines(report: &IamPreflightReport) -> Vec<String> {
 
 #[cfg(test)]
 fn build_simulate_input_for_test(
-    actor_arn: &str,
+    actor_arn: &PolicySourceArn,
     actions: &BTreeSet<String>,
     marker: Option<String>,
 ) -> aws_sdk_iam::operation::simulate_principal_policy::SimulatePrincipalPolicyInput {
     let mut builder =
         aws_sdk_iam::operation::simulate_principal_policy::SimulatePrincipalPolicyInput::builder()
-            .policy_source_arn(actor_arn)
+            .policy_source_arn(actor_arn.as_str())
             .resource_arns("*")
             .set_marker(marker);
     for action in actions {
@@ -915,26 +989,74 @@ IAM preflight findings (1 warning):
     }
 
     #[test]
-    fn role_name_parses_iam_role_and_assumed_role_arns() {
-        assert_eq!(
-            role_name_from_actor_arn("arn:aws:sts::123456789012:assumed-role/deploy/session"),
-            Some("deploy".to_string())
-        );
-        assert_eq!(
-            role_name_from_actor_arn("arn:aws:iam::123456789012:role/path/deploy"),
-            Some("deploy".to_string())
-        );
-        assert_eq!(
-            role_name_from_actor_arn("arn:aws:iam::123456789012:user/alice"),
-            None
-        );
+    fn policy_source_arn_normalizes_caller_identity_arns() {
+        let cases = [
+            (
+                "arn:aws:sts::123456789012:assumed-role/deploy/session",
+                "arn:aws:iam::123456789012:role/deploy",
+            ),
+            (
+                "arn:aws:sts::123456789012:federated-user/alice",
+                "arn:aws:iam::123456789012:user/alice",
+            ),
+            (
+                "arn:aws:iam::123456789012:role/deploy",
+                "arn:aws:iam::123456789012:role/deploy",
+            ),
+            (
+                "arn:aws:iam::123456789012:user/alice",
+                "arn:aws:iam::123456789012:user/alice",
+            ),
+            (
+                "arn:aws:iam::123456789012:group/admins",
+                "arn:aws:iam::123456789012:group/admins",
+            ),
+            (
+                "arn:aws:sts::123456789012:assumed-role/deploy/session/with/slashes",
+                "arn:aws:iam::123456789012:role/deploy",
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let arn = PolicySourceArn::from_caller_identity_arn(input)
+                .expect("caller identity ARN should normalize");
+
+            assert_eq!(arn.as_str(), expected);
+        }
     }
 
     #[test]
-    fn role_arn_parses_assumed_role_for_simulate_resource_hint() {
+    fn policy_source_arn_rejects_unsupported_shapes() {
+        assert!(PolicySourceArn::from_caller_identity_arn("not-an-arn").is_err());
+    }
+
+    #[test]
+    fn policy_source_arn_role_name_only_returns_iam_roles() {
+        let role =
+            PolicySourceArn::from_caller_identity_arn("arn:aws:iam::123456789012:role/deploy")
+                .expect("role ARN should normalize");
+        let user =
+            PolicySourceArn::from_caller_identity_arn("arn:aws:iam::123456789012:user/alice")
+                .expect("user ARN should normalize");
+        let group =
+            PolicySourceArn::from_caller_identity_arn("arn:aws:iam::123456789012:group/admins")
+                .expect("group ARN should normalize");
+
+        assert_eq!(role.role_name(), Some("deploy"));
+        assert_eq!(user.role_name(), None);
+        assert_eq!(group.role_name(), None);
+    }
+
+    #[test]
+    fn policy_source_arn_normalizes_issue_assumed_role_session() {
+        let arn = PolicySourceArn::from_caller_identity_arn(
+            "arn:aws:sts::151116838382:assumed-role/carina-registry-publish-deploy/1781434654872024000",
+        )
+        .expect("issue actor ARN should normalize");
+
         assert_eq!(
-            role_arn_from_actor_arn("arn:aws:sts::123456789012:assumed-role/deploy/session"),
-            Some("arn:aws:iam::123456789012:role/deploy".to_string())
+            arn.as_str(),
+            "arn:aws:iam::151116838382:role/carina-registry-publish-deploy"
         );
     }
 
@@ -944,16 +1066,16 @@ IAM preflight findings (1 warning):
             "ec2:DescribeInternetGateways".to_string(),
             "iam:CreateServiceLinkedRole".to_string(),
         ]);
-
-        let input = build_simulate_input_for_test(
+        let actor = PolicySourceArn::from_caller_identity_arn(
             "arn:aws:sts::123456789012:assumed-role/deploy/session",
-            &actions,
-            Some("next-page".to_string()),
-        );
+        )
+        .expect("actor ARN should normalize");
+
+        let input = build_simulate_input_for_test(&actor, &actions, Some("next-page".to_string()));
 
         assert_eq!(
             input.policy_source_arn(),
-            Some("arn:aws:sts::123456789012:assumed-role/deploy/session")
+            Some("arn:aws:iam::123456789012:role/deploy")
         );
         assert_eq!(
             input.action_names(),
