@@ -400,6 +400,9 @@ async fn main() {
             force,
             parallelism,
         } => {
+            // TODO(T7/T8): replace this fresh token with one fed by the signal listener.
+            // Until then, real SIGINT/SIGTERM still drops the future via signal::run_with_ctrl_c.
+            let cancel_token = tokio_util::sync::CancellationToken::new();
             run_destroy(
                 &path,
                 auto_approve,
@@ -408,6 +411,7 @@ async fn main() {
                 force,
                 parallelism,
                 &provider_context,
+                cancel_token,
             )
             .await
         }
