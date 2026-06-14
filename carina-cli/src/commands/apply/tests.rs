@@ -1796,27 +1796,39 @@ fn emit_newline_on_interrupt_writes_nothing_on_other_error() {
     assert!(buf.is_empty());
 }
 
+struct NeverReady;
+
+impl tokio::io::AsyncRead for NeverReady {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        _: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Pending
+    }
+}
+
 #[tokio::test]
 async fn confirm_apply_returns_confirmed_on_yes() {
     let input = &b"yes\n"[..];
-    let interrupt = std::future::pending::<()>();
-    let outcome = confirm_apply(input, interrupt, false).await.unwrap();
+    let cancel = CancellationToken::new();
+    let outcome = confirm_apply(input, cancel, false).await.unwrap();
     assert_eq!(outcome, ApplyConfirmation::Confirmed);
 }
 
 #[tokio::test]
 async fn confirm_apply_returns_cancelled_on_no() {
     let input = &b"no\n"[..];
-    let interrupt = std::future::pending::<()>();
-    let outcome = confirm_apply(input, interrupt, false).await.unwrap();
+    let cancel = CancellationToken::new();
+    let outcome = confirm_apply(input, cancel, false).await.unwrap();
     assert_eq!(outcome, ApplyConfirmation::Cancelled);
 }
 
 #[tokio::test]
 async fn confirm_apply_returns_cancelled_on_empty_input() {
     let input = &b"\n"[..];
-    let interrupt = std::future::pending::<()>();
-    let outcome = confirm_apply(input, interrupt, false).await.unwrap();
+    let cancel = CancellationToken::new();
+    let outcome = confirm_apply(input, cancel, false).await.unwrap();
     assert_eq!(outcome, ApplyConfirmation::Cancelled);
 }
 
@@ -1824,27 +1836,28 @@ async fn confirm_apply_returns_cancelled_on_empty_input() {
 async fn confirm_apply_auto_approve_skips_read() {
     // Reader would hang forever; auto_approve must short-circuit without reading.
     let input = tokio::io::BufReader::new(tokio::io::empty());
-    let interrupt = std::future::pending::<()>();
-    let outcome = confirm_apply(input, interrupt, true).await.unwrap();
+    let cancel = CancellationToken::new();
+    let outcome = confirm_apply(input, cancel, true).await.unwrap();
     assert_eq!(outcome, ApplyConfirmation::Confirmed);
 }
 
 #[tokio::test]
-async fn confirm_apply_propagates_interrupt() {
-    // A reader that never resolves, to force the interrupt path.
-    struct NeverReady;
-    impl tokio::io::AsyncRead for NeverReady {
-        fn poll_read(
-            self: std::pin::Pin<&mut Self>,
-            _: &mut std::task::Context<'_>,
-            _: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Pending
-        }
-    }
+async fn confirm_apply_returns_interrupted_when_cancel_fires_after_subscription() {
     let reader = tokio::io::BufReader::new(NeverReady);
-    let interrupt = async {};
-    let err = confirm_apply(reader, interrupt, false).await.unwrap_err();
+    let cancel = CancellationToken::new();
+    let waiting = tokio::spawn(confirm_apply(reader, cancel.clone(), false));
+    tokio::task::yield_now().await;
+    cancel.cancel();
+    let err = waiting.await.unwrap().unwrap_err();
+    assert!(matches!(err, AppError::Interrupted));
+}
+
+#[tokio::test]
+async fn confirm_apply_returns_interrupted_when_cancel_token_fires() {
+    let token = CancellationToken::new();
+    token.cancel();
+    let reader = tokio::io::BufReader::new(NeverReady);
+    let err = confirm_apply(reader, token, false).await.unwrap_err();
     assert!(matches!(err, AppError::Interrupted));
 }
 
