@@ -3,6 +3,7 @@ pub mod destroy;
 pub mod docs;
 pub mod export;
 pub mod fmt;
+pub(crate) mod iam_preflight;
 pub mod init;
 pub mod lint;
 pub mod migrate_state;

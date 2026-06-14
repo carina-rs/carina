@@ -411,8 +411,8 @@ pub async fn run_plan(
     tui: bool,
     refresh: bool,
     json: bool,
-    _check_iam: bool,
-    _strict_iam: bool,
+    check_iam: bool,
+    strict_iam: bool,
     provider_context: &ProviderContext,
 ) -> Result<bool, AppError> {
     let loaded = load_configuration_with_config(
@@ -717,6 +717,26 @@ pub async fn run_plan(
             "{} resource(s) have prevent_destroy set and cannot be deleted or replaced",
             ctx.plan.errors().len()
         )));
+    }
+
+    let iam_preflight_result = if check_iam {
+        let result =
+            crate::commands::iam_preflight::run_iam_preflight(&ctx.plan, &ctx.provider, strict_iam)
+                .await;
+        crate::commands::iam_preflight::emit_warnings(&result);
+        Some(result)
+    } else {
+        None
+    };
+    let iam_strict_failed = strict_iam
+        && iam_preflight_result
+            .as_ref()
+            .is_some_and(crate::commands::iam_preflight::should_fail_strict);
+
+    if iam_strict_failed {
+        return Err(AppError::Validation(
+            "IAM preflight check failed in strict mode".to_string(),
+        ));
     }
 
     // Build delete attributes map from current states for display
