@@ -577,16 +577,14 @@ fn classify_simulate_error(err: SimulatePrincipalPolicyError) -> SimulateError {
     // The generated enum is #[non_exhaustive], and IAM may return operation-level
     // errors such as AccessDenied through generic metadata instead of a named
     // variant. Match every known variant, then classify future/generic variants
-    // by their service error code.
+    // through the same metadata formatter.
     match err {
         SimulatePrincipalPolicyError::InvalidInputException(_)
         | SimulatePrincipalPolicyError::NoSuchEntityException(_)
-        | SimulatePrincipalPolicyError::PolicyEvaluationException(_) => SimulateError::Other(
-            format!("AWS IAM SimulatePrincipalPolicy failed with code {code}"),
-        ),
-        _ => SimulateError::Other(format!(
-            "AWS IAM SimulatePrincipalPolicy failed with code {code}"
-        )),
+        | SimulatePrincipalPolicyError::PolicyEvaluationException(_) => {
+            SimulateError::Other(format_simulate_error(&err))
+        }
+        _ => SimulateError::Other(format_simulate_error(&err)),
     }
 }
 
@@ -834,7 +832,7 @@ IAM preflight findings (1 warning):
     }
 
     #[test]
-    fn classify_simulate_non_access_denied_reports_service_code() {
+    fn classify_simulate_non_access_denied_reports_service_code_and_message() {
         let err = SimulatePrincipalPolicyError::generic(
             ErrorMetadata::builder()
                 .code("ThrottlingException")
@@ -846,6 +844,30 @@ IAM preflight findings (1 warning):
             classify_simulate_error(err),
             SimulateError::Other(message)
                 if message.contains("code ThrottlingException")
+                    && message.contains("rate exceeded")
+                    && !message.contains("service error")
+        ));
+    }
+
+    #[test]
+    fn classify_simulate_named_error_reports_service_message() {
+        let err = SimulatePrincipalPolicyError::InvalidInputException(
+            aws_sdk_iam::types::error::InvalidInputException::builder()
+                .message("ResourceArns cannot be used with ec2:DescribeInternetGateways")
+                .meta(
+                    ErrorMetadata::builder()
+                        .code("InvalidInput")
+                        .message("ResourceArns cannot be used with ec2:DescribeInternetGateways")
+                        .build(),
+                )
+                .build(),
+        );
+
+        assert!(matches!(
+            classify_simulate_error(err),
+            SimulateError::Other(message)
+                if message.contains("code InvalidInput")
+                    && message.contains("ResourceArns cannot be used with ec2:DescribeInternetGateways")
                     && !message.contains("service error")
         ));
     }
