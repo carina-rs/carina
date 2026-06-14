@@ -122,6 +122,7 @@ mod tests {
             successfully_deleted: HashSet::new(),
             permanent_name_overrides: HashMap::new(),
             current_states: HashMap::new(),
+            bindings: carina_core::binding_index::ResolvedBindings::default(),
             failed_refreshes: HashSet::new(),
         }
     }

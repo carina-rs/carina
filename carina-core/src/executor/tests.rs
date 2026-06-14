@@ -588,6 +588,7 @@ fn empty_execution_result() -> ExecutionResult {
         successfully_deleted: HashSet::new(),
         permanent_name_overrides: HashMap::new(),
         current_states: HashMap::new(),
+        bindings: ResolvedBindings::default(),
         failed_refreshes: HashSet::new(),
     }
 }

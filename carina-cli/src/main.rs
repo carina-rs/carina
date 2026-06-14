@@ -367,10 +367,29 @@ async fn main() {
             lock,
             parallelism,
         } => {
+            // TODO(T7/T8): replace this fresh token with one fed by the signal listener.
+            // Until then, real SIGINT/SIGTERM still drops the future via signal::run_with_ctrl_c.
+            let cancel_token = tokio_util::sync::CancellationToken::new();
             if path.extension().is_some_and(|ext| ext == "json") {
-                run_apply_from_plan(&path, auto_approve, lock, parallelism, &provider_context).await
+                run_apply_from_plan(
+                    &path,
+                    auto_approve,
+                    lock,
+                    parallelism,
+                    &provider_context,
+                    cancel_token,
+                )
+                .await
             } else {
-                run_apply(&path, auto_approve, lock, parallelism, &provider_context).await
+                run_apply(
+                    &path,
+                    auto_approve,
+                    lock,
+                    parallelism,
+                    &provider_context,
+                    cancel_token,
+                )
+                .await
             }
         }
         Commands::Destroy {
