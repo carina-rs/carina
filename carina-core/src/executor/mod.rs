@@ -31,7 +31,8 @@ use crate::binding_index::ResolvedBindings;
 use crate::effect::Effect;
 use crate::parser::ProviderConfig;
 use crate::provider::{Provider, ProviderNormalizer};
-use crate::resource::{ResourceId, State, Value};
+use crate::resource::{ResourceId, State};
+use crate::wait::WaitObservation;
 
 use parallel::execute_effects_sequential;
 use phased::{execute_effects_phased, has_interdependent_replaces};
@@ -166,10 +167,8 @@ pub enum ExecutionEvent<'a> {
     /// Emitted at `max(30s, interval * 5)` cadence with the elapsed time and
     /// last observed attributes so operators can see what the wait is reading.
     WaitPolling {
-        binding: &'a str,
-        target_id: &'a ResourceId,
+        observation: WaitObservation<'a>,
         elapsed: Duration,
-        last_attrs: &'a HashMap<String, Value>,
     },
     CascadeUpdateSucceeded {
         id: &'a ResourceId,

@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use carina_core::executor::{ExecutionEvent, ExecutionObserver};
 use carina_core::plan::Plan;
-use carina_core::resource::Value;
 use carina_core::value::format_value_user_facing;
+use carina_core::wait::WaitObservation;
 use colored::Colorize;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
@@ -164,19 +164,11 @@ fn handle_tty(
             }
         }
         ExecutionEvent::WaitPolling {
-            binding,
+            observation,
             elapsed,
-            last_attrs,
-            ..
         } => {
-            let observed = format_wait_observed_attr(last_attrs);
             multi
-                .println(format!(
-                    "  ~ {}: waited {}, {}",
-                    binding,
-                    format_duration(*elapsed),
-                    observed
-                ))
+                .println(format_wait_polling_line(observation, *elapsed))
                 .ok();
         }
         ExecutionEvent::CascadeUpdateSucceeded { id } => {
@@ -287,19 +279,9 @@ fn format_plain(event: &ExecutionEvent) -> Vec<String> {
             )]
         }
         ExecutionEvent::WaitPolling {
-            binding,
+            observation,
             elapsed,
-            last_attrs,
-            ..
-        } => {
-            let observed = format_wait_observed_attr(last_attrs);
-            vec![format!(
-                "  ~ {}: waited {}, {}",
-                binding,
-                format_duration(*elapsed),
-                observed
-            )]
-        }
+        } => vec![format_wait_polling_line(observation, *elapsed)],
         ExecutionEvent::CascadeUpdateSucceeded { id } => {
             vec![format!("  ✓ Update {} (cascade)", id)]
         }
@@ -324,8 +306,23 @@ fn format_plain(event: &ExecutionEvent) -> Vec<String> {
     }
 }
 
-fn format_wait_observed_attr(last_attrs: &HashMap<String, Value>) -> String {
-    let mut observed: Vec<_> = last_attrs.iter().collect();
+fn format_wait_polling_line(observation: &WaitObservation, elapsed: Duration) -> String {
+    let observed = format_wait_observed_attr(observation);
+    format!(
+        "  ~ {}: waited {}, {}",
+        observation.binding(),
+        format_duration(elapsed),
+        observed
+    )
+}
+
+fn format_wait_observed_attr(observation: &WaitObservation) -> String {
+    if let Some((attr, value)) = observation.primary() {
+        let key = attr.segments.join(".");
+        return format!("{key}={}", format_value_user_facing(value));
+    }
+
+    let mut observed: Vec<_> = observation.last_attrs().iter().collect();
     observed.sort_by_key(|(key, _)| *key);
     let Some((key, value)) = observed.first() else {
         return "no observed attributes".to_string();
@@ -338,14 +335,34 @@ mod tests {
     use super::*;
     use carina_core::effect::Effect;
     use carina_core::executor::ProgressInfo;
-    use carina_core::resource::{ConcreteValue, DeferredValue, Resource, UnknownReason};
+    use carina_core::resource::{
+        ConcreteValue, DeferredValue, Resource, ResourceId, UnknownReason, Value,
+    };
+    use carina_core::wait::predicate::{AttrPath, WaitPredicate};
+    use indexmap::IndexMap;
 
     fn dummy_create_effect() -> Effect {
         Effect::Create(Resource::new("aws.s3.Bucket", "demo"))
     }
 
+    fn wait_observation<'a>(
+        target_id: &'a ResourceId,
+        predicate: &'a WaitPredicate,
+        last_attrs: &'a HashMap<String, Value>,
+    ) -> WaitObservation<'a> {
+        WaitObservation::new("demo_ready", target_id, predicate, last_attrs)
+    }
+
+    fn equals_predicate(attr: AttrPath, value: &str) -> WaitPredicate {
+        WaitPredicate::Equals {
+            attr,
+            value: Value::Concrete(ConcreteValue::String(value.to_string())),
+        }
+    }
+
     #[test]
     fn wait_observed_attr_is_deterministic() {
+        let target_id = ResourceId::new("aws.test.Resource", "demo");
         let attrs = HashMap::from([
             (
                 "status".to_string(),
@@ -356,34 +373,104 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("arn:demo".to_string())),
             ),
         ]);
+        let predicate = equals_predicate(AttrPath::single("missing"), "present");
+        let observation = wait_observation(&target_id, &predicate, &attrs);
 
-        assert_eq!(format_wait_observed_attr(&attrs), "arn=arn:demo");
+        assert_eq!(format_wait_observed_attr(&observation), "arn=arn:demo");
+    }
+
+    #[test]
+    fn wait_observed_attr_uses_predicate_attr_when_present() {
+        let target_id = ResourceId::new("aws.test.Resource", "demo");
+        let status = AttrPath::single("status");
+        let predicate = equals_predicate(status, "pending");
+        let attrs = HashMap::from([
+            (
+                "arn".to_string(),
+                Value::Concrete(ConcreteValue::String("arn:demo".to_string())),
+            ),
+            (
+                "status".to_string(),
+                Value::Concrete(ConcreteValue::String("pending".to_string())),
+            ),
+        ]);
+        let observation = wait_observation(&target_id, &predicate, &attrs);
+
+        assert_eq!(format_wait_observed_attr(&observation), "status=pending");
+    }
+
+    #[test]
+    fn wait_observed_attr_formats_multi_segment_predicate_attr() {
+        let target_id = ResourceId::new("aws.test.Resource", "demo");
+        let renewal_status = AttrPath {
+            segments: vec!["renewal_summary".to_string(), "renewal_status".to_string()],
+        };
+        let predicate = equals_predicate(renewal_status, "PENDING");
+        let attrs = HashMap::from([(
+            "renewal_summary".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "renewal_status".to_string(),
+                Value::Concrete(ConcreteValue::String("PENDING".to_string())),
+            )]))),
+        )]);
+        let observation = wait_observation(&target_id, &predicate, &attrs);
+
+        assert_eq!(
+            format_wait_observed_attr(&observation),
+            "renewal_summary.renewal_status=PENDING"
+        );
+    }
+
+    #[test]
+    fn wait_observed_attr_falls_back_to_sort_first_when_predicate_attr_missing() {
+        let target_id = ResourceId::new("aws.test.Resource", "demo");
+        let xyz = AttrPath::single("xyz");
+        let predicate = equals_predicate(xyz, "present");
+        let attrs = HashMap::from([
+            (
+                "status".to_string(),
+                Value::Concrete(ConcreteValue::String("pending".to_string())),
+            ),
+            (
+                "arn".to_string(),
+                Value::Concrete(ConcreteValue::String("arn:demo".to_string())),
+            ),
+        ]);
+        let observation = wait_observation(&target_id, &predicate, &attrs);
+
+        assert_eq!(format_wait_observed_attr(&observation), "arn=arn:demo");
     }
 
     #[test]
     fn wait_observed_attr_uses_display_formatting() {
+        let target_id = ResourceId::new("aws.test.Resource", "demo");
         let attrs = HashMap::from([(
             "arn".to_string(),
             Value::Concrete(ConcreteValue::String(
                 "arn:aws:acm:1:certificate/abc".to_string(),
             )),
         )]);
+        let predicate = equals_predicate(AttrPath::single("missing"), "present");
+        let observation = wait_observation(&target_id, &predicate, &attrs);
 
         assert_eq!(
-            format_wait_observed_attr(&attrs),
+            format_wait_observed_attr(&observation),
             "arn=arn:aws:acm:1:certificate/abc"
         );
     }
 
     #[test]
     fn wait_observed_attr_handles_unknown_value() {
+        let target_id = ResourceId::new("aws.test.Resource", "demo");
         let attrs = HashMap::from([(
             "status".to_string(),
             Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
         )]);
+        let predicate = equals_predicate(AttrPath::single("missing"), "present");
+        let observation = wait_observation(&target_id, &predicate, &attrs);
 
         assert_eq!(
-            format_wait_observed_attr(&attrs),
+            format_wait_observed_attr(&observation),
             "status=(known after upstream apply)"
         );
     }

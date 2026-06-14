@@ -20,6 +20,7 @@ use crate::executor::{ExecutionEvent, ExecutionObserver};
 use crate::provider::{Provider, ProviderError, ReadRequest};
 use crate::resource::{ResourceId, State, Value};
 use crate::value::format_value_user_facing;
+use crate::wait::WaitObservation;
 use crate::wait::predicate::WaitPredicate;
 
 /// Outcome of polling a Wait effect. The variants distinguish:
@@ -366,11 +367,10 @@ pub(crate) async fn execute_wait_effect_with_heartbeat_gap(
             .map(|last| now.duration_since(last) >= heartbeat_gap)
             .unwrap_or(true);
         if should_emit_heartbeat {
+            let observation = WaitObservation::new(binding, target_id, until, &state.attributes);
             observer.on_event(&ExecutionEvent::WaitPolling {
-                binding,
-                target_id,
+                observation,
                 elapsed: start.elapsed(),
-                last_attrs: &state.attributes,
             });
             last_heartbeat_at = Some(now);
         }
@@ -530,7 +530,7 @@ mod tests {
     }
 
     struct HeartbeatObserver {
-        heartbeats: Mutex<Vec<Instant>>,
+        heartbeats: Mutex<Vec<(Instant, Vec<AttrPath>)>>,
     }
 
     impl HeartbeatObserver {
@@ -540,15 +540,23 @@ mod tests {
             }
         }
 
-        fn heartbeats(&self) -> Vec<Instant> {
+        fn heartbeats(&self) -> Vec<(Instant, Vec<AttrPath>)> {
             self.heartbeats.lock().unwrap().clone()
         }
     }
 
     impl ExecutionObserver for HeartbeatObserver {
         fn on_event(&self, event: &ExecutionEvent) {
-            if let ExecutionEvent::WaitPolling { .. } = event {
-                self.heartbeats.lock().unwrap().push(Instant::now());
+            if let ExecutionEvent::WaitPolling { observation, .. } = event {
+                let watched_attrs = observation
+                    .watched_attrs()
+                    .iter()
+                    .map(|attr| (*attr).clone())
+                    .collect();
+                self.heartbeats
+                    .lock()
+                    .unwrap()
+                    .push((Instant::now(), watched_attrs));
             }
         }
     }
@@ -836,8 +844,9 @@ mod tests {
             !heartbeats.is_empty(),
             "wait should emit at least one WaitPolling heartbeat"
         );
+        assert_eq!(heartbeats[0].1, vec![AttrPath::single("status")]);
         for pair in heartbeats.windows(2) {
-            let gap = pair[1].duration_since(pair[0]);
+            let gap = pair[1].0.duration_since(pair[0].0);
             assert!(
                 gap >= Duration::from_millis(5),
                 "heartbeat gap should respect max(30s, interval * 5) with test seam, got {gap:?}"
