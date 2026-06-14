@@ -227,6 +227,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminate_and_interrupt_events_share_the_same_cancel_path() {
+        // T12 contract: the listener treats Interrupt and Terminate identically.
+        // Both fire token.cancel() and neither call exit on the first signal.
+        // This pins the design so a future change cannot accidentally introduce
+        // signal-kind-specific behavior at the listener layer.
+        for signal in [ShutdownSignal::Interrupt, ShutdownSignal::Terminate] {
+            let token = CancellationToken::new();
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let exit_calls = Arc::new(Mutex::new(Vec::<i32>::new()));
+            let exit = RecordingExit {
+                calls: Arc::clone(&exit_calls),
+            };
+
+            let task = tokio::spawn(listen_for_shutdown_events(
+                token.clone(),
+                SignalEvents::from_receiver(rx),
+                exit,
+            ));
+            tx.send(signal).unwrap();
+            token.cancelled().await;
+
+            assert!(token.is_cancelled(), "{signal:?} must cancel the token");
+            assert_eq!(
+                *exit_calls.lock().unwrap(),
+                Vec::<i32>::new(),
+                "{signal:?} must not exit on first signal"
+            );
+
+            drop(tx);
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn signal_listener_calls_exit_130_on_second_interrupt() {
         let token = CancellationToken::new();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
