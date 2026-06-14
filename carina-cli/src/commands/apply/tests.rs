@@ -69,6 +69,54 @@ async fn run_apply_cancelled_after_partial_execution_persists_state_and_releases
     assert!(!fixture.lock_path().exists());
 }
 
+#[tokio::test]
+async fn apply_cancel_token_integration_persists_completed_state_releases_lock_and_returns_interrupted()
+ {
+    // Regression test for #3498: a cancelled apply must persist completed
+    // resources to state, release the lock, and return AppError::Interrupted.
+    // The resource names mirror the publish-ALB scenario that surfaced this
+    // bug in production.
+    let fixture = ApplyCancellationFixture::new()
+        .with_resources(["alb", "listener", "target_group"])
+        .cancel_after_successes(1);
+    let token = fixture.cancel_token();
+
+    let observer_factory = fixture.observer_factory();
+    let err = run_apply_with_observer_factory(
+        fixture.config_path(),
+        true,
+        true,
+        NonZeroUsize::new(1).unwrap(),
+        fixture.provider_context(),
+        token,
+        &observer_factory,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(err, AppError::Interrupted));
+    let state = fixture.read_state().await;
+    assert!(
+        state
+            .find_resource("mock", "test.resource", "alb")
+            .is_some(),
+        "alb must be persisted to state (it completed before cancel)"
+    );
+    assert!(
+        state
+            .find_resource("mock", "test.resource", "listener")
+            .is_none(),
+        "listener must not be in state (cancelled before completion)"
+    );
+    assert!(
+        state
+            .find_resource("mock", "test.resource", "target_group")
+            .is_none(),
+        "target_group must not be in state (cancelled before completion)"
+    );
+    assert!(!fixture.lock_path().exists(), "lock file must be released");
+}
+
 fn s3_backend_config_with_encrypt(encrypt: bool) -> carina_core::parser::BackendConfig {
     let mut attributes = HashMap::new();
     attributes.insert(
