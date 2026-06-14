@@ -94,6 +94,21 @@ directly; it reads, thinks, reviews, and writes docs only.
 - Opus writing the plan, the implementation, or the refactor edits
   itself is forbidden; docs are the only thing Opus writes.
 
+**Codegen delegations always include the docs regen step.** Whenever a
+Codex task touches anything that drives schema codegen
+(`carina-provider-aws*/src/bin/codegen.rs`, `resource_type_overrides()`,
+`generate-schemas.sh`, or the generated `schemas/` tree), the
+delegation prompt MUST instruct Codex to run BOTH `generate-schemas.sh`
+AND `generate-docs.sh` (cache-only mode is fine) and verify the
+`generated-docs/` tree is clean before declaring done. CI's `Check
+Docs Content` runs `generate-docs.sh --from-cache-only` and fails if
+the docs tree drifts; only running `generate-schemas.sh` locally
+passes Opus-side verify but trips that CI gate. The pair is
+load-bearing — never instruct one without the other. Past failure
+mode: awscc#364 burned a CI cycle on this exact mistake (the
+`RedirectConfig.Protocol` enum block was still in `generated-docs/`
+after the schema lost its enum framing).
+
 See the codex skill for the full subcontracting protocol.
 
 ## Communication Style
