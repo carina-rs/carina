@@ -90,6 +90,38 @@ pub struct ExecutionResult {
     pub failed_refreshes: HashSet<ResourceId>,
 }
 
+/// Outcome of executing a plan: either it ran to completion, or a
+/// cancel request was observed and the run unwound after in-flight
+/// effects finished. Both variants carry the `ExecutionResult` of
+/// whatever the run produced; callers must destructure to decide
+/// whether to surface an `Interrupted` error after persisting state.
+///
+/// The enum intentionally provides no `?` shortcut and no `From` /
+/// `Into` to `Result<ExecutionResult, _>`. A future caller cannot
+/// silently drop the `Cancelled` arm — the compiler forces explicit
+/// handling. See [`ExecutionOutcomeCannotBeQuestionMarked`] for the
+/// compile-fail evidence.
+pub enum ExecutionOutcome {
+    Completed(ExecutionResult),
+    Cancelled(ExecutionResult),
+}
+
+/// Marker type whose `compile_fail` doctest is the type-safety evidence
+/// that `ExecutionOutcome` cannot be `?`-ed into a `Result`. The marker
+/// is hidden from rustdoc — it exists only so `cargo test --doc
+/// ExecutionOutcomeCannotBeQuestionMarked` runs the guard.
+///
+/// ```compile_fail
+/// use carina_core::executor::{ExecutionOutcome, ExecutionResult};
+///
+/// fn must_not_compile(outcome: ExecutionOutcome) -> Result<ExecutionResult, String> {
+///     let result = outcome?;
+///     Ok(result)
+/// }
+/// ```
+#[doc(hidden)]
+pub struct ExecutionOutcomeCannotBeQuestionMarked;
+
 /// Progress information for effect execution.
 #[derive(Debug, Clone, Copy)]
 pub struct ProgressInfo {
