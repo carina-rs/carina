@@ -32,7 +32,7 @@ use crate::binding_index::ResolvedBindings;
 use crate::effect::Effect;
 use crate::parser::ProviderConfig;
 use crate::provider::{Provider, ProviderNormalizer};
-use crate::resource::{ResolvedResource, ResourceId, State};
+use crate::resource::{ResolvedResource, Resource, ResourceId, State};
 use crate::value::SerializationError;
 use crate::wait::WaitObservation;
 
@@ -88,6 +88,7 @@ pub struct ExecutionResult {
     pub failure_count: usize,
     pub skip_count: usize,
     pub applied_states: std::collections::HashMap<ResourceId, State>,
+    pub runtime_synthesized_resources: Vec<Resource>,
     pub successfully_deleted: HashSet<ResourceId>,
     pub permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>>,
     pub current_states: HashMap<ResourceId, State>,

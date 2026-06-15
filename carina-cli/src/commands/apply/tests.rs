@@ -381,6 +381,7 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
     let result = build_state_after_apply(ApplyStateSave {
         state_file: None,
         sorted_resources: &sorted_resources,
+        runtime_synthesized_resources: &[],
         current_states: &current_states,
         applied_states: &applied_states,
         permanent_name_overrides: &permanent_name_overrides,
@@ -496,6 +497,7 @@ fn build_state_after_apply_preserves_block_name_attribute() {
     let state = build_state_after_apply(ApplyStateSave {
         state_file: None,
         sorted_resources: &sorted_resources,
+        runtime_synthesized_resources: &[],
         current_states: &current_states,
         applied_states: &applied_states,
         permanent_name_overrides: &permanent_name_overrides,
@@ -726,6 +728,7 @@ fn block_name_attribute_state_roundtrip() {
     let state = build_state_after_apply(ApplyStateSave {
         state_file: None,
         sorted_resources: &sorted_resources,
+        runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &applied_states,
         permanent_name_overrides: &HashMap::new(),
@@ -932,6 +935,7 @@ fn move_plus_replace_keeps_post_replace_identifier_and_attributes() {
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: Some(state_file),
         sorted_resources: &sorted_resources,
+        runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &applied_states,
         permanent_name_overrides: &HashMap::new(),
@@ -1048,6 +1052,7 @@ fn move_plus_update_keeps_post_update_attributes() {
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: Some(state_file),
         sorted_resources: &sorted_resources,
+        runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &applied_states,
         permanent_name_overrides: &HashMap::new(),
@@ -1125,6 +1130,7 @@ fn move_alone_carries_attributes_via_current_states() {
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: Some(state_file),
         sorted_resources: &sorted_resources,
+        runtime_synthesized_resources: &[],
         current_states: &current_states,
         applied_states: &HashMap::new(),
         permanent_name_overrides: &HashMap::new(),
@@ -1177,6 +1183,7 @@ fn move_with_absent_from_is_no_op() {
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: Some(StateFile::default()),
         sorted_resources: &[],
+        runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &HashMap::new(),
         permanent_name_overrides: &HashMap::new(),
@@ -1223,6 +1230,7 @@ fn failed_refresh_preserves_existing_row() {
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: Some(state_file),
         sorted_resources: &sorted_resources,
+        runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &HashMap::new(),
         permanent_name_overrides: &HashMap::new(),
@@ -1280,6 +1288,7 @@ fn move_from_overlapping_desired_resource_errors() {
     let result = build_state_after_apply(ApplyStateSave {
         state_file: None,
         sorted_resources: &sorted_resources,
+        runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &applied,
         permanent_name_overrides: &HashMap::new(),
@@ -1333,6 +1342,7 @@ fn remove_overlapping_desired_resource_errors() {
     let result = build_state_after_apply(ApplyStateSave {
         state_file: None,
         sorted_resources: &sorted_resources,
+        runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &applied,
         permanent_name_overrides: &HashMap::new(),
@@ -1387,6 +1397,7 @@ fn self_move_overlapping_desired_resource_errors() {
     let result = build_state_after_apply(ApplyStateSave {
         state_file: None,
         sorted_resources: &sorted_resources,
+        runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &applied,
         permanent_name_overrides: &HashMap::new(),

@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 
@@ -559,9 +559,10 @@ pub(super) async fn execute_effects_sequential(
     let mut successfully_deleted: HashSet<ResourceId> = HashSet::new();
     let mut permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
     let mut pending_refreshes: HashMap<ResourceId, String> = HashMap::new();
+    let mut runtime_synthesized_resources: Vec<Resource> = Vec::new();
 
     let mut effects = input.plan.effects().to_vec();
-    let total = count_actionable_effects(input.plan.effects());
+    let mut total = count_actionable_effects(input.plan.effects());
     let completed = AtomicUsize::new(0);
 
     let mut analysis =
@@ -695,11 +696,37 @@ pub(super) async fn execute_effects_sequential(
                 ..
             } = &effect
             {
-                let children =
-                    expand_deferred_for_effects(upstream_binding, template, &input.bindings);
+                let children = match expand_deferred_for_effects(
+                    upstream_binding,
+                    template,
+                    &input.bindings,
+                ) {
+                    Ok(children) => children,
+                    Err(err) => {
+                        let message = err.message();
+                        observer.on_event(&ExecutionEvent::EffectFailed {
+                            effect: &effect,
+                            error: &message,
+                            duration: Duration::ZERO,
+                            progress: ProgressInfo {
+                                completed: completed.load(Ordering::Relaxed),
+                                total,
+                            },
+                        });
+                        failure_count += 1;
+                        failed_bindings.insert(template.binding_name.clone());
+                        completed_indices.insert(idx);
+                        completed_synchronous_dispatch = true;
+                        break;
+                    }
+                };
                 if !children.is_empty() {
+                    total += count_actionable_effects(&children);
                     for child in children {
                         let child_idx = effects.len();
+                        if let Effect::Create(resource) = &child {
+                            runtime_synthesized_resources.push(resource.clone());
+                        }
                         if let Some(binding) = child.binding_name() {
                             idx_to_binding.insert(child_idx, binding);
                         }
@@ -1080,6 +1107,7 @@ pub(super) async fn execute_effects_sequential(
         failure_count,
         skip_count,
         applied_states: applied_states.into_inner(),
+        runtime_synthesized_resources,
         successfully_deleted,
         permanent_name_overrides,
         current_states: input.current_states.clone(),

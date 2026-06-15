@@ -353,6 +353,7 @@ pub(crate) async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), 
     let mut state = build_state_after_apply(ApplyStateSave {
         state_file: input.state_file,
         sorted_resources: input.sorted_resources,
+        runtime_synthesized_resources: &input.result.runtime_synthesized_resources,
         current_states: input.current_states,
         applied_states: &input.result.applied_states,
         permanent_name_overrides: &input.result.permanent_name_overrides,

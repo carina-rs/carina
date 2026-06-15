@@ -275,7 +275,7 @@ pub(crate) fn collect_required_actions(
     let mut required = Vec::new();
     for effect in plan.effects() {
         for (id, op) in effect_required_ops(effect) {
-            let actions = provider.required_permissions(id, op);
+            let actions = provider.required_permissions(&id, op);
             for action in actions {
                 required.push(RequiredAction {
                     effect: EffectAddress {
@@ -290,18 +290,23 @@ pub(crate) fn collect_required_actions(
     required
 }
 
-fn effect_required_ops(effect: &Effect) -> Vec<(&ResourceId, PlanOp)> {
+fn effect_required_ops(effect: &Effect) -> Vec<(ResourceId, PlanOp)> {
     match effect {
-        Effect::Read { resource } => vec![(&resource.id, PlanOp::Read)],
-        Effect::Create(resource) => vec![(&resource.id, PlanOp::Create)],
-        Effect::Update { id, .. } => vec![(id, PlanOp::Update)],
-        Effect::Replace { id, to, .. } => vec![(id, PlanOp::Delete), (&to.id, PlanOp::Create)],
-        Effect::Delete { id, .. } => vec![(id, PlanOp::Delete)],
-        Effect::Import { id, .. } => vec![(id, PlanOp::Read)],
-        Effect::Remove { .. }
-        | Effect::Move { .. }
-        | Effect::Wait { .. }
-        | Effect::ExpandDeferredFor { .. } => Vec::new(),
+        Effect::Read { resource } => vec![(resource.id.clone(), PlanOp::Read)],
+        Effect::Create(resource) => vec![(resource.id.clone(), PlanOp::Create)],
+        Effect::Update { id, .. } => vec![(id.clone(), PlanOp::Update)],
+        Effect::Replace { id, to, .. } => {
+            vec![
+                (id.clone(), PlanOp::Delete),
+                (to.id.clone(), PlanOp::Create),
+            ]
+        }
+        Effect::Delete { id, .. } => vec![(id.clone(), PlanOp::Delete)],
+        Effect::Import { id, .. } => vec![(id.clone(), PlanOp::Read)],
+        Effect::ExpandDeferredFor { template, .. } => {
+            effect_required_ops(&Effect::Create(template.template_resource.clone()))
+        }
+        Effect::Remove { .. } | Effect::Move { .. } | Effect::Wait { .. } => Vec::new(),
     }
 }
 
@@ -736,6 +741,7 @@ mod tests {
     use super::*;
     use aws_sdk_iam::error::ErrorMetadata;
     use carina_core::effect::ChangedCreateOnly;
+    use carina_core::parser::{DeferredForExpression, ForBinding};
     use carina_core::provider::{
         BoxFuture, CreateRequest, DeleteRequest, ProviderError, ProviderResult, ReadRequest,
         UpdateRequest,
@@ -859,6 +865,34 @@ mod tests {
                 "test:read:logs.Group",
             ]
         );
+    }
+
+    #[test]
+    fn collect_required_actions_includes_expand_deferred_for_template_create() {
+        let template_resource =
+            Resource::with_provider("aws", "route53.RecordSet", "validation_records", None);
+        let mut plan = Plan::new();
+        plan.add(Effect::ExpandDeferredFor {
+            id: ResourceId::new("__deferred_for", "validation_records"),
+            upstream_binding: "cert".to_string(),
+            template: Box::new(DeferredForExpression {
+                file: None,
+                line: 1,
+                header: "for opt in cert.domain_validation_options".to_string(),
+                resource_type: "aws.route53.RecordSet".to_string(),
+                attributes: Default::default(),
+                binding_name: "validation_records".to_string(),
+                iterable_binding: "cert".to_string(),
+                iterable_attr: "domain_validation_options".to_string(),
+                binding: ForBinding::Simple("opt".to_string()),
+                template_resource,
+            }),
+        });
+
+        let entries = collect_required_actions(&plan, &PermissionProvider);
+        let actions: Vec<_> = entries.into_iter().map(|entry| entry.action).collect();
+
+        assert_eq!(actions, vec!["test:create:route53.RecordSet"]);
     }
 
     #[test]

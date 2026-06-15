@@ -402,8 +402,9 @@ pub(super) async fn execute_effects_phased(
     let mut successfully_deleted: HashSet<ResourceId> = HashSet::new();
     let mut permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
     let mut pending_refreshes: HashMap<ResourceId, String> = HashMap::new();
+    let mut runtime_synthesized_resources: Vec<Resource> = Vec::new();
 
-    let total = count_actionable_effects(input.plan.effects());
+    let mut total = count_actionable_effects(input.plan.effects());
     let completed = AtomicUsize::new(0);
 
     let mut effects = input.plan.effects().to_vec();
@@ -526,11 +527,37 @@ pub(super) async fn execute_effects_phased(
                     ..
                 } = &effect
                 {
-                    let children =
-                        expand_deferred_for_effects(upstream_binding, template, &input.bindings);
+                    let children = match expand_deferred_for_effects(
+                        upstream_binding,
+                        template,
+                        &input.bindings,
+                    ) {
+                        Ok(children) => children,
+                        Err(err) => {
+                            let message = err.message();
+                            observer.on_event(&ExecutionEvent::EffectFailed {
+                                effect: &effect,
+                                error: &message,
+                                duration: Duration::ZERO,
+                                progress: ProgressInfo {
+                                    completed: completed.load(Ordering::Relaxed),
+                                    total,
+                                },
+                            });
+                            failure_count += 1;
+                            failed_bindings.insert(template.binding_name.clone());
+                            completed_indices.insert(idx);
+                            completed_synchronous_dispatch = true;
+                            break;
+                        }
+                    };
                     if !children.is_empty() {
+                        total += count_actionable_effects(&children);
                         for child in children {
                             let child_idx = effects.len();
+                            if let Effect::Create(resource) = &child {
+                                runtime_synthesized_resources.push(resource.clone());
+                            }
                             effects.push(child);
                             phase1_indices.push(child_idx);
                         }
@@ -1491,12 +1518,36 @@ pub(super) async fn execute_effects_phased(
                     ..
                 } = &effect
                 {
-                    let children =
-                        expand_deferred_for_effects(upstream_binding, template, &input.bindings);
+                    let children = match expand_deferred_for_effects(
+                        upstream_binding,
+                        template,
+                        &input.bindings,
+                    ) {
+                        Ok(children) => children,
+                        Err(err) => {
+                            let message = err.message();
+                            observer.on_event(&ExecutionEvent::EffectFailed {
+                                effect: &effect,
+                                error: &message,
+                                duration: Duration::ZERO,
+                                progress: ProgressInfo {
+                                    completed: completed.load(Ordering::Relaxed),
+                                    total,
+                                },
+                            });
+                            failure_count += 1;
+                            failed_bindings.insert(template.binding_name.clone());
+                            completed_indices.insert(idx);
+                            completed_synchronous_dispatch = true;
+                            break;
+                        }
+                    };
                     if !children.is_empty() {
+                        total += count_actionable_effects(&children);
                         for child in children {
                             let child_idx = effects.len();
                             if let Effect::Create(resource) = &child {
+                                runtime_synthesized_resources.push(resource.clone());
                                 debug_assert!(
                                     resource.dependency_bindings.contains(upstream_binding),
                                     "apply-time deferred-for child must retain iterable dependency"
@@ -2136,6 +2187,7 @@ pub(super) async fn execute_effects_phased(
         failure_count,
         skip_count,
         applied_states: applied_states.into_inner(),
+        runtime_synthesized_resources,
         successfully_deleted,
         permanent_name_overrides,
         current_states: input.current_states.clone(),

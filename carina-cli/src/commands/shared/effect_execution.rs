@@ -119,6 +119,7 @@ mod tests {
             failure_count: 0,
             skip_count: 0,
             applied_states: HashMap::new(),
+            runtime_synthesized_resources: Vec::new(),
             successfully_deleted: HashSet::new(),
             permanent_name_overrides: HashMap::new(),
             current_states: HashMap::new(),
