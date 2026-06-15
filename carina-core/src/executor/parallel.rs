@@ -7,10 +7,10 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::deps::find_failed_dependency;
-use crate::effect::{Effect, WaitTarget};
+use crate::effect::Effect;
 use crate::parser::ResourceRef;
 use crate::provider::Provider;
-use crate::resource::{Resource, ResourceId, State, Value};
+use crate::resource::{Resource, ResourceId, Value};
 
 use super::basic::{
     BasicEffectCtx, ExecutionState, RenormalizePipeline, count_actionable_effects,
@@ -18,8 +18,9 @@ use super::basic::{
 };
 use super::replace::{ReplaceContext, SingleEffectResult, execute_replace_parallel};
 use super::wait::{
-    SKIP_REASON_CANCELLED, UnsatisfiableReason, WaitAwareInFlight, WaitOutcome, WaitSignal,
-    count_effectively_undispatched, unsatisfiable_reason_message, wait_failure_message,
+    AppliedStates, SKIP_REASON_CANCELLED, UnsatisfiableReason, WaitAwareInFlight, WaitOutcome,
+    WaitSignal, count_effectively_undispatched, resolve_wait_identifier,
+    unsatisfiable_reason_message, wait_failure_message,
 };
 use super::{ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, ProgressInfo};
 
@@ -548,7 +549,7 @@ pub(super) async fn execute_effects_sequential(
     let mut success_count = 0;
     let mut failure_count = 0;
     let mut skip_count = 0;
-    let mut applied_states: HashMap<ResourceId, State> = HashMap::new();
+    let (mut applied_states, wait_identifiers) = AppliedStates::with_initial(&input.current_states);
     let mut failed_bindings: HashSet<String> = HashSet::new();
     let mut successfully_deleted: HashSet<ResourceId> = HashSet::new();
     let mut permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
@@ -678,29 +679,9 @@ pub(super) async fn execute_effects_sequential(
                 continue;
             }
 
-            // Snapshot bindings for this effect's resolution
+            // Snapshot bindings for this effect's resolution.
             let binding_snapshot = input.bindings.clone();
-            // Resolve the wait target's identifier *now*, before the
-            // dispatch closure: a target created in this same run has no
-            // plan-time identifier (`WaitTarget::ResolvedAtApply`), so
-            // we read it from the just-completed effect's state held in
-            // `applied_states`. The scheduler guarantees the producing
-            // Create/Update/Replace ran before this Wait is dispatched
-            // (see the Wait-dependency edges above), so the entry is
-            // present. Falls back to no identifier only when the target
-            // was never produced in this plan (refresh-only apply).
-            // carina#3119.
-            let wait_identifier: Option<String> = match effect {
-                Effect::Wait {
-                    target_id, target, ..
-                } => match target {
-                    WaitTarget::Known(id) => Some(id.clone()),
-                    WaitTarget::ResolvedAtApply => applied_states
-                        .get(target_id)
-                        .and_then(|s| s.identifier.clone()),
-                },
-                _ => None,
-            };
+            let wait_identifiers = wait_identifiers.clone();
             let unresolved = &input.unresolved_resources;
             let pipeline = RenormalizePipeline {
                 normalizer: input.normalizer,
@@ -799,10 +780,13 @@ pub(super) async fn execute_effects_sequential(
                                 completed: c,
                                 total,
                             };
+                            let identifier_resolver = |target_id: &ResourceId| {
+                                resolve_wait_identifier(&wait_identifiers, target_id)
+                            };
                             let outcome = super::wait::execute_wait_effect(
                                 provider,
                                 target_id,
-                                wait_identifier.as_deref(),
+                                &identifier_resolver,
                                 until,
                                 *timeout,
                                 *interval,
@@ -1025,7 +1009,6 @@ pub(super) async fn execute_effects_sequential(
                 }
             },
         }
-
         in_flight
             .check_terminal(count_undispatched(&dispatched, &failed_bindings))
             .cancel_if_terminal()
@@ -1044,7 +1027,7 @@ pub(super) async fn execute_effects_sequential(
         success_count,
         failure_count,
         skip_count,
-        applied_states,
+        applied_states: applied_states.into_inner(),
         successfully_deleted,
         permanent_name_overrides,
         current_states: input.current_states.clone(),
@@ -1063,7 +1046,7 @@ mod tests {
         BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer, ProviderError, ProviderResult,
         ReadRequest, UpdateRequest,
     };
-    use crate::resource::{Composition, ConcreteValue, DataSource, Value};
+    use crate::resource::{Composition, ConcreteValue, DataSource, State, Value};
     use crate::schema::SchemaRegistry;
     use crate::wait::predicate::{AttrPath, WaitPredicate};
     use std::collections::BTreeSet;
@@ -1287,7 +1270,6 @@ mod tests {
         plan.add(Effect::Wait {
             binding: "cert_issued".to_string(),
             target_id: cert_id.clone(),
-            target: WaitTarget::ResolvedAtApply,
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
                 value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
@@ -1382,7 +1364,6 @@ mod tests {
         plan.add(Effect::Wait {
             binding: "cert_issued".to_string(),
             target_id: cert_id.clone(),
-            target: WaitTarget::ResolvedAtApply,
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
                 value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),

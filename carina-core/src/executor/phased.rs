@@ -8,7 +8,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::deps::{find_failed_dependency, get_resource_dependencies};
-use crate::effect::{Effect, WaitTarget};
+use crate::effect::Effect;
 use crate::provider::{CreateRequest, DeleteRequest, Provider, UpdateRequest};
 use crate::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 
@@ -19,8 +19,9 @@ use super::basic::{
 };
 use super::replace::{compute_full_diff_patch, single_attribute_patch};
 use super::wait::{
-    SKIP_REASON_CANCELLED, UnsatisfiableReason, WaitAwareInFlight, WaitOutcome,
-    count_effectively_undispatched, unsatisfiable_reason_message, wait_failure_message,
+    AppliedStates, SKIP_REASON_CANCELLED, UnsatisfiableReason, WaitAwareInFlight, WaitOutcome,
+    count_effectively_undispatched, resolve_wait_identifier, unsatisfiable_reason_message,
+    wait_failure_message,
 };
 use super::{
     ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, ProgressInfo,
@@ -165,6 +166,10 @@ pub(super) fn topological_sort_replaces(
 ///
 /// Only considers dependencies between effects in the given subset. Dependencies
 /// on effects outside the subset are ignored (assumed already completed).
+/// When `include_wait_target_edges` is true, Wait effects also depend on the
+/// same-phase effect that produces their target. Phase 5 passes false because
+/// its waits target Replace effects that have already completed by strict phase
+/// ordering; there is intentionally no fictional cross-phase dep edge.
 ///
 /// `Virtual` resources (the synthetic bindings module calls expose for their
 /// `attributes { }` block) have no Effect and would be invisible to a direct
@@ -177,6 +182,7 @@ pub(super) fn build_phase_dependency_map(
     phase_indices: &[usize],
     unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
     compositions: &[crate::resource::Composition],
+    include_wait_target_edges: bool,
 ) -> HashMap<usize, HashSet<usize>> {
     // Build binding -> effect index mapping for effects in this phase
     let phase_set: HashSet<usize> = phase_indices.iter().copied().collect();
@@ -193,11 +199,22 @@ pub(super) fn build_phase_dependency_map(
     for &idx in phase_indices {
         let mut dep_indices = HashSet::new();
         let effect = &effects[idx];
-        if effect.as_resource_ref().is_some() {
-            resolver.collect_from_effect(effect, &mut dep_indices);
-            if let Some(unresolved) = unresolved_resources.get(effect.resource_id()) {
-                resolver.collect_from_resource(unresolved.as_resource(), &mut dep_indices);
+        match effect {
+            Effect::Wait { target_id, .. } => {
+                resolver.collect_from_effect(effect, &mut dep_indices);
+                if include_wait_target_edges
+                    && let Some(target_idx) = binding_to_idx.get(target_id.name_str())
+                {
+                    dep_indices.insert(*target_idx);
+                }
             }
+            _ if effect.as_resource_ref().is_some() => {
+                resolver.collect_from_effect(effect, &mut dep_indices);
+                if let Some(unresolved) = unresolved_resources.get(effect.resource_id()) {
+                    resolver.collect_from_resource(unresolved.as_resource(), &mut dep_indices);
+                }
+            }
+            _ => {}
         }
         deps_of.insert(idx, dep_indices);
     }
@@ -262,9 +279,21 @@ impl<'a> DepResolver<'a> {
     /// the `ResourceLike` value-ref + `dependency_bindings` view and the
     /// effect's explicit `depends_on` edges — the same set
     /// `get_resource_dependencies` computes for a managed resource.
-    /// State-only / `Wait` effects have no resource and contribute
-    /// nothing.
+    /// State-only effects have no resource and contribute nothing. Wait
+    /// effects contribute their explicit `depends_on` edges here; any
+    /// same-phase target-producer edge is owned by `build_phase_dependency_map`.
+    /// Phase 5 waits do not need such an edge because their Replace targets
+    /// completed in an earlier phase by construction.
     pub(super) fn collect_from_effect(&self, effect: &Effect, out: &mut HashSet<usize>) {
+        if let Effect::Wait { .. } = effect {
+            let dep_bindings = effect.explicit_dependencies();
+            let mut visited: HashSet<&str> = HashSet::new();
+            for binding in &dep_bindings {
+                self.expand(binding.as_str(), out, &mut visited);
+            }
+            return;
+        }
+
         let Some(resource) = effect.as_resource_ref() else {
             return;
         };
@@ -392,7 +421,7 @@ pub(super) async fn execute_effects_phased(
     let mut success_count = 0;
     let mut failure_count = 0;
     let mut skip_count = 0;
-    let mut applied_states: HashMap<ResourceId, State> = HashMap::new();
+    let (mut applied_states, wait_identifiers) = AppliedStates::with_initial(&input.current_states);
     let mut failed_bindings: HashSet<String> = HashSet::new();
     let mut successfully_deleted: HashSet<ResourceId> = HashSet::new();
     let mut permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
@@ -404,6 +433,22 @@ pub(super) async fn execute_effects_phased(
     let effects = input.plan.effects();
     let replace_bindings = collect_replace_bindings(effects);
     let sorted_indices = topological_sort_replaces(effects, &replace_bindings);
+    let replaced_ids: HashSet<ResourceId> = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Replace { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    let post_replace_wait_indices: Vec<usize> = effects
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, effect)| match effect {
+            Effect::Wait { target_id, .. } if replaced_ids.contains(target_id) => Some(idx),
+            _ => None,
+        })
+        .collect();
+    let post_replace_wait_set: HashSet<usize> = post_replace_wait_indices.iter().copied().collect();
     let mut cancelled = false;
 
     // -----------------------------------------------------------------------
@@ -411,7 +456,10 @@ pub(super) async fn execute_effects_phased(
     // -----------------------------------------------------------------------
     {
         let phase1_indices: Vec<usize> = (0..effects.len())
-            .filter(|&idx| !matches!(&effects[idx], Effect::Replace { .. } | Effect::Read { .. }))
+            .filter(|&idx| {
+                !matches!(&effects[idx], Effect::Replace { .. } | Effect::Read { .. })
+                    && !post_replace_wait_set.contains(&idx)
+            })
             .collect();
 
         let deps_of = build_phase_dependency_map(
@@ -419,6 +467,7 @@ pub(super) async fn execute_effects_phased(
             &phase1_indices,
             input.unresolved_resources,
             input.compositions,
+            true,
         );
         let mut completed_indices: HashSet<usize> = HashSet::new();
         let mut dispatched: HashSet<usize> = HashSet::new();
@@ -482,18 +531,6 @@ pub(super) async fn execute_effects_phased(
                     continue;
                 }
 
-                let wait_identifier: Option<String> = match effect {
-                    Effect::Wait {
-                        target_id, target, ..
-                    } => match target {
-                        WaitTarget::Known(id) => Some(id.clone()),
-                        WaitTarget::ResolvedAtApply => applied_states
-                            .get(target_id)
-                            .and_then(|state| state.identifier.clone()),
-                    },
-                    _ => None,
-                };
-
                 if let Effect::Wait {
                     binding,
                     target_id,
@@ -508,14 +545,18 @@ pub(super) async fn execute_effects_phased(
                         completed: c,
                         total,
                     };
+                    let wait_identifiers = wait_identifiers.clone();
                     in_flight.push_wait(idx, |cancel_rx| {
                         Box::pin(async move {
                             let started = Instant::now();
                             observer.on_event(&ExecutionEvent::EffectStarted { effect });
+                            let identifier_resolver = |target_id: &ResourceId| {
+                                resolve_wait_identifier(&wait_identifiers, target_id)
+                            };
                             let outcome = super::wait::execute_wait_effect(
                                 provider,
                                 target_id,
-                                wait_identifier.as_deref(),
+                                &identifier_resolver,
                                 until,
                                 *timeout,
                                 *interval,
@@ -721,7 +762,6 @@ pub(super) async fn execute_effects_phased(
                 },
                 _ => unreachable!(),
             }
-
             in_flight
                 .check_terminal(count_undispatched(&dispatched, &failed_bindings))
                 .cancel_if_terminal()
@@ -769,6 +809,7 @@ pub(super) async fn execute_effects_phased(
             &cbd_indices,
             input.unresolved_resources,
             input.compositions,
+            true,
         );
         let mut completed_indices: HashSet<usize> = HashSet::new();
         let mut dispatched: HashSet<usize> = HashSet::new();
@@ -1327,6 +1368,7 @@ pub(super) async fn execute_effects_phased(
             &phase4_indices,
             input.unresolved_resources,
             input.compositions,
+            true,
         );
         let mut completed_indices: HashSet<usize> = HashSet::new();
         let mut dispatched: HashSet<usize> = HashSet::new();
@@ -1677,6 +1719,248 @@ pub(super) async fn execute_effects_phased(
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Phase 5: Waits whose targets were replaced in this phased run
+    // -----------------------------------------------------------------------
+    if !cancelled && !post_replace_wait_indices.is_empty() {
+        let deps_of = build_phase_dependency_map(
+            effects,
+            &post_replace_wait_indices,
+            input.unresolved_resources,
+            input.compositions,
+            false,
+        );
+        let mut completed_indices: HashSet<usize> = HashSet::new();
+        let mut dispatched: HashSet<usize> = HashSet::new();
+        let mut in_flight: WaitAwareInFlight<'_, PhaseEffectResult> = WaitAwareInFlight::new();
+
+        loop {
+            let mut newly_ready: Vec<usize> = Vec::new();
+            if !cancelled {
+                for &idx in &post_replace_wait_indices {
+                    if dispatched.contains(&idx) {
+                        continue;
+                    }
+                    let deps = deps_of.get(&idx).cloned().unwrap_or_default();
+                    if deps.iter().all(|d| completed_indices.contains(d)) {
+                        newly_ready.push(idx);
+                    } else {
+                        let pending: Vec<String> = deps
+                            .iter()
+                            .filter(|d| !completed_indices.contains(d))
+                            .map(|d| effects[*d].resource_id().to_string())
+                            .collect();
+                        observer.on_event(&ExecutionEvent::Waiting {
+                            effect: &effects[idx],
+                            pending_dependencies: pending,
+                        });
+                    }
+                }
+                newly_ready.sort();
+            }
+
+            for idx in newly_ready {
+                dispatched.insert(idx);
+                let effect = &effects[idx];
+
+                if let Some(failed_dep) = find_failed_dependency(effect, &failed_bindings) {
+                    let c = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    let detail =
+                        unsatisfiable_reason_message(&UnsatisfiableReason::DependencyFailed {
+                            binding: failed_dep,
+                        });
+                    let reason = format!("unsatisfiable: {detail}");
+                    observer.on_event(&ExecutionEvent::EffectSkipped {
+                        effect,
+                        reason: &reason,
+                        progress: ProgressInfo {
+                            completed: c,
+                            total,
+                        },
+                    });
+                    skip_count += 1;
+                    if let Some(binding) = effect.binding_name() {
+                        failed_bindings.insert(binding);
+                    }
+                    completed_indices.insert(idx);
+                    continue;
+                }
+
+                if let Effect::Wait {
+                    binding,
+                    target_id,
+                    until,
+                    timeout,
+                    interval,
+                    ..
+                } = effect
+                {
+                    let c = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    let progress = ProgressInfo {
+                        completed: c,
+                        total,
+                    };
+                    let wait_identifiers = wait_identifiers.clone();
+                    in_flight.push_wait(idx, |cancel_rx| {
+                        Box::pin(async move {
+                            let started = Instant::now();
+                            observer.on_event(&ExecutionEvent::EffectStarted { effect });
+                            let identifier_resolver = |target_id: &ResourceId| {
+                                resolve_wait_identifier(&wait_identifiers, target_id)
+                            };
+                            let outcome = super::wait::execute_wait_effect(
+                                provider,
+                                target_id,
+                                &identifier_resolver,
+                                until,
+                                *timeout,
+                                *interval,
+                                cancel_rx,
+                                observer,
+                            )
+                            .await;
+                            (
+                                idx,
+                                PhaseEffectResult::Wait {
+                                    binding: binding.clone(),
+                                    outcome,
+                                    duration: started.elapsed(),
+                                    progress,
+                                },
+                            )
+                        })
+                    });
+                }
+            }
+
+            let count_undispatched =
+                |dispatched: &HashSet<usize>, failed_bindings: &HashSet<String>| {
+                    count_effectively_undispatched(
+                        &post_replace_wait_indices,
+                        dispatched,
+                        effects,
+                        failed_bindings,
+                    )
+                };
+            in_flight
+                .check_terminal(count_undispatched(&dispatched, &failed_bindings))
+                .cancel_if_terminal()
+                .drop_without_awaiting();
+
+            if in_flight.is_empty() {
+                if cancelled {
+                    emit_cancelled_skips_with_progress(
+                        effects,
+                        &post_replace_wait_indices,
+                        &mut dispatched,
+                        &mut completed_indices,
+                        &mut skip_count,
+                        observer,
+                        |_| ProgressInfo {
+                            completed: completed.fetch_add(1, Ordering::Relaxed) + 1,
+                            total,
+                        },
+                    );
+                }
+                break;
+            }
+
+            let (finished_idx, result) = if cancelled {
+                let Some(finished) = in_flight
+                    .check_terminal(count_undispatched(&dispatched, &failed_bindings))
+                    .cancel_if_terminal()
+                    .next_completed()
+                    .await
+                else {
+                    break;
+                };
+                finished
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        cancelled = true;
+                        in_flight.signal_in_flight_waits();
+                        continue;
+                    }
+                    finished = in_flight
+                        .check_terminal(count_undispatched(&dispatched, &failed_bindings))
+                        .cancel_if_terminal()
+                        .next_completed() => {
+                        let Some(finished) = finished else {
+                            break;
+                        };
+                        finished
+                    }
+                }
+            };
+            completed_indices.insert(finished_idx);
+
+            match result {
+                PhaseEffectResult::Wait {
+                    binding,
+                    outcome,
+                    duration,
+                    progress,
+                } => match outcome {
+                    WaitOutcome::Satisfied { state } => {
+                        observer.on_event(&ExecutionEvent::EffectSucceeded {
+                            effect: &effects[finished_idx],
+                            state: Some(&state),
+                            duration,
+                            progress,
+                        });
+                        success_count += 1;
+                        let synthetic = ResourceId::new("__wait", &binding);
+                        let attrs: HashMap<String, Value> = state
+                            .attributes
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value.clone()))
+                            .collect();
+                        input
+                            .bindings
+                            .record_applied(Some(&binding), &attrs, &state);
+                        applied_states.insert(synthetic, state);
+                    }
+                    WaitOutcome::Unsatisfiable(reason) => {
+                        let detail = unsatisfiable_reason_message(&reason);
+                        let reason = format!("unsatisfiable: {detail}");
+                        observer.on_event(&ExecutionEvent::EffectSkipped {
+                            effect: &effects[finished_idx],
+                            reason: &reason,
+                            progress,
+                        });
+                        skip_count += 1;
+                        failed_bindings.insert(binding);
+                    }
+                    WaitOutcome::Cancelled => {
+                        observer.on_event(&ExecutionEvent::EffectSkipped {
+                            effect: &effects[finished_idx],
+                            reason: SKIP_REASON_CANCELLED,
+                            progress,
+                        });
+                        skip_count += 1;
+                    }
+                    outcome @ (WaitOutcome::Timeout { .. }
+                    | WaitOutcome::NotFound(_)
+                    | WaitOutcome::ReadFailed(_)) => {
+                        let error =
+                            wait_failure_message(&outcome, effects[finished_idx].resource_id());
+                        observer.on_event(&ExecutionEvent::EffectFailed {
+                            effect: &effects[finished_idx],
+                            error: &error,
+                            duration,
+                            progress,
+                        });
+                        failure_count += 1;
+                        failed_bindings.insert(binding);
+                    }
+                },
+                _ => unreachable!(),
+            }
+        }
+    }
+
     // Preserve CBD create states for any temporary that was created in Phase 2
     // but did not complete finalize. Phase 4 removes finalized indices from
     // cbd_create_states, so anything remaining here is genuinely unprocessed.
@@ -1703,7 +1987,7 @@ pub(super) async fn execute_effects_phased(
         success_count,
         failure_count,
         skip_count,
-        applied_states,
+        applied_states: applied_states.into_inner(),
         successfully_deleted,
         permanent_name_overrides,
         current_states: input.current_states.clone(),
@@ -1914,7 +2198,6 @@ mod tests {
         plan.add(Effect::Wait {
             binding: "cert_issued".to_string(),
             target_id: cert_id.clone(),
-            target: WaitTarget::ResolvedAtApply,
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
                 value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
@@ -2013,7 +2296,6 @@ mod tests {
         plan.add(Effect::Wait {
             binding: "cert_issued".to_string(),
             target_id: cert_id.clone(),
-            target: WaitTarget::ResolvedAtApply,
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
                 value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
@@ -2041,7 +2323,8 @@ mod tests {
             ),
         ]);
         let phase1_indices: Vec<usize> = (0..plan.effects().len()).collect();
-        let deps = build_phase_dependency_map(plan.effects(), &phase1_indices, &unresolved, &[]);
+        let deps =
+            build_phase_dependency_map(plan.effects(), &phase1_indices, &unresolved, &[], true);
         assert!(
             deps.get(&3).is_some_and(|listener_deps| {
                 listener_deps.contains(&1) && listener_deps.contains(&2)
@@ -2129,7 +2412,8 @@ mod tests {
             UnresolvedResource::from_pre_resolve(role_policy.clone()),
         );
 
-        let deps_of = build_phase_dependency_map(&effects, &phase_indices, &unresolved, &[virt]);
+        let deps_of =
+            build_phase_dependency_map(&effects, &phase_indices, &unresolved, &[virt], true);
 
         assert!(
             deps_of[&1].contains(&0),
@@ -2176,6 +2460,7 @@ mod tests {
             &phase_indices,
             &unresolved,
             &[inner_virt, outer_virt],
+            true,
         );
 
         assert!(

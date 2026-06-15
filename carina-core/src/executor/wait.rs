@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -22,6 +23,61 @@ use crate::resource::{ResourceId, State, Value};
 use crate::value::format_value_user_facing;
 use crate::wait::WaitObservation;
 use crate::wait::predicate::WaitPredicate;
+
+pub(crate) type WaitIdentifierResolver<'a> =
+    dyn Fn(&ResourceId) -> Option<String> + Send + Sync + 'a;
+pub(crate) type SharedWaitIdentifiers = Arc<Mutex<HashMap<ResourceId, Option<String>>>>;
+
+fn initial_wait_identifiers(current_states: &HashMap<ResourceId, State>) -> SharedWaitIdentifiers {
+    Arc::new(Mutex::new(
+        current_states
+            .iter()
+            .map(|(id, state)| (id.clone(), state.identifier.clone()))
+            .collect(),
+    ))
+}
+
+pub(crate) fn resolve_wait_identifier(
+    shared: &SharedWaitIdentifiers,
+    target_id: &ResourceId,
+) -> Option<String> {
+    shared
+        .lock()
+        .expect("wait identifier map poisoned")
+        .get(target_id)
+        .cloned()
+        .flatten()
+}
+
+pub(crate) struct AppliedStates {
+    states: HashMap<ResourceId, State>,
+    wait_identifiers: SharedWaitIdentifiers,
+}
+
+impl AppliedStates {
+    pub(crate) fn with_initial(
+        current_states: &HashMap<ResourceId, State>,
+    ) -> (Self, SharedWaitIdentifiers) {
+        let shared = initial_wait_identifiers(current_states);
+        let applied_states = Self {
+            states: HashMap::new(),
+            wait_identifiers: shared.clone(),
+        };
+        (applied_states, shared)
+    }
+
+    pub(crate) fn insert(&mut self, id: ResourceId, state: State) {
+        self.wait_identifiers
+            .lock()
+            .expect("wait identifier map poisoned")
+            .insert(id.clone(), state.identifier.clone());
+        self.states.insert(id, state);
+    }
+
+    pub(crate) fn into_inner(self) -> HashMap<ResourceId, State> {
+        self.states
+    }
+}
 
 /// Outcome of polling a Wait effect. The variants distinguish:
 /// - `Satisfied`: the wait condition was met; carries the resource state.
@@ -306,7 +362,7 @@ impl<'a, 'fut, R> NextReady<'a, 'fut, R> {
 pub async fn execute_wait_effect(
     provider: &dyn Provider,
     target_id: &ResourceId,
-    target_identifier: Option<&str>,
+    identifier_resolver: &WaitIdentifierResolver<'_>,
     until: &WaitPredicate,
     timeout: Duration,
     interval: Duration,
@@ -317,7 +373,7 @@ pub async fn execute_wait_effect(
         provider,
         target_id.name_str(),
         target_id,
-        target_identifier,
+        identifier_resolver,
         until,
         timeout,
         interval,
@@ -333,7 +389,7 @@ pub(crate) async fn execute_wait_effect_with_heartbeat_gap(
     provider: &dyn Provider,
     binding: &str,
     target_id: &ResourceId,
-    target_identifier: Option<&str>,
+    identifier_resolver: &WaitIdentifierResolver<'_>,
     until: &WaitPredicate,
     timeout: Duration,
     interval: Duration,
@@ -344,8 +400,9 @@ pub(crate) async fn execute_wait_effect_with_heartbeat_gap(
     let start = Instant::now();
     let mut last_heartbeat_at: Option<Instant> = None;
     loop {
+        let target_identifier = identifier_resolver(target_id);
         let state = match provider
-            .read(target_id, target_identifier, ReadRequest)
+            .read(target_id, target_identifier.as_deref(), ReadRequest)
             .await
         {
             Ok(state) => state,
@@ -418,6 +475,10 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::watch;
+
+    fn no_identifier(_: &ResourceId) -> Option<String> {
+        None
+    }
 
     /// Minimal test provider: returns a queue of pre-canned read
     /// responses in order, then repeats the last one. Counts every
@@ -583,7 +644,7 @@ mod tests {
         let result = execute_wait_effect(
             &provider,
             &target,
-            None,
+            &no_identifier,
             &pred,
             Duration::from_secs(60),
             Duration::from_millis(10),
@@ -617,7 +678,7 @@ mod tests {
         let result = execute_wait_effect(
             &provider,
             &target,
-            None,
+            &no_identifier,
             &pred,
             Duration::from_secs(60),
             Duration::from_millis(1),
@@ -642,7 +703,7 @@ mod tests {
         let result = execute_wait_effect(
             &provider,
             &target,
-            None,
+            &no_identifier,
             &pred,
             Duration::from_millis(10),
             Duration::from_millis(2),
@@ -753,7 +814,7 @@ mod tests {
         let result = execute_wait_effect(
             &provider,
             &target,
-            None,
+            &no_identifier,
             &pred,
             Duration::from_secs(60),
             Duration::from_millis(1),
@@ -790,7 +851,7 @@ mod tests {
             execute_wait_effect(
                 &provider,
                 &target,
-                None,
+                &no_identifier,
                 &pred,
                 Duration::from_secs(60),
                 Duration::from_millis(1),
@@ -825,7 +886,7 @@ mod tests {
             &provider,
             "cert_issued",
             &target,
-            None,
+            &no_identifier,
             &pred,
             Duration::from_millis(100),
             Duration::from_millis(1),

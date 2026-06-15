@@ -85,7 +85,7 @@ pub struct ExecutionResult {
     pub success_count: usize,
     pub failure_count: usize,
     pub skip_count: usize,
-    pub applied_states: HashMap<ResourceId, State>,
+    pub applied_states: std::collections::HashMap<ResourceId, State>,
     pub successfully_deleted: HashSet<ResourceId>,
     pub permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>>,
     pub current_states: HashMap<ResourceId, State>,

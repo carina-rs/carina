@@ -360,7 +360,6 @@ pub fn find_failed_dependent<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effect::WaitTarget;
     use crate::resource::{DeferredValue, Directives, Resource, ResourceId, Value};
     use crate::wait::predicate::{AttrPath, WaitPredicate};
 
@@ -368,7 +367,6 @@ mod tests {
         Effect::Wait {
             binding: "cert_issued".to_string(),
             target_id: ResourceId::new("acm.Certificate", "cert"),
-            target: WaitTarget::Known("cert-id".to_string()),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
                 value: Value::Concrete(crate::resource::ConcreteValue::String(
