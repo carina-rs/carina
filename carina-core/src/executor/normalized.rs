@@ -260,3 +260,34 @@ pub(crate) fn value_contains_unknown(value: &Value) -> bool {
         _ => false,
     }
 }
+
+/// Return whether `value` can drive plan-time deferred-for expansion.
+///
+/// Expansion needs a fully known iterable. Any reference-bearing or
+/// unevaluated deferred shape means substitution must wait until apply
+/// time, while concrete containers are walked recursively so deferred
+/// leaves nested inside lists/maps are rejected by the same predicate.
+pub fn is_value_fully_concrete_for_expansion(value: &Value) -> bool {
+    match value {
+        Value::Concrete(concrete) => match concrete {
+            ConcreteValue::String(_) => true,
+            ConcreteValue::EnumIdentifier(_) => true,
+            ConcreteValue::CanonicalEnum(_) => true,
+            ConcreteValue::Int(_) => true,
+            ConcreteValue::Float(_) => true,
+            ConcreteValue::Bool(_) => true,
+            ConcreteValue::Duration(_) => true,
+            ConcreteValue::List(items) => items.iter().all(is_value_fully_concrete_for_expansion),
+            ConcreteValue::StringList(_) => true,
+            ConcreteValue::Map(map) => map.values().all(is_value_fully_concrete_for_expansion),
+        },
+        Value::Deferred(deferred) => match deferred {
+            DeferredValue::ResourceRef { .. } => false,
+            DeferredValue::BindingRef { .. } => false,
+            DeferredValue::Interpolation(_) => false,
+            DeferredValue::FunctionCall { .. } => false,
+            DeferredValue::Secret(inner) => is_value_fully_concrete_for_expansion(inner),
+            DeferredValue::Unknown(_) => false,
+        },
+    }
+}

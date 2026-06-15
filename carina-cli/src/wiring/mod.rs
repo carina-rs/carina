@@ -16,8 +16,8 @@ use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
 use carina_core::effect::Effect;
 use carina_core::executor::normalized::{
-    restore_stripped_attributes, run_desired_normalization_stages, states_contain_unknown,
-    strip_provider_boundary_attributes,
+    is_value_fully_concrete_for_expansion, restore_stripped_attributes,
+    run_desired_normalization_stages, states_contain_unknown, strip_provider_boundary_attributes,
 };
 use carina_core::identifier::{
     self, AnonymousIdBindingStateInfo, AnonymousIdStateInfo, PrefixStateInfo, StateBlockClaims,
@@ -1273,6 +1273,35 @@ impl RefreshableChildIds {
     }
 }
 
+/// A deferred-for expression whose iterable is not plan-time concrete,
+/// but has enough upstream identity for the apply executor to re-expand it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApplyTimeReexpansionTarget {
+    pub id: ResourceId,
+    pub upstream_binding: String,
+    pub template: carina_core::parser::DeferredForExpression,
+}
+
+impl ApplyTimeReexpansionTarget {
+    fn from_deferred(deferred: &carina_core::parser::DeferredForExpression) -> Self {
+        let mut id = deferred.template_resource.id.clone();
+        id.set_name(deferred.binding_name.clone());
+        Self {
+            id,
+            upstream_binding: deferred.iterable_binding.clone(),
+            template: deferred.clone(),
+        }
+    }
+
+    fn to_effect(&self) -> Effect {
+        Effect::ExpandDeferredFor {
+            id: self.id.clone(),
+            upstream_binding: self.upstream_binding.clone(),
+            template: Box::new(self.template.clone()),
+        }
+    }
+}
+
 /// Outcome of the carina#3132 post-refresh deferred-for expansion.
 pub struct DeferredForExpansion {
     /// The augmented, re-sorted resource set: every original resource
@@ -1282,6 +1311,9 @@ pub struct DeferredForExpansion {
     /// Loops still unresolved (iterable genuinely unknowable at plan
     /// time) — rendered as the carina#3128 validate/plan placeholder.
     pub residual_deferred_for: Vec<carina_core::parser::DeferredForExpression>,
+    /// Loops whose iterable is deferred until apply and should become
+    /// state-only `Effect::ExpandDeferredFor` entries in the plan.
+    pub apply_time_reexpansion_targets: Vec<ApplyTimeReexpansionTarget>,
     /// Ids of the resources materialized by this expansion (empty when
     /// no loop resolved).
     pub new_child_ids: HashSet<ResourceId>,
@@ -1353,6 +1385,7 @@ pub fn expand_same_config_deferred_for<E: Clone>(
         return Ok(DeferredForExpansion {
             sorted_resources: sorted_resources.to_vec(),
             residual_deferred_for: Vec::new(),
+            apply_time_reexpansion_targets: Vec::new(),
             new_child_ids: HashSet::new(),
             refreshable_child_ids: RefreshableChildIds::default(),
             printed_warnings,
@@ -1369,11 +1402,39 @@ pub fn expand_same_config_deferred_for<E: Clone>(
     })
     .project_iterable_bindings();
 
+    let mut apply_time_reexpansion_targets = Vec::new();
+    let pre_expandable_deferred_for: Vec<_> = parsed
+        .deferred_for_expressions
+        .iter()
+        .filter_map(|deferred| {
+            let iterable = iterable_bindings
+                .get(&deferred.iterable_binding)
+                .and_then(|attrs| attrs.get(&deferred.iterable_attr));
+
+            match iterable {
+                Some(value) if is_value_fully_concrete_for_expansion(value) => {
+                    Some(deferred.clone())
+                }
+                Some(_) | None => {
+                    apply_time_reexpansion_targets
+                        .push(ApplyTimeReexpansionTarget::from_deferred(deferred));
+                    None
+                }
+            }
+        })
+        .collect();
+
     // `expand_deferred_for_expressions` is a `&mut self` method that
     // appends generated resources and drops resolved entries. `parsed`
     // is borrowed immutably here, so expand on a local clone and read
     // the augmented resource set / residual deferred list back out.
     let mut expanded: carina_core::parser::File<E> = (*parsed).clone();
+    for target in &apply_time_reexpansion_targets {
+        expanded
+            .warnings
+            .retain(|w| w.line != target.template.line || w.file != target.template.file);
+    }
+    expanded.deferred_for_expressions = pre_expandable_deferred_for;
     expanded.expand_deferred_for_expressions(&iterable_bindings);
     let printed_warnings = expanded.print_warnings();
     let residual_deferred_for = expanded.deferred_for_expressions.clone();
@@ -1424,6 +1485,7 @@ pub fn expand_same_config_deferred_for<E: Clone>(
     Ok(DeferredForExpansion {
         sorted_resources: resorted,
         residual_deferred_for,
+        apply_time_reexpansion_targets,
         new_child_ids,
         refreshable_child_ids,
         printed_warnings,
@@ -1462,6 +1524,7 @@ pub fn expand_same_config_deferred_for<E: Clone>(
 pub struct ExpandedRefreshState {
     pub sorted_resources: Vec<Resource>,
     pub residual_deferred_for: Vec<carina_core::parser::DeferredForExpression>,
+    pub apply_time_reexpansion_targets: Vec<ApplyTimeReexpansionTarget>,
     pub new_child_ids: HashSet<ResourceId>,
     pub refreshable_child_ids: RefreshableChildIds,
     pub printed_warnings: bool,
@@ -1504,6 +1567,7 @@ pub async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNorm
     let DeferredForExpansion {
         sorted_resources,
         residual_deferred_for,
+        apply_time_reexpansion_targets,
         new_child_ids,
         refreshable_child_ids,
         printed_warnings,
@@ -1556,6 +1620,7 @@ pub async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNorm
     Ok(ExpandedRefreshState {
         sorted_resources,
         residual_deferred_for,
+        apply_time_reexpansion_targets,
         new_child_ids,
         refreshable_child_ids,
         printed_warnings,
@@ -1892,6 +1957,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     let DeferredForExpansion {
         sorted_resources: resorted,
         residual_deferred_for,
+        apply_time_reexpansion_targets,
         new_child_ids,
         refreshable_child_ids,
         printed_warnings,
@@ -2098,6 +2164,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         &plan_bindings,
         &upstream_binding_names,
     );
+    add_apply_time_reexpansion_effects(&mut plan, &apply_time_reexpansion_targets);
 
     let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
         .iter()
@@ -2597,6 +2664,13 @@ pub fn add_state_block_effects(
     // Add the new state block effects
     for effect in new_effects {
         plan.add(effect);
+    }
+}
+
+/// Add apply-time deferred-for re-expansion effects to the plan.
+pub fn add_apply_time_reexpansion_effects(plan: &mut Plan, targets: &[ApplyTimeReexpansionTarget]) {
+    for target in targets {
+        plan.add(target.to_effect());
     }
 }
 

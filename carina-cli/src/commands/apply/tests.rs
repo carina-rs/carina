@@ -2217,8 +2217,8 @@ mod apply_deferred_for_parity {
         );
     }
 
-    /// No refreshed cert state ⇒ the loop stays deferred on the apply
-    /// path too (no mis-expansion), matching the plan path's
+    /// No refreshed cert state ⇒ the loop is carried as an apply-time
+    /// re-expansion target (no mis-expansion), matching the plan path's
     /// unresolvable-iterable behavior.
     #[test]
     fn apply_unresolvable_iterable_stays_deferred() {
@@ -2253,7 +2253,8 @@ mod apply_deferred_for_parity {
                 .all(|r| !r.id.resource_type.contains("RecordSet")),
             "no RecordSet materializes without a resolvable iterable on apply"
         );
-        assert_eq!(out.residual_deferred_for.len(), 1);
+        assert_eq!(out.apply_time_reexpansion_targets.len(), 1);
+        assert!(out.residual_deferred_for.is_empty());
         assert!(out.new_child_ids.is_empty());
     }
 
