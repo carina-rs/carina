@@ -9,7 +9,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::deps::{find_failed_dependency, get_resource_dependencies};
 use crate::effect::Effect;
-use crate::provider::{CreateRequest, DeleteRequest, Provider, UpdateRequest};
+use crate::provider::{
+    CreateRequest, DeleteRequest, PartialCreateDiagnostic, Provider, UpdateRequest,
+};
 use crate::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 
 use super::basic::{
@@ -343,6 +345,7 @@ pub(super) enum PhaseEffectResult {
     CbdCreateSuccess {
         idx: usize,
         state: State,
+        diagnostic: Option<PartialCreateDiagnostic>,
         cascade_states: Vec<(ResourceId, State, HashMap<String, Value>, Option<String>)>,
     },
     /// Phase 2: CBD create failed
@@ -362,6 +365,7 @@ pub(super) enum PhaseEffectResult {
     NonCbdCreateSuccess {
         state: State,
         resource_id: ResourceId,
+        diagnostic: Option<PartialCreateDiagnostic>,
         resolved_attrs: HashMap<String, Value>,
         binding: Option<String>,
     },
@@ -396,6 +400,8 @@ pub(super) async fn execute_effects_phased(
 ) -> (ExecutionResult, bool) {
     let mut success_count = 0;
     let mut failure_count = 0;
+    let mut partial_count = 0;
+    let mut partial_diagnostics = Vec::new();
     let mut skip_count = 0;
     let (mut applied_states, wait_identifiers) = AppliedStates::with_initial(&input.current_states);
     let mut failed_bindings: HashSet<String> = HashSet::new();
@@ -749,6 +755,8 @@ pub(super) async fn execute_effects_phased(
                         &mut ExecutionState {
                             success_count: &mut success_count,
                             failure_count: &mut failure_count,
+                            partial_count: &mut partial_count,
+                            partial_diagnostics: &mut partial_diagnostics,
                             applied_states: &mut applied_states,
                             failed_bindings: &mut failed_bindings,
                             successfully_deleted: &mut successfully_deleted,
@@ -828,6 +836,7 @@ pub(super) async fn execute_effects_phased(
     // Phase 2: CBD creates with parallel execution (forward dependency order)
     // -----------------------------------------------------------------------
     let mut cbd_create_states: HashMap<usize, State> = HashMap::new();
+    let mut cbd_create_diagnostics: HashMap<usize, PartialCreateDiagnostic> = HashMap::new();
     let mut replace_start_times: HashMap<usize, Instant> = HashMap::new();
 
     // Assign progress numbers to all Replace effects upfront.
@@ -969,7 +978,9 @@ pub(super) async fn execute_effects_phased(
                             .create(&to.id, CreateRequest { resource: resolved })
                             .await
                         {
-                            Ok(state) => {
+                            Ok(outcome) => {
+                                let diagnostic = outcome.diagnostic().cloned();
+                                let state = outcome.into_state_for_writeback();
                                 let mut local_bindings = binding_snapshot.clone();
                                 local_bindings.record_applied(
                                     to.binding.as_deref(),
@@ -1081,6 +1092,7 @@ pub(super) async fn execute_effects_phased(
                                         PhaseEffectResult::CbdCreateSuccess {
                                             idx,
                                             state,
+                                            diagnostic,
                                             cascade_states,
                                         },
                                     )
@@ -1143,6 +1155,7 @@ pub(super) async fn execute_effects_phased(
                 PhaseEffectResult::CbdCreateSuccess {
                     idx,
                     state,
+                    diagnostic,
                     cascade_states,
                 } => {
                     let effect = &effects[idx];
@@ -1152,6 +1165,9 @@ pub(super) async fn execute_effects_phased(
                             &to.resolved_attributes(),
                             &state,
                         );
+                        if let Some(diagnostic) = diagnostic {
+                            cbd_create_diagnostics.insert(idx, diagnostic);
+                        }
                     }
                     for (cascade_id, cascade_state, cascade_attrs, cascade_binding) in
                         cascade_states
@@ -1183,6 +1199,8 @@ pub(super) async fn execute_effects_phased(
                         &mut ExecutionState {
                             success_count: &mut success_count,
                             failure_count: &mut failure_count,
+                            partial_count: &mut partial_count,
+                            partial_diagnostics: &mut partial_diagnostics,
                             applied_states: &mut applied_states,
                             failed_bindings: &mut failed_bindings,
                             successfully_deleted: &mut successfully_deleted,
@@ -1415,6 +1433,7 @@ pub(super) async fn execute_effects_phased(
                     }
                     // Remove from cbd_create_states since delete failed
                     cbd_create_states.remove(&finished_idx);
+                    cbd_create_diagnostics.remove(&finished_idx);
                 }
                 _ => unreachable!(),
             }
@@ -1634,6 +1653,7 @@ pub(super) async fn execute_effects_phased(
                         let to = to.clone();
                         let temporary_name = temporary_name.clone();
                         let effect_for_future = effect.clone();
+                        let diagnostic = cbd_create_diagnostics.get(&idx).cloned();
 
                         in_flight.push(Box::pin(async move {
                             let started = effect_started;
@@ -1659,12 +1679,28 @@ pub(super) async fn execute_effects_phased(
                                             from: &temp.temporary_value,
                                             to: &temp.original_value,
                                         });
-                                        observer.on_event(&ExecutionEvent::EffectSucceeded {
-                                            effect: &effect_for_future,
-                                            state: None,
-                                            duration: started.elapsed(),
-                                            progress,
-                                        });
+                                        let renamed_state =
+                                            diagnostic.clone().map_or(renamed_state.clone(), |d| {
+                                                d.into_state_for_writeback(renamed_state)
+                                            });
+                                        if let Some(diagnostic) = &diagnostic {
+                                            observer.on_event(
+                                                &ExecutionEvent::EffectPartiallySucceeded {
+                                                    effect: &effect_for_future,
+                                                    state: &renamed_state,
+                                                    diagnostic,
+                                                    duration: started.elapsed(),
+                                                    progress,
+                                                },
+                                            );
+                                        } else {
+                                            observer.on_event(&ExecutionEvent::EffectSucceeded {
+                                                effect: &effect_for_future,
+                                                state: None,
+                                                duration: started.elapsed(),
+                                                progress,
+                                            });
+                                        }
                                         (
                                             idx,
                                             PhaseEffectResult::CbdFinalizeSuccess {
@@ -1711,12 +1747,22 @@ pub(super) async fn execute_effects_phased(
                                             None
                                         }
                                     });
-                                observer.on_event(&ExecutionEvent::EffectSucceeded {
-                                    effect: &effect_for_future,
-                                    state: None,
-                                    duration: started.elapsed(),
-                                    progress,
-                                });
+                                if let Some(diagnostic) = &diagnostic {
+                                    observer.on_event(&ExecutionEvent::EffectPartiallySucceeded {
+                                        effect: &effect_for_future,
+                                        state: &state,
+                                        diagnostic,
+                                        duration: started.elapsed(),
+                                        progress,
+                                    });
+                                } else {
+                                    observer.on_event(&ExecutionEvent::EffectSucceeded {
+                                        effect: &effect_for_future,
+                                        state: None,
+                                        duration: started.elapsed(),
+                                        progress,
+                                    });
+                                }
                                 (
                                     idx,
                                     PhaseEffectResult::CbdFinalizeSuccess {
@@ -1775,22 +1821,47 @@ pub(super) async fn execute_effects_phased(
                                     .create(&to.id, CreateRequest { resource: resolved })
                                     .await
                                 {
-                                    Ok(state) => {
-                                        observer.on_event(&ExecutionEvent::EffectSucceeded {
-                                            effect: &effect_for_future,
-                                            state: Some(&state),
-                                            duration: started.elapsed(),
-                                            progress,
-                                        });
-                                        (
-                                            idx,
-                                            PhaseEffectResult::NonCbdCreateSuccess {
-                                                state,
-                                                resource_id: to.id.clone(),
-                                                resolved_attrs,
-                                                binding: to.binding.clone(),
-                                            },
-                                        )
+                                    Ok(outcome) => {
+                                        let diagnostic = outcome.diagnostic().cloned();
+                                        let state = outcome.into_state_for_writeback();
+                                        if let Some(diagnostic) = diagnostic {
+                                            observer.on_event(
+                                                &ExecutionEvent::EffectPartiallySucceeded {
+                                                    effect: &effect_for_future,
+                                                    state: &state,
+                                                    diagnostic: &diagnostic,
+                                                    duration: started.elapsed(),
+                                                    progress,
+                                                },
+                                            );
+                                            (
+                                                idx,
+                                                PhaseEffectResult::NonCbdCreateSuccess {
+                                                    state,
+                                                    resource_id: to.id.clone(),
+                                                    diagnostic: Some(diagnostic),
+                                                    resolved_attrs,
+                                                    binding: to.binding.clone(),
+                                                },
+                                            )
+                                        } else {
+                                            observer.on_event(&ExecutionEvent::EffectSucceeded {
+                                                effect: &effect_for_future,
+                                                state: Some(&state),
+                                                duration: started.elapsed(),
+                                                progress,
+                                            });
+                                            (
+                                                idx,
+                                                PhaseEffectResult::NonCbdCreateSuccess {
+                                                    state,
+                                                    resource_id: to.id.clone(),
+                                                    diagnostic: None,
+                                                    resolved_attrs,
+                                                    binding: to.binding.clone(),
+                                                },
+                                            )
+                                        }
                                     }
                                     Err(e) => {
                                         let error_str = e.to_string();
@@ -1864,7 +1935,12 @@ pub(super) async fn execute_effects_phased(
                     permanent_overrides,
                 } => {
                     cbd_create_states.remove(&finished_idx);
-                    success_count += 1;
+                    if let Some(diagnostic) = cbd_create_diagnostics.remove(&finished_idx) {
+                        partial_count += 1;
+                        partial_diagnostics.push((resource_id.clone(), diagnostic));
+                    } else {
+                        success_count += 1;
+                    }
                     applied_states.insert(resource_id, state);
                     if let Some((id, overrides)) = permanent_overrides {
                         permanent_name_overrides.insert(id, overrides);
@@ -1876,6 +1952,7 @@ pub(super) async fn execute_effects_phased(
                     binding,
                 } => {
                     cbd_create_states.remove(&finished_idx);
+                    cbd_create_diagnostics.remove(&finished_idx);
                     failure_count += 1;
                     applied_states.insert(resource_id, state);
                     if let Some(binding) = binding {
@@ -1885,10 +1962,16 @@ pub(super) async fn execute_effects_phased(
                 PhaseEffectResult::NonCbdCreateSuccess {
                     state,
                     resource_id,
+                    diagnostic,
                     resolved_attrs,
                     binding,
                 } => {
-                    success_count += 1;
+                    if let Some(diagnostic) = diagnostic {
+                        partial_count += 1;
+                        partial_diagnostics.push((resource_id.clone(), diagnostic));
+                    } else {
+                        success_count += 1;
+                    }
                     applied_states.insert(resource_id, state.clone());
                     input
                         .bindings
@@ -1906,6 +1989,8 @@ pub(super) async fn execute_effects_phased(
                         &mut ExecutionState {
                             success_count: &mut success_count,
                             failure_count: &mut failure_count,
+                            partial_count: &mut partial_count,
+                            partial_diagnostics: &mut partial_diagnostics,
                             applied_states: &mut applied_states,
                             failed_bindings: &mut failed_bindings,
                             successfully_deleted: &mut successfully_deleted,
@@ -2185,6 +2270,8 @@ pub(super) async fn execute_effects_phased(
     let result = ExecutionResult {
         success_count,
         failure_count,
+        partial_count,
+        partial_diagnostics,
         skip_count,
         applied_states: applied_states.into_inner(),
         runtime_synthesized_resources,
@@ -2250,7 +2337,7 @@ mod tests {
             &self,
             id: &ResourceId,
             _request: CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
             self.create_log
                 .lock()
                 .unwrap()
@@ -2261,7 +2348,9 @@ mod tests {
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                     Err(ProviderError::api_error("alb create failed"))
                 } else {
-                    Ok(State::existing(id, HashMap::new()).with_identifier("cert-id"))
+                    Ok(crate::provider::CreateOutcome::Success {
+                        state: State::existing(id, HashMap::new()).with_identifier("cert-id"),
+                    })
                 }
             })
         }
@@ -2333,6 +2422,7 @@ mod tests {
                 ExecutionEvent::Waiting { .. }
                 | ExecutionEvent::EffectStarted { .. }
                 | ExecutionEvent::EffectSucceeded { .. }
+                | ExecutionEvent::EffectPartiallySucceeded { .. }
                 | ExecutionEvent::WaitPolling { .. }
                 | ExecutionEvent::CascadeUpdateSucceeded { .. }
                 | ExecutionEvent::CascadeUpdateFailed { .. }

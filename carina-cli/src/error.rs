@@ -133,6 +133,10 @@ pub enum AppError {
     #[error("{0}")]
     Config(String),
 
+    /// Apply completed with one or more partial create results.
+    #[error("{0}")]
+    PartialSuccess(String),
+
     /// Operation interrupted by user (Ctrl+C / SIGINT)
     #[error("Operation cancelled by user")]
     Interrupted,

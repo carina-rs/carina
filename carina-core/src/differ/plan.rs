@@ -8,7 +8,9 @@ use crate::identifier::generate_random_suffix;
 use crate::parser::WaitBinding;
 use crate::plan::{Plan, PlanError};
 use crate::provider::Provider;
-use crate::resource::{ConcreteValue, DataSource, Directives, Resource, ResourceId, State, Value};
+use crate::resource::{
+    ConcreteValue, DataSource, Directives, PlanInputState, Resource, ResourceId, State, Value,
+};
 use crate::schema::{
     ResourceSchema, SchemaKind, SchemaRegistry, WAIT_DEFAULT_INTERVAL, WAIT_DEFAULT_TIMEOUT,
 };
@@ -213,12 +215,40 @@ fn generate_temporary_name(
 ///     &[],
 /// );
 /// ```
+///
+/// Raw [`State`] maps cannot be passed to planning. Callers must convert
+/// through [`State::into_plan_input`](crate::resource::State::into_plan_input)
+/// or [`into_plan_input_map`](crate::resource::into_plan_input_map), which
+/// materializes partial-create unknowns before diffing.
+///
+/// ```compile_fail
+/// use std::collections::HashMap;
+/// use carina_core::differ::create_plan;
+/// use carina_core::provider::ProviderRouter;
+/// use carina_core::resource::{Resource, ResourceId, State};
+/// use carina_core::schema::SchemaRegistry;
+///
+/// let resources: Vec<Resource> = vec![];
+/// let states: HashMap<ResourceId, State> = HashMap::new();
+/// let _ = create_plan(
+///     &resources,
+///     &[],
+///     &ProviderRouter::new(),
+///     &states,
+///     &HashMap::new(),
+///     &SchemaRegistry::default(),
+///     &HashMap::new(),
+///     &HashMap::new(),
+///     &HashMap::new(),
+///     &[],
+/// );
+/// ```
 #[allow(clippy::too_many_arguments)]
 pub fn create_plan(
     managed: &[Resource],
     data_sources: &[DataSource],
     provider: &dyn Provider,
-    current_states: &HashMap<ResourceId, State>,
+    current_states: &HashMap<ResourceId, PlanInputState>,
     directives_map: &HashMap<ResourceId, Directives>,
     registry: &SchemaRegistry,
     saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
@@ -249,7 +279,7 @@ pub fn create_plan(
         let current = current_states
             .get(&resource.id)
             .cloned()
-            .unwrap_or_else(|| State::not_found(resource.id.clone()));
+            .unwrap_or_else(|| State::not_found(resource.id.clone()).into_plan_input());
 
         let saved = saved_attrs.get(&resource.id);
         let prev_explicit_for_resource = prev_explicit.get(&resource.id);
@@ -260,7 +290,7 @@ pub fn create_plan(
         );
         let d = diff(
             resource,
-            &current,
+            current.as_state(),
             saved,
             prev_explicit_for_resource,
             schema,
@@ -365,7 +395,7 @@ pub fn create_plan(
                 }
                 let identifier = current_states
                     .get(&id)
-                    .and_then(|s| s.identifier.clone())
+                    .and_then(|s| s.as_state().identifier.clone())
                     .unwrap_or_default();
                 let directives = resource.directives.clone();
                 let binding = resource.binding.clone();
@@ -385,7 +415,8 @@ pub fn create_plan(
     }
 
     // Detect orphaned resources: exist in current_states but not in desired
-    for (id, state) in current_states {
+    for (id, plan_state) in current_states {
+        let state = plan_state.as_state();
         if state.exists && !desired_ids.contains(id) {
             let directives = directives_map.get(id).cloned().unwrap_or_default();
             if directives.prevent_destroy {
@@ -568,7 +599,8 @@ pub fn create_plan(
         //      satisfy the predicate (missing state ⇒ treat as work).
         let wait_has_work = current_states
             .get(&target_id)
-            .map(|state| {
+            .map(|plan_state| {
+                let state = plan_state.as_state();
                 let target_is_mutating = plan
                     .effects()
                     .iter()
@@ -643,7 +675,7 @@ fn known_binding_names(managed: &[Resource], data_sources: &[DataSource]) -> Has
 pub fn cascade_dependent_updates(
     plan: &mut Plan,
     unresolved_managed: &[Resource],
-    current_states: &HashMap<ResourceId, State>,
+    current_states: &HashMap<ResourceId, PlanInputState>,
     registry: &SchemaRegistry,
 ) {
     // Build binding/key -> unresolved resource mapping.
@@ -823,7 +855,7 @@ pub fn cascade_dependent_updates(
             if let Some(unresolved) = binding_to_unresolved.get(dep_binding) {
                 let from = current_states
                     .get(&unresolved.id)
-                    .cloned()
+                    .map(|state| state.as_state().clone())
                     .unwrap_or_else(|| State::not_found(unresolved.id.clone()));
 
                 if !from.exists {

@@ -75,7 +75,7 @@ pub struct CreateParams {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateResult {
-    pub state: State,
+    pub outcome: CreateOutcome,
 }
 
 // -- update --

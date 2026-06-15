@@ -84,18 +84,23 @@ impl CarinaProvider for MockProcessProvider {
         })
     }
 
-    fn create(&self, id: &ResourceId, request: CreateRequest) -> Result<State, ProviderError> {
+    fn create(
+        &self,
+        id: &ResourceId,
+        request: CreateRequest,
+    ) -> Result<CreateOutcome, ProviderError> {
         let mut states = self.states.lock().unwrap();
         let key = Self::resource_key(id);
         let resource = request.resource;
         states.insert(key, resource.attributes.clone());
 
-        Ok(State {
+        let state = State {
             id: id.clone(),
             identifier: Some("mock-id".into()),
             attributes: resource.attributes,
             exists: true,
-        })
+        };
+        Ok(CreateOutcome::Success { state })
     }
 
     fn update(

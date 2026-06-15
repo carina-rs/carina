@@ -1068,6 +1068,8 @@ mod resolved_bindings_tests {
                 .into_iter()
                 .collect(),
                 dependency_bindings: BTreeSet::new(),
+
+                partial_read: None,
             },
         );
         let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -1234,6 +1236,8 @@ mod resolved_bindings_tests {
                 .into_iter()
                 .collect(),
                 dependency_bindings: BTreeSet::new(),
+
+                partial_read: None,
             },
         );
         let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -1293,6 +1297,8 @@ mod resolved_bindings_tests {
             .into_iter()
             .collect(),
             dependency_bindings: BTreeSet::new(),
+
+            partial_read: None,
         };
 
         resolved.record_applied(Some("vpc"), &resource_attrs, &state);
@@ -1330,6 +1336,8 @@ mod resolved_bindings_tests {
             exists: true,
             attributes: HashMap::new(),
             dependency_bindings: BTreeSet::new(),
+
+            partial_read: None,
         };
 
         resolved.record_applied(None, &attrs, &state);
@@ -1374,6 +1382,8 @@ mod resolved_bindings_tests {
             .into_iter()
             .collect(),
             dependency_bindings: BTreeSet::new(),
+
+            partial_read: None,
         };
         child.record_applied(Some("subnet"), &HashMap::new(), &extra_state);
 
@@ -1656,7 +1666,10 @@ mod resolved_bindings_tests {
                 .into_iter()
                 .collect(),
                 dependency_bindings: BTreeSet::new(),
-            },
+
+                partial_read: None,
+
+                },
         );
 
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
@@ -1727,6 +1740,8 @@ mod resolved_bindings_tests {
                 .into_iter()
                 .collect(),
                 dependency_bindings: BTreeSet::new(),
+
+                partial_read: None,
             },
         );
 

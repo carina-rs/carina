@@ -143,7 +143,11 @@ pub trait CarinaProvider {
     fn read_data_source(&self, resource: &Resource) -> Result<State, ProviderError>;
 
     /// Create a new resource.
-    fn create(&self, id: &ResourceId, request: CreateRequest) -> Result<State, ProviderError>;
+    fn create(
+        &self,
+        id: &ResourceId,
+        request: CreateRequest,
+    ) -> Result<CreateOutcome, ProviderError>;
 
     /// Update an existing resource.
     ///
@@ -349,7 +353,7 @@ fn dispatch(provider: &mut impl CarinaProvider, request: &Request) -> Response {
                 Err(e) => return Response::error(id, -32602, e),
             };
             match provider.create(&params.id, params.request) {
-                Ok(state) => Response::success(id, methods::CreateResult { state }),
+                Ok(outcome) => Response::success(id, methods::CreateResult { outcome }),
                 Err(e) => Response::error(id, -1, e.message),
             }
         }

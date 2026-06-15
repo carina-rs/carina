@@ -121,6 +121,9 @@ impl std::fmt::Display for UnknownReason {
                 write!(f, "deferred for-binding value {}", path.to_dot_string())
             }
             UnknownReason::EmptyInterpolation => write!(f, "empty interpolation"),
+            UnknownReason::PostCreateReadIncomplete { detail } => {
+                write!(f, "post-create read failed: {detail}")
+            }
         }
     }
 }
@@ -143,6 +146,9 @@ pub fn render_unknown(reason: &UnknownReason) -> String {
             format!("(known after upstream apply: {})", path.to_dot_string())
         }
         UnknownReason::EmptyInterpolation => "(empty interpolation)".to_string(),
+        UnknownReason::PostCreateReadIncomplete { detail } => {
+            format!("(known after next apply: post-create read failed — {detail})")
+        }
     }
 }
 
@@ -991,6 +997,7 @@ pub fn redact_secrets_in_state(
         attributes: redact_secrets_in_attributes(&state.attributes)?,
         exists: state.exists,
         dependency_bindings: state.dependency_bindings.clone(),
+        partial_read: state.partial_read.clone(),
     })
 }
 
@@ -2385,6 +2392,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn render_unknown_post_create_read_incomplete() {
+        let r = UnknownReason::PostCreateReadIncomplete {
+            detail: "AccessDenied".to_string(),
+        };
+        assert_eq!(
+            render_unknown(&r),
+            "(known after next apply: post-create read failed — AccessDenied)"
+        );
+    }
+
     /// `UnknownReason::Display` flows into the user-facing error from
     /// `format_plan_save_error` / `SerializationError::Display`. Pin
     /// the wording so a future regression does not silently degrade
@@ -2408,6 +2426,15 @@ mod tests {
         assert_eq!(
             format!("{}", UnknownReason::ForValue),
             "deferred for-binding value"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                UnknownReason::PostCreateReadIncomplete {
+                    detail: "AccessDenied".to_string()
+                }
+            ),
+            "post-create read failed: AccessDenied"
         );
     }
 
@@ -2982,6 +3009,26 @@ mod tests {
                 }
             ),
             "expected UnknownNotAllowed/ForKey/ValueToJson, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn post_create_read_incomplete_unknown_returns_err_in_value_to_json() {
+        let v = Value::Deferred(DeferredValue::Unknown(
+            UnknownReason::PostCreateReadIncomplete {
+                detail: "mock partial create".to_string(),
+            },
+        ));
+        let err = value_to_json(&v).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SerializationError::UnknownNotAllowed {
+                    reason: UnknownReason::PostCreateReadIncomplete { .. },
+                    context: SerializationContext::ValueToJson,
+                }
+            ),
+            "expected UnknownNotAllowed/PostCreateReadIncomplete/ValueToJson, got: {err:?}"
         );
     }
 
@@ -4617,6 +4664,7 @@ mod tests {
             attributes,
             exists: true,
             dependency_bindings: BTreeSet::new(),
+            partial_read: None,
         }
     }
 

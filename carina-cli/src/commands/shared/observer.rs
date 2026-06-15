@@ -113,6 +113,41 @@ fn handle_tty(
                 eprintln!("  {msg}");
             }
         }
+        ExecutionEvent::EffectPartiallySucceeded {
+            effect,
+            diagnostic,
+            duration,
+            progress,
+            ..
+        } => {
+            let key = format_effect(effect);
+            let timing = format!("took {}", format_duration(*duration)).dimmed();
+            let counter = format_progress(progress).dimmed();
+            let missing = if diagnostic.missing_attributes().is_empty() {
+                "(none)".to_string()
+            } else {
+                diagnostic.missing_attributes().join(", ")
+            };
+            let msg = format!(
+                "{} {} (partial) {} {}\n      {} reason: {}\n      {} missing attributes: {}\n      {} state recorded; re-run apply to complete the read",
+                "⚠".yellow(),
+                format_effect(effect),
+                timing,
+                counter,
+                "→".yellow(),
+                diagnostic.reason(),
+                "→".yellow(),
+                missing,
+                "→".yellow()
+            );
+            let mut bars = bars.lock().unwrap();
+            if let Some(pb) = bars.remove(&key) {
+                pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
+                pb.finish_with_message(msg);
+            } else {
+                eprintln!("  {msg}");
+            }
+        }
         ExecutionEvent::EffectFailed {
             effect,
             error,
@@ -251,6 +286,32 @@ fn format_plain(event: &ExecutionEvent) -> Vec<String> {
                 timing,
                 counter
             )]
+        }
+        ExecutionEvent::EffectPartiallySucceeded {
+            effect,
+            diagnostic,
+            duration,
+            progress,
+            ..
+        } => {
+            let timing = format!("took {}", format_duration(*duration));
+            let counter = format_progress(progress);
+            let missing = if diagnostic.missing_attributes().is_empty() {
+                "(none)".to_string()
+            } else {
+                diagnostic.missing_attributes().join(", ")
+            };
+            vec![
+                format!(
+                    "  ⚠ {} (partial) {} {}",
+                    format_effect(effect),
+                    timing,
+                    counter
+                ),
+                format!("      → reason: {}", diagnostic.reason()),
+                format!("      → missing attributes: {}", missing),
+                "      → state recorded; re-run apply to complete the read".to_string(),
+            ]
         }
         ExecutionEvent::EffectFailed {
             effect,

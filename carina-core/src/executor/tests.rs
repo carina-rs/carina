@@ -58,7 +58,7 @@ fn validation_deferred_for_expression() -> crate::parser::DeferredForExpression 
 // -----------------------------------------------------------------------
 
 struct MockProvider {
-    create_results: Mutex<Vec<ProviderResult<State>>>,
+    create_results: Mutex<Vec<ProviderResult<crate::provider::CreateOutcome>>>,
     delete_results: Mutex<Vec<ProviderResult<()>>>,
     update_results: Mutex<Vec<ProviderResult<State>>>,
     read_results: Mutex<Vec<ProviderResult<State>>>,
@@ -87,6 +87,13 @@ impl MockProvider {
     }
 
     fn push_create(&self, result: ProviderResult<State>) {
+        self.create_results
+            .lock()
+            .unwrap()
+            .push(result.map(|state| crate::provider::CreateOutcome::Success { state }));
+    }
+
+    fn push_create_outcome(&self, result: ProviderResult<crate::provider::CreateOutcome>) {
         self.create_results.lock().unwrap().push(result);
     }
 
@@ -143,7 +150,7 @@ impl Provider for MockProvider {
         &self,
         id: &ResourceId,
         request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
         let id_str = id.to_string();
         self.call_log
             .lock()
@@ -224,6 +231,9 @@ fn format_execution_event(event: &ExecutionEvent<'_>) -> String {
         ExecutionEvent::EffectSucceeded { effect, .. } => {
             format!("succeeded:{}", effect.resource_id())
         }
+        ExecutionEvent::EffectPartiallySucceeded { effect, .. } => {
+            format!("partial:{}", effect.resource_id())
+        }
         ExecutionEvent::EffectFailed { effect, error, .. } => {
             format!("failed:{}:{}", effect.resource_id(), error)
         }
@@ -302,6 +312,7 @@ impl ExecutionObserver for ProgressObserver {
         self.events.on_event(event);
         match event {
             ExecutionEvent::EffectSucceeded { progress, .. }
+            | ExecutionEvent::EffectPartiallySucceeded { progress, .. }
             | ExecutionEvent::EffectFailed { progress, .. }
             | ExecutionEvent::EffectSkipped { progress, .. } => {
                 self.progress.lock().unwrap().push(*progress);
@@ -729,6 +740,8 @@ fn empty_execution_result() -> ExecutionResult {
     ExecutionResult {
         success_count: 0,
         failure_count: 0,
+        partial_count: 0,
+        partial_diagnostics: Vec::new(),
         skip_count: 0,
         applied_states: Default::default(),
         runtime_synthesized_resources: Vec::new(),
@@ -907,7 +920,7 @@ impl Provider for DelayedCountingProvider {
         &self,
         id: &ResourceId,
         _request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
         let id = id.clone();
         let delay = self.delay_for(&id);
         let started = self.started.clone();
@@ -921,7 +934,9 @@ impl Provider for DelayedCountingProvider {
             {
                 cancel.cancel();
             }
-            Ok(ok_state(&id))
+            Ok(crate::provider::CreateOutcome::Success {
+                state: ok_state(&id),
+            })
         })
     }
 
@@ -1016,9 +1031,13 @@ impl Provider for PendingWaitProvider {
         &self,
         id: &ResourceId,
         _request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
         let id = id.clone();
-        Box::pin(async move { Ok(ok_state(&id)) })
+        Box::pin(async move {
+            Ok(crate::provider::CreateOutcome::Success {
+                state: ok_state(&id),
+            })
+        })
     }
 
     fn update(
@@ -1646,6 +1665,51 @@ async fn test_simple_create() {
             .iter()
             .any(|e| e.starts_with("succeeded:"))
     );
+}
+
+#[tokio::test]
+async fn partial_create_records_state_and_diagnostic() {
+    let provider = MockProvider::new();
+    let resource = make_resource("a", &[]);
+    let rid = resource.id.clone();
+    let diagnostic = crate::provider::PartialCreateDiagnostic::new(
+        "mock partial create".to_string(),
+        vec!["computed".to_string()],
+    )
+    .expect("missing attributes are non-empty");
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(resource));
+
+    provider.push_create_outcome(Ok(crate::provider::CreateOutcome::partial_success(
+        ok_state(&rid),
+        "mock partial create".to_string(),
+        vec!["computed".to_string()],
+    )));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+
+    assert_eq!(result.success_count, 0);
+    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.partial_count, 1);
+    assert!(result.applied_states.contains_key(&rid));
+    assert_eq!(result.partial_diagnostics, vec![(rid, diagnostic)]);
+    assert!(observer.events().iter().any(|e| e.starts_with("partial:")));
 }
 
 /// carina#3060: the apply execution path must re-apply the provider
@@ -3323,7 +3387,7 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
             &self,
             id: &ResourceId,
             _request: CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
             let id_clone = id.clone();
             let name = id.name_str().to_string();
             let delay = self.delays.get(&name).copied().unwrap_or(Duration::ZERO);
@@ -3342,7 +3406,9 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
                     "id".to_string(),
                     Value::Concrete(ConcreteValue::String("id-123".to_string())),
                 );
-                Ok(State::existing(id_clone, attrs).with_identifier("id-123"))
+                Ok(crate::provider::CreateOutcome::Success {
+                    state: State::existing(id_clone, attrs).with_identifier("id-123"),
+                })
             })
         }
 
@@ -3481,7 +3547,7 @@ impl Provider for DelayedUpdateProvider {
         &self,
         _id: &ResourceId,
         _request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
         Box::pin(async { Err(ProviderError::internal("not implemented")) })
     }
 
@@ -4094,7 +4160,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
 type CreateLog = Vec<(String, HashMap<String, Value>)>;
 
 struct RecordingMockProvider {
-    create_results: Mutex<Vec<ProviderResult<State>>>,
+    create_results: Mutex<Vec<ProviderResult<crate::provider::CreateOutcome>>>,
     /// Records: (resource_id_string, resolved_attributes)
     create_log: Arc<Mutex<CreateLog>>,
 }
@@ -4108,7 +4174,10 @@ impl RecordingMockProvider {
     }
 
     fn push_create(&self, result: ProviderResult<State>) {
-        self.create_results.lock().unwrap().push(result);
+        self.create_results
+            .lock()
+            .unwrap()
+            .push(result.map(|state| crate::provider::CreateOutcome::Success { state }));
     }
 
     fn create_calls(&self) -> Vec<(String, HashMap<String, Value>)> {
@@ -4138,7 +4207,7 @@ impl Provider for RecordingMockProvider {
         &self,
         id: &ResourceId,
         request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
         let id_str = id.to_string();
         let attrs = request.resource.as_resource().resolved_attributes();
         self.create_log.lock().unwrap().push((id_str, attrs));
@@ -5101,11 +5170,13 @@ impl Provider for IdentifierAwareProvider {
         &self,
         _id: &ResourceId,
         _request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
         let state = self.created_state.lock().unwrap().clone();
-        Box::pin(
-            async move { state.ok_or_else(|| ProviderError::api_error("no canned create state")) },
-        )
+        Box::pin(async move {
+            state
+                .map(|state| crate::provider::CreateOutcome::Success { state })
+                .ok_or_else(|| ProviderError::api_error("no canned create state"))
+        })
     }
 
     fn update(
@@ -5722,7 +5793,7 @@ async fn expand_deferred_for_cancelled_after_upstream_create_reports_skipped() {
             &self,
             id: &ResourceId,
             _request: CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
             self.calls
                 .lock()
                 .unwrap()
@@ -5731,13 +5802,15 @@ async fn expand_deferred_for_cancelled_after_upstream_create_reports_skipped() {
             let id = id.clone();
             Box::pin(async move {
                 cancel.cancel();
-                Ok(State::existing(
-                    id,
-                    HashMap::from([(
-                        "domain_validation_options".to_string(),
-                        Value::Concrete(ConcreteValue::List(Vec::new())),
-                    )]),
-                ))
+                Ok(crate::provider::CreateOutcome::Success {
+                    state: State::existing(
+                        id,
+                        HashMap::from([(
+                            "domain_validation_options".to_string(),
+                            Value::Concrete(ConcreteValue::List(Vec::new())),
+                        )]),
+                    ),
+                })
             })
         }
 

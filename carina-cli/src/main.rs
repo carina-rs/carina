@@ -525,6 +525,10 @@ fn render_app_error(e: &error::AppError) -> AppErrorRendering {
                 exit_code: 1,
             }
         }
+        error::AppError::PartialSuccess(message) => AppErrorRendering {
+            stderr: format_error_lines(message),
+            exit_code: 2,
+        },
         _ => AppErrorRendering {
             stderr: format_error_lines(&e.to_string()),
             exit_code: 1,

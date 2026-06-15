@@ -10,8 +10,8 @@ use crate::differ::{
 use crate::effect::Effect;
 use crate::executor::UnresolvedResource;
 use crate::provider::{
-    CreateRequest, DeleteRequest, PatchOp, PatchOpKind, Provider, UpdatePatch, UpdateRequest,
-    build_update_patch,
+    CreateRequest, DeleteRequest, PartialCreateDiagnostic, PatchOp, PatchOpKind, Provider,
+    UpdatePatch, UpdateRequest, build_update_patch,
 };
 use crate::resource::{ConcreteValue, ResolvedResource, Resource, ResourceId, State, Value};
 use crate::schema::SchemaRegistry;
@@ -102,6 +102,7 @@ pub(super) enum SingleEffectResult {
         success: bool,
         state: Option<State>,
         resource_id: ResourceId,
+        diagnostic: Option<PartialCreateDiagnostic>,
         resolved_attrs: Option<HashMap<String, Value>>,
         binding: Option<String>,
         refreshes: Vec<(ResourceId, String)>,
@@ -184,7 +185,9 @@ pub(super) async fn execute_cbd_replace_parallel(
         .create(&ctx.to.id, CreateRequest { resource: resolved })
         .await
     {
-        Ok(state) => {
+        Ok(outcome) => {
+            let diagnostic = outcome.diagnostic().cloned();
+            let state = outcome.into_state_for_writeback();
             // Build a local bindings clone for cascade resolution
             let mut local_bindings = ctx.bindings.clone();
             local_bindings.record_applied(ctx.to.binding.as_deref(), &resolved_attrs, &state);
@@ -254,6 +257,7 @@ pub(super) async fn execute_cbd_replace_parallel(
                     success: false,
                     state: None,
                     resource_id: ctx.to.id.clone(),
+                    diagnostic,
                     resolved_attrs: None,
                     binding: ctx.effect.binding_name(),
                     refreshes,
@@ -301,7 +305,10 @@ pub(super) async fn execute_cbd_replace_parallel(
                                     from: &temp.temporary_value,
                                     to: &temp.original_value,
                                 });
-                                final_state = renamed_state;
+                                final_state =
+                                    diagnostic.clone().map_or(renamed_state.clone(), |d| {
+                                        d.into_state_for_writeback(renamed_state)
+                                    });
                             }
                             Err(e) => {
                                 let error_str = e.to_string();
@@ -331,6 +338,7 @@ pub(super) async fn execute_cbd_replace_parallel(
                             success: false,
                             state: Some(final_state),
                             resource_id: ctx.to.id.clone(),
+                            diagnostic,
                             resolved_attrs: Some(resolved_attrs.clone()),
                             binding: ctx.effect.binding_name(),
                             refreshes,
@@ -338,16 +346,27 @@ pub(super) async fn execute_cbd_replace_parallel(
                             permanent_overrides,
                         }
                     } else {
-                        observer.on_event(&ExecutionEvent::EffectSucceeded {
-                            effect: ctx.effect,
-                            state: None,
-                            duration: ctx.started.elapsed(),
-                            progress: ctx.progress,
-                        });
+                        if let Some(diagnostic) = &diagnostic {
+                            observer.on_event(&ExecutionEvent::EffectPartiallySucceeded {
+                                effect: ctx.effect,
+                                state: &final_state,
+                                diagnostic,
+                                duration: ctx.started.elapsed(),
+                                progress: ctx.progress,
+                            });
+                        } else {
+                            observer.on_event(&ExecutionEvent::EffectSucceeded {
+                                effect: ctx.effect,
+                                state: None,
+                                duration: ctx.started.elapsed(),
+                                progress: ctx.progress,
+                            });
+                        }
                         SingleEffectResult::Replace {
                             success: true,
                             state: Some(final_state),
                             resource_id: ctx.to.id.clone(),
+                            diagnostic,
                             resolved_attrs: Some(resolved_attrs),
                             binding: ctx.to.binding.clone(),
                             refreshes,
@@ -372,6 +391,7 @@ pub(super) async fn execute_cbd_replace_parallel(
                         success: false,
                         state: None,
                         resource_id: ctx.to.id.clone(),
+                        diagnostic,
                         resolved_attrs: None,
                         binding: ctx.effect.binding_name(),
                         refreshes,
@@ -393,6 +413,7 @@ pub(super) async fn execute_cbd_replace_parallel(
                 success: false,
                 state: None,
                 resource_id: ctx.to.id.clone(),
+                diagnostic: None,
                 resolved_attrs: None,
                 binding: ctx.effect.binding_name(),
                 refreshes,
@@ -448,6 +469,7 @@ pub(super) async fn execute_dbd_replace_parallel(
                         success: false,
                         state: None,
                         resource_id: ctx.to.id.clone(),
+                        diagnostic: None,
                         resolved_attrs: None,
                         binding: ctx.effect.binding_name(),
                         refreshes,
@@ -460,22 +482,46 @@ pub(super) async fn execute_dbd_replace_parallel(
                 .create(&ctx.to.id, CreateRequest { resource: resolved })
                 .await
             {
-                Ok(state) => {
-                    observer.on_event(&ExecutionEvent::EffectSucceeded {
-                        effect: ctx.effect,
-                        state: Some(&state),
-                        duration: ctx.started.elapsed(),
-                        progress: ctx.progress,
-                    });
-                    SingleEffectResult::Replace {
-                        success: true,
-                        state: Some(state),
-                        resource_id: ctx.to.id.clone(),
-                        resolved_attrs: Some(resolved_attrs),
-                        binding: ctx.to.binding.clone(),
-                        refreshes,
+                Ok(outcome) => {
+                    let diagnostic = outcome.diagnostic().cloned();
+                    let state = outcome.into_state_for_writeback();
+                    if let Some(diagnostic) = diagnostic {
+                        observer.on_event(&ExecutionEvent::EffectPartiallySucceeded {
+                            effect: ctx.effect,
+                            state: &state,
+                            diagnostic: &diagnostic,
+                            duration: ctx.started.elapsed(),
+                            progress: ctx.progress,
+                        });
+                        SingleEffectResult::Replace {
+                            success: true,
+                            state: Some(state),
+                            resource_id: ctx.to.id.clone(),
+                            diagnostic: Some(diagnostic),
+                            resolved_attrs: Some(resolved_attrs),
+                            binding: ctx.to.binding.clone(),
+                            refreshes,
 
-                        permanent_overrides: None,
+                            permanent_overrides: None,
+                        }
+                    } else {
+                        observer.on_event(&ExecutionEvent::EffectSucceeded {
+                            effect: ctx.effect,
+                            state: Some(&state),
+                            duration: ctx.started.elapsed(),
+                            progress: ctx.progress,
+                        });
+                        SingleEffectResult::Replace {
+                            success: true,
+                            state: Some(state),
+                            resource_id: ctx.to.id.clone(),
+                            diagnostic: None,
+                            resolved_attrs: Some(resolved_attrs),
+                            binding: ctx.to.binding.clone(),
+                            refreshes,
+
+                            permanent_overrides: None,
+                        }
                     }
                 }
                 Err(e) => {
@@ -491,6 +537,7 @@ pub(super) async fn execute_dbd_replace_parallel(
                         success: false,
                         state: None,
                         resource_id: ctx.to.id.clone(),
+                        diagnostic: None,
                         resolved_attrs: None,
                         binding: ctx.effect.binding_name(),
                         refreshes,
@@ -513,6 +560,7 @@ pub(super) async fn execute_dbd_replace_parallel(
                 success: false,
                 state: None,
                 resource_id: ctx.to.id.clone(),
+                diagnostic: None,
                 resolved_attrs: None,
                 binding: ctx.effect.binding_name(),
                 refreshes,

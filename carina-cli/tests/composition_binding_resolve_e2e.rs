@@ -114,9 +114,13 @@ impl Provider for NoopProvider {
         &self,
         id: &carina_core::resource::ResourceId,
         _request: carina_core::provider::CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<carina_core::resource::State>> {
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
         let id = id.clone();
-        Box::pin(async move { Ok(carina_core::resource::State::existing(id, HashMap::new())) })
+        Box::pin(async move {
+            Ok(carina_core::provider::CreateOutcome::Success {
+                state: carina_core::resource::State::existing(id, HashMap::new()),
+            })
+        })
     }
     fn update(
         &self,

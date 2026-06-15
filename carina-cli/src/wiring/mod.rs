@@ -31,7 +31,9 @@ use carina_core::provider::{
 };
 use carina_core::resolver::resolve_refs_for_plan;
 use carina_core::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, State, Value};
-use carina_core::schema::{SchemaRegistry, resolve_block_names};
+use carina_core::schema::{
+    AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, resolve_block_names,
+};
 use carina_core::validation;
 use carina_provider_mock::MockProvider;
 use carina_state::StateFile;
@@ -100,7 +102,22 @@ pub struct WiringContext {
 
 impl WiringContext {
     pub fn new(factories: Vec<Box<dyn ProviderFactory>>) -> Self {
-        let schemas = provider_mod::collect_schemas(&factories);
+        let mut schemas = provider_mod::collect_schemas(&factories);
+        if std::env::var_os("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA").is_some() {
+            schemas.insert(
+                "mock",
+                ResourceSchema::new("test.resource")
+                    .attribute(
+                        AttributeSchema::new("name", AttributeType::string())
+                            .required()
+                            .create_only(),
+                    )
+                    .attribute(AttributeSchema::new(
+                        "tags",
+                        AttributeType::map(AttributeType::string()),
+                    )),
+            );
+        }
         Self {
             factories: Arc::new(factories),
             schemas,
@@ -1828,6 +1845,9 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         provider
             .hydrate_read_state(&mut current_states, &saved_attrs)
             .await;
+        if let Some(sf) = state_file.as_ref() {
+            sf.restore_partial_read_markers(&mut current_states);
+        }
 
         // Transfer state for explicit `moved` blocks and anonymous →
         // let-bound renames (#1685). Must run before phase 2 so the ref
@@ -1915,6 +1935,9 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
             provider
                 .hydrate_read_state(&mut current_states, &saved_attrs)
                 .await;
+            if let Some(sf) = state_file.as_ref() {
+                sf.restore_partial_read_markers(&mut current_states);
+            }
             moved_pairs.extend(materialize_moved_states(
                 &mut current_states,
                 &mut prev_explicit,
@@ -2011,6 +2034,9 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
             provider
                 .hydrate_read_state(&mut current_states, &saved_attrs)
                 .await;
+            if let Some(sf) = state_file.as_ref() {
+                sf.restore_partial_read_markers(&mut current_states);
+            }
         } else if let Some(sf) = state_file.as_ref() {
             // --refresh=false: restore children's state from the cached
             // state file, same as the original resources. A child not in
@@ -2124,6 +2150,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
             &mut wait_bindings,
         )
         .await;
+    let plan_input_states = carina_core::resource::into_plan_input_map(current_states.clone());
 
     // Build directives map from state file for orphaned resource deletion
     let directives_map = state_file
@@ -2134,7 +2161,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         &resources,
         &data_sources_for_plan,
         &provider,
-        &current_states,
+        &plan_input_states,
         &directives_map,
         ctx.schemas(),
         &saved_attrs,
@@ -2146,7 +2173,12 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     // Populate cascading updates for Replace effects with create_before_destroy.
     // Uses unresolved resources (sorted_resources) so dependent Update effects
     // retain ResourceRef values for re-resolution at apply time.
-    cascade_dependent_updates(&mut plan, &sorted_resources, &current_states, ctx.schemas());
+    cascade_dependent_updates(
+        &mut plan,
+        &sorted_resources,
+        &plan_input_states,
+        ctx.schemas(),
+    );
 
     // Add state block effects (import/removed/moved) to the plan.
     // carina#3329: pass the same plan_bindings + upstream_binding_names

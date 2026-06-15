@@ -6,12 +6,14 @@
 use std::collections::HashMap;
 
 use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
 
 use crate::effect::PlanOp;
 use crate::resource::{
-    ConcreteValue, DataSource, Directives, ResolvedResource, Resource, ResourceId, State, Value,
+    ConcreteValue, DataSource, Directives, PartialReadMarker, ResolvedResource, Resource,
+    ResourceId, State, Value,
 };
 use crate::schema::{SchemaRegistry, TypeIdentity};
 use crate::wait::BindingPattern;
@@ -486,6 +488,80 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// attributes that APIs don't return in read responses.
 pub type SavedAttrs = HashMap<ResourceId, HashMap<String, Value>>;
 
+/// Result of a provider create operation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum CreateOutcome {
+    /// Create completed and the returned state is complete.
+    Success { state: State },
+    /// Create completed but the provider could not fully observe state.
+    PartialSuccess {
+        state: State,
+        diagnostic: PartialCreateDiagnostic,
+    },
+}
+
+/// Diagnostic details for a partial create.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PartialCreateDiagnostic {
+    reason: String,
+    missing_attributes: Vec<String>,
+}
+
+impl CreateOutcome {
+    pub fn partial_success(state: State, reason: String, missing_attributes: Vec<String>) -> Self {
+        match PartialCreateDiagnostic::new(reason, missing_attributes) {
+            Some(diagnostic) => CreateOutcome::PartialSuccess { state, diagnostic },
+            None => CreateOutcome::Success { state },
+        }
+    }
+
+    /// Consume the outcome and produce a State ready for writeback.
+    pub fn into_state_for_writeback(self) -> State {
+        match self {
+            CreateOutcome::Success { state } => state,
+            CreateOutcome::PartialSuccess { state, diagnostic } => {
+                diagnostic.into_state_for_writeback(state)
+            }
+        }
+    }
+
+    pub fn diagnostic(&self) -> Option<&PartialCreateDiagnostic> {
+        match self {
+            CreateOutcome::Success { .. } => None,
+            CreateOutcome::PartialSuccess { diagnostic, .. } => Some(diagnostic),
+        }
+    }
+}
+
+impl PartialCreateDiagnostic {
+    pub fn new(reason: String, missing_attributes: Vec<String>) -> Option<Self> {
+        if missing_attributes.is_empty() {
+            None
+        } else {
+            Some(Self {
+                reason,
+                missing_attributes,
+            })
+        }
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    pub fn missing_attributes(&self) -> &[String] {
+        &self.missing_attributes
+    }
+
+    pub fn into_state_for_writeback(self, mut state: State) -> State {
+        state.partial_read = Some(PartialReadMarker {
+            detail: self.reason,
+            missing_attributes: self.missing_attributes.into_iter().collect(),
+        });
+        state
+    }
+}
+
 /// Runtime CRUD operations for a provider.
 ///
 /// Each infrastructure provider (AWS, GCP, etc.) implements this trait
@@ -558,7 +634,7 @@ pub trait Provider: Send + Sync {
         &self,
         id: &ResourceId,
         request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>>;
+    ) -> BoxFuture<'_, ProviderResult<CreateOutcome>>;
 
     /// Update an existing resource by applying `request.patch`.
     ///
@@ -890,7 +966,7 @@ impl Provider for ProviderRouter {
         &self,
         id: &ResourceId,
         request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
         match self.get_provider_or_error(id) {
             Ok(provider) => provider.create(id, request),
             Err(e) => Box::pin(async move { Err(e) }),
@@ -1319,7 +1395,7 @@ impl Provider for Box<dyn Provider> {
         &self,
         id: &ResourceId,
         request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
         (**self).create(id, request)
     }
 
@@ -1394,14 +1470,13 @@ mod tests {
             &self,
             id: &ResourceId,
             request: CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
             let id = id.clone();
             let attrs = request.resource.as_resource().attributes.clone();
             Box::pin(async move {
-                Ok(
-                    State::existing(id, crate::resource::attrs_to_hashmap(&attrs))
-                        .with_identifier("mock-id-123"),
-                )
+                let state = State::existing(id, crate::resource::attrs_to_hashmap(&attrs))
+                    .with_identifier("mock-id-123");
+                Ok(CreateOutcome::Success { state })
             })
         }
 
@@ -1450,6 +1525,48 @@ mod tests {
         let id = ResourceId::new("test", "example");
         let state = provider.read(&id, None, ReadRequest).await.unwrap();
         assert!(!state.exists);
+    }
+
+    #[test]
+    fn create_outcome_exposes_state_and_diagnostic() {
+        let id = ResourceId::new("test", "example");
+        let state = State::existing(id, HashMap::new()).with_identifier("mock-id");
+        let diagnostic = PartialCreateDiagnostic::new(
+            "mock partial create".to_string(),
+            vec!["dns_name".to_string()],
+        )
+        .expect("missing attributes are non-empty");
+
+        let success = CreateOutcome::Success {
+            state: state.clone(),
+        };
+        assert_eq!(success.diagnostic(), None);
+        assert_eq!(success.into_state_for_writeback(), state.clone());
+
+        let partial = CreateOutcome::partial_success(
+            state.clone(),
+            "mock partial create".to_string(),
+            vec!["dns_name".to_string()],
+        );
+
+        assert_eq!(partial.diagnostic(), Some(&diagnostic));
+        let state = partial.into_state_for_writeback();
+        assert_eq!(state.partial_read.unwrap().missing_attributes.len(), 1);
+    }
+
+    #[test]
+    fn create_outcome_empty_partial_diagnostic_becomes_success() {
+        let id = ResourceId::new("test", "example");
+        let state = State::existing(id, HashMap::new()).with_identifier("mock-id");
+
+        let outcome = CreateOutcome::partial_success(
+            state.clone(),
+            "mock partial create".to_string(),
+            vec![],
+        );
+
+        assert_eq!(outcome.diagnostic(), None);
+        assert_eq!(outcome.into_state_for_writeback(), state);
     }
 
     #[test]
@@ -1505,7 +1622,7 @@ mod tests {
             &self,
             _id: &ResourceId,
             _request: CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("not supported")) })
         }
 
@@ -1628,7 +1745,8 @@ mod tests {
                 },
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_state_for_writeback();
         assert!(state.exists);
         assert_eq!(state.identifier, Some("mock-id-123".to_string()));
     }
@@ -1658,7 +1776,8 @@ mod tests {
                 },
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_state_for_writeback();
         assert!(state.exists);
         assert_eq!(state.identifier, Some("mock-id-123".to_string()));
     }
@@ -2167,7 +2286,7 @@ mod tests {
             &self,
             _id: &ResourceId,
             _request: CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("not supported")) })
         }
         fn update(
@@ -2509,9 +2628,13 @@ mod tests {
                 &self,
                 id: &ResourceId,
                 _request: CreateRequest,
-            ) -> BoxFuture<'_, ProviderResult<State>> {
+            ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
                 let id = id.clone();
-                Box::pin(async move { Ok(State::not_found(id)) })
+                Box::pin(async move {
+                    Ok(CreateOutcome::Success {
+                        state: State::not_found(id),
+                    })
+                })
             }
 
             fn update(

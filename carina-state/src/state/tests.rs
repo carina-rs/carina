@@ -273,6 +273,8 @@ fn test_from_provider_state() {
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let existing = ResourceState::new("s3.Bucket", "my-bucket", "awscc").with_protected(true);
@@ -306,6 +308,8 @@ fn test_from_provider_state_without_existing() {
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -344,6 +348,8 @@ fn test_from_provider_state_repairs_unrecorded_from_state_attrs() {
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let mut existing = ResourceState::new("sso.Assignment", "x", "awscc");
@@ -389,6 +395,8 @@ fn test_from_provider_state_emits_unrecorded_for_fresh_empty_body_resource() {
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -425,6 +433,8 @@ fn test_from_provider_state_preserves_populated_struct_when_resource_attrs_empty
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     // Prior on-disk: populated Struct (e.g. from a previous self-heal).
@@ -461,6 +471,8 @@ fn test_from_provider_state_no_repair_when_state_attrs_also_empty() {
         attributes: HashMap::new(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let mut existing = ResourceState::new("sso.Assignment", "x", "awscc");
@@ -811,6 +823,8 @@ fn test_from_provider_state_stores_binding_and_dependencies() {
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1105,6 +1119,8 @@ fn test_merge_write_only_attributes() {
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let mut rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1149,6 +1165,8 @@ fn test_merge_write_only_attributes_not_in_desired() {
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let mut rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1185,6 +1203,8 @@ fn test_merge_write_only_skips_if_already_in_provider_state() {
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let mut rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1261,6 +1281,8 @@ fn test_from_provider_state_secret_stored_as_hash() {
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1328,6 +1350,8 @@ fn test_from_provider_state_secret_in_map_stored_as_hash() {
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1399,6 +1423,8 @@ fn test_from_provider_state_secret_in_map_preserves_provider_extra_keys() {
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1458,6 +1484,8 @@ fn test_from_provider_state_secret_in_list_stored_as_hash() {
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1521,6 +1549,7 @@ fn build_remote_bindings_ignores_resource_bindings() {
         binding: Some("vpc".to_string()),
         dependency_bindings: BTreeSet::new(),
         write_only_attributes: vec![],
+        partial_read: None,
     });
     let bindings = state.build_remote_bindings();
     assert!(
@@ -1591,6 +1620,8 @@ fn from_provider_state_rejects_resource_ref_in_provider_attributes() {
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let err = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap_err();
@@ -1724,4 +1755,54 @@ fn build_directives_keys_include_provider_instance() {
         !map.contains_key(&legacy),
         "ResourceId without provider_instance must not match a Some(_) entry"
     );
+}
+
+#[test]
+fn partial_read_marker_round_trips_through_state_json() {
+    let mut state = StateFile::new();
+    let mut rs = ResourceState::new("test.resource", "r1", "mock").with_identifier("mock-id");
+    rs.partial_read = Some(PartialReadMarker {
+        detail: "mock partial create".to_string(),
+        missing_attributes: ["a".to_string(), "b".to_string()].into_iter().collect(),
+    });
+    state.upsert_resource(rs);
+
+    let json = serde_json::to_string(&state).expect("serialize");
+    let back = check_and_migrate(&json).expect("read").into_state();
+
+    assert_eq!(
+        back.resources[0].partial_read,
+        state.resources[0].partial_read
+    );
+}
+
+#[test]
+fn missing_partial_read_field_defaults_to_none() {
+    let json = r#"{
+        "version": 7,
+        "serial": 0,
+        "lineage": "test-lineage",
+        "carina_version": "0.4.0",
+        "resources": [{
+            "resource_type": "test.resource",
+            "name": "r1",
+            "provider": "mock",
+            "identifier": "mock-id",
+            "attributes": {"name": "r1"},
+            "protected": false,
+            "directives": {},
+            "prefixes": {},
+            "name_overrides": {},
+            "desired_keys": [],
+            "explicit": {"kind": "struct", "children": {}},
+            "binding": null,
+            "dependency_bindings": [],
+            "write_only_attributes": []
+        }]
+    }"#;
+
+    let state = check_and_migrate(json).expect("read").into_state();
+
+    assert_eq!(state.resources.len(), 1);
+    assert_eq!(state.resources[0].partial_read, None);
 }

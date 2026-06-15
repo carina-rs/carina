@@ -553,6 +553,8 @@ pub(super) async fn execute_effects_sequential(
 ) -> (ExecutionResult, bool) {
     let mut success_count = 0;
     let mut failure_count = 0;
+    let mut partial_count = 0;
+    let mut partial_diagnostics = Vec::new();
     let mut skip_count = 0;
     let (mut applied_states, wait_identifiers) = AppliedStates::with_initial(&input.current_states);
     let mut failed_bindings: HashSet<String> = HashSet::new();
@@ -979,6 +981,8 @@ pub(super) async fn execute_effects_sequential(
                     &mut ExecutionState {
                         success_count: &mut success_count,
                         failure_count: &mut failure_count,
+                        partial_count: &mut partial_count,
+                        partial_diagnostics: &mut partial_diagnostics,
                         applied_states: &mut applied_states,
                         failed_bindings: &mut failed_bindings,
                         successfully_deleted: &mut successfully_deleted,
@@ -991,13 +995,14 @@ pub(super) async fn execute_effects_sequential(
                 success,
                 state,
                 resource_id,
+                diagnostic,
                 resolved_attrs,
                 binding,
                 refreshes,
                 permanent_overrides,
             } => {
                 if let Some(state) = &state {
-                    applied_states.insert(resource_id, state.clone());
+                    applied_states.insert(resource_id.clone(), state.clone());
                     if let Some(attrs) = &resolved_attrs {
                         input
                             .bindings
@@ -1005,7 +1010,12 @@ pub(super) async fn execute_effects_sequential(
                     }
                 }
                 if success {
-                    success_count += 1;
+                    if let Some(diagnostic) = diagnostic {
+                        partial_count += 1;
+                        partial_diagnostics.push((resource_id.clone(), diagnostic));
+                    } else {
+                        success_count += 1;
+                    }
                     if let Some((id, overrides)) = permanent_overrides {
                         permanent_name_overrides.insert(id, overrides);
                     }
@@ -1105,6 +1115,8 @@ pub(super) async fn execute_effects_sequential(
     let result = ExecutionResult {
         success_count,
         failure_count,
+        partial_count,
+        partial_diagnostics,
         skip_count,
         applied_states: applied_states.into_inner(),
         runtime_synthesized_resources,
@@ -1220,7 +1232,7 @@ mod tests {
             &self,
             id: &ResourceId,
             _request: CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
             self.create_log
                 .lock()
                 .unwrap()
@@ -1231,7 +1243,9 @@ mod tests {
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                     Err(ProviderError::api_error("alb create failed"))
                 } else {
-                    Ok(State::existing(id, HashMap::new()).with_identifier("cert-id"))
+                    Ok(crate::provider::CreateOutcome::Success {
+                        state: State::existing(id, HashMap::new()).with_identifier("cert-id"),
+                    })
                 }
             })
         }
@@ -1303,6 +1317,7 @@ mod tests {
                 ExecutionEvent::Waiting { .. }
                 | ExecutionEvent::EffectStarted { .. }
                 | ExecutionEvent::EffectSucceeded { .. }
+                | ExecutionEvent::EffectPartiallySucceeded { .. }
                 | ExecutionEvent::WaitPolling { .. }
                 | ExecutionEvent::CascadeUpdateSucceeded { .. }
                 | ExecutionEvent::CascadeUpdateFailed { .. }

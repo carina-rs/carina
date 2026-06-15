@@ -1342,6 +1342,8 @@ mod tests {
                 .into_iter()
                 .collect(),
                 dependency_bindings: std::collections::BTreeSet::new(),
+
+                partial_read: None,
             },
         );
 

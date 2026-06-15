@@ -2,7 +2,9 @@
 
 use carina_core::deps::get_resource_dependencies;
 use carina_core::explicit::{self, ExplicitFields};
-use carina_core::resource::{ConcreteValue, Directives, Resource, ResourceId, State, Value};
+use carina_core::resource::{
+    ConcreteValue, Directives, PartialReadMarker, Resource, ResourceId, State, Value,
+};
 use carina_core::value::{
     SecretHashContext, contains_secret, json_to_dsl_value, merge_secrets_into_provider_json,
     value_to_json,
@@ -206,6 +208,29 @@ impl StateFile {
         result
     }
 
+    /// Restore partial-read markers from the state file onto refreshed states.
+    pub fn restore_partial_read_markers(&self, states: &mut HashMap<ResourceId, State>) {
+        for (id, current) in states.iter_mut() {
+            if !current.exists {
+                current.partial_read = None;
+                continue;
+            }
+            let marker = self
+                .find_resource(&id.provider, &id.resource_type, id.name_str())
+                .and_then(|rs| rs.partial_read.clone());
+            if let Some(mut marker) = marker {
+                marker
+                    .missing_attributes
+                    .retain(|attr| !current.attributes.contains_key(attr));
+                if marker.missing_attributes.is_empty() {
+                    current.partial_read = None;
+                } else {
+                    current.partial_read = Some(marker);
+                }
+            }
+        }
+    }
+
     /// Build a map of `ExplicitFields` trees (one per resource) recording
     /// which fields the user explicitly wrote in their `.crn`. The differ
     /// uses these trees both to detect attribute removals and to project
@@ -245,6 +270,7 @@ impl StateFile {
                 attributes: attrs,
                 exists: true,
                 dependency_bindings: rs.unwrap().dependency_bindings.clone(),
+                partial_read: rs.unwrap().partial_read.clone(),
             };
         }
         State::not_found(id.clone())
@@ -288,6 +314,7 @@ impl StateFile {
                     attributes: attrs,
                     exists: true,
                     dependency_bindings: rs.dependency_bindings.clone(),
+                    partial_read: rs.partial_read.clone(),
                 };
                 result.insert(id, state);
             }
@@ -692,6 +719,9 @@ pub struct ResourceState {
     /// to write-only attributes can be detected on subsequent plans.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub write_only_attributes: Vec<String>,
+    /// Marker for a state produced by a partial-success create.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_read: Option<PartialReadMarker>,
 }
 
 impl ResourceState {
@@ -715,6 +745,7 @@ impl ResourceState {
             binding: None,
             dependency_bindings: BTreeSet::new(),
             write_only_attributes: Vec::new(),
+            partial_read: None,
         }
     }
 
@@ -740,6 +771,7 @@ impl ResourceState {
         if let Some(identifier) = &state.identifier {
             self.identifier = Some(identifier.clone());
         }
+        self.partial_read = state.partial_read.clone();
         self
     }
 
@@ -820,6 +852,7 @@ impl ResourceState {
             resource.id.provider.clone(),
         );
         rs.identifier = state.identifier.clone();
+        rs.partial_read = state.partial_read.clone();
         for (k, v) in &state.attributes {
             rs.attributes
                 .insert(k.clone(), value_to_json(v).map_err(|e| e.to_string())?);

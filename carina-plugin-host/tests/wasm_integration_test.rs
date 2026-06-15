@@ -123,7 +123,8 @@ async fn test_wasm_mock_provider_create_and_read() {
             },
         )
         .await
-        .expect("create should succeed");
+        .expect("create should succeed")
+        .into_state_for_writeback();
     assert_eq!(created.identifier, Some("mock-id".into()));
     assert_eq!(
         created.attributes.get("name"),
@@ -191,7 +192,8 @@ async fn test_wasm_mock_provider_update_and_delete() {
             },
         )
         .await
-        .expect("create should succeed");
+        .expect("create should succeed")
+        .into_state_for_writeback();
     assert_eq!(
         created.attributes.get("color"),
         Some(&Value::Concrete(ConcreteValue::String("red".into())))
