@@ -229,6 +229,27 @@ macro_rules! export_provider {
                 }
             }
 
+            fn proto_to_wit_create_outcome(
+                outcome: &proto::CreateOutcome,
+            ) -> wit_types::CreateOutcome {
+                match outcome {
+                    proto::CreateOutcome::Success { state } => {
+                        wit_types::CreateOutcome::Success(proto_to_wit_state(state))
+                    }
+                    proto::CreateOutcome::PartialSuccess { state, diagnostic } => {
+                        wit_types::CreateOutcome::PartialSuccess(
+                            wit_types::CreatePartialSuccess {
+                                state: proto_to_wit_state(state),
+                                diagnostic: wit_types::PartialCreateDiagnostic {
+                                    reason: diagnostic.reason.clone(),
+                                    missing_attributes: diagnostic.missing_attributes.clone(),
+                                },
+                            },
+                        )
+                    }
+                }
+            }
+
             fn wit_to_proto_resource(res: &wit_types::ResourceDef) -> proto::Resource {
                 proto::Resource {
                     id: wit_to_proto_resource_id(&res.id),
@@ -450,12 +471,12 @@ macro_rules! export_provider {
                 fn create(
                     id: wit_types::ResourceId,
                     request: wit_types::CreateRequest,
-                ) -> Result<wit_types::State, wit_types::ProviderError> {
+                ) -> Result<wit_types::CreateOutcome, wit_types::ProviderError> {
                     let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
                     let proto_request = wit_to_proto_create_request(request);
                     match $crate::CarinaProvider::create(&*provider, &proto_id, proto_request) {
-                        Ok(state) => Ok(proto_to_wit_state(&state)),
+                        Ok(outcome) => Ok(proto_to_wit_create_outcome(&outcome)),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
@@ -782,6 +803,27 @@ macro_rules! export_provider {
                 }
             }
 
+            fn proto_to_wit_create_outcome(
+                outcome: &proto::CreateOutcome,
+            ) -> wit_types::CreateOutcome {
+                match outcome {
+                    proto::CreateOutcome::Success { state } => {
+                        wit_types::CreateOutcome::Success(proto_to_wit_state(state))
+                    }
+                    proto::CreateOutcome::PartialSuccess { state, diagnostic } => {
+                        wit_types::CreateOutcome::PartialSuccess(
+                            wit_types::CreatePartialSuccess {
+                                state: proto_to_wit_state(state),
+                                diagnostic: wit_types::PartialCreateDiagnostic {
+                                    reason: diagnostic.reason.clone(),
+                                    missing_attributes: diagnostic.missing_attributes.clone(),
+                                },
+                            },
+                        )
+                    }
+                }
+            }
+
             fn wit_to_proto_resource(res: &wit_types::ResourceDef) -> proto::Resource {
                 proto::Resource {
                     id: wit_to_proto_resource_id(&res.id),
@@ -1005,12 +1047,12 @@ macro_rules! export_provider {
                 fn create(
                     id: wit_types::ResourceId,
                     request: wit_types::CreateRequest,
-                ) -> Result<wit_types::State, wit_types::ProviderError> {
+                ) -> Result<wit_types::CreateOutcome, wit_types::ProviderError> {
                     let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
                     let proto_request = wit_to_proto_create_request(request);
                     match $crate::CarinaProvider::create(&*provider, &proto_id, proto_request) {
-                        Ok(state) => Ok(proto_to_wit_state(&state)),
+                        Ok(outcome) => Ok(proto_to_wit_create_outcome(&outcome)),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }

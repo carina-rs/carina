@@ -82,7 +82,7 @@ impl Provider for TestProvider {
         &self,
         _id: &ResourceId,
         _request: carina_core::provider::CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
         Box::pin(async { Err(ProviderError::internal("unexpected create")) })
     }
 
@@ -1321,7 +1321,7 @@ fn orphaned_state_resource_produces_delete_effect() {
         &desired,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &current_states,
+        &carina_core::resource::into_plan_input_map(current_states.clone()),
         &directives_map,
         &SchemaRegistry::new(),
         &saved_attrs,
@@ -1436,6 +1436,8 @@ async fn lock_released_on_write_state_failure() {
     let result = ApplyResult {
         success_count: 0,
         failure_count: 0,
+        partial_count: 0,
+        partial_diagnostics: Vec::new(),
         skip_count: 0,
         applied_states: HashMap::new(),
         runtime_synthesized_resources: Vec::new(),
@@ -1576,6 +1578,8 @@ async fn finalize_apply_uses_write_state_locked() {
     let result = ApplyResult {
         success_count: 0,
         failure_count: 0,
+        partial_count: 0,
+        partial_diagnostics: Vec::new(),
         skip_count: 0,
         applied_states: HashMap::new(),
         runtime_synthesized_resources: Vec::new(),
@@ -1656,7 +1660,7 @@ impl Provider for RecordingProvider {
         &self,
         id: &ResourceId,
         request: carina_core::provider::CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
         // Return a state with a new identifier to simulate resource creation
         let mut attrs = request.resource.as_resource().attributes.clone();
         // Simulate AWS returning a new ID
@@ -1667,7 +1671,7 @@ impl Provider for RecordingProvider {
         let id = id.clone();
         let state = State::existing(id, carina_core::resource::attrs_to_hashmap(&attrs))
             .with_identifier("vpc-NEW");
-        Box::pin(async move { Ok(state) })
+        Box::pin(async move { Ok(carina_core::provider::CreateOutcome::Success { state }) })
     }
 
     fn update(
@@ -1750,13 +1754,13 @@ impl Provider for RenameFailProvider {
         &self,
         id: &ResourceId,
         request: carina_core::provider::CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
         let state = State::existing(
             id.clone(),
             request.resource.as_resource().resolved_attributes(),
         )
         .with_identifier("temp-name-abc");
-        Box::pin(async move { Ok(state) })
+        Box::pin(async move { Ok(carina_core::provider::CreateOutcome::Success { state }) })
     }
 
     fn update(
@@ -2225,6 +2229,8 @@ async fn finalize_apply_without_lock_uses_write_state() {
     let result = ApplyResult {
         success_count: 0,
         failure_count: 0,
+        partial_count: 0,
+        partial_diagnostics: Vec::new(),
         skip_count: 0,
         applied_states: HashMap::new(),
         runtime_synthesized_resources: Vec::new(),
@@ -2346,7 +2352,7 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
         &desired,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &current_states,
+        &carina_core::resource::into_plan_input_map(current_states.clone()),
         &directives_map,
         &SchemaRegistry::new(),
         &saved_attrs,
@@ -2433,7 +2439,7 @@ fn refresh_false_uses_cached_state_from_state_file() {
         &desired,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &current_states,
+        &carina_core::resource::into_plan_input_map(current_states.clone()),
         &directives_map,
         &SchemaRegistry::new(),
         &saved_attrs,
@@ -2482,7 +2488,7 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
         &desired,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &current_states,
+        &carina_core::resource::into_plan_input_map(current_states.clone()),
         &directives_map,
         &SchemaRegistry::new(),
         &saved_attrs,
@@ -2529,7 +2535,7 @@ fn refresh_false_without_state_file_treats_resources_as_new() {
         &desired,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &current_states,
+        &carina_core::resource::into_plan_input_map(current_states.clone()),
         &HashMap::new(),
         &SchemaRegistry::new(),
         &HashMap::new(),
@@ -2671,6 +2677,7 @@ fn build_state_after_apply_persists_write_only_attributes() {
             )]),
             exists: true,
             dependency_bindings: BTreeSet::new(),
+            partial_read: None,
         },
     )]);
 
@@ -2783,7 +2790,7 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
         &[resource],
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        reloaded.as_map(),
+        &carina_core::resource::into_plan_input_map(reloaded.as_map().clone()),
         &HashMap::new(),
         &schemas,
         &HashMap::new(),
@@ -2827,6 +2834,7 @@ fn build_state_after_apply_write_only_detects_value_change() {
             )]),
             exists: true,
             dependency_bindings: BTreeSet::new(),
+            partial_read: None,
         },
     )]);
 
@@ -3113,6 +3121,8 @@ async fn finalize_apply_clears_state_exports_when_params_empty() {
     let result = ApplyResult {
         success_count: 0,
         failure_count: 0,
+        partial_count: 0,
+        partial_diagnostics: Vec::new(),
         skip_count: 0,
         applied_states: HashMap::new(),
         runtime_synthesized_resources: Vec::new(),
@@ -3173,6 +3183,8 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
     let result = ApplyResult {
         success_count: 0,
         failure_count: 0,
+        partial_count: 0,
+        partial_diagnostics: Vec::new(),
         skip_count: 0,
         applied_states: HashMap::new(),
         runtime_synthesized_resources: Vec::new(),
@@ -3239,6 +3251,8 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
     let result = ApplyResult {
         success_count: 1,
         failure_count: 1,
+        partial_count: 0,
+        partial_diagnostics: Vec::new(),
         skip_count: 0,
         applied_states: HashMap::from([(a_id.clone(), a_state.clone())]),
         runtime_synthesized_resources: Vec::new(),

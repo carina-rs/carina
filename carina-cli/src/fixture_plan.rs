@@ -325,7 +325,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &resources,
         &data_sources_for_plan,
         &carina_core::provider::ProviderRouter::new(),
-        &current_states,
+        &carina_core::resource::into_plan_input_map(current_states.clone()),
         &directives_map,
         wiring.schemas(),
         &saved_attrs,
@@ -337,7 +337,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     cascade_dependent_updates(
         &mut plan,
         &sorted_resources,
-        &current_states,
+        &carina_core::resource::into_plan_input_map(current_states.clone()),
         wiring.schemas(),
     );
 

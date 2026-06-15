@@ -117,6 +117,8 @@ mod tests {
         ExecutionResult {
             success_count: 0,
             failure_count: 0,
+            partial_count: 0,
+            partial_diagnostics: Vec::new(),
             skip_count: 0,
             applied_states: HashMap::new(),
             runtime_synthesized_resources: Vec::new(),
@@ -174,7 +176,7 @@ mod tests {
             &self,
             _id: &ResourceId,
             _request: CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
             unreachable!("import path must not call create")
         }
 

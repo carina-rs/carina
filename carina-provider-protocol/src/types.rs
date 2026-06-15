@@ -117,6 +117,27 @@ pub struct State {
     pub exists: bool,
 }
 
+/// Result of a create operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum CreateOutcome {
+    Success {
+        state: State,
+    },
+    PartialSuccess {
+        state: State,
+        diagnostic: PartialCreateDiagnostic,
+    },
+}
+
+/// Diagnostic details for a partial create.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartialCreateDiagnostic {
+    pub reason: String,
+    #[serde(default)]
+    pub missing_attributes: Vec<String>,
+}
+
 /// Kind of a single [`PatchOp`]. Mirrors `patch-op-kind` in
 /// `wit/types.wit`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

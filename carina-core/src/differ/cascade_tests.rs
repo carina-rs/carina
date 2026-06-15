@@ -80,7 +80,12 @@ fn cascade_dependent_updates_adds_update_for_dependent() {
 
     // Apply cascade
     let schemas = SchemaRegistry::new();
-    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
+    cascade_dependent_updates(
+        &mut plan,
+        &unresolved_resources,
+        &crate::resource::into_plan_input_map(current_states.clone()),
+        &schemas,
+    );
 
     // Verify the Replace effect now has a cascading update for the subnet
     let effects = plan.effects();
@@ -184,7 +189,12 @@ fn cascade_skips_resources_already_in_plan() {
     });
 
     let schemas = SchemaRegistry::new();
-    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
+    cascade_dependent_updates(
+        &mut plan,
+        &unresolved_resources,
+        &crate::resource::into_plan_input_map(current_states.clone()),
+        &schemas,
+    );
 
     // The Replace should have NO cascading updates since subnet already has an Update
     if let Effect::Replace {
@@ -247,7 +257,12 @@ fn cascade_no_op_without_create_before_destroy() {
     });
 
     let schemas = SchemaRegistry::new();
-    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
+    cascade_dependent_updates(
+        &mut plan,
+        &unresolved_resources,
+        &crate::resource::into_plan_input_map(current_states.clone()),
+        &schemas,
+    );
 
     if let Effect::Replace {
         cascading_updates, ..
@@ -343,7 +358,12 @@ fn cascade_transitive_dependencies() {
     });
 
     let schemas = SchemaRegistry::new();
-    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
+    cascade_dependent_updates(
+        &mut plan,
+        &unresolved_resources,
+        &crate::resource::into_plan_input_map(current_states.clone()),
+        &schemas,
+    );
 
     // Only subnet directly depends on VPC, so only subnet gets cascading update
     // Instance depends on subnet, not VPC directly
@@ -423,7 +443,12 @@ fn cascade_anonymous_resource_dependent() {
     });
 
     let schemas = SchemaRegistry::new();
-    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
+    cascade_dependent_updates(
+        &mut plan,
+        &unresolved_resources,
+        &crate::resource::into_plan_input_map(current_states.clone()),
+        &schemas,
+    );
 
     if let Effect::Replace {
         cascading_updates, ..
@@ -534,7 +559,12 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
     });
 
     // Apply cascade with schemas so it can detect create-only attributes
-    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
+    cascade_dependent_updates(
+        &mut plan,
+        &unresolved_resources,
+        &crate::resource::into_plan_input_map(current_states.clone()),
+        &schemas,
+    );
 
     // After cascading, the subnet should appear as a separate Replace effect in the plan,
     // NOT as a CascadingUpdate inside the VPC's Replace effect.
@@ -684,7 +714,12 @@ fn cascade_generates_replace_when_create_only_list_contains_nested_ref() {
         cascade_ref_hints: vec![],
     });
 
-    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
+    cascade_dependent_updates(
+        &mut plan,
+        &unresolved_resources,
+        &crate::resource::into_plan_input_map(current_states.clone()),
+        &schemas,
+    );
 
     let effects = plan.effects();
     assert_eq!(
@@ -798,7 +833,12 @@ fn cascade_hint_prefers_resource_ref_over_binding_ref_in_mixed_list() {
         cascade_ref_hints: vec![],
     });
 
-    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
+    cascade_dependent_updates(
+        &mut plan,
+        &unresolved_resources,
+        &crate::resource::into_plan_input_map(current_states.clone()),
+        &schemas,
+    );
 
     match &plan.effects()[1] {
         Effect::Replace {
@@ -916,7 +956,12 @@ fn cascade_generates_replace_when_create_only_map_contains_nested_ref() {
         cascade_ref_hints: vec![],
     });
 
-    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
+    cascade_dependent_updates(
+        &mut plan,
+        &unresolved_resources,
+        &crate::resource::into_plan_input_map(current_states.clone()),
+        &schemas,
+    );
 
     let effects = plan.effects();
     assert_eq!(
@@ -1043,7 +1088,12 @@ fn cascade_prevent_destroy_blocks_nested_map_ref_promotion_to_replace() {
         cascade_ref_hints: vec![],
     });
 
-    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
+    cascade_dependent_updates(
+        &mut plan,
+        &unresolved_resources,
+        &crate::resource::into_plan_input_map(current_states.clone()),
+        &schemas,
+    );
 
     assert!(
         plan.has_errors(),
@@ -1188,7 +1238,12 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
     });
 
     // Apply cascade
-    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
+    cascade_dependent_updates(
+        &mut plan,
+        &unresolved_resources,
+        &crate::resource::into_plan_input_map(current_states.clone()),
+        &schemas,
+    );
 
     // After cascading, the subnet Replace should have BOTH availability_zone AND vpc_id
     // in changed_create_only, because vpc_id is a create-only ref to the replaced VPC.
@@ -1322,7 +1377,12 @@ fn auto_detect_create_before_destroy_when_resource_has_dependents() {
 
     // Apply cascade — this should auto-detect that VPC has dependents and
     // promote it to create_before_destroy
-    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
+    cascade_dependent_updates(
+        &mut plan,
+        &unresolved_resources,
+        &crate::resource::into_plan_input_map(current_states.clone()),
+        &schemas,
+    );
 
     // The VPC Replace should now have create_before_destroy = true
     // because the subnet references it
@@ -1456,7 +1516,12 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
     });
 
     // Apply cascade
-    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
+    cascade_dependent_updates(
+        &mut plan,
+        &unresolved_resources,
+        &crate::resource::into_plan_input_map(current_states.clone()),
+        &schemas,
+    );
 
     // After cascading, the subnet should be UPGRADED from Update to Replace,
     // because vpc_id is a create-only attribute referencing the replaced VPC.
@@ -1576,7 +1641,12 @@ fn cascade_prevent_destroy_blocks_promotion_to_replace() {
     });
 
     // Apply cascade
-    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
+    cascade_dependent_updates(
+        &mut plan,
+        &unresolved_resources,
+        &crate::resource::into_plan_input_map(current_states.clone()),
+        &schemas,
+    );
 
     // The subnet should NOT be promoted to Replace because it has prevent_destroy.
     // Instead, a PlanError should be generated.
@@ -1711,7 +1781,12 @@ fn cascade_prevent_destroy_blocks_merge_upgrade_to_replace() {
     });
 
     // Apply cascade
-    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
+    cascade_dependent_updates(
+        &mut plan,
+        &unresolved_resources,
+        &crate::resource::into_plan_input_map(current_states.clone()),
+        &schemas,
+    );
 
     // The subnet should NOT be upgraded to Replace because it has prevent_destroy.
     // A PlanError should be generated instead.

@@ -37,8 +37,8 @@ use carina_core::executor::{
 use carina_core::module_resolver::resolve_modules;
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{
-    BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer, Provider, ProviderResult, ReadRequest,
-    UpdateRequest,
+    BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, NoopNormalizer, Provider,
+    ProviderResult, ReadRequest, UpdateRequest,
 };
 use carina_core::resolver::resolve_refs_with_state_and_remote;
 use carina_core::resource::{ConcreteValue, ResourceId, State, Value};
@@ -103,7 +103,7 @@ impl Provider for MockProvider {
         &self,
         id: &ResourceId,
         _request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
         let id = id.clone();
         Box::pin(async move {
             let mut attrs = HashMap::new();
@@ -117,7 +117,9 @@ impl Provider for MockProvider {
                 "id".to_string(),
                 Value::Concrete(ConcreteValue::String("id-123".to_string())),
             );
-            Ok(State::existing(id, attrs).with_identifier("id-123"))
+            Ok(CreateOutcome::Success {
+                state: State::existing(id, attrs).with_identifier("id-123"),
+            })
         })
     }
 
@@ -259,7 +261,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         &resources_for_plan,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &current_states,
+        &carina_core::resource::into_plan_input_map(current_states.clone()),
         &HashMap::new(),
         &registry,
         &HashMap::new(),
@@ -409,7 +411,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         &resources_for_plan,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &current_states,
+        &carina_core::resource::into_plan_input_map(current_states.clone()),
         &HashMap::new(),
         &registry,
         &HashMap::new(),
@@ -567,7 +569,7 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
         &resources_for_plan,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &current_states,
+        &carina_core::resource::into_plan_input_map(current_states.clone()),
         &HashMap::new(),
         &registry,
         &HashMap::new(),

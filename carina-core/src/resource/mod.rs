@@ -852,6 +852,8 @@ pub enum UnknownReason {
     /// diagnostic at the `${}` span and for downstream resolvers to
     /// stay tolerant. See #2480.
     EmptyInterpolation,
+    /// A create completed, but the provider could not read all attributes.
+    PostCreateReadIncomplete { detail: String },
 }
 
 /// A part of a string interpolation expression
@@ -1368,6 +1370,7 @@ impl Value {
                     // `UpstreamRef` so two distinct loop-var paths get
                     // distinct hashes.
                     UnknownReason::ForValuePath { path } => path.hash(hasher),
+                    UnknownReason::PostCreateReadIncomplete { detail } => detail.hash(hasher),
                     // `For{Key,Index,Value}` and `EmptyInterpolation`
                     // carry no payload; the discriminant alone already
                     // distinguishes them.
@@ -1940,6 +1943,50 @@ pub(crate) fn assert_value_fully_resolved(
     }
 }
 
+/// Marker for a state produced by a partial-success create.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PartialReadMarker {
+    pub detail: String,
+    pub missing_attributes: BTreeSet<String>,
+}
+
+/// State as fed to plan/diff/render.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanInputState(State);
+
+impl PlanInputState {
+    pub fn as_state(&self) -> &State {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> State {
+        self.0
+    }
+}
+
+impl AsRef<State> for PlanInputState {
+    fn as_ref(&self) -> &State {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for PlanInputState {
+    type Target = State;
+
+    fn deref(&self) -> &State {
+        &self.0
+    }
+}
+
+pub fn into_plan_input_map(
+    states: HashMap<ResourceId, State>,
+) -> HashMap<ResourceId, PlanInputState> {
+    states
+        .into_iter()
+        .map(|(id, state)| (id, state.into_plan_input()))
+        .collect()
+}
+
 /// Current state fetched from actual infrastructure
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct State {
@@ -1954,6 +2001,9 @@ pub struct State {
     ///
     /// Set semantics (BTreeSet) — see Resource::dependency_bindings (#2228).
     pub dependency_bindings: BTreeSet<String>,
+    /// Present when this state came from a partial-success create.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_read: Option<PartialReadMarker>,
 }
 
 impl State {
@@ -1964,6 +2014,7 @@ impl State {
             attributes: HashMap::new(),
             exists: false,
             dependency_bindings: BTreeSet::new(),
+            partial_read: None,
         }
     }
 
@@ -1974,6 +2025,7 @@ impl State {
             attributes,
             exists: true,
             dependency_bindings: BTreeSet::new(),
+            partial_read: None,
         }
     }
 
@@ -1985,6 +2037,32 @@ impl State {
     pub fn with_dependency_bindings(mut self, deps: BTreeSet<String>) -> Self {
         self.dependency_bindings = deps;
         self
+    }
+
+    pub fn with_partial_read(mut self, marker: PartialReadMarker) -> Self {
+        self.partial_read = Some(marker);
+        self
+    }
+
+    pub fn into_plan_input(mut self) -> PlanInputState {
+        self.materialize_partial_read_unknowns();
+        PlanInputState(self)
+    }
+
+    /// Reconstruct plan-time unknowns from the partial-read marker.
+    pub(crate) fn materialize_partial_read_unknowns(&mut self) {
+        let Some(marker) = &self.partial_read else {
+            return;
+        };
+        for attr in &marker.missing_attributes {
+            self.attributes.entry(attr.clone()).or_insert_with(|| {
+                Value::Deferred(DeferredValue::Unknown(
+                    UnknownReason::PostCreateReadIncomplete {
+                        detail: marker.detail.clone(),
+                    },
+                ))
+            });
+        }
     }
 }
 

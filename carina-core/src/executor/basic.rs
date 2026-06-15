@@ -14,12 +14,13 @@ use crate::executor::UnresolvedResource;
 use crate::executor::normalized::{NormalizedResource, apply_desired_normalization};
 use crate::parser::ProviderConfig;
 use crate::provider::{
-    CreateRequest, DeleteRequest, Provider, ProviderNormalizer, ReadRequest, UpdateRequest,
-    build_update_patch,
+    CreateOutcome, CreateRequest, DeleteRequest, PartialCreateDiagnostic, Provider,
+    ProviderNormalizer, ReadRequest, UpdateRequest, build_update_patch,
 };
 use crate::resolver::resolve_ref_value;
 use crate::resource::{
-    ConcreteValue, DeferredValue, ResolvedResource, Resource, ResourceId, State, Value,
+    ConcreteValue, DeferredValue, PartialReadMarker, ResolvedResource, Resource, ResourceId, State,
+    Value,
 };
 use crate::value::{SecretHashContext, SerializationContext, SerializationError};
 
@@ -49,6 +50,13 @@ pub(super) enum BasicEffectResult {
         resolved_attrs: Option<HashMap<String, Value>>,
         binding: Option<String>,
     },
+    PartialSuccess {
+        state: State,
+        resource_id: ResourceId,
+        diagnostic: PartialCreateDiagnostic,
+        resolved_attrs: Option<HashMap<String, Value>>,
+        binding: Option<String>,
+    },
     Failure {
         binding: Option<String>,
         refresh: Option<(ResourceId, String)>,
@@ -65,6 +73,8 @@ pub(super) enum BasicEffectResult {
 pub(super) struct ExecutionState<'a> {
     pub(super) success_count: &'a mut usize,
     pub(super) failure_count: &'a mut usize,
+    pub(super) partial_count: &'a mut usize,
+    pub(super) partial_diagnostics: &'a mut Vec<(ResourceId, PartialCreateDiagnostic)>,
     pub(super) applied_states: &'a mut AppliedStates,
     pub(super) failed_bindings: &'a mut std::collections::HashSet<String>,
     pub(super) successfully_deleted: &'a mut std::collections::HashSet<ResourceId>,
@@ -437,6 +447,25 @@ pub(super) fn process_basic_result(result: BasicEffectResult, exec: &mut Executi
                 queue_state_refresh(exec.pending_refreshes, id, Some(identifier.as_str()));
             }
         }
+        BasicEffectResult::PartialSuccess {
+            mut state,
+            resource_id,
+            diagnostic,
+            resolved_attrs,
+            binding,
+        } => {
+            *exec.partial_count += 1;
+            state.partial_read = Some(PartialReadMarker {
+                detail: diagnostic.reason.clone(),
+                missing_attributes: diagnostic.missing_attributes.iter().cloned().collect(),
+            });
+            if let Some(attrs) = &resolved_attrs {
+                exec.bindings
+                    .record_applied(binding.as_deref(), attrs, &state);
+            }
+            exec.applied_states.insert(resource_id.clone(), state);
+            exec.partial_diagnostics.push((resource_id, diagnostic));
+        }
         BasicEffectResult::Deleted { resource_id, .. } => {
             *exec.success_count += 1;
             exec.successfully_deleted.insert(resource_id);
@@ -521,7 +550,7 @@ pub(super) async fn execute_basic_effect<'a>(
                 .create(&resource.id, CreateRequest { resource: resolved })
                 .await
             {
-                Ok(state) => {
+                Ok(CreateOutcome::Success { state }) => {
                     observer.on_event(&ExecutionEvent::EffectSucceeded {
                         effect,
                         state: Some(&state),
@@ -531,6 +560,22 @@ pub(super) async fn execute_basic_effect<'a>(
                     BasicEffectResult::Success {
                         state: Some(state),
                         resource_id: resource.id.clone(),
+                        resolved_attrs: Some(resolved_attrs),
+                        binding: resource.binding.clone(),
+                    }
+                }
+                Ok(CreateOutcome::PartialSuccess { state, diagnostic }) => {
+                    observer.on_event(&ExecutionEvent::EffectPartiallySucceeded {
+                        effect,
+                        state: &state,
+                        diagnostic: &diagnostic,
+                        duration: started.elapsed(),
+                        progress,
+                    });
+                    BasicEffectResult::PartialSuccess {
+                        state,
+                        resource_id: resource.id.clone(),
+                        diagnostic,
                         resolved_attrs: Some(resolved_attrs),
                         binding: resource.binding.clone(),
                     }
@@ -699,6 +744,71 @@ pub(super) async fn execute_basic_effect<'a>(
                 }
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod process_basic_result_tests {
+    use super::*;
+    use crate::provider::PartialCreateDiagnostic;
+    use crate::resource::{State, Value};
+    use std::collections::HashSet;
+
+    #[test]
+    fn partial_success_records_state_and_diagnostic() {
+        let id = ResourceId::with_provider("mock", "test.resource", "r1", None);
+        let state = State::existing(id.clone(), HashMap::new()).with_identifier("mock-id");
+        let diagnostic = PartialCreateDiagnostic {
+            reason: "mock partial create".to_string(),
+            missing_attributes: vec!["computed".to_string()],
+        };
+        let (mut applied_states, _) = AppliedStates::with_initial(&HashMap::new());
+        let mut success_count = 0;
+        let mut failure_count = 0;
+        let mut partial_count = 0;
+        let mut partial_diagnostics = Vec::new();
+        let mut failed_bindings = HashSet::new();
+        let mut successfully_deleted = HashSet::new();
+        let mut pending_refreshes = HashMap::new();
+        let mut bindings = ResolvedBindings::default();
+        let mut exec = ExecutionState {
+            success_count: &mut success_count,
+            failure_count: &mut failure_count,
+            partial_count: &mut partial_count,
+            partial_diagnostics: &mut partial_diagnostics,
+            applied_states: &mut applied_states,
+            failed_bindings: &mut failed_bindings,
+            successfully_deleted: &mut successfully_deleted,
+            pending_refreshes: &mut pending_refreshes,
+            bindings: &mut bindings,
+        };
+
+        process_basic_result(
+            BasicEffectResult::PartialSuccess {
+                state: state.clone(),
+                resource_id: id.clone(),
+                diagnostic: diagnostic.clone(),
+                resolved_attrs: None::<HashMap<String, Value>>,
+                binding: None,
+            },
+            &mut exec,
+        );
+
+        assert_eq!(success_count, 0);
+        assert_eq!(failure_count, 0);
+        assert_eq!(partial_count, 1);
+        assert_eq!(partial_diagnostics, vec![(id.clone(), diagnostic)]);
+        let states = applied_states.into_inner();
+        let applied = states.get(&id).expect("partial state must be recorded");
+        assert_eq!(applied.identifier, state.identifier);
+        assert_eq!(applied.attributes, state.attributes);
+        assert_eq!(
+            applied.partial_read.as_ref().map(|marker| (
+                marker.detail.as_str(),
+                marker.missing_attributes.contains("computed")
+            )),
+            Some(("mock partial create", true))
+        );
     }
 }
 

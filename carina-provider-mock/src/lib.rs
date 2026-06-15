@@ -7,14 +7,21 @@ use std::time::Duration;
 
 use carina_core::effect::PlanOp;
 use carina_core::provider::{
-    BoxFuture, CreateRequest, DeleteRequest, PatchOpKind, Provider, ProviderError, ProviderResult,
-    ReadRequest, UpdateRequest,
+    BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, PartialCreateDiagnostic, PatchOpKind,
+    Provider, ProviderError, ProviderResult, ReadRequest, UpdateRequest,
 };
 use carina_core::resource::{DataSource, ResourceId, State, Value};
 use carina_core::value::{json_to_dsl_value, value_to_json};
 
 pub struct MockProvider {
     state_file: PathBuf,
+    partial_create: Option<PartialCreateConfig>,
+}
+
+#[derive(Clone, Debug)]
+struct PartialCreateConfig {
+    resource_id_pattern: String,
+    missing_attributes: Vec<String>,
 }
 
 static ACTIVE_UPDATES: AtomicUsize = AtomicUsize::new(0);
@@ -47,7 +54,22 @@ impl MockProvider {
             MAX_ACTIVE_UPDATES.store(0, Ordering::SeqCst);
             write_max_active();
         }
-        Self { state_file }
+        Self {
+            state_file,
+            partial_create: partial_create_config_from_env(),
+        }
+    }
+
+    pub fn with_partial_create_for(
+        mut self,
+        resource_id_pattern: impl Into<String>,
+        missing_attributes: Vec<String>,
+    ) -> Self {
+        self.partial_create = Some(PartialCreateConfig {
+            resource_id_pattern: resource_id_pattern.into(),
+            missing_attributes,
+        });
+        self
     }
 
     fn load_states(&self) -> HashMap<String, HashMap<String, serde_json::Value>> {
@@ -72,6 +94,34 @@ impl MockProvider {
     fn resource_key(id: &ResourceId) -> String {
         format!("{}.{}", id.resource_type, id.name)
     }
+
+    fn partial_create_config_for(&self, id: &ResourceId) -> Option<&PartialCreateConfig> {
+        let config = self.partial_create.as_ref()?;
+        let full = format!("{}.{}.{}", id.provider, id.resource_type, id.name);
+        let short = Self::resource_key(id);
+        (config.resource_id_pattern == "*"
+            || config.resource_id_pattern == full
+            || config.resource_id_pattern == short)
+            .then_some(config)
+    }
+}
+
+fn partial_create_config_from_env() -> Option<PartialCreateConfig> {
+    let resource_id_pattern = env::var("CARINA_MOCK_PARTIAL_CREATE_FOR").ok()?;
+    let missing_attributes = env::var("CARINA_MOCK_PARTIAL_CREATE_MISSING")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_else(|| vec!["computed".to_string()]);
+    Some(PartialCreateConfig {
+        resource_id_pattern,
+        missing_attributes,
+    })
 }
 
 fn update_delay() -> Option<Duration> {
@@ -134,25 +184,47 @@ impl Provider for MockProvider {
         &self,
         id: &ResourceId,
         request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
         let id = id.clone();
         let resource = request.resource.as_resource().clone();
         Box::pin(async move {
             let mut states = self.load_states();
             let key = Self::resource_key(&id);
 
-            let attrs: HashMap<String, serde_json::Value> = resource
+            let mut attrs: HashMap<String, serde_json::Value> = resource
                 .attributes
                 .iter()
                 .map(|(k, v)| value_to_json(v).map(|jv| (k.clone(), jv)))
                 .collect::<Result<_, _>>()
                 .map_err(|e| ProviderError::internal(format!("Failed to convert value: {}", e)))?;
 
+            let partial_create = self.partial_create_config_for(&id);
+            if let Some(config) = partial_create {
+                for attr in &config.missing_attributes {
+                    attrs.remove(attr);
+                }
+            }
+
             states.insert(key, attrs);
             self.save_states(&states)
                 .map_err(|e| ProviderError::internal("Failed to save state").with_cause(e))?;
 
-            Ok(State::existing(id, resource.resolved_attributes()).with_identifier("mock-id"))
+            let mut state = State::existing(id.clone(), resource.resolved_attributes())
+                .with_identifier("mock-id");
+            if let Some(config) = partial_create {
+                for attr in &config.missing_attributes {
+                    state.attributes.remove(attr);
+                }
+                return Ok(CreateOutcome::PartialSuccess {
+                    state,
+                    diagnostic: PartialCreateDiagnostic {
+                        reason: "mock partial create".to_string(),
+                        missing_attributes: config.missing_attributes.clone(),
+                    },
+                });
+            }
+
+            Ok(CreateOutcome::Success { state })
         })
     }
 
@@ -239,6 +311,7 @@ mod tests {
         let state_file = tmp.path().join("mock-state.json");
         let provider = MockProvider {
             state_file: state_file.clone(),
+            partial_create: None,
         };
         let mut states = HashMap::new();
         let mut entry = HashMap::new();

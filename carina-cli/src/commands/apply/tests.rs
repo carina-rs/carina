@@ -87,14 +87,17 @@ impl Provider for FailBCreateProvider {
         &self,
         id: &ResourceId,
         request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
         let id = id.clone();
         Box::pin(async move {
             if id.name_str() == "b" {
                 return Err(ProviderError::api_error("create failed").for_resource(id));
             }
             let resource = request.resource.as_resource().clone();
-            Ok(State::existing(id, resource.resolved_attributes()).with_identifier("mock-id"))
+            Ok(carina_core::provider::CreateOutcome::Success {
+                state: State::existing(id, resource.resolved_attributes())
+                    .with_identifier("mock-id"),
+            })
         })
     }
 
@@ -2416,4 +2419,14 @@ mod saved_plan_version_tests {
             "error must point the user at the supported migration path, got: {msg}",
         );
     }
+}
+#[test]
+fn apply_exit_code_prioritizes_failure_over_partial() {
+    assert_eq!(apply_exit_code_for_counts(0, 0), ApplyExitCode::Success);
+    assert_eq!(
+        apply_exit_code_for_counts(0, 1),
+        ApplyExitCode::PartialSuccess
+    );
+    assert_eq!(apply_exit_code_for_counts(1, 0), ApplyExitCode::Failure);
+    assert_eq!(apply_exit_code_for_counts(1, 1), ApplyExitCode::Failure);
 }

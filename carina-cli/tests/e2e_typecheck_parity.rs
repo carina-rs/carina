@@ -230,7 +230,8 @@ impl Provider for NoopProvider {
         &self,
         _id: &carina_core::resource::ResourceId,
         _request: carina_core::provider::CreateRequest,
-    ) -> BoxFuture<'_, carina_core::provider::ProviderResult<State>> {
+    ) -> BoxFuture<'_, carina_core::provider::ProviderResult<carina_core::provider::CreateOutcome>>
+    {
         Box::pin(async { unimplemented!("e2e parity tests do not exercise apply") })
     }
     fn update(

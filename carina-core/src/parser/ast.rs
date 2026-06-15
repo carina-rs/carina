@@ -1642,7 +1642,8 @@ pub(super) fn substitute_placeholder(
             // Upstream and empty-interpolation unknowns are not for-expansion placeholders.
             UnknownReason::UpstreamRef { .. }
             | UnknownReason::UpstreamBareRef { .. }
-            | UnknownReason::EmptyInterpolation => {}
+            | UnknownReason::EmptyInterpolation
+            | UnknownReason::PostCreateReadIncomplete { .. } => {}
             // Function placeholders are substituted by user-function evaluation, not for expansion.
             UnknownReason::FnParam { .. } | UnknownReason::FnLocal { .. } => {}
         },

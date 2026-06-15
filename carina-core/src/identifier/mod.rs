@@ -282,6 +282,9 @@ fn deterministic_value_string(value: &Value) -> String {
                     format!("Unknown(ForValuePath({}))", path.to_dot_string())
                 }
                 UnknownReason::EmptyInterpolation => "Unknown(EmptyInterpolation)".to_string(),
+                UnknownReason::PostCreateReadIncomplete { detail } => {
+                    format!("Unknown(PostCreateReadIncomplete({detail}))")
+                }
             }
         }
     }

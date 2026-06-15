@@ -1164,6 +1164,9 @@ async fn run_apply_locked(
     provider
         .hydrate_read_state(&mut current_states, &saved_attrs)
         .await;
+    if let Some(sf) = state_file.as_ref() {
+        sf.restore_partial_read_markers(&mut current_states);
+    }
     let moved_pairs = {
         let mut pairs = crate::wiring::materialize_moved_states(
             &mut current_states,
@@ -1359,6 +1362,7 @@ async fn run_apply_locked(
             &mut wait_bindings,
         )
         .await;
+    let plan_input_states = carina_core::resource::into_plan_input_map(current_states.clone());
 
     let directives_map = state_file
         .as_ref()
@@ -1369,7 +1373,7 @@ async fn run_apply_locked(
         &resources_for_plan,
         &data_sources_for_plan,
         &provider,
-        &current_states,
+        &plan_input_states,
         &directives_map,
         schemas,
         &saved_attrs,
@@ -1380,7 +1384,7 @@ async fn run_apply_locked(
 
     // Populate cascading updates for create_before_destroy Replace effects.
     // Uses unresolved resources (sorted_resources) so dependents retain ResourceRef values.
-    cascade_dependent_updates(&mut plan, &sorted_resources, &current_states, schemas);
+    cascade_dependent_updates(&mut plan, &sorted_resources, &plan_input_states, schemas);
 
     // Add state block effects (import/removed/moved) to the plan.
     // carina#3329: resolve `import { id = "${…}|…" }` interpolations
@@ -1615,7 +1619,11 @@ async fn run_apply_locked(
     handle_finalize_after_execute(finalize_result, cancelled)?;
 
     println!();
-    if result.failure_count == 0 && result.skip_count == 0 {
+    let exit_code = apply_exit_code_for_counts(
+        result.failure_count + result.skip_count,
+        result.partial_count,
+    );
+    if exit_code == ApplyExitCode::Success {
         println!(
             "{}",
             format!("Apply complete! {} changes applied.", result.success_count)
@@ -1625,16 +1633,21 @@ async fn run_apply_locked(
         Ok(Some(resources_finished.duration_since(apply_phase_started)))
     } else {
         let mut parts = vec![format!("{} succeeded", result.success_count)];
+        if result.partial_count > 0 {
+            parts.push(format!("{} partial", result.partial_count));
+        }
         if result.failure_count > 0 {
             parts.push(format!("{} failed", result.failure_count));
         }
         if result.skip_count > 0 {
             parts.push(format!("{} skipped", result.skip_count));
         }
-        Err(AppError::Config(format!(
-            "Apply failed. {}.",
-            parts.join(", ")
-        )))
+        let message = format!("Apply failed. {}.", parts.join(", "));
+        if exit_code == ApplyExitCode::PartialSuccess {
+            Err(AppError::PartialSuccess(message))
+        } else {
+            Err(AppError::Config(message))
+        }
     }
 }
 
@@ -2109,7 +2122,11 @@ async fn run_apply_from_plan_locked(
     handle_finalize_after_execute(finalize_result, cancelled)?;
 
     println!();
-    if result.failure_count == 0 && result.skip_count == 0 {
+    let exit_code = apply_exit_code_for_counts(
+        result.failure_count + result.skip_count,
+        result.partial_count,
+    );
+    if exit_code == ApplyExitCode::Success {
         println!(
             "{}",
             format!("Apply complete! {} changes applied.", result.success_count)
@@ -2119,16 +2136,21 @@ async fn run_apply_from_plan_locked(
         Ok(Some(resources_finished.duration_since(apply_phase_started)))
     } else {
         let mut parts = vec![format!("{} succeeded", result.success_count)];
+        if result.partial_count > 0 {
+            parts.push(format!("{} partial", result.partial_count));
+        }
         if result.failure_count > 0 {
             parts.push(format!("{} failed", result.failure_count));
         }
         if result.skip_count > 0 {
             parts.push(format!("{} skipped", result.skip_count));
         }
-        Err(AppError::Config(format!(
-            "Apply failed. {}.",
-            parts.join(", ")
-        )))
+        let message = format!("Apply failed. {}.", parts.join(", "));
+        if exit_code == ApplyExitCode::PartialSuccess {
+            Err(AppError::PartialSuccess(message))
+        } else {
+            Err(AppError::Config(message))
+        }
     }
 }
 
@@ -2136,6 +2158,26 @@ async fn run_apply_from_plan_locked(
 pub(crate) enum ApplyConfirmation {
     Confirmed,
     Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyExitCode {
+    Success = 0,
+    Failure = 1,
+    PartialSuccess = 2,
+}
+
+pub(crate) fn apply_exit_code_for_counts(
+    failure_count: usize,
+    partial_count: usize,
+) -> ApplyExitCode {
+    if failure_count > 0 {
+        ApplyExitCode::Failure
+    } else if partial_count > 0 {
+        ApplyExitCode::PartialSuccess
+    } else {
+        ApplyExitCode::Success
+    }
 }
 
 /// Prompt the user to confirm an apply. Shared between the resource-change and

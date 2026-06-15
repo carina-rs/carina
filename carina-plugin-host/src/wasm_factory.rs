@@ -22,8 +22,8 @@ use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use carina_core::effect::PlanOp;
 use carina_core::provider::{
-    BoxFuture, CreateRequest, DeleteRequest, Provider, ProviderError, ProviderFactory,
-    ProviderNormalizer, ProviderResult, ReadRequest, SavedAttrs, UpdateRequest,
+    BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, Provider, ProviderError,
+    ProviderFactory, ProviderNormalizer, ProviderResult, ReadRequest, SavedAttrs, UpdateRequest,
 };
 use carina_core::resource::{DataSource, Resource, ResourceId, State, Value};
 use carina_core::schema::{CompletionValue, ResourceSchema, TypeIdentity};
@@ -814,7 +814,7 @@ impl WasmBindings {
         store: &mut Store<HostState>,
         id: &wit_types::ResourceId,
         request: &wit_types::CreateRequest,
-    ) -> wasmtime::Result<Result<wit_types::State, wit_types::ProviderError>> {
+    ) -> wasmtime::Result<Result<wit_types::CreateOutcome, wit_types::ProviderError>> {
         match self {
             WasmBindings::Basic(b) => {
                 b.carina_provider_provider()
@@ -2003,7 +2003,7 @@ impl Provider for WasmProvider {
         &self,
         id: &ResourceId,
         request: CreateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
         let wit_id = wasm_convert::core_to_wit_resource_id(id);
         let wit_request = match wasm_convert::core_to_wit_create_request(&request) {
             Ok(v) => v,
@@ -2033,7 +2033,9 @@ impl Provider for WasmProvider {
                     }
                 })?;
                 match result {
-                    Ok(wit_state) => Ok(wasm_convert::wit_to_core_state(&wit_state, &id)),
+                    Ok(wit_outcome) => {
+                        Ok(wasm_convert::wit_to_core_create_outcome(wit_outcome, &id))
+                    }
                     Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
                 }
             },

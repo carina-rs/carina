@@ -5,10 +5,12 @@ use std::fmt;
 
 use carina_core::effect::PlanOp as CorePlanOp;
 use carina_core::provider::{
-    CreateRequest as CoreCreateRequest, DeleteRequest as CoreDeleteRequest,
-    ErrorDetail as CoreErrorDetail, PatchOp as CorePatchOp, PatchOpKind as CorePatchOpKind,
-    ProviderError as CoreProviderError, ReadRequest as CoreReadRequest,
-    UpdatePatch as CoreUpdatePatch, UpdateRequest as CoreUpdateRequest,
+    CreateOutcome as CoreCreateOutcome, CreateRequest as CoreCreateRequest,
+    DeleteRequest as CoreDeleteRequest, ErrorDetail as CoreErrorDetail,
+    PartialCreateDiagnostic as CorePartialCreateDiagnostic, PatchOp as CorePatchOp,
+    PatchOpKind as CorePatchOpKind, ProviderError as CoreProviderError,
+    ReadRequest as CoreReadRequest, UpdatePatch as CoreUpdatePatch,
+    UpdateRequest as CoreUpdateRequest,
 };
 use carina_core::resource::{
     ConcreteValue, DataSource as CoreDataSource, DeferredValue, Directives,
@@ -421,6 +423,24 @@ pub fn wit_to_core_state(state: &wit::State, id: &CoreResourceId) -> CoreState {
         core_state = core_state.with_identifier(ident);
     }
     core_state
+}
+
+pub fn wit_to_core_create_outcome(
+    outcome: wit::CreateOutcome,
+    id: &CoreResourceId,
+) -> CoreCreateOutcome {
+    match outcome {
+        wit::CreateOutcome::Success(state) => CoreCreateOutcome::Success {
+            state: wit_to_core_state(&state, id),
+        },
+        wit::CreateOutcome::PartialSuccess(partial) => CoreCreateOutcome::PartialSuccess {
+            state: wit_to_core_state(&partial.state, id),
+            diagnostic: CorePartialCreateDiagnostic {
+                reason: partial.diagnostic.reason,
+                missing_attributes: partial.diagnostic.missing_attributes,
+            },
+        },
+    }
 }
 
 // -- Resource --

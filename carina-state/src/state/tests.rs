@@ -273,6 +273,8 @@ fn test_from_provider_state() {
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let existing = ResourceState::new("s3.Bucket", "my-bucket", "awscc").with_protected(true);
@@ -306,6 +308,8 @@ fn test_from_provider_state_without_existing() {
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -344,6 +348,8 @@ fn test_from_provider_state_repairs_unrecorded_from_state_attrs() {
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let mut existing = ResourceState::new("sso.Assignment", "x", "awscc");
@@ -389,6 +395,8 @@ fn test_from_provider_state_emits_unrecorded_for_fresh_empty_body_resource() {
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -425,6 +433,8 @@ fn test_from_provider_state_preserves_populated_struct_when_resource_attrs_empty
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     // Prior on-disk: populated Struct (e.g. from a previous self-heal).
@@ -461,6 +471,8 @@ fn test_from_provider_state_no_repair_when_state_attrs_also_empty() {
         attributes: HashMap::new(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let mut existing = ResourceState::new("sso.Assignment", "x", "awscc");
@@ -811,6 +823,8 @@ fn test_from_provider_state_stores_binding_and_dependencies() {
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1105,6 +1119,8 @@ fn test_merge_write_only_attributes() {
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let mut rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1149,6 +1165,8 @@ fn test_merge_write_only_attributes_not_in_desired() {
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let mut rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1185,6 +1203,8 @@ fn test_merge_write_only_skips_if_already_in_provider_state() {
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let mut rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1261,6 +1281,8 @@ fn test_from_provider_state_secret_stored_as_hash() {
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1328,6 +1350,8 @@ fn test_from_provider_state_secret_in_map_stored_as_hash() {
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1399,6 +1423,8 @@ fn test_from_provider_state_secret_in_map_preserves_provider_extra_keys() {
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1458,6 +1484,8 @@ fn test_from_provider_state_secret_in_list_stored_as_hash() {
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
@@ -1521,6 +1549,7 @@ fn build_remote_bindings_ignores_resource_bindings() {
         binding: Some("vpc".to_string()),
         dependency_bindings: BTreeSet::new(),
         write_only_attributes: vec![],
+        partial_read: None,
     });
     let bindings = state.build_remote_bindings();
     assert!(
@@ -1591,6 +1620,8 @@ fn from_provider_state_rejects_resource_ref_in_provider_attributes() {
         .collect(),
         exists: true,
         dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
     };
 
     let err = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap_err();

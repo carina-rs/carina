@@ -196,7 +196,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
         &resources_without,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &current_states,
+        &carina_core::resource::into_plan_input_map(current_states.clone()),
         &directives_map,
         &schemas,
         &saved_attrs,
@@ -216,7 +216,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
         &resources_with,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &current_states,
+        &carina_core::resource::into_plan_input_map(current_states.clone()),
         &directives_map,
         &schemas,
         &saved_attrs,
@@ -309,7 +309,7 @@ fn test_merge_default_tags_prevents_false_diff() {
         &resources_without,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &current_states,
+        &carina_core::resource::into_plan_input_map(current_states.clone()),
         &directives_map,
         &schemas,
         &saved_attrs,
@@ -340,7 +340,7 @@ fn test_merge_default_tags_prevents_false_diff() {
         &resources_with,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &current_states,
+        &carina_core::resource::into_plan_input_map(current_states.clone()),
         &directives_map,
         &schemas,
         &saved_attrs,
@@ -2283,9 +2283,13 @@ mod read_with_retry_identifier_tests {
             &self,
             id: &ResourceId,
             _request: carina_core::provider::CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
             let id = id.clone();
-            Box::pin(async move { Ok(State::not_found(id)) })
+            Box::pin(async move {
+                Ok(carina_core::provider::CreateOutcome::Success {
+                    state: State::not_found(id),
+                })
+            })
         }
 
         fn update(
@@ -3509,9 +3513,13 @@ mod wait_until_enum_alias {
             &self,
             id: &ResourceId,
             _r: carina_core::provider::CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
             let id = id.clone();
-            Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
+            Box::pin(async move {
+                Ok(carina_core::provider::CreateOutcome::Success {
+                    state: State::existing(id, HashMap::new()),
+                })
+            })
         }
         fn update(
             &self,
@@ -3631,7 +3639,7 @@ mod wait_until_enum_alias {
             &resources,
             &[],
             &carina_core::provider::ProviderRouter::new(),
-            &states,
+            &carina_core::resource::into_plan_input_map(states.clone()),
             &HashMap::new(),
             ctx.schemas(),
             &HashMap::new(),
@@ -3653,7 +3661,7 @@ mod wait_until_enum_alias {
             &resources,
             &[],
             &carina_core::provider::ProviderRouter::new(),
-            &states,
+            &carina_core::resource::into_plan_input_map(states.clone()),
             &HashMap::new(),
             ctx.schemas(),
             &HashMap::new(),

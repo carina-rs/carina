@@ -85,8 +85,10 @@ mod tests {
             &self,
             _id: &ResourceId,
             _request: crate::provider::CreateRequest,
-        ) -> crate::provider::BoxFuture<'_, crate::provider::ProviderResult<crate::resource::State>>
-        {
+        ) -> crate::provider::BoxFuture<
+            '_,
+            crate::provider::ProviderResult<crate::provider::CreateOutcome>,
+        > {
             Box::pin(async { panic!("unexpected create") })
         }
 
