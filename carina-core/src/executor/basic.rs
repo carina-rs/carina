@@ -18,11 +18,19 @@ use crate::provider::{
     build_update_patch,
 };
 use crate::resolver::resolve_ref_value;
-use crate::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, State, Value};
-use crate::value::SecretHashContext;
+use crate::resource::{
+    ConcreteValue, DeferredValue, ResolvedResource, Resource, ResourceId, State, Value,
+};
+use crate::value::{SecretHashContext, SerializationContext, SerializationError};
 
 use super::wait::AppliedStates;
 use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
+
+/// Private capability token for constructing [`ResolvedResource`].
+/// Only this module can create a value, so the checked constructor in
+/// `resource` cannot be used by sibling modules as a convention-only
+/// escape hatch.
+pub(crate) struct ResolvedResourceToken(());
 
 /// Result of executing a basic effect (Create, Update, or Delete).
 ///
@@ -134,21 +142,22 @@ pub(super) async fn resolve_resource(
     resource: &Resource,
     bindings: &ResolvedBindings,
     pipeline: &RenormalizePipeline<'_>,
-) -> Result<NormalizedResource, String> {
+) -> Result<ResolvedResource, String> {
     let mut resolved = resource.clone();
     for (key, expr) in &resource.attributes {
         let resolved_value = unwrap_secret(resolve_ref_value(expr, bindings)?);
         assert_fully_resolved(&resolved_value, key, bindings)?;
         resolved.attributes.insert(key.clone(), resolved_value);
     }
-    Ok(apply_desired_normalization(
+    let normalized = apply_desired_normalization(
         resolved,
         pipeline.provider_configs,
         pipeline.normalizer,
         pipeline.factories,
         pipeline.schemas,
     )
-    .await)
+    .await;
+    resolved_normalized_resource(normalized).map_err(|err| err.to_string())
 }
 
 /// Resolve a resource, preferring unresolved source for re-resolution.
@@ -161,21 +170,35 @@ pub(super) async fn resolve_resource_with_source(
     source: &Resource,
     bindings: &ResolvedBindings,
     pipeline: &RenormalizePipeline<'_>,
-) -> Result<NormalizedResource, String> {
+) -> Result<ResolvedResource, String> {
     let mut resolved = target.clone();
     for (key, expr) in &source.attributes {
         let resolved_value = unwrap_secret(resolve_ref_value(expr, bindings)?);
         assert_fully_resolved(&resolved_value, key, bindings)?;
         resolved.attributes.insert(key.clone(), resolved_value);
     }
-    Ok(apply_desired_normalization(
+    let normalized = apply_desired_normalization(
         resolved,
         pipeline.provider_configs,
         pipeline.normalizer,
         pipeline.factories,
         pipeline.schemas,
     )
-    .await)
+    .await;
+    resolved_normalized_resource(normalized).map_err(|err| err.to_string())
+}
+
+#[cfg(test)]
+pub(super) fn resolved_resource(
+    resource: Resource,
+) -> Result<ResolvedResource, SerializationError> {
+    ResolvedResource::new(resource, ResolvedResourceToken(()))
+}
+
+pub(super) fn resolved_normalized_resource(
+    resource: NormalizedResource,
+) -> Result<ResolvedResource, SerializationError> {
+    resource.into_resolved_resource(ResolvedResourceToken(()))
 }
 
 /// The full plan-time normalization pipeline, threaded into the apply
@@ -199,34 +222,6 @@ pub(super) struct RenormalizePipeline<'a> {
 /// be resolved before reaching the provider (the executor unwraps
 /// secrets just downstream of this check).
 ///
-/// `Unknown` is *not* rejected: it is the deliberately-modeled
-/// "known after upstream apply" placeholder used by plan rendering
-/// (`UnknownReason::UpstreamRef`) and never reaches the apply path
-/// for local refs. Treating it as unresolved here would regress
-/// `resolve_refs_for_plan`'s contract.
-///
-/// # Kind-aware diagnostic (carina#3334)
-///
-/// When the unresolved value names a binding, the binding's
-/// [`BindingValueSource`] selects the remediation text:
-///
-/// - [`BindingValueSource::Upstream`] — the binding is an
-///   `upstream_state` read. `wait` blocks attach to managed-resource
-///   lifecycles in *this* configuration and cannot wake on an
-///   upstream stack's exports; the only fix is to apply the upstream
-///   stack first. The message says so verbatim.
-/// - [`BindingValueSource::Local`] / [`BindingValueSource::WaitAlias`]
-///   / unknown — the existing "add a `wait` block" hint applies (or
-///   is at least not actively misleading).
-///
-/// Sibling case carina#3252 was a data-source binding whose read
-/// state was missing from the binding view; that bug was fixed
-/// upstream (see [`crate::binding_index::ResolvedBindings`]
-/// `layer_data_source_bindings`) so the apply path no longer reaches
-/// this function for a resolved data source. If a data-source binding
-/// *does* still reach this function (e.g. a read returned 0 rows for
-/// the queried key), it falls through to the generic message — same
-/// behavior as before.
 fn assert_fully_resolved(
     value: &Value,
     attribute_key: &str,
@@ -282,27 +277,30 @@ fn assert_fully_resolved(
                 bindings,
             ))
         }
-        _ => Ok(()),
+        Value::Deferred(DeferredValue::Unknown(reason)) => {
+            Err(SerializationError::UnknownNotAllowed {
+                reason: reason.clone(),
+                context: SerializationContext::WasmBoundary,
+            }
+            .to_string())
+        }
+        Value::Concrete(ConcreteValue::String(_))
+        | Value::Concrete(ConcreteValue::EnumIdentifier(_))
+        | Value::Concrete(ConcreteValue::CanonicalEnum(_))
+        | Value::Concrete(ConcreteValue::Int(_))
+        | Value::Concrete(ConcreteValue::Float(_))
+        | Value::Concrete(ConcreteValue::Bool(_))
+        | Value::Concrete(ConcreteValue::Duration(_))
+        | Value::Concrete(ConcreteValue::StringList(_)) => Ok(()),
     }
 }
 
-/// Shape of the unresolved value at the leaf of the rejected
-/// attribute. Drives the per-shape opening of the error message while
-/// the remediation text is selected by binding kind.
 enum UnresolvedSite {
     Ref { path: String },
     Interpolation,
     FunctionCall { name: String },
 }
 
-/// Build the kind-aware unresolved-binding error message.
-///
-/// `referenced_binding` is the name of the binding whose missing
-/// publish is the proximate cause of the failure. For container
-/// shapes (`Interpolation`, `FunctionCall`), the caller passes the
-/// first unresolved binding found by walking the value; an empty
-/// string means "no binding could be identified", which falls back to
-/// the generic remediation.
 fn unresolved_binding_message(
     attribute_key: &str,
     site: UnresolvedSite,
@@ -333,9 +331,6 @@ fn unresolved_binding_message(
     format!("{opener} {remediation}")
 }
 
-/// Walk a value tree and return the first binding name found inside
-/// any unresolved [`DeferredValue`] (`ResourceRef`, `BindingRef`,
-/// nested `Interpolation`, nested `FunctionCall`).
 fn collect_unresolved_bindings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
     use crate::resource::InterpolationPart;
     match value {
@@ -354,6 +349,7 @@ fn collect_unresolved_bindings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
                 collect_unresolved_bindings(a, out);
             }
         }
+        Value::Deferred(DeferredValue::Unknown(_)) => {}
         Value::Concrete(ConcreteValue::List(items)) => {
             for v in items {
                 collect_unresolved_bindings(v, out);
@@ -364,21 +360,17 @@ fn collect_unresolved_bindings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
                 collect_unresolved_bindings(v, out);
             }
         }
-        _ => {}
+        Value::Concrete(ConcreteValue::String(_))
+        | Value::Concrete(ConcreteValue::EnumIdentifier(_))
+        | Value::Concrete(ConcreteValue::CanonicalEnum(_))
+        | Value::Concrete(ConcreteValue::Int(_))
+        | Value::Concrete(ConcreteValue::Float(_))
+        | Value::Concrete(ConcreteValue::Bool(_))
+        | Value::Concrete(ConcreteValue::Duration(_))
+        | Value::Concrete(ConcreteValue::StringList(_)) => {}
     }
 }
 
-/// Pick the most actionable binding name to feature in the
-/// diagnostic when a container value (`Interpolation`, `FunctionCall`)
-/// holds multiple unresolved references.
-///
-/// Selection rule: an `upstream_state` binding (whose remediation is
-/// "apply the upstream stack first") takes priority over a local /
-/// wait-alias binding (whose remediation is `wait`). Mixing the two
-/// in a single interpolation is unusual but legal — preferring
-/// Upstream means the message points at the binding the operator
-/// must act on outside the current configuration, not the one
-/// `wait` could (in principle) address.
 fn pick_unresolved_binding_for_diagnostic<'a>(
     value: &'a Value,
     bindings: &ResolvedBindings,
@@ -764,13 +756,11 @@ mod assert_fully_resolved_tests {
     }
 
     #[test]
-    fn unknown_is_intentionally_allowed() {
-        // `Unknown` is the plan-rendering placeholder for upstream
-        // refs (#2371). It legitimately reaches the apply path during
-        // re-resolution sweeps and must not be rejected by the local
-        // fail-fast.
+    fn unknown_is_rejected_at_apply_seam() {
         let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue));
-        assert!(assert_fully_resolved(&v, "name", &empty_bindings()).is_ok());
+        let err = assert_fully_resolved(&v, "name", &empty_bindings())
+            .expect_err("Unknown must be rejected at apply seam");
+        assert!(err.contains("value is not yet known"), "got: {err}");
     }
 
     #[test]

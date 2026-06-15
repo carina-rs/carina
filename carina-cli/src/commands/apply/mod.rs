@@ -719,12 +719,19 @@ async fn run_apply_with_observer_factory(
                     ctx.schemas(),
                 )
                 .await;
+                let resolved_bucket =
+                    carina_core::executor::resolve_normalized_for_provider(normalized_bucket)
+                        .map_err(|err| {
+                            AppError::Config(format!(
+                                "Failed to resolve state bucket before create: {err}"
+                            ))
+                        })?;
 
                 match bucket_provider
                     .create(
                         &bucket_resource.id,
                         carina_core::provider::CreateRequest {
-                            resource: normalized_bucket,
+                            resource: resolved_bucket,
                         },
                     )
                     .await

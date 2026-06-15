@@ -1830,6 +1830,116 @@ impl Resource {
     }
 }
 
+/// A managed resource whose attribute tree has been checked and found
+/// free of any `Value::Deferred` placeholder before provider dispatch.
+///
+/// The constructor requires a private token from
+/// `carina_core::executor::basic`, so callers outside the basic
+/// executor's resolve helpers cannot manufacture this witness.
+///
+/// ```compile_fail
+/// use carina_core::resource::{ResolvedResource, Resource};
+///
+/// let resource = Resource::new("test", "example");
+/// let _: ResolvedResource = resource.into();
+/// ```
+///
+/// ```compile_fail
+/// use carina_core::resource::{ResolvedResource, Resource};
+///
+/// let resource = Resource::new("test", "example");
+/// let _ = ResolvedResource::new(resource);
+/// ```
+///
+/// ```compile_fail
+/// use carina_core::resource::{ResolvedResource, Resource};
+///
+/// let resource = Resource::new("test", "example");
+/// let _ = ResolvedResource::try_new(resource);
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedResource(Resource);
+
+impl ResolvedResource {
+    pub(crate) fn new(
+        resource: Resource,
+        _token: crate::executor::basic::ResolvedResourceToken,
+    ) -> Result<Self, crate::value::SerializationError> {
+        assert_resource_fully_resolved(&resource)?;
+        Ok(Self(resource))
+    }
+
+    /// Borrow the underlying resource for provider-boundary consumers.
+    pub fn as_resource(&self) -> &Resource {
+        &self.0
+    }
+}
+
+pub(crate) fn assert_resource_fully_resolved(
+    resource: &Resource,
+) -> Result<(), crate::value::SerializationError> {
+    for value in resource.attributes.values() {
+        assert_value_fully_resolved(value)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn assert_value_fully_resolved(
+    value: &Value,
+) -> Result<(), crate::value::SerializationError> {
+    let context = crate::value::SerializationContext::WasmBoundary;
+    match value {
+        Value::Concrete(ConcreteValue::List(items)) => {
+            for item in items {
+                assert_value_fully_resolved(item)?;
+            }
+            Ok(())
+        }
+        Value::Concrete(ConcreteValue::Map(map)) => {
+            for v in map.values() {
+                assert_value_fully_resolved(v)?;
+            }
+            Ok(())
+        }
+        Value::Deferred(DeferredValue::Secret(inner)) => assert_value_fully_resolved(inner),
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+            Err(crate::value::SerializationError::UnresolvedResourceRef {
+                path: path.to_dot_string(),
+                context,
+            })
+        }
+        Value::Deferred(DeferredValue::BindingRef { binding }) => {
+            Err(crate::value::SerializationError::UnresolvedResourceRef {
+                path: binding.clone(),
+                context,
+            })
+        }
+        Value::Deferred(DeferredValue::Interpolation(_)) => {
+            Err(crate::value::SerializationError::UnresolvedInterpolation { context })
+        }
+        Value::Deferred(DeferredValue::FunctionCall { name, .. }) => {
+            Err(crate::value::SerializationError::UnresolvedFunctionCall {
+                name: name.clone(),
+                context,
+            })
+        }
+        Value::Deferred(DeferredValue::Unknown(reason)) => {
+            Err(crate::value::SerializationError::UnknownNotAllowed {
+                reason: reason.clone(),
+                context,
+            })
+        }
+        Value::Concrete(ConcreteValue::String(_))
+        | Value::Concrete(ConcreteValue::EnumIdentifier(_))
+        | Value::Concrete(ConcreteValue::CanonicalEnum(_))
+        | Value::Concrete(ConcreteValue::Int(_))
+        | Value::Concrete(ConcreteValue::Float(_))
+        | Value::Concrete(ConcreteValue::Bool(_))
+        | Value::Concrete(ConcreteValue::Duration(_))
+        | Value::Concrete(ConcreteValue::StringList(_)) => Ok(()),
+    }
+}
+
 /// Current state fetched from actual infrastructure
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct State {

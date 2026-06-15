@@ -28,8 +28,8 @@ use std::collections::HashMap;
 use crate::parser::ProviderConfig;
 use crate::provider::{ProviderFactory, ProviderNormalizer};
 use crate::resource::{
-    ConcreteValue, DeferredValue, InterpolationPart, Resource, ResourceId, State, Value,
-    contains_resource_ref,
+    ConcreteValue, DeferredValue, InterpolationPart, ResolvedResource, Resource, ResourceId, State,
+    Value, contains_resource_ref,
 };
 use crate::schema::SchemaRegistry;
 
@@ -42,6 +42,15 @@ impl NormalizedResource {
     /// Borrow the normalized resource for read-only consumers.
     pub fn as_resource(&self) -> &Resource {
         &self.0
+    }
+
+    /// Consume this normalized desired resource and prove it is free
+    /// of deferred placeholders before provider dispatch.
+    pub(crate) fn into_resolved_resource(
+        self,
+        token: crate::executor::basic::ResolvedResourceToken,
+    ) -> Result<ResolvedResource, crate::value::SerializationError> {
+        ResolvedResource::new(self.0, token)
     }
 }
 

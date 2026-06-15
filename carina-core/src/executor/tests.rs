@@ -4,7 +4,11 @@ use crate::provider::{
     BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer, ProviderError, ProviderResult,
     ReadRequest, UpdateRequest,
 };
-use crate::resource::{ConcreteValue, DataSource, DeferredValue, Directives, Resource, Value};
+use crate::resource::{
+    AccessPath, ConcreteValue, DataSource, DeferredValue, Directives, Resource, UnknownReason,
+    Value,
+};
+use crate::value::SerializationError;
 use parallel::{build_dependency_analysis, build_dependency_levels};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -242,6 +246,64 @@ fn completed_result(outcome: ExecutionOutcome) -> ExecutionResult {
             result.success_count, result.failure_count, result.skip_count
         ),
     }
+}
+
+fn resource_with_attr(value: Value) -> Resource {
+    let mut resource = Resource::new("test", "resolved-resource-test");
+    resource.set_attr("attr", value);
+    resource
+}
+
+fn for_value_path_unknown() -> Value {
+    Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValuePath {
+        path: AccessPath::with_fields("opt", "resource_record", vec!["name".to_string()]),
+    }))
+}
+
+#[test]
+fn resolved_resource_constructor_rejects_value_unknown() {
+    let err = basic::resolved_resource(resource_with_attr(for_value_path_unknown()))
+        .expect_err("deferred unknown must not construct a ResolvedResource");
+
+    assert!(
+        matches!(err, SerializationError::UnknownNotAllowed { .. }),
+        "expected UnknownNotAllowed, got {err:?}"
+    );
+}
+
+#[test]
+fn resolved_resource_constructor_rejects_resource_ref() {
+    let value = Value::Deferred(DeferredValue::ResourceRef {
+        path: AccessPath::new("cert", "domain_validation_options"),
+    });
+
+    let err = basic::resolved_resource(resource_with_attr(value))
+        .expect_err("resource refs must not construct a ResolvedResource");
+
+    assert!(
+        matches!(err, SerializationError::UnresolvedResourceRef { .. }),
+        "expected UnresolvedResourceRef, got {err:?}"
+    );
+}
+
+#[test]
+fn resolved_resource_constructor_rejects_nested_deferred() {
+    let mut map = indexmap::IndexMap::new();
+    map.insert(
+        "secret".to_string(),
+        Value::Deferred(DeferredValue::Secret(Box::new(for_value_path_unknown()))),
+    );
+    let nested = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+        ConcreteValue::Map(map),
+    )]));
+
+    let err = basic::resolved_resource(resource_with_attr(nested))
+        .expect_err("nested deferred values must not construct a ResolvedResource");
+
+    assert!(
+        matches!(err, SerializationError::UnknownNotAllowed { .. }),
+        "expected UnknownNotAllowed, got {err:?}"
+    );
 }
 
 // -----------------------------------------------------------------------

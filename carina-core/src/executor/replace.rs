@@ -9,12 +9,11 @@ use crate::differ::{
 };
 use crate::effect::Effect;
 use crate::executor::UnresolvedResource;
-use crate::executor::normalized::NormalizedResource;
 use crate::provider::{
     CreateRequest, DeleteRequest, PatchOp, PatchOpKind, Provider, UpdatePatch, UpdateRequest,
     build_update_patch,
 };
-use crate::resource::{ConcreteValue, Resource, ResourceId, State, Value};
+use crate::resource::{ConcreteValue, ResolvedResource, Resource, ResourceId, State, Value};
 use crate::schema::SchemaRegistry;
 use crate::value::SecretHashContext;
 
@@ -31,7 +30,7 @@ use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
 /// from/to comparison directly).
 pub fn compute_full_diff_patch(
     from: &State,
-    to: &NormalizedResource,
+    to: &ResolvedResource,
     to_source: &Resource,
     schemas: &SchemaRegistry,
     resource_id: &ResourceId,
