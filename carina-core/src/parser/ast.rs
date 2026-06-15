@@ -1313,43 +1313,18 @@ impl<E> File<E> {
 
             match (&deferred.binding, iterable_value) {
                 // Simple binding: only the value var is bound
-                (ForBinding::Simple(_), Value::Concrete(ConcreteValue::List(items))) => {
-                    for (i, item) in items.iter().enumerate() {
-                        let address = format!("{}[{}]", deferred.binding_name, i);
-                        expanded_resources
-                            .push(build_expanded_child(deferred, address, None, None, item));
-                    }
+                (ForBinding::Simple(_), Value::Concrete(ConcreteValue::List(_))) => {
+                    expanded_resources.extend(expand_deferred_children(deferred, iterable_value));
                     resolved_indices.push(idx);
                 }
                 // Indexed binding: both index and value vars are bound
-                (ForBinding::Indexed(_, _), Value::Concrete(ConcreteValue::List(items))) => {
-                    for (i, item) in items.iter().enumerate() {
-                        let address = format!("{}[{}]", deferred.binding_name, i);
-                        expanded_resources.push(build_expanded_child(
-                            deferred,
-                            address,
-                            Some(i as i64),
-                            None,
-                            item,
-                        ));
-                    }
+                (ForBinding::Indexed(_, _), Value::Concrete(ConcreteValue::List(_))) => {
+                    expanded_resources.extend(expand_deferred_children(deferred, iterable_value));
                     resolved_indices.push(idx);
                 }
                 // Map binding expands over maps, substituting both key and value vars
-                (ForBinding::Map(_, _), Value::Concrete(ConcreteValue::Map(map))) => {
-                    let mut keys: Vec<&String> = map.keys().collect();
-                    keys.sort();
-                    for key in keys {
-                        let val = &map[key];
-                        let address = crate::utils::map_key_address(&deferred.binding_name, key);
-                        expanded_resources.push(build_expanded_child(
-                            deferred,
-                            address,
-                            None,
-                            Some(key),
-                            val,
-                        ));
-                    }
+                (ForBinding::Map(_, _), Value::Concrete(ConcreteValue::Map(_))) => {
+                    expanded_resources.extend(expand_deferred_children(deferred, iterable_value));
                     resolved_indices.push(idx);
                 }
                 // Shape mismatch: replace the original "not yet available" warning
@@ -1408,6 +1383,92 @@ impl<E> File<E> {
         // composition for-body never reaches the deferred path.)
         self.resources.extend(expanded_resources);
         self.warnings.extend(new_warnings);
+    }
+}
+
+pub fn expand_deferred_children(
+    deferred: &DeferredForExpression,
+    iterable_value: &Value,
+) -> Vec<Resource> {
+    match &deferred.binding {
+        ForBinding::Simple(_) => match iterable_value {
+            Value::Concrete(ConcreteValue::List(items)) => items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    let address = format!("{}[{}]", deferred.binding_name, i);
+                    build_expanded_child(deferred, address, None, None, item)
+                })
+                .collect(),
+            Value::Concrete(ConcreteValue::Map(_))
+            | Value::Concrete(ConcreteValue::String(_))
+            | Value::Concrete(ConcreteValue::EnumIdentifier(_))
+            | Value::Concrete(ConcreteValue::CanonicalEnum(_))
+            | Value::Concrete(ConcreteValue::Int(_))
+            | Value::Concrete(ConcreteValue::Float(_))
+            | Value::Concrete(ConcreteValue::Bool(_))
+            | Value::Concrete(ConcreteValue::Duration(_))
+            | Value::Concrete(ConcreteValue::StringList(_))
+            | Value::Deferred(DeferredValue::ResourceRef { .. })
+            | Value::Deferred(DeferredValue::BindingRef { .. })
+            | Value::Deferred(DeferredValue::Interpolation(_))
+            | Value::Deferred(DeferredValue::FunctionCall { .. })
+            | Value::Deferred(DeferredValue::Secret(_))
+            | Value::Deferred(DeferredValue::Unknown(_)) => Vec::new(),
+        },
+        ForBinding::Indexed(_, _) => match iterable_value {
+            Value::Concrete(ConcreteValue::List(items)) => items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    let address = format!("{}[{}]", deferred.binding_name, i);
+                    build_expanded_child(deferred, address, Some(i as i64), None, item)
+                })
+                .collect(),
+            Value::Concrete(ConcreteValue::Map(_))
+            | Value::Concrete(ConcreteValue::String(_))
+            | Value::Concrete(ConcreteValue::EnumIdentifier(_))
+            | Value::Concrete(ConcreteValue::CanonicalEnum(_))
+            | Value::Concrete(ConcreteValue::Int(_))
+            | Value::Concrete(ConcreteValue::Float(_))
+            | Value::Concrete(ConcreteValue::Bool(_))
+            | Value::Concrete(ConcreteValue::Duration(_))
+            | Value::Concrete(ConcreteValue::StringList(_))
+            | Value::Deferred(DeferredValue::ResourceRef { .. })
+            | Value::Deferred(DeferredValue::BindingRef { .. })
+            | Value::Deferred(DeferredValue::Interpolation(_))
+            | Value::Deferred(DeferredValue::FunctionCall { .. })
+            | Value::Deferred(DeferredValue::Secret(_))
+            | Value::Deferred(DeferredValue::Unknown(_)) => Vec::new(),
+        },
+        ForBinding::Map(_, _) => match iterable_value {
+            Value::Concrete(ConcreteValue::Map(map)) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                keys.into_iter()
+                    .map(|key| {
+                        let val = &map[key];
+                        let address = crate::utils::map_key_address(&deferred.binding_name, key);
+                        build_expanded_child(deferred, address, None, Some(key), val)
+                    })
+                    .collect()
+            }
+            Value::Concrete(ConcreteValue::List(_))
+            | Value::Concrete(ConcreteValue::String(_))
+            | Value::Concrete(ConcreteValue::EnumIdentifier(_))
+            | Value::Concrete(ConcreteValue::CanonicalEnum(_))
+            | Value::Concrete(ConcreteValue::Int(_))
+            | Value::Concrete(ConcreteValue::Float(_))
+            | Value::Concrete(ConcreteValue::Bool(_))
+            | Value::Concrete(ConcreteValue::Duration(_))
+            | Value::Concrete(ConcreteValue::StringList(_))
+            | Value::Deferred(DeferredValue::ResourceRef { .. })
+            | Value::Deferred(DeferredValue::BindingRef { .. })
+            | Value::Deferred(DeferredValue::Interpolation(_))
+            | Value::Deferred(DeferredValue::FunctionCall { .. })
+            | Value::Deferred(DeferredValue::Secret(_))
+            | Value::Deferred(DeferredValue::Unknown(_)) => Vec::new(),
+        },
     }
 }
 

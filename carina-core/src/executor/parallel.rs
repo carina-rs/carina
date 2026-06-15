@@ -16,6 +16,7 @@ use super::basic::{
     BasicEffectCtx, ExecutionState, RenormalizePipeline, count_actionable_effects,
     execute_basic_effect, process_basic_result, refresh_pending_states,
 };
+use super::expand::expand_deferred_for_effects;
 use super::replace::{ReplaceContext, SingleEffectResult, execute_replace_parallel};
 use super::wait::{
     AppliedStates, SKIP_REASON_CANCELLED, UnsatisfiableReason, WaitAwareInFlight, WaitOutcome,
@@ -23,6 +24,16 @@ use super::wait::{
     unsatisfiable_reason_message, wait_failure_message,
 };
 use super::{ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, ProgressInfo};
+
+pub(super) fn is_runtime_dispatchable(effect: &Effect) -> bool {
+    !matches!(effect, Effect::Read { .. })
+        && (!effect.is_state_operation() || matches!(effect, Effect::ExpandDeferredFor { .. }))
+}
+
+pub(super) fn is_runtime_noop(effect: &Effect) -> bool {
+    matches!(effect, Effect::Read { .. })
+        || (effect.is_state_operation() && !matches!(effect, Effect::ExpandDeferredFor { .. }))
+}
 
 #[derive(Debug, Clone)]
 pub struct UnresolvedResource(Resource);
@@ -384,7 +395,9 @@ pub(super) fn build_dependency_analysis(
 
     let mut analysis = DependencyAnalysis::new(effects.len());
     for (idx, effect) in effects.iter().enumerate() {
-        if effect.as_resource_ref().is_some() {
+        if matches!(effect, Effect::ExpandDeferredFor { .. }) {
+            analyzer.collect_from_effect(effect, &mut analysis, idx);
+        } else if effect.as_resource_ref().is_some() {
             if let Some(unresolved) = unresolved_resources.get(effect.resource_id()) {
                 analyzer.collect_from_resource(unresolved.as_resource(), &mut analysis, idx);
             } else {
@@ -547,17 +560,17 @@ pub(super) async fn execute_effects_sequential(
     let mut permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
     let mut pending_refreshes: HashMap<ResourceId, String> = HashMap::new();
 
-    let effects = input.plan.effects();
-    let total = count_actionable_effects(effects);
+    let mut effects = input.plan.effects().to_vec();
+    let total = count_actionable_effects(input.plan.effects());
     let completed = AtomicUsize::new(0);
 
     let mut analysis =
-        build_dependency_analysis(effects, input.unresolved_resources, input.compositions);
-    relax_update_update_edges(effects, &mut analysis);
-    let deps_of = analysis.into_deps_of();
+        build_dependency_analysis(&effects, input.unresolved_resources, input.compositions);
+    relax_update_update_edges(&effects, &mut analysis);
+    let mut deps_of = analysis.into_deps_of();
 
     // Build effect index -> binding name mapping for resolving dependency names
-    let idx_to_binding: HashMap<usize, String> = effects
+    let mut idx_to_binding: HashMap<usize, String> = effects
         .iter()
         .enumerate()
         .filter_map(|(idx, effect)| effect.binding_name().map(|b| (idx, b)))
@@ -568,15 +581,15 @@ pub(super) async fn execute_effects_sequential(
     // Track which effect indices have been dispatched (spawned or skipped)
     let mut dispatched: HashSet<usize> = HashSet::new();
     // All actionable effect indices (excluding Read and state operations)
-    let actionable_indices: Vec<usize> = (0..effects.len())
-        .filter(|&idx| {
-            !matches!(&effects[idx], Effect::Read { .. }) && !effects[idx].is_state_operation()
-        })
+    let mut actionable_indices: Vec<usize> = (0..effects.len())
+        .filter(|&idx| is_runtime_dispatchable(&effects[idx]))
         .collect();
 
-    // Mark Read and state operation effects as completed (they are no-ops in the executor)
+    // Mark Read and plain state operation effects as completed (they are no-ops in the executor).
+    // ExpandDeferredFor is state-only for progress/provider purposes, but it is a scheduler
+    // dispatch point that materializes dynamic Create effects.
     for (idx, effect) in effects.iter().enumerate() {
-        if matches!(effect, Effect::Read { .. }) || effect.is_state_operation() {
+        if is_runtime_noop(effect) {
             completed_indices.insert(idx);
             dispatched.insert(idx);
         }
@@ -640,12 +653,17 @@ pub(super) async fn execute_effects_sequential(
         newly_ready.truncate(available);
 
         // Process newly ready effects: skip those with failed deps, spawn the rest
+        let mut completed_synchronous_dispatch = false;
         for idx in newly_ready {
             dispatched.insert(idx);
-            let effect = &effects[idx];
+            let effect = effects[idx].clone();
 
-            if let Some(failed_dep) = find_failed_dependency(effect, &failed_bindings) {
-                let c = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Some(failed_dep) = find_failed_dependency(&effect, &failed_bindings) {
+                let c = if matches!(effect, Effect::ExpandDeferredFor { .. }) {
+                    completed.load(Ordering::Relaxed)
+                } else {
+                    completed.fetch_add(1, Ordering::Relaxed) + 1
+                };
                 let reason = if effect.is_wait() {
                     let detail =
                         unsatisfiable_reason_message(&UnsatisfiableReason::DependencyFailed {
@@ -656,7 +674,7 @@ pub(super) async fn execute_effects_sequential(
                     format!("dependency '{}' failed", failed_dep)
                 };
                 observer.on_event(&ExecutionEvent::EffectSkipped {
-                    effect,
+                    effect: &effect,
                     reason: &reason,
                     progress: ProgressInfo {
                         completed: c,
@@ -671,6 +689,36 @@ pub(super) async fn execute_effects_sequential(
                 continue;
             }
 
+            if let Effect::ExpandDeferredFor {
+                upstream_binding,
+                template,
+                ..
+            } = &effect
+            {
+                let children =
+                    expand_deferred_for_effects(upstream_binding, template, &input.bindings);
+                if !children.is_empty() {
+                    for child in children {
+                        let child_idx = effects.len();
+                        if let Some(binding) = child.binding_name() {
+                            idx_to_binding.insert(child_idx, binding);
+                        }
+                        effects.push(child);
+                        actionable_indices.push(child_idx);
+                    }
+                    let mut analysis = build_dependency_analysis(
+                        &effects,
+                        input.unresolved_resources,
+                        input.compositions,
+                    );
+                    relax_update_update_edges(&effects, &mut analysis);
+                    deps_of = analysis.into_deps_of();
+                }
+                completed_indices.insert(idx);
+                completed_synchronous_dispatch = true;
+                break;
+            }
+
             // Snapshot bindings for this effect's resolution.
             let binding_snapshot = input.bindings.clone();
             let wait_identifiers = wait_identifiers.clone();
@@ -682,10 +730,11 @@ pub(super) async fn execute_effects_sequential(
                 schemas: input.schemas,
             };
             let completed_ref = &completed;
+            let effect_for_future = effect.clone();
             let make_future = move |wait_cancel_rx: Option<
                 tokio::sync::watch::Receiver<WaitSignal>,
             >| async move {
-                let result = match effect.as_basic() {
+                let result = match effect_for_future.as_basic() {
                     // `BasicEffect` is the type-level contract for
                     // `execute_basic_effect`: any Create/Update/Delete
                     // narrows here, and any non-basic variant falls
@@ -708,7 +757,7 @@ pub(super) async fn execute_effects_sequential(
                         )
                         .await,
                     ),
-                    None => match effect {
+                    None => match &effect_for_future {
                         Effect::Create(_) | Effect::Update { .. } | Effect::Delete { .. } => {
                             // `as_basic()` returns `Some` for exactly these
                             // three variants; they're handled by the `Some`
@@ -730,12 +779,14 @@ pub(super) async fn execute_effects_sequential(
                                 completed: c,
                                 total,
                             };
-                            observer.on_event(&ExecutionEvent::EffectStarted { effect });
+                            observer.on_event(&ExecutionEvent::EffectStarted {
+                                effect: &effect_for_future,
+                            });
 
                             execute_replace_parallel(
                                 provider,
                                 &ReplaceContext {
-                                    effect,
+                                    effect: &effect_for_future,
                                     id,
                                     from,
                                     to,
@@ -757,9 +808,9 @@ pub(super) async fn execute_effects_sequential(
                         Effect::Import { .. } | Effect::Remove { .. } | Effect::Move { .. } => {
                             SingleEffectResult::ReadNoOp
                         }
-                        Effect::ExpandDeferredFor { .. } => {
-                            unreachable!("ExpandDeferredFor dispatch lands in Round 4")
-                        }
+                        Effect::ExpandDeferredFor { .. } => unreachable!(
+                            "ExpandDeferredFor is handled synchronously before provider dispatch"
+                        ),
                         Effect::Wait {
                             binding,
                             target_id,
@@ -770,7 +821,9 @@ pub(super) async fn execute_effects_sequential(
                         } => {
                             let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
                             let started = Instant::now();
-                            observer.on_event(&ExecutionEvent::EffectStarted { effect });
+                            observer.on_event(&ExecutionEvent::EffectStarted {
+                                effect: &effect_for_future,
+                            });
                             let progress = ProgressInfo {
                                 completed: c,
                                 total,
@@ -808,12 +861,16 @@ pub(super) async fn execute_effects_sequential(
             }
         }
 
+        if completed_synchronous_dispatch {
+            continue;
+        }
+
         let count_undispatched =
             |dispatched: &HashSet<usize>, failed_bindings: &HashSet<String>| {
                 count_effectively_undispatched(
                     &actionable_indices,
                     dispatched,
-                    effects,
+                    &effects,
                     failed_bindings,
                 )
             };
@@ -832,7 +889,7 @@ pub(super) async fn execute_effects_sequential(
             if cancelled {
                 emit_cancelled_skips(
                     &CancelSkipCtx {
-                        effects,
+                        effects: &effects,
                         completed: &completed,
                         total,
                         observer,

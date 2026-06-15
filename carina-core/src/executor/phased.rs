@@ -17,6 +17,8 @@ use super::basic::{
     count_actionable_effects, execute_basic_effect, process_basic_result, queue_state_refresh,
     refresh_pending_states, resolve_resource, resolve_resource_with_source,
 };
+use super::expand::expand_deferred_for_effects;
+use super::parallel::is_runtime_dispatchable;
 use super::replace::{compute_full_diff_patch, single_attribute_patch};
 use super::wait::{
     AppliedStates, SKIP_REASON_CANCELLED, UnsatisfiableReason, WaitAwareInFlight, WaitOutcome,
@@ -198,7 +200,7 @@ pub(super) fn build_phase_dependency_map(
         let mut dep_indices = HashSet::new();
         let effect = &effects[idx];
         match effect {
-            Effect::Wait { .. } => {
+            Effect::Wait { .. } | Effect::ExpandDeferredFor { .. } => {
                 resolver.collect_from_effect(effect, &mut dep_indices);
             }
             _ if effect.as_resource_ref().is_some() => {
@@ -404,9 +406,9 @@ pub(super) async fn execute_effects_phased(
     let total = count_actionable_effects(input.plan.effects());
     let completed = AtomicUsize::new(0);
 
-    let effects = input.plan.effects();
-    let replace_bindings = collect_replace_bindings(effects);
-    let sorted_indices = topological_sort_replaces(effects, &replace_bindings);
+    let mut effects = input.plan.effects().to_vec();
+    let replace_bindings = collect_replace_bindings(&effects);
+    let sorted_indices = topological_sort_replaces(&effects, &replace_bindings);
     let replaced_ids: HashSet<ResourceId> = effects
         .iter()
         .filter_map(|effect| match effect {
@@ -432,12 +434,21 @@ pub(super) async fn execute_effects_phased(
         let phase1_indices: Vec<usize> = (0..effects.len())
             .filter(|&idx| {
                 !matches!(&effects[idx], Effect::Replace { .. } | Effect::Read { .. })
+                    && is_runtime_dispatchable(&effects[idx])
+                    && !matches!(
+                        &effects[idx],
+                        Effect::ExpandDeferredFor {
+                            upstream_binding,
+                            ..
+                        } if replace_bindings.contains(upstream_binding)
+                    )
                     && !post_replace_wait_set.contains(&idx)
             })
             .collect();
 
-        let deps_of = build_phase_dependency_map(
-            effects,
+        let mut phase1_indices = phase1_indices;
+        let mut deps_of = build_phase_dependency_map(
+            &effects,
             &phase1_indices,
             input.unresolved_resources,
             input.compositions,
@@ -473,12 +484,17 @@ pub(super) async fn execute_effects_phased(
                 newly_ready.sort();
             }
 
+            let mut completed_synchronous_dispatch = false;
             for idx in newly_ready {
                 dispatched.insert(idx);
-                let effect = &effects[idx];
+                let effect = effects[idx].clone();
 
-                if let Some(failed_dep) = find_failed_dependency(effect, &failed_bindings) {
-                    let c = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(failed_dep) = find_failed_dependency(&effect, &failed_bindings) {
+                    let c = if matches!(effect, Effect::ExpandDeferredFor { .. }) {
+                        completed.load(Ordering::Relaxed)
+                    } else {
+                        completed.fetch_add(1, Ordering::Relaxed) + 1
+                    };
                     let reason = if effect.is_wait() {
                         let detail =
                             unsatisfiable_reason_message(&UnsatisfiableReason::DependencyFailed {
@@ -489,7 +505,7 @@ pub(super) async fn execute_effects_phased(
                         format!("dependency '{}' failed", failed_dep)
                     };
                     observer.on_event(&ExecutionEvent::EffectSkipped {
-                        effect,
+                        effect: &effect,
                         reason: &reason,
                         progress: ProgressInfo {
                             completed: c,
@@ -504,6 +520,32 @@ pub(super) async fn execute_effects_phased(
                     continue;
                 }
 
+                if let Effect::ExpandDeferredFor {
+                    upstream_binding,
+                    template,
+                    ..
+                } = &effect
+                {
+                    let children =
+                        expand_deferred_for_effects(upstream_binding, template, &input.bindings);
+                    if !children.is_empty() {
+                        for child in children {
+                            let child_idx = effects.len();
+                            effects.push(child);
+                            phase1_indices.push(child_idx);
+                        }
+                        deps_of = build_phase_dependency_map(
+                            &effects,
+                            &phase1_indices,
+                            input.unresolved_resources,
+                            input.compositions,
+                        );
+                    }
+                    completed_indices.insert(idx);
+                    completed_synchronous_dispatch = true;
+                    break;
+                }
+
                 if let Effect::Wait {
                     binding,
                     target_id,
@@ -511,8 +553,13 @@ pub(super) async fn execute_effects_phased(
                     timeout,
                     interval,
                     ..
-                } = effect
+                } = &effect
                 {
+                    let binding = binding.clone();
+                    let target_id = target_id.clone();
+                    let until = until.clone();
+                    let timeout = *timeout;
+                    let interval = *interval;
                     let c = completed.fetch_add(1, Ordering::Relaxed) + 1;
                     let progress = ProgressInfo {
                         completed: c,
@@ -520,19 +567,20 @@ pub(super) async fn execute_effects_phased(
                     };
                     let wait_identifiers = wait_identifiers.clone();
                     in_flight.push_wait(idx, |cancel_rx| {
+                        let effect = effect.clone();
                         Box::pin(async move {
                             let started = Instant::now();
-                            observer.on_event(&ExecutionEvent::EffectStarted { effect });
+                            observer.on_event(&ExecutionEvent::EffectStarted { effect: &effect });
                             let identifier_resolver = |target_id: &ResourceId| {
                                 resolve_wait_identifier(&wait_identifiers, target_id)
                             };
                             let outcome = super::wait::execute_wait_effect(
                                 provider,
-                                target_id,
+                                &target_id,
                                 &identifier_resolver,
-                                until,
-                                *timeout,
-                                *interval,
+                                &until,
+                                timeout,
+                                interval,
                                 cancel_rx,
                                 observer,
                             )
@@ -540,7 +588,7 @@ pub(super) async fn execute_effects_phased(
                             (
                                 idx,
                                 PhaseEffectResult::Wait {
-                                    binding: binding.clone(),
+                                    binding,
                                     outcome,
                                     duration: started.elapsed(),
                                     progress,
@@ -563,10 +611,10 @@ pub(super) async fn execute_effects_phased(
                 // phases; everything else that isn't basic ends up
                 // here and is silently skipped from the basic
                 // executor's point of view.
-                let Some(basic_effect) = effect.as_basic() else {
+                if effect.as_basic().is_none() {
                     completed_indices.insert(idx);
                     continue;
-                };
+                }
 
                 let binding_snapshot = input.bindings.clone();
                 let unresolved = &input.unresolved_resources;
@@ -577,8 +625,12 @@ pub(super) async fn execute_effects_phased(
                     schemas: input.schemas,
                 };
                 let completed_ref = &completed;
+                let effect_for_future = effect.clone();
 
                 in_flight.push_non_wait(idx, async move {
+                    let basic_effect = effect_for_future
+                        .as_basic()
+                        .expect("phase 1 basic dispatch must receive a basic effect");
                     let basic = execute_basic_effect(
                         basic_effect,
                         &BasicEffectCtx {
@@ -596,12 +648,16 @@ pub(super) async fn execute_effects_phased(
                 });
             }
 
+            if completed_synchronous_dispatch {
+                continue;
+            }
+
             let count_undispatched =
                 |dispatched: &HashSet<usize>, failed_bindings: &HashSet<String>| {
                     count_effectively_undispatched(
                         &phase1_indices,
                         dispatched,
-                        effects,
+                        &effects,
                         failed_bindings,
                     )
                 };
@@ -613,7 +669,7 @@ pub(super) async fn execute_effects_phased(
             if in_flight.is_empty() {
                 if cancelled {
                     emit_cancelled_skips_with_progress(
-                        effects,
+                        &effects,
                         &phase1_indices,
                         &mut dispatched,
                         &mut completed_indices,
@@ -778,7 +834,7 @@ pub(super) async fn execute_effects_phased(
             .collect();
 
         let deps_of = build_phase_dependency_map(
-            effects,
+            &effects,
             &cbd_indices,
             input.unresolved_resources,
             input.compositions,
@@ -1030,7 +1086,7 @@ pub(super) async fn execute_effects_phased(
             if in_flight.is_empty() {
                 if cancelled {
                     emit_cancelled_skips_with_progress(
-                        effects,
+                        &effects,
                         &cbd_indices,
                         &mut dispatched,
                         &mut completed_indices,
@@ -1094,11 +1150,19 @@ pub(super) async fn execute_effects_phased(
                         queue_state_refresh(&mut pending_refreshes, &id, Some(&identifier));
                     }
                 }
-                PhaseEffectResult::Basic(BasicEffectResult::Failure { binding, .. }) => {
-                    failure_count += 1;
-                    if let Some(binding) = binding {
-                        failed_bindings.insert(binding);
-                    }
+                PhaseEffectResult::Basic(basic) => {
+                    process_basic_result(
+                        basic,
+                        &mut ExecutionState {
+                            success_count: &mut success_count,
+                            failure_count: &mut failure_count,
+                            applied_states: &mut applied_states,
+                            failed_bindings: &mut failed_bindings,
+                            successfully_deleted: &mut successfully_deleted,
+                            pending_refreshes: &mut pending_refreshes,
+                            bindings: &mut input.bindings,
+                        },
+                    );
                 }
                 _ => unreachable!(),
             }
@@ -1277,7 +1341,7 @@ pub(super) async fn execute_effects_phased(
             if in_flight.is_empty() {
                 if cancelled {
                     emit_cancelled_skips_with_progress(
-                        effects,
+                        &effects,
                         &delete_indices,
                         &mut dispatched,
                         &mut completed_indices,
@@ -1333,10 +1397,28 @@ pub(super) async fn execute_effects_phased(
     // Phase 4: Non-CBD creates and CBD finalization with parallel execution
     // -----------------------------------------------------------------------
     if !cancelled {
-        let phase4_indices: Vec<usize> = sorted_indices.clone();
+        let mut phase4_indices: Vec<usize> = sorted_indices.clone();
+        phase4_indices.extend(effects.iter().enumerate().filter_map(
+            |(idx, effect)| match effect {
+                Effect::ExpandDeferredFor {
+                    upstream_binding, ..
+                } if replace_bindings.contains(upstream_binding) => Some(idx),
+                Effect::Create(_)
+                | Effect::Update { .. }
+                | Effect::Replace { .. }
+                | Effect::Delete { .. }
+                | Effect::Read { .. }
+                | Effect::Import { .. }
+                | Effect::Remove { .. }
+                | Effect::Move { .. }
+                | Effect::Wait { .. }
+                | Effect::ExpandDeferredFor { .. } => None,
+            },
+        ));
+        phase4_indices.sort();
 
-        let deps_of = build_phase_dependency_map(
-            effects,
+        let mut deps_of = build_phase_dependency_map(
+            &effects,
             &phase4_indices,
             input.unresolved_resources,
             input.compositions,
@@ -1376,15 +1458,23 @@ pub(super) async fn execute_effects_phased(
                 newly_ready.sort();
             }
 
+            let mut completed_synchronous_dispatch = false;
             for idx in newly_ready {
                 dispatched.insert(idx);
-                let effect = &effects[idx];
-                let progress = replace_progress[&idx];
+                let effect = effects[idx].clone();
 
-                if let Some(failed_dep) = find_failed_dependency(effect, &failed_bindings) {
+                if let Some(failed_dep) = find_failed_dependency(&effect, &failed_bindings) {
                     let reason = format!("dependency '{}' failed", failed_dep);
+                    let progress =
+                        replace_progress
+                            .get(&idx)
+                            .copied()
+                            .unwrap_or_else(|| ProgressInfo {
+                                completed: completed.load(Ordering::Relaxed),
+                                total,
+                            });
                     observer.on_event(&ExecutionEvent::EffectSkipped {
-                        effect,
+                        effect: &effect,
                         reason: &reason,
                         progress,
                     });
@@ -1392,6 +1482,71 @@ pub(super) async fn execute_effects_phased(
                         failed_bindings.insert(binding);
                     }
                     completed_indices.insert(idx);
+                    continue;
+                }
+
+                if let Effect::ExpandDeferredFor {
+                    upstream_binding,
+                    template,
+                    ..
+                } = &effect
+                {
+                    let children =
+                        expand_deferred_for_effects(upstream_binding, template, &input.bindings);
+                    if !children.is_empty() {
+                        for child in children {
+                            let child_idx = effects.len();
+                            if let Effect::Create(resource) = &child {
+                                debug_assert!(
+                                    resource.dependency_bindings.contains(upstream_binding),
+                                    "apply-time deferred-for child must retain iterable dependency"
+                                );
+                            }
+                            effects.push(child);
+                            phase4_indices.push(child_idx);
+                        }
+                        deps_of = build_phase_dependency_map(
+                            &effects,
+                            &phase4_indices,
+                            input.unresolved_resources,
+                            input.compositions,
+                        );
+                    }
+                    completed_indices.insert(idx);
+                    completed_synchronous_dispatch = true;
+                    break;
+                }
+
+                if effect.as_basic().is_some() {
+                    let binding_snapshot = input.bindings.clone();
+                    let unresolved = &input.unresolved_resources;
+                    let pipeline = RenormalizePipeline {
+                        normalizer: input.normalizer,
+                        provider_configs: input.provider_configs,
+                        factories: input.factories,
+                        schemas: input.schemas,
+                    };
+                    let completed_ref = &completed;
+                    let effect_for_future = effect.clone();
+                    in_flight.push(Box::pin(async move {
+                        let basic_effect = effect_for_future
+                            .as_basic()
+                            .expect("dynamic phase 4 create must be a basic effect");
+                        let basic = execute_basic_effect(
+                            basic_effect,
+                            &BasicEffectCtx {
+                                provider,
+                                bindings: &binding_snapshot,
+                                unresolved,
+                                pipeline: &pipeline,
+                                completed: completed_ref,
+                                total,
+                            },
+                            observer,
+                        )
+                        .await;
+                        (idx, PhaseEffectResult::Basic(basic))
+                    }));
                     continue;
                 }
 
@@ -1410,8 +1565,9 @@ pub(super) async fn execute_effects_phased(
                     directives,
                     temporary_name,
                     ..
-                } = effect
+                } = &effect
                 {
+                    let progress = replace_progress[&idx];
                     let effect_started = replace_start_times
                         .get(&idx)
                         .copied()
@@ -1426,6 +1582,7 @@ pub(super) async fn execute_effects_phased(
                         let id = id.clone();
                         let to = to.clone();
                         let temporary_name = temporary_name.clone();
+                        let effect_for_future = effect.clone();
 
                         in_flight.push(Box::pin(async move {
                             let started = effect_started;
@@ -1452,7 +1609,7 @@ pub(super) async fn execute_effects_phased(
                                             to: &temp.original_value,
                                         });
                                         observer.on_event(&ExecutionEvent::EffectSucceeded {
-                                            effect,
+                                            effect: &effect_for_future,
                                             state: None,
                                             duration: started.elapsed(),
                                             progress,
@@ -1473,7 +1630,7 @@ pub(super) async fn execute_effects_phased(
                                             error: &error_str,
                                         });
                                         observer.on_event(&ExecutionEvent::EffectFailed {
-                                            effect,
+                                            effect: &effect_for_future,
                                             error: "rename failed",
                                             duration: started.elapsed(),
                                             progress,
@@ -1483,7 +1640,7 @@ pub(super) async fn execute_effects_phased(
                                             PhaseEffectResult::CbdFinalizeFailed {
                                                 state,
                                                 resource_id: to.id.clone(),
-                                                binding: effect.binding_name(),
+                                                binding: effect_for_future.binding_name(),
                                             },
                                         )
                                     }
@@ -1504,7 +1661,7 @@ pub(super) async fn execute_effects_phased(
                                         }
                                     });
                                 observer.on_event(&ExecutionEvent::EffectSucceeded {
-                                    effect,
+                                    effect: &effect_for_future,
                                     state: None,
                                     duration: started.elapsed(),
                                     progress,
@@ -1529,8 +1686,9 @@ pub(super) async fn execute_effects_phased(
                         }
 
                         // Non-CBD: create new resource
+                        let effect_for_future = effect.clone();
                         in_flight.push(Box::pin(async move {
-                            if let Effect::Replace { to, .. } = effect {
+                            if let Effect::Replace { to, .. } = &effect_for_future {
                                 let started = effect_started;
                                 let resolve_source = unresolved
                                     .get(&to.id)
@@ -1546,7 +1704,7 @@ pub(super) async fn execute_effects_phased(
                                     Ok(r) => r,
                                     Err(e) => {
                                         observer.on_event(&ExecutionEvent::EffectFailed {
-                                            effect,
+                                            effect: &effect_for_future,
                                             error: &e,
                                             duration: started.elapsed(),
                                             progress,
@@ -1554,7 +1712,7 @@ pub(super) async fn execute_effects_phased(
                                         return (
                                             idx,
                                             PhaseEffectResult::Basic(BasicEffectResult::Failure {
-                                                binding: effect.binding_name(),
+                                                binding: effect_for_future.binding_name(),
                                                 refresh: None,
                                             }),
                                         );
@@ -1568,7 +1726,7 @@ pub(super) async fn execute_effects_phased(
                                 {
                                     Ok(state) => {
                                         observer.on_event(&ExecutionEvent::EffectSucceeded {
-                                            effect,
+                                            effect: &effect_for_future,
                                             state: Some(&state),
                                             duration: started.elapsed(),
                                             progress,
@@ -1586,7 +1744,7 @@ pub(super) async fn execute_effects_phased(
                                     Err(e) => {
                                         let error_str = e.to_string();
                                         observer.on_event(&ExecutionEvent::EffectFailed {
-                                            effect,
+                                            effect: &effect_for_future,
                                             error: &error_str,
                                             duration: started.elapsed(),
                                             progress,
@@ -1594,7 +1752,7 @@ pub(super) async fn execute_effects_phased(
                                         (
                                             idx,
                                             PhaseEffectResult::NonCbdCreateFailure {
-                                                binding: effect.binding_name(),
+                                                binding: effect_for_future.binding_name(),
                                             },
                                         )
                                     }
@@ -1607,16 +1765,28 @@ pub(super) async fn execute_effects_phased(
                 }
             }
 
+            if completed_synchronous_dispatch {
+                continue;
+            }
+
             if in_flight.is_empty() {
                 if cancelled {
                     emit_cancelled_skips_with_progress(
-                        effects,
+                        &effects,
                         &phase4_indices,
                         &mut dispatched,
                         &mut completed_indices,
                         &mut skip_count,
                         observer,
-                        |idx| replace_progress[&idx],
+                        |idx| {
+                            replace_progress
+                                .get(&idx)
+                                .copied()
+                                .unwrap_or_else(|| ProgressInfo {
+                                    completed: completed.fetch_add(1, Ordering::Relaxed) + 1,
+                                    total,
+                                })
+                        },
                     );
                 }
                 break;
@@ -1679,11 +1849,19 @@ pub(super) async fn execute_effects_phased(
                         failed_bindings.insert(binding);
                     }
                 }
-                PhaseEffectResult::Basic(BasicEffectResult::Failure { binding, .. }) => {
-                    failure_count += 1;
-                    if let Some(binding) = binding {
-                        failed_bindings.insert(binding);
-                    }
+                PhaseEffectResult::Basic(basic) => {
+                    process_basic_result(
+                        basic,
+                        &mut ExecutionState {
+                            success_count: &mut success_count,
+                            failure_count: &mut failure_count,
+                            applied_states: &mut applied_states,
+                            failed_bindings: &mut failed_bindings,
+                            successfully_deleted: &mut successfully_deleted,
+                            pending_refreshes: &mut pending_refreshes,
+                            bindings: &mut input.bindings,
+                        },
+                    );
                 }
                 _ => unreachable!(),
             }
@@ -1695,7 +1873,7 @@ pub(super) async fn execute_effects_phased(
     // -----------------------------------------------------------------------
     if !cancelled && !post_replace_wait_indices.is_empty() {
         let deps_of = build_phase_dependency_map(
-            effects,
+            &effects,
             &post_replace_wait_indices,
             input.unresolved_resources,
             input.compositions,
@@ -1808,7 +1986,7 @@ pub(super) async fn execute_effects_phased(
                     count_effectively_undispatched(
                         &post_replace_wait_indices,
                         dispatched,
-                        effects,
+                        &effects,
                         failed_bindings,
                     )
                 };
@@ -1820,7 +1998,7 @@ pub(super) async fn execute_effects_phased(
             if in_flight.is_empty() {
                 if cancelled {
                     emit_cancelled_skips_with_progress(
-                        effects,
+                        &effects,
                         &post_replace_wait_indices,
                         &mut dispatched,
                         &mut completed_indices,

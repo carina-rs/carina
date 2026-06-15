@@ -22,6 +22,7 @@ pub use ast::{
     ParsedExportParam, ParsedFile, ProviderConfig, RequireBlock, ResourceContext, ResourceRef,
     ResourceTypePath, StateBlock, StateBlockAddress, TypeExpr, UntilPredicateAst, UpstreamState,
     UseStatement, UserFunction, UserFunctionBody, ValidateExpr, ValidationBlock, WaitBinding,
+    expand_deferred_children,
 };
 pub use config::{DecryptorFn, ProviderContext, ValidatorFn};
 pub(crate) use entry::{BindingSeed, parse_with_seeded_bindings};

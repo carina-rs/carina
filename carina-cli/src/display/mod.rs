@@ -724,21 +724,41 @@ impl<'a> TreeRenderContext<'a> {
                 .unwrap();
             }
             Effect::ExpandDeferredFor {
-                id,
                 upstream_binding,
+                template,
                 ..
             } => {
                 writeln!(
                     self.out,
-                    "{}{}{} {} {} {}",
+                    "{}{}{} {}",
                     base_indent,
                     connector,
                     colored_symbol,
-                    id.display_type().cyan().bold(),
-                    id.name_str().yellow().bold(),
-                    format!("(deferred for: waits on {})", upstream_binding).dimmed()
+                    template.header.yellow().bold()
                 )
                 .unwrap();
+                let attr_prefix = if indent == 0 {
+                    format!("{}{}", base_indent, attr_base)
+                } else {
+                    let continuation = if is_last {
+                        format!("{}   ", prefix)
+                    } else {
+                        format!("{}│  ", prefix)
+                    };
+                    format!("{}{}   ", base_indent, continuation)
+                };
+                writeln!(
+                    self.out,
+                    "{}{}",
+                    attr_prefix,
+                    format!(
+                        "(deferred until apply: one {} per element after {} applies)",
+                        template.resource_type, upstream_binding
+                    )
+                    .dimmed()
+                )
+                .unwrap();
+                has_displayed_attrs = true;
             }
         }
 
