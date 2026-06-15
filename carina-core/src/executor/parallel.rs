@@ -261,8 +261,10 @@ impl DependencyAnalyzer {
     ) {
         if let Some(resource) = effect.as_resource_ref() {
             self.collect_from_resource_ref(resource, analysis, child);
+            return;
         }
-        for binding in effect.explicit_dependencies() {
+
+        for binding in effect.blocking_bindings() {
             self.record_binding_edge(&binding, ReadsSet::unknown(), analysis, child);
         }
     }
@@ -429,23 +431,13 @@ pub(super) fn build_dependency_analysis(
         analysis.add_edge(parent_idx, child_idx, ReadsSet::unknown());
     }
 
-    // Wait dependencies: each `Effect::Wait` depends on the effect that
-    // produces its target (Create / Update / Replace on `target_id`) so
-    // the wait does not start polling before the target has been
-    // created. Explicit `depends_on = [...]` entries from the wait
-    // block layer on top.
+    // Wait dependencies: each `Effect::Wait` depends on its blocking
+    // bindings, with the target binding first. This keeps the polling
+    // wait behind the effect that produces its target, plus any explicit
+    // `depends_on = [...]` entries from the wait block.
     for (idx, effect) in effects.iter().enumerate() {
-        if let Effect::Wait { target_id, .. } = effect {
-            // Edge from the wait to its target's binding-effect (if
-            // present in the plan). The target may already exist (no
-            // Create effect in this plan) — then the wait is free to
-            // start immediately, which is what we want for refresh-only
-            // applies.
-            if let Some(target_binding) = lookup_idx(target_id.name_str()) {
-                analysis.add_edge(idx, target_binding, ReadsSet::unknown());
-            }
-            // Honour `depends_on = [...]` declared in the wait block.
-            for dep_binding in effect.explicit_dependencies() {
+        if let Effect::Wait { .. } = effect {
+            for dep_binding in effect.blocking_bindings() {
                 if let Some(dep_idx) = lookup_idx(&dep_binding) {
                     analysis.add_edge(idx, dep_idx, ReadsSet::unknown());
                 }
