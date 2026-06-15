@@ -313,26 +313,10 @@ pub fn find_failed_dependency(
     effect: &Effect,
     failed_bindings: &HashSet<String>,
 ) -> Option<String> {
-    if let Effect::Wait {
-        explicit_dependencies,
-        ..
-    } = effect
-    {
-        return explicit_dependencies
-            .iter()
-            .find(|dep| failed_bindings.contains(*dep))
-            .cloned();
-    }
-
-    // carina#3181 PR D: `Effect` payloads are typestate structs, so the
-    // dependency set is assembled from the `ResourceLike` view (value
-    // refs + `dependency_bindings`) plus the effect's explicit
-    // `depends_on` edges — the same union `get_resource_dependencies`
-    // computes for a legacy `Resource`.
-    let resource = effect.as_resource_ref()?;
-    let mut deps = get_resource_value_ref_dependencies(resource);
-    deps.extend(effect.explicit_dependencies());
-    deps.into_iter().find(|dep| failed_bindings.contains(dep))
+    effect
+        .blocking_bindings()
+        .into_iter()
+        .find(|dep| failed_bindings.contains(dep))
 }
 
 /// Check if any dependent of the given binding has failed (is in failed_bindings).
@@ -363,7 +347,7 @@ mod tests {
     use crate::resource::{DeferredValue, Directives, Resource, ResourceId, Value};
     use crate::wait::predicate::{AttrPath, WaitPredicate};
 
-    fn wait_effect_with_explicit_dependency(binding: &str) -> Effect {
+    fn wait_effect_with_explicit_dependency(binding: Option<&str>) -> Effect {
         Effect::Wait {
             binding: "cert_issued".to_string(),
             target_id: ResourceId::new("acm.Certificate", "cert"),
@@ -376,7 +360,7 @@ mod tests {
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: std::time::Duration::from_secs(60),
             interval: std::time::Duration::from_millis(1),
-            explicit_dependencies: HashSet::from([binding.to_string()]),
+            explicit_dependencies: binding.into_iter().map(String::from).collect(),
         }
     }
 
@@ -609,7 +593,7 @@ mod tests {
 
     #[test]
     fn find_failed_dependency_returns_wait_explicit_dependency_when_failed() {
-        let effect = wait_effect_with_explicit_dependency("failed_binding");
+        let effect = wait_effect_with_explicit_dependency(Some("failed_binding"));
         let failed_bindings: HashSet<String> =
             ["failed_binding"].into_iter().map(String::from).collect();
 
@@ -620,8 +604,46 @@ mod tests {
     }
 
     #[test]
+    fn find_failed_dependency_returns_wait_target_binding_when_failed() {
+        let effect = wait_effect_with_explicit_dependency(None);
+        let failed_bindings: HashSet<String> = ["cert"].into_iter().map(String::from).collect();
+
+        assert_eq!(
+            find_failed_dependency(&effect, &failed_bindings),
+            Some("cert".to_string())
+        );
+    }
+
+    #[test]
+    fn find_failed_dependency_returns_wait_target_binding_in_preference_to_explicit_when_both_fail()
+    {
+        let effect = wait_effect_with_explicit_dependency(Some("other_failed"));
+        let failed_bindings: HashSet<String> = ["cert", "other_failed"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        assert_eq!(
+            find_failed_dependency(&effect, &failed_bindings),
+            Some("cert".to_string())
+        );
+    }
+
+    #[test]
+    fn wait_blocking_bindings_include_target_before_explicit_dependencies() {
+        let effect = wait_effect_with_explicit_dependency(Some("other_failed"));
+        let blocking_bindings = effect.blocking_bindings();
+
+        assert_eq!(blocking_bindings.first(), Some(&"cert".to_string()));
+        assert_eq!(
+            blocking_bindings.into_iter().collect::<HashSet<_>>(),
+            HashSet::from(["cert".to_string(), "other_failed".to_string()])
+        );
+    }
+
+    #[test]
     fn find_failed_dependency_returns_none_when_wait_explicit_dependency_did_not_fail() {
-        let effect = wait_effect_with_explicit_dependency("failed_binding");
+        let effect = wait_effect_with_explicit_dependency(Some("failed_binding"));
         let failed_bindings: HashSet<String> = HashSet::new();
 
         assert_eq!(find_failed_dependency(&effect, &failed_bindings), None);

@@ -3,7 +3,10 @@
 //! An Effect describes "what to do" without actually performing the side effect.
 //! Side effects only occur when they are executed via a Provider.
 
-use std::{collections::HashSet, ops::Deref};
+use std::{
+    collections::{BTreeSet, HashSet},
+    ops::Deref,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -500,6 +503,46 @@ impl Effect {
             return explicit_dependencies.clone();
         }
         HashSet::new()
+    }
+
+    /// Bindings whose failure must prevent this effect from being dispatched.
+    ///
+    /// For [`Effect::Wait`] this is `target_id.name_str()` plus the wait's
+    /// explicit dependencies, with the target binding first. For other
+    /// resource-carrying variants this is value-reference bindings plus
+    /// explicit dependencies. State-only effects that do not carry dependency
+    /// metadata return an empty list.
+    ///
+    /// This concentrates the "what blocks me?" rule in one place so callers
+    /// cannot forget Wait's implicit target binding.
+    pub fn blocking_bindings(&self) -> Vec<String> {
+        match self {
+            Effect::Wait {
+                target_id,
+                explicit_dependencies,
+                ..
+            } => {
+                let target_binding = target_id.name_str();
+                let mut out = Vec::with_capacity(1 + explicit_dependencies.len());
+                out.push(target_binding.to_string());
+                out.extend(
+                    explicit_dependencies
+                        .iter()
+                        .filter(|dep| dep.as_str() != target_binding)
+                        .cloned()
+                        .collect::<BTreeSet<_>>(),
+                );
+                out
+            }
+            _ => {
+                let mut deps = BTreeSet::new();
+                if let Some(resource) = self.as_resource_ref() {
+                    deps.extend(crate::deps::get_resource_value_ref_dependencies(resource));
+                }
+                deps.extend(self.explicit_dependencies());
+                deps.into_iter().collect()
+            }
+        }
     }
 }
 

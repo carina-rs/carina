@@ -165,11 +165,10 @@ pub(super) fn topological_sort_replaces(
 /// Build a dependency map for a subset of effects identified by their indices.
 ///
 /// Only considers dependencies between effects in the given subset. Dependencies
-/// on effects outside the subset are ignored (assumed already completed).
-/// When `include_wait_target_edges` is true, Wait effects also depend on the
-/// same-phase effect that produces their target. Phase 5 passes false because
-/// its waits target Replace effects that have already completed by strict phase
-/// ordering; there is intentionally no fictional cross-phase dep edge.
+/// on effects outside the subset are ignored (assumed already completed). Wait
+/// blockers, including both target and explicit wait-block dependencies, are
+/// handled uniformly by `DepResolver::collect_from_effect` via
+/// `Effect::blocking_bindings()`.
 ///
 /// `Virtual` resources (the synthetic bindings module calls expose for their
 /// `attributes { }` block) have no Effect and would be invisible to a direct
@@ -182,7 +181,6 @@ pub(super) fn build_phase_dependency_map(
     phase_indices: &[usize],
     unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
     compositions: &[crate::resource::Composition],
-    include_wait_target_edges: bool,
 ) -> HashMap<usize, HashSet<usize>> {
     // Build binding -> effect index mapping for effects in this phase
     let phase_set: HashSet<usize> = phase_indices.iter().copied().collect();
@@ -200,13 +198,8 @@ pub(super) fn build_phase_dependency_map(
         let mut dep_indices = HashSet::new();
         let effect = &effects[idx];
         match effect {
-            Effect::Wait { target_id, .. } => {
+            Effect::Wait { .. } => {
                 resolver.collect_from_effect(effect, &mut dep_indices);
-                if include_wait_target_edges
-                    && let Some(target_idx) = binding_to_idx.get(target_id.name_str())
-                {
-                    dep_indices.insert(*target_idx);
-                }
             }
             _ if effect.as_resource_ref().is_some() => {
                 resolver.collect_from_effect(effect, &mut dep_indices);
@@ -274,31 +267,12 @@ impl<'a> DepResolver<'a> {
     /// Walk an effect's dependencies and merge the reached effect indices
     /// into `out`.
     ///
-    /// carina#3181: `Effect` payloads are typestate structs (managed
-    /// resources / data sources), so the dependency set is the union of
-    /// the `ResourceLike` value-ref + `dependency_bindings` view and the
-    /// effect's explicit `depends_on` edges — the same set
-    /// `get_resource_dependencies` computes for a managed resource.
-    /// State-only effects have no resource and contribute nothing. Wait
-    /// effects contribute their explicit `depends_on` edges here; any
-    /// same-phase target-producer edge is owned by `build_phase_dependency_map`.
-    /// Phase 5 waits do not need such an edge because their Replace targets
-    /// completed in an earlier phase by construction.
+    /// `Effect::blocking_bindings` concentrates the blocker set: managed
+    /// resources/data sources contribute value refs plus explicit
+    /// `depends_on`, and waits contribute their target plus explicit
+    /// wait-block dependencies.
     pub(super) fn collect_from_effect(&self, effect: &Effect, out: &mut HashSet<usize>) {
-        if let Effect::Wait { .. } = effect {
-            let dep_bindings = effect.explicit_dependencies();
-            let mut visited: HashSet<&str> = HashSet::new();
-            for binding in &dep_bindings {
-                self.expand(binding.as_str(), out, &mut visited);
-            }
-            return;
-        }
-
-        let Some(resource) = effect.as_resource_ref() else {
-            return;
-        };
-        let mut dep_bindings = crate::deps::get_resource_value_ref_dependencies(resource);
-        dep_bindings.extend(effect.explicit_dependencies());
+        let dep_bindings = effect.blocking_bindings();
         let mut visited: HashSet<&str> = HashSet::new();
         for binding in &dep_bindings {
             self.expand(binding.as_str(), out, &mut visited);
@@ -467,7 +441,6 @@ pub(super) async fn execute_effects_phased(
             &phase1_indices,
             input.unresolved_resources,
             input.compositions,
-            true,
         );
         let mut completed_indices: HashSet<usize> = HashSet::new();
         let mut dispatched: HashSet<usize> = HashSet::new();
@@ -809,7 +782,6 @@ pub(super) async fn execute_effects_phased(
             &cbd_indices,
             input.unresolved_resources,
             input.compositions,
-            true,
         );
         let mut completed_indices: HashSet<usize> = HashSet::new();
         let mut dispatched: HashSet<usize> = HashSet::new();
@@ -1368,7 +1340,6 @@ pub(super) async fn execute_effects_phased(
             &phase4_indices,
             input.unresolved_resources,
             input.compositions,
-            true,
         );
         let mut completed_indices: HashSet<usize> = HashSet::new();
         let mut dispatched: HashSet<usize> = HashSet::new();
@@ -1728,7 +1699,6 @@ pub(super) async fn execute_effects_phased(
             &post_replace_wait_indices,
             input.unresolved_resources,
             input.compositions,
-            false,
         );
         let mut completed_indices: HashSet<usize> = HashSet::new();
         let mut dispatched: HashSet<usize> = HashSet::new();
@@ -2323,8 +2293,7 @@ mod tests {
             ),
         ]);
         let phase1_indices: Vec<usize> = (0..plan.effects().len()).collect();
-        let deps =
-            build_phase_dependency_map(plan.effects(), &phase1_indices, &unresolved, &[], true);
+        let deps = build_phase_dependency_map(plan.effects(), &phase1_indices, &unresolved, &[]);
         assert!(
             deps.get(&3).is_some_and(|listener_deps| {
                 listener_deps.contains(&1) && listener_deps.contains(&2)
@@ -2412,8 +2381,7 @@ mod tests {
             UnresolvedResource::from_pre_resolve(role_policy.clone()),
         );
 
-        let deps_of =
-            build_phase_dependency_map(&effects, &phase_indices, &unresolved, &[virt], true);
+        let deps_of = build_phase_dependency_map(&effects, &phase_indices, &unresolved, &[virt]);
 
         assert!(
             deps_of[&1].contains(&0),
@@ -2460,7 +2428,6 @@ mod tests {
             &phase_indices,
             &unresolved,
             &[inner_virt, outer_virt],
-            true,
         );
 
         assert!(

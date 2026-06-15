@@ -9,7 +9,6 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::deps::get_resource_value_ref_dependencies;
 use crate::effect::Effect;
 use crate::plan::Plan;
 use crate::resource::{ConcreteValue, DeferredValue, Value};
@@ -45,8 +44,7 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
                     let rl = effect
                         .as_resource_ref()
                         .expect("variant carries a resource");
-                    let mut deps = get_resource_value_ref_dependencies(rl);
-                    deps.extend(effect.explicit_dependencies());
+                    let deps = effect.blocking_bindings().into_iter().collect();
                     (Some(rl), deps)
                 }
                 Effect::Delete {
@@ -87,8 +85,11 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
                 Effect::Wait {
                     binding, target_id, ..
                 } => {
-                    // The wait depends on its target binding so the tree
-                    // shows the wait as a child of the resource it gates.
+                    // Scheduling uses `Effect::blocking_bindings()` so
+                    // wait targets and explicit wait-block dependencies
+                    // both block dispatch. The display tree intentionally
+                    // uses only the target edge because it visualizes the
+                    // structural "wait gates this resource" relationship.
                     let mut deps = HashSet::new();
                     deps.insert(target_id.name_str().to_string());
                     binding_to_effect.insert(binding.clone(), idx);
