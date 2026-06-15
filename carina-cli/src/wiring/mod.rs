@@ -31,7 +31,9 @@ use carina_core::provider::{
 };
 use carina_core::resolver::resolve_refs_for_plan;
 use carina_core::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, State, Value};
-use carina_core::schema::{SchemaRegistry, resolve_block_names};
+use carina_core::schema::{
+    AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, resolve_block_names,
+};
 use carina_core::validation;
 use carina_provider_mock::MockProvider;
 use carina_state::StateFile;
@@ -100,7 +102,22 @@ pub struct WiringContext {
 
 impl WiringContext {
     pub fn new(factories: Vec<Box<dyn ProviderFactory>>) -> Self {
-        let schemas = provider_mod::collect_schemas(&factories);
+        let mut schemas = provider_mod::collect_schemas(&factories);
+        if std::env::var_os("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA").is_some() {
+            schemas.insert(
+                "mock",
+                ResourceSchema::new("test.resource")
+                    .attribute(
+                        AttributeSchema::new("name", AttributeType::string())
+                            .required()
+                            .create_only(),
+                    )
+                    .attribute(AttributeSchema::new(
+                        "tags",
+                        AttributeType::map(AttributeType::string()),
+                    )),
+            );
+        }
         Self {
             factories: Arc::new(factories),
             schemas,

@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use carina_core::effect::PlanOp;
 use carina_core::provider::{
-    BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, PartialCreateDiagnostic, PatchOpKind,
-    Provider, ProviderError, ProviderResult, ReadRequest, UpdateRequest,
+    BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, PatchOpKind, Provider, ProviderError,
+    ProviderResult, ReadRequest, UpdateRequest,
 };
 use carina_core::resource::{DataSource, ResourceId, State, Value};
 use carina_core::value::{json_to_dsl_value, value_to_json};
@@ -215,13 +215,11 @@ impl Provider for MockProvider {
                 for attr in &config.missing_attributes {
                     state.attributes.remove(attr);
                 }
-                return Ok(CreateOutcome::PartialSuccess {
+                return Ok(CreateOutcome::partial_success(
                     state,
-                    diagnostic: PartialCreateDiagnostic {
-                        reason: "mock partial create".to_string(),
-                        missing_attributes: config.missing_attributes.clone(),
-                    },
-                });
+                    "mock partial create".to_string(),
+                    config.missing_attributes.clone(),
+                ));
             }
 
             Ok(CreateOutcome::Success { state })

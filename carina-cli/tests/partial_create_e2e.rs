@@ -23,16 +23,22 @@ impl Scenario {
     }
 
     fn write_config(&self) {
+        self.write_config_with_name("r1");
+    }
+
+    fn write_config_with_name(&self, name: &str) {
         fs::write(
             self.project.join("main.crn"),
-            r#"backend local { path = "carina.state.json" }
-provider mock {}
+            format!(
+                r#"backend local {{ path = "carina.state.json" }}
+provider mock {{}}
 
-let r1 = mock.test.resource {
-  name = "r1"
-  tags = { version = "one" }
-}
-"#,
+let r1 = mock.test.resource {{
+  name = "{name}"
+  tags = {{ version = "one" }}
+}}
+"#
+            ),
         )
         .unwrap();
     }
@@ -69,6 +75,7 @@ fn carina(project: &Path) -> Command {
     command
         .current_dir(project)
         .env("NO_COLOR", "1")
+        .env("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA", "1")
         .env_remove("CLICOLOR_FORCE");
     command
 }
@@ -154,5 +161,56 @@ fn partial_create_records_state_and_next_plan_surfaces_unknown_reason() {
         plan_text
             .contains("(known after next apply: post-create read failed — mock partial create)"),
         "next plan must surface the partial-create unknown reason\nstdout/stderr:\n{plan_text}"
+    );
+}
+
+#[test]
+fn replace_partial_create_records_marker_for_next_plan() {
+    let scenario = Scenario::new();
+    scenario.write_config();
+    scenario.init();
+
+    let first_apply = scenario.apply_partial();
+    assert_eq!(
+        first_apply.status.code(),
+        Some(2),
+        "initial partial apply must exit 2\nstdout/stderr:\n{}",
+        output_text(&first_apply)
+    );
+
+    scenario.write_config_with_name("r1-replacement");
+    let replace_apply = scenario.apply_partial();
+    let replace_apply_text = output_text(&replace_apply);
+    assert_eq!(
+        replace_apply.status.code(),
+        Some(2),
+        "replace partial apply must exit 2\nstdout/stderr:\n{replace_apply_text}"
+    );
+    assert!(
+        replace_apply_text.contains("(partial)"),
+        "replace apply output must render partial create\nstdout/stderr:\n{replace_apply_text}"
+    );
+
+    let state_text = fs::read_to_string(scenario.project.join("carina.state.json")).unwrap();
+    assert!(
+        !state_text.contains("__carina_unknown"),
+        "state file must not persist unknown sentinels:\n{state_text}"
+    );
+    assert!(
+        state_text.contains("\"partial_read\""),
+        "replace writeback must persist the partial_read marker:\n{state_text}"
+    );
+
+    let plan = scenario.plan();
+    assert_success("carina plan after replace partial", &plan);
+    let plan_text = output_text(&plan);
+    assert!(
+        plan_text.contains("~ mock.test.resource r1") && plan_text.contains("1 to change"),
+        "next plan must show the replace partial resource as an update\nstdout/stderr:\n{plan_text}"
+    );
+    assert!(
+        plan_text
+            .contains("(known after next apply: post-create read failed — mock partial create)"),
+        "next plan must surface the replace partial-create unknown reason\nstdout/stderr:\n{plan_text}"
     );
 }

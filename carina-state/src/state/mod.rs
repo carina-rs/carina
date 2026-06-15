@@ -210,23 +210,22 @@ impl StateFile {
 
     /// Restore partial-read markers from the state file onto refreshed states.
     pub fn restore_partial_read_markers(&self, states: &mut HashMap<ResourceId, State>) {
-        for (id, state) in states.iter_mut() {
-            if !state.exists {
-                state.partial_read = None;
+        for (id, current) in states.iter_mut() {
+            if !current.exists {
+                current.partial_read = None;
                 continue;
             }
             let marker = self
                 .find_resource(&id.provider, &id.resource_type, id.name_str())
                 .and_then(|rs| rs.partial_read.clone());
-            if let Some(marker) = marker {
-                if marker
+            if let Some(mut marker) = marker {
+                marker
                     .missing_attributes
-                    .iter()
-                    .any(|attr| !state.attributes.contains_key(attr))
-                {
-                    state.partial_read = Some(marker);
+                    .retain(|attr| !current.attributes.contains_key(attr));
+                if marker.missing_attributes.is_empty() {
+                    current.partial_read = None;
                 } else {
-                    state.partial_read = None;
+                    current.partial_read = Some(marker);
                 }
             }
         }

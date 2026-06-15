@@ -1970,14 +1970,6 @@ impl AsRef<State> for PlanInputState {
     }
 }
 
-impl std::ops::Deref for PlanInputState {
-    type Target = State;
-
-    fn deref(&self) -> &State {
-        &self.0
-    }
-}
-
 pub fn into_plan_input_map(
     states: HashMap<ResourceId, State>,
 ) -> HashMap<ResourceId, PlanInputState> {
@@ -2036,11 +2028,6 @@ impl State {
 
     pub fn with_dependency_bindings(mut self, deps: BTreeSet<String>) -> Self {
         self.dependency_bindings = deps;
-        self
-    }
-
-    pub fn with_partial_read(mut self, marker: PartialReadMarker) -> Self {
-        self.partial_read = Some(marker);
         self
     }
 

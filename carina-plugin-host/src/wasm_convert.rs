@@ -6,8 +6,7 @@ use std::fmt;
 use carina_core::effect::PlanOp as CorePlanOp;
 use carina_core::provider::{
     CreateOutcome as CoreCreateOutcome, CreateRequest as CoreCreateRequest,
-    DeleteRequest as CoreDeleteRequest, ErrorDetail as CoreErrorDetail,
-    PartialCreateDiagnostic as CorePartialCreateDiagnostic, PatchOp as CorePatchOp,
+    DeleteRequest as CoreDeleteRequest, ErrorDetail as CoreErrorDetail, PatchOp as CorePatchOp,
     PatchOpKind as CorePatchOpKind, ProviderError as CoreProviderError,
     ReadRequest as CoreReadRequest, UpdatePatch as CoreUpdatePatch,
     UpdateRequest as CoreUpdateRequest,
@@ -433,13 +432,11 @@ pub fn wit_to_core_create_outcome(
         wit::CreateOutcome::Success(state) => CoreCreateOutcome::Success {
             state: wit_to_core_state(&state, id),
         },
-        wit::CreateOutcome::PartialSuccess(partial) => CoreCreateOutcome::PartialSuccess {
-            state: wit_to_core_state(&partial.state, id),
-            diagnostic: CorePartialCreateDiagnostic {
-                reason: partial.diagnostic.reason,
-                missing_attributes: partial.diagnostic.missing_attributes,
-            },
-        },
+        wit::CreateOutcome::PartialSuccess(partial) => CoreCreateOutcome::partial_success(
+            wit_to_core_state(&partial.state, id),
+            partial.diagnostic.reason,
+            partial.diagnostic.missing_attributes,
+        ),
     }
 }
 

@@ -1756,3 +1756,53 @@ fn build_directives_keys_include_provider_instance() {
         "ResourceId without provider_instance must not match a Some(_) entry"
     );
 }
+
+#[test]
+fn partial_read_marker_round_trips_through_state_json() {
+    let mut state = StateFile::new();
+    let mut rs = ResourceState::new("test.resource", "r1", "mock").with_identifier("mock-id");
+    rs.partial_read = Some(PartialReadMarker {
+        detail: "mock partial create".to_string(),
+        missing_attributes: ["a".to_string(), "b".to_string()].into_iter().collect(),
+    });
+    state.upsert_resource(rs);
+
+    let json = serde_json::to_string(&state).expect("serialize");
+    let back = check_and_migrate(&json).expect("read").into_state();
+
+    assert_eq!(
+        back.resources[0].partial_read,
+        state.resources[0].partial_read
+    );
+}
+
+#[test]
+fn missing_partial_read_field_defaults_to_none() {
+    let json = r#"{
+        "version": 7,
+        "serial": 0,
+        "lineage": "test-lineage",
+        "carina_version": "0.4.0",
+        "resources": [{
+            "resource_type": "test.resource",
+            "name": "r1",
+            "provider": "mock",
+            "identifier": "mock-id",
+            "attributes": {"name": "r1"},
+            "protected": false,
+            "directives": {},
+            "prefixes": {},
+            "name_overrides": {},
+            "desired_keys": [],
+            "explicit": {"kind": "struct", "children": {}},
+            "binding": null,
+            "dependency_bindings": [],
+            "write_only_attributes": []
+        }]
+    }"#;
+
+    let state = check_and_migrate(json).expect("read").into_state();
+
+    assert_eq!(state.resources.len(), 1);
+    assert_eq!(state.resources[0].partial_read, None);
+}

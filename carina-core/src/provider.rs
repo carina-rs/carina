@@ -12,7 +12,8 @@ use std::pin::Pin;
 
 use crate::effect::PlanOp;
 use crate::resource::{
-    ConcreteValue, DataSource, Directives, ResolvedResource, Resource, ResourceId, State, Value,
+    ConcreteValue, DataSource, Directives, PartialReadMarker, ResolvedResource, Resource,
+    ResourceId, State, Value,
 };
 use crate::schema::{SchemaRegistry, TypeIdentity};
 use crate::wait::BindingPattern;
@@ -502,20 +503,25 @@ pub enum CreateOutcome {
 /// Diagnostic details for a partial create.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PartialCreateDiagnostic {
-    pub reason: String,
-    pub missing_attributes: Vec<String>,
+    reason: String,
+    missing_attributes: Vec<String>,
 }
 
 impl CreateOutcome {
-    pub fn state(&self) -> &State {
-        match self {
-            CreateOutcome::Success { state } | CreateOutcome::PartialSuccess { state, .. } => state,
+    pub fn partial_success(state: State, reason: String, missing_attributes: Vec<String>) -> Self {
+        match PartialCreateDiagnostic::new(reason, missing_attributes) {
+            Some(diagnostic) => CreateOutcome::PartialSuccess { state, diagnostic },
+            None => CreateOutcome::Success { state },
         }
     }
 
-    pub fn into_state(self) -> State {
+    /// Consume the outcome and produce a State ready for writeback.
+    pub fn into_state_for_writeback(self) -> State {
         match self {
-            CreateOutcome::Success { state } | CreateOutcome::PartialSuccess { state, .. } => state,
+            CreateOutcome::Success { state } => state,
+            CreateOutcome::PartialSuccess { state, diagnostic } => {
+                diagnostic.into_state_for_writeback(state)
+            }
         }
     }
 
@@ -524,6 +530,35 @@ impl CreateOutcome {
             CreateOutcome::Success { .. } => None,
             CreateOutcome::PartialSuccess { diagnostic, .. } => Some(diagnostic),
         }
+    }
+}
+
+impl PartialCreateDiagnostic {
+    pub fn new(reason: String, missing_attributes: Vec<String>) -> Option<Self> {
+        if missing_attributes.is_empty() {
+            None
+        } else {
+            Some(Self {
+                reason,
+                missing_attributes,
+            })
+        }
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    pub fn missing_attributes(&self) -> &[String] {
+        &self.missing_attributes
+    }
+
+    pub fn into_state_for_writeback(self, mut state: State) -> State {
+        state.partial_read = Some(PartialReadMarker {
+            detail: self.reason,
+            missing_attributes: self.missing_attributes.into_iter().collect(),
+        });
+        state
     }
 }
 
@@ -1496,26 +1531,42 @@ mod tests {
     fn create_outcome_exposes_state_and_diagnostic() {
         let id = ResourceId::new("test", "example");
         let state = State::existing(id, HashMap::new()).with_identifier("mock-id");
-        let diagnostic = PartialCreateDiagnostic {
-            reason: "mock partial create".to_string(),
-            missing_attributes: vec!["dns_name".to_string()],
-        };
+        let diagnostic = PartialCreateDiagnostic::new(
+            "mock partial create".to_string(),
+            vec!["dns_name".to_string()],
+        )
+        .expect("missing attributes are non-empty");
 
         let success = CreateOutcome::Success {
             state: state.clone(),
         };
-        assert_eq!(success.state(), &state);
         assert_eq!(success.diagnostic(), None);
-        assert_eq!(success.into_state(), state.clone());
+        assert_eq!(success.into_state_for_writeback(), state.clone());
 
-        let partial = CreateOutcome::PartialSuccess {
-            state: state.clone(),
-            diagnostic: diagnostic.clone(),
-        };
+        let partial = CreateOutcome::partial_success(
+            state.clone(),
+            "mock partial create".to_string(),
+            vec!["dns_name".to_string()],
+        );
 
-        assert_eq!(partial.state(), &state);
         assert_eq!(partial.diagnostic(), Some(&diagnostic));
-        assert_eq!(partial.into_state(), state);
+        let state = partial.into_state_for_writeback();
+        assert_eq!(state.partial_read.unwrap().missing_attributes.len(), 1);
+    }
+
+    #[test]
+    fn create_outcome_empty_partial_diagnostic_becomes_success() {
+        let id = ResourceId::new("test", "example");
+        let state = State::existing(id, HashMap::new()).with_identifier("mock-id");
+
+        let outcome = CreateOutcome::partial_success(
+            state.clone(),
+            "mock partial create".to_string(),
+            vec![],
+        );
+
+        assert_eq!(outcome.diagnostic(), None);
+        assert_eq!(outcome.into_state_for_writeback(), state);
     }
 
     #[test]
@@ -1695,7 +1746,7 @@ mod tests {
             )
             .await
             .unwrap()
-            .into_state();
+            .into_state_for_writeback();
         assert!(state.exists);
         assert_eq!(state.identifier, Some("mock-id-123".to_string()));
     }
@@ -1726,7 +1777,7 @@ mod tests {
             )
             .await
             .unwrap()
-            .into_state();
+            .into_state_for_writeback();
         assert!(state.exists);
         assert_eq!(state.identifier, Some("mock-id-123".to_string()));
     }

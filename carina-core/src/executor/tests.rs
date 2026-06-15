@@ -1672,18 +1672,20 @@ async fn partial_create_records_state_and_diagnostic() {
     let provider = MockProvider::new();
     let resource = make_resource("a", &[]);
     let rid = resource.id.clone();
-    let diagnostic = crate::provider::PartialCreateDiagnostic {
-        reason: "mock partial create".to_string(),
-        missing_attributes: vec!["computed".to_string()],
-    };
+    let diagnostic = crate::provider::PartialCreateDiagnostic::new(
+        "mock partial create".to_string(),
+        vec!["computed".to_string()],
+    )
+    .expect("missing attributes are non-empty");
 
     let mut plan = Plan::new();
     plan.add(Effect::Create(resource));
 
-    provider.push_create_outcome(Ok(crate::provider::CreateOutcome::PartialSuccess {
-        state: ok_state(&rid),
-        diagnostic: diagnostic.clone(),
-    }));
+    provider.push_create_outcome(Ok(crate::provider::CreateOutcome::partial_success(
+        ok_state(&rid),
+        "mock partial create".to_string(),
+        vec!["computed".to_string()],
+    )));
 
     let input = ExecutionInput {
         plan: &plan,

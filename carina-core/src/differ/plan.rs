@@ -395,7 +395,7 @@ pub fn create_plan(
                 }
                 let identifier = current_states
                     .get(&id)
-                    .and_then(|s| s.identifier.clone())
+                    .and_then(|s| s.as_state().identifier.clone())
                     .unwrap_or_default();
                 let directives = resource.directives.clone();
                 let binding = resource.binding.clone();
@@ -415,7 +415,8 @@ pub fn create_plan(
     }
 
     // Detect orphaned resources: exist in current_states but not in desired
-    for (id, state) in current_states {
+    for (id, plan_state) in current_states {
+        let state = plan_state.as_state();
         if state.exists && !desired_ids.contains(id) {
             let directives = directives_map.get(id).cloned().unwrap_or_default();
             if directives.prevent_destroy {
@@ -598,7 +599,8 @@ pub fn create_plan(
         //      satisfy the predicate (missing state ⇒ treat as work).
         let wait_has_work = current_states
             .get(&target_id)
-            .map(|state| {
+            .map(|plan_state| {
+                let state = plan_state.as_state();
                 let target_is_mutating = plan
                     .effects()
                     .iter()

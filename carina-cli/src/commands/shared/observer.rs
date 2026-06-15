@@ -123,10 +123,10 @@ fn handle_tty(
             let key = format_effect(effect);
             let timing = format!("took {}", format_duration(*duration)).dimmed();
             let counter = format_progress(progress).dimmed();
-            let missing = if diagnostic.missing_attributes.is_empty() {
+            let missing = if diagnostic.missing_attributes().is_empty() {
                 "(none)".to_string()
             } else {
-                diagnostic.missing_attributes.join(", ")
+                diagnostic.missing_attributes().join(", ")
             };
             let msg = format!(
                 "{} {} (partial) {} {}\n      {} reason: {}\n      {} missing attributes: {}\n      {} state recorded; re-run apply to complete the read",
@@ -135,7 +135,7 @@ fn handle_tty(
                 timing,
                 counter,
                 "→".yellow(),
-                diagnostic.reason,
+                diagnostic.reason(),
                 "→".yellow(),
                 missing,
                 "→".yellow()
@@ -296,10 +296,10 @@ fn format_plain(event: &ExecutionEvent) -> Vec<String> {
         } => {
             let timing = format!("took {}", format_duration(*duration));
             let counter = format_progress(progress);
-            let missing = if diagnostic.missing_attributes.is_empty() {
+            let missing = if diagnostic.missing_attributes().is_empty() {
                 "(none)".to_string()
             } else {
-                diagnostic.missing_attributes.join(", ")
+                diagnostic.missing_attributes().join(", ")
             };
             vec![
                 format!(
@@ -308,7 +308,7 @@ fn format_plain(event: &ExecutionEvent) -> Vec<String> {
                     timing,
                     counter
                 ),
-                format!("      → reason: {}", diagnostic.reason),
+                format!("      → reason: {}", diagnostic.reason()),
                 format!("      → missing attributes: {}", missing),
                 "      → state recorded; re-run apply to complete the read".to_string(),
             ]
