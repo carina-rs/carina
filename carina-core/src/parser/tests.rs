@@ -1,5 +1,6 @@
 use super::*;
-use crate::binding_index::IterableBindings;
+use crate::binding_index::{IterableBindings, PreApplyInputs, ResolvedBindings};
+use crate::resolver::resolve_refs_for_plan;
 use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Resource, Value};
 use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
@@ -8026,6 +8027,132 @@ fn expand_deferred_for_indexed_binding_substitutes_index_and_value() {
     assert_eq!(
         parsed.resources[1].get_attr("position"),
         Some(&Value::Concrete(ConcreteValue::Int(1)))
+    );
+}
+
+#[test]
+fn expand_deferred_for_children_depend_on_iterable_binding_for_all_binding_shapes() {
+    let input = r#"
+        let orgs = upstream_state {
+            source = "../organizations"
+        }
+
+        for account_id in orgs.accounts {
+            awscc.sso.Assignment {
+                target_id = account_id
+            }
+        }
+
+        for (i, account_id) in orgs.accounts {
+            awscc.sso.Assignment {
+                target_id = account_id
+                position = i
+            }
+        }
+
+        for name, account_id in orgs.named_accounts {
+            awscc.sso.Assignment {
+                target_id = account_id
+                target_name = name
+            }
+        }
+    "#;
+
+    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    assert_eq!(parsed.deferred_for_expressions.len(), 3);
+
+    let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+    let mut orgs_attrs = HashMap::new();
+    orgs_attrs.insert(
+        "accounts".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("111111111111".to_string()),
+        )])),
+    );
+    let mut named_accounts: IndexMap<String, Value> = IndexMap::new();
+    named_accounts.insert(
+        "prod".to_string(),
+        Value::Concrete(ConcreteValue::String("222222222222".to_string())),
+    );
+    orgs_attrs.insert(
+        "named_accounts".to_string(),
+        Value::Concrete(ConcreteValue::Map(named_accounts)),
+    );
+    remote_bindings.insert("orgs".to_string(), orgs_attrs);
+
+    parsed.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings));
+
+    assert_eq!(parsed.deferred_for_expressions.len(), 0);
+    assert_eq!(parsed.resources.len(), 3); // allow: direct — fixture test inspection
+    for resource in &parsed.resources {
+        assert!(
+            resource.dependency_bindings.contains("orgs"),
+            "expanded deferred-for child {} should depend on iterable binding `orgs`, got {:?}",
+            resource.id,
+            resource.dependency_bindings
+        );
+    }
+}
+
+/// Guards carina#3554 against a future refactor of
+/// `get_resource_value_ref_dependencies` that drops the union with existing
+/// `dependency_bindings`.
+#[test]
+fn expand_deferred_for_dependency_binding_survives_resolve() {
+    let input = r#"
+        let orgs = upstream_state {
+            source = "../organizations"
+        }
+
+        for account_id in orgs.accounts {
+            awscc.sso.Assignment {
+                target_id = account_id
+                anchor_id = anchor.target_id
+            }
+        }
+    "#;
+
+    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    assert_eq!(parsed.deferred_for_expressions.len(), 1);
+
+    let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
+    let mut orgs_attrs = HashMap::new();
+    orgs_attrs.insert(
+        "accounts".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("111111111111".to_string()),
+        )])),
+    );
+    remote_bindings.insert("orgs".to_string(), orgs_attrs);
+    let mut anchor_attrs = HashMap::new();
+    anchor_attrs.insert(
+        "target_id".to_string(),
+        Value::Concrete(ConcreteValue::String("anchor".to_string())),
+    );
+    remote_bindings.insert("anchor".to_string(), anchor_attrs);
+
+    parsed.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(
+        remote_bindings.clone(),
+    ));
+    assert_eq!(parsed.deferred_for_expressions.len(), 0);
+    assert_eq!(parsed.resources.len(), 1); // allow: direct — fixture test inspection
+
+    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+        managed: &parsed.resources,
+        compositions: &parsed.compositions,
+        data_sources: &parsed.data_sources,
+        current_states: &HashMap::new(),
+        remote_bindings: &remote_bindings,
+        wait_aliases: &[],
+    });
+    let upstream_keys: HashSet<&str> = remote_bindings.keys().map(String::as_str).collect();
+    resolve_refs_for_plan(&mut parsed.resources, &bindings, &upstream_keys).unwrap();
+
+    let child = &parsed.resources[0];
+    assert!(
+        child.dependency_bindings.contains("orgs"),
+        "resolve_refs_for_plan must preserve deferred-for iterable dependency binding, got {:?}",
+        child.dependency_bindings
     );
 }
 
