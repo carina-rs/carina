@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 /// resources *would* be created once the iterable becomes available.
 /// Also stores enough information to expand the loop later when the iterable
 /// is loaded from upstream_state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DeferredForExpression {
     /// Full source path of the file this deferred expression originated
     /// from (stamped by `config_loader` after parsing).

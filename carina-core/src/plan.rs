@@ -218,6 +218,7 @@ impl Plan {
                 Effect::Remove { .. } => summary.remove += 1,
                 Effect::Move { .. } => summary.moved += 1,
                 Effect::Wait { .. } => summary.wait += 1,
+                Effect::ExpandDeferredFor { .. } => {}
             }
         }
         summary
@@ -301,7 +302,8 @@ impl ModularPlan {
                 | Effect::Import { .. }
                 | Effect::Remove { .. }
                 | Effect::Move { .. }
-                | Effect::Wait { .. } => ModuleSource::Root,
+                | Effect::Wait { .. }
+                | Effect::ExpandDeferredFor { .. } => ModuleSource::Root,
             };
             modular.effect_sources.insert(idx, source);
         }
@@ -431,6 +433,11 @@ fn format_effect_brief(effect: &Effect) -> String {
             until_surface,
             ..
         } => format!("> {} (until {})", binding, until_surface),
+        Effect::ExpandDeferredFor {
+            id,
+            upstream_binding,
+            ..
+        } => format!("~ {} (deferred for: waits on {})", id, upstream_binding),
     }
 }
 

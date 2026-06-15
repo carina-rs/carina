@@ -757,6 +757,9 @@ pub(super) async fn execute_effects_sequential(
                         Effect::Import { .. } | Effect::Remove { .. } | Effect::Move { .. } => {
                             SingleEffectResult::ReadNoOp
                         }
+                        Effect::ExpandDeferredFor { .. } => {
+                            unreachable!("ExpandDeferredFor dispatch lands in Round 4")
+                        }
                         Effect::Wait {
                             binding,
                             target_id,

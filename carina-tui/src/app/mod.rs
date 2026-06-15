@@ -806,6 +806,25 @@ fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode
             depth: 0,
             parent: None,
         },
+        Effect::ExpandDeferredFor {
+            id,
+            upstream_binding,
+            ..
+        } => TreeNode {
+            effect_label: format!(
+                "{} (deferred for: waits on {})",
+                id.human(),
+                upstream_binding
+            ),
+            resource_type: id.display_type(),
+            name_part: id.name_str().to_string(),
+            symbol: "~".to_string(),
+            kind: EffectKind::Update,
+            detail_rows,
+            children: Vec::new(),
+            depth: 0,
+            parent: None,
+        },
     }
 }
 

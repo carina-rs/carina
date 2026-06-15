@@ -1058,6 +1058,25 @@ pub fn redact_secrets_in_effect(
         // typed predicate over scalar values, surface form is the
         // user-authored source. Clone through unchanged.
         Effect::Wait { .. } => effect.clone(),
+        Effect::ExpandDeferredFor {
+            id,
+            upstream_binding,
+            template,
+        } => {
+            let mut redacted_template = (**template).clone();
+            redacted_template.attributes = redacted_template
+                .attributes
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), redact_secrets_in_value(value)?)))
+                .collect::<Result<Vec<_>, SerializationError>>()?;
+            redacted_template.template_resource =
+                redact_secrets_in_managed(&redacted_template.template_resource)?;
+            Effect::ExpandDeferredFor {
+                id: id.clone(),
+                upstream_binding: upstream_binding.clone(),
+                template: Box::new(redacted_template),
+            }
+        }
     })
 }
 

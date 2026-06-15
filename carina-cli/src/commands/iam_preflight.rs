@@ -298,7 +298,10 @@ fn effect_required_ops(effect: &Effect) -> Vec<(&ResourceId, PlanOp)> {
         Effect::Replace { id, to, .. } => vec![(id, PlanOp::Delete), (&to.id, PlanOp::Create)],
         Effect::Delete { id, .. } => vec![(id, PlanOp::Delete)],
         Effect::Import { id, .. } => vec![(id, PlanOp::Read)],
-        Effect::Remove { .. } | Effect::Move { .. } | Effect::Wait { .. } => Vec::new(),
+        Effect::Remove { .. }
+        | Effect::Move { .. }
+        | Effect::Wait { .. }
+        | Effect::ExpandDeferredFor { .. } => Vec::new(),
     }
 }
 
@@ -313,6 +316,7 @@ fn effect_resource_ids(effect: &Effect) -> Vec<&ResourceId> {
         Effect::Remove { id, .. } => vec![id],
         Effect::Move { from, to } => vec![from, to],
         Effect::Wait { .. } => Vec::new(),
+        Effect::ExpandDeferredFor { id, .. } => vec![id],
     }
 }
 

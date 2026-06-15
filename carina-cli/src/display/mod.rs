@@ -473,6 +473,7 @@ impl<'a> TreeRenderContext<'a> {
             Effect::Remove { .. } => "~".yellow().bold(),
             Effect::Move { .. } => "->".yellow().bold(),
             Effect::Wait { .. } => ">".magenta().bold(),
+            Effect::ExpandDeferredFor { .. } => "~".yellow().bold(),
         };
 
         // Build the tree connector (shown before child resources)
@@ -719,6 +720,23 @@ impl<'a> TreeRenderContext<'a> {
                     colored_symbol,
                     binding.magenta().bold(),
                     format!("(until {})", until_surface).dimmed()
+                )
+                .unwrap();
+            }
+            Effect::ExpandDeferredFor {
+                id,
+                upstream_binding,
+                ..
+            } => {
+                writeln!(
+                    self.out,
+                    "{}{}{} {} {} {}",
+                    base_indent,
+                    connector,
+                    colored_symbol,
+                    id.display_type().cyan().bold(),
+                    id.name_str().yellow().bold(),
+                    format!("(deferred for: waits on {})", upstream_binding).dimmed()
                 )
                 .unwrap();
             }
@@ -2010,6 +2028,17 @@ pub fn format_effect(effect: &Effect) -> String {
             ..
         } => {
             format!("Wait {} (until {})", binding, until_surface)
+        }
+        Effect::ExpandDeferredFor {
+            id,
+            upstream_binding,
+            ..
+        } => {
+            format!(
+                "Expand deferred for {} (waits on {})",
+                id.human(),
+                upstream_binding
+            )
         }
     }
 }
