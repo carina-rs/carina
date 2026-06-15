@@ -586,7 +586,7 @@ fn empty_execution_result() -> ExecutionResult {
         success_count: 0,
         failure_count: 0,
         skip_count: 0,
-        applied_states: HashMap::new(),
+        applied_states: Default::default(),
         successfully_deleted: HashSet::new(),
         permanent_name_overrides: HashMap::new(),
         current_states: HashMap::new(),
@@ -1210,7 +1210,6 @@ async fn execute_plan_cancels_in_flight_wait_effect_promptly() {
     plan.add(Effect::Wait {
         binding: "cert_ready".to_string(),
         target_id: cert_id,
-        target: crate::effect::WaitTarget::ResolvedAtApply,
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
             value: Value::Concrete(ConcreteValue::String("READY".to_string())),
@@ -1279,7 +1278,6 @@ async fn execute_plan_cancelled_wait_emits_cancelled_skip_not_unsatisfiable() {
     plan.add(Effect::Wait {
         binding: "cert_ready".to_string(),
         target_id: cert_id,
-        target: crate::effect::WaitTarget::ResolvedAtApply,
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
             value: Value::Concrete(ConcreteValue::String("READY".to_string())),
@@ -4248,7 +4246,6 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
     plan.add(Effect::Wait {
         binding: "cert_issued".to_string(),
         target_id: cert_id.clone(),
-        target: crate::effect::WaitTarget::ResolvedAtApply,
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
             value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
@@ -4401,7 +4398,6 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
     plan.add(Effect::Wait {
         binding: "cert_issued".to_string(),
         target_id: cert_id.clone(),
-        target: crate::effect::WaitTarget::ResolvedAtApply,
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
             value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
@@ -4503,7 +4499,6 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
     plan.add(Effect::Wait {
         binding: "cert_issued".to_string(),
         target_id: cert_id.clone(),
-        target: crate::effect::WaitTarget::ResolvedAtApply,
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
             value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
@@ -4983,7 +4978,7 @@ impl Provider for IdentifierAwareProvider {
         _identifier: &str,
         _request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
-        Box::pin(async move { Err(ProviderError::api_error("delete not expected")) })
+        Box::pin(async move { Ok(()) })
     }
 
     fn required_permissions(&self, _id: &ResourceId, _op: crate::effect::PlanOp) -> Vec<String> {
@@ -4992,9 +4987,7 @@ impl Provider for IdentifierAwareProvider {
 }
 
 /// Regression for carina#3119: a resource created *in the same apply run*
-/// has no plan-time identifier, so the differ emits
-/// `WaitTarget::ResolvedAtApply` on `Effect::Wait`. The executor must
-/// resolve the real identifier from the just-completed Create's state
+/// must be polled with the identifier from the just-completed Create's state
 /// (held in `applied_states`), not poll `provider.read` with no
 /// identifier.
 ///
@@ -5026,9 +5019,6 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
     plan.add(Effect::Wait {
         binding: "cert_issued".to_string(),
         target_id: cert_id.clone(),
-        // The differ emits `ResolvedAtApply` because the cert does not
-        // exist at plan time (created in this same run).
-        target: crate::effect::WaitTarget::ResolvedAtApply,
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
             value: Value::Concrete(ConcreteValue::String("issued".to_string())),
@@ -5072,6 +5062,222 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
         "the wait read must be called with the created identifier \
          resolved from applied_states, not the plan-time None; got: {:?}",
         provider.read_identifiers()
+    );
+}
+
+/// Regression for carina#3553: when a wait target is replaced in the same
+/// apply run, the wait must poll the post-replace identifier from the
+/// replacement state, not the pre-replace identifier snapshotted in the plan.
+#[tokio::test]
+async fn wait_resolves_target_identifier_from_just_replaced_state() {
+    use crate::effect::ChangedCreateOnly;
+    use crate::wait::predicate::{AttrPath, WaitPredicate};
+
+    let mut cert = Resource::new("test", "cert");
+    cert.binding = Some("cert".to_string());
+    let cert_id = cert.id.clone();
+    cert.set_attr(
+        "domain_name",
+        Value::Concrete(ConcreteValue::String("new.example.com".to_string())),
+    );
+
+    let old_state = State::existing(
+        cert_id.clone(),
+        HashMap::from([(
+            "status".to_string(),
+            Value::Concrete(ConcreteValue::String("pending".to_string())),
+        )]),
+    )
+    .with_identifier("old-arn");
+
+    let new_state = State::existing(
+        cert_id.clone(),
+        HashMap::from([(
+            "status".to_string(),
+            Value::Concrete(ConcreteValue::String("issued".to_string())),
+        )]),
+    )
+    .with_identifier("new-arn");
+
+    let provider = IdentifierAwareProvider::new("new-arn", new_state);
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Replace {
+        id: cert_id.clone(),
+        from: Box::new(old_state.clone()),
+        to: cert,
+        directives: Directives::default(),
+        changed_create_only: ChangedCreateOnly::new(vec!["domain_name".to_string()]).unwrap(),
+        cascading_updates: Vec::new(),
+        temporary_name: None,
+        cascade_ref_hints: Vec::new(),
+    });
+    plan.add(Effect::Wait {
+        binding: "cert_issued".to_string(),
+        target_id: cert_id.clone(),
+        until: WaitPredicate::Equals {
+            attr: AttrPath::single("status"),
+            value: Value::Concrete(ConcreteValue::String("issued".to_string())),
+        },
+        until_surface: "cert.status == \"issued\"".to_string(),
+        timeout: std::time::Duration::from_secs(5),
+        interval: std::time::Duration::from_millis(10),
+        explicit_dependencies: std::collections::HashSet::new(),
+    });
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::from([(cert_id.clone(), old_state)]),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+    let read_identifiers = provider.read_identifiers();
+
+    assert!(
+        !read_identifiers
+            .iter()
+            .any(|identifier| identifier.as_deref() == Some("old-arn")),
+        "wait polled stale pre-replace identifier old-arn; read identifiers seen: {read_identifiers:?}"
+    );
+    assert_eq!(
+        result.failure_count, 0,
+        "wait must use the replacement identifier; read identifiers seen: {read_identifiers:?}"
+    );
+    assert_eq!(result.success_count, 2, "Replace and Wait must succeed");
+    assert!(
+        read_identifiers
+            .iter()
+            .any(|identifier| identifier.as_deref() == Some("new-arn")),
+        "wait read must use the replacement identifier from applied_states; got: {read_identifiers:?}"
+    );
+}
+
+/// Regression for carina#3553 in the phased executor: interdependent
+/// replacements force phased execution, and a wait targeting one of
+/// those replacements must not run before the replacement publishes its
+/// new identifier.
+#[tokio::test]
+async fn wait_resolves_target_identifier_from_just_replaced_state_phased() {
+    use crate::effect::ChangedCreateOnly;
+    use crate::wait::predicate::{AttrPath, WaitPredicate};
+
+    let mut cert = Resource::new("test", "cert");
+    cert.binding = Some("cert".to_string());
+    let cert_id = cert.id.clone();
+    cert.set_attr(
+        "domain_name",
+        Value::Concrete(ConcreteValue::String("new.example.com".to_string())),
+    );
+
+    let mut dep = Resource::new("test", "dep");
+    dep.binding = Some("dep".to_string());
+    dep.dependency_bindings.insert("cert".to_string());
+    let dep_id = dep.id.clone();
+
+    let old_cert_state = State::existing(
+        cert_id.clone(),
+        HashMap::from([(
+            "status".to_string(),
+            Value::Concrete(ConcreteValue::String("pending".to_string())),
+        )]),
+    )
+    .with_identifier("old-arn");
+    let new_cert_state = State::existing(
+        cert_id.clone(),
+        HashMap::from([(
+            "status".to_string(),
+            Value::Concrete(ConcreteValue::String("issued".to_string())),
+        )]),
+    )
+    .with_identifier("new-arn");
+    let old_dep_state = State::existing(dep_id.clone(), HashMap::new()).with_identifier("dep-old");
+
+    let provider = IdentifierAwareProvider::new("new-arn", new_cert_state);
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Replace {
+        id: cert_id.clone(),
+        from: Box::new(old_cert_state.clone()),
+        to: cert,
+        directives: Directives::default(),
+        changed_create_only: ChangedCreateOnly::new(vec!["domain_name".to_string()]).unwrap(),
+        cascading_updates: Vec::new(),
+        temporary_name: None,
+        cascade_ref_hints: Vec::new(),
+    });
+    plan.add(Effect::Replace {
+        id: dep_id.clone(),
+        from: Box::new(old_dep_state.clone()),
+        to: dep,
+        directives: Directives::default(),
+        changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
+        cascading_updates: Vec::new(),
+        temporary_name: None,
+        cascade_ref_hints: Vec::new(),
+    });
+    plan.add(Effect::Wait {
+        binding: "cert_issued".to_string(),
+        target_id: cert_id.clone(),
+        until: WaitPredicate::Equals {
+            attr: AttrPath::single("status"),
+            value: Value::Concrete(ConcreteValue::String("issued".to_string())),
+        },
+        until_surface: "cert.status == \"issued\"".to_string(),
+        timeout: std::time::Duration::from_secs(5),
+        interval: std::time::Duration::from_millis(10),
+        explicit_dependencies: std::collections::HashSet::new(),
+    });
+    assert!(
+        has_interdependent_replaces(plan.effects()),
+        "test must exercise phased execution"
+    );
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::from([
+            (cert_id.clone(), old_cert_state),
+            (dep_id.clone(), old_dep_state),
+        ]),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+    let read_identifiers = provider.read_identifiers();
+
+    assert!(
+        !read_identifiers
+            .iter()
+            .any(|identifier| identifier.as_deref() == Some("old-arn")),
+        "phased wait polled stale pre-replace identifier old-arn; read identifiers seen: {read_identifiers:?}"
+    );
+    assert_eq!(
+        result.failure_count, 0,
+        "phased wait must use the replacement identifier; read identifiers seen: {read_identifiers:?}"
+    );
+    assert!(
+        read_identifiers
+            .iter()
+            .any(|identifier| identifier.as_deref() == Some("new-arn")),
+        "phased wait read must use the replacement identifier from applied_states; got: {read_identifiers:?}"
     );
 }
 

@@ -21,6 +21,7 @@ use crate::resolver::resolve_ref_value;
 use crate::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, State, Value};
 use crate::value::SecretHashContext;
 
+use super::wait::AppliedStates;
 use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
 
 /// Result of executing a basic effect (Create, Update, or Delete).
@@ -56,7 +57,7 @@ pub(super) enum BasicEffectResult {
 pub(super) struct ExecutionState<'a> {
     pub(super) success_count: &'a mut usize,
     pub(super) failure_count: &'a mut usize,
-    pub(super) applied_states: &'a mut HashMap<ResourceId, State>,
+    pub(super) applied_states: &'a mut AppliedStates,
     pub(super) failed_bindings: &'a mut std::collections::HashSet<String>,
     pub(super) successfully_deleted: &'a mut std::collections::HashSet<ResourceId>,
     pub(super) pending_refreshes: &'a mut HashMap<ResourceId, String>,

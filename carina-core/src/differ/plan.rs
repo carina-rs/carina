@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::deps::get_resource_dependencies;
-use crate::effect::{CascadingUpdate, ChangedCreateOnly, Effect, TemporaryName, WaitTarget};
+use crate::effect::{CascadingUpdate, ChangedCreateOnly, Effect, TemporaryName};
 use crate::identifier::generate_random_suffix;
 use crate::parser::WaitBinding;
 use crate::plan::{Plan, PlanError};
@@ -538,18 +538,6 @@ pub fn create_plan(
             value: wb.until_predicate.rhs.clone(),
         };
         let target_id = target_id_resolved;
-        // The target's identifier is only known at plan time if it
-        // already exists in state. When the target is created/updated
-        // in this same run it has no prior state, so the executor must
-        // resolve the real identifier from the just-applied state — see
-        // [`WaitTarget`] and carina#3119.
-        let target = match current_states
-            .get(&target_id)
-            .and_then(|s| s.identifier.clone())
-        {
-            Some(id) => WaitTarget::Known(id),
-            None => WaitTarget::ResolvedAtApply,
-        };
         let schema = registry.get(
             &target_id.provider,
             &target_id.resource_type,
@@ -572,28 +560,24 @@ pub fn create_plan(
         // would poll-and-return immediately. Dragging such a wait into
         // the plan is pure noise (a `> <binding> (until …)` node with no
         // pending work), so suppress it. The wait *does* have work when:
-        //   1. the target has no resolved identifier at plan time
-        //      (`ResolvedAtApply`; typically created this run) — its
-        //      post-apply attributes are unknown, must poll;
+        //   1. the target has no state entry (typically created this
+        //      run) — its post-apply attributes are unknown, must poll;
         //   2. the target has a mutating effect in this plan — cached
         //      attributes are stale, must re-poll; or
         //   3. the target is unchanged but its cached state does not yet
         //      satisfy the predicate (missing state ⇒ treat as work).
-        let wait_has_work = match &target {
-            WaitTarget::ResolvedAtApply => true,
-            WaitTarget::Known(_) => {
+        let wait_has_work = current_states
+            .get(&target_id)
+            .map(|state| {
                 let target_is_mutating = plan
                     .effects()
                     .iter()
                     .any(|e| e.resource_id() == &target_id && e.is_mutating());
-                let target_needs_wait = current_states
-                    .get(&target_id)
-                    .map(|s| !until.evaluate(&s.attributes))
-                    .unwrap_or(true);
+                let target_needs_wait = !until.evaluate(&state.attributes);
 
                 target_is_mutating || target_needs_wait
-            }
-        };
+            })
+            .unwrap_or(true);
         if !wait_has_work {
             continue;
         }
@@ -618,7 +602,6 @@ pub fn create_plan(
             // type tracked for its own newtype migration (carina#3066).
             binding: wb.binding.as_str().to_string(),
             target_id,
-            target,
             until,
             until_surface: wb.until_raw.clone(),
             timeout,

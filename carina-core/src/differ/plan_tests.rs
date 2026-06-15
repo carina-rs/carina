@@ -1803,7 +1803,7 @@ fn wait_omitted_when_already_satisfied_and_target_unchanged() {
 /// carina#3358 counterpart: when the wait's target *is* changing in the
 /// same plan, the cached state is stale — its post-apply attributes are
 /// unknown, so the wait must still be emitted to re-poll on `apply`.
-/// Here the target is new (`WaitTarget::ResolvedAtApply`).
+/// Here the target is new and has no current state entry.
 #[test]
 fn wait_emitted_when_target_is_changing_even_if_cached_state_satisfies() {
     use crate::effect::Effect;
@@ -1853,22 +1853,20 @@ fn wait_emitted_when_target_is_changing_even_if_cached_state_satisfies() {
     );
 }
 
-/// carina#3358: pins the `WaitTarget::Known` + `target_is_mutating`
-/// branch of `wait_has_work`. An *existing* target (resolved identifier
-/// in state → `Known`) whose cached state already satisfies the
-/// predicate, but which has a pending `Update` in this plan, must still
-/// emit the wait: the cached `ISSUED` is stale relative to the
-/// about-to-apply change, so the executor must re-poll. Without this
-/// test the `target_is_mutating ||` half of the gate is dead under the
-/// suite and could be silently dropped, re-introducing the bug for
-/// changing-but-Known targets.
+/// carina#3358: pins the existing-target + `target_is_mutating`
+/// branch of `wait_has_work`. An existing target whose cached state
+/// already satisfies the predicate, but which has a pending `Update` in
+/// this plan, must still emit the wait: the cached `ISSUED` is stale
+/// relative to the about-to-apply change, so the executor must re-poll.
+/// Without this test the `target_is_mutating ||` half of the gate is
+/// dead under the suite and could be silently dropped.
 #[test]
 fn wait_emitted_when_known_target_has_pending_update_even_if_cached_state_satisfies() {
     use crate::effect::Effect;
     use crate::parser::{UntilPredicateAst, WaitBinding};
 
-    // cert EXISTS in state with an identifier (→ WaitTarget::Known) and
-    // its cached `status` already satisfies the predicate, BUT it has a
+    // cert EXISTS in state and its cached `status` already satisfies
+    // the predicate, BUT it has a
     // pending Update (desired `domain_name` differs from state).
     let cert = Resource::new("acm.Certificate", "cert")
         .with_binding("cert")
@@ -1922,9 +1920,9 @@ fn wait_emitted_when_known_target_has_pending_update_even_if_cached_state_satisf
         &[wait],
     );
 
-    // Precondition: cert really has a pending Update (Known + mutating),
-    // so this hits the `target_is_mutating` arm — not `ResolvedAtApply`
-    // and not the `target_needs_wait` arm.
+    // Precondition: cert really has a pending Update, so this hits the
+    // `target_is_mutating` arm for an existing state row and not the
+    // `target_needs_wait` arm.
     assert!(
         plan.effects()
             .iter()
