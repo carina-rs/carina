@@ -10,8 +10,9 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::effect::PlanOp;
-use crate::executor::normalized::NormalizedResource;
-use crate::resource::{ConcreteValue, DataSource, Directives, Resource, ResourceId, State, Value};
+use crate::resource::{
+    ConcreteValue, DataSource, Directives, ResolvedResource, Resource, ResourceId, State, Value,
+};
 use crate::schema::{SchemaRegistry, TypeIdentity};
 use crate::wait::BindingPattern;
 use crate::wait::predicate::AttrPath;
@@ -351,7 +352,7 @@ pub type ProviderResult<T> = Result<T, ProviderError>;
 #[derive(Debug, Clone)]
 pub struct CreateRequest {
     /// Full desired state for the new resource.
-    pub resource: NormalizedResource,
+    pub resource: ResolvedResource,
 }
 
 /// Per-operation request record for [`Provider::read`].
@@ -443,7 +444,7 @@ pub enum PatchOpKind {
 /// value from `to`.
 pub fn build_update_patch(
     changed_attributes: &[String],
-    to: &NormalizedResource,
+    to: &ResolvedResource,
     from: &State,
 ) -> UpdatePatch {
     let to = to.as_resource();
@@ -1353,14 +1354,17 @@ impl Provider for Box<dyn Provider> {
 mod tests {
     use super::*;
 
-    fn normalized_for_test(resource: Resource) -> NormalizedResource {
-        futures::executor::block_on(crate::executor::normalized::apply_desired_normalization(
-            resource,
-            &[],
-            &NoopNormalizer,
-            &[],
-            &crate::schema::SchemaRegistry::new(),
-        ))
+    fn resolved_for_test(resource: Resource) -> ResolvedResource {
+        let normalized =
+            futures::executor::block_on(crate::executor::normalized::apply_desired_normalization(
+                resource,
+                &[],
+                &NoopNormalizer,
+                &[],
+                &crate::schema::SchemaRegistry::new(),
+            ));
+        crate::executor::resolve_normalized_for_provider(normalized)
+            .expect("test resource should be fully resolved")
     }
 
     // Mock Provider for testing
@@ -1620,7 +1624,7 @@ mod tests {
             .create(
                 &id,
                 CreateRequest {
-                    resource: normalized_for_test(resource),
+                    resource: resolved_for_test(resource),
                 },
             )
             .await
@@ -1650,7 +1654,7 @@ mod tests {
             .create(
                 &id,
                 CreateRequest {
-                    resource: normalized_for_test(resource),
+                    resource: resolved_for_test(resource),
                 },
             )
             .await
@@ -2072,14 +2076,7 @@ mod tests {
             Value::Concrete(ConcreteValue::String("added".into())),
         );
 
-        let to =
-            futures::executor::block_on(crate::executor::normalized::apply_desired_normalization(
-                to,
-                &[],
-                &NoopNormalizer,
-                &[],
-                &crate::schema::SchemaRegistry::new(),
-            ));
+        let to = resolved_for_test(to);
         let changed = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let patch = build_update_patch(&changed, &to, &from);
         assert_eq!(patch.ops.len(), 3);

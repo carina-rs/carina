@@ -2,7 +2,10 @@ use super::*;
 
 use carina_core::effect::{CascadingUpdate, Effect};
 use carina_core::plan::Plan;
-use carina_core::resource::{ConcreteValue, Directives, Resource, ResourceId, State, Value};
+use carina_core::resource::{
+    AccessPath, ConcreteValue, DeferredValue, Directives, Resource, ResourceId, State,
+    UnknownReason, Value,
+};
 
 fn make_resource(resource_type: &str, name: &str, binding: &str, deps: &[&str]) -> Resource {
     let mut r = Resource::new(resource_type, name);
@@ -1031,6 +1034,64 @@ fn test_replace_cascade_ref_hints_show_binding() {
         "Expected 'forces replacement, known after apply' in output, got: {}",
         output
     );
+}
+
+#[test]
+fn test_expand_deferred_for_renders_deferred_until_apply_marker() {
+    let mut template_resource = Resource::new("route53.Record", "validation_records");
+    template_resource.binding = Some("validation_records".to_string());
+    template_resource.set_attr(
+        "name",
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValuePath {
+            path: AccessPath::with_fields("opt", "resource_record", vec!["name".to_string()]),
+        })),
+    );
+
+    let deferred = carina_core::parser::DeferredForExpression {
+        file: None,
+        line: 1,
+        header: "for opt in cert.domain_validation_options".to_string(),
+        resource_type: "aws.route53.Record".to_string(),
+        attributes: template_resource
+            .attributes
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        binding_name: "validation_records".to_string(),
+        iterable_binding: "cert".to_string(),
+        iterable_attr: "domain_validation_options".to_string(),
+        binding: carina_core::parser::ForBinding::Simple("opt".to_string()),
+        template_resource,
+    };
+
+    let mut plan = Plan::new();
+    plan.add(Effect::ExpandDeferredFor {
+        id: ResourceId::new("__deferred_for", "validation_records"),
+        upstream_binding: "cert".to_string(),
+        template: Box::new(deferred),
+    });
+
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        None,
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+        None,
+    ));
+
+    insta::assert_snapshot!(output, @r###"
+Execution Plan:
+
+  ~ for opt in cert.domain_validation_options
+      (deferred until apply: one aws.route53.Record per element after cert applies)
+
+Plan: 0 to add, 0 to change, 0 to destroy.
+
+"###);
 }
 
 /// Test that cascading update diff only shows attributes referencing the replaced binding,

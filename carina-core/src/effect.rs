@@ -11,6 +11,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::non_empty::NonEmptyVec;
+use crate::parser::DeferredForExpression;
 use crate::resource::{DataSource, Directives, Resource, ResourceId, State};
 use crate::wait::predicate::WaitPredicate;
 
@@ -243,6 +244,21 @@ pub enum Effect {
         #[serde(default)]
         explicit_dependencies: HashSet<String>,
     },
+
+    /// Re-expand a `for opt in <upstream>.<collection> { ... }`
+    /// expression against the post-apply upstream state, emitting
+    /// fresh `Create` effects for the synthesised children.
+    ///
+    /// Emitted by the planner when the iterable's plan-time value is
+    /// unresolved. State-only: does not call the provider.
+    ExpandDeferredFor {
+        /// Synthetic id used for plan-tree display and progress.
+        id: ResourceId,
+        /// The iterable's binding name (e.g. "cert").
+        upstream_binding: String,
+        /// The for-expression body, replayed against the upstream state.
+        template: Box<DeferredForExpression>,
+    },
 }
 
 /// A type-level narrowing of [`Effect`] to the variants the basic
@@ -363,7 +379,8 @@ impl Effect {
             | Effect::Import { .. }
             | Effect::Remove { .. }
             | Effect::Move { .. }
-            | Effect::Wait { .. } => None,
+            | Effect::Wait { .. }
+            | Effect::ExpandDeferredFor { .. } => None,
         }
     }
 
@@ -387,20 +404,57 @@ impl Effect {
             Effect::Remove { .. } => "remove",
             Effect::Move { .. } => "move",
             Effect::Wait { .. } => "wait",
+            Effect::ExpandDeferredFor { .. } => "expand_deferred_for",
         }
     }
 
     /// Returns whether this Effect causes a mutation
     pub fn is_mutating(&self) -> bool {
-        !matches!(self, Effect::Read { .. }) && !self.is_wait()
+        match self {
+            Effect::Read { .. } => false,
+            Effect::Create(_) => true,
+            Effect::Update { .. } => true,
+            Effect::Replace { .. } => true,
+            Effect::Delete { .. } => true,
+            Effect::Import { .. } => true,
+            Effect::Remove { .. } => true,
+            Effect::Move { .. } => true,
+            Effect::Wait { .. } => false,
+            Effect::ExpandDeferredFor { .. } => true,
+        }
     }
 
-    /// Returns whether this is a state-only operation (import/remove/move)
+    /// Returns whether this is a state-only operation.
     pub fn is_state_operation(&self) -> bool {
-        matches!(
-            self,
-            Effect::Import { .. } | Effect::Remove { .. } | Effect::Move { .. }
-        )
+        match self {
+            Effect::Read { .. } => false,
+            Effect::Create(_) => false,
+            Effect::Update { .. } => false,
+            Effect::Replace { .. } => false,
+            Effect::Delete { .. } => false,
+            Effect::Import { .. } => true,
+            Effect::Remove { .. } => true,
+            Effect::Move { .. } => true,
+            Effect::Wait { .. } => false,
+            Effect::ExpandDeferredFor { .. } => false,
+        }
+    }
+
+    /// Effects that do not call the provider and do not directly mutate state,
+    /// but produce new effects for the scheduler to dispatch.
+    pub fn is_scheduler_meta(&self) -> bool {
+        match self {
+            Effect::Read { .. } => false,
+            Effect::Create(_) => false,
+            Effect::Update { .. } => false,
+            Effect::Replace { .. } => false,
+            Effect::Delete { .. } => false,
+            Effect::Import { .. } => false,
+            Effect::Remove { .. } => false,
+            Effect::Move { .. } => false,
+            Effect::Wait { .. } => false,
+            Effect::ExpandDeferredFor { .. } => true,
+        }
     }
 
     /// Returns the resource ID for this effect
@@ -415,6 +469,7 @@ impl Effect {
             Effect::Remove { id, .. } => id,
             Effect::Move { to, .. } => to,
             Effect::Wait { target_id, .. } => target_id,
+            Effect::ExpandDeferredFor { id, .. } => id,
         }
     }
 
@@ -438,37 +493,25 @@ impl Effect {
             | Effect::Import { .. }
             | Effect::Remove { .. }
             | Effect::Move { .. }
-            | Effect::Wait { .. } => None,
-        }
-    }
-
-    /// Returns the `directives` block of this effect's resource, if it
-    /// has one. `Read` (data source) and the managed variants both carry
-    /// directives; state-only and `Wait` effects do not.
-    fn resource_directives(&self) -> Option<&Directives> {
-        match self {
-            Effect::Create(resource) => Some(&resource.directives),
-            Effect::Update { to, .. } => Some(&to.directives),
-            Effect::Replace { to, .. } => Some(&to.directives),
-            Effect::Read { resource } => Some(&resource.directives),
-            Effect::Delete { .. }
-            | Effect::Import { .. }
-            | Effect::Remove { .. }
-            | Effect::Move { .. }
-            | Effect::Wait { .. } => None,
+            | Effect::Wait { .. }
+            | Effect::ExpandDeferredFor { .. } => None,
         }
     }
 
     /// Returns the binding name for this effect's resource, if it has one.
     pub fn binding_name(&self) -> Option<String> {
-        if let Effect::Delete { binding, .. } = self {
-            return binding.clone();
+        match self {
+            Effect::Read { resource } => resource.binding.clone(),
+            Effect::Create(resource) => resource.binding.clone(),
+            Effect::Update { to, .. } => to.binding.clone(),
+            Effect::Replace { to, .. } => to.binding.clone(),
+            Effect::Delete { binding, .. } => binding.clone(),
+            Effect::Import { .. } => None,
+            Effect::Remove { .. } => None,
+            Effect::Move { .. } => None,
+            Effect::Wait { binding, .. } => Some(binding.clone()),
+            Effect::ExpandDeferredFor { .. } => None,
         }
-        if let Effect::Wait { binding, .. } = self {
-            return Some(binding.clone());
-        }
-        self.as_resource_ref()
-            .and_then(|r| r.binding().map(str::to_string))
     }
 
     /// Returns the binding names this effect depends on **via explicit
@@ -485,24 +528,24 @@ impl Effect {
     /// State-only effects (Import, Remove, Move) return an empty set —
     /// they are scheduling primitives, not resource-state operations.
     pub fn explicit_dependencies(&self) -> HashSet<String> {
-        if let Some(directives) = self.resource_directives() {
-            return directives.depends_on.iter().cloned().collect();
+        match self {
+            Effect::Read { resource } => resource.directives.depends_on.iter().cloned().collect(),
+            Effect::Create(resource) => resource.directives.depends_on.iter().cloned().collect(),
+            Effect::Update { to, .. } => to.directives.depends_on.iter().cloned().collect(),
+            Effect::Replace { to, .. } => to.directives.depends_on.iter().cloned().collect(),
+            Effect::Delete {
+                explicit_dependencies,
+                ..
+            } => explicit_dependencies.clone(),
+            Effect::Import { .. } => HashSet::new(),
+            Effect::Remove { .. } => HashSet::new(),
+            Effect::Move { .. } => HashSet::new(),
+            Effect::Wait {
+                explicit_dependencies,
+                ..
+            } => explicit_dependencies.clone(),
+            Effect::ExpandDeferredFor { .. } => HashSet::new(),
         }
-        if let Effect::Delete {
-            explicit_dependencies,
-            ..
-        } = self
-        {
-            return explicit_dependencies.clone();
-        }
-        if let Effect::Wait {
-            explicit_dependencies,
-            ..
-        } = self
-        {
-            return explicit_dependencies.clone();
-        }
-        HashSet::new()
     }
 
     /// Bindings whose failure must prevent this effect from being dispatched.
@@ -534,7 +577,14 @@ impl Effect {
                 );
                 out
             }
-            _ => {
+            Effect::Read { .. }
+            | Effect::Create(_)
+            | Effect::Update { .. }
+            | Effect::Replace { .. }
+            | Effect::Delete { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. } => {
                 let mut deps = BTreeSet::new();
                 if let Some(resource) = self.as_resource_ref() {
                     deps.extend(crate::deps::get_resource_value_ref_dependencies(resource));
@@ -542,6 +592,9 @@ impl Effect {
                 deps.extend(self.explicit_dependencies());
                 deps.into_iter().collect()
             }
+            Effect::ExpandDeferredFor {
+                upstream_binding, ..
+            } => vec![upstream_binding.clone()],
         }
     }
 }
@@ -621,6 +674,110 @@ pub fn resolve_import_identifier(identifier: &crate::resource::Value) -> Result<
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    fn deferred_for_template() -> crate::parser::DeferredForExpression {
+        crate::parser::DeferredForExpression {
+            file: Some("main.crn".to_string()),
+            line: 12,
+            header: "for opt in cert.domain_validation_options".to_string(),
+            resource_type: "route53.Record".to_string(),
+            attributes: vec![],
+            binding_name: "validation_records".to_string(),
+            iterable_binding: "cert".to_string(),
+            iterable_attr: "domain_validation_options".to_string(),
+            binding: crate::parser::ForBinding::Simple("opt".to_string()),
+            template_resource: Resource::new("route53.Record", "validation_records"),
+        }
+    }
+
+    fn expand_deferred_for_effect() -> Effect {
+        Effect::ExpandDeferredFor {
+            id: ResourceId::new("route53.Record", "validation_records"),
+            upstream_binding: "cert".to_string(),
+            template: Box::new(deferred_for_template()),
+        }
+    }
+
+    fn every_effect_variant() -> Vec<(&'static str, Effect)> {
+        use crate::resource::{ConcreteValue, State, Value};
+        use crate::wait::predicate::{AttrPath, WaitPredicate};
+        use std::time::Duration;
+
+        let rid = ResourceId::new("test", "x");
+        vec![
+            (
+                "Read",
+                Effect::Read {
+                    resource: DataSource::new("test", "x"),
+                },
+            ),
+            ("Create", Effect::Create(Resource::new("test", "x"))),
+            (
+                "Update",
+                Effect::Update {
+                    id: rid.clone(),
+                    from: Box::new(State::not_found(rid.clone())),
+                    to: Resource::new("test", "x"),
+                    changed_attributes: vec![],
+                },
+            ),
+            (
+                "Replace",
+                Effect::Replace {
+                    id: rid.clone(),
+                    from: Box::new(State::not_found(rid.clone())),
+                    to: Resource::new("test", "x"),
+                    directives: Directives::default(),
+                    changed_create_only: ChangedCreateOnly::new(vec!["attr".to_string()]).unwrap(),
+                    cascading_updates: vec![],
+                    temporary_name: None,
+                    cascade_ref_hints: vec![],
+                },
+            ),
+            (
+                "Delete",
+                Effect::Delete {
+                    id: rid.clone(),
+                    identifier: "x-1".to_string(),
+                    directives: Directives::default(),
+                    binding: None,
+                    dependencies: HashSet::new(),
+                    explicit_dependencies: HashSet::new(),
+                },
+            ),
+            (
+                "Import",
+                Effect::Import {
+                    id: rid.clone(),
+                    identifier: Value::Concrete(ConcreteValue::String("x-1".to_string())),
+                },
+            ),
+            ("Remove", Effect::Remove { id: rid.clone() }),
+            (
+                "Move",
+                Effect::Move {
+                    from: rid.clone(),
+                    to: ResourceId::new("test", "y"),
+                },
+            ),
+            (
+                "Wait",
+                Effect::Wait {
+                    binding: "w".to_string(),
+                    target_id: rid,
+                    until: WaitPredicate::Equals {
+                        attr: AttrPath::single("status"),
+                        value: Value::Concrete(ConcreteValue::String("ready".to_string())),
+                    },
+                    until_surface: "status == 'ready'".to_string(),
+                    timeout: Duration::from_secs(60),
+                    interval: Duration::from_secs(1),
+                    explicit_dependencies: HashSet::new(),
+                },
+            ),
+            ("ExpandDeferredFor", expand_deferred_for_effect()),
+        ]
+    }
 
     #[test]
     fn plan_op_supports_debug_eq_and_hash() {
@@ -706,6 +863,68 @@ mod tests {
         // Sanity: still passes for a concrete String/EnumIdentifier.
         let s = Value::Concrete(ConcreteValue::enum_identifier("ENUM_X"));
         assert_eq!(resolve_import_identifier(&s).unwrap(), "ENUM_X");
+    }
+
+    #[test]
+    fn expand_deferred_for_blocking_bindings_is_upstream_only() {
+        let effect = expand_deferred_for_effect();
+        assert_eq!(effect.blocking_bindings(), vec!["cert".to_string()]);
+    }
+
+    #[test]
+    fn expand_deferred_for_as_basic_returns_none() {
+        let effect = expand_deferred_for_effect();
+        assert!(effect.as_basic().is_none());
+    }
+
+    #[test]
+    fn expand_deferred_for_resource_id_returns_synthetic_id() {
+        let effect = expand_deferred_for_effect();
+        assert_eq!(
+            effect.resource_id(),
+            &ResourceId::new("route53.Record", "validation_records")
+        );
+    }
+
+    #[test]
+    fn expand_deferred_for_serde_roundtrip() {
+        let original = expand_deferred_for_effect();
+        let json = serde_json::to_string(&original).expect("serialize");
+        let decoded: Effect = serde_json::from_str(&json).expect("deserialize");
+        match decoded {
+            Effect::ExpandDeferredFor { template, .. } => {
+                assert_eq!(template.file, None);
+                assert_eq!(template.line, 0);
+                assert_eq!(template.header, "for opt in cert.domain_validation_options");
+                assert_eq!(template.resource_type, "route53.Record");
+                assert_eq!(template.binding_name, "validation_records");
+                assert_eq!(template.iterable_binding, "cert");
+                assert_eq!(template.iterable_attr, "domain_validation_options");
+            }
+            other => panic!("expected ExpandDeferredFor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_scheduler_meta_only_true_for_expand_deferred_for() {
+        for (label, effect) in every_effect_variant() {
+            assert_eq!(
+                effect.is_scheduler_meta(),
+                label == "ExpandDeferredFor",
+                "{label} scheduler-meta classification mismatch",
+            );
+        }
+    }
+
+    #[test]
+    fn is_state_operation_excludes_expand_deferred_for() {
+        for (label, effect) in every_effect_variant() {
+            assert_eq!(
+                effect.is_state_operation(),
+                matches!(label, "Import" | "Remove" | "Move"),
+                "{label} state-operation classification mismatch",
+            );
+        }
     }
 
     #[test]

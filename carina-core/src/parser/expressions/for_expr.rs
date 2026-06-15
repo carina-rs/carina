@@ -16,7 +16,7 @@ use crate::parser::{
 use crate::resource::{ConcreteValue, DataSource, DeferredValue, Resource, UnknownReason, Value};
 
 /// Binding pattern for a for expression
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ForBinding {
     /// Simple: `for x in ...`
     Simple(String),

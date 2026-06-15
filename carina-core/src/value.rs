@@ -908,6 +908,26 @@ pub fn redact_secrets_in_managed(
     })
 }
 
+/// Redact secrets in a managed resource while preserving deferred placeholders.
+///
+/// Deferred-for templates intentionally contain `Unknown(ForValue*)`
+/// placeholders until apply-time expansion substitutes the iterable
+/// values. They still need secret redaction for saved plans, but they
+/// must not use the strict provider-bound redactor.
+fn redact_secrets_in_managed_only(
+    resource: &crate::resource::Resource,
+) -> Result<crate::resource::Resource, SerializationError> {
+    let attributes: Result<_, _> = resource
+        .attributes
+        .iter()
+        .map(|(k, e)| redact_secrets_only(e).map(|rv| (k.clone(), rv)))
+        .collect();
+    Ok(crate::resource::Resource {
+        attributes: attributes?,
+        ..resource.clone()
+    })
+}
+
 /// Redact all secrets in a [`DataSource`](crate::resource::DataSource).
 pub fn redact_secrets_in_data_source(
     resource: &crate::resource::DataSource,
@@ -1058,6 +1078,25 @@ pub fn redact_secrets_in_effect(
         // typed predicate over scalar values, surface form is the
         // user-authored source. Clone through unchanged.
         Effect::Wait { .. } => effect.clone(),
+        Effect::ExpandDeferredFor {
+            id,
+            upstream_binding,
+            template,
+        } => {
+            let mut redacted_template = (**template).clone();
+            redacted_template.attributes = redacted_template
+                .attributes
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), redact_secrets_only(value)?)))
+                .collect::<Result<Vec<_>, SerializationError>>()?;
+            redacted_template.template_resource =
+                redact_secrets_in_managed_only(&redacted_template.template_resource)?;
+            Effect::ExpandDeferredFor {
+                id: id.clone(),
+                upstream_binding: upstream_binding.clone(),
+                template: Box::new(redacted_template),
+            }
+        }
     })
 }
 
@@ -4985,6 +5024,88 @@ mod tests {
                 );
             }
             other => panic!("expected Effect::Import, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn redact_secrets_in_expand_deferred_for_preserves_for_unknowns() {
+        use crate::effect::Effect;
+        use crate::parser::{DeferredForExpression, ForBinding};
+        use crate::plan::Plan;
+        use crate::resource::{
+            AccessPath, DeferredValue, Resource, ResourceId, UnknownReason, Value,
+        };
+
+        let placeholder = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValuePath {
+            path: AccessPath::with_fields("opt", "resource_record", vec!["name".to_string()]),
+        }));
+        let mut template_resource = Resource::new("aws.route53.RecordSet", "validation_records");
+        template_resource.set_attr("name", placeholder.clone());
+        let effect = Effect::ExpandDeferredFor {
+            id: ResourceId::new("__deferred_for", "validation_records"),
+            upstream_binding: "cert".to_string(),
+            template: Box::new(DeferredForExpression {
+                file: None,
+                line: 1,
+                header: "for opt in cert.domain_validation_options".to_string(),
+                resource_type: "aws.route53.RecordSet".to_string(),
+                attributes: vec![("name".to_string(), placeholder.clone())],
+                binding_name: "validation_records".to_string(),
+                iterable_binding: "cert".to_string(),
+                iterable_attr: "domain_validation_options".to_string(),
+                binding: ForBinding::Simple("opt".to_string()),
+                template_resource,
+            }),
+        };
+
+        let redacted = redact_secrets_in_effect(&effect)
+            .expect("deferred-for template placeholders must survive effect redaction");
+        assert_expand_deferred_for_placeholder_survives(&redacted, &placeholder);
+
+        let mut plan = Plan::new();
+        plan.add(effect);
+        let redacted_plan = redact_secrets_in_plan(&plan)
+            .expect("deferred-for template placeholders must survive plan redaction");
+        assert_expand_deferred_for_placeholder_survives(&redacted_plan.effects()[0], &placeholder);
+    }
+
+    fn assert_expand_deferred_for_placeholder_survives(
+        effect: &crate::effect::Effect,
+        expected: &Value,
+    ) {
+        fn assert_for_value_path(value: Option<&Value>, expected: &Value) {
+            match (value, expected) {
+                (
+                    Some(Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValuePath {
+                        path,
+                    }))),
+                    Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValuePath {
+                        path: expected_path,
+                    })),
+                ) => {
+                    assert_eq!(path.binding(), expected_path.binding());
+                    assert_eq!(path.attribute(), expected_path.attribute());
+                    assert_eq!(path.segments(), expected_path.segments());
+                }
+                (actual, expected) => {
+                    panic!("expected preserved ForValuePath {expected:?}, got {actual:?}")
+                }
+            }
+        }
+
+        match effect {
+            crate::effect::Effect::ExpandDeferredFor { template, .. } => {
+                assert_for_value_path(
+                    template
+                        .attributes
+                        .iter()
+                        .find(|(key, _)| key == "name")
+                        .map(|(_, value)| value),
+                    expected,
+                );
+                assert_for_value_path(template.template_resource.attributes.get("name"), expected);
+            }
+            other => panic!("expected Effect::ExpandDeferredFor, got {other:?}"),
         }
     }
 }

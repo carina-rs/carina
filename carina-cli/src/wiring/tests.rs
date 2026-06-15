@@ -2371,7 +2371,7 @@ mod expand_same_config_deferred_for_tests {
     use super::*;
     use carina_core::binding_index::WaitAliasSpec;
     use carina_core::parser::{ProviderContext, parse};
-    use carina_core::resource::{ConcreteValue, State, Value};
+    use carina_core::resource::{ConcreteValue, DeferredValue, State, UnknownReason, Value};
     use std::collections::HashMap;
 
     /// `let cert` (same-config) + a `for` over its provider-read
@@ -2428,6 +2428,10 @@ mod expand_same_config_deferred_for_tests {
             Value::Concrete(ConcreteValue::String("111111111111".into())),
             Value::Concrete(ConcreteValue::String("222222222222".into())),
         ]))
+    }
+
+    fn unknown_account_ids() -> Value {
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue))
     }
 
     /// Direct unit test of `RefreshableChildIds::select` — the sole
@@ -2541,6 +2545,104 @@ mod expand_same_config_deferred_for_tests {
     }
 
     #[test]
+    fn expand_same_config_emits_expand_deferred_for_when_iterable_is_unresolved() {
+        let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
+        let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
+        let states = states_with_cert(&parsed, "account_ids", unknown_account_ids());
+
+        let out = expand_same_config_deferred_for(
+            &parsed,
+            &sorted,
+            &states,
+            &HashMap::new(),
+            &[] as &[WaitAliasSpec],
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+        )
+        .expect("expand");
+
+        assert_eq!(
+            out.apply_time_reexpansion_targets.len(),
+            1,
+            "one deferred-for expression should be carried for apply-time re-expansion"
+        );
+        assert_eq!(
+            out.apply_time_reexpansion_targets[0].upstream_binding,
+            "cert"
+        );
+        assert!(
+            out.sorted_resources
+                .iter()
+                .all(|r| !r.id.resource_type.contains("Assignment")),
+            "no Assignment may be pre-expanded from an unresolved iterable"
+        );
+        assert!(
+            out.new_child_ids.is_empty(),
+            "unresolved iterable must not report materialized children"
+        );
+    }
+
+    #[test]
+    fn expand_same_config_pre_expands_when_iterable_is_concrete() {
+        let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
+        let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
+        let states = states_with_cert(&parsed, "account_ids", account_ids());
+
+        let out = expand_same_config_deferred_for(
+            &parsed,
+            &sorted,
+            &states,
+            &HashMap::new(),
+            &[] as &[WaitAliasSpec],
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+        )
+        .expect("expand");
+
+        let assignments: Vec<_> = out
+            .sorted_resources
+            .iter()
+            .filter(|r| r.id.resource_type.contains("Assignment"))
+            .collect();
+        assert_eq!(assignments.len(), 2);
+        assert!(
+            out.apply_time_reexpansion_targets.is_empty(),
+            "fully concrete iterable must pre-expand instead of emitting ExpandDeferredFor"
+        );
+    }
+
+    #[test]
+    fn expand_same_config_passes_through_pr3558_dependency_bindings_on_pre_expanded_children() {
+        let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
+        let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
+        let states = states_with_cert(&parsed, "account_ids", account_ids());
+
+        let out = expand_same_config_deferred_for(
+            &parsed,
+            &sorted,
+            &states,
+            &HashMap::new(),
+            &[] as &[WaitAliasSpec],
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+        )
+        .expect("expand");
+
+        let assignments: Vec<_> = out
+            .sorted_resources
+            .iter()
+            .filter(|r| r.id.resource_type.contains("Assignment"))
+            .collect();
+        assert_eq!(assignments.len(), 2);
+        for assignment in assignments {
+            assert!(
+                assignment.dependency_bindings.contains("cert"),
+                "pre-expanded child must retain the iterable binding dependency"
+            );
+        }
+    }
+
+    #[test]
     fn resort_preserves_pre_expansion_relative_order() {
         // carina#3132 highest-risk requirement: appending loop children
         // and re-sorting must not reorder already-planned resources
@@ -2612,10 +2714,13 @@ mod expand_same_config_deferred_for_tests {
             "no Assignment may materialize without a resolvable iterable"
         );
         assert_eq!(
-            out.residual_deferred_for.len(),
+            out.apply_time_reexpansion_targets.len(),
             1,
-            "the unresolvable loop must remain deferred so the validate/\
-             plan placeholder still renders"
+            "the unresolvable loop must become an apply-time re-expansion target"
+        );
+        assert!(
+            out.residual_deferred_for.is_empty(),
+            "apply-time re-expansion targets must not be mixed into residual deferred-for warnings"
         );
         assert_eq!(
             out.sorted_resources.len(),

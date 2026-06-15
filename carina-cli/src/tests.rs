@@ -158,6 +158,7 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: Some(existing_state),
         sorted_resources: &[resource],
+        runtime_synthesized_resources: &[],
         current_states: &current_states,
         applied_states: &HashMap::new(),
         permanent_name_overrides: &HashMap::new(),
@@ -209,6 +210,7 @@ async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: Some(existing_state),
         sorted_resources: &[resource],
+        runtime_synthesized_resources: &[],
         current_states: &current_states,
         applied_states: &HashMap::new(),
         permanent_name_overrides: &HashMap::new(),
@@ -256,6 +258,7 @@ async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refr
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: Some(existing_state),
         sorted_resources: &[resource],
+        runtime_synthesized_resources: &[],
         current_states: &current_states,
         applied_states: &HashMap::new(),
         permanent_name_overrides: &HashMap::new(),
@@ -1435,6 +1438,7 @@ async fn lock_released_on_write_state_failure() {
         failure_count: 0,
         skip_count: 0,
         applied_states: HashMap::new(),
+        runtime_synthesized_resources: Vec::new(),
         permanent_name_overrides: HashMap::new(),
         successfully_deleted: HashSet::new(),
         current_states: HashMap::new(),
@@ -1574,6 +1578,7 @@ async fn finalize_apply_uses_write_state_locked() {
         failure_count: 0,
         skip_count: 0,
         applied_states: HashMap::new(),
+        runtime_synthesized_resources: Vec::new(),
         permanent_name_overrides: HashMap::new(),
         successfully_deleted: HashSet::new(),
         current_states: HashMap::new(),
@@ -2222,6 +2227,7 @@ async fn finalize_apply_without_lock_uses_write_state() {
         failure_count: 0,
         skip_count: 0,
         applied_states: HashMap::new(),
+        runtime_synthesized_resources: Vec::new(),
         permanent_name_overrides: HashMap::new(),
         successfully_deleted: HashSet::new(),
         current_states: HashMap::new(),
@@ -2588,6 +2594,7 @@ fn import_effect_preserves_resource_metadata_in_state() {
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: None,
         sorted_resources: &[resource],
+        runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &applied_states,
         permanent_name_overrides: &HashMap::new(),
@@ -2682,6 +2689,7 @@ fn build_state_after_apply_persists_write_only_attributes() {
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: None,
         sorted_resources: &[resource],
+        runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &applied_states,
         permanent_name_overrides: &HashMap::new(),
@@ -2759,6 +2767,7 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: None,
         sorted_resources: &[resource.clone()],
+        runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &applied_states,
         permanent_name_overrides: &HashMap::new(),
@@ -2843,6 +2852,7 @@ fn build_state_after_apply_write_only_detects_value_change() {
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: Some(existing_state),
         sorted_resources: &[resource],
+        runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &applied_states,
         permanent_name_overrides: &HashMap::new(),
@@ -3105,6 +3115,7 @@ async fn finalize_apply_clears_state_exports_when_params_empty() {
         failure_count: 0,
         skip_count: 0,
         applied_states: HashMap::new(),
+        runtime_synthesized_resources: Vec::new(),
         permanent_name_overrides: HashMap::new(),
         successfully_deleted: HashSet::new(),
         current_states: HashMap::new(),
@@ -3164,6 +3175,7 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
         failure_count: 0,
         skip_count: 0,
         applied_states: HashMap::new(),
+        runtime_synthesized_resources: Vec::new(),
         permanent_name_overrides: HashMap::new(),
         successfully_deleted: HashSet::new(),
         current_states: HashMap::new(),
@@ -3229,6 +3241,7 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
         failure_count: 1,
         skip_count: 0,
         applied_states: HashMap::from([(a_id.clone(), a_state.clone())]),
+        runtime_synthesized_resources: Vec::new(),
         permanent_name_overrides: HashMap::new(),
         successfully_deleted: HashSet::new(),
         current_states: HashMap::from([(a_id, a_state)]),

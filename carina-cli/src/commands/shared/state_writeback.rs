@@ -528,6 +528,7 @@ pub(crate) fn dsl_value_to_json(
 pub(crate) struct ApplyStateSave<'a> {
     pub state_file: Option<StateFile>,
     pub sorted_resources: &'a [Resource],
+    pub runtime_synthesized_resources: &'a [Resource],
     pub current_states: &'a HashMap<ResourceId, State>,
     pub applied_states: &'a HashMap<ResourceId, State>,
     pub permanent_name_overrides: &'a HashMap<ResourceId, HashMap<String, String>>,
@@ -645,6 +646,7 @@ impl<'a> WritebackPlan<'a> {
 /// is Phase 1's job.
 fn decompose<'a>(
     sorted_resources: &'a [Resource],
+    runtime_synthesized_resources: &'a [Resource],
     current_states: &'a HashMap<ResourceId, State>,
     applied_states: &'a HashMap<ResourceId, State>,
     plan: &Plan,
@@ -666,6 +668,12 @@ fn decompose<'a>(
             } else {
                 wb.add_cleanup(resource.id.clone())?;
             }
+        }
+    }
+
+    for resource in runtime_synthesized_resources {
+        if let Some(applied) = applied_states.get(&resource.id) {
+            wb.add_upsert(resource, UpsertSource::Applied(applied))?;
         }
     }
 
@@ -697,6 +705,7 @@ pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateF
     let ApplyStateSave {
         state_file,
         sorted_resources,
+        runtime_synthesized_resources,
         current_states,
         applied_states,
         permanent_name_overrides,
@@ -709,6 +718,7 @@ pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateF
 
     let writeback = decompose(
         sorted_resources,
+        runtime_synthesized_resources,
         current_states,
         applied_states,
         plan,
@@ -872,6 +882,55 @@ mod post_apply_states_tests {
             Some(Value::Concrete(ConcreteValue::String(s))) => assert_eq!(s, "Enabled"),
             other => panic!("expected post-apply 'Enabled', got: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod apply_state_save_tests {
+    use super::*;
+    use carina_core::plan::Plan;
+    use carina_core::resource::{ConcreteValue, Resource, State, Value};
+
+    #[test]
+    fn build_state_after_apply_persists_runtime_synthesized_resources() {
+        let runtime_child = Resource::new("route53.Record", "validation_records[0]")
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("_dns_record_name_".to_string())),
+            );
+        let child_id = runtime_child.id.clone();
+        let child_state = State::existing(
+            child_id.clone(),
+            HashMap::from([(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("_dns_record_name_".to_string())),
+            )]),
+        )
+        .with_identifier("record-id");
+
+        let state = build_state_after_apply(ApplyStateSave {
+            state_file: Some(StateFile::new()),
+            sorted_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &HashMap::from([(child_id.clone(), child_state)]),
+            runtime_synthesized_resources: std::slice::from_ref(&runtime_child),
+            permanent_name_overrides: &HashMap::new(),
+            plan: &Plan::new(),
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &carina_core::schema::SchemaRegistry::new(),
+        })
+        .expect("state writeback should accept runtime-synthesized child");
+
+        assert!(
+            state
+                .resources
+                .iter()
+                .any(|row| row.provider == child_id.provider
+                    && row.resource_type == child_id.resource_type
+                    && row.name == "validation_records[0]"),
+            "runtime-synthesized child must be persisted in state"
+        );
     }
 }
 

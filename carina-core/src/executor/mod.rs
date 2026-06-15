@@ -11,7 +11,8 @@
 //! - `replace`: Replace effect orchestration (CBD and DBD)
 //! - `phased`: Interdependent Replace ordering (4-phase execution)
 
-mod basic;
+pub(crate) mod basic;
+mod expand;
 pub mod normalized;
 #[cfg(test)]
 mod normalized_tests;
@@ -31,7 +32,8 @@ use crate::binding_index::ResolvedBindings;
 use crate::effect::Effect;
 use crate::parser::ProviderConfig;
 use crate::provider::{Provider, ProviderNormalizer};
-use crate::resource::{ResourceId, State};
+use crate::resource::{ResolvedResource, Resource, ResourceId, State};
+use crate::value::SerializationError;
 use crate::wait::WaitObservation;
 
 use parallel::execute_effects_sequential;
@@ -86,6 +88,7 @@ pub struct ExecutionResult {
     pub failure_count: usize,
     pub skip_count: usize,
     pub applied_states: std::collections::HashMap<ResourceId, State>,
+    pub runtime_synthesized_resources: Vec<Resource>,
     pub successfully_deleted: HashSet<ResourceId>,
     pub permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>>,
     pub current_states: HashMap<ResourceId, State>,
@@ -229,6 +232,14 @@ pub async fn execute_plan(
     } else {
         ExecutionOutcome::Completed(result)
     }
+}
+
+/// Prove an already-normalized desired resource is fully resolved before
+/// direct provider dispatch outside the normal plan executor.
+pub fn resolve_normalized_for_provider(
+    resource: normalized::NormalizedResource,
+) -> Result<ResolvedResource, SerializationError> {
+    basic::resolved_normalized_resource(resource)
 }
 
 #[cfg(test)]

@@ -98,6 +98,18 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
                     effect_deps.insert(idx, deps);
                     continue;
                 }
+                Effect::ExpandDeferredFor {
+                    id,
+                    upstream_binding,
+                    ..
+                } => {
+                    let fallback = id.to_string();
+                    binding_to_effect.insert(fallback.clone(), idx);
+                    effect_bindings.insert(idx, fallback);
+                    effect_types.insert(idx, "deferred_for".to_string());
+                    effect_deps.insert(idx, HashSet::from([upstream_binding.clone()]));
+                    continue;
+                }
             };
 
         if let Some(r) = resource {

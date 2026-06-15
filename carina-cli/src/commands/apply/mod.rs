@@ -353,6 +353,7 @@ pub(crate) async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), 
     let mut state = build_state_after_apply(ApplyStateSave {
         state_file: input.state_file,
         sorted_resources: input.sorted_resources,
+        runtime_synthesized_resources: &input.result.runtime_synthesized_resources,
         current_states: input.current_states,
         applied_states: &input.result.applied_states,
         permanent_name_overrides: &input.result.permanent_name_overrides,
@@ -719,12 +720,19 @@ async fn run_apply_with_observer_factory(
                     ctx.schemas(),
                 )
                 .await;
+                let resolved_bucket =
+                    carina_core::executor::resolve_normalized_for_provider(normalized_bucket)
+                        .map_err(|err| {
+                            AppError::Config(format!(
+                                "Failed to resolve state bucket before create: {err}"
+                            ))
+                        })?;
 
                 match bucket_provider
                     .create(
                         &bucket_resource.id,
                         carina_core::provider::CreateRequest {
-                            resource: normalized_bucket,
+                            resource: resolved_bucket,
                         },
                     )
                     .await
@@ -1240,6 +1248,7 @@ async fn run_apply_locked(
     let crate::wiring::ExpandedRefreshState {
         sorted_resources: resorted,
         residual_deferred_for,
+        apply_time_reexpansion_targets,
         new_child_ids: _,
         refreshable_child_ids: _,
         // `printed_warnings` drives the plan path's spinner-bar-region
@@ -1394,6 +1403,7 @@ async fn run_apply_locked(
         &bindings,
         &no_unresolved_upstreams,
     );
+    crate::wiring::add_apply_time_reexpansion_effects(&mut plan, &apply_time_reexpansion_targets);
 
     // Check for prevent_destroy violations
     if plan.has_errors() {

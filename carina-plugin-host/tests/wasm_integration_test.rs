@@ -8,20 +8,22 @@ use carina_core::provider::{
     CreateRequest, DeleteRequest, PatchOp, PatchOpKind, Provider, ProviderFactory, ReadRequest,
     UpdatePatch, UpdateRequest,
 };
-use carina_core::resource::{ConcreteValue, DataSource, Resource, ResourceId, Value};
+use carina_core::resource::{
+    ConcreteValue, DataSource, ResolvedResource, Resource, ResourceId, Value,
+};
 use carina_plugin_host::WasmProviderFactory;
 
-async fn normalized_for_test(
-    resource: Resource,
-) -> carina_core::executor::normalized::NormalizedResource {
-    carina_core::executor::normalized::apply_desired_normalization(
+async fn normalized_for_test(resource: Resource) -> ResolvedResource {
+    let normalized = carina_core::executor::normalized::apply_desired_normalization(
         resource,
         &[],
         &carina_core::provider::NoopNormalizer,
         &[],
         &carina_core::schema::SchemaRegistry::new(),
     )
-    .await
+    .await;
+    carina_core::executor::resolve_normalized_for_provider(normalized)
+        .expect("test resource should be fully resolved")
 }
 
 fn wasm_path() -> Option<PathBuf> {

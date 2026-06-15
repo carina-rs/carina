@@ -4,13 +4,54 @@ use crate::provider::{
     BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer, ProviderError, ProviderResult,
     ReadRequest, UpdateRequest,
 };
-use crate::resource::{ConcreteValue, DataSource, DeferredValue, Directives, Resource, Value};
+use crate::resource::{
+    AccessPath, ConcreteValue, DataSource, DeferredValue, Directives, Resource, UnknownReason,
+    Value,
+};
+use crate::value::SerializationError;
 use parallel::{build_dependency_analysis, build_dependency_levels};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
+
+fn validation_deferred_for_expression() -> crate::parser::DeferredForExpression {
+    let mut template_resource = Resource::new("test", "validation_records");
+    template_resource.binding = Some("validation_records".to_string());
+    template_resource
+        .dependency_bindings
+        .insert("cert".to_string());
+    template_resource.set_attr(
+        "name",
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValuePath {
+            path: AccessPath::with_fields("opt", "resource_record", vec!["name".to_string()]),
+        })),
+    );
+    template_resource.set_attr(
+        "value",
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValuePath {
+            path: AccessPath::with_fields("opt", "resource_record", vec!["value".to_string()]),
+        })),
+    );
+
+    crate::parser::DeferredForExpression {
+        file: None,
+        line: 1,
+        header: "for opt in cert.domain_validation_options".to_string(),
+        resource_type: "test.ValidationRecord".to_string(),
+        attributes: template_resource
+            .attributes
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        binding_name: "validation_records".to_string(),
+        iterable_binding: "cert".to_string(),
+        iterable_attr: "domain_validation_options".to_string(),
+        binding: crate::parser::ForBinding::Simple("opt".to_string()),
+        template_resource,
+    }
+}
 
 // -----------------------------------------------------------------------
 // Mock Provider
@@ -160,6 +201,11 @@ struct MockObserver {
     events: Mutex<Vec<String>>,
 }
 
+struct ProgressObserver {
+    events: MockObserver,
+    progress: Mutex<Vec<ProgressInfo>>,
+}
+
 fn format_execution_event(event: &ExecutionEvent<'_>) -> String {
     match event {
         ExecutionEvent::Waiting {
@@ -234,6 +280,46 @@ impl ExecutionObserver for MockObserver {
     }
 }
 
+impl ProgressObserver {
+    fn new() -> Self {
+        Self {
+            events: MockObserver::new(),
+            progress: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn events(&self) -> Vec<String> {
+        self.events.events()
+    }
+
+    fn progress(&self) -> Vec<ProgressInfo> {
+        self.progress.lock().unwrap().clone()
+    }
+}
+
+impl ExecutionObserver for ProgressObserver {
+    fn on_event(&self, event: &ExecutionEvent) {
+        self.events.on_event(event);
+        match event {
+            ExecutionEvent::EffectSucceeded { progress, .. }
+            | ExecutionEvent::EffectFailed { progress, .. }
+            | ExecutionEvent::EffectSkipped { progress, .. } => {
+                self.progress.lock().unwrap().push(*progress);
+            }
+            ExecutionEvent::Waiting { .. }
+            | ExecutionEvent::EffectStarted { .. }
+            | ExecutionEvent::WaitPolling { .. }
+            | ExecutionEvent::CascadeUpdateSucceeded { .. }
+            | ExecutionEvent::CascadeUpdateFailed { .. }
+            | ExecutionEvent::RenameSucceeded { .. }
+            | ExecutionEvent::RenameFailed { .. }
+            | ExecutionEvent::RefreshStarted
+            | ExecutionEvent::RefreshSucceeded { .. }
+            | ExecutionEvent::RefreshFailed { .. } => {}
+        }
+    }
+}
+
 fn completed_result(outcome: ExecutionOutcome) -> ExecutionResult {
     match outcome {
         ExecutionOutcome::Completed(result) => result,
@@ -242,6 +328,64 @@ fn completed_result(outcome: ExecutionOutcome) -> ExecutionResult {
             result.success_count, result.failure_count, result.skip_count
         ),
     }
+}
+
+fn resource_with_attr(value: Value) -> Resource {
+    let mut resource = Resource::new("test", "resolved-resource-test");
+    resource.set_attr("attr", value);
+    resource
+}
+
+fn for_value_path_unknown() -> Value {
+    Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValuePath {
+        path: AccessPath::with_fields("opt", "resource_record", vec!["name".to_string()]),
+    }))
+}
+
+#[test]
+fn resolved_resource_constructor_rejects_value_unknown() {
+    let err = basic::resolved_resource(resource_with_attr(for_value_path_unknown()))
+        .expect_err("deferred unknown must not construct a ResolvedResource");
+
+    assert!(
+        matches!(err, SerializationError::UnknownNotAllowed { .. }),
+        "expected UnknownNotAllowed, got {err:?}"
+    );
+}
+
+#[test]
+fn resolved_resource_constructor_rejects_resource_ref() {
+    let value = Value::Deferred(DeferredValue::ResourceRef {
+        path: AccessPath::new("cert", "domain_validation_options"),
+    });
+
+    let err = basic::resolved_resource(resource_with_attr(value))
+        .expect_err("resource refs must not construct a ResolvedResource");
+
+    assert!(
+        matches!(err, SerializationError::UnresolvedResourceRef { .. }),
+        "expected UnresolvedResourceRef, got {err:?}"
+    );
+}
+
+#[test]
+fn resolved_resource_constructor_rejects_nested_deferred() {
+    let mut map = indexmap::IndexMap::new();
+    map.insert(
+        "secret".to_string(),
+        Value::Deferred(DeferredValue::Secret(Box::new(for_value_path_unknown()))),
+    );
+    let nested = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+        ConcreteValue::Map(map),
+    )]));
+
+    let err = basic::resolved_resource(resource_with_attr(nested))
+        .expect_err("nested deferred values must not construct a ResolvedResource");
+
+    assert!(
+        matches!(err, SerializationError::UnknownNotAllowed { .. }),
+        "expected UnknownNotAllowed, got {err:?}"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -587,6 +731,7 @@ fn empty_execution_result() -> ExecutionResult {
         failure_count: 0,
         skip_count: 0,
         applied_states: Default::default(),
+        runtime_synthesized_resources: Vec::new(),
         successfully_deleted: HashSet::new(),
         permanent_name_overrides: HashMap::new(),
         current_states: HashMap::new(),
@@ -5279,6 +5424,527 @@ async fn wait_resolves_target_identifier_from_just_replaced_state_phased() {
             .any(|identifier| identifier.as_deref() == Some("new-arn")),
         "phased wait read must use the replacement identifier from applied_states; got: {read_identifiers:?}"
     );
+}
+
+#[tokio::test]
+async fn expand_deferred_for_dispatches_after_upstream_replace_before_wait_phased() {
+    use crate::effect::ChangedCreateOnly;
+    use crate::wait::predicate::{AttrPath, WaitPredicate};
+
+    let mut cert = Resource::new("test", "cert");
+    cert.binding = Some("cert".to_string());
+    cert.set_attr(
+        "domain_name",
+        Value::Concrete(ConcreteValue::String("example.com".to_string())),
+    );
+    let cert_id = cert.id.clone();
+
+    let mut dep = Resource::new("test", "dep");
+    dep.binding = Some("dep".to_string());
+    dep.dependency_bindings.insert("cert".to_string());
+    let dep_id = dep.id.clone();
+
+    let old_cert_state = State::existing(cert_id.clone(), HashMap::new()).with_identifier("old");
+    let old_dep_state = State::existing(dep_id.clone(), HashMap::new()).with_identifier("dep-old");
+
+    let cert_state = State::existing(
+        cert_id.clone(),
+        HashMap::from([
+            (
+                "domain_validation_options".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::Map(indexmap::IndexMap::from([(
+                        "resource_record".to_string(),
+                        Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+                            (
+                                "name".to_string(),
+                                Value::Concrete(ConcreteValue::String(
+                                    "_dns_record_name_".to_string(),
+                                )),
+                            ),
+                            (
+                                "value".to_string(),
+                                Value::Concrete(ConcreteValue::String(
+                                    "_dns_record_value_".to_string(),
+                                )),
+                            ),
+                        ]))),
+                    )])),
+                )])),
+            ),
+            (
+                "status".to_string(),
+                Value::Concrete(ConcreteValue::String("issued".to_string())),
+            ),
+        ]),
+    )
+    .with_identifier("new");
+    let dep_state = State::existing(dep_id.clone(), HashMap::new()).with_identifier("dep-new");
+    let validation_id = ResourceId::new("test", "validation_records[0]");
+    let validation_state =
+        State::existing(validation_id.clone(), HashMap::new()).with_identifier("validation");
+
+    let provider = MockProvider::new();
+    provider.push_delete(Ok(()));
+    provider.push_delete(Ok(()));
+    provider.push_create(Ok(cert_state.clone()));
+    provider.push_create(Ok(dep_state));
+    provider.push_create(Ok(validation_state));
+    provider.push_read(Ok(cert_state));
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Replace {
+        id: cert_id.clone(),
+        from: Box::new(old_cert_state.clone()),
+        to: cert,
+        directives: Directives::default(),
+        changed_create_only: ChangedCreateOnly::new(vec!["domain_name".to_string()]).unwrap(),
+        cascading_updates: Vec::new(),
+        temporary_name: None,
+        cascade_ref_hints: Vec::new(),
+    });
+    plan.add(Effect::Replace {
+        id: dep_id.clone(),
+        from: Box::new(old_dep_state.clone()),
+        to: dep,
+        directives: Directives::default(),
+        changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
+        cascading_updates: Vec::new(),
+        temporary_name: None,
+        cascade_ref_hints: Vec::new(),
+    });
+    plan.add(Effect::ExpandDeferredFor {
+        id: ResourceId::new("__deferred_for", "validation_records"),
+        upstream_binding: "cert".to_string(),
+        template: Box::new(validation_deferred_for_expression()),
+    });
+    plan.add(Effect::Wait {
+        binding: "cert_issued".to_string(),
+        target_id: cert_id.clone(),
+        until: WaitPredicate::Equals {
+            attr: AttrPath::single("status"),
+            value: Value::Concrete(ConcreteValue::String("issued".to_string())),
+        },
+        until_surface: "cert.status == \"issued\"".to_string(),
+        timeout: std::time::Duration::from_secs(5),
+        interval: std::time::Duration::from_millis(10),
+        explicit_dependencies: HashSet::from(["validation_records[0]".to_string()]),
+    });
+    assert!(
+        has_interdependent_replaces(plan.effects()),
+        "test must exercise phased execution"
+    );
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::from([
+            (cert_id.clone(), old_cert_state),
+            (dep_id.clone(), old_dep_state),
+        ]),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let observer = ProgressObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+
+    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.skip_count, 0);
+    let events = observer.events();
+    let cert_success = events
+        .iter()
+        .position(|event| event == "succeeded:test.cert")
+        .expect("cert replace must succeed");
+    let validation_success = events
+        .iter()
+        .position(|event| event == "succeeded:test.validation_records[0]")
+        .expect("validation record create must succeed");
+    let wait_success = events
+        .iter()
+        .enumerate()
+        .skip(validation_success + 1)
+        .find_map(|(idx, event)| (event == "succeeded:test.cert").then_some(idx))
+        .expect("wait must succeed");
+    assert!(cert_success < validation_success);
+    assert!(validation_success < wait_success);
+    assert!(
+        observer
+            .progress()
+            .iter()
+            .all(|progress| progress.completed <= progress.total),
+        "dynamic creates must increase total before progress is emitted"
+    );
+
+    let created = provider.captured_create_resources();
+    let validation = created
+        .iter()
+        .find(|resource| resource.id == validation_id)
+        .expect("validation child must be passed through provider create");
+    assert_eq!(
+        validation.attributes.get("name"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "_dns_record_name_".to_string()
+        )))
+    );
+}
+
+#[tokio::test]
+async fn expand_deferred_for_emits_zero_children_when_collection_is_empty() {
+    use crate::effect::ChangedCreateOnly;
+    use crate::wait::predicate::{AttrPath, WaitPredicate};
+
+    let mut cert = Resource::new("test", "cert_empty");
+    cert.binding = Some("cert".to_string());
+    cert.set_attr(
+        "domain_name",
+        Value::Concrete(ConcreteValue::String("example.com".to_string())),
+    );
+    let cert_id = cert.id.clone();
+    let old_cert_state = State::existing(cert_id.clone(), HashMap::new()).with_identifier("old");
+    let cert_state = State::existing(
+        cert_id.clone(),
+        HashMap::from([
+            (
+                "domain_validation_options".to_string(),
+                Value::Concrete(ConcreteValue::List(Vec::new())),
+            ),
+            (
+                "status".to_string(),
+                Value::Concrete(ConcreteValue::String("issued".to_string())),
+            ),
+        ]),
+    )
+    .with_identifier("new");
+
+    let provider = MockProvider::new();
+    provider.push_delete(Ok(()));
+    provider.push_create(Ok(cert_state.clone()));
+    provider.push_read(Ok(cert_state));
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Replace {
+        id: cert_id.clone(),
+        from: Box::new(old_cert_state.clone()),
+        to: cert,
+        directives: Directives::default(),
+        changed_create_only: ChangedCreateOnly::new(vec!["domain_name".to_string()]).unwrap(),
+        cascading_updates: Vec::new(),
+        temporary_name: None,
+        cascade_ref_hints: Vec::new(),
+    });
+    plan.add(Effect::ExpandDeferredFor {
+        id: ResourceId::new("__deferred_for", "validation_records"),
+        upstream_binding: "cert".to_string(),
+        template: Box::new(validation_deferred_for_expression()),
+    });
+    plan.add(Effect::Wait {
+        binding: "cert_issued".to_string(),
+        target_id: cert_id.clone(),
+        until: WaitPredicate::Equals {
+            attr: AttrPath::single("status"),
+            value: Value::Concrete(ConcreteValue::String("issued".to_string())),
+        },
+        until_surface: "cert.status == \"issued\"".to_string(),
+        timeout: std::time::Duration::from_secs(5),
+        interval: std::time::Duration::from_millis(10),
+        explicit_dependencies: HashSet::new(),
+    });
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::from([(cert_id.clone(), old_cert_state)]),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+
+    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.skip_count, 0);
+    assert!(
+        provider
+            .calls()
+            .iter()
+            .all(|(op, id)| op != "create" || id != "test.validation_records[0]"),
+        "empty collection must not synthesize children"
+    );
+    let events = observer.events();
+    assert!(
+        events.contains(&"succeeded:test.cert_empty".to_string()),
+        "events: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn expand_deferred_for_cancelled_after_upstream_create_reports_skipped() {
+    use crate::effect::ChangedCreateOnly;
+
+    struct CancelAfterCertProvider {
+        cancel: CancellationToken,
+        calls: Mutex<Vec<(String, String)>>,
+    }
+
+    impl Provider for CancelAfterCertProvider {
+        fn name(&self) -> &str {
+            "cancel-after-cert"
+        }
+
+        fn read(
+            &self,
+            id: &ResourceId,
+            _identifier: Option<&str>,
+            _request: ReadRequest,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            let id = id.clone();
+            Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
+        }
+
+        fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+            self.read(&resource.id, None, ReadRequest)
+        }
+
+        fn create(
+            &self,
+            id: &ResourceId,
+            _request: CreateRequest,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("create".to_string(), id.to_string()));
+            let cancel = self.cancel.clone();
+            let id = id.clone();
+            Box::pin(async move {
+                cancel.cancel();
+                Ok(State::existing(
+                    id,
+                    HashMap::from([(
+                        "domain_validation_options".to_string(),
+                        Value::Concrete(ConcreteValue::List(Vec::new())),
+                    )]),
+                ))
+            })
+        }
+
+        fn update(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _request: UpdateRequest,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            unreachable!("test does not update")
+        }
+
+        fn delete(
+            &self,
+            id: &ResourceId,
+            _identifier: &str,
+            _request: DeleteRequest,
+        ) -> BoxFuture<'_, ProviderResult<()>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("delete".to_string(), id.to_string()));
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn required_permissions(
+            &self,
+            _id: &ResourceId,
+            _op: crate::effect::PlanOp,
+        ) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    let mut cert = Resource::new("test", "cert_cancel");
+    cert.binding = Some("cert".to_string());
+    cert.set_attr(
+        "domain_name",
+        Value::Concrete(ConcreteValue::String("example.com".to_string())),
+    );
+    let cert_id = cert.id.clone();
+    let old_cert_state = State::existing(cert_id.clone(), HashMap::new()).with_identifier("old");
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Replace {
+        id: cert_id.clone(),
+        from: Box::new(old_cert_state.clone()),
+        to: cert,
+        directives: Directives::default(),
+        changed_create_only: ChangedCreateOnly::new(vec!["domain_name".to_string()]).unwrap(),
+        cascading_updates: Vec::new(),
+        temporary_name: None,
+        cascade_ref_hints: Vec::new(),
+    });
+    plan.add(Effect::ExpandDeferredFor {
+        id: ResourceId::new("__deferred_for", "validation_records"),
+        upstream_binding: "cert".to_string(),
+        template: Box::new(validation_deferred_for_expression()),
+    });
+
+    let cancel = CancellationToken::new();
+    let provider = CancelAfterCertProvider {
+        cancel: cancel.clone(),
+        calls: Mutex::new(Vec::new()),
+    };
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::from([(cert_id.clone(), old_cert_state)]),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+    };
+    let observer = MockObserver::new();
+    let outcome = execute_plan(&provider, input, &observer, cancel).await;
+
+    assert!(matches!(outcome, ExecutionOutcome::Cancelled(_)));
+    assert!(
+        observer
+            .events()
+            .iter()
+            .any(|event| { event == "skipped:__deferred_for.validation_records:cancelled" })
+    );
+}
+
+#[tokio::test]
+async fn expand_deferred_for_returns_error_when_upstream_binding_missing() {
+    let provider = MockProvider::new();
+    let mut plan = Plan::new();
+    plan.add(Effect::ExpandDeferredFor {
+        id: ResourceId::new("__deferred_for", "validation_records"),
+        upstream_binding: "missing_cert".to_string(),
+        template: Box::new(validation_deferred_for_expression()),
+    });
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+
+    assert_eq!(result.failure_count, 1);
+    assert!(observer.events().iter().any(|event| {
+        event.contains("failed:__deferred_for.validation_records") && event.contains("missing_cert")
+    }));
+}
+
+#[tokio::test]
+async fn expand_deferred_for_returns_error_when_iterable_attr_missing() {
+    let mut cert = Resource::new("test", "cert_missing_attr");
+    cert.binding = Some("cert".to_string());
+    let cert_id = cert.id.clone();
+
+    let provider = MockProvider::new();
+    provider.push_create(Ok(State::existing(cert_id.clone(), HashMap::new())));
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(cert));
+    plan.add(Effect::ExpandDeferredFor {
+        id: ResourceId::new("__deferred_for", "validation_records"),
+        upstream_binding: "cert".to_string(),
+        template: Box::new(validation_deferred_for_expression()),
+    });
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+    };
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+
+    assert_eq!(result.failure_count, 1);
+    assert!(observer.events().iter().any(|event| {
+        event.contains("failed:__deferred_for.validation_records")
+            && event.contains("domain_validation_options")
+    }));
+}
+
+#[tokio::test]
+async fn apply_time_expand_deferred_for_emits_failed_on_shape_mismatch() {
+    let mut cert = Resource::new("test", "cert_shape_mismatch");
+    cert.binding = Some("cert".to_string());
+    let cert_id = cert.id.clone();
+    let cert_state = State::existing(
+        cert_id.clone(),
+        HashMap::from([(
+            "domain_validation_options".to_string(),
+            Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::new())),
+        )]),
+    );
+
+    let provider = MockProvider::new();
+    provider.push_create(Ok(cert_state));
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(cert));
+    plan.add(Effect::ExpandDeferredFor {
+        id: ResourceId::new("__deferred_for", "validation_records"),
+        upstream_binding: "cert".to_string(),
+        template: Box::new(validation_deferred_for_expression()),
+    });
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+    };
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+
+    assert_eq!(result.failure_count, 1);
+    assert!(observer.events().iter().any(|event| {
+        event.contains("failed:__deferred_for.validation_records")
+            && event.contains("expected list")
+            && event.contains("got map")
+    }));
 }
 
 /// Regression for carina#3164: a plan that mixes `Effect::Move` with

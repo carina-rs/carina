@@ -20,12 +20,14 @@ use std::collections::{HashMap, HashSet};
 /// resources *would* be created once the iterable becomes available.
 /// Also stores enough information to expand the loop later when the iterable
 /// is loaded from upstream_state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DeferredForExpression {
     /// Full source path of the file this deferred expression originated
     /// from (stamped by `config_loader` after parsing).
+    #[serde(skip)]
     pub file: Option<String>,
     /// Source line number of the `for` keyword.
+    #[serde(skip)]
     pub line: usize,
     /// The for-expression header, e.g., `for account_id in orgs.accounts`.
     pub header: String,
@@ -45,6 +47,29 @@ pub struct DeferredForExpression {
     pub binding: ForBinding,
     /// Template resource for expansion (the for body parsed with placeholders).
     pub template_resource: Resource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShapeMismatch {
+    expected_kind: &'static str,
+    got_kind: &'static str,
+}
+
+impl ShapeMismatch {
+    fn new(expected_kind: &'static str, got_kind: &'static str) -> Self {
+        Self {
+            expected_kind,
+            got_kind,
+        }
+    }
+
+    pub fn expected_kind(&self) -> &'static str {
+        self.expected_kind
+    }
+
+    pub fn got_kind(&self) -> &'static str {
+        self.got_kind
+    }
 }
 
 /// Origin of a resource yielded by [`ParsedFile::iter_all_resources`].
@@ -1313,43 +1338,27 @@ impl<E> File<E> {
 
             match (&deferred.binding, iterable_value) {
                 // Simple binding: only the value var is bound
-                (ForBinding::Simple(_), Value::Concrete(ConcreteValue::List(items))) => {
-                    for (i, item) in items.iter().enumerate() {
-                        let address = format!("{}[{}]", deferred.binding_name, i);
-                        expanded_resources
-                            .push(build_expanded_child(deferred, address, None, None, item));
-                    }
+                (ForBinding::Simple(_), Value::Concrete(ConcreteValue::List(_))) => {
+                    expanded_resources.extend(
+                        expand_deferred_children(deferred, iterable_value)
+                            .expect("matched simple deferred-for list iterable"),
+                    );
                     resolved_indices.push(idx);
                 }
                 // Indexed binding: both index and value vars are bound
-                (ForBinding::Indexed(_, _), Value::Concrete(ConcreteValue::List(items))) => {
-                    for (i, item) in items.iter().enumerate() {
-                        let address = format!("{}[{}]", deferred.binding_name, i);
-                        expanded_resources.push(build_expanded_child(
-                            deferred,
-                            address,
-                            Some(i as i64),
-                            None,
-                            item,
-                        ));
-                    }
+                (ForBinding::Indexed(_, _), Value::Concrete(ConcreteValue::List(_))) => {
+                    expanded_resources.extend(
+                        expand_deferred_children(deferred, iterable_value)
+                            .expect("matched indexed deferred-for list iterable"),
+                    );
                     resolved_indices.push(idx);
                 }
                 // Map binding expands over maps, substituting both key and value vars
-                (ForBinding::Map(_, _), Value::Concrete(ConcreteValue::Map(map))) => {
-                    let mut keys: Vec<&String> = map.keys().collect();
-                    keys.sort();
-                    for key in keys {
-                        let val = &map[key];
-                        let address = crate::utils::map_key_address(&deferred.binding_name, key);
-                        expanded_resources.push(build_expanded_child(
-                            deferred,
-                            address,
-                            None,
-                            Some(key),
-                            val,
-                        ));
-                    }
+                (ForBinding::Map(_, _), Value::Concrete(ConcreteValue::Map(_))) => {
+                    expanded_resources.extend(
+                        expand_deferred_children(deferred, iterable_value)
+                            .expect("matched map deferred-for map iterable"),
+                    );
                     resolved_indices.push(idx);
                 }
                 // Shape mismatch: replace the original "not yet available" warning
@@ -1408,6 +1417,145 @@ impl<E> File<E> {
         // composition for-body never reaches the deferred path.)
         self.resources.extend(expanded_resources);
         self.warnings.extend(new_warnings);
+    }
+}
+
+pub fn expand_deferred_children(
+    deferred: &DeferredForExpression,
+    iterable_value: &Value,
+) -> Result<Vec<Resource>, ShapeMismatch> {
+    match &deferred.binding {
+        ForBinding::Simple(_) => match iterable_value {
+            Value::Concrete(ConcreteValue::List(items)) => Ok(items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    let address = format!("{}[{}]", deferred.binding_name, i);
+                    build_expanded_child(deferred, address, None, None, item)
+                })
+                .collect()),
+            Value::Concrete(ConcreteValue::Map(_)) => Err(ShapeMismatch::new("list", "map")),
+            Value::Concrete(ConcreteValue::String(_)) => Err(ShapeMismatch::new("list", "string")),
+            Value::Concrete(ConcreteValue::EnumIdentifier(_)) => {
+                Err(ShapeMismatch::new("list", "enum identifier"))
+            }
+            Value::Concrete(ConcreteValue::CanonicalEnum(_)) => {
+                Err(ShapeMismatch::new("list", "enum"))
+            }
+            Value::Concrete(ConcreteValue::Int(_)) => Err(ShapeMismatch::new("list", "int")),
+            Value::Concrete(ConcreteValue::Float(_)) => Err(ShapeMismatch::new("list", "float")),
+            Value::Concrete(ConcreteValue::Bool(_)) => Err(ShapeMismatch::new("list", "bool")),
+            Value::Concrete(ConcreteValue::Duration(_)) => {
+                Err(ShapeMismatch::new("list", "duration"))
+            }
+            Value::Concrete(ConcreteValue::StringList(_)) => {
+                Err(ShapeMismatch::new("list", "string list"))
+            }
+            Value::Deferred(DeferredValue::ResourceRef { .. }) => {
+                Err(ShapeMismatch::new("list", "deferred resource reference"))
+            }
+            Value::Deferred(DeferredValue::BindingRef { .. }) => {
+                Err(ShapeMismatch::new("list", "deferred binding reference"))
+            }
+            Value::Deferred(DeferredValue::Interpolation(_)) => {
+                Err(ShapeMismatch::new("list", "deferred interpolation"))
+            }
+            Value::Deferred(DeferredValue::FunctionCall { .. }) => {
+                Err(ShapeMismatch::new("list", "deferred function call"))
+            }
+            Value::Deferred(DeferredValue::Secret(_)) => Err(ShapeMismatch::new("list", "secret")),
+            Value::Deferred(DeferredValue::Unknown(_)) => {
+                Err(ShapeMismatch::new("list", "unknown"))
+            }
+        },
+        ForBinding::Indexed(_, _) => match iterable_value {
+            Value::Concrete(ConcreteValue::List(items)) => Ok(items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    let address = format!("{}[{}]", deferred.binding_name, i);
+                    build_expanded_child(deferred, address, Some(i as i64), None, item)
+                })
+                .collect()),
+            Value::Concrete(ConcreteValue::Map(_)) => Err(ShapeMismatch::new("list", "map")),
+            Value::Concrete(ConcreteValue::String(_)) => Err(ShapeMismatch::new("list", "string")),
+            Value::Concrete(ConcreteValue::EnumIdentifier(_)) => {
+                Err(ShapeMismatch::new("list", "enum identifier"))
+            }
+            Value::Concrete(ConcreteValue::CanonicalEnum(_)) => {
+                Err(ShapeMismatch::new("list", "enum"))
+            }
+            Value::Concrete(ConcreteValue::Int(_)) => Err(ShapeMismatch::new("list", "int")),
+            Value::Concrete(ConcreteValue::Float(_)) => Err(ShapeMismatch::new("list", "float")),
+            Value::Concrete(ConcreteValue::Bool(_)) => Err(ShapeMismatch::new("list", "bool")),
+            Value::Concrete(ConcreteValue::Duration(_)) => {
+                Err(ShapeMismatch::new("list", "duration"))
+            }
+            Value::Concrete(ConcreteValue::StringList(_)) => {
+                Err(ShapeMismatch::new("list", "string list"))
+            }
+            Value::Deferred(DeferredValue::ResourceRef { .. }) => {
+                Err(ShapeMismatch::new("list", "deferred resource reference"))
+            }
+            Value::Deferred(DeferredValue::BindingRef { .. }) => {
+                Err(ShapeMismatch::new("list", "deferred binding reference"))
+            }
+            Value::Deferred(DeferredValue::Interpolation(_)) => {
+                Err(ShapeMismatch::new("list", "deferred interpolation"))
+            }
+            Value::Deferred(DeferredValue::FunctionCall { .. }) => {
+                Err(ShapeMismatch::new("list", "deferred function call"))
+            }
+            Value::Deferred(DeferredValue::Secret(_)) => Err(ShapeMismatch::new("list", "secret")),
+            Value::Deferred(DeferredValue::Unknown(_)) => {
+                Err(ShapeMismatch::new("list", "unknown"))
+            }
+        },
+        ForBinding::Map(_, _) => match iterable_value {
+            Value::Concrete(ConcreteValue::Map(map)) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                Ok(keys
+                    .into_iter()
+                    .map(|key| {
+                        let val = &map[key];
+                        let address = crate::utils::map_key_address(&deferred.binding_name, key);
+                        build_expanded_child(deferred, address, None, Some(key), val)
+                    })
+                    .collect())
+            }
+            Value::Concrete(ConcreteValue::List(_)) => Err(ShapeMismatch::new("map", "list")),
+            Value::Concrete(ConcreteValue::String(_)) => Err(ShapeMismatch::new("map", "string")),
+            Value::Concrete(ConcreteValue::EnumIdentifier(_)) => {
+                Err(ShapeMismatch::new("map", "enum identifier"))
+            }
+            Value::Concrete(ConcreteValue::CanonicalEnum(_)) => {
+                Err(ShapeMismatch::new("map", "enum"))
+            }
+            Value::Concrete(ConcreteValue::Int(_)) => Err(ShapeMismatch::new("map", "int")),
+            Value::Concrete(ConcreteValue::Float(_)) => Err(ShapeMismatch::new("map", "float")),
+            Value::Concrete(ConcreteValue::Bool(_)) => Err(ShapeMismatch::new("map", "bool")),
+            Value::Concrete(ConcreteValue::Duration(_)) => {
+                Err(ShapeMismatch::new("map", "duration"))
+            }
+            Value::Concrete(ConcreteValue::StringList(_)) => {
+                Err(ShapeMismatch::new("map", "string list"))
+            }
+            Value::Deferred(DeferredValue::ResourceRef { .. }) => {
+                Err(ShapeMismatch::new("map", "deferred resource reference"))
+            }
+            Value::Deferred(DeferredValue::BindingRef { .. }) => {
+                Err(ShapeMismatch::new("map", "deferred binding reference"))
+            }
+            Value::Deferred(DeferredValue::Interpolation(_)) => {
+                Err(ShapeMismatch::new("map", "deferred interpolation"))
+            }
+            Value::Deferred(DeferredValue::FunctionCall { .. }) => {
+                Err(ShapeMismatch::new("map", "deferred function call"))
+            }
+            Value::Deferred(DeferredValue::Secret(_)) => Err(ShapeMismatch::new("map", "secret")),
+            Value::Deferred(DeferredValue::Unknown(_)) => Err(ShapeMismatch::new("map", "unknown")),
+        },
     }
 }
 
@@ -1645,6 +1793,64 @@ mod substitute_placeholder_tests {
             !names.contains("plain_value_name"),
             "plain value lets must be excluded from structural binding names"
         );
+    }
+
+    #[test]
+    fn expand_deferred_children_returns_shape_mismatch_for_simple_binding_with_map_iterable() {
+        let mut template_resource = Resource::new("mock.Target", "children");
+        template_resource.binding = Some("children".to_string());
+        template_resource.set_attr(
+            "name",
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+        );
+        let deferred = DeferredForExpression {
+            file: None,
+            line: 1,
+            header: "for opt in cert.options".to_string(),
+            resource_type: "mock.Target".to_string(),
+            attributes: Vec::new(),
+            binding_name: "children".to_string(),
+            iterable_binding: "cert".to_string(),
+            iterable_attr: "options".to_string(),
+            binding: ForBinding::Simple("opt".to_string()),
+            template_resource,
+        };
+
+        let err = expand_deferred_children(
+            &deferred,
+            &Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+        )
+        .expect_err("simple for-binding over a map must be a shape mismatch");
+
+        assert_eq!(err.expected_kind(), "list");
+        assert_eq!(err.got_kind(), "map");
+    }
+
+    #[test]
+    fn deferred_for_expression_serde_skips_diagnostic_location() {
+        let deferred = DeferredForExpression {
+            file: Some("/abs/path.crn".to_string()),
+            line: 42,
+            header: "for opt in cert.options".to_string(),
+            resource_type: "mock.Target".to_string(),
+            attributes: Vec::new(),
+            binding_name: "children".to_string(),
+            iterable_binding: "cert".to_string(),
+            iterable_attr: "options".to_string(),
+            binding: ForBinding::Simple("opt".to_string()),
+            template_resource: Resource::new("mock.Target", "children"),
+        };
+
+        let json = serde_json::to_string(&deferred).expect("serialize deferred for expression");
+        assert!(
+            !json.contains("/abs/path.crn"),
+            "saved-plan JSON must not contain machine-local source paths: {json}"
+        );
+
+        let decoded: DeferredForExpression =
+            serde_json::from_str(&json).expect("deserialize deferred for expression");
+        assert_eq!(decoded.file, None);
+        assert_eq!(decoded.line, 0);
     }
 
     #[test]

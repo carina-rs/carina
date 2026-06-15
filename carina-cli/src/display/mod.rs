@@ -473,6 +473,7 @@ impl<'a> TreeRenderContext<'a> {
             Effect::Remove { .. } => "~".yellow().bold(),
             Effect::Move { .. } => "->".yellow().bold(),
             Effect::Wait { .. } => ">".magenta().bold(),
+            Effect::ExpandDeferredFor { .. } => "~".yellow().bold(),
         };
 
         // Build the tree connector (shown before child resources)
@@ -721,6 +722,43 @@ impl<'a> TreeRenderContext<'a> {
                     format!("(until {})", until_surface).dimmed()
                 )
                 .unwrap();
+            }
+            Effect::ExpandDeferredFor {
+                upstream_binding,
+                template,
+                ..
+            } => {
+                writeln!(
+                    self.out,
+                    "{}{}{} {}",
+                    base_indent,
+                    connector,
+                    colored_symbol,
+                    template.header.yellow().bold()
+                )
+                .unwrap();
+                let attr_prefix = if indent == 0 {
+                    format!("{}{}", base_indent, attr_base)
+                } else {
+                    let continuation = if is_last {
+                        format!("{}   ", prefix)
+                    } else {
+                        format!("{}│  ", prefix)
+                    };
+                    format!("{}{}   ", base_indent, continuation)
+                };
+                writeln!(
+                    self.out,
+                    "{}{}",
+                    attr_prefix,
+                    format!(
+                        "(deferred until apply: one {} per element after {} applies)",
+                        template.resource_type, upstream_binding
+                    )
+                    .dimmed()
+                )
+                .unwrap();
+                has_displayed_attrs = true;
             }
         }
 
@@ -2010,6 +2048,17 @@ pub fn format_effect(effect: &Effect) -> String {
             ..
         } => {
             format!("Wait {} (until {})", binding, until_surface)
+        }
+        Effect::ExpandDeferredFor {
+            id,
+            upstream_binding,
+            ..
+        } => {
+            format!(
+                "Expand deferred for {} (waits on {})",
+                id.human(),
+                upstream_binding
+            )
         }
     }
 }

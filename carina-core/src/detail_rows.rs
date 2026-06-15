@@ -465,7 +465,10 @@ pub fn build_detail_rows(
                 annotation: None,
             }]
         }
-        Effect::Remove { .. } | Effect::Move { .. } | Effect::Wait { .. } => Vec::new(),
+        Effect::Remove { .. }
+        | Effect::Move { .. }
+        | Effect::Wait { .. }
+        | Effect::ExpandDeferredFor { .. } => Vec::new(),
     }
 }
 
