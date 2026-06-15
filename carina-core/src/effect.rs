@@ -436,6 +436,23 @@ impl Effect {
             Effect::Remove { .. } => true,
             Effect::Move { .. } => true,
             Effect::Wait { .. } => false,
+            Effect::ExpandDeferredFor { .. } => false,
+        }
+    }
+
+    /// Effects that do not call the provider and do not directly mutate state,
+    /// but produce new effects for the scheduler to dispatch.
+    pub fn is_scheduler_meta(&self) -> bool {
+        match self {
+            Effect::Read { .. } => false,
+            Effect::Create(_) => false,
+            Effect::Update { .. } => false,
+            Effect::Replace { .. } => false,
+            Effect::Delete { .. } => false,
+            Effect::Import { .. } => false,
+            Effect::Remove { .. } => false,
+            Effect::Move { .. } => false,
+            Effect::Wait { .. } => false,
             Effect::ExpandDeferredFor { .. } => true,
         }
     }
@@ -681,6 +698,87 @@ mod tests {
         }
     }
 
+    fn every_effect_variant() -> Vec<(&'static str, Effect)> {
+        use crate::resource::{ConcreteValue, State, Value};
+        use crate::wait::predicate::{AttrPath, WaitPredicate};
+        use std::time::Duration;
+
+        let rid = ResourceId::new("test", "x");
+        vec![
+            (
+                "Read",
+                Effect::Read {
+                    resource: DataSource::new("test", "x"),
+                },
+            ),
+            ("Create", Effect::Create(Resource::new("test", "x"))),
+            (
+                "Update",
+                Effect::Update {
+                    id: rid.clone(),
+                    from: Box::new(State::not_found(rid.clone())),
+                    to: Resource::new("test", "x"),
+                    changed_attributes: vec![],
+                },
+            ),
+            (
+                "Replace",
+                Effect::Replace {
+                    id: rid.clone(),
+                    from: Box::new(State::not_found(rid.clone())),
+                    to: Resource::new("test", "x"),
+                    directives: Directives::default(),
+                    changed_create_only: ChangedCreateOnly::new(vec!["attr".to_string()]).unwrap(),
+                    cascading_updates: vec![],
+                    temporary_name: None,
+                    cascade_ref_hints: vec![],
+                },
+            ),
+            (
+                "Delete",
+                Effect::Delete {
+                    id: rid.clone(),
+                    identifier: "x-1".to_string(),
+                    directives: Directives::default(),
+                    binding: None,
+                    dependencies: HashSet::new(),
+                    explicit_dependencies: HashSet::new(),
+                },
+            ),
+            (
+                "Import",
+                Effect::Import {
+                    id: rid.clone(),
+                    identifier: Value::Concrete(ConcreteValue::String("x-1".to_string())),
+                },
+            ),
+            ("Remove", Effect::Remove { id: rid.clone() }),
+            (
+                "Move",
+                Effect::Move {
+                    from: rid.clone(),
+                    to: ResourceId::new("test", "y"),
+                },
+            ),
+            (
+                "Wait",
+                Effect::Wait {
+                    binding: "w".to_string(),
+                    target_id: rid,
+                    until: WaitPredicate::Equals {
+                        attr: AttrPath::single("status"),
+                        value: Value::Concrete(ConcreteValue::String("ready".to_string())),
+                    },
+                    until_surface: "status == 'ready'".to_string(),
+                    timeout: Duration::from_secs(60),
+                    interval: Duration::from_secs(1),
+                    explicit_dependencies: HashSet::new(),
+                },
+            ),
+            ("ExpandDeferredFor", expand_deferred_for_effect()),
+        ]
+    }
+
     #[test]
     fn plan_op_supports_debug_eq_and_hash() {
         let op = PlanOp::Create;
@@ -794,6 +892,28 @@ mod tests {
         let json = serde_json::to_string(&original).expect("serialize");
         let decoded: Effect = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn is_scheduler_meta_only_true_for_expand_deferred_for() {
+        for (label, effect) in every_effect_variant() {
+            assert_eq!(
+                effect.is_scheduler_meta(),
+                label == "ExpandDeferredFor",
+                "{label} scheduler-meta classification mismatch",
+            );
+        }
+    }
+
+    #[test]
+    fn is_state_operation_excludes_expand_deferred_for() {
+        for (label, effect) in every_effect_variant() {
+            assert_eq!(
+                effect.is_state_operation(),
+                matches!(label, "Import" | "Remove" | "Move"),
+                "{label} state-operation classification mismatch",
+            );
+        }
     }
 
     #[test]

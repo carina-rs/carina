@@ -27,12 +27,12 @@ use super::{ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, 
 
 pub(super) fn is_runtime_dispatchable(effect: &Effect) -> bool {
     !matches!(effect, Effect::Read { .. })
-        && (!effect.is_state_operation() || matches!(effect, Effect::ExpandDeferredFor { .. }))
+        && (!effect.is_state_operation() || effect.is_scheduler_meta())
 }
 
 pub(super) fn is_runtime_noop(effect: &Effect) -> bool {
     matches!(effect, Effect::Read { .. })
-        || (effect.is_state_operation() && !matches!(effect, Effect::ExpandDeferredFor { .. }))
+        || (effect.is_state_operation() && !effect.is_scheduler_meta())
 }
 
 #[derive(Debug, Clone)]
@@ -395,7 +395,7 @@ pub(super) fn build_dependency_analysis(
 
     let mut analysis = DependencyAnalysis::new(effects.len());
     for (idx, effect) in effects.iter().enumerate() {
-        if matches!(effect, Effect::ExpandDeferredFor { .. }) {
+        if effect.is_scheduler_meta() {
             analyzer.collect_from_effect(effect, &mut analysis, idx);
         } else if effect.as_resource_ref().is_some() {
             if let Some(unresolved) = unresolved_resources.get(effect.resource_id()) {
@@ -660,7 +660,7 @@ pub(super) async fn execute_effects_sequential(
             let effect = effects[idx].clone();
 
             if let Some(failed_dep) = find_failed_dependency(&effect, &failed_bindings) {
-                let c = if matches!(effect, Effect::ExpandDeferredFor { .. }) {
+                let c = if effect.is_scheduler_meta() {
                     completed.load(Ordering::Relaxed)
                 } else {
                     completed.fetch_add(1, Ordering::Relaxed) + 1

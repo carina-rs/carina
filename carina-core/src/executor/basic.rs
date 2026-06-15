@@ -448,7 +448,9 @@ pub(super) fn process_basic_result(result: BasicEffectResult, exec: &mut Executi
 pub(super) fn count_actionable_effects(effects: &[Effect]) -> usize {
     effects
         .iter()
-        .filter(|e| !matches!(e, Effect::Read { .. }) && !e.is_state_operation())
+        .filter(|e| {
+            !matches!(e, Effect::Read { .. }) && !e.is_state_operation() && !e.is_scheduler_meta()
+        })
         .count()
 }
 

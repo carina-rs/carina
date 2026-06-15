@@ -491,7 +491,7 @@ pub(super) async fn execute_effects_phased(
                 let effect = effects[idx].clone();
 
                 if let Some(failed_dep) = find_failed_dependency(&effect, &failed_bindings) {
-                    let c = if matches!(effect, Effect::ExpandDeferredFor { .. }) {
+                    let c = if effect.is_scheduler_meta() {
                         completed.load(Ordering::Relaxed)
                     } else {
                         completed.fetch_add(1, Ordering::Relaxed) + 1
