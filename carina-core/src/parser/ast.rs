@@ -1316,11 +1316,8 @@ impl<E> File<E> {
                 (ForBinding::Simple(_), Value::Concrete(ConcreteValue::List(items))) => {
                     for (i, item) in items.iter().enumerate() {
                         let address = format!("{}[{}]", deferred.binding_name, i);
-                        let mut resource = deferred.template_resource.clone();
-                        resource.id.set_name(address.clone());
-                        resource.binding = Some(address);
-                        substitute_attrs(&mut resource, None, None, item);
-                        expanded_resources.push(resource);
+                        expanded_resources
+                            .push(build_expanded_child(deferred, address, None, None, item));
                     }
                     resolved_indices.push(idx);
                 }
@@ -1328,11 +1325,13 @@ impl<E> File<E> {
                 (ForBinding::Indexed(_, _), Value::Concrete(ConcreteValue::List(items))) => {
                     for (i, item) in items.iter().enumerate() {
                         let address = format!("{}[{}]", deferred.binding_name, i);
-                        let mut resource = deferred.template_resource.clone();
-                        resource.id.set_name(address.clone());
-                        resource.binding = Some(address);
-                        substitute_attrs(&mut resource, Some(i as i64), None, item);
-                        expanded_resources.push(resource);
+                        expanded_resources.push(build_expanded_child(
+                            deferred,
+                            address,
+                            Some(i as i64),
+                            None,
+                            item,
+                        ));
                     }
                     resolved_indices.push(idx);
                 }
@@ -1343,11 +1342,13 @@ impl<E> File<E> {
                     for key in keys {
                         let val = &map[key];
                         let address = crate::utils::map_key_address(&deferred.binding_name, key);
-                        let mut resource = deferred.template_resource.clone();
-                        resource.id.set_name(address.clone());
-                        resource.binding = Some(address);
-                        substitute_attrs(&mut resource, None, Some(key), val);
-                        expanded_resources.push(resource);
+                        expanded_resources.push(build_expanded_child(
+                            deferred,
+                            address,
+                            None,
+                            Some(key),
+                            val,
+                        ));
                     }
                     resolved_indices.push(idx);
                 }
@@ -1408,6 +1409,23 @@ impl<E> File<E> {
         self.resources.extend(expanded_resources);
         self.warnings.extend(new_warnings);
     }
+}
+
+fn build_expanded_child(
+    deferred: &DeferredForExpression,
+    address: String,
+    index: Option<i64>,
+    key: Option<&str>,
+    item: &Value,
+) -> Resource {
+    let mut resource = deferred.template_resource.clone();
+    resource.id.set_name(address.clone());
+    resource.binding = Some(address);
+    resource
+        .dependency_bindings
+        .insert(deferred.iterable_binding.clone());
+    substitute_attrs(&mut resource, index, key, item);
+    resource
 }
 
 /// Run `substitute_placeholder` over every attribute of `resource`, then
