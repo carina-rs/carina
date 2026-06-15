@@ -24,8 +24,10 @@ use std::collections::{HashMap, HashSet};
 pub struct DeferredForExpression {
     /// Full source path of the file this deferred expression originated
     /// from (stamped by `config_loader` after parsing).
+    #[serde(skip)]
     pub file: Option<String>,
     /// Source line number of the `for` keyword.
+    #[serde(skip)]
     pub line: usize,
     /// The for-expression header, e.g., `for account_id in orgs.accounts`.
     pub header: String,
@@ -1822,6 +1824,33 @@ mod substitute_placeholder_tests {
 
         assert_eq!(err.expected_kind(), "list");
         assert_eq!(err.got_kind(), "map");
+    }
+
+    #[test]
+    fn deferred_for_expression_serde_skips_diagnostic_location() {
+        let deferred = DeferredForExpression {
+            file: Some("/abs/path.crn".to_string()),
+            line: 42,
+            header: "for opt in cert.options".to_string(),
+            resource_type: "mock.Target".to_string(),
+            attributes: Vec::new(),
+            binding_name: "children".to_string(),
+            iterable_binding: "cert".to_string(),
+            iterable_attr: "options".to_string(),
+            binding: ForBinding::Simple("opt".to_string()),
+            template_resource: Resource::new("mock.Target", "children"),
+        };
+
+        let json = serde_json::to_string(&deferred).expect("serialize deferred for expression");
+        assert!(
+            !json.contains("/abs/path.crn"),
+            "saved-plan JSON must not contain machine-local source paths: {json}"
+        );
+
+        let decoded: DeferredForExpression =
+            serde_json::from_str(&json).expect("deserialize deferred for expression");
+        assert_eq!(decoded.file, None);
+        assert_eq!(decoded.line, 0);
     }
 
     #[test]

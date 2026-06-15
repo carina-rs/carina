@@ -891,7 +891,18 @@ mod tests {
         let original = expand_deferred_for_effect();
         let json = serde_json::to_string(&original).expect("serialize");
         let decoded: Effect = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(decoded, original);
+        match decoded {
+            Effect::ExpandDeferredFor { template, .. } => {
+                assert_eq!(template.file, None);
+                assert_eq!(template.line, 0);
+                assert_eq!(template.header, "for opt in cert.domain_validation_options");
+                assert_eq!(template.resource_type, "route53.Record");
+                assert_eq!(template.binding_name, "validation_records");
+                assert_eq!(template.iterable_binding, "cert");
+                assert_eq!(template.iterable_attr, "domain_validation_options");
+            }
+            other => panic!("expected ExpandDeferredFor, got {other:?}"),
+        }
     }
 
     #[test]
