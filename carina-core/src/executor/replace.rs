@@ -325,11 +325,8 @@ pub(super) async fn execute_cbd_replace_parallel(
                                     }
                                 };
                                 final_state = rename_outcome.into_state_for_writeback();
-                                if diagnostic.is_none() {
-                                    diagnostic = rename_diagnostic;
-                                } else if let Some(rename_diagnostic) = rename_diagnostic {
-                                    cascade_diagnostics.push((ctx.id.clone(), rename_diagnostic));
-                                } else if let Some(diagnostic) = diagnostic.clone() {
+                                diagnostic = rename_diagnostic.or(diagnostic);
+                                if let Some(diagnostic) = diagnostic.clone() {
                                     final_state = diagnostic.into_state_for_writeback(final_state);
                                 }
                             }
