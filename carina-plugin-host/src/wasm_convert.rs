@@ -121,17 +121,9 @@ pub fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, SerializationError
             Ok(wit::Value::ListVal(json_str))
         }
         CoreValue::Concrete(ConcreteValue::StringList(items)) => {
-            // Cross the WASM boundary as a plain JSON array of strings —
-            // the provider sees the same shape as `Value::Concrete(ConcreteValue::List([String]))`,
-            // matching AWS's wire-format expectation for the
-            // `string_or_list_of_strings` IAM shape.
-            let json_arr: Vec<serde_json::Value> = items
-                .iter()
-                .map(|s| serde_json::Value::String(s.clone()))
-                .collect();
-            let json_str = serde_json::to_string(&json_arr)
-                .expect("serde_json::Value -> String is infallible");
-            Ok(wit::Value::ListVal(json_str))
+            let json_str =
+                serde_json::to_string(items).expect("Vec<String> -> String is infallible");
+            Ok(wit::Value::StringListVal(json_str))
         }
         CoreValue::Concrete(ConcreteValue::Map(map)) => {
             let json_map: Result<serde_json::Map<String, serde_json::Value>, _> = map
@@ -187,6 +179,10 @@ pub fn wit_to_core_value(v: &wit::Value) -> CoreValue {
         wit::Value::IntVal(i) => CoreValue::Concrete(ConcreteValue::Int(*i)),
         wit::Value::FloatVal(f) => CoreValue::Concrete(ConcreteValue::Float(*f)),
         wit::Value::BoolVal(b) => CoreValue::Concrete(ConcreteValue::Bool(*b)),
+        wit::Value::StringListVal(json) => {
+            let items: Vec<String> = serde_json::from_str(json).unwrap_or_default();
+            CoreValue::Concrete(ConcreteValue::StringList(items))
+        }
         wit::Value::ListVal(json) => {
             let items: Vec<serde_json::Value> = serde_json::from_str(json).unwrap_or_default();
             CoreValue::Concrete(ConcreteValue::List(
@@ -1266,6 +1262,18 @@ mod tests {
     }
 
     #[test]
+    fn test_string_list_roundtrip_preserves_variant() {
+        let core = CoreValue::Concrete(ConcreteValue::StringList(vec![
+            "s3:GetObject".into(),
+            "s3:ListBucket".into(),
+        ]));
+        let wit = core_to_wit_value(&core).unwrap();
+        assert!(matches!(wit, wit::Value::StringListVal(_)));
+        let back = wit_to_core_value(&wit);
+        assert_eq!(core, back);
+    }
+
+    #[test]
     fn test_map_roundtrip() {
         let core = CoreValue::Concrete(ConcreteValue::Map(
             vec![
@@ -1478,6 +1486,16 @@ mod tests {
         match wit_v {
             wit::Value::ListVal(json) => assert_eq!(json, "[\"p\"]"),
             other => panic!("expected ListVal, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn string_list_uses_dedicated_wit_variant() {
+        let v = CoreValue::Concrete(ConcreteValue::StringList(vec!["p".into()]));
+        let wit_v = core_to_wit_value(&v).unwrap();
+        match wit_v {
+            wit::Value::StringListVal(json) => assert_eq!(json, "[\"p\"]"),
+            other => panic!("expected StringListVal, got: {other:?}"),
         }
     }
 

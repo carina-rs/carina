@@ -56,6 +56,50 @@ fn diff_update_when_different() {
 }
 
 #[test]
+fn diff_reports_string_list_vs_generic_string_list_shape_mismatch() {
+    let mut statement = IndexMap::new();
+    statement.insert(
+        "action".to_string(),
+        Value::Concrete(ConcreteValue::StringList(vec!["s3:GetObject".to_string()])),
+    );
+    let desired_policy = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "statement".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(statement),
+        )])),
+    )])));
+    let desired = Resource::new("awscc.ec2.VpcEndpoint", "vpce")
+        .with_attribute("policy_document", desired_policy);
+
+    let mut statement = IndexMap::new();
+    statement.insert(
+        "action".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("s3:GetObject".to_string()),
+        )])),
+    );
+    let current_policy = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "statement".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(statement),
+        )])),
+    )])));
+    let current = State::existing(
+        desired.id.clone(),
+        HashMap::from([("policy_document".to_string(), current_policy)]),
+    );
+
+    let result = diff(&desired, &current, None, None, None);
+
+    match result {
+        Diff::Update {
+            changed_attributes, ..
+        } => assert_eq!(changed_attributes, vec!["policy_document".to_string()]),
+        other => panic!("expected Update for non-canonical generic List shape, got {other:?}"),
+    }
+}
+
+#[test]
 fn create_plan_from_resources() {
     let resources = vec![
         Resource::new("bucket", "new-bucket"),
