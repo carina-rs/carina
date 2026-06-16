@@ -604,6 +604,24 @@ impl PartialReadDiagnostic {
         }
     }
 
+    /// Merge two optional diagnostics.
+    ///
+    /// When both are present, `a` keeps its reason because it represents the
+    /// more recent operation, while missing attributes are unioned with `b`.
+    /// Use this wherever two operations on the same resource may each report
+    /// partial; `.or()` silently drops the loser's missing attributes.
+    pub fn merge_options(a: Option<Self>, b: Option<Self>) -> Option<Self> {
+        match (a, b) {
+            (Some(mut a), Some(b)) => {
+                a.merge_in(b);
+                Some(a)
+            }
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
     pub fn into_state_for_writeback(self, mut state: State) -> State {
         state.partial_read = Some(PartialReadMarker {
             detail: self.reason,
@@ -1622,6 +1640,42 @@ mod tests {
 
         assert_eq!(outcome.diagnostic(), None);
         assert_eq!(outcome.into_state_for_writeback(), state);
+    }
+
+    #[test]
+    fn partial_read_diagnostic_merge_options_covers_all_cases() {
+        let a = PartialReadDiagnostic::new(
+            "rename partial".to_string(),
+            vec!["rename_attr".to_string(), "shared".to_string()],
+        )
+        .expect("missing attributes are non-empty");
+        let b = PartialReadDiagnostic::new(
+            "create partial".to_string(),
+            vec!["create_attr".to_string(), "shared".to_string()],
+        )
+        .expect("missing attributes are non-empty");
+
+        assert_eq!(PartialReadDiagnostic::merge_options(None, None), None);
+        assert_eq!(
+            PartialReadDiagnostic::merge_options(Some(a.clone()), None),
+            Some(a.clone())
+        );
+        assert_eq!(
+            PartialReadDiagnostic::merge_options(None, Some(b.clone())),
+            Some(b.clone())
+        );
+
+        let merged = PartialReadDiagnostic::merge_options(Some(a), Some(b))
+            .expect("both diagnostics should merge into one");
+        assert_eq!(merged.reason(), "rename partial");
+        assert_eq!(
+            merged.missing_attributes(),
+            &[
+                "rename_attr".to_string(),
+                "shared".to_string(),
+                "create_attr".to_string(),
+            ]
+        );
     }
 
     #[test]

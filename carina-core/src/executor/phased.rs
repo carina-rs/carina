@@ -1709,16 +1709,10 @@ pub(super) async fn execute_effects_phased(
                                         };
                                         let mut renamed_state =
                                             rename_outcome.into_state_for_writeback();
-                                        let final_diagnostic = match (rename_diagnostic, diagnostic)
-                                        {
-                                            (Some(mut rename), Some(create)) => {
-                                                rename.merge_in(create);
-                                                Some(rename)
-                                            }
-                                            (Some(rename), None) => Some(rename),
-                                            (None, Some(create)) => Some(create),
-                                            (None, None) => None,
-                                        };
+                                        let final_diagnostic = PartialReadDiagnostic::merge_options(
+                                            rename_diagnostic,
+                                            diagnostic,
+                                        );
                                         if let Some(diagnostic) = final_diagnostic.clone() {
                                             renamed_state =
                                                 diagnostic.into_state_for_writeback(renamed_state);

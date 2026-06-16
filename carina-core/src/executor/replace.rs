@@ -325,15 +325,10 @@ pub(super) async fn execute_cbd_replace_parallel(
                                     }
                                 };
                                 final_state = rename_outcome.into_state_for_writeback();
-                                diagnostic = match (rename_diagnostic, diagnostic) {
-                                    (Some(mut rename), Some(create)) => {
-                                        rename.merge_in(create);
-                                        Some(rename)
-                                    }
-                                    (Some(rename), None) => Some(rename),
-                                    (None, Some(create)) => Some(create),
-                                    (None, None) => None,
-                                };
+                                diagnostic = PartialReadDiagnostic::merge_options(
+                                    rename_diagnostic,
+                                    diagnostic,
+                                );
                                 if let Some(diagnostic) = diagnostic.clone() {
                                     final_state = diagnostic.into_state_for_writeback(final_state);
                                 }
