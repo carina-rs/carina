@@ -39,6 +39,12 @@ pub fn proto_value_to_json(v: &proto::Value) -> serde_json::Value {
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null),
         proto::Value::String(s) => serde_json::Value::String(s.clone()),
+        proto::Value::StringList(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(|s| serde_json::Value::String(s.clone()))
+                .collect(),
+        ),
         proto::Value::List(items) => {
             serde_json::Value::Array(items.iter().map(proto_value_to_json).collect())
         }
@@ -139,6 +145,10 @@ macro_rules! export_provider {
                     wit_types::Value::IntVal(i) => proto::Value::Int(*i),
                     wit_types::Value::FloatVal(f) => proto::Value::Float(*f),
                     wit_types::Value::StrVal(s) => proto::Value::String(s.clone()),
+                    wit_types::Value::StringListVal(json) => {
+                        let items: Vec<String> = serde_json::from_str(json).unwrap_or_default();
+                        proto::Value::StringList(items)
+                    }
                     wit_types::Value::ListVal(json) => {
                         let items: Vec<serde_json::Value> =
                             serde_json::from_str(json).unwrap_or_default();
@@ -177,6 +187,9 @@ macro_rules! export_provider {
                     proto::Value::Int(i) => wit_types::Value::IntVal(*i),
                     proto::Value::Float(f) => wit_types::Value::FloatVal(*f),
                     proto::Value::String(s) => wit_types::Value::StrVal(s.clone()),
+                    proto::Value::StringList(items) => {
+                        wit_types::Value::StringListVal(serde_json::to_string(items).unwrap())
+                    }
                     proto::Value::List(items) => {
                         let json_items: Vec<serde_json::Value> =
                             items.iter().map(helpers::proto_value_to_json).collect();
@@ -734,6 +747,10 @@ macro_rules! export_provider {
                     wit_types::Value::IntVal(i) => proto::Value::Int(*i),
                     wit_types::Value::FloatVal(f) => proto::Value::Float(*f),
                     wit_types::Value::StrVal(s) => proto::Value::String(s.clone()),
+                    wit_types::Value::StringListVal(json) => {
+                        let items: Vec<String> = serde_json::from_str(json).unwrap_or_default();
+                        proto::Value::StringList(items)
+                    }
                     wit_types::Value::ListVal(json) => {
                         let items: Vec<serde_json::Value> =
                             serde_json::from_str(json).unwrap_or_default();
@@ -772,6 +789,9 @@ macro_rules! export_provider {
                     proto::Value::Int(i) => wit_types::Value::IntVal(*i),
                     proto::Value::Float(f) => wit_types::Value::FloatVal(*f),
                     proto::Value::String(s) => wit_types::Value::StrVal(s.clone()),
+                    proto::Value::StringList(items) => {
+                        wit_types::Value::StringListVal(serde_json::to_string(items).unwrap())
+                    }
                     proto::Value::List(items) => {
                         let json_items: Vec<serde_json::Value> =
                             items.iter().map(helpers::proto_value_to_json).collect();

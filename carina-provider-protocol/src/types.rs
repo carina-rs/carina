@@ -45,6 +45,7 @@ pub enum Value {
     Int(i64),
     Float(f64),
     String(String),
+    StringList(Vec<String>),
     List(Vec<Value>),
     Map(HashMap<String, Value>),
 }
@@ -56,6 +57,14 @@ impl Serialize for Value {
             Value::Int(i) => serializer.serialize_i64(*i),
             Value::Float(f) => serializer.serialize_f64(*f),
             Value::String(s) => serializer.serialize_str(s),
+            Value::StringList(l) => {
+                use serde::ser::SerializeSeq;
+                let mut seq = serializer.serialize_seq(Some(l.len()))?;
+                for v in l {
+                    seq.serialize_element(v)?;
+                }
+                seq.end()
+            }
             Value::List(l) => {
                 use serde::ser::SerializeSeq;
                 let mut seq = serializer.serialize_seq(Some(l.len()))?;

@@ -4211,6 +4211,56 @@ mod tests {
     }
 
     #[test]
+    fn canonicalize_iam_policy_document_statement_action_to_string_list() {
+        let statement = AttributeType::struct_(
+            "Statement".to_string(),
+            vec![
+                crate::schema::StructField::new("action", string_or_list_of_strings()),
+                crate::schema::StructField::new("resource", string_or_list_of_strings()),
+            ],
+        );
+        let policy_document = AttributeType::struct_(
+            "PolicyDocument".to_string(),
+            vec![crate::schema::StructField::new(
+                "statement",
+                AttributeType::list(statement),
+            )],
+        );
+        let schema = crate::schema::Schema::flat(policy_document);
+
+        let mut statement = IndexMap::new();
+        statement.insert(
+            "action".to_string(),
+            Value::Concrete(ConcreteValue::String("sts:AssumeRole".to_string())),
+        );
+        let mut policy = IndexMap::new();
+        policy.insert(
+            "statement".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(statement),
+            )])),
+        );
+
+        let canon = schema.canonicalize(Value::Concrete(ConcreteValue::Map(policy)));
+        let Value::Concrete(ConcreteValue::Map(policy)) = canon else {
+            panic!("expected policy document map");
+        };
+        let Some(Value::Concrete(ConcreteValue::List(statements))) = policy.get("statement") else {
+            panic!("expected statement list, got {policy:?}");
+        };
+        let Some(Value::Concrete(ConcreteValue::Map(statement))) = statements.first() else {
+            panic!("expected first statement map, got {statements:?}");
+        };
+
+        assert_eq!(
+            statement.get("action"),
+            Some(&Value::Concrete(ConcreteValue::StringList(vec![
+                "sts:AssumeRole".to_string()
+            ])))
+        );
+    }
+
+    #[test]
     fn canonicalize_recurses_into_struct_via_provider_name() {
         let t = AttributeType::struct_(
             "Statement".to_string(),
