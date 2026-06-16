@@ -8,9 +8,27 @@ use std::hash::{Hash, Hasher};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
+use crate::schema::{ResourceSchema, Shape, TypeIdentity};
+
 pub use enum_value::{
     CanonicalEnumValue, EnumValueResolver, RawEnumIdentifier, RawEnumIdentifierParts,
 };
+
+#[derive(Clone, Copy)]
+pub struct EnumAttr<'a> {
+    api_value: &'a str,
+    identity: &'a TypeIdentity,
+}
+
+impl<'a> EnumAttr<'a> {
+    pub fn api_value(&self) -> &'a str {
+        self.api_value
+    }
+
+    pub fn identity(&self) -> &'a TypeIdentity {
+        self.identity
+    }
+}
 
 /// The `name` portion of a `ResourceId`.
 ///
@@ -1796,6 +1814,40 @@ impl Resource {
         self.attributes.get(key)
     }
 
+    pub fn get_enum_attr<'a>(
+        &'a self,
+        schema: &'a ResourceSchema,
+        name: &str,
+    ) -> Option<EnumAttr<'a>> {
+        let attr_schema = schema.attributes.get(name)?;
+        let Shape::Enum {
+            identity, values, ..
+        } = schema.shape_of(&attr_schema.attr_type)
+        else {
+            return None;
+        };
+        let value = self.get_attr(name)?;
+        let resolver = EnumValueResolver::with_defs(&attr_schema.attr_type, &schema.defs);
+
+        match value {
+            Value::Concrete(ConcreteValue::CanonicalEnum(c)) if c.identity() == identity => {
+                Some(EnumAttr {
+                    api_value: c.api_value(),
+                    identity,
+                })
+            }
+            Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
+                let canonical = resolver.resolve_raw(raw).ok()?;
+                enum_attr_from_resolved_text(identity, values, raw.as_str(), &canonical)
+            }
+            Value::Concrete(ConcreteValue::String(s)) => {
+                let canonical = resolver.resolve_state_text(s).ok()?;
+                enum_attr_from_resolved_text(identity, values, s, &canonical)
+            }
+            _ => None,
+        }
+    }
+
     /// Get a mutable attribute value by key, returning `Option<&mut Value>`.
     pub fn get_attr_mut(&mut self, key: &str) -> Option<&mut Value> {
         self.attributes.get_mut(key)
@@ -1830,6 +1882,169 @@ impl Resource {
     pub fn with_module_source(mut self, source: ModuleSource) -> Self {
         self.module_source = Some(source);
         self
+    }
+}
+
+fn enum_attr_from_resolved_text<'a>(
+    identity: &'a TypeIdentity,
+    values: Option<&'a [String]>,
+    input: &'a str,
+    canonical: &CanonicalEnumValue,
+) -> Option<EnumAttr<'a>> {
+    if canonical.identity() != identity {
+        return None;
+    }
+    let api_value = values
+        .into_iter()
+        .flatten()
+        .find(|value| value.as_str() == canonical.api_value())
+        .map_or_else(
+            || (input == canonical.api_value()).then_some(input),
+            |value| Some(value.as_str()),
+        )?;
+    Some(EnumAttr {
+        api_value,
+        identity,
+    })
+}
+
+#[cfg(test)]
+mod enum_attr_tests {
+    use super::*;
+    use crate::schema::{AttributeSchema, AttributeType, enum_identity};
+
+    fn status_enum_type() -> AttributeType {
+        AttributeType::enum_(
+            enum_identity("Status", Some("aws.s3.BucketVersioning")),
+            Some(vec!["Enabled".to_string(), "Suspended".to_string()]),
+            vec![],
+            None,
+            None,
+        )
+    }
+
+    fn status_identity() -> TypeIdentity {
+        enum_identity("Status", Some("aws.s3.BucketVersioning"))
+    }
+
+    fn mfa_delete_status_identity() -> TypeIdentity {
+        enum_identity("Status", Some("aws.s3.MfaDelete"))
+    }
+
+    fn schema_with_status() -> ResourceSchema {
+        ResourceSchema::new("aws.s3.BucketVersioning")
+            .attribute(AttributeSchema::new("status", status_enum_type()))
+    }
+
+    fn resource_with_attr(name: &str, value: ConcreteValue) -> Resource {
+        Resource::with_provider("aws", "s3.BucketVersioning", "example", None)
+            .with_attribute(name, Value::Concrete(value))
+    }
+
+    fn canonical_status(api_value: &str) -> ConcreteValue {
+        ConcreteValue::CanonicalEnum(CanonicalEnumValue::new_for_test(
+            status_identity(),
+            api_value,
+        ))
+    }
+
+    #[test]
+    fn returns_none_when_attribute_absent() {
+        let schema = schema_with_status();
+        let resource = Resource::with_provider("aws", "s3.BucketVersioning", "example", None);
+
+        assert!(resource.get_enum_attr(&schema, "status").is_none());
+    }
+
+    #[test]
+    fn returns_none_when_schema_attribute_is_not_enum() {
+        let schema = ResourceSchema::new("aws.s3.BucketVersioning")
+            .attribute(AttributeSchema::new("name", AttributeType::string()));
+        let resource = resource_with_attr("name", ConcreteValue::String("x".to_string()));
+
+        assert!(resource.get_enum_attr(&schema, "name").is_none());
+    }
+
+    #[test]
+    fn resolves_canonical_enum_for_matching_identity() {
+        let schema = schema_with_status();
+        let resource = resource_with_attr("status", canonical_status("Enabled"));
+
+        let attr = resource.get_enum_attr(&schema, "status").unwrap();
+
+        assert_eq!(attr.api_value(), "Enabled");
+        assert_eq!(attr.identity(), &status_identity());
+    }
+
+    #[test]
+    fn resolves_enum_identifier_through_resolver() {
+        let schema = schema_with_status();
+        let resource = resource_with_attr(
+            "status",
+            ConcreteValue::enum_identifier("aws.s3.BucketVersioning.Status.enabled"),
+        );
+
+        let attr = resource.get_enum_attr(&schema, "status").unwrap();
+
+        assert_eq!(attr.api_value(), "Enabled");
+        assert_eq!(attr.identity(), &status_identity());
+    }
+
+    #[test]
+    fn resolves_string_through_resolver() {
+        let schema = schema_with_status();
+        let resource = resource_with_attr("status", ConcreteValue::String("Enabled".to_string()));
+
+        let attr = resource.get_enum_attr(&schema, "status").unwrap();
+
+        assert_eq!(attr.api_value(), "Enabled");
+        assert_eq!(attr.identity(), &status_identity());
+    }
+
+    #[test]
+    fn rejects_canonical_enum_with_mismatched_identity() {
+        let schema = schema_with_status();
+        let resource = resource_with_attr(
+            "status",
+            ConcreteValue::CanonicalEnum(CanonicalEnumValue::new_for_test(
+                mfa_delete_status_identity(),
+                "Enabled",
+            )),
+        );
+
+        assert!(resource.get_enum_attr(&schema, "status").is_none());
+    }
+
+    #[test]
+    fn returns_none_for_int_value_in_enum_schema() {
+        let schema = schema_with_status();
+        let resource = resource_with_attr("status", ConcreteValue::Int(1));
+
+        assert!(resource.get_enum_attr(&schema, "status").is_none());
+    }
+
+    #[test]
+    fn resolves_ref_typed_attribute_through_defs() {
+        let schema = ResourceSchema::new("aws.s3.BucketVersioning")
+            .with_def("VersioningStatus", status_enum_type())
+            .attribute(AttributeSchema::new(
+                "status",
+                AttributeType::ref_("VersioningStatus"),
+            ));
+        let cases = [
+            canonical_status("Enabled"),
+            ConcreteValue::enum_identifier("aws.s3.BucketVersioning.Status.enabled"),
+            ConcreteValue::String("Enabled".to_string()),
+        ];
+
+        for value in cases {
+            let resource = resource_with_attr("status", value);
+
+            let attr = resource.get_enum_attr(&schema, "status").unwrap();
+
+            assert_eq!(attr.api_value(), "Enabled");
+            assert_eq!(attr.identity(), &status_identity());
+        }
     }
 }
 
