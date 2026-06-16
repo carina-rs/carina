@@ -8,7 +8,7 @@ use std::hash::{Hash, Hasher};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use crate::schema::{ResourceSchema, Shape, TypeIdentity};
+use crate::schema::{AttributeType, ResourceSchema, Shape, TypeIdentity, struct_fields_with_defs};
 
 pub use enum_value::{
     CanonicalEnumValue, EnumValueResolver, RawEnumIdentifier, RawEnumIdentifierParts,
@@ -1820,14 +1820,44 @@ impl Resource {
         name: &str,
     ) -> Option<EnumAttr<'a>> {
         let attr_schema = schema.attributes.get(name)?;
+        let value = self.get_attr(name)?;
+        self.enum_attr_for_type(value, &attr_schema.attr_type, schema)
+    }
+
+    pub fn get_enum_struct_field<'a>(
+        &'a self,
+        schema: &'a ResourceSchema,
+        struct_attr: &str,
+        field_name: &str,
+    ) -> Option<EnumAttr<'a>> {
+        let attr_schema = schema.attributes.get(struct_attr)?;
+        let Shape::Struct { .. } = schema.shape_of(&attr_schema.attr_type) else {
+            return None;
+        };
+        let field = struct_fields_with_defs(&attr_schema.attr_type, &schema.defs)?
+            .iter()
+            .find(|field| field.name == field_name)?;
+        let value = self.get_attr(struct_attr)?;
+        let Value::Concrete(ConcreteValue::Map(map)) = value else {
+            return None;
+        };
+        let value = map.get(field_name)?;
+        self.enum_attr_for_type(value, &field.field_type, schema)
+    }
+
+    fn enum_attr_for_type<'a>(
+        &'a self,
+        value: &'a Value,
+        attr_type: &'a AttributeType,
+        schema: &'a ResourceSchema,
+    ) -> Option<EnumAttr<'a>> {
         let Shape::Enum {
             identity, values, ..
-        } = schema.shape_of(&attr_schema.attr_type)
+        } = schema.shape_of(attr_type)
         else {
             return None;
         };
-        let value = self.get_attr(name)?;
-        let resolver = EnumValueResolver::with_defs(&attr_schema.attr_type, &schema.defs);
+        let resolver = EnumValueResolver::with_defs(attr_type, &schema.defs);
 
         match value {
             Value::Concrete(ConcreteValue::CanonicalEnum(c)) if c.identity() == identity => {
@@ -1911,7 +1941,7 @@ fn enum_attr_from_resolved_text<'a>(
 #[cfg(test)]
 mod enum_attr_tests {
     use super::*;
-    use crate::schema::{AttributeSchema, AttributeType, enum_identity};
+    use crate::schema::{AttributeSchema, AttributeType, StructField, enum_identity};
 
     fn status_enum_type() -> AttributeType {
         AttributeType::enum_(
@@ -1936,9 +1966,26 @@ mod enum_attr_tests {
             .attribute(AttributeSchema::new("status", status_enum_type()))
     }
 
+    fn options_struct_type(fields: Vec<StructField>) -> AttributeType {
+        AttributeType::struct_("Options", fields)
+    }
+
+    fn schema_with_options(fields: Vec<StructField>) -> ResourceSchema {
+        ResourceSchema::new("aws.s3.BucketVersioning")
+            .attribute(AttributeSchema::new("options", options_struct_type(fields)))
+    }
+
     fn resource_with_attr(name: &str, value: ConcreteValue) -> Resource {
         Resource::with_provider("aws", "s3.BucketVersioning", "example", None)
             .with_attribute(name, Value::Concrete(value))
+    }
+
+    fn resource_with_options(fields: Vec<(&str, ConcreteValue)>) -> Resource {
+        let map = fields
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), Value::Concrete(value)))
+            .collect();
+        resource_with_attr("options", ConcreteValue::Map(map))
     }
 
     fn canonical_status(api_value: &str) -> ConcreteValue {
@@ -1946,6 +1993,15 @@ mod enum_attr_tests {
             status_identity(),
             api_value,
         ))
+    }
+
+    fn assert_struct_field_enabled(resource: &Resource, schema: &ResourceSchema) {
+        let attr = resource
+            .get_enum_struct_field(schema, "options", "dns_support")
+            .unwrap();
+
+        assert_eq!(attr.api_value(), "Enabled");
+        assert_eq!(attr.identity(), &status_identity());
     }
 
     #[test]
@@ -2044,6 +2100,169 @@ mod enum_attr_tests {
 
             assert_eq!(attr.api_value(), "Enabled");
             assert_eq!(attr.identity(), &status_identity());
+        }
+    }
+
+    #[test]
+    fn struct_field_returns_none_when_struct_attribute_absent() {
+        let schema = schema_with_options(vec![StructField::new("dns_support", status_enum_type())]);
+        let resource = Resource::with_provider("aws", "s3.BucketVersioning", "example", None);
+
+        assert!(
+            resource
+                .get_enum_struct_field(&schema, "options", "dns_support")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn struct_field_returns_none_when_struct_attribute_is_not_map() {
+        let schema = schema_with_options(vec![StructField::new("dns_support", status_enum_type())]);
+        let resource = resource_with_attr("options", ConcreteValue::String("Enabled".to_string()));
+
+        assert!(
+            resource
+                .get_enum_struct_field(&schema, "options", "dns_support")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn struct_field_returns_none_when_struct_schema_does_not_declare_field() {
+        let schema =
+            schema_with_options(vec![StructField::new("dns_hostnames", status_enum_type())]);
+        let resource = resource_with_options(vec![("dns_support", canonical_status("Enabled"))]);
+
+        assert!(
+            resource
+                .get_enum_struct_field(&schema, "options", "dns_support")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn struct_field_returns_none_when_field_is_not_enum_in_schema() {
+        let schema = schema_with_options(vec![StructField::new(
+            "dns_support",
+            AttributeType::string(),
+        )]);
+        let resource = resource_with_options(vec![(
+            "dns_support",
+            ConcreteValue::String("Enabled".to_string()),
+        )]);
+
+        assert!(
+            resource
+                .get_enum_struct_field(&schema, "options", "dns_support")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn struct_field_returns_none_when_field_absent_in_map() {
+        let schema = schema_with_options(vec![StructField::new("dns_support", status_enum_type())]);
+        let resource = resource_with_options(vec![("dns_hostnames", canonical_status("Enabled"))]);
+
+        assert!(
+            resource
+                .get_enum_struct_field(&schema, "options", "dns_support")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn struct_field_resolves_canonical_enum_for_matching_identity() {
+        let schema = schema_with_options(vec![StructField::new("dns_support", status_enum_type())]);
+        let resource = resource_with_options(vec![("dns_support", canonical_status("Enabled"))]);
+
+        assert_struct_field_enabled(&resource, &schema);
+    }
+
+    #[test]
+    fn struct_field_resolves_enum_identifier_through_resolver() {
+        let schema = schema_with_options(vec![StructField::new("dns_support", status_enum_type())]);
+        let resource = resource_with_options(vec![(
+            "dns_support",
+            ConcreteValue::enum_identifier("aws.s3.BucketVersioning.Status.enabled"),
+        )]);
+
+        assert_struct_field_enabled(&resource, &schema);
+    }
+
+    #[test]
+    fn struct_field_resolves_string_through_resolver() {
+        let schema = schema_with_options(vec![StructField::new("dns_support", status_enum_type())]);
+        let resource = resource_with_options(vec![(
+            "dns_support",
+            ConcreteValue::String("Enabled".to_string()),
+        )]);
+
+        assert_struct_field_enabled(&resource, &schema);
+    }
+
+    #[test]
+    fn struct_field_rejects_canonical_enum_with_mismatched_identity() {
+        let schema = schema_with_options(vec![StructField::new("dns_support", status_enum_type())]);
+        let resource = resource_with_options(vec![(
+            "dns_support",
+            ConcreteValue::CanonicalEnum(CanonicalEnumValue::new_for_test(
+                mfa_delete_status_identity(),
+                "Enabled",
+            )),
+        )]);
+
+        assert!(
+            resource
+                .get_enum_struct_field(&schema, "options", "dns_support")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn struct_field_resolves_ref_typed_struct_through_defs() {
+        let schema = ResourceSchema::new("aws.s3.BucketVersioning")
+            .with_def(
+                "Options",
+                options_struct_type(vec![StructField::new("dns_support", status_enum_type())]),
+            )
+            .attribute(AttributeSchema::new(
+                "options",
+                AttributeType::ref_("Options"),
+            ));
+        let cases = [
+            canonical_status("Enabled"),
+            ConcreteValue::enum_identifier("aws.s3.BucketVersioning.Status.enabled"),
+            ConcreteValue::String("Enabled".to_string()),
+        ];
+
+        for value in cases {
+            let resource = resource_with_options(vec![("dns_support", value)]);
+
+            assert_struct_field_enabled(&resource, &schema);
+        }
+    }
+
+    #[test]
+    fn struct_field_resolves_ref_typed_field_through_defs() {
+        let schema = ResourceSchema::new("aws.s3.BucketVersioning")
+            .with_def("VersioningStatus", status_enum_type())
+            .attribute(AttributeSchema::new(
+                "options",
+                options_struct_type(vec![StructField::new(
+                    "dns_support",
+                    AttributeType::ref_("VersioningStatus"),
+                )]),
+            ));
+        let cases = [
+            canonical_status("Enabled"),
+            ConcreteValue::enum_identifier("aws.s3.BucketVersioning.Status.enabled"),
+            ConcreteValue::String("Enabled".to_string()),
+        ];
+
+        for value in cases {
+            let resource = resource_with_options(vec![("dns_support", value)]);
+
+            assert_struct_field_enabled(&resource, &schema);
         }
     }
 }
