@@ -1707,9 +1707,22 @@ pub(super) async fn execute_effects_phased(
                                                 diagnostic, ..
                                             } => Some(diagnostic.clone()),
                                         };
-                                        let renamed_state =
+                                        let mut renamed_state =
                                             rename_outcome.into_state_for_writeback();
-                                        let final_diagnostic = rename_diagnostic.or(diagnostic);
+                                        let final_diagnostic = match (rename_diagnostic, diagnostic)
+                                        {
+                                            (Some(mut rename), Some(create)) => {
+                                                rename.merge_in(create);
+                                                Some(rename)
+                                            }
+                                            (Some(rename), None) => Some(rename),
+                                            (None, Some(create)) => Some(create),
+                                            (None, None) => None,
+                                        };
+                                        if let Some(diagnostic) = final_diagnostic.clone() {
+                                            renamed_state =
+                                                diagnostic.into_state_for_writeback(renamed_state);
+                                        }
                                         if let Some(diagnostic) = &final_diagnostic {
                                             observer.on_event(
                                                 &ExecutionEvent::EffectPartiallySucceeded {

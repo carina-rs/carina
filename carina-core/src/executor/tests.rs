@@ -2900,6 +2900,86 @@ async fn test_cbd_rename_partial_create_partial_counts_once() {
         result.partial_diagnostics[0].1.reason(),
         "rename read incomplete"
     );
+    let marker = result.applied_states[&id]
+        .partial_read
+        .as_ref()
+        .expect("partial marker should be written back");
+    assert_eq!(marker.detail, "rename read incomplete");
+    assert!(marker.missing_attributes.contains("rename_attr"));
+    assert!(marker.missing_attributes.contains("create_attr"));
+    assert_eq!(marker.missing_attributes.len(), 2);
+}
+
+#[tokio::test]
+async fn test_cbd_rename_success_create_partial_keeps_create_marker() {
+    let provider = MockProvider::new();
+    let id = ResourceId::with_provider("test", "replace", "replace", None);
+    let from = State::existing(id.clone(), HashMap::new()).with_identifier("replace-old");
+    let mut to = Resource::with_provider("test", "replace", "replace", None);
+    to.binding = Some("replace".to_string());
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Replace {
+        id: id.clone(),
+        from: Box::new(from),
+        to,
+        directives: Directives {
+            create_before_destroy: true,
+            ..Default::default()
+        },
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".to_string()])
+            .unwrap(),
+        cascading_updates: vec![],
+        temporary_name: Some(crate::effect::TemporaryName {
+            attribute: "name".to_string(),
+            original_value: "replace-final".to_string(),
+            temporary_value: "replace-temp".to_string(),
+            can_rename: true,
+        }),
+        cascade_ref_hints: vec![],
+    });
+
+    provider.push_create_outcome(Ok(crate::provider::CreateOutcome::partial_success(
+        ok_state(&id),
+        "create read incomplete".to_string(),
+        vec!["create_attr".to_string()],
+    )));
+    provider.push_delete(Ok(()));
+    provider.push_update(Ok(ok_state(&id)));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+
+    assert_eq!(result.success_count, 0);
+    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.partial_count, 1);
+    assert_eq!(result.partial_diagnostics.len(), 1);
+    assert_eq!(result.partial_diagnostics[0].0, id);
+    assert_eq!(
+        result.partial_diagnostics[0].1.reason(),
+        "create read incomplete"
+    );
+    let marker = result.applied_states[&id]
+        .partial_read
+        .as_ref()
+        .expect("partial marker should be written back");
+    assert_eq!(marker.detail, "create read incomplete");
+    assert!(marker.missing_attributes.contains("create_attr"));
+    assert_eq!(marker.missing_attributes.len(), 1);
 }
 
 #[tokio::test]

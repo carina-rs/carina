@@ -591,6 +591,19 @@ impl PartialReadDiagnostic {
         &self.missing_attributes
     }
 
+    /// Merge another partial-read diagnostic into this one.
+    ///
+    /// The receiver's reason is kept because it represents the most recent
+    /// operation that wrote the state. Missing attributes are unioned so the
+    /// next plan can surface every unobserved attribute as Unknown.
+    pub fn merge_in(&mut self, other: PartialReadDiagnostic) {
+        for attr in other.missing_attributes {
+            if !self.missing_attributes.contains(&attr) {
+                self.missing_attributes.push(attr);
+            }
+        }
+    }
+
     pub fn into_state_for_writeback(self, mut state: State) -> State {
         state.partial_read = Some(PartialReadMarker {
             detail: self.reason,
