@@ -496,20 +496,32 @@ pub enum CreateOutcome {
     /// Create completed but the provider could not fully observe state.
     PartialSuccess {
         state: State,
-        diagnostic: PartialCreateDiagnostic,
+        diagnostic: PartialReadDiagnostic,
     },
 }
 
-/// Diagnostic details for a partial create.
+/// Result of a provider update operation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PartialCreateDiagnostic {
+pub enum UpdateOutcome {
+    /// Update completed and the returned state is complete.
+    Success { state: State },
+    /// Update completed but the provider could not fully observe state.
+    PartialSuccess {
+        state: State,
+        diagnostic: PartialReadDiagnostic,
+    },
+}
+
+/// Diagnostic details for a partial post-mutation read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PartialReadDiagnostic {
     reason: String,
     missing_attributes: Vec<String>,
 }
 
 impl CreateOutcome {
     pub fn partial_success(state: State, reason: String, missing_attributes: Vec<String>) -> Self {
-        match PartialCreateDiagnostic::new(reason, missing_attributes) {
+        match PartialReadDiagnostic::new(reason, missing_attributes) {
             Some(diagnostic) => CreateOutcome::PartialSuccess { state, diagnostic },
             None => CreateOutcome::Success { state },
         }
@@ -525,7 +537,7 @@ impl CreateOutcome {
         }
     }
 
-    pub fn diagnostic(&self) -> Option<&PartialCreateDiagnostic> {
+    pub fn diagnostic(&self) -> Option<&PartialReadDiagnostic> {
         match self {
             CreateOutcome::Success { .. } => None,
             CreateOutcome::PartialSuccess { diagnostic, .. } => Some(diagnostic),
@@ -533,7 +545,33 @@ impl CreateOutcome {
     }
 }
 
-impl PartialCreateDiagnostic {
+impl UpdateOutcome {
+    pub fn partial_success(state: State, reason: String, missing_attributes: Vec<String>) -> Self {
+        match PartialReadDiagnostic::new(reason, missing_attributes) {
+            Some(diagnostic) => UpdateOutcome::PartialSuccess { state, diagnostic },
+            None => UpdateOutcome::Success { state },
+        }
+    }
+
+    /// Consume the outcome and produce a State ready for writeback.
+    pub fn into_state_for_writeback(self) -> State {
+        match self {
+            UpdateOutcome::Success { state } => state,
+            UpdateOutcome::PartialSuccess { state, diagnostic } => {
+                diagnostic.into_state_for_writeback(state)
+            }
+        }
+    }
+
+    pub fn diagnostic(&self) -> Option<&PartialReadDiagnostic> {
+        match self {
+            UpdateOutcome::Success { .. } => None,
+            UpdateOutcome::PartialSuccess { diagnostic, .. } => Some(diagnostic),
+        }
+    }
+}
+
+impl PartialReadDiagnostic {
     pub fn new(reason: String, missing_attributes: Vec<String>) -> Option<Self> {
         if missing_attributes.is_empty() {
             None
@@ -551,6 +589,37 @@ impl PartialCreateDiagnostic {
 
     pub fn missing_attributes(&self) -> &[String] {
         &self.missing_attributes
+    }
+
+    /// Merge another partial-read diagnostic into this one.
+    ///
+    /// The receiver's reason is kept because it represents the most recent
+    /// operation that wrote the state. Missing attributes are unioned so the
+    /// next plan can surface every unobserved attribute as Unknown.
+    pub fn merge_in(&mut self, other: PartialReadDiagnostic) {
+        for attr in other.missing_attributes {
+            if !self.missing_attributes.contains(&attr) {
+                self.missing_attributes.push(attr);
+            }
+        }
+    }
+
+    /// Merge two optional diagnostics.
+    ///
+    /// When both are present, `a` keeps its reason because it represents the
+    /// more recent operation, while missing attributes are unioned with `b`.
+    /// Use this wherever two operations on the same resource may each report
+    /// partial; `.or()` silently drops the loser's missing attributes.
+    pub fn merge_options(a: Option<Self>, b: Option<Self>) -> Option<Self> {
+        match (a, b) {
+            (Some(mut a), Some(b)) => {
+                a.merge_in(b);
+                Some(a)
+            }
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
     }
 
     pub fn into_state_for_writeback(self, mut state: State) -> State {
@@ -655,7 +724,7 @@ pub trait Provider: Send + Sync {
         id: &ResourceId,
         identifier: &str,
         request: UpdateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>>;
+    ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>>;
 
     /// Delete an existing resource. `identifier` is the cloud-side
     /// internal ID (e.g. `vpc-xxx`).
@@ -978,7 +1047,7 @@ impl Provider for ProviderRouter {
         id: &ResourceId,
         identifier: &str,
         request: UpdateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         match self.get_provider_or_error(id) {
             Ok(provider) => provider.update(id, identifier, request),
             Err(e) => Box::pin(async move { Err(e) }),
@@ -1404,7 +1473,7 @@ impl Provider for Box<dyn Provider> {
         id: &ResourceId,
         identifier: &str,
         request: UpdateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         (**self).update(id, identifier, request)
     }
 
@@ -1485,7 +1554,7 @@ mod tests {
             id: &ResourceId,
             _identifier: &str,
             request: UpdateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
             let id = id.clone();
             // Apply the patch on top of `from` so the test sees the
             // user-specified changes round-tripped into State.
@@ -1502,7 +1571,11 @@ mod tests {
                     }
                 }
             }
-            Box::pin(async move { Ok(State::existing(id, attrs)) })
+            Box::pin(async move {
+                Ok(UpdateOutcome::Success {
+                    state: State::existing(id, attrs),
+                })
+            })
         }
 
         fn delete(
@@ -1531,7 +1604,7 @@ mod tests {
     fn create_outcome_exposes_state_and_diagnostic() {
         let id = ResourceId::new("test", "example");
         let state = State::existing(id, HashMap::new()).with_identifier("mock-id");
-        let diagnostic = PartialCreateDiagnostic::new(
+        let diagnostic = PartialReadDiagnostic::new(
             "mock partial create".to_string(),
             vec!["dns_name".to_string()],
         )
@@ -1567,6 +1640,42 @@ mod tests {
 
         assert_eq!(outcome.diagnostic(), None);
         assert_eq!(outcome.into_state_for_writeback(), state);
+    }
+
+    #[test]
+    fn partial_read_diagnostic_merge_options_covers_all_cases() {
+        let a = PartialReadDiagnostic::new(
+            "rename partial".to_string(),
+            vec!["rename_attr".to_string(), "shared".to_string()],
+        )
+        .expect("missing attributes are non-empty");
+        let b = PartialReadDiagnostic::new(
+            "create partial".to_string(),
+            vec!["create_attr".to_string(), "shared".to_string()],
+        )
+        .expect("missing attributes are non-empty");
+
+        assert_eq!(PartialReadDiagnostic::merge_options(None, None), None);
+        assert_eq!(
+            PartialReadDiagnostic::merge_options(Some(a.clone()), None),
+            Some(a.clone())
+        );
+        assert_eq!(
+            PartialReadDiagnostic::merge_options(None, Some(b.clone())),
+            Some(b.clone())
+        );
+
+        let merged = PartialReadDiagnostic::merge_options(Some(a), Some(b))
+            .expect("both diagnostics should merge into one");
+        assert_eq!(merged.reason(), "rename partial");
+        assert_eq!(
+            merged.missing_attributes(),
+            &[
+                "rename_attr".to_string(),
+                "shared".to_string(),
+                "create_attr".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -1631,7 +1740,7 @@ mod tests {
             _id: &ResourceId,
             _identifier: &str,
             _request: UpdateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("not supported")) })
         }
 
@@ -2230,7 +2339,11 @@ mod tests {
             from,
             patch: UpdatePatch::default(),
         };
-        let state = router.update(&id, "mock-id-123", request).await.unwrap();
+        let state = router
+            .update(&id, "mock-id-123", request)
+            .await
+            .unwrap()
+            .into_state_for_writeback();
         assert!(state.exists);
     }
 
@@ -2294,7 +2407,7 @@ mod tests {
             _id: &ResourceId,
             _identifier: &str,
             _request: UpdateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("not supported")) })
         }
         fn delete(
@@ -2642,9 +2755,13 @@ mod tests {
                 id: &ResourceId,
                 _identifier: &str,
                 _request: UpdateRequest,
-            ) -> BoxFuture<'_, ProviderResult<State>> {
+            ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
                 let id = id.clone();
-                Box::pin(async move { Ok(State::not_found(id)) })
+                Box::pin(async move {
+                    Ok(UpdateOutcome::Success {
+                        state: State::not_found(id),
+                    })
+                })
             }
 
             fn delete(

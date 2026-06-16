@@ -8,18 +8,19 @@ use std::time::Duration;
 use carina_core::effect::PlanOp;
 use carina_core::provider::{
     BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, PatchOpKind, Provider, ProviderError,
-    ProviderResult, ReadRequest, UpdateRequest,
+    ProviderResult, ReadRequest, UpdateOutcome, UpdateRequest,
 };
 use carina_core::resource::{DataSource, ResourceId, State, Value};
 use carina_core::value::{json_to_dsl_value, value_to_json};
 
 pub struct MockProvider {
     state_file: PathBuf,
-    partial_create: Option<PartialCreateConfig>,
+    partial_create: Option<PartialConfig>,
+    partial_update: Option<PartialConfig>,
 }
 
 #[derive(Clone, Debug)]
-struct PartialCreateConfig {
+struct PartialConfig {
     resource_id_pattern: String,
     missing_attributes: Vec<String>,
 }
@@ -57,6 +58,7 @@ impl MockProvider {
         Self {
             state_file,
             partial_create: partial_create_config_from_env(),
+            partial_update: partial_update_config_from_env(),
         }
     }
 
@@ -65,7 +67,19 @@ impl MockProvider {
         resource_id_pattern: impl Into<String>,
         missing_attributes: Vec<String>,
     ) -> Self {
-        self.partial_create = Some(PartialCreateConfig {
+        self.partial_create = Some(PartialConfig {
+            resource_id_pattern: resource_id_pattern.into(),
+            missing_attributes,
+        });
+        self
+    }
+
+    pub fn with_partial_update_for(
+        mut self,
+        resource_id_pattern: impl Into<String>,
+        missing_attributes: Vec<String>,
+    ) -> Self {
+        self.partial_update = Some(PartialConfig {
             resource_id_pattern: resource_id_pattern.into(),
             missing_attributes,
         });
@@ -95,18 +109,26 @@ impl MockProvider {
         format!("{}.{}", id.resource_type, id.name)
     }
 
-    fn partial_create_config_for(&self, id: &ResourceId) -> Option<&PartialCreateConfig> {
+    fn partial_create_config_for(&self, id: &ResourceId) -> Option<&PartialConfig> {
         let config = self.partial_create.as_ref()?;
+        Self::partial_config_matches(config, id).then_some(config)
+    }
+
+    fn partial_update_config_for(&self, id: &ResourceId) -> Option<&PartialConfig> {
+        let config = self.partial_update.as_ref()?;
+        Self::partial_config_matches(config, id).then_some(config)
+    }
+
+    fn partial_config_matches(config: &PartialConfig, id: &ResourceId) -> bool {
         let full = format!("{}.{}.{}", id.provider, id.resource_type, id.name);
         let short = Self::resource_key(id);
-        (config.resource_id_pattern == "*"
+        config.resource_id_pattern == "*"
             || config.resource_id_pattern == full
-            || config.resource_id_pattern == short)
-            .then_some(config)
+            || config.resource_id_pattern == short
     }
 }
 
-fn partial_create_config_from_env() -> Option<PartialCreateConfig> {
+fn partial_create_config_from_env() -> Option<PartialConfig> {
     let resource_id_pattern = env::var("CARINA_MOCK_PARTIAL_CREATE_FOR").ok()?;
     let missing_attributes = env::var("CARINA_MOCK_PARTIAL_CREATE_MISSING")
         .ok()
@@ -118,7 +140,25 @@ fn partial_create_config_from_env() -> Option<PartialCreateConfig> {
                 .collect()
         })
         .unwrap_or_else(|| vec!["computed".to_string()]);
-    Some(PartialCreateConfig {
+    Some(PartialConfig {
+        resource_id_pattern,
+        missing_attributes,
+    })
+}
+
+fn partial_update_config_from_env() -> Option<PartialConfig> {
+    let resource_id_pattern = env::var("CARINA_MOCK_PARTIAL_UPDATE_FOR").ok()?;
+    let missing_attributes = env::var("CARINA_MOCK_PARTIAL_UPDATE_MISSING")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_else(|| vec!["computed".to_string()]);
+    Some(PartialConfig {
         resource_id_pattern,
         missing_attributes,
     })
@@ -231,7 +271,7 @@ impl Provider for MockProvider {
         id: &ResourceId,
         _identifier: &str,
         request: UpdateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         let id = id.clone();
         Box::pin(async move {
             let _active = ActiveUpdateGuard::enter();
@@ -258,17 +298,35 @@ impl Provider for MockProvider {
 
             let mut states = self.load_states();
             let key = Self::resource_key(&id);
-            let attrs: HashMap<String, serde_json::Value> = attributes
+            let partial_update = self.partial_update_config_for(&id);
+            let mut attrs: HashMap<String, serde_json::Value> = attributes
                 .iter()
                 .map(|(k, v)| value_to_json(v).map(|jv| (k.clone(), jv)))
                 .collect::<Result<_, _>>()
                 .map_err(|e| ProviderError::internal(format!("Failed to convert value: {}", e)))?;
+            if let Some(config) = partial_update {
+                for attr in &config.missing_attributes {
+                    attrs.remove(attr);
+                }
+            }
 
             states.insert(key, attrs);
             self.save_states(&states)
                 .map_err(|e| ProviderError::internal("Failed to save state").with_cause(e))?;
 
-            Ok(State::existing(id, attributes))
+            let mut state = State::existing(id, attributes).with_identifier("mock-id");
+            if let Some(config) = partial_update {
+                for attr in &config.missing_attributes {
+                    state.attributes.remove(attr);
+                }
+                return Ok(UpdateOutcome::partial_success(
+                    state,
+                    "mock partial update".to_string(),
+                    config.missing_attributes.clone(),
+                ));
+            }
+
+            Ok(UpdateOutcome::Success { state })
         })
     }
 
@@ -310,6 +368,7 @@ mod tests {
         let provider = MockProvider {
             state_file: state_file.clone(),
             partial_create: None,
+            partial_update: None,
         };
         let mut states = HashMap::new();
         let mut entry = HashMap::new();

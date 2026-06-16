@@ -126,13 +126,26 @@ pub enum CreateOutcome {
     },
     PartialSuccess {
         state: State,
-        diagnostic: PartialCreateDiagnostic,
+        diagnostic: PartialReadDiagnostic,
     },
 }
 
-/// Diagnostic details for a partial create.
+/// Result of an update operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PartialCreateDiagnostic {
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum UpdateOutcome {
+    Success {
+        state: State,
+    },
+    PartialSuccess {
+        state: State,
+        diagnostic: PartialReadDiagnostic,
+    },
+}
+
+/// Diagnostic details for a partial post-mutation read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartialReadDiagnostic {
     pub reason: String,
     #[serde(default)]
     pub missing_attributes: Vec<String>,

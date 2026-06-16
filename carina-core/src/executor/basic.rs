@@ -14,8 +14,8 @@ use crate::executor::UnresolvedResource;
 use crate::executor::normalized::{NormalizedResource, apply_desired_normalization};
 use crate::parser::ProviderConfig;
 use crate::provider::{
-    CreateRequest, DeleteRequest, PartialCreateDiagnostic, Provider, ProviderNormalizer,
-    ReadRequest, UpdateRequest, build_update_patch,
+    CreateRequest, DeleteRequest, PartialReadDiagnostic, Provider, ProviderNormalizer, ReadRequest,
+    UpdateOutcome, UpdateRequest, build_update_patch,
 };
 use crate::resolver::resolve_ref_value;
 use crate::resource::{
@@ -52,7 +52,7 @@ pub(super) enum BasicEffectResult {
     PartialSuccess {
         state: State,
         resource_id: ResourceId,
-        diagnostic: PartialCreateDiagnostic,
+        diagnostic: PartialReadDiagnostic,
         resolved_attrs: Option<HashMap<String, Value>>,
         binding: Option<String>,
     },
@@ -73,7 +73,7 @@ pub(super) struct ExecutionState<'a> {
     pub(super) success_count: &'a mut usize,
     pub(super) failure_count: &'a mut usize,
     pub(super) partial_count: &'a mut usize,
-    pub(super) partial_diagnostics: &'a mut Vec<(ResourceId, PartialCreateDiagnostic)>,
+    pub(super) partial_diagnostics: &'a mut Vec<(ResourceId, PartialReadDiagnostic)>,
     pub(super) applied_states: &'a mut AppliedStates,
     pub(super) failed_bindings: &'a mut std::collections::HashSet<String>,
     pub(super) successfully_deleted: &'a mut std::collections::HashSet<ResourceId>,
@@ -673,18 +673,42 @@ pub(super) async fn execute_basic_effect<'a>(
                 patch,
             };
             match provider.update(id, identifier, request).await {
-                Ok(state) => {
-                    observer.on_event(&ExecutionEvent::EffectSucceeded {
-                        effect,
-                        state: Some(&state),
-                        duration: started.elapsed(),
-                        progress,
-                    });
-                    BasicEffectResult::Success {
-                        state: Some(state),
-                        resource_id: id.clone(),
-                        resolved_attrs: Some(resolved_to.as_resource().resolved_attributes()),
-                        binding: to.binding.clone(),
+                Ok(outcome) => {
+                    let diagnostic = match &outcome {
+                        UpdateOutcome::Success { .. } => None,
+                        UpdateOutcome::PartialSuccess { diagnostic, .. } => {
+                            Some(diagnostic.clone())
+                        }
+                    };
+                    let state = outcome.into_state_for_writeback();
+                    if let Some(diagnostic) = diagnostic {
+                        observer.on_event(&ExecutionEvent::EffectPartiallySucceeded {
+                            effect,
+                            state: &state,
+                            diagnostic: &diagnostic,
+                            duration: started.elapsed(),
+                            progress,
+                        });
+                        BasicEffectResult::PartialSuccess {
+                            state,
+                            resource_id: id.clone(),
+                            diagnostic,
+                            resolved_attrs: Some(resolved_to.as_resource().resolved_attributes()),
+                            binding: to.binding.clone(),
+                        }
+                    } else {
+                        observer.on_event(&ExecutionEvent::EffectSucceeded {
+                            effect,
+                            state: Some(&state),
+                            duration: started.elapsed(),
+                            progress,
+                        });
+                        BasicEffectResult::Success {
+                            state: Some(state),
+                            resource_id: id.clone(),
+                            resolved_attrs: Some(resolved_to.as_resource().resolved_attributes()),
+                            binding: to.binding.clone(),
+                        }
                     }
                 }
                 Err(e) => {
@@ -748,7 +772,7 @@ pub(super) async fn execute_basic_effect<'a>(
 #[cfg(test)]
 mod process_basic_result_tests {
     use super::*;
-    use crate::provider::PartialCreateDiagnostic;
+    use crate::provider::PartialReadDiagnostic;
     use crate::resource::{State, Value};
     use std::collections::HashSet;
 
@@ -756,7 +780,7 @@ mod process_basic_result_tests {
     fn partial_success_records_state_and_diagnostic() {
         let id = ResourceId::with_provider("mock", "test.resource", "r1", None);
         let state = State::existing(id.clone(), HashMap::new()).with_identifier("mock-id");
-        let diagnostic = PartialCreateDiagnostic::new(
+        let diagnostic = PartialReadDiagnostic::new(
             "mock partial create".to_string(),
             vec!["computed".to_string()],
         )

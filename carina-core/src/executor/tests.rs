@@ -60,7 +60,7 @@ fn validation_deferred_for_expression() -> crate::parser::DeferredForExpression 
 struct MockProvider {
     create_results: Mutex<Vec<ProviderResult<crate::provider::CreateOutcome>>>,
     delete_results: Mutex<Vec<ProviderResult<()>>>,
-    update_results: Mutex<Vec<ProviderResult<State>>>,
+    update_results: Mutex<Vec<ProviderResult<crate::provider::UpdateOutcome>>>,
     read_results: Mutex<Vec<ProviderResult<State>>>,
     /// Records calls in order: ("create"|"delete"|"update"|"read", resource_id_string)
     call_log: Arc<Mutex<Vec<(String, String)>>>,
@@ -102,6 +102,13 @@ impl MockProvider {
     }
 
     fn push_update(&self, result: ProviderResult<State>) {
+        self.update_results
+            .lock()
+            .unwrap()
+            .push(result.map(|state| crate::provider::UpdateOutcome::Success { state }));
+    }
+
+    fn push_update_outcome(&self, result: ProviderResult<crate::provider::UpdateOutcome>) {
         self.update_results.lock().unwrap().push(result);
     }
 
@@ -169,7 +176,7 @@ impl Provider for MockProvider {
         id: &ResourceId,
         _identifier: &str,
         request: UpdateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
         let id_str = id.to_string();
         self.call_log
             .lock()
@@ -945,7 +952,7 @@ impl Provider for DelayedCountingProvider {
         id: &ResourceId,
         _identifier: &str,
         _request: UpdateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
         let id = id.clone();
         let started = self.started.clone();
         Box::pin(async move {
@@ -958,7 +965,9 @@ impl Provider for DelayedCountingProvider {
                 "finalized".to_string(),
                 Value::Concrete(ConcreteValue::Bool(true)),
             );
-            Ok(State::existing(id, attrs).with_identifier("finalized-id"))
+            Ok(crate::provider::UpdateOutcome::Success {
+                state: State::existing(id, attrs).with_identifier("finalized-id"),
+            })
         })
     }
 
@@ -1045,7 +1054,7 @@ impl Provider for PendingWaitProvider {
         _id: &ResourceId,
         _identifier: &str,
         _request: UpdateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
         Box::pin(async { Err(ProviderError::internal("update not used")) })
     }
 
@@ -1672,7 +1681,7 @@ async fn partial_create_records_state_and_diagnostic() {
     let provider = MockProvider::new();
     let resource = make_resource("a", &[]);
     let rid = resource.id.clone();
-    let diagnostic = crate::provider::PartialCreateDiagnostic::new(
+    let diagnostic = crate::provider::PartialReadDiagnostic::new(
         "mock partial create".to_string(),
         vec!["computed".to_string()],
     )
@@ -2783,7 +2792,11 @@ async fn test_cbd_cascade_update_patch_uses_plan_time_comparison_semantics() {
     });
 
     provider.push_create(Ok(ok_state(&replace_id)));
-    provider.push_update(Ok(ok_state(&cascade_id)));
+    provider.push_update_outcome(Ok(crate::provider::UpdateOutcome::partial_success(
+        ok_state(&cascade_id),
+        "cascade read incomplete".to_string(),
+        vec!["description".to_string()],
+    )));
     provider.push_delete(Ok(()));
 
     let input = ExecutionInput {
@@ -2802,12 +2815,171 @@ async fn test_cbd_cascade_update_patch_uses_plan_time_comparison_semantics() {
     let observer = MockObserver::new();
     let result =
         completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
-    assert_eq!(result.success_count, 1);
+    assert_eq!(result.success_count, 0);
+    assert_eq!(result.partial_count, 1);
+    assert_eq!(result.partial_diagnostics.len(), 1);
+    assert_eq!(result.partial_diagnostics[0].0, cascade_id);
+    assert_eq!(
+        result.partial_diagnostics[0].1.reason(),
+        "cascade read incomplete"
+    );
 
     let reqs = provider.captured_update_requests();
     assert_eq!(reqs.len(), 1);
     let patched_keys: Vec<&str> = reqs[0].patch.ops.iter().map(|op| op.key.as_str()).collect();
     assert_eq!(patched_keys, vec!["description"]);
+}
+
+#[tokio::test]
+async fn test_cbd_rename_partial_create_partial_counts_once() {
+    let provider = MockProvider::new();
+    let id = ResourceId::with_provider("test", "replace", "replace", None);
+    let from = State::existing(id.clone(), HashMap::new()).with_identifier("replace-old");
+    let mut to = Resource::with_provider("test", "replace", "replace", None);
+    to.binding = Some("replace".to_string());
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Replace {
+        id: id.clone(),
+        from: Box::new(from),
+        to,
+        directives: Directives {
+            create_before_destroy: true,
+            ..Default::default()
+        },
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".to_string()])
+            .unwrap(),
+        cascading_updates: vec![],
+        temporary_name: Some(crate::effect::TemporaryName {
+            attribute: "name".to_string(),
+            original_value: "replace-final".to_string(),
+            temporary_value: "replace-temp".to_string(),
+            can_rename: true,
+        }),
+        cascade_ref_hints: vec![],
+    });
+
+    provider.push_create_outcome(Ok(crate::provider::CreateOutcome::partial_success(
+        ok_state(&id),
+        "create read incomplete".to_string(),
+        vec!["create_attr".to_string()],
+    )));
+    provider.push_delete(Ok(()));
+    provider.push_update_outcome(Ok(crate::provider::UpdateOutcome::partial_success(
+        ok_state(&id),
+        "rename read incomplete".to_string(),
+        vec!["rename_attr".to_string()],
+    )));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+
+    assert_eq!(provider.calls()[0].0, "create");
+    assert_eq!(provider.calls()[1].0, "delete");
+    assert_eq!(provider.calls()[2].0, "update");
+    assert_eq!(result.success_count, 0);
+    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.partial_count, 1);
+    assert_eq!(result.partial_diagnostics.len(), 1);
+    assert_eq!(result.partial_diagnostics[0].0, id);
+    assert_eq!(
+        result.partial_diagnostics[0].1.reason(),
+        "rename read incomplete"
+    );
+    let marker = result.applied_states[&id]
+        .partial_read
+        .as_ref()
+        .expect("partial marker should be written back");
+    assert_eq!(marker.detail, "rename read incomplete");
+    assert!(marker.missing_attributes.contains("rename_attr"));
+    assert!(marker.missing_attributes.contains("create_attr"));
+    assert_eq!(marker.missing_attributes.len(), 2);
+}
+
+#[tokio::test]
+async fn test_cbd_rename_success_create_partial_keeps_create_marker() {
+    let provider = MockProvider::new();
+    let id = ResourceId::with_provider("test", "replace", "replace", None);
+    let from = State::existing(id.clone(), HashMap::new()).with_identifier("replace-old");
+    let mut to = Resource::with_provider("test", "replace", "replace", None);
+    to.binding = Some("replace".to_string());
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Replace {
+        id: id.clone(),
+        from: Box::new(from),
+        to,
+        directives: Directives {
+            create_before_destroy: true,
+            ..Default::default()
+        },
+        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".to_string()])
+            .unwrap(),
+        cascading_updates: vec![],
+        temporary_name: Some(crate::effect::TemporaryName {
+            attribute: "name".to_string(),
+            original_value: "replace-final".to_string(),
+            temporary_value: "replace-temp".to_string(),
+            can_rename: true,
+        }),
+        cascade_ref_hints: vec![],
+    });
+
+    provider.push_create_outcome(Ok(crate::provider::CreateOutcome::partial_success(
+        ok_state(&id),
+        "create read incomplete".to_string(),
+        vec!["create_attr".to_string()],
+    )));
+    provider.push_delete(Ok(()));
+    provider.push_update(Ok(ok_state(&id)));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+
+    assert_eq!(result.success_count, 0);
+    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.partial_count, 1);
+    assert_eq!(result.partial_diagnostics.len(), 1);
+    assert_eq!(result.partial_diagnostics[0].0, id);
+    assert_eq!(
+        result.partial_diagnostics[0].1.reason(),
+        "create read incomplete"
+    );
+    let marker = result.applied_states[&id]
+        .partial_read
+        .as_ref()
+        .expect("partial marker should be written back");
+    assert_eq!(marker.detail, "create read incomplete");
+    assert!(marker.missing_attributes.contains("create_attr"));
+    assert_eq!(marker.missing_attributes.len(), 1);
 }
 
 #[tokio::test]
@@ -3417,7 +3589,7 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
             _id: &ResourceId,
             _identifier: &str,
             _request: UpdateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("not implemented")) })
         }
 
@@ -3556,7 +3728,7 @@ impl Provider for DelayedUpdateProvider {
         id: &ResourceId,
         identifier: &str,
         request: UpdateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
         let id = id.clone();
         let identifier = identifier.to_string();
         let delay = self.delay;
@@ -3580,7 +3752,9 @@ impl Provider for DelayedUpdateProvider {
                     Value::Concrete(ConcreteValue::String("provider-violated-id".to_string())),
                 );
             }
-            Ok(State::existing(id, attrs).with_identifier(&identifier))
+            Ok(crate::provider::UpdateOutcome::Success {
+                state: State::existing(id, attrs).with_identifier(&identifier),
+            })
         })
     }
 
@@ -4220,7 +4394,7 @@ impl Provider for RecordingMockProvider {
         _id: &ResourceId,
         _identifier: &str,
         _request: UpdateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
         Box::pin(async { Err(ProviderError::internal("not implemented")) })
     }
 
@@ -5184,7 +5358,7 @@ impl Provider for IdentifierAwareProvider {
         _id: &ResourceId,
         _identifier: &str,
         _request: UpdateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
         Box::pin(async move { Err(ProviderError::api_error("update not expected")) })
     }
 
@@ -5819,7 +5993,7 @@ async fn expand_deferred_for_cancelled_after_upstream_create_reports_skipped() {
             _id: &ResourceId,
             _identifier: &str,
             _request: UpdateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
             unreachable!("test does not update")
         }
 

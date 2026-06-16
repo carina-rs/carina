@@ -106,7 +106,7 @@ impl Provider for FailBCreateProvider {
         id: &ResourceId,
         _identifier: &str,
         _request: UpdateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
         let id = id.clone();
         Box::pin(async move { Err(ProviderError::internal("unexpected update").for_resource(id)) })
     }

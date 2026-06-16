@@ -97,8 +97,10 @@ mod tests {
             _id: &ResourceId,
             _identifier: &str,
             _request: crate::provider::UpdateRequest,
-        ) -> crate::provider::BoxFuture<'_, crate::provider::ProviderResult<crate::resource::State>>
-        {
+        ) -> crate::provider::BoxFuture<
+            '_,
+            crate::provider::ProviderResult<crate::provider::UpdateOutcome>,
+        > {
             Box::pin(async { panic!("unexpected update") })
         }
 

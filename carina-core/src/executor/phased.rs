@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::deps::{find_failed_dependency, get_resource_dependencies};
 use crate::effect::Effect;
 use crate::provider::{
-    CreateRequest, DeleteRequest, PartialCreateDiagnostic, Provider, UpdateRequest,
+    CreateRequest, DeleteRequest, PartialReadDiagnostic, Provider, UpdateOutcome, UpdateRequest,
 };
 use crate::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 
@@ -345,7 +345,8 @@ pub(super) enum PhaseEffectResult {
     CbdCreateSuccess {
         idx: usize,
         state: State,
-        diagnostic: Option<PartialCreateDiagnostic>,
+        diagnostic: Option<PartialReadDiagnostic>,
+        cascade_diagnostics: Vec<(ResourceId, PartialReadDiagnostic)>,
         cascade_states: Vec<(ResourceId, State, HashMap<String, Value>, Option<String>)>,
     },
     /// Phase 2: CBD create failed
@@ -365,7 +366,7 @@ pub(super) enum PhaseEffectResult {
     NonCbdCreateSuccess {
         state: State,
         resource_id: ResourceId,
-        diagnostic: Option<PartialCreateDiagnostic>,
+        diagnostic: Option<PartialReadDiagnostic>,
         resolved_attrs: HashMap<String, Value>,
         binding: Option<String>,
     },
@@ -375,6 +376,7 @@ pub(super) enum PhaseEffectResult {
     CbdFinalizeSuccess {
         state: State,
         resource_id: ResourceId,
+        diagnostic: Option<PartialReadDiagnostic>,
         permanent_overrides: Option<(ResourceId, HashMap<String, String>)>,
     },
     /// Phase 4: CBD finalization failed (rename failed)
@@ -836,7 +838,7 @@ pub(super) async fn execute_effects_phased(
     // Phase 2: CBD creates with parallel execution (forward dependency order)
     // -----------------------------------------------------------------------
     let mut cbd_create_states: HashMap<usize, State> = HashMap::new();
-    let mut cbd_create_diagnostics: HashMap<usize, PartialCreateDiagnostic> = HashMap::new();
+    let mut cbd_create_diagnostics: HashMap<usize, PartialReadDiagnostic> = HashMap::new();
     let mut replace_start_times: HashMap<usize, Instant> = HashMap::new();
 
     // Assign progress numbers to all Replace effects upfront.
@@ -989,6 +991,7 @@ pub(super) async fn execute_effects_phased(
                                 );
 
                                 let mut cascade_failed = false;
+                                let mut cascade_diagnostics = Vec::new();
                                 let mut refreshes = Vec::new();
                                 let mut cascade_states = Vec::new();
                                 for cascade in cascading_updates {
@@ -1034,12 +1037,25 @@ pub(super) async fn execute_effects_phased(
                                         .update(&cascade.id, cascade_identifier, cascade_request)
                                         .await
                                     {
-                                        Ok(cascade_state) => {
+                                        Ok(cascade_outcome) => {
+                                            let cascade_diagnostic = match &cascade_outcome {
+                                                UpdateOutcome::Success { .. } => None,
+                                                UpdateOutcome::PartialSuccess {
+                                                    diagnostic,
+                                                    ..
+                                                } => Some(diagnostic.clone()),
+                                            };
                                             observer.on_event(
                                                 &ExecutionEvent::CascadeUpdateSucceeded {
                                                     id: &cascade.id,
                                                 },
                                             );
+                                            let cascade_state =
+                                                cascade_outcome.into_state_for_writeback();
+                                            if let Some(diagnostic) = cascade_diagnostic {
+                                                cascade_diagnostics
+                                                    .push((cascade.id.clone(), diagnostic));
+                                            }
                                             let cascade_attrs =
                                                 resolved_to.as_resource().resolved_attributes();
                                             local_bindings.record_applied(
@@ -1093,6 +1109,7 @@ pub(super) async fn execute_effects_phased(
                                             idx,
                                             state,
                                             diagnostic,
+                                            cascade_diagnostics,
                                             cascade_states,
                                         },
                                     )
@@ -1156,6 +1173,7 @@ pub(super) async fn execute_effects_phased(
                     idx,
                     state,
                     diagnostic,
+                    cascade_diagnostics,
                     cascade_states,
                 } => {
                     let effect = &effects[idx];
@@ -1178,6 +1196,10 @@ pub(super) async fn execute_effects_phased(
                             &cascade_attrs,
                             &cascade_state,
                         );
+                    }
+                    for (cascade_id, diagnostic) in cascade_diagnostics {
+                        partial_count += 1;
+                        partial_diagnostics.push((cascade_id, diagnostic));
                     }
                     replace_start_times.insert(idx, started);
                     cbd_create_states.insert(idx, state);
@@ -1673,17 +1695,29 @@ pub(super) async fn execute_effects_phased(
                                     patch: rename_patch,
                                 };
                                 match provider.update(&id, new_identifier, rename_request).await {
-                                    Ok(renamed_state) => {
+                                    Ok(rename_outcome) => {
                                         observer.on_event(&ExecutionEvent::RenameSucceeded {
                                             id: &id,
                                             from: &temp.temporary_value,
                                             to: &temp.original_value,
                                         });
-                                        let renamed_state =
-                                            diagnostic.clone().map_or(renamed_state.clone(), |d| {
-                                                d.into_state_for_writeback(renamed_state)
-                                            });
-                                        if let Some(diagnostic) = &diagnostic {
+                                        let rename_diagnostic = match &rename_outcome {
+                                            UpdateOutcome::Success { .. } => None,
+                                            UpdateOutcome::PartialSuccess {
+                                                diagnostic, ..
+                                            } => Some(diagnostic.clone()),
+                                        };
+                                        let mut renamed_state =
+                                            rename_outcome.into_state_for_writeback();
+                                        let final_diagnostic = PartialReadDiagnostic::merge_options(
+                                            rename_diagnostic,
+                                            diagnostic,
+                                        );
+                                        if let Some(diagnostic) = final_diagnostic.clone() {
+                                            renamed_state =
+                                                diagnostic.into_state_for_writeback(renamed_state);
+                                        }
+                                        if let Some(diagnostic) = &final_diagnostic {
                                             observer.on_event(
                                                 &ExecutionEvent::EffectPartiallySucceeded {
                                                     effect: &effect_for_future,
@@ -1706,6 +1740,7 @@ pub(super) async fn execute_effects_phased(
                                             PhaseEffectResult::CbdFinalizeSuccess {
                                                 state: renamed_state,
                                                 resource_id: to.id.clone(),
+                                                diagnostic: final_diagnostic,
                                                 permanent_overrides: None,
                                             },
                                         )
@@ -1768,6 +1803,7 @@ pub(super) async fn execute_effects_phased(
                                     PhaseEffectResult::CbdFinalizeSuccess {
                                         state,
                                         resource_id: to.id.clone(),
+                                        diagnostic,
                                         permanent_overrides,
                                     },
                                 )
@@ -1932,13 +1968,17 @@ pub(super) async fn execute_effects_phased(
                 PhaseEffectResult::CbdFinalizeSuccess {
                     state,
                     resource_id,
+                    diagnostic,
                     permanent_overrides,
                 } => {
                     cbd_create_states.remove(&finished_idx);
-                    if let Some(diagnostic) = cbd_create_diagnostics.remove(&finished_idx) {
+                    if let Some(diagnostic) =
+                        diagnostic.or_else(|| cbd_create_diagnostics.remove(&finished_idx))
+                    {
                         partial_count += 1;
                         partial_diagnostics.push((resource_id.clone(), diagnostic));
                     } else {
+                        cbd_create_diagnostics.remove(&finished_idx);
                         success_count += 1;
                     }
                     applied_states.insert(resource_id, state);
@@ -2360,7 +2400,7 @@ mod tests {
             _id: &ResourceId,
             _identifier: &str,
             _request: UpdateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("update not used")) })
         }
 

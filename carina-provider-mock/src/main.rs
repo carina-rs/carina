@@ -108,7 +108,7 @@ impl CarinaProvider for MockProcessProvider {
         id: &ResourceId,
         _identifier: &str,
         request: UpdateRequest,
-    ) -> Result<State, ProviderError> {
+    ) -> Result<UpdateOutcome, ProviderError> {
         // Apply the patch on top of `from` to construct the post-update
         // attribute map. Also echo the patch op kinds into a sentinel
         // attribute so integration tests can assert the patch
@@ -145,12 +145,13 @@ impl CarinaProvider for MockProcessProvider {
         let key = Self::resource_key(id);
         states.insert(key, attributes.clone());
 
-        Ok(State {
+        let state = State {
             id: id.clone(),
             identifier: Some("mock-id".into()),
             attributes,
             exists: true,
-        })
+        };
+        Ok(UpdateOutcome::Success { state })
     }
 
     fn delete(

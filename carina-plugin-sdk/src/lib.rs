@@ -159,7 +159,7 @@ pub trait CarinaProvider {
         id: &ResourceId,
         identifier: &str,
         request: UpdateRequest,
-    ) -> Result<State, ProviderError>;
+    ) -> Result<UpdateOutcome, ProviderError>;
 
     /// Delete an existing resource.
     fn delete(
@@ -364,7 +364,7 @@ fn dispatch(provider: &mut impl CarinaProvider, request: &Request) -> Response {
                 Err(e) => return Response::error(id, -32602, e),
             };
             match provider.update(&params.id, &params.identifier, params.request) {
-                Ok(state) => Response::success(id, methods::UpdateResult { state }),
+                Ok(outcome) => Response::success(id, methods::UpdateResult { outcome }),
                 Err(e) => Response::error(id, -1, e.message),
             }
         }

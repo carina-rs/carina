@@ -1272,7 +1272,7 @@ mod tests {
             _id: &ResourceId,
             _identifier: &str,
             _request: carina_core::provider::UpdateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
             Box::pin(async { unreachable!() })
         }
 

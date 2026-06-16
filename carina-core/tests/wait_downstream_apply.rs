@@ -38,7 +38,7 @@ use carina_core::module_resolver::resolve_modules;
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{
     BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, NoopNormalizer, Provider,
-    ProviderResult, ReadRequest, UpdateRequest,
+    ProviderResult, ReadRequest, UpdateOutcome, UpdateRequest,
 };
 use carina_core::resolver::resolve_refs_with_state_and_remote;
 use carina_core::resource::{ConcreteValue, ResourceId, State, Value};
@@ -128,9 +128,13 @@ impl Provider for MockProvider {
         id: &ResourceId,
         _identifier: &str,
         _request: UpdateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         let id = id.clone();
-        Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
+        Box::pin(async move {
+            Ok(UpdateOutcome::Success {
+                state: State::existing(id, HashMap::new()),
+            })
+        })
     }
 
     fn delete(

@@ -227,7 +227,8 @@ async fn test_wasm_mock_provider_update_and_delete() {
             },
         )
         .await
-        .expect("update should succeed");
+        .expect("update should succeed")
+        .into_state_for_writeback();
     assert_eq!(
         updated.attributes.get("color"),
         Some(&Value::Concrete(ConcreteValue::String("blue".into())))

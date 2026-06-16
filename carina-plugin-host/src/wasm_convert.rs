@@ -8,8 +8,8 @@ use carina_core::provider::{
     CreateOutcome as CoreCreateOutcome, CreateRequest as CoreCreateRequest,
     DeleteRequest as CoreDeleteRequest, ErrorDetail as CoreErrorDetail, PatchOp as CorePatchOp,
     PatchOpKind as CorePatchOpKind, ProviderError as CoreProviderError,
-    ReadRequest as CoreReadRequest, UpdatePatch as CoreUpdatePatch,
-    UpdateRequest as CoreUpdateRequest,
+    ReadRequest as CoreReadRequest, UpdateOutcome as CoreUpdateOutcome,
+    UpdatePatch as CoreUpdatePatch, UpdateRequest as CoreUpdateRequest,
 };
 use carina_core::resource::{
     ConcreteValue, DataSource as CoreDataSource, DeferredValue, Directives,
@@ -433,6 +433,22 @@ pub fn wit_to_core_create_outcome(
             state: wit_to_core_state(&state, id),
         },
         wit::CreateOutcome::PartialSuccess(partial) => CoreCreateOutcome::partial_success(
+            wit_to_core_state(&partial.state, id),
+            partial.diagnostic.reason,
+            partial.diagnostic.missing_attributes,
+        ),
+    }
+}
+
+pub fn wit_to_core_update_outcome(
+    outcome: wit::UpdateOutcome,
+    id: &CoreResourceId,
+) -> CoreUpdateOutcome {
+    match outcome {
+        wit::UpdateOutcome::Success(state) => CoreUpdateOutcome::Success {
+            state: wit_to_core_state(&state, id),
+        },
+        wit::UpdateOutcome::PartialSuccess(partial) => CoreUpdateOutcome::partial_success(
             wit_to_core_state(&partial.state, id),
             partial.diagnostic.reason,
             partial.diagnostic.missing_attributes,
