@@ -414,7 +414,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
             managed: &resources_for_plan.clone(),
             compositions: &parsed.compositions,
             data_sources: &[],
-            current_states: &current_states,
+            current_states: &carina_core::resource::into_plan_input_map(current_states.clone()),
             remote_bindings: &remote_bindings,
             wait_aliases: &wait_aliases,
         },

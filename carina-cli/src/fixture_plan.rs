@@ -225,12 +225,13 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     // resolve through the composition layer to the managed sibling.
     let upstream_binding_names: std::collections::HashSet<&str> =
         remote_bindings.keys().map(String::as_str).collect();
+    let pre_apply_input_states = carina_core::resource::into_plan_input_map(current_states.clone());
     let plan_bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
         carina_core::binding_index::PreApplyInputs {
             managed: &resources,
             compositions: &parsed.compositions,
             data_sources: &data_sources,
-            current_states: &current_states,
+            current_states: &pre_apply_input_states,
             remote_bindings: &remote_bindings,
             wait_aliases: &wait_aliases,
         },
@@ -321,11 +322,12 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &resources,
         &data_sources_for_plan,
     );
+    let plan_input_states = carina_core::resource::into_plan_input_map(current_states.clone());
     let mut plan = create_plan(
         &resources,
         &data_sources_for_plan,
         &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_map(current_states.clone()),
+        &plan_input_states,
         &directives_map,
         wiring.schemas(),
         &saved_attrs,
@@ -337,7 +339,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     cascade_dependent_updates(
         &mut plan,
         &sorted_resources,
-        &carina_core::resource::into_plan_input_map(current_states.clone()),
+        &plan_input_states,
         wiring.schemas(),
     );
 

@@ -40,7 +40,7 @@
 //! ```
 
 use crate::parser::{BindingName, ResourceRef};
-use crate::resource::{Composition, Resource, ResourceId, State, Value};
+use crate::resource::{Composition, PlanInputState, Resource, ResourceId, State, Value};
 use crate::schema::{ResourceSchema, SchemaRegistry};
 use std::collections::HashMap;
 
@@ -445,7 +445,7 @@ pub struct PreApplyInputs<'a> {
     pub managed: &'a [Resource],
     pub compositions: &'a [Composition],
     pub data_sources: &'a [crate::resource::DataSource],
-    pub current_states: &'a HashMap<ResourceId, State>,
+    pub current_states: &'a HashMap<ResourceId, PlanInputState>,
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
     pub wait_aliases: &'a [WaitAliasSpec],
 }
@@ -496,7 +496,7 @@ impl ResolvedBindings {
     /// a data source or composition still snapshots the resolved attrs.
     fn build_managed_core(
         managed: &[Resource],
-        current_states: &HashMap<ResourceId, State>,
+        current_states: &HashMap<ResourceId, PlanInputState>,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
     ) -> Self {
         let mut by_name: HashMap<String, ResolvedBinding> = HashMap::new();
@@ -507,9 +507,9 @@ impl ResolvedBindings {
             };
             let mut merged: HashMap<String, Value> = resource.resolved_attributes();
             if let Some(state) = current_states.get(&resource.id)
-                && state.exists
+                && state.as_state().exists
             {
-                for (k, v) in &state.attributes {
+                for (k, v) in &state.as_state().attributes {
                     merged.entry(k.clone()).or_insert_with(|| v.clone());
                 }
             }
@@ -672,7 +672,7 @@ impl ResolvedBindings {
     pub(crate) fn layer_data_source_bindings(
         &mut self,
         data_sources: &[crate::resource::DataSource],
-        current_states: &HashMap<ResourceId, State>,
+        current_states: &HashMap<ResourceId, PlanInputState>,
     ) {
         for d in data_sources.iter() {
             let Some(binding_name) = d.binding.as_ref() else {
@@ -680,9 +680,9 @@ impl ResolvedBindings {
             };
             let mut merged = crate::resource::attrs_to_hashmap(&d.attributes);
             if let Some(state) = current_states.get(&d.id)
-                && state.exists
+                && state.as_state().exists
             {
-                for (k, v) in &state.attributes {
+                for (k, v) in &state.as_state().attributes {
                     merged.insert(k.clone(), v.clone());
                 }
             }
@@ -994,7 +994,10 @@ let vpc = aws.ec2.Vpc {
 #[cfg(test)]
 mod resolved_bindings_tests {
     use super::*;
-    use crate::resource::{ConcreteValue, DataSource, Resource, ResourceId, State, Value};
+    use crate::resource::{
+        ConcreteValue, DataSource, DeferredValue, PartialReadMarker, Resource, ResourceId, State,
+        UnknownReason, Value,
+    };
     use std::collections::BTreeSet;
 
     fn make_resource(name: &str, binding: Option<&str>, attrs: Vec<(&str, Value)>) -> Resource {
@@ -1021,7 +1024,7 @@ mod resolved_bindings_tests {
             managed: &resources,
             compositions: &[],
             data_sources: &[],
-            current_states: &states,
+            current_states: &crate::resource::into_plan_input_map(states.clone()),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -1078,7 +1081,7 @@ mod resolved_bindings_tests {
             managed: &resources,
             compositions: &[],
             data_sources: &[],
-            current_states: &states,
+            current_states: &crate::resource::into_plan_input_map(states.clone()),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -1101,6 +1104,71 @@ mod resolved_bindings_tests {
     }
 
     #[test]
+    fn pre_apply_materializes_partial_read_unknown_for_sibling_ref() {
+        let id_a = ResourceId::new("test.resource", "a");
+        let id_b = ResourceId::new("test.resource", "b");
+        let a = make_resource("a", Some("a"), vec![]);
+        let b = make_resource(
+            "b",
+            Some("b"),
+            vec![(
+                "target",
+                Value::resource_ref("a".to_string(), "dns_name".to_string(), vec![]),
+            )],
+        );
+        let mut partial_a =
+            State::existing(id_a.clone(), HashMap::new()).with_identifier("aws-id-A");
+        partial_a.partial_read = Some(PartialReadMarker {
+            detail: "read after create did not return dns_name".to_string(),
+            missing_attributes: ["dns_name".to_string()].into_iter().collect(),
+        });
+        let states: HashMap<ResourceId, State> = [
+            (id_a, partial_a),
+            (id_b.clone(), State::existing(id_b, HashMap::new())),
+        ]
+        .into_iter()
+        .collect();
+        let plan_input_states = crate::resource::into_plan_input_map(states);
+        let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let mut resources = vec![a, b];
+
+        let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
+            managed: &resources,
+            compositions: &[],
+            data_sources: &[],
+            current_states: &plan_input_states,
+            remote_bindings: &remote,
+            wait_aliases: &[],
+        });
+
+        let a_dns_name = resolved
+            .get("a")
+            .and_then(|attrs| attrs.get("dns_name"))
+            .expect("partial-read missing attribute must be materialized");
+        match a_dns_name {
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::PostCreateReadIncomplete {
+                detail,
+            })) => assert_eq!(detail, "read after create did not return dns_name"),
+            other => panic!("expected PostCreateReadIncomplete unknown, got {other:?}"),
+        }
+
+        crate::resolver::resolve_refs_with_state_and_remote(&mut resources, &resolved)
+            .expect("sibling ref should resolve through the binding view");
+        let target = resources[1]
+            .attributes
+            .get("target")
+            .expect("target attribute should remain present");
+        match target {
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::PostCreateReadIncomplete {
+                detail,
+            })) => assert_eq!(detail, "read after create did not return dns_name"),
+            other => {
+                panic!("expected sibling ref to resolve to partial-read unknown, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
     fn upstream_state_binding_is_first_class() {
         // Upstream-state bindings have no `Resource` and no `ResourceSchema`,
         // which is the case `BindingIndex` cannot represent.
@@ -1118,7 +1186,7 @@ mod resolved_bindings_tests {
             managed: &resources,
             compositions: &[],
             data_sources: &[],
-            current_states: &states,
+            current_states: &crate::resource::into_plan_input_map(states.clone()),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -1153,7 +1221,7 @@ mod resolved_bindings_tests {
             managed: &resources,
             compositions: &[],
             data_sources: &[],
-            current_states: &states,
+            current_states: &crate::resource::into_plan_input_map(states.clone()),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -1190,7 +1258,7 @@ mod resolved_bindings_tests {
             managed: &resources,
             compositions: &[],
             data_sources: &[],
-            current_states: &states,
+            current_states: &crate::resource::into_plan_input_map(states.clone()),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -1246,7 +1314,7 @@ mod resolved_bindings_tests {
             managed: &resources,
             compositions: &[],
             data_sources: &[],
-            current_states: &states,
+            current_states: &crate::resource::into_plan_input_map(states.clone()),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -1365,7 +1433,7 @@ mod resolved_bindings_tests {
             managed: &resources,
             compositions: &[],
             data_sources: &[],
-            current_states: &states,
+            current_states: &crate::resource::into_plan_input_map(states.clone()),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -1676,7 +1744,7 @@ mod resolved_bindings_tests {
             managed: &[],
             compositions: &[],
             data_sources: &[ds],
-            current_states: &states,
+            current_states: &crate::resource::into_plan_input_map(states.clone()),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
@@ -1749,7 +1817,7 @@ mod resolved_bindings_tests {
             managed: &[],
             compositions: &[],
             data_sources: &[ds],
-            current_states: &states,
+            current_states: &crate::resource::into_plan_input_map(states.clone()),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
@@ -1800,7 +1868,7 @@ mod resolved_bindings_tests {
             managed: &[],
             compositions: &[],
             data_sources: &[ds],
-            current_states: &states,
+            current_states: &crate::resource::into_plan_input_map(states.clone()),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });

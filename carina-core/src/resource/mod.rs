@@ -1964,12 +1964,6 @@ impl PlanInputState {
     }
 }
 
-impl AsRef<State> for PlanInputState {
-    fn as_ref(&self) -> &State {
-        &self.0
-    }
-}
-
 pub fn into_plan_input_map(
     states: HashMap<ResourceId, State>,
 ) -> HashMap<ResourceId, PlanInputState> {

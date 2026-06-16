@@ -1319,11 +1319,12 @@ async fn run_apply_locked(
     // referencing `<module_instance>.<attr>` chains through the
     // composition's attribute map to the managed sibling literal
     // (carina#3246).
+    let pre_apply_input_states = carina_core::resource::into_plan_input_map(current_states.clone());
     let mut bindings = ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
         managed: &sorted_resources,
         compositions: &pre_resolve_compositions,
         data_sources: &data_sources,
-        current_states: &current_states,
+        current_states: &pre_apply_input_states,
         remote_bindings: &remote_bindings,
         wait_aliases: &wait_aliases,
     });
@@ -2034,11 +2035,12 @@ async fn run_apply_from_plan_locked(
     // resolves through the data source's attribute map.
     let plan_compositions: &[carina_core::resource::Composition] = &plan_file.compositions;
     let plan_data_sources: &[carina_core::resource::DataSource] = &plan_file.data_sources;
+    let pre_apply_input_states = carina_core::resource::into_plan_input_map(current_states.clone());
     let mut bindings = ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
         managed: sorted_resources,
         compositions: plan_compositions,
         data_sources: plan_data_sources,
-        current_states: &current_states,
+        current_states: &pre_apply_input_states,
         remote_bindings: &upstream_snapshot,
         wait_aliases: &wait_aliases,
     });

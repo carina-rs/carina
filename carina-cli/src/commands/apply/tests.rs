@@ -1876,7 +1876,9 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
             managed: &sorted_resources.clone(),
             compositions: &[],
             data_sources: &[],
-            current_states: &pre_apply_current_states,
+            current_states: &carina_core::resource::into_plan_input_map(
+                pre_apply_current_states.clone(),
+            ),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         },

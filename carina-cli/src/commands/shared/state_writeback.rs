@@ -124,9 +124,9 @@ impl PostApplyStates {
         Self { map }
     }
 
-    /// Borrow the underlying map for callers that need to feed it
-    /// into a `PreApplyInputs.current_states` slot. Read-only — the
-    /// merge is finalized at construction time.
+    /// Borrow the underlying storage-form map. Callers that feed this
+    /// into binding resolution must convert it through
+    /// `into_plan_input_map` at that boundary.
     pub(crate) fn as_map(&self) -> &HashMap<ResourceId, carina_core::resource::State> {
         &self.map
     }
@@ -356,11 +356,13 @@ pub(crate) fn resolve_exports(
     // with `compositions: &[]` here, then call
     // `layer_compositions_post_apply` once the re-resolution is done.
     // (carina#3181, carina#3248)
+    let plan_input_states =
+        carina_core::resource::into_plan_input_map(post_apply_states.as_map().clone());
     let mut bindings = ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
         managed: sorted_resources,
         compositions: &[],
         data_sources,
-        current_states: post_apply_states.as_map(),
+        current_states: &plan_input_states,
         remote_bindings: &HashMap::new(),
         wait_aliases,
     });

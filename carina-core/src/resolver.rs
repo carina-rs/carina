@@ -8,9 +8,11 @@ use std::collections::HashMap;
 use indexmap::IndexMap;
 
 use crate::binding_index::ResolvedBindings;
+#[cfg(test)]
+use crate::resource::State;
 use crate::resource::{
-    Composition, ConcreteValue, DataSource, DeferredValue, InterpolationPart, Resource, ResourceId,
-    State, Value, contains_resource_ref, peel_secrets, rewrap_secrets,
+    Composition, ConcreteValue, DataSource, DeferredValue, InterpolationPart, PlanInputState,
+    Resource, ResourceId, Value, contains_resource_ref, peel_secrets, rewrap_secrets,
 };
 
 /// Resolve all ResourceRef values in resources using current state.
@@ -27,7 +29,7 @@ use crate::resource::{
 /// to their attributes. For example, `network -> { vpc -> { vpc_id -> "vpc-123" } }`.
 pub fn resolve_refs_with_state(
     resources: &mut [Resource],
-    current_states: &HashMap<ResourceId, State>,
+    current_states: &HashMap<ResourceId, PlanInputState>,
 ) -> Result<(), String> {
     let bindings =
         crate::binding_index::ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
@@ -573,11 +575,12 @@ mod tests {
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         wait_aliases: &[crate::binding_index::WaitAliasSpec],
     ) -> Result<(), String> {
+        let plan_input_states = crate::resource::into_plan_input_map(current_states.clone());
         let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
             managed: resources,
             compositions: &[],
             data_sources: &[],
-            current_states,
+            current_states: &plan_input_states,
             remote_bindings,
             wait_aliases,
         });
@@ -592,11 +595,12 @@ mod tests {
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         wait_aliases: &[crate::binding_index::WaitAliasSpec],
     ) -> Result<(), String> {
+        let plan_input_states = crate::resource::into_plan_input_map(current_states.clone());
         let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
             managed: resources,
             compositions: &[],
             data_sources: &[],
-            current_states,
+            current_states: &plan_input_states,
             remote_bindings,
             wait_aliases,
         });
@@ -1347,7 +1351,11 @@ mod tests {
             },
         );
 
-        resolve_refs_with_state(&mut resources, &current_states).unwrap();
+        resolve_refs_with_state(
+            &mut resources,
+            &crate::resource::into_plan_input_map(current_states.clone()),
+        )
+        .unwrap();
 
         // The subnet's vpc_id should be resolved from state
         assert_eq!(
@@ -1577,7 +1585,10 @@ mod tests {
         )];
 
         let current_states: HashMap<ResourceId, State> = HashMap::new();
-        let result = resolve_refs_with_state(&mut resources, &current_states);
+        let result = resolve_refs_with_state(
+            &mut resources,
+            &crate::resource::into_plan_input_map(current_states.clone()),
+        );
         assert!(
             result.is_err(),
             "Expected error from resolve_refs_with_state, got Ok"

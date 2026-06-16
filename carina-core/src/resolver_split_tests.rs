@@ -144,7 +144,7 @@ fn resolve_managed_refs_falls_through_state_attributes() {
             managed: &managed,
             compositions: &[],
             data_sources: &[],
-            current_states: &current_states,
+            current_states: &crate::resource::into_plan_input_map(current_states.clone()),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
