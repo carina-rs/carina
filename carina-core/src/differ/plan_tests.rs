@@ -59,7 +59,10 @@ impl crate::provider::Provider for HintProvider {
         _id: &ResourceId,
         _identifier: &str,
         _request: crate::provider::UpdateRequest,
-    ) -> crate::provider::BoxFuture<'_, crate::provider::ProviderResult<State>> {
+    ) -> crate::provider::BoxFuture<
+        '_,
+        crate::provider::ProviderResult<crate::provider::UpdateOutcome>,
+    > {
         Box::pin(async { panic!("unexpected update") })
     }
 

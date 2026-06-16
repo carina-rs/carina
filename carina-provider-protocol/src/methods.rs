@@ -89,7 +89,7 @@ pub struct UpdateParams {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateResult {
-    pub state: State,
+    pub outcome: UpdateOutcome,
 }
 
 // -- delete --

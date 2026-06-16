@@ -782,7 +782,7 @@ mod tests {
             _id: &ResourceId,
             _identifier: &str,
             _request: UpdateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("unused")) })
         }
 

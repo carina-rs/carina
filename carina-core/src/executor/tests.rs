@@ -60,7 +60,7 @@ fn validation_deferred_for_expression() -> crate::parser::DeferredForExpression 
 struct MockProvider {
     create_results: Mutex<Vec<ProviderResult<crate::provider::CreateOutcome>>>,
     delete_results: Mutex<Vec<ProviderResult<()>>>,
-    update_results: Mutex<Vec<ProviderResult<State>>>,
+    update_results: Mutex<Vec<ProviderResult<crate::provider::UpdateOutcome>>>,
     read_results: Mutex<Vec<ProviderResult<State>>>,
     /// Records calls in order: ("create"|"delete"|"update"|"read", resource_id_string)
     call_log: Arc<Mutex<Vec<(String, String)>>>,
@@ -102,6 +102,13 @@ impl MockProvider {
     }
 
     fn push_update(&self, result: ProviderResult<State>) {
+        self.update_results
+            .lock()
+            .unwrap()
+            .push(result.map(|state| crate::provider::UpdateOutcome::Success { state }));
+    }
+
+    fn push_update_outcome(&self, result: ProviderResult<crate::provider::UpdateOutcome>) {
         self.update_results.lock().unwrap().push(result);
     }
 
@@ -169,7 +176,7 @@ impl Provider for MockProvider {
         id: &ResourceId,
         _identifier: &str,
         request: UpdateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
         let id_str = id.to_string();
         self.call_log
             .lock()
@@ -945,7 +952,7 @@ impl Provider for DelayedCountingProvider {
         id: &ResourceId,
         _identifier: &str,
         _request: UpdateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
         let id = id.clone();
         let started = self.started.clone();
         Box::pin(async move {
@@ -958,7 +965,9 @@ impl Provider for DelayedCountingProvider {
                 "finalized".to_string(),
                 Value::Concrete(ConcreteValue::Bool(true)),
             );
-            Ok(State::existing(id, attrs).with_identifier("finalized-id"))
+            Ok(crate::provider::UpdateOutcome::Success {
+                state: State::existing(id, attrs).with_identifier("finalized-id"),
+            })
         })
     }
 
@@ -1045,7 +1054,7 @@ impl Provider for PendingWaitProvider {
         _id: &ResourceId,
         _identifier: &str,
         _request: UpdateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
         Box::pin(async { Err(ProviderError::internal("update not used")) })
     }
 
@@ -1672,7 +1681,7 @@ async fn partial_create_records_state_and_diagnostic() {
     let provider = MockProvider::new();
     let resource = make_resource("a", &[]);
     let rid = resource.id.clone();
-    let diagnostic = crate::provider::PartialCreateDiagnostic::new(
+    let diagnostic = crate::provider::PartialReadDiagnostic::new(
         "mock partial create".to_string(),
         vec!["computed".to_string()],
     )
@@ -2783,7 +2792,11 @@ async fn test_cbd_cascade_update_patch_uses_plan_time_comparison_semantics() {
     });
 
     provider.push_create(Ok(ok_state(&replace_id)));
-    provider.push_update(Ok(ok_state(&cascade_id)));
+    provider.push_update_outcome(Ok(crate::provider::UpdateOutcome::partial_success(
+        ok_state(&cascade_id),
+        "cascade read incomplete".to_string(),
+        vec!["description".to_string()],
+    )));
     provider.push_delete(Ok(()));
 
     let input = ExecutionInput {
@@ -2802,7 +2815,14 @@ async fn test_cbd_cascade_update_patch_uses_plan_time_comparison_semantics() {
     let observer = MockObserver::new();
     let result =
         completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
-    assert_eq!(result.success_count, 1);
+    assert_eq!(result.success_count, 0);
+    assert_eq!(result.partial_count, 1);
+    assert_eq!(result.partial_diagnostics.len(), 1);
+    assert_eq!(result.partial_diagnostics[0].0, cascade_id);
+    assert_eq!(
+        result.partial_diagnostics[0].1.reason(),
+        "cascade read incomplete"
+    );
 
     let reqs = provider.captured_update_requests();
     assert_eq!(reqs.len(), 1);
@@ -3417,7 +3437,7 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
             _id: &ResourceId,
             _identifier: &str,
             _request: UpdateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("not implemented")) })
         }
 
@@ -3556,7 +3576,7 @@ impl Provider for DelayedUpdateProvider {
         id: &ResourceId,
         identifier: &str,
         request: UpdateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
         let id = id.clone();
         let identifier = identifier.to_string();
         let delay = self.delay;
@@ -3580,7 +3600,9 @@ impl Provider for DelayedUpdateProvider {
                     Value::Concrete(ConcreteValue::String("provider-violated-id".to_string())),
                 );
             }
-            Ok(State::existing(id, attrs).with_identifier(&identifier))
+            Ok(crate::provider::UpdateOutcome::Success {
+                state: State::existing(id, attrs).with_identifier(&identifier),
+            })
         })
     }
 
@@ -4220,7 +4242,7 @@ impl Provider for RecordingMockProvider {
         _id: &ResourceId,
         _identifier: &str,
         _request: UpdateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
         Box::pin(async { Err(ProviderError::internal("not implemented")) })
     }
 
@@ -5184,7 +5206,7 @@ impl Provider for IdentifierAwareProvider {
         _id: &ResourceId,
         _identifier: &str,
         _request: UpdateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
         Box::pin(async move { Err(ProviderError::api_error("update not expected")) })
     }
 
@@ -5819,7 +5841,7 @@ async fn expand_deferred_for_cancelled_after_upstream_create_reports_skipped() {
             _id: &ResourceId,
             _identifier: &str,
             _request: UpdateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
             unreachable!("test does not update")
         }
 

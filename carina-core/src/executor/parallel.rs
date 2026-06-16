@@ -996,6 +996,7 @@ pub(super) async fn execute_effects_sequential(
                 state,
                 resource_id,
                 diagnostic,
+                cascade_diagnostics,
                 resolved_attrs,
                 binding,
                 refreshes,
@@ -1010,10 +1011,18 @@ pub(super) async fn execute_effects_sequential(
                     }
                 }
                 if success {
+                    let mut recorded_partial = false;
                     if let Some(diagnostic) = diagnostic {
                         partial_count += 1;
                         partial_diagnostics.push((resource_id.clone(), diagnostic));
-                    } else {
+                        recorded_partial = true;
+                    }
+                    for (id, diagnostic) in cascade_diagnostics {
+                        partial_count += 1;
+                        partial_diagnostics.push((id, diagnostic));
+                        recorded_partial = true;
+                    }
+                    if !recorded_partial {
                         success_count += 1;
                     }
                     if let Some((id, overrides)) = permanent_overrides {
@@ -1255,7 +1264,7 @@ mod tests {
             _id: &ResourceId,
             _identifier: &str,
             _request: UpdateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("update not used")) })
         }
 

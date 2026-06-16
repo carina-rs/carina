@@ -549,9 +549,13 @@ mod tests {
             id: &ResourceId,
             _identifier: &str,
             _request: UpdateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
             let id = id.clone();
-            Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
+            Box::pin(async move {
+                Ok(crate::provider::UpdateOutcome::Success {
+                    state: State::existing(id, HashMap::new()),
+                })
+            })
         }
 
         fn delete(

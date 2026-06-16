@@ -10,8 +10,8 @@ use crate::differ::{
 use crate::effect::Effect;
 use crate::executor::UnresolvedResource;
 use crate::provider::{
-    CreateRequest, DeleteRequest, PartialCreateDiagnostic, PatchOp, PatchOpKind, Provider,
-    UpdatePatch, UpdateRequest, build_update_patch,
+    CreateRequest, DeleteRequest, PartialReadDiagnostic, PatchOp, PatchOpKind, Provider,
+    UpdateOutcome, UpdatePatch, UpdateRequest, build_update_patch,
 };
 use crate::resource::{ConcreteValue, ResolvedResource, Resource, ResourceId, State, Value};
 use crate::schema::SchemaRegistry;
@@ -102,7 +102,8 @@ pub(super) enum SingleEffectResult {
         success: bool,
         state: Option<State>,
         resource_id: ResourceId,
-        diagnostic: Option<PartialCreateDiagnostic>,
+        diagnostic: Option<PartialReadDiagnostic>,
+        cascade_diagnostics: Vec<(ResourceId, PartialReadDiagnostic)>,
         resolved_attrs: Option<HashMap<String, Value>>,
         binding: Option<String>,
         refreshes: Vec<(ResourceId, String)>,
@@ -186,7 +187,7 @@ pub(super) async fn execute_cbd_replace_parallel(
         .await
     {
         Ok(outcome) => {
-            let diagnostic = outcome.diagnostic().cloned();
+            let mut diagnostic = outcome.diagnostic().cloned();
             let state = outcome.into_state_for_writeback();
             // Build a local bindings clone for cascade resolution
             let mut local_bindings = ctx.bindings.clone();
@@ -194,6 +195,7 @@ pub(super) async fn execute_cbd_replace_parallel(
 
             // Execute cascading updates
             let mut cascade_failed = false;
+            let mut cascade_diagnostics = Vec::new();
             for cascade in ctx.cascading_updates {
                 let resolved_to = match resolve_resource(&cascade.to, &local_bindings, ctx.pipeline)
                     .await
@@ -226,7 +228,17 @@ pub(super) async fn execute_cbd_replace_parallel(
                     .update(&cascade.id, cascade_identifier, cascade_request)
                     .await
                 {
-                    Ok(cascade_state) => {
+                    Ok(cascade_outcome) => {
+                        let cascade_diagnostic = match &cascade_outcome {
+                            UpdateOutcome::Success { .. } => None,
+                            UpdateOutcome::PartialSuccess { diagnostic, .. } => {
+                                Some(diagnostic.clone())
+                            }
+                        };
+                        let cascade_state = cascade_outcome.into_state_for_writeback();
+                        if let Some(diagnostic) = cascade_diagnostic {
+                            cascade_diagnostics.push((cascade.id.clone(), diagnostic));
+                        }
                         observer
                             .on_event(&ExecutionEvent::CascadeUpdateSucceeded { id: &cascade.id });
                         local_bindings.record_applied(
@@ -258,6 +270,7 @@ pub(super) async fn execute_cbd_replace_parallel(
                     state: None,
                     resource_id: ctx.to.id.clone(),
                     diagnostic,
+                    cascade_diagnostics,
                     resolved_attrs: None,
                     binding: ctx.effect.binding_name(),
                     refreshes,
@@ -299,16 +312,26 @@ pub(super) async fn execute_cbd_replace_parallel(
                             .update(ctx.id, new_identifier, rename_request)
                             .await
                         {
-                            Ok(renamed_state) => {
+                            Ok(rename_outcome) => {
                                 observer.on_event(&ExecutionEvent::RenameSucceeded {
                                     id: ctx.id,
                                     from: &temp.temporary_value,
                                     to: &temp.original_value,
                                 });
-                                final_state =
-                                    diagnostic.clone().map_or(renamed_state.clone(), |d| {
-                                        d.into_state_for_writeback(renamed_state)
-                                    });
+                                let rename_diagnostic = match &rename_outcome {
+                                    UpdateOutcome::Success { .. } => None,
+                                    UpdateOutcome::PartialSuccess { diagnostic, .. } => {
+                                        Some(diagnostic.clone())
+                                    }
+                                };
+                                final_state = rename_outcome.into_state_for_writeback();
+                                if diagnostic.is_none() {
+                                    diagnostic = rename_diagnostic;
+                                } else if let Some(rename_diagnostic) = rename_diagnostic {
+                                    cascade_diagnostics.push((ctx.id.clone(), rename_diagnostic));
+                                } else if let Some(diagnostic) = diagnostic.clone() {
+                                    final_state = diagnostic.into_state_for_writeback(final_state);
+                                }
                             }
                             Err(e) => {
                                 let error_str = e.to_string();
@@ -339,6 +362,7 @@ pub(super) async fn execute_cbd_replace_parallel(
                             state: Some(final_state),
                             resource_id: ctx.to.id.clone(),
                             diagnostic,
+                            cascade_diagnostics,
                             resolved_attrs: Some(resolved_attrs.clone()),
                             binding: ctx.effect.binding_name(),
                             refreshes,
@@ -367,6 +391,7 @@ pub(super) async fn execute_cbd_replace_parallel(
                             state: Some(final_state),
                             resource_id: ctx.to.id.clone(),
                             diagnostic,
+                            cascade_diagnostics,
                             resolved_attrs: Some(resolved_attrs),
                             binding: ctx.to.binding.clone(),
                             refreshes,
@@ -392,6 +417,7 @@ pub(super) async fn execute_cbd_replace_parallel(
                         state: None,
                         resource_id: ctx.to.id.clone(),
                         diagnostic,
+                        cascade_diagnostics,
                         resolved_attrs: None,
                         binding: ctx.effect.binding_name(),
                         refreshes,
@@ -414,6 +440,7 @@ pub(super) async fn execute_cbd_replace_parallel(
                 state: None,
                 resource_id: ctx.to.id.clone(),
                 diagnostic: None,
+                cascade_diagnostics: Vec::new(),
                 resolved_attrs: None,
                 binding: ctx.effect.binding_name(),
                 refreshes,
@@ -470,6 +497,7 @@ pub(super) async fn execute_dbd_replace_parallel(
                         state: None,
                         resource_id: ctx.to.id.clone(),
                         diagnostic: None,
+                        cascade_diagnostics: Vec::new(),
                         resolved_attrs: None,
                         binding: ctx.effect.binding_name(),
                         refreshes,
@@ -498,6 +526,7 @@ pub(super) async fn execute_dbd_replace_parallel(
                             state: Some(state),
                             resource_id: ctx.to.id.clone(),
                             diagnostic: Some(diagnostic),
+                            cascade_diagnostics: Vec::new(),
                             resolved_attrs: Some(resolved_attrs),
                             binding: ctx.to.binding.clone(),
                             refreshes,
@@ -516,6 +545,7 @@ pub(super) async fn execute_dbd_replace_parallel(
                             state: Some(state),
                             resource_id: ctx.to.id.clone(),
                             diagnostic: None,
+                            cascade_diagnostics: Vec::new(),
                             resolved_attrs: Some(resolved_attrs),
                             binding: ctx.to.binding.clone(),
                             refreshes,
@@ -538,6 +568,7 @@ pub(super) async fn execute_dbd_replace_parallel(
                         state: None,
                         resource_id: ctx.to.id.clone(),
                         diagnostic: None,
+                        cascade_diagnostics: Vec::new(),
                         resolved_attrs: None,
                         binding: ctx.effect.binding_name(),
                         refreshes,
@@ -561,6 +592,7 @@ pub(super) async fn execute_dbd_replace_parallel(
                 state: None,
                 resource_id: ctx.to.id.clone(),
                 diagnostic: None,
+                cascade_diagnostics: Vec::new(),
                 resolved_attrs: None,
                 binding: ctx.effect.binding_name(),
                 refreshes,

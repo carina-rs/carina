@@ -91,7 +91,7 @@ impl Provider for TestProvider {
         _id: &ResourceId,
         _identifier: &str,
         _request: carina_core::provider::UpdateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
         Box::pin(async { Err(ProviderError::internal("unexpected update")) })
     }
 
@@ -1679,7 +1679,7 @@ impl Provider for RecordingProvider {
         id: &ResourceId,
         _identifier: &str,
         request: carina_core::provider::UpdateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
         // Reconstruct a Resource view of the desired post-update state for
         // existing tests that introspect the recorded `to`.
         let mut attrs = request.from.attributes.clone();
@@ -1707,7 +1707,7 @@ impl Provider for RecordingProvider {
         }
         self.update_calls.lock().unwrap().push((id.to_string(), to));
         let state = State::existing(id.clone(), attrs).with_identifier("subnet-123");
-        Box::pin(async move { Ok(state) })
+        Box::pin(async move { Ok(carina_core::provider::UpdateOutcome::Success { state }) })
     }
 
     fn delete(
@@ -1768,7 +1768,7 @@ impl Provider for RenameFailProvider {
         _id: &ResourceId,
         _identifier: &str,
         _request: carina_core::provider::UpdateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
         Box::pin(async { Err(ProviderError::api_error("rename failed: API error")) })
     }
 

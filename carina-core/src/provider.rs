@@ -496,20 +496,32 @@ pub enum CreateOutcome {
     /// Create completed but the provider could not fully observe state.
     PartialSuccess {
         state: State,
-        diagnostic: PartialCreateDiagnostic,
+        diagnostic: PartialReadDiagnostic,
     },
 }
 
-/// Diagnostic details for a partial create.
+/// Result of a provider update operation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PartialCreateDiagnostic {
+pub enum UpdateOutcome {
+    /// Update completed and the returned state is complete.
+    Success { state: State },
+    /// Update completed but the provider could not fully observe state.
+    PartialSuccess {
+        state: State,
+        diagnostic: PartialReadDiagnostic,
+    },
+}
+
+/// Diagnostic details for a partial post-mutation read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PartialReadDiagnostic {
     reason: String,
     missing_attributes: Vec<String>,
 }
 
 impl CreateOutcome {
     pub fn partial_success(state: State, reason: String, missing_attributes: Vec<String>) -> Self {
-        match PartialCreateDiagnostic::new(reason, missing_attributes) {
+        match PartialReadDiagnostic::new(reason, missing_attributes) {
             Some(diagnostic) => CreateOutcome::PartialSuccess { state, diagnostic },
             None => CreateOutcome::Success { state },
         }
@@ -525,7 +537,7 @@ impl CreateOutcome {
         }
     }
 
-    pub fn diagnostic(&self) -> Option<&PartialCreateDiagnostic> {
+    pub fn diagnostic(&self) -> Option<&PartialReadDiagnostic> {
         match self {
             CreateOutcome::Success { .. } => None,
             CreateOutcome::PartialSuccess { diagnostic, .. } => Some(diagnostic),
@@ -533,7 +545,33 @@ impl CreateOutcome {
     }
 }
 
-impl PartialCreateDiagnostic {
+impl UpdateOutcome {
+    pub fn partial_success(state: State, reason: String, missing_attributes: Vec<String>) -> Self {
+        match PartialReadDiagnostic::new(reason, missing_attributes) {
+            Some(diagnostic) => UpdateOutcome::PartialSuccess { state, diagnostic },
+            None => UpdateOutcome::Success { state },
+        }
+    }
+
+    /// Consume the outcome and produce a State ready for writeback.
+    pub fn into_state_for_writeback(self) -> State {
+        match self {
+            UpdateOutcome::Success { state } => state,
+            UpdateOutcome::PartialSuccess { state, diagnostic } => {
+                diagnostic.into_state_for_writeback(state)
+            }
+        }
+    }
+
+    pub fn diagnostic(&self) -> Option<&PartialReadDiagnostic> {
+        match self {
+            UpdateOutcome::Success { .. } => None,
+            UpdateOutcome::PartialSuccess { diagnostic, .. } => Some(diagnostic),
+        }
+    }
+}
+
+impl PartialReadDiagnostic {
     pub fn new(reason: String, missing_attributes: Vec<String>) -> Option<Self> {
         if missing_attributes.is_empty() {
             None
@@ -655,7 +693,7 @@ pub trait Provider: Send + Sync {
         id: &ResourceId,
         identifier: &str,
         request: UpdateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>>;
+    ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>>;
 
     /// Delete an existing resource. `identifier` is the cloud-side
     /// internal ID (e.g. `vpc-xxx`).
@@ -978,7 +1016,7 @@ impl Provider for ProviderRouter {
         id: &ResourceId,
         identifier: &str,
         request: UpdateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         match self.get_provider_or_error(id) {
             Ok(provider) => provider.update(id, identifier, request),
             Err(e) => Box::pin(async move { Err(e) }),
@@ -1404,7 +1442,7 @@ impl Provider for Box<dyn Provider> {
         id: &ResourceId,
         identifier: &str,
         request: UpdateRequest,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         (**self).update(id, identifier, request)
     }
 
@@ -1485,7 +1523,7 @@ mod tests {
             id: &ResourceId,
             _identifier: &str,
             request: UpdateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
             let id = id.clone();
             // Apply the patch on top of `from` so the test sees the
             // user-specified changes round-tripped into State.
@@ -1502,7 +1540,11 @@ mod tests {
                     }
                 }
             }
-            Box::pin(async move { Ok(State::existing(id, attrs)) })
+            Box::pin(async move {
+                Ok(UpdateOutcome::Success {
+                    state: State::existing(id, attrs),
+                })
+            })
         }
 
         fn delete(
@@ -1531,7 +1573,7 @@ mod tests {
     fn create_outcome_exposes_state_and_diagnostic() {
         let id = ResourceId::new("test", "example");
         let state = State::existing(id, HashMap::new()).with_identifier("mock-id");
-        let diagnostic = PartialCreateDiagnostic::new(
+        let diagnostic = PartialReadDiagnostic::new(
             "mock partial create".to_string(),
             vec!["dns_name".to_string()],
         )
@@ -1631,7 +1673,7 @@ mod tests {
             _id: &ResourceId,
             _identifier: &str,
             _request: UpdateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("not supported")) })
         }
 
@@ -2230,7 +2272,11 @@ mod tests {
             from,
             patch: UpdatePatch::default(),
         };
-        let state = router.update(&id, "mock-id-123", request).await.unwrap();
+        let state = router
+            .update(&id, "mock-id-123", request)
+            .await
+            .unwrap()
+            .into_state_for_writeback();
         assert!(state.exists);
     }
 
@@ -2294,7 +2340,7 @@ mod tests {
             _id: &ResourceId,
             _identifier: &str,
             _request: UpdateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("not supported")) })
         }
         fn delete(
@@ -2642,9 +2688,13 @@ mod tests {
                 id: &ResourceId,
                 _identifier: &str,
                 _request: UpdateRequest,
-            ) -> BoxFuture<'_, ProviderResult<State>> {
+            ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
                 let id = id.clone();
-                Box::pin(async move { Ok(State::not_found(id)) })
+                Box::pin(async move {
+                    Ok(UpdateOutcome::Success {
+                        state: State::not_found(id),
+                    })
+                })
             }
 
             fn delete(

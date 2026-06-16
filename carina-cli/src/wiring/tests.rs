@@ -2297,9 +2297,13 @@ mod read_with_retry_identifier_tests {
             id: &ResourceId,
             _identifier: &str,
             _request: carina_core::provider::UpdateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
             let id = id.clone();
-            Box::pin(async move { Ok(State::not_found(id)) })
+            Box::pin(async move {
+                Ok(carina_core::provider::UpdateOutcome::Success {
+                    state: State::not_found(id),
+                })
+            })
         }
 
         fn delete(
@@ -3526,9 +3530,13 @@ mod wait_until_enum_alias {
             id: &ResourceId,
             _i: &str,
             _r: carina_core::provider::UpdateRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
             let id = id.clone();
-            Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
+            Box::pin(async move {
+                Ok(carina_core::provider::UpdateOutcome::Success {
+                    state: State::existing(id, HashMap::new()),
+                })
+            })
         }
         fn delete(
             &self,

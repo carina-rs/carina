@@ -240,7 +240,28 @@ macro_rules! export_provider {
                         wit_types::CreateOutcome::PartialSuccess(
                             wit_types::CreatePartialSuccess {
                                 state: proto_to_wit_state(state),
-                                diagnostic: wit_types::PartialCreateDiagnostic {
+                                diagnostic: wit_types::PartialReadDiagnostic {
+                                    reason: diagnostic.reason.clone(),
+                                    missing_attributes: diagnostic.missing_attributes.clone(),
+                                },
+                            },
+                        )
+                    }
+                }
+            }
+
+            fn proto_to_wit_update_outcome(
+                outcome: &proto::UpdateOutcome,
+            ) -> wit_types::UpdateOutcome {
+                match outcome {
+                    proto::UpdateOutcome::Success { state } => {
+                        wit_types::UpdateOutcome::Success(proto_to_wit_state(state))
+                    }
+                    proto::UpdateOutcome::PartialSuccess { state, diagnostic } => {
+                        wit_types::UpdateOutcome::PartialSuccess(
+                            wit_types::UpdatePartialSuccess {
+                                state: proto_to_wit_state(state),
+                                diagnostic: wit_types::PartialReadDiagnostic {
                                     reason: diagnostic.reason.clone(),
                                     missing_attributes: diagnostic.missing_attributes.clone(),
                                 },
@@ -485,7 +506,7 @@ macro_rules! export_provider {
                     id: wit_types::ResourceId,
                     identifier: String,
                     request: wit_types::UpdateRequest,
-                ) -> Result<wit_types::State, wit_types::ProviderError> {
+                ) -> Result<wit_types::UpdateOutcome, wit_types::ProviderError> {
                     let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
                     let proto_request = wit_to_proto_update_request(request, &proto_id);
@@ -495,7 +516,7 @@ macro_rules! export_provider {
                         &identifier,
                         proto_request,
                     ) {
-                        Ok(state) => Ok(proto_to_wit_state(&state)),
+                        Ok(outcome) => Ok(proto_to_wit_update_outcome(&outcome)),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
@@ -814,7 +835,28 @@ macro_rules! export_provider {
                         wit_types::CreateOutcome::PartialSuccess(
                             wit_types::CreatePartialSuccess {
                                 state: proto_to_wit_state(state),
-                                diagnostic: wit_types::PartialCreateDiagnostic {
+                                diagnostic: wit_types::PartialReadDiagnostic {
+                                    reason: diagnostic.reason.clone(),
+                                    missing_attributes: diagnostic.missing_attributes.clone(),
+                                },
+                            },
+                        )
+                    }
+                }
+            }
+
+            fn proto_to_wit_update_outcome(
+                outcome: &proto::UpdateOutcome,
+            ) -> wit_types::UpdateOutcome {
+                match outcome {
+                    proto::UpdateOutcome::Success { state } => {
+                        wit_types::UpdateOutcome::Success(proto_to_wit_state(state))
+                    }
+                    proto::UpdateOutcome::PartialSuccess { state, diagnostic } => {
+                        wit_types::UpdateOutcome::PartialSuccess(
+                            wit_types::UpdatePartialSuccess {
+                                state: proto_to_wit_state(state),
+                                diagnostic: wit_types::PartialReadDiagnostic {
                                     reason: diagnostic.reason.clone(),
                                     missing_attributes: diagnostic.missing_attributes.clone(),
                                 },
@@ -1061,7 +1103,7 @@ macro_rules! export_provider {
                     id: wit_types::ResourceId,
                     identifier: String,
                     request: wit_types::UpdateRequest,
-                ) -> Result<wit_types::State, wit_types::ProviderError> {
+                ) -> Result<wit_types::UpdateOutcome, wit_types::ProviderError> {
                     let provider = get_provider().lock().unwrap();
                     let proto_id = wit_to_proto_resource_id(&id);
                     let proto_request = wit_to_proto_update_request(request, &proto_id);
@@ -1071,7 +1113,7 @@ macro_rules! export_provider {
                         &identifier,
                         proto_request,
                     ) {
-                        Ok(state) => Ok(proto_to_wit_state(&state)),
+                        Ok(outcome) => Ok(proto_to_wit_update_outcome(&outcome)),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }

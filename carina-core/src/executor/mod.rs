@@ -31,7 +31,7 @@ use std::time::Duration;
 use crate::binding_index::ResolvedBindings;
 use crate::effect::Effect;
 use crate::parser::ProviderConfig;
-use crate::provider::{PartialCreateDiagnostic, Provider, ProviderNormalizer};
+use crate::provider::{PartialReadDiagnostic, Provider, ProviderNormalizer};
 use crate::resource::{ResolvedResource, Resource, ResourceId, State};
 use crate::value::SerializationError;
 use crate::wait::WaitObservation;
@@ -87,7 +87,7 @@ pub struct ExecutionResult {
     pub success_count: usize,
     pub failure_count: usize,
     pub partial_count: usize,
-    pub partial_diagnostics: Vec<(ResourceId, PartialCreateDiagnostic)>,
+    pub partial_diagnostics: Vec<(ResourceId, PartialReadDiagnostic)>,
     pub skip_count: usize,
     pub applied_states: std::collections::HashMap<ResourceId, State>,
     pub runtime_synthesized_resources: Vec<Resource>,
@@ -159,7 +159,7 @@ pub enum ExecutionEvent<'a> {
     EffectPartiallySucceeded {
         effect: &'a Effect,
         state: &'a State,
-        diagnostic: &'a PartialCreateDiagnostic,
+        diagnostic: &'a PartialReadDiagnostic,
         duration: Duration,
         progress: ProgressInfo,
     },
