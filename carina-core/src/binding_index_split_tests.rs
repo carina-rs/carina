@@ -89,7 +89,7 @@ fn pre_apply_merges_state_for_missing_dsl_keys() {
         managed: &[m],
         compositions: &[],
         data_sources: &[],
-        current_states: &current_states,
+        current_states: &crate::resource::into_plan_input_map(current_states.clone()),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });

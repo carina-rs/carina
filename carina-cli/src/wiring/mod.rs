@@ -1413,7 +1413,7 @@ pub fn expand_same_config_deferred_for<E: Clone>(
         managed: sorted_resources,
         compositions: &parsed.compositions,
         data_sources: &parsed.data_sources,
-        current_states,
+        current_states: &carina_core::resource::into_plan_input_map(current_states.clone()),
         remote_bindings,
         wait_aliases,
     })
@@ -2102,12 +2102,13 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     // surviving as an unresolved `ResourceRef` (carina#3246).
     let upstream_binding_names: std::collections::HashSet<&str> =
         remote_bindings.keys().map(String::as_str).collect();
+    let pre_apply_input_states = carina_core::resource::into_plan_input_map(current_states.clone());
     let plan_bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
         carina_core::binding_index::PreApplyInputs {
             managed: &resources,
             compositions: &parsed.compositions,
             data_sources: &data_sources,
-            current_states: &current_states,
+            current_states: &pre_apply_input_states,
             remote_bindings,
             wait_aliases: &wait_aliases,
         },
@@ -2997,7 +2998,7 @@ pub(crate) fn resolve_data_source_refs_for_refresh(
         managed,
         compositions,
         data_sources,
-        current_states,
+        current_states: &carina_core::resource::into_plan_input_map(current_states.clone()),
         remote_bindings,
         wait_aliases,
     });

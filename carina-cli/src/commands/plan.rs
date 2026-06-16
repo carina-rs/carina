@@ -885,12 +885,13 @@ pub(crate) fn resolve_export_values_for_display(
     // carina#3248: build the unified pre-apply bindings view so an
     // export referencing `<module_instance>.<attr>` chains through the
     // composition to the managed sibling literal (carina#3246).
+    let plan_input_states = carina_core::resource::into_plan_input_map(current_states.clone());
     let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
         carina_core::binding_index::PreApplyInputs {
             managed: resources,
             compositions,
             data_sources,
-            current_states,
+            current_states: &plan_input_states,
             remote_bindings: &HashMap::new(),
             wait_aliases,
         },
