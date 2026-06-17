@@ -2,7 +2,7 @@
 source: carina-tui/src/tui_snapshot_tests.rs
 expression: output
 ---
-┌ Plan (Plan: 0 to create, 0 to update, 0 to delete) ──────────────────────────────────────────────────────────────────┐
+┌ Plan (Plan: 0 to create, 0 to update, 0 to delete, 1 to move) ───────────────────────────────────────────────────────┐
 │-> ec2.Vpc new_vpc                                                                                                    │
 │                                                                                                                      │
 │                                                                                                                      │

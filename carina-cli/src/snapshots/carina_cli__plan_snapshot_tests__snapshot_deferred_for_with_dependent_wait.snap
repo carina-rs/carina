@@ -1,0 +1,20 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+assertion_line: 2028
+expression: output
+---
+Execution Plan:
+
+  + aws.acm.Certificate cert
+      domain_name: "registry.example.com"
+      validation_method: "DNS"
+        │
+        └─ +/- aws.route53.RecordSet [from cert.domain_validation_options]
+              - destroying validation_records[0]
+              + replaced by deferred for-loop, count known after cert applies
+              │
+              └─ + aws.acm.CertificateValidation 
+                    certificate_arn: "arn:aws:acm:us-east-1:123456789012:certificate/example"
+                    validation_record_id: "known-after-validation-records"
+
+Plan: 2 to add (+1 deferred, count unknown), 0 to change, 1 to destroy.

@@ -1184,6 +1184,9 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
             referenced.insert(dep.clone());
         }
     }
+    for deferred in &parsed.deferred_for_expressions {
+        referenced.insert(deferred.iterable_binding.clone());
+    }
     for call in &parsed.module_calls {
         for value in call.arguments.values() {
             collect_dependencies(value, &mut referenced);

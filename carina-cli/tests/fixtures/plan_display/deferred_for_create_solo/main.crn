@@ -1,0 +1,21 @@
+# Same-config deferred for-expression whose iterable is known only after
+# the upstream Certificate create has applied.
+
+provider aws {
+  region = "us-east-1"
+}
+
+let cert = aws.acm.Certificate {
+  domain_name       = "registry.example.com"
+  validation_method = "DNS"
+}
+
+let validation_records = for opt in cert.domain_validation_options {
+  aws.route53.RecordSet {
+    hosted_zone_id   = "Z123"
+    name             = opt.resource_record.name
+    type             = opt.resource_record.type
+    ttl              = 60
+    resource_records = [opt.resource_record.value]
+  }
+}

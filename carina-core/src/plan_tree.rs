@@ -14,6 +14,78 @@ use crate::plan::Plan;
 use crate::resource::{ConcreteValue, DeferredValue, Value};
 use crate::utils::enum_display_value;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChildRenderItem {
+    Normal(usize),
+    PairedDeferredFor {
+        expand_idx: usize,
+        delete_indices: Vec<usize>,
+    },
+}
+
+pub fn child_render_items(effects: &[Effect], child_indices: &[usize]) -> Vec<ChildRenderItem> {
+    let mut paired_deletes = HashSet::new();
+    let mut pairs: HashMap<usize, Vec<usize>> = HashMap::new();
+
+    for &expand_idx in child_indices {
+        let Effect::ExpandDeferredFor { template, .. } = &effects[expand_idx] else {
+            continue;
+        };
+        let delete_indices: Vec<usize> = child_indices
+            .iter()
+            .copied()
+            .filter(|delete_idx| {
+                matches!(
+                    &effects[*delete_idx],
+                    Effect::Delete { id, binding: Some(binding), .. }
+                        if id.resource_type == template.template_resource.id.resource_type
+                            && binding_matches_deferred_template(binding, &template.binding_name)
+                )
+            })
+            .collect();
+
+        if delete_indices.is_empty() {
+            continue;
+        }
+        paired_deletes.extend(delete_indices.iter().copied());
+        pairs.insert(expand_idx, delete_indices);
+    }
+
+    child_indices
+        .iter()
+        .copied()
+        .filter_map(|idx| {
+            if let Some(delete_indices) = pairs.remove(&idx) {
+                Some(ChildRenderItem::PairedDeferredFor {
+                    expand_idx: idx,
+                    delete_indices,
+                })
+            } else if paired_deletes.contains(&idx) {
+                None
+            } else {
+                Some(ChildRenderItem::Normal(idx))
+            }
+        })
+        .collect()
+}
+
+pub fn binding_matches_deferred_template(binding: &str, template_binding_name: &str) -> bool {
+    let Some(suffix) = binding.strip_prefix(template_binding_name) else {
+        return false;
+    };
+    let Some(inner) = suffix.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
+        return false;
+    };
+    !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit())
+}
+
+pub fn is_synthetic_deferred_binding(binding_name: &str) -> bool {
+    binding_name
+        .rsplit('.')
+        .next()
+        .is_none_or(|segment| segment.is_empty() || segment.starts_with('_'))
+}
+
 /// Intermediate data for tree-building: maps from effect indices to their
 /// bindings, dependency sets, and resource types.
 pub struct DependencyGraph {
@@ -101,10 +173,12 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
                 Effect::ExpandDeferredFor {
                     id,
                     upstream_binding,
+                    template,
                     ..
                 } => {
                     let fallback = id.to_string();
                     binding_to_effect.insert(fallback.clone(), idx);
+                    binding_to_effect.insert(template.binding_name.clone(), idx);
                     effect_bindings.insert(idx, fallback);
                     effect_types.insert(idx, "deferred_for".to_string());
                     effect_deps.insert(idx, HashSet::from([upstream_binding.clone()]));
@@ -380,8 +454,9 @@ pub fn shorten_service_name<'a>(attr_name: &str, value: &'a str) -> Cow<'a, str>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::{DeferredForExpression, ForBinding};
     use crate::plan::Plan;
-    use crate::resource::Resource;
+    use crate::resource::{Directives, Resource, ResourceId};
 
     #[test]
     fn explicit_only_depends_on_edge_is_in_dependency_graph() {
@@ -407,5 +482,88 @@ mod tests {
             "explicit depends_on edge should be in dependency graph; got {:?}",
             bucket_deps
         );
+    }
+
+    #[test]
+    fn child_render_items_pair_deferred_for_with_numeric_index_deletes() {
+        let template_resource = Resource::new("route53.Record", "validation_records")
+            .with_binding("validation_records");
+        let deferred = DeferredForExpression {
+            file: None,
+            line: 1,
+            header: "for opt in cert.domain_validation_options".to_string(),
+            resource_type: "aws.route53.Record".to_string(),
+            attributes: Vec::new(),
+            binding_name: "validation_records".to_string(),
+            iterable_binding: "cert".to_string(),
+            iterable_attr: "domain_validation_options".to_string(),
+            binding: ForBinding::Simple("opt".to_string()),
+            template_resource,
+        };
+
+        let mut plan = Plan::new();
+        plan.add(Effect::ExpandDeferredFor {
+            id: ResourceId::new("__deferred_for", "validation_records"),
+            upstream_binding: "cert".to_string(),
+            template: Box::new(deferred),
+        });
+        plan.add(Effect::Delete {
+            id: ResourceId::new("route53.Record", "old-record-0"),
+            identifier: "record-0".to_string(),
+            directives: Directives::default(),
+            binding: Some("validation_records[0]".to_string()),
+            dependencies: HashSet::new(),
+            explicit_dependencies: HashSet::new(),
+        });
+        plan.add(Effect::Delete {
+            id: ResourceId::new("route53.Record", "old-record-abc"),
+            identifier: "record-abc".to_string(),
+            directives: Directives::default(),
+            binding: Some("validation_records[abc]".to_string()),
+            dependencies: HashSet::new(),
+            explicit_dependencies: HashSet::new(),
+        });
+
+        assert_eq!(
+            child_render_items(plan.effects(), &[0, 1, 2]),
+            vec![
+                ChildRenderItem::PairedDeferredFor {
+                    expand_idx: 0,
+                    delete_indices: vec![1],
+                },
+                ChildRenderItem::Normal(2),
+            ]
+        );
+    }
+
+    #[test]
+    fn deferred_template_binding_match_requires_single_numeric_index() {
+        assert!(binding_matches_deferred_template(
+            "validation_records[0]",
+            "validation_records"
+        ));
+        assert!(binding_matches_deferred_template(
+            "validation_records[42]",
+            "validation_records"
+        ));
+        assert!(!binding_matches_deferred_template(
+            "validation_records[]",
+            "validation_records"
+        ));
+        assert!(!binding_matches_deferred_template(
+            "validation_records[abc]",
+            "validation_records"
+        ));
+        assert!(!binding_matches_deferred_template(
+            "validation_records[0][1]",
+            "validation_records"
+        ));
+    }
+
+    #[test]
+    fn empty_deferred_binding_is_synthetic() {
+        assert!(is_synthetic_deferred_binding(""));
+        assert!(is_synthetic_deferred_binding("module._records"));
+        assert!(!is_synthetic_deferred_binding("validation_records"));
     }
 }

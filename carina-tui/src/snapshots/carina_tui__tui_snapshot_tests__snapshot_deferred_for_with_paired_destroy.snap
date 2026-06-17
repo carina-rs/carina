@@ -1,16 +1,10 @@
 ---
 source: carina-tui/src/tui_snapshot_tests.rs
+assertion_line: 335
 expression: output
 ---
-┌ Plan (Plan: 1 to create, 1 to update, 0 to delete, 1 to move) ───────────────────────────────────────────────────────┐
-│~ ec2.Vpc new_vpc                                                                                                     │
-│    └── + ec2.Subnet (cidr_block: 10.0.1.0/24)                                                                        │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
+┌ Plan (Plan: 0 to create (+1 deferred, count unknown), 0 to update, 1 to delete) ─────────────────────────────────────┐
+│+/- aws.route53.Record [from cert.domain_validation_options]                                                          │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
@@ -30,13 +24,10 @@ expression: output
 │                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ Details ─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│~ ec2.Vpc new_vpc                                                                                                     │
+│+/- aws.route53.Record [from cert.domain_validation_options]                                                          │
 │                                                                                                                      │
-│  tags:                                                                                                               │
-│    + Name: "updated"                                                                                                 │
-│  # (1 unchanged attribute hidden)                                                                                    │
-│                                                                                                                      │
-│                                                                                                                      │
+│  - destroying validation_records[0]                                                                                  │
+│  + replaced by deferred for-loop, count known after cert applies                                                     │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │

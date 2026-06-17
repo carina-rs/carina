@@ -1,6 +1,6 @@
 //! Plan title and effect-kind styling helpers.
 
-use carina_core::plan::PlanSummary;
+use carina_core::plan::{PlanSummary, PlanSummaryPart};
 use ratatui::prelude::*;
 
 use crate::app::EffectKind;
@@ -12,63 +12,88 @@ use crate::app::EffectKind;
 pub(super) fn build_plan_title(summary: &PlanSummary) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = vec![Span::raw(" Plan (Plan: ")];
 
-    let mut parts_added = 0;
-
-    if summary.read > 0 {
-        if parts_added > 0 {
+    for (idx, part) in summary.parts().into_iter().enumerate() {
+        if idx > 0 {
             spans.push(Span::raw(", "));
         }
-        spans.push(Span::styled(
-            format!("{}", summary.read),
-            Style::default().fg(Color::Cyan),
-        ));
-        spans.push(Span::raw(" to read"));
-        parts_added += 1;
-    }
 
-    // create is always shown
-    if parts_added > 0 {
-        spans.push(Span::raw(", "));
-    }
-    spans.push(Span::styled(
-        format!("{}", summary.create),
-        Style::default().fg(Color::Green),
-    ));
-    spans.push(Span::raw(" to create"));
-    parts_added += 1;
-
-    // update is always shown
-    if parts_added > 0 {
-        spans.push(Span::raw(", "));
-    }
-    spans.push(Span::styled(
-        format!("{}", summary.update),
-        Style::default().fg(Color::Yellow),
-    ));
-    spans.push(Span::raw(" to update"));
-    parts_added += 1;
-
-    if summary.replace > 0 {
-        if parts_added > 0 {
-            spans.push(Span::raw(", "));
+        match part {
+            PlanSummaryPart::Read { count } => {
+                spans.push(Span::styled(
+                    count.to_string(),
+                    Style::default().fg(Color::Cyan),
+                ));
+                spans.push(Span::raw(" to read"));
+            }
+            PlanSummaryPart::Import { count } => {
+                spans.push(Span::styled(
+                    count.to_string(),
+                    Style::default().fg(Color::Cyan),
+                ));
+                spans.push(Span::raw(" to import"));
+            }
+            PlanSummaryPart::Create {
+                count,
+                deferred_count,
+            } => {
+                spans.push(Span::styled(
+                    count.to_string(),
+                    Style::default().fg(Color::Green),
+                ));
+                spans.push(Span::raw(" to create"));
+                if deferred_count > 0 {
+                    spans.push(Span::raw(" (+"));
+                    spans.push(Span::styled(
+                        deferred_count.to_string(),
+                        Style::default().fg(Color::Green),
+                    ));
+                    spans.push(Span::raw(" deferred, count unknown)"));
+                }
+            }
+            PlanSummaryPart::Update { count } => {
+                spans.push(Span::styled(
+                    count.to_string(),
+                    Style::default().fg(Color::Yellow),
+                ));
+                spans.push(Span::raw(" to update"));
+            }
+            PlanSummaryPart::Replace { count } => {
+                spans.push(Span::styled(
+                    count.to_string(),
+                    Style::default().fg(Color::Magenta),
+                ));
+                spans.push(Span::raw(" to replace"));
+            }
+            PlanSummaryPart::Delete { count } => {
+                spans.push(Span::styled(
+                    count.to_string(),
+                    Style::default().fg(Color::Red),
+                ));
+                spans.push(Span::raw(" to delete"));
+            }
+            PlanSummaryPart::Remove { count } => {
+                spans.push(Span::styled(
+                    count.to_string(),
+                    Style::default().fg(Color::Yellow),
+                ));
+                spans.push(Span::raw(" to remove from state"));
+            }
+            PlanSummaryPart::Move { count } => {
+                spans.push(Span::styled(
+                    count.to_string(),
+                    Style::default().fg(Color::Yellow),
+                ));
+                spans.push(Span::raw(" to move"));
+            }
+            PlanSummaryPart::Wait { count } => {
+                spans.push(Span::styled(
+                    count.to_string(),
+                    Style::default().fg(Color::Magenta),
+                ));
+                spans.push(Span::raw(" to wait"));
+            }
         }
-        spans.push(Span::styled(
-            format!("{}", summary.replace),
-            Style::default().fg(Color::Magenta),
-        ));
-        spans.push(Span::raw(" to replace"));
-        parts_added += 1;
     }
-
-    // delete is always shown
-    if parts_added > 0 {
-        spans.push(Span::raw(", "));
-    }
-    spans.push(Span::styled(
-        format!("{}", summary.delete),
-        Style::default().fg(Color::Red),
-    ));
-    spans.push(Span::raw(" to delete"));
 
     spans.push(Span::raw(") "));
 

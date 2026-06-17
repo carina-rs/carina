@@ -319,6 +319,32 @@ impl<'a> BasicEffect<'a> {
 }
 
 impl Effect {
+    /// Plain display glyph for this effect.
+    ///
+    /// Color and text styling stay in each UI sink; this method owns the
+    /// operation-to-glyph mapping so CLI, TUI, and compact plan formatting
+    /// cannot drift independently.
+    pub fn display_glyph(&self) -> &'static str {
+        match self {
+            Effect::Create(_) => "+",
+            Effect::Update { .. } => "~",
+            Effect::Replace { directives, .. } => {
+                if directives.create_before_destroy {
+                    "+/-"
+                } else {
+                    "-/+"
+                }
+            }
+            Effect::Delete { .. } => "-",
+            Effect::Read { .. } => "<=",
+            Effect::Import { .. } => "<-",
+            Effect::Remove { .. } => "~",
+            Effect::Move { .. } => "->",
+            Effect::Wait { .. } => ">",
+            Effect::ExpandDeferredFor { .. } => "+",
+        }
+    }
+
     /// Narrow this effect to a [`BasicEffect`] if it is one of the
     /// variants the basic executor handles (`Create`, `Update`,
     /// `Delete`). Returns `None` for `Replace`, `Read`, `Import`,

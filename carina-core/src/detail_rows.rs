@@ -30,6 +30,8 @@ pub enum DetailLevel {
 /// Both CLI and TUI consume these to render effect details.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DetailRow {
+    /// A preformatted informational line.
+    Text { text: String },
     /// A normal attribute value (for Create/Delete effects)
     Attribute {
         key: String,

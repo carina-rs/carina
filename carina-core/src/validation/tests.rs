@@ -203,6 +203,34 @@ fn binding_referenced_in_secret_builtin_function_call_is_not_unused() {
 }
 
 #[test]
+fn binding_referenced_only_by_deferred_for_iterable_is_not_unused() {
+    let src = r#"
+        let cert = aws.acm.Certificate {
+            domain_name       = "registry.example.com"
+            validation_method = "DNS"
+        }
+
+        let zone = aws.route53.HostedZone {
+            name = "example.com"
+        }
+
+        let validation_records = for opt in cert.domain_validation_options {
+            aws.route53.RecordSet {
+                hosted_zone_id   = zone.id
+                name             = opt.resource_record.name
+                type             = opt.resource_record.type
+                ttl              = 60
+                resource_records = [opt.resource_record.value]
+            }
+        }
+    "#;
+    let parsed = crate::parser::parse(src, &crate::parser::ProviderContext::default()).unwrap();
+
+    assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    assert!(check_unused_bindings(&parsed).is_empty());
+}
+
+#[test]
 fn bare_binding_ref_is_not_unused() {
     let src = r#"
         let _ = aws.s3.Bucket {

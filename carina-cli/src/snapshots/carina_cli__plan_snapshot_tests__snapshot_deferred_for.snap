@@ -1,5 +1,6 @@
 ---
 source: carina-cli/src/plan_snapshot_tests.rs
+assertion_line: 1938
 expression: output
 ---
 Execution Plan:
@@ -13,4 +14,4 @@ Execution Plan:
       target_type: 'AWS_ACCOUNT'
 
 
-Plan: 0 to add, 0 to change, 0 to destroy, 1 deferred.
+Plan: 0 to add, 0 to change, 0 to destroy, 1 root-scope deferred.

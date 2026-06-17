@@ -8,6 +8,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use carina_core::config_loader::load_configuration;
+use carina_core::effect::Effect;
+use carina_core::plan::Plan;
 use carina_core::resource::{ResourceId, State};
 use carina_core::schema::SchemaRegistry;
 
@@ -1930,6 +1932,113 @@ fn snapshot_deferred_for() {
         &HashMap::new(),
         None,
         &HashMap::new(),
+        &[],
+        &fp.deferred_for_expressions,
+        Some(&fp.prev_explicit),
+        None,
+    ));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_deferred_for_create_solo() {
+    let fp = build_plan_from_fixture_name("deferred_for_create_solo");
+    let delete_attributes =
+        crate::fixture_plan::delete_attributes_from_plan(&fp.plan, &fp.current_states);
+    let output = strip_ansi(&format_plan(
+        &fp.plan,
+        DetailLevel::Full,
+        &delete_attributes,
+        Some(&fp.schemas),
+        &fp.moved_origins,
+        &[],
+        &fp.deferred_for_expressions,
+        Some(&fp.prev_explicit),
+        None,
+    ));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_deferred_for_anonymous() {
+    let fp = build_plan_from_fixture_name("deferred_for_anonymous");
+    let output = strip_ansi(&format_plan(
+        &fp.plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&fp.schemas),
+        &fp.moved_origins,
+        &[],
+        &fp.deferred_for_expressions,
+        Some(&fp.prev_explicit),
+        None,
+    ));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_deferred_for_with_paired_destroy() {
+    let fp = build_plan_from_fixture_name("deferred_for_with_paired_destroy");
+    let delete_attributes =
+        crate::fixture_plan::delete_attributes_from_plan(&fp.plan, &fp.current_states);
+    let output = strip_ansi(&format_plan(
+        &fp.plan,
+        DetailLevel::Full,
+        &delete_attributes,
+        Some(&fp.schemas),
+        &fp.moved_origins,
+        &[],
+        &fp.deferred_for_expressions,
+        Some(&fp.prev_explicit),
+        None,
+    ));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_deferred_for_with_dependent_wait() {
+    let mut fp = build_plan_from_fixture_name("deferred_for_with_dependent_wait");
+    let mut plan = Plan::new();
+    for effect in fp.plan.effects() {
+        let mut effect = effect.clone();
+        if let Effect::Create(resource) = &mut effect
+            && resource.id.resource_type == "acm.CertificateValidation"
+        {
+            resource
+                .directives
+                .depends_on
+                .push("validation_records".to_string());
+        }
+        plan.add(effect);
+    }
+    fp.plan = plan;
+    let delete_attributes =
+        crate::fixture_plan::delete_attributes_from_plan(&fp.plan, &fp.current_states);
+    let output = strip_ansi(&format_plan(
+        &fp.plan,
+        DetailLevel::Full,
+        &delete_attributes,
+        Some(&fp.schemas),
+        &fp.moved_origins,
+        &[],
+        &fp.deferred_for_expressions,
+        Some(&fp.prev_explicit),
+        None,
+    ));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_deferred_for_with_unrelated_delete() {
+    let fp = build_plan_from_fixture_name("deferred_for_with_unrelated_delete");
+    let delete_attributes =
+        crate::fixture_plan::delete_attributes_from_plan(&fp.plan, &fp.current_states);
+    let output = strip_ansi(&format_plan(
+        &fp.plan,
+        DetailLevel::Full,
+        &delete_attributes,
+        Some(&fp.schemas),
+        &fp.moved_origins,
         &[],
         &fp.deferred_for_expressions,
         Some(&fp.prev_explicit),

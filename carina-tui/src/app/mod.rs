@@ -6,7 +6,8 @@ use carina_core::detail_rows::{DetailLevel, DetailRow, build_detail_rows};
 use carina_core::effect::Effect;
 use carina_core::plan::{Plan, PlanSummary};
 use carina_core::plan_tree::{
-    build_dependency_graph, build_single_parent_tree, extract_compact_hint,
+    ChildRenderItem, build_dependency_graph, build_single_parent_tree, child_render_items,
+    extract_compact_hint, is_synthetic_deferred_binding,
 };
 use carina_core::resource::ResourceId;
 use carina_core::schema::SchemaRegistry;
@@ -114,6 +115,8 @@ impl App {
         // Shorten effect labels: strip provider prefix, use binding or compact hint
         shorten_effect_labels(plan, &mut nodes);
 
+        let mut suppressed: HashSet<usize> = pair_deferred_for_nodes(plan, &mut nodes);
+
         // Suppress Move nodes when an Update/Replace exists for the same target,
         // matching CLI behavior (the move info is shown as annotation on Update/Replace).
         let update_or_replace_targets: HashSet<ResourceId> = plan
@@ -125,19 +128,20 @@ impl App {
             })
             .collect();
 
-        let suppressed: HashSet<usize> = plan
-            .effects()
-            .iter()
-            .enumerate()
-            .filter_map(|(i, e)| {
-                if let Effect::Move { to, .. } = e
-                    && update_or_replace_targets.contains(to)
-                {
-                    return Some(i);
-                }
-                None
-            })
-            .collect();
+        suppressed.extend(
+            plan.effects()
+                .iter()
+                .enumerate()
+                .filter_map(|(i, e)| {
+                    if let Effect::Move { to, .. } = e
+                        && update_or_replace_targets.contains(to)
+                    {
+                        return Some(i);
+                    }
+                    None
+                })
+                .collect::<HashSet<_>>(),
+        );
 
         if !suppressed.is_empty() {
             // Build old→new index mapping for remapping parent/children references
@@ -671,6 +675,73 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
     }
 }
 
+fn pair_deferred_for_nodes(plan: &Plan, nodes: &mut [TreeNode]) -> HashSet<usize> {
+    let mut suppressed = HashSet::new();
+    let root_indices: Vec<usize> = nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, node)| node.parent.is_none().then_some(idx))
+        .collect();
+    collect_paired_deferred_for(plan, nodes, &root_indices, &mut suppressed);
+
+    for parent_idx in 0..nodes.len() {
+        let children = nodes[parent_idx].children.clone();
+        collect_paired_deferred_for(plan, nodes, &children, &mut suppressed);
+    }
+
+    suppressed
+}
+
+fn collect_paired_deferred_for(
+    plan: &Plan,
+    nodes: &mut [TreeNode],
+    siblings: &[usize],
+    suppressed: &mut HashSet<usize>,
+) {
+    for item in child_render_items(plan.effects(), siblings) {
+        if let ChildRenderItem::PairedDeferredFor {
+            expand_idx,
+            delete_indices,
+        } = item
+        {
+            let Effect::ExpandDeferredFor {
+                upstream_binding,
+                template,
+                ..
+            } = &plan.effects()[expand_idx]
+            else {
+                continue;
+            };
+            nodes[expand_idx].resource_type = template.resource_type.clone();
+            nodes[expand_idx].name_part =
+                format!("[from {}.{}]", upstream_binding, template.iterable_attr);
+            nodes[expand_idx].effect_label = format!(
+                "{} [from {}.{}]",
+                template.resource_type, upstream_binding, template.iterable_attr
+            );
+            nodes[expand_idx].symbol = "+/-".to_string();
+            nodes[expand_idx].kind = EffectKind::Replace;
+            let mut detail_rows = Vec::new();
+            for delete_idx in &delete_indices {
+                if let Effect::Delete { id, binding, .. } = &plan.effects()[*delete_idx] {
+                    let display_name = binding.as_deref().unwrap_or(id.name_str());
+                    detail_rows.push(DetailRow::Text {
+                        text: format!("- destroying {}", display_name),
+                    });
+                }
+            }
+            detail_rows.push(DetailRow::Text {
+                text: format!(
+                    "+ replaced by deferred for-loop, count known after {} applies",
+                    upstream_binding
+                ),
+            });
+            nodes[expand_idx].detail_rows = detail_rows;
+            suppressed.extend(delete_indices);
+        }
+    }
+}
+
 fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode {
     let detail_rows = build_detail_rows(effect, schemas, DetailLevel::Full, None, None);
 
@@ -679,7 +750,7 @@ fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode
             effect_label: format!("{}", resource.id.human()),
             resource_type: resource.id.display_type(),
             name_part: resource.id.name_str().to_string(),
-            symbol: "<=".to_string(),
+            symbol: effect.display_glyph().to_string(),
             kind: EffectKind::Read,
             detail_rows,
             children: Vec::new(),
@@ -690,7 +761,7 @@ fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode
             effect_label: format!("{}", resource.id.human()),
             resource_type: resource.id.display_type(),
             name_part: resource.id.name_str().to_string(),
-            symbol: "+".to_string(),
+            symbol: effect.display_glyph().to_string(),
             kind: EffectKind::Create,
             detail_rows,
             children: Vec::new(),
@@ -701,31 +772,24 @@ fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode
             effect_label: format!("{}", id.human()),
             resource_type: id.display_type(),
             name_part: id.name_str().to_string(),
-            symbol: "~".to_string(),
+            symbol: effect.display_glyph().to_string(),
             kind: EffectKind::Update,
             detail_rows,
             children: Vec::new(),
             depth: 0,
             parent: None,
         },
-        Effect::Replace { id, directives, .. } => {
-            let symbol = if directives.create_before_destroy {
-                "+/-".to_string()
-            } else {
-                "-/+".to_string()
-            };
-            TreeNode {
-                effect_label: format!("{}", id.human()),
-                resource_type: id.display_type(),
-                name_part: id.name_str().to_string(),
-                symbol,
-                kind: EffectKind::Replace,
-                detail_rows,
-                children: Vec::new(),
-                depth: 0,
-                parent: None,
-            }
-        }
+        Effect::Replace { id, .. } => TreeNode {
+            effect_label: format!("{}", id.human()),
+            resource_type: id.display_type(),
+            name_part: id.name_str().to_string(),
+            symbol: effect.display_glyph().to_string(),
+            kind: EffectKind::Replace,
+            detail_rows,
+            children: Vec::new(),
+            depth: 0,
+            parent: None,
+        },
         Effect::Delete { id, identifier, .. } => {
             // build_detail_rows returns empty for Delete without delete_attributes,
             // so add the identifier as a manual attribute row
@@ -742,7 +806,7 @@ fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode
                 effect_label: format!("{}", id.human()),
                 resource_type: id.display_type(),
                 name_part: id.name_str().to_string(),
-                symbol: "-".to_string(),
+                symbol: effect.display_glyph().to_string(),
                 kind: EffectKind::Delete,
                 detail_rows: rows,
                 children: Vec::new(),
@@ -754,7 +818,7 @@ fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode
             effect_label: format!("{}", id.human()),
             resource_type: id.display_type(),
             name_part: id.name_str().to_string(),
-            symbol: "<-".to_string(),
+            symbol: effect.display_glyph().to_string(),
             kind: EffectKind::Read,
             detail_rows,
             children: Vec::new(),
@@ -773,7 +837,7 @@ fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode
             // `EffectKind::Delete` would color the whole row red and
             // re-introduce the misread the symbol fix was meant to
             // remove.
-            symbol: "~".to_string(),
+            symbol: effect.display_glyph().to_string(),
             kind: EffectKind::Update,
             detail_rows,
             children: Vec::new(),
@@ -784,7 +848,7 @@ fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode
             effect_label: format!("{} -> {}", from.human(), to.human()),
             resource_type: to.display_type(),
             name_part: to.name_str().to_string(),
-            symbol: "->".to_string(),
+            symbol: effect.display_glyph().to_string(),
             kind: EffectKind::Update,
             detail_rows,
             children: Vec::new(),
@@ -799,7 +863,7 @@ fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode
             effect_label: format!("{} (until {})", binding, until_surface),
             resource_type: "wait".to_string(),
             name_part: binding.clone(),
-            symbol: ">".to_string(),
+            symbol: effect.display_glyph().to_string(),
             kind: EffectKind::Wait,
             detail_rows,
             children: Vec::new(),
@@ -807,24 +871,51 @@ fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode
             parent: None,
         },
         Effect::ExpandDeferredFor {
-            id,
             upstream_binding,
+            template,
             ..
-        } => TreeNode {
-            effect_label: format!(
-                "{} (deferred for: waits on {})",
-                id.human(),
-                upstream_binding
-            ),
-            resource_type: id.display_type(),
-            name_part: id.name_str().to_string(),
-            symbol: "~".to_string(),
-            kind: EffectKind::Update,
-            detail_rows,
-            children: Vec::new(),
-            depth: 0,
-            parent: None,
-        },
+        } => {
+            let source = deferred_for_source(template);
+            let mut rows = detail_rows;
+            if rows.is_empty() {
+                rows.push(DetailRow::Attribute {
+                    key: "deferred".to_string(),
+                    value: format!("count known after {} applies", upstream_binding),
+                    ref_binding: None,
+                    annotation: Some(format!("from {source}")),
+                });
+            }
+            TreeNode {
+                effect_label: format!(
+                    "deferred for: {} (count known after {} applies)",
+                    source, upstream_binding
+                ),
+                resource_type: template.resource_type.clone(),
+                name_part: deferred_for_display_name(template),
+                symbol: effect.display_glyph().to_string(),
+                kind: EffectKind::Create,
+                detail_rows: rows,
+                children: Vec::new(),
+                depth: 0,
+                parent: None,
+            }
+        }
+    }
+}
+
+fn deferred_for_display_name(template: &carina_core::parser::DeferredForExpression) -> String {
+    if is_synthetic_deferred_binding(&template.binding_name) {
+        format!("(deferred from {})", deferred_for_source(template))
+    } else {
+        format!("{}[?]", template.binding_name)
+    }
+}
+
+fn deferred_for_source(template: &carina_core::parser::DeferredForExpression) -> String {
+    if template.iterable_attr.is_empty() {
+        template.iterable_binding.clone()
+    } else {
+        format!("{}.{}", template.iterable_binding, template.iterable_attr)
     }
 }
 

@@ -22,7 +22,8 @@ use carina_state::{StateFile, check_and_migrate};
 
 use crate::commands::validate_and_resolve;
 use crate::wiring::{
-    WiringContext, compute_anonymous_identifiers_with_ctx, normalize_state_with_ctx,
+    WiringContext, add_apply_time_reexpansion_effects, compute_anonymous_identifiers_with_ctx,
+    expand_same_config_deferred_for, normalize_state_with_ctx,
     reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
     resolve_enum_aliases_in_states,
 };
@@ -322,6 +323,33 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &resources,
         &data_sources_for_plan,
     );
+    let deferred_for_expansion = expand_same_config_deferred_for(
+        &parsed,
+        &sorted_resources,
+        &current_states,
+        &remote_bindings,
+        &wait_aliases,
+        &HashSet::new(),
+        &HashSet::new(),
+    )
+    .expect("fixture deferred-for expansion failed");
+    let managed_bindings: HashSet<String> = sorted_resources
+        .iter()
+        .filter_map(|resource| resource.binding.clone())
+        .collect();
+    let apply_time_reexpansion_targets: Vec<_> = deferred_for_expansion
+        .apply_time_reexpansion_targets
+        .into_iter()
+        .filter(|target| managed_bindings.contains(&target.upstream_binding))
+        .collect();
+    let mut residual_deferred_for = deferred_for_expansion.residual_deferred_for;
+    residual_deferred_for.extend(
+        parsed
+            .deferred_for_expressions
+            .iter()
+            .filter(|deferred| !managed_bindings.contains(&deferred.iterable_binding))
+            .cloned(),
+    );
     let plan_input_states = carina_core::resource::into_plan_input_map(current_states.clone());
     let mut plan = create_plan(
         &resources,
@@ -352,6 +380,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &plan_bindings,
         &upstream_binding_names,
     );
+    add_apply_time_reexpansion_effects(&mut plan, &apply_time_reexpansion_targets);
 
     let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
         .iter()
@@ -376,7 +405,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         current_states,
         schemas: wiring.schemas().clone(),
         moved_origins,
-        deferred_for_expressions: parsed.deferred_for_expressions,
+        deferred_for_expressions: residual_deferred_for,
         export_params: parsed.export_params,
         resolved_export_params,
         prev_explicit,

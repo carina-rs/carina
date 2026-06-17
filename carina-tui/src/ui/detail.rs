@@ -79,6 +79,13 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
     let dim_style = Style::default().fg(Color::DarkGray);
 
     match row {
+        DetailRow::Text { text } => {
+            let mut line = Line::from(vec![Span::raw(format!("  {}", text))]);
+            if is_selected {
+                line = line.style(Style::default().bg(Color::DarkGray));
+            }
+            lines.push(line);
+        }
         DetailRow::Attribute {
             key,
             value,
