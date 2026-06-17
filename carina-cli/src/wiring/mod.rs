@@ -2842,6 +2842,14 @@ pub async fn read_with_retry(
             .await
         {
             Ok(state) => return Ok(state),
+            Err(ProviderError::NotFound(_)) => {
+                // carina-rs/carina-provider-aws#462: ProviderError::NotFound is
+                // the canonical drift signal — the resource is recorded in state
+                // but no longer exists in the cloud. Translate it into
+                // State::not_found(id) so the planner emits a Create-this-back
+                // plan instead of aborting.
+                return Ok(State::not_found(id.clone()));
+            }
             Err(e) if attempt < max_retries && is_throttling_error(&e) => {
                 let delay = Duration::from_secs(1 << attempt); // 1s, 2s, 4s
                 eprintln!(
