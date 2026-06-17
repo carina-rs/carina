@@ -1,4 +1,151 @@
 use super::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use carina_core::effect::PlanOp;
+use carina_core::provider::{
+    BoxFuture, CreateOutcome, DeleteRequest, ProviderResult, ReadRequest, UpdateOutcome,
+    UpdateRequest,
+};
+
+enum ReadBehavior {
+    NotFound,
+    ApiError,
+    NotFoundThenSuccess,
+}
+
+struct ReadWithRetryProvider {
+    behavior: ReadBehavior,
+    read_calls: AtomicUsize,
+}
+
+impl ReadWithRetryProvider {
+    fn new(behavior: ReadBehavior) -> Self {
+        Self {
+            behavior,
+            read_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn read_calls(&self) -> usize {
+        self.read_calls.load(Ordering::SeqCst)
+    }
+}
+
+impl Provider for ReadWithRetryProvider {
+    fn name(&self) -> &str {
+        "test"
+    }
+
+    fn read(
+        &self,
+        id: &ResourceId,
+        _identifier: Option<&str>,
+        _request: ReadRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let id = id.clone();
+        let attempt = self.read_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            match self.behavior {
+                ReadBehavior::NotFound => Err(ProviderError::not_found("missing")),
+                ReadBehavior::ApiError => Err(ProviderError::api_error("boom")),
+                ReadBehavior::NotFoundThenSuccess if attempt == 0 => {
+                    Err(ProviderError::not_found("missing"))
+                }
+                ReadBehavior::NotFoundThenSuccess => {
+                    Ok(State::existing(id, HashMap::new()).with_identifier("read-on-retry"))
+                }
+            }
+        })
+    }
+
+    fn read_data_source(
+        &self,
+        resource: &carina_core::resource::DataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let id = resource.id.clone();
+        Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
+    }
+
+    fn create(
+        &self,
+        id: &ResourceId,
+        _request: carina_core::provider::CreateRequest,
+    ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
+        let id = id.clone();
+        Box::pin(async move {
+            Ok(CreateOutcome::Success {
+                state: State::existing(id, HashMap::new()),
+            })
+        })
+    }
+
+    fn update(
+        &self,
+        id: &ResourceId,
+        _identifier: &str,
+        _request: UpdateRequest,
+    ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
+        let id = id.clone();
+        Box::pin(async move {
+            Ok(UpdateOutcome::Success {
+                state: State::existing(id, HashMap::new()),
+            })
+        })
+    }
+
+    fn delete(
+        &self,
+        _id: &ResourceId,
+        _identifier: &str,
+        _request: DeleteRequest,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn required_permissions(&self, _id: &ResourceId, _op: PlanOp) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+#[tokio::test]
+async fn read_with_retry_translates_not_found_to_state_not_found() {
+    let provider = ReadWithRetryProvider::new(ReadBehavior::NotFound);
+    let id = ResourceId::new("test.Resource", "gone");
+
+    let state = read_with_retry(&provider, &id, Some("some-identifier"))
+        .await
+        .expect("not found should translate into a not_found state");
+
+    assert!(!state.exists);
+    assert_eq!(state.id, id);
+    assert_eq!(state.identifier, None);
+}
+
+#[tokio::test]
+async fn read_with_retry_propagates_other_errors() {
+    let provider = ReadWithRetryProvider::new(ReadBehavior::ApiError);
+    let id = ResourceId::new("test.Resource", "broken");
+
+    let result = read_with_retry(&provider, &id, Some("some-identifier")).await;
+
+    assert!(matches!(result, Err(ProviderError::ApiError(_))));
+}
+
+#[tokio::test]
+async fn read_with_retry_does_not_retry_not_found() {
+    let provider = ReadWithRetryProvider::new(ReadBehavior::NotFoundThenSuccess);
+    let id = ResourceId::new("test.Resource", "gone");
+
+    let state = read_with_retry(&provider, &id, Some("some-identifier"))
+        .await
+        .expect("not found should translate into a not_found state");
+
+    assert!(!state.exists);
+    assert_eq!(state.id, id);
+    assert_eq!(state.identifier, None);
+    assert_eq!(provider.read_calls(), 1);
+}
+
 use carina_core::parser::ParsedFile;
 
 #[test]
