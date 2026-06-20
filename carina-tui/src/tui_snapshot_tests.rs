@@ -11,7 +11,9 @@ use ratatui::backend::TestBackend;
 use carina_core::effect::Effect;
 use carina_core::parser::{DeferredForExpression, ForBinding};
 use carina_core::plan::Plan;
-use carina_core::resource::{ConcreteValue, Directives, Resource, ResourceId, State, Value};
+use carina_core::resource::{
+    ConcreteValue, DeferredValue, Directives, Resource, ResourceId, State, UnknownReason, Value,
+};
 use carina_core::schema::SchemaRegistry;
 
 use crate::app::App;
@@ -211,7 +213,7 @@ fn build_deferred_for_plan() -> Plan {
         line: 1,
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "aws.route53.Record".to_string(),
-        attributes: Vec::new(),
+        attributes: deferred_record_attributes(),
         binding_name: "validation_records".to_string(),
         iterable_binding: "cert".to_string(),
         iterable_attr: "domain_validation_options".to_string(),
@@ -220,6 +222,7 @@ fn build_deferred_for_plan() -> Plan {
     };
 
     let mut plan = Plan::new();
+    plan.add(Effect::Create(certificate_resource()));
     plan.add(Effect::ExpandDeferredFor {
         id: ResourceId::new("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
@@ -235,7 +238,7 @@ fn build_anonymous_deferred_for_plan() -> Plan {
         line: 1,
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "aws.route53.Record".to_string(),
-        attributes: Vec::new(),
+        attributes: deferred_record_attributes(),
         binding_name: "_anon_validation_records".to_string(),
         iterable_binding: "cert".to_string(),
         iterable_attr: "domain_validation_options".to_string(),
@@ -244,6 +247,7 @@ fn build_anonymous_deferred_for_plan() -> Plan {
     };
 
     let mut plan = Plan::new();
+    plan.add(Effect::Create(certificate_resource()));
     plan.add(Effect::ExpandDeferredFor {
         id: ResourceId::new("__deferred_for", "_anon_validation_records"),
         upstream_binding: "cert".to_string(),
@@ -260,7 +264,7 @@ fn build_deferred_for_with_paired_destroy_plan() -> Plan {
         line: 1,
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "aws.route53.Record".to_string(),
-        attributes: Vec::new(),
+        attributes: deferred_record_attributes(),
         binding_name: "validation_records".to_string(),
         iterable_binding: "cert".to_string(),
         iterable_attr: "domain_validation_options".to_string(),
@@ -269,6 +273,7 @@ fn build_deferred_for_with_paired_destroy_plan() -> Plan {
     };
 
     let mut plan = Plan::new();
+    plan.add(Effect::Create(certificate_resource()));
     plan.add(Effect::ExpandDeferredFor {
         id: ResourceId::new("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
@@ -279,10 +284,45 @@ fn build_deferred_for_with_paired_destroy_plan() -> Plan {
         identifier: "record-0".to_string(),
         directives: Directives::default(),
         binding: Some("validation_records[0]".to_string()),
-        dependencies: HashSet::new(),
+        dependencies: HashSet::from(["cert".to_string()]),
         explicit_dependencies: HashSet::new(),
     });
     plan
+}
+
+fn certificate_resource() -> Resource {
+    Resource::new("acm.Certificate", "cert")
+        .with_binding("cert")
+        .with_attribute(
+            "domain_name",
+            Value::Concrete(ConcreteValue::String("registry.example.com".to_string())),
+        )
+        .with_attribute(
+            "validation_method",
+            Value::Concrete(ConcreteValue::String("DNS".to_string())),
+        )
+}
+
+fn deferred_record_attributes() -> Vec<(String, Value)> {
+    vec![
+        (
+            "hosted_zone_id".to_string(),
+            Value::Concrete(ConcreteValue::String("Z123".to_string())),
+        ),
+        ("ttl".to_string(), Value::Concrete(ConcreteValue::Int(60))),
+        (
+            "type".to_string(),
+            Value::Concrete(ConcreteValue::String("CNAME".to_string())),
+        ),
+        (
+            "name".to_string(),
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+        ),
+        (
+            "resource_records".to_string(),
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+        ),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -313,28 +353,28 @@ fn snapshot_map_key_diff() {
 #[test]
 fn snapshot_deferred_for_create() {
     let plan = build_deferred_for_plan();
-    let output = render_tui(&plan, 120, 30, 0);
+    let output = render_tui(&plan, 120, 32, 1);
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_deferred_for_anonymous() {
     let plan = build_anonymous_deferred_for_plan();
-    let output = render_tui(&plan, 120, 30, 0);
+    let output = render_tui(&plan, 120, 32, 1);
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_deferred_for_with_paired_destroy() {
     let plan = build_deferred_for_with_paired_destroy_plan();
-    let output = render_tui(&plan, 120, 30, 0);
+    let output = render_tui(&plan, 120, 32, 1);
     assert!(output.contains("+/-"));
     assert!(
         output.contains(
             "+/- aws.route53.Record validation_records[*] (N records after cert applies)"
         )
     );
-    assert!(output.contains("from: for opt in cert.domain_validation_options"));
+    assert!(output.contains("<- for opt in cert.domain_validation_options"));
     assert!(!output.contains("- destroying validation_records[0]"));
     assert!(!output.contains("+ replaced by deferred for-loop"));
     insta::assert_snapshot!(output);

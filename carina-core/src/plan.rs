@@ -219,11 +219,7 @@ impl Plan {
                 Effect::Remove { .. } => summary.remove += 1,
                 Effect::Move { .. } => summary.moved += 1,
                 Effect::Wait { .. } => summary.wait += 1,
-                Effect::ExpandDeferredFor { template, .. } => {
-                    if crate::plan_tree::is_synthetic_deferred_binding(&template.binding_name) {
-                        summary.legacy_anonymous_deferred += 1;
-                    }
-                }
+                Effect::ExpandDeferredFor { .. } => {}
             }
         }
         summary.delete = self
@@ -248,7 +244,6 @@ pub struct PlanSummary {
     pub replace: usize,
     pub delete: usize,
     pub deferred: Vec<DeferredSummaryEntry>,
-    pub legacy_anonymous_deferred: usize,
     pub import: usize,
     pub remove: usize,
     pub moved: usize,
@@ -258,6 +253,7 @@ pub struct PlanSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeferredSummaryEntry {
     pub upstream_binding: String,
+    pub verb: String,
     pub action: DeferredSummaryAction,
 }
 
@@ -319,16 +315,7 @@ impl PlanSummary {
             .map(|part| match part {
                 PlanSummaryPart::Read { count } => format!("{count} to read"),
                 PlanSummaryPart::Import { count } => format!("{count} to import"),
-                PlanSummaryPart::Create { count } => {
-                    if self.legacy_anonymous_deferred > 0 {
-                        format!(
-                            "{count} to create (+{} deferred, count unknown)",
-                            self.legacy_anonymous_deferred
-                        )
-                    } else {
-                        format!("{count} to create")
-                    }
-                }
+                PlanSummaryPart::Create { count } => format!("{count} to create"),
                 PlanSummaryPart::Update { count } => format!("{count} to update"),
                 PlanSummaryPart::Replace { count } => format!("{count} to replace"),
                 PlanSummaryPart::Delete { count } => format!("{count} to delete"),
@@ -348,7 +335,10 @@ impl PlanSummary {
                     DeferredSummaryAction::Add => "add",
                     DeferredSummaryAction::Replace => "replace",
                 };
-                format!("N to {action} after {} applies.", entry.upstream_binding)
+                format!(
+                    "N to {action} after {} {}.",
+                    entry.upstream_binding, entry.verb
+                )
             })
             .collect()
     }
@@ -684,6 +674,9 @@ mod tests {
             template_resource,
         };
         let mut plan = Plan::new();
+        plan.add(Effect::Create(
+            Resource::new("acm.Certificate", "cert").with_binding("cert"),
+        ));
         plan.add(Effect::ExpandDeferredFor {
             id: ResourceId::new("route53.RecordSet", "validation_records"),
             upstream_binding: "cert".to_string(),
@@ -691,11 +684,11 @@ mod tests {
         });
 
         let summary = plan.summary();
-        assert_eq!(summary.create, 0);
+        assert_eq!(summary.create, 1);
         assert_eq!(summary.deferred.len(), 1);
         assert_eq!(summary.deferred[0].upstream_binding, "cert");
         assert_eq!(summary.deferred[0].action, DeferredSummaryAction::Add);
-        assert!(summary.to_string().contains("0 to create"));
+        assert!(summary.to_string().contains("1 to create"));
         assert_eq!(
             summary.deferred_lines(),
             vec!["N to add after cert applies."]

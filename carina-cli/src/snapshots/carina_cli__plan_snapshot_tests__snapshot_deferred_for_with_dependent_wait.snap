@@ -9,7 +9,12 @@ Execution Plan:
       validation_method: "DNS"
         │
         └─ +/- aws.route53.RecordSet validation_records[*] (N records after cert applies)
-              from: for opt in cert.domain_validation_options
+              <- for opt in cert.domain_validation_options
+              hosted_zone_id: "Z123"
+              name: (known after cert applies)
+              resource_records: (known after cert applies)
+              ttl: 60
+              type: (known after cert applies)
               │
               └─ + aws.acm.CertificateValidation 
                     certificate_arn: "arn:aws:acm:us-east-1:123456789012:certificate/example"

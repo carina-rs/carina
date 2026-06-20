@@ -9,10 +9,12 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use crate::detail_rows::DetailRow;
 use crate::effect::Effect;
 use crate::plan::{DeferredSummaryAction, DeferredSummaryEntry, Plan};
 use crate::resource::{ConcreteValue, DeferredValue, Value};
 use crate::utils::enum_display_value;
+use crate::value::format_value_with_key;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChildRenderItem {
@@ -121,16 +123,11 @@ pub fn deferred_summary_for_plan(plan: &Plan) -> DeferredSummaryForPlan {
         .enumerate()
         .filter_map(|(idx, effect)| {
             let Effect::ExpandDeferredFor {
-                upstream_binding,
-                template,
-                ..
+                upstream_binding, ..
             } = effect
             else {
                 return None;
             };
-            if is_synthetic_deferred_binding(&template.binding_name) {
-                return None;
-            }
             let action = if paired_expands.contains(&idx) {
                 DeferredSummaryAction::Replace
             } else {
@@ -138,6 +135,7 @@ pub fn deferred_summary_for_plan(plan: &Plan) -> DeferredSummaryForPlan {
             };
             Some(DeferredSummaryEntry {
                 upstream_binding: upstream_binding.clone(),
+                verb: deferred_for_verb(plan, upstream_binding).to_string(),
                 action,
             })
         })
@@ -175,6 +173,99 @@ pub fn is_synthetic_deferred_binding(binding_name: &str) -> bool {
         .rsplit('.')
         .next()
         .is_none_or(|segment| segment.is_empty() || segment.starts_with('_'))
+}
+
+pub fn deferred_for_source(template: &crate::parser::DeferredForExpression) -> String {
+    if template.iterable_attr.is_empty() {
+        template.iterable_binding.clone()
+    } else {
+        format!("{}.{}", template.iterable_binding, template.iterable_attr)
+    }
+}
+
+pub fn deferred_for_verb(plan: &Plan, upstream_binding: &str) -> &'static str {
+    if plan
+        .effects()
+        .iter()
+        .any(|effect| effect.binding_name().as_deref() == Some(upstream_binding))
+    {
+        "applies"
+    } else {
+        "resolves"
+    }
+}
+
+pub fn deferred_for_display_name(
+    template: &crate::parser::DeferredForExpression,
+    upstream_binding: &str,
+    verb: &str,
+) -> String {
+    let note = format!("(N records after {upstream_binding} {verb})");
+    if is_synthetic_deferred_binding(&template.binding_name) {
+        note
+    } else {
+        format!("{}[*] {note}", template.binding_name)
+    }
+}
+
+pub fn deferred_for_detail_rows(
+    template: &crate::parser::DeferredForExpression,
+    upstream_binding: &str,
+    verb: &str,
+) -> Vec<DetailRow> {
+    let mut rows = vec![DetailRow::Text {
+        text: format!("<- {}", template.header),
+    }];
+    let mut attrs: Vec<_> = template.attributes.iter().collect();
+    attrs.sort_by_key(|(key, _)| key.clone());
+    rows.extend(attrs.into_iter().map(|(key, value)| DetailRow::Attribute {
+        key: key.clone(),
+        value: format_deferred_for_template_value(value, key, upstream_binding, verb),
+        ref_binding: None,
+        annotation: None,
+    }));
+    rows
+}
+
+pub fn format_deferred_for_template_value(
+    value: &Value,
+    key: &str,
+    upstream_binding: &str,
+    verb: &str,
+) -> String {
+    let formatted = format_value_with_key(value, Some(key));
+    let replaced = replace_known_after_upstream(&formatted, upstream_binding, verb);
+    if let Some(inner) = replaced
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .filter(|value| value.starts_with("(known after ") && !value.contains(','))
+    {
+        inner.to_string()
+    } else {
+        replaced
+    }
+}
+
+pub fn replace_known_after_upstream(input: &str, upstream_binding: &str, verb: &str) -> String {
+    const PREFIX: &str = "(known after upstream apply";
+    let replacement = format!("(known after {upstream_binding} {verb})");
+    let mut output = String::with_capacity(input.len());
+    let mut rest = input;
+
+    while let Some(start) = rest.find(PREFIX) {
+        output.push_str(&rest[..start]);
+        let after_start = &rest[start..];
+        if let Some(end) = after_start.find(')') {
+            output.push_str(&replacement);
+            rest = &after_start[end + 1..];
+        } else {
+            output.push_str(after_start);
+            rest = "";
+        }
+    }
+
+    output.push_str(rest);
+    output
 }
 
 /// Intermediate data for tree-building: maps from effect indices to their

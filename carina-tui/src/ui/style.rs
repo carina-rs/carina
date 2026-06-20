@@ -38,14 +38,6 @@ pub(super) fn build_plan_title(summary: &PlanSummary) -> Line<'static> {
                     Style::default().fg(Color::Green),
                 ));
                 spans.push(Span::raw(" to create"));
-                if summary.legacy_anonymous_deferred > 0 {
-                    spans.push(Span::raw(" (+"));
-                    spans.push(Span::styled(
-                        summary.legacy_anonymous_deferred.to_string(),
-                        Style::default().fg(Color::Green),
-                    ));
-                    spans.push(Span::raw(" deferred, count unknown)"));
-                }
             }
             PlanSummaryPart::Update { count } => {
                 spans.push(Span::styled(

@@ -1086,11 +1086,12 @@ fn test_expand_deferred_for_renders_deferred_until_apply_marker() {
     insta::assert_snapshot!(output, @"
     Execution Plan:
 
-      + aws.route53.Record validation_records[*] (N records after cert applies)
-          from: for opt in cert.domain_validation_options
+      + aws.route53.Record validation_records[*] (N records after cert resolves)
+          <- for opt in cert.domain_validation_options
+          name: (known after cert resolves)
 
     Plan: 0 to add, 0 to change, 0 to destroy.
-           N to add after cert applies.
+           N to add after cert resolves.
     ");
 }
 
@@ -1160,11 +1161,12 @@ fn test_deferred_for_pairs_top_level_indexed_deletes() {
     insta::assert_snapshot!(output, @"
     Execution Plan:
 
-      +/- aws.route53.Record validation_records[*] (N records after cert applies)
-          from: for opt in cert.domain_validation_options
+      +/- aws.route53.Record validation_records[*] (N records after cert resolves)
+          <- for opt in cert.domain_validation_options
+          name: (known after cert resolves)
 
     Plan: 0 to add, 0 to change, 0 to destroy.
-           N to replace after cert applies.
+           N to replace after cert resolves.
     ");
 }
 
@@ -1201,14 +1203,15 @@ fn test_paired_deferred_for_renders_dependent_children() {
     insta::assert_snapshot!(output, @"
     Execution Plan:
 
-      +/- aws.route53.Record validation_records[*] (N records after cert applies)
-          from: for opt in cert.domain_validation_options
+      +/- aws.route53.Record validation_records[*] (N records after cert resolves)
+          <- for opt in cert.domain_validation_options
+          name: (known after cert resolves)
             │
             └─ + acm.CertificateValidation cert-validation
                   validation_record_id: __deferred_for.validation_records.id
 
     Plan: 1 to add, 0 to change, 0 to destroy.
-           N to replace after cert applies.
+           N to replace after cert resolves.
     ");
 }
 
@@ -1239,7 +1242,8 @@ fn test_deferred_for_does_not_pair_unrelated_same_type_delete() {
 
       + acm.Certificate cert
             ├─ +/- aws.route53.Record validation_records[*] (N records after cert applies)
-            │     from: for opt in cert.domain_validation_options
+            │     <- for opt in cert.domain_validation_options
+            │     name: (known after cert applies)
             │
             └─ - route53.Record old_record
 
@@ -1869,7 +1873,8 @@ fn format_export_value_duration_renders_canonical() {
 fn format_deferred_value_duration_renders_canonical() {
     // Same shape as format_export_value but on the deferred-for path.
     let v = Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(60)));
-    let result = format_deferred_value(&v);
+    let result =
+        carina_core::plan_tree::format_deferred_for_template_value(&v, "ttl", "cert", "applies");
     // The deferred path may inject ANSI dimming for Unknown variants,
     // but a resolved Duration must render verbatim.
     assert_eq!(result, "1min");

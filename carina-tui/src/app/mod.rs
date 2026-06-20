@@ -7,7 +7,7 @@ use carina_core::effect::Effect;
 use carina_core::plan::{Plan, PlanSummary};
 use carina_core::plan_tree::{
     ChildRenderItem, build_dependency_graph, build_single_parent_tree, child_render_items,
-    extract_compact_hint, is_synthetic_deferred_binding,
+    deferred_for_detail_rows, deferred_for_display_name, deferred_for_verb, extract_compact_hint,
 };
 use carina_core::resource::ResourceId;
 use carina_core::schema::SchemaRegistry;
@@ -104,7 +104,7 @@ impl App {
         let mut nodes: Vec<TreeNode> = plan
             .effects()
             .iter()
-            .map(|e| effect_to_node(e, schemas_opt))
+            .map(|e| effect_to_node(plan, e, schemas_opt))
             .collect();
         let plan_summary = plan.summary();
         let summary = format!("{}", plan_summary);
@@ -712,21 +712,22 @@ fn collect_paired_deferred_for(
             else {
                 continue;
             };
+            let verb = deferred_for_verb(plan, upstream_binding);
             nodes[expand_idx].resource_type = template.resource_type.clone();
-            nodes[expand_idx].name_part = deferred_for_display_name(template, upstream_binding);
+            nodes[expand_idx].name_part =
+                deferred_for_display_name(template, upstream_binding, verb);
             nodes[expand_idx].effect_label =
                 format!("{} {}", template.resource_type, nodes[expand_idx].name_part);
             nodes[expand_idx].symbol = "+/-".to_string();
             nodes[expand_idx].kind = EffectKind::Replace;
-            nodes[expand_idx].detail_rows = vec![DetailRow::Text {
-                text: format!("from: {}", template.header),
-            }];
+            nodes[expand_idx].detail_rows =
+                deferred_for_detail_rows(template, upstream_binding, verb);
             suppressed.extend(delete_indices);
         }
     }
 }
 
-fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode {
+fn effect_to_node(plan: &Plan, effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode {
     let detail_rows = build_detail_rows(effect, schemas, DetailLevel::Full, None, None);
 
     match effect {
@@ -859,30 +860,16 @@ fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode
             template,
             ..
         } => {
-            let mut rows = detail_rows;
-            if rows.is_empty() {
-                if is_synthetic_deferred_binding(&template.binding_name) {
-                    let source = deferred_for_source(template);
-                    rows.push(DetailRow::Attribute {
-                        key: "deferred".to_string(),
-                        value: format!("count known after {} applies", upstream_binding),
-                        ref_binding: None,
-                        annotation: Some(format!("from {source}")),
-                    });
-                } else {
-                    rows.push(DetailRow::Text {
-                        text: format!("from: {}", template.header),
-                    });
-                }
-            }
+            let verb = deferred_for_verb(plan, upstream_binding);
+            let rows = deferred_for_detail_rows(template, upstream_binding, verb);
             TreeNode {
                 effect_label: format!(
                     "{} {}",
                     template.resource_type,
-                    deferred_for_display_name(template, upstream_binding)
+                    deferred_for_display_name(template, upstream_binding, verb)
                 ),
                 resource_type: template.resource_type.clone(),
-                name_part: deferred_for_display_name(template, upstream_binding),
+                name_part: deferred_for_display_name(template, upstream_binding, verb),
                 symbol: effect.display_glyph().to_string(),
                 kind: EffectKind::Create,
                 detail_rows: rows,
@@ -891,28 +878,6 @@ fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode
                 parent: None,
             }
         }
-    }
-}
-
-fn deferred_for_display_name(
-    template: &carina_core::parser::DeferredForExpression,
-    upstream_binding: &str,
-) -> String {
-    if is_synthetic_deferred_binding(&template.binding_name) {
-        format!("(deferred from {})", deferred_for_source(template))
-    } else {
-        format!(
-            "{}[*] (N records after {} applies)",
-            template.binding_name, upstream_binding
-        )
-    }
-}
-
-fn deferred_for_source(template: &carina_core::parser::DeferredForExpression) -> String {
-    if template.iterable_attr.is_empty() {
-        template.iterable_binding.clone()
-    } else {
-        format!("{}.{}", template.iterable_binding, template.iterable_attr)
     }
 }
 

@@ -15,7 +15,8 @@ use carina_core::plan::{DeferredSummaryAction, Plan, PlanSummaryPart};
 use carina_core::plan_tree::shorten_attr_name;
 use carina_core::plan_tree::{
     ChildRenderItem, build_dependency_graph, build_single_parent_tree, child_render_items,
-    extract_compact_hint, is_synthetic_deferred_binding,
+    deferred_for_detail_rows, deferred_for_display_name, deferred_for_source, deferred_for_verb,
+    extract_compact_hint,
 };
 use carina_core::resource::{ConcreteValue, DeferredValue, ResourceId, Value};
 use carina_core::schema::SchemaRegistry;
@@ -62,46 +63,6 @@ fn format_compact_name(
         format!("({})", hint)
     } else {
         name.to_string()
-    }
-}
-
-/// Format a value in a deferred for-expression template.
-/// Placeholder values (`Value::Deferred(DeferredValue::Unknown)`) are shown dimmed; resolved
-/// values are shown normally.
-fn format_deferred_value(value: &Value) -> String {
-    /// Catch-all placeholder text for value variants whose contents
-    /// cannot be sensibly inlined into a deferred-for template
-    /// (e.g. `Interpolation`, `FunctionCall`, `Secret`). The wording
-    /// matches `render_unknown(ForValue)` so display stays uniform
-    /// across the deferred and resolved-Unknown paths.
-    const DEFERRED_FALLBACK: &str = "(known after upstream apply)";
-
-    match value {
-        Value::Deferred(DeferredValue::Unknown(reason)) => {
-            format!("{}", carina_core::value::render_unknown(reason).dimmed())
-        }
-        Value::Concrete(ConcreteValue::String(s)) => format!("'{}'", s),
-        Value::Concrete(ConcreteValue::Int(i)) => i.to_string(),
-        Value::Concrete(ConcreteValue::Float(f)) => f.to_string(),
-        Value::Concrete(ConcreteValue::Bool(b)) => b.to_string(),
-        Value::Concrete(ConcreteValue::Duration(d)) => carina_core::value::render_duration(*d),
-        Value::Deferred(DeferredValue::ResourceRef { path }) => path.to_dot_string().to_string(),
-        Value::Concrete(ConcreteValue::List(items)) => {
-            let formatted: Vec<String> = items.iter().map(format_deferred_value).collect();
-            format!("[{}]", formatted.join(", "))
-        }
-        Value::Concrete(ConcreteValue::StringList(items)) => {
-            let formatted: Vec<String> = items.iter().map(|s| format!("'{}'", s)).collect();
-            format!("[{}]", formatted.join(", "))
-        }
-        Value::Concrete(ConcreteValue::Map(map)) => {
-            let formatted: Vec<String> = map
-                .iter()
-                .map(|(k, v)| format!("{} = {}", k, format_deferred_value(v)))
-                .collect();
-            format!("{{{}}}", formatted.join(", "))
-        }
-        _ => format!("{}", DEFERRED_FALLBACK.dimmed()),
     }
 }
 
@@ -319,15 +280,7 @@ pub fn format_plan(
             PlanSummaryPart::Import { count } => format!("{} to import", count.to_string().cyan()),
             PlanSummaryPart::Create { count } => {
                 let count = count.to_string().green();
-                if summary.legacy_anonymous_deferred > 0 {
-                    format!(
-                        "{} to add (+{} deferred, count unknown)",
-                        count,
-                        summary.legacy_anonymous_deferred.to_string().green()
-                    )
-                } else {
-                    format!("{} to add", count)
-                }
+                format!("{} to add", count)
             }
             PlanSummaryPart::Update { count } => {
                 format!("{} to change", count.to_string().yellow())
@@ -348,12 +301,6 @@ pub fn format_plan(
             PlanSummaryPart::Wait { count } => format!("{} to wait", count.to_string().magenta()),
         })
         .collect();
-    if !deferred_for_expressions.is_empty() {
-        parts.push(format!(
-            "{} root-scope deferred",
-            deferred_for_expressions.len().to_string().cyan()
-        ));
-    }
     if !export_changes.is_empty() {
         parts.push(format!(
             "{} export change(s)",
@@ -368,10 +315,21 @@ pub fn format_plan(
         };
         writeln!(
             out,
-            "       {} to {} after {} applies.",
+            "       {} to {} after {} {}.",
             "N".green(),
             action,
-            entry.upstream_binding
+            entry.upstream_binding,
+            entry.verb
+        )
+        .unwrap();
+    }
+    for deferred in deferred_for_expressions {
+        writeln!(
+            out,
+            "       {} to {} after {} resolves.",
+            "N".green(),
+            "add".green(),
+            deferred_for_source(deferred)
         )
         .unwrap();
     }
@@ -383,25 +341,24 @@ pub fn format_plan(
 /// Format a single deferred for-expression for plan display.
 fn format_deferred_for_expression(deferred: &carina_core::parser::DeferredForExpression) -> String {
     let mut out = String::new();
-    writeln!(out, "  {} {}", "?".cyan(), deferred.header).unwrap();
+    let upstream = deferred_for_source(deferred);
     writeln!(
         out,
-        "      {}",
-        format!(
-            "expands to one {} per element (count known after upstream apply)",
-            deferred.resource_type
-        )
-        .dimmed()
+        "  {} {} {}",
+        "+".green().bold(),
+        deferred.resource_type.cyan().bold(),
+        format!("(N records after {upstream} resolves)").dimmed()
     )
     .unwrap();
-    // Sort attributes for deterministic output
-    let mut attrs: Vec<_> = deferred.attributes.iter().collect();
-    attrs.sort_by_key(|(k, _)| k.clone());
-    for (key, value) in &attrs {
-        let formatted = format_deferred_value(value);
-        writeln!(out, "      {}: {}", key.dimmed(), formatted).unwrap();
+    for row in deferred_for_detail_rows(deferred, &upstream, "resolves") {
+        match row {
+            DetailRow::Text { text } => writeln!(out, "      {}", text.dimmed()).unwrap(),
+            DetailRow::Attribute { key, value, .. } => {
+                writeln!(out, "      {}: {}", key.dimmed(), value).unwrap();
+            }
+            _ => {}
+        }
     }
-    writeln!(out).unwrap();
     out
 }
 
@@ -744,17 +701,16 @@ impl<'a> TreeRenderContext<'a> {
                 template,
                 ..
             } => {
-                let display_name = deferred_for_display_name(template);
-                let deferred_note = deferred_for_note(template, upstream_binding);
+                let verb = deferred_for_verb(self.plan, upstream_binding);
+                let display_name = deferred_for_display_name(template, upstream_binding, verb);
                 writeln!(
                     self.out,
-                    "{}{}{} {} {}{}",
+                    "{}{}{} {} {}",
                     base_indent,
                     connector,
                     colored_symbol,
                     template.resource_type.cyan().bold(),
-                    display_name.green().bold(),
-                    deferred_note
+                    display_name.green().bold()
                 )
                 .unwrap();
                 let attr_prefix = if indent == 0 {
@@ -767,23 +723,9 @@ impl<'a> TreeRenderContext<'a> {
                     };
                     format!("{}{}   ", base_indent, continuation)
                 };
-                if is_synthetic_deferred_binding(&template.binding_name) {
-                    writeln!(
-                        self.out,
-                        "{}{}",
-                        attr_prefix,
-                        format!("(deferred, count known after {} applies)", upstream_binding)
-                            .dimmed()
-                    )
-                    .unwrap();
+                for row in deferred_for_detail_rows(template, upstream_binding, verb) {
+                    render_detail_row(&mut self.out, &row, effect, &attr_prefix);
                 }
-                writeln!(
-                    self.out,
-                    "{}{}",
-                    attr_prefix,
-                    format!("from: {}", template.header).dimmed()
-                )
-                .unwrap();
                 has_displayed_attrs = true;
             }
         }
@@ -949,15 +891,17 @@ impl<'a> TreeRenderContext<'a> {
         };
         let base_indent = "  ";
         let attr_base = "    ";
+        let verb = deferred_for_verb(self.plan, upstream_binding);
         writeln!(
             self.out,
-            "{}{}{} {} {} {}",
+            "{}{}{} {} {}",
             base_indent,
             connector,
             "+/-".magenta().bold(),
             template.resource_type.cyan().bold(),
-            format!("{}[*]", template.binding_name).magenta().bold(),
-            format!("(N records after {} applies)", upstream_binding).dimmed()
+            deferred_for_display_name(template, upstream_binding, verb)
+                .magenta()
+                .bold()
         )
         .unwrap();
 
@@ -972,13 +916,14 @@ impl<'a> TreeRenderContext<'a> {
             format!("{}{}   ", base_indent, continuation)
         };
 
-        writeln!(
-            self.out,
-            "{}{}",
-            attr_prefix,
-            format!("from: {}", template.header).dimmed()
-        )
-        .unwrap();
+        for row in deferred_for_detail_rows(template, upstream_binding, verb) {
+            render_detail_row(
+                &mut self.out,
+                &row,
+                &self.plan.effects()[expand_idx],
+                &attr_prefix,
+            );
+        }
 
         let children = self
             .dependents
@@ -1153,33 +1098,6 @@ fn format_composition_header(binding: &str, source_path: Option<&str>) -> String
             binding.cyan().bold(),
             format!("({})", path).dimmed(),
         ),
-    }
-}
-
-fn deferred_for_display_name(template: &carina_core::parser::DeferredForExpression) -> String {
-    if is_synthetic_deferred_binding(&template.binding_name) {
-        let source = if template.iterable_attr.is_empty() {
-            template.iterable_binding.clone()
-        } else {
-            format!("{}.{}", template.iterable_binding, template.iterable_attr)
-        };
-        format!("(deferred from {source})")
-    } else {
-        format!("{}[*]", template.binding_name)
-    }
-}
-
-fn deferred_for_note(
-    template: &carina_core::parser::DeferredForExpression,
-    upstream_binding: &str,
-) -> String {
-    if is_synthetic_deferred_binding(&template.binding_name) {
-        String::new()
-    } else {
-        format!(
-            " {}",
-            format!("(N records after {upstream_binding} applies)").dimmed()
-        )
     }
 }
 

@@ -2,8 +2,9 @@
 source: carina-tui/src/tui_snapshot_tests.rs
 expression: output
 ---
-┌ Plan (Plan: 0 to create, 0 to update, 0 to delete; N to replace after cert applies.) ────────────────────────────────┐
-│+/- aws.route53.Record validation_records[*] (N records after cert applies)                                           │
+┌ Plan (Plan: 1 to create, 0 to update, 0 to delete; N to replace after cert applies.) ────────────────────────────────┐
+│+ acm.Certificate cert                                                                                                │
+│    └── +/- aws.route53.Record validation_records[*] (N records after cert applies)                                   │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
@@ -25,10 +26,11 @@ expression: output
 ┌ Details ─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │+/- aws.route53.Record validation_records[*] (N records after cert applies)                                           │
 │                                                                                                                      │
-│  from: for opt in cert.domain_validation_options                                                                     │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
+│  <- for opt in cert.domain_validation_options                                                                        │
+│  hosted_zone_id: "Z123"                                                                                              │
+│  name: (known after cert applies)                                                                                    │
+│  resource_records: (known after cert applies)                                                                        │
+│  ttl: 60                                                                                                             │
+│  type: "CNAME"                                                                                                       │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
  / search  ↑↓/jk navigate  Tab switch panel  Enter detail  q/Esc quit
