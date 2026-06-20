@@ -1,6 +1,6 @@
 //! Plan title and effect-kind styling helpers.
 
-use carina_core::plan::{PlanSummary, PlanSummaryPart};
+use carina_core::plan::{DeferredSummaryAction, PlanSummary, PlanSummaryPart};
 use ratatui::prelude::*;
 
 use crate::app::EffectKind;
@@ -32,19 +32,16 @@ pub(super) fn build_plan_title(summary: &PlanSummary) -> Line<'static> {
                 ));
                 spans.push(Span::raw(" to import"));
             }
-            PlanSummaryPart::Create {
-                count,
-                deferred_count,
-            } => {
+            PlanSummaryPart::Create { count } => {
                 spans.push(Span::styled(
                     count.to_string(),
                     Style::default().fg(Color::Green),
                 ));
                 spans.push(Span::raw(" to create"));
-                if deferred_count > 0 {
+                if summary.legacy_anonymous_deferred > 0 {
                     spans.push(Span::raw(" (+"));
                     spans.push(Span::styled(
-                        deferred_count.to_string(),
+                        summary.legacy_anonymous_deferred.to_string(),
                         Style::default().fg(Color::Green),
                     ));
                     spans.push(Span::raw(" deferred, count unknown)"));
@@ -93,6 +90,24 @@ pub(super) fn build_plan_title(summary: &PlanSummary) -> Line<'static> {
                 spans.push(Span::raw(" to wait"));
             }
         }
+    }
+
+    for entry in &summary.deferred {
+        spans.push(Span::raw("; "));
+        spans.push(Span::styled("N", Style::default().fg(Color::Green)));
+        spans.push(Span::raw(" to "));
+        match entry.action {
+            DeferredSummaryAction::Add => {
+                spans.push(Span::styled("add", Style::default().fg(Color::Green)));
+            }
+            DeferredSummaryAction::Replace => {
+                spans.push(Span::styled("replace", Style::default().fg(Color::Magenta)));
+            }
+        }
+        spans.push(Span::raw(format!(
+            " after {} applies.",
+            entry.upstream_binding
+        )));
     }
 
     spans.push(Span::raw(") "));

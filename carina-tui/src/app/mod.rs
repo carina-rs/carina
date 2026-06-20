@@ -713,30 +713,14 @@ fn collect_paired_deferred_for(
                 continue;
             };
             nodes[expand_idx].resource_type = template.resource_type.clone();
-            nodes[expand_idx].name_part =
-                format!("[from {}.{}]", upstream_binding, template.iterable_attr);
-            nodes[expand_idx].effect_label = format!(
-                "{} [from {}.{}]",
-                template.resource_type, upstream_binding, template.iterable_attr
-            );
+            nodes[expand_idx].name_part = deferred_for_display_name(template, upstream_binding);
+            nodes[expand_idx].effect_label =
+                format!("{} {}", template.resource_type, nodes[expand_idx].name_part);
             nodes[expand_idx].symbol = "+/-".to_string();
             nodes[expand_idx].kind = EffectKind::Replace;
-            let mut detail_rows = Vec::new();
-            for delete_idx in &delete_indices {
-                if let Effect::Delete { id, binding, .. } = &plan.effects()[*delete_idx] {
-                    let display_name = binding.as_deref().unwrap_or(id.name_str());
-                    detail_rows.push(DetailRow::Text {
-                        text: format!("- destroying {}", display_name),
-                    });
-                }
-            }
-            detail_rows.push(DetailRow::Text {
-                text: format!(
-                    "+ replaced by deferred for-loop, count known after {} applies",
-                    upstream_binding
-                ),
-            });
-            nodes[expand_idx].detail_rows = detail_rows;
+            nodes[expand_idx].detail_rows = vec![DetailRow::Text {
+                text: format!("from: {}", template.header),
+            }];
             suppressed.extend(delete_indices);
         }
     }
@@ -875,23 +859,30 @@ fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode
             template,
             ..
         } => {
-            let source = deferred_for_source(template);
             let mut rows = detail_rows;
             if rows.is_empty() {
-                rows.push(DetailRow::Attribute {
-                    key: "deferred".to_string(),
-                    value: format!("count known after {} applies", upstream_binding),
-                    ref_binding: None,
-                    annotation: Some(format!("from {source}")),
-                });
+                if is_synthetic_deferred_binding(&template.binding_name) {
+                    let source = deferred_for_source(template);
+                    rows.push(DetailRow::Attribute {
+                        key: "deferred".to_string(),
+                        value: format!("count known after {} applies", upstream_binding),
+                        ref_binding: None,
+                        annotation: Some(format!("from {source}")),
+                    });
+                } else {
+                    rows.push(DetailRow::Text {
+                        text: format!("from: {}", template.header),
+                    });
+                }
             }
             TreeNode {
                 effect_label: format!(
-                    "deferred for: {} (count known after {} applies)",
-                    source, upstream_binding
+                    "{} {}",
+                    template.resource_type,
+                    deferred_for_display_name(template, upstream_binding)
                 ),
                 resource_type: template.resource_type.clone(),
-                name_part: deferred_for_display_name(template),
+                name_part: deferred_for_display_name(template, upstream_binding),
                 symbol: effect.display_glyph().to_string(),
                 kind: EffectKind::Create,
                 detail_rows: rows,
@@ -903,11 +894,17 @@ fn effect_to_node(effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode
     }
 }
 
-fn deferred_for_display_name(template: &carina_core::parser::DeferredForExpression) -> String {
+fn deferred_for_display_name(
+    template: &carina_core::parser::DeferredForExpression,
+    upstream_binding: &str,
+) -> String {
     if is_synthetic_deferred_binding(&template.binding_name) {
         format!("(deferred from {})", deferred_for_source(template))
     } else {
-        format!("{}[?]", template.binding_name)
+        format!(
+            "{}[*] (N records after {} applies)",
+            template.binding_name, upstream_binding
+        )
     }
 }
 

@@ -10,7 +10,7 @@ use carina_core::detail_rows::{
 #[cfg(test)]
 use carina_core::effect::CascadingUpdate;
 use carina_core::effect::Effect;
-use carina_core::plan::{Plan, PlanSummaryPart};
+use carina_core::plan::{DeferredSummaryAction, Plan, PlanSummaryPart};
 #[cfg(test)]
 use carina_core::plan_tree::shorten_attr_name;
 use carina_core::plan_tree::{
@@ -317,16 +317,13 @@ pub fn format_plan(
         .map(|part| match part {
             PlanSummaryPart::Read { count } => format!("{} to read", count.to_string().cyan()),
             PlanSummaryPart::Import { count } => format!("{} to import", count.to_string().cyan()),
-            PlanSummaryPart::Create {
-                count,
-                deferred_count,
-            } => {
+            PlanSummaryPart::Create { count } => {
                 let count = count.to_string().green();
-                if deferred_count > 0 {
+                if summary.legacy_anonymous_deferred > 0 {
                     format!(
                         "{} to add (+{} deferred, count unknown)",
                         count,
-                        deferred_count.to_string().green()
+                        summary.legacy_anonymous_deferred.to_string().green()
                     )
                 } else {
                     format!("{} to add", count)
@@ -364,6 +361,20 @@ pub fn format_plan(
         ));
     }
     writeln!(out, "Plan: {}.", parts.join(", ")).unwrap();
+    for entry in &summary.deferred {
+        let action = match entry.action {
+            DeferredSummaryAction::Add => "add".green(),
+            DeferredSummaryAction::Replace => "replace".magenta(),
+        };
+        writeln!(
+            out,
+            "       {} to {} after {} applies.",
+            "N".green(),
+            action,
+            entry.upstream_binding
+        )
+        .unwrap();
+    }
     writeln!(out).unwrap();
 
     out
@@ -734,14 +745,16 @@ impl<'a> TreeRenderContext<'a> {
                 ..
             } => {
                 let display_name = deferred_for_display_name(template);
+                let deferred_note = deferred_for_note(template, upstream_binding);
                 writeln!(
                     self.out,
-                    "{}{}{} {} {}",
+                    "{}{}{} {} {}{}",
                     base_indent,
                     connector,
                     colored_symbol,
                     template.resource_type.cyan().bold(),
-                    display_name.green().bold()
+                    display_name.green().bold(),
+                    deferred_note
                 )
                 .unwrap();
                 let attr_prefix = if indent == 0 {
@@ -754,13 +767,16 @@ impl<'a> TreeRenderContext<'a> {
                     };
                     format!("{}{}   ", base_indent, continuation)
                 };
-                writeln!(
-                    self.out,
-                    "{}{}",
-                    attr_prefix,
-                    format!("(deferred, count known after {} applies)", upstream_binding).dimmed()
-                )
-                .unwrap();
+                if is_synthetic_deferred_binding(&template.binding_name) {
+                    writeln!(
+                        self.out,
+                        "{}{}",
+                        attr_prefix,
+                        format!("(deferred, count known after {} applies)", upstream_binding)
+                            .dimmed()
+                    )
+                    .unwrap();
+                }
                 writeln!(
                     self.out,
                     "{}{}",
@@ -935,14 +951,13 @@ impl<'a> TreeRenderContext<'a> {
         let attr_base = "    ";
         writeln!(
             self.out,
-            "{}{}{} {} {}",
+            "{}{}{} {} {} {}",
             base_indent,
             connector,
             "+/-".magenta().bold(),
             template.resource_type.cyan().bold(),
-            format!("[from {}.{}]", upstream_binding, template.iterable_attr)
-                .magenta()
-                .bold()
+            format!("{}[*]", template.binding_name).magenta().bold(),
+            format!("(N records after {} applies)", upstream_binding).dimmed()
         )
         .unwrap();
 
@@ -957,27 +972,11 @@ impl<'a> TreeRenderContext<'a> {
             format!("{}{}   ", base_indent, continuation)
         };
 
-        for delete_idx in delete_indices {
-            if let Effect::Delete { id, binding, .. } = &self.plan.effects()[*delete_idx] {
-                let display_name = binding.as_deref().unwrap_or(id.name_str());
-                writeln!(
-                    self.out,
-                    "{}{}",
-                    attr_prefix,
-                    format!("- destroying {}", display_name).red()
-                )
-                .unwrap();
-            }
-        }
         writeln!(
             self.out,
             "{}{}",
             attr_prefix,
-            format!(
-                "+ replaced by deferred for-loop, count known after {} applies",
-                upstream_binding
-            )
-            .green()
+            format!("from: {}", template.header).dimmed()
         )
         .unwrap();
 
@@ -1166,7 +1165,21 @@ fn deferred_for_display_name(template: &carina_core::parser::DeferredForExpressi
         };
         format!("(deferred from {source})")
     } else {
-        format!("{}[?]", template.binding_name)
+        format!("{}[*]", template.binding_name)
+    }
+}
+
+fn deferred_for_note(
+    template: &carina_core::parser::DeferredForExpression,
+    upstream_binding: &str,
+) -> String {
+    if is_synthetic_deferred_binding(&template.binding_name) {
+        String::new()
+    } else {
+        format!(
+            " {}",
+            format!("(N records after {upstream_binding} applies)").dimmed()
+        )
     }
 }
 

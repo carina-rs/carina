@@ -1,6 +1,5 @@
 ---
 source: carina-cli/src/plan_snapshot_tests.rs
-assertion_line: 2012
 expression: output
 ---
 Execution Plan:
@@ -9,8 +8,7 @@ Execution Plan:
       domain_name: "registry.example.com"
       validation_method: "DNS"
         │
-        ├─ + aws.route53.RecordSet validation_records[?]
-        │     (deferred, count known after cert applies)
+        ├─ + aws.route53.RecordSet validation_records[*] (N records after cert applies)
         │     from: for opt in cert.domain_validation_options
         │
         └─ - aws.route53.RecordSet extra_record
@@ -20,4 +18,5 @@ Execution Plan:
               ttl: 60
               type: "CNAME"
 
-Plan: 1 to add (+1 deferred, count unknown), 0 to change, 1 to destroy.
+Plan: 1 to add, 0 to change, 1 to destroy.
+       N to add after cert applies.

@@ -1,10 +1,9 @@
 ---
 source: carina-tui/src/tui_snapshot_tests.rs
-assertion_line: 260
 expression: output
 ---
-┌ Plan (Plan: 0 to create (+1 deferred, count unknown), 0 to update, 0 to delete) ─────────────────────────────────────┐
-│+ aws.route53.Record validation_records[?]                                                                            │
+┌ Plan (Plan: 0 to create, 0 to update, 0 to delete; N to add after cert applies.) ────────────────────────────────────┐
+│+ aws.route53.Record validation_records[*] (N records after cert applies)                                             │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
@@ -24,9 +23,9 @@ expression: output
 │                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ Details ─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│+ aws.route53.Record validation_records[?]                                                                            │
+│+ aws.route53.Record validation_records[*] (N records after cert applies)                                             │
 │                                                                                                                      │
-│  deferred: count known after cert applies  from cert.domain_validation_options                                       │
+│  from: for opt in cert.domain_validation_options                                                                     │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │

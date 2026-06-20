@@ -202,6 +202,7 @@ impl Plan {
     /// Generate a summary of the Plan for display
     pub fn summary(&self) -> PlanSummary {
         let mut summary = PlanSummary::default();
+        let deferred_summary = crate::plan_tree::deferred_summary_for_plan(self);
         for effect in &self.effects {
             match effect {
                 Effect::Read { .. } => summary.read += 1,
@@ -213,14 +214,28 @@ impl Plan {
                     summary.replace += 1;
                     summary.update += cascading_updates.len();
                 }
-                Effect::Delete { .. } => summary.delete += 1,
+                Effect::Delete { .. } => {}
                 Effect::Import { .. } => summary.import += 1,
                 Effect::Remove { .. } => summary.remove += 1,
                 Effect::Move { .. } => summary.moved += 1,
                 Effect::Wait { .. } => summary.wait += 1,
-                Effect::ExpandDeferredFor { .. } => summary.deferred_add += 1,
+                Effect::ExpandDeferredFor { template, .. } => {
+                    if crate::plan_tree::is_synthetic_deferred_binding(&template.binding_name) {
+                        summary.legacy_anonymous_deferred += 1;
+                    }
+                }
             }
         }
+        summary.delete = self
+            .effects
+            .iter()
+            .enumerate()
+            .filter(|(idx, effect)| {
+                matches!(effect, Effect::Delete { .. })
+                    && !deferred_summary.paired_delete_indices.contains(idx)
+            })
+            .count();
+        summary.deferred = deferred_summary.entries;
         summary
     }
 }
@@ -232,18 +247,31 @@ pub struct PlanSummary {
     pub update: usize,
     pub replace: usize,
     pub delete: usize,
-    pub deferred_add: usize,
+    pub deferred: Vec<DeferredSummaryEntry>,
+    pub legacy_anonymous_deferred: usize,
     pub import: usize,
     pub remove: usize,
     pub moved: usize,
     pub wait: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredSummaryEntry {
+    pub upstream_binding: String,
+    pub action: DeferredSummaryAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferredSummaryAction {
+    Add,
+    Replace,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanSummaryPart {
     Read { count: usize },
     Import { count: usize },
-    Create { count: usize, deferred_count: usize },
+    Create { count: usize },
     Update { count: usize },
     Replace { count: usize },
     Delete { count: usize },
@@ -261,10 +289,7 @@ impl PlanSummary {
         if self.import > 0 {
             parts.push(PlanSummaryPart::Import { count: self.import });
         }
-        parts.push(PlanSummaryPart::Create {
-            count: self.create,
-            deferred_count: self.deferred_add,
-        });
+        parts.push(PlanSummaryPart::Create { count: self.create });
         parts.push(PlanSummaryPart::Update { count: self.update });
         if self.replace > 0 {
             parts.push(PlanSummaryPart::Replace {
@@ -294,12 +319,12 @@ impl PlanSummary {
             .map(|part| match part {
                 PlanSummaryPart::Read { count } => format!("{count} to read"),
                 PlanSummaryPart::Import { count } => format!("{count} to import"),
-                PlanSummaryPart::Create {
-                    count,
-                    deferred_count,
-                } => {
-                    if deferred_count > 0 {
-                        format!("{count} to create (+{deferred_count} deferred, count unknown)")
+                PlanSummaryPart::Create { count } => {
+                    if self.legacy_anonymous_deferred > 0 {
+                        format!(
+                            "{count} to create (+{} deferred, count unknown)",
+                            self.legacy_anonymous_deferred
+                        )
                     } else {
                         format!("{count} to create")
                     }
@@ -313,6 +338,19 @@ impl PlanSummary {
             })
             .collect::<Vec<_>>()
             .join(", ")
+    }
+
+    pub fn deferred_lines(&self) -> Vec<String> {
+        self.deferred
+            .iter()
+            .map(|entry| {
+                let action = match entry.action {
+                    DeferredSummaryAction::Add => "add",
+                    DeferredSummaryAction::Replace => "replace",
+                };
+                format!("N to {action} after {} applies.", entry.upstream_binding)
+            })
+            .collect()
     }
 }
 
@@ -628,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_summary_counts_deferred_adds() {
+    fn plan_summary_records_deferred_adds() {
         use crate::parser::ForBinding;
         use crate::resource::ResourceId;
 
@@ -654,11 +692,13 @@ mod tests {
 
         let summary = plan.summary();
         assert_eq!(summary.create, 0);
-        assert_eq!(summary.deferred_add, 1);
-        assert!(
-            summary
-                .to_string()
-                .contains("0 to create (+1 deferred, count unknown)")
+        assert_eq!(summary.deferred.len(), 1);
+        assert_eq!(summary.deferred[0].upstream_binding, "cert");
+        assert_eq!(summary.deferred[0].action, DeferredSummaryAction::Add);
+        assert!(summary.to_string().contains("0 to create"));
+        assert_eq!(
+            summary.deferred_lines(),
+            vec!["N to add after cert applies."]
         );
     }
 

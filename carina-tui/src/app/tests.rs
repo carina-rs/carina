@@ -88,11 +88,8 @@ fn expand_deferred_for_uses_create_symbol_and_kind() {
     assert_eq!(app.nodes.len(), 1);
     assert_eq!(app.nodes[0].symbol, "+");
     assert_eq!(app.nodes[0].kind, EffectKind::Create);
-    assert_eq!(app.plan_summary.deferred_add, 1);
-    assert!(
-        app.summary
-            .contains("0 to create (+1 deferred, count unknown)")
-    );
+    assert_eq!(app.plan_summary.deferred.len(), 1);
+    assert!(app.summary.contains("0 to create"));
 }
 
 #[test]

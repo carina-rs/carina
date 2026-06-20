@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::effect::Effect;
-use crate::plan::Plan;
+use crate::plan::{DeferredSummaryAction, DeferredSummaryEntry, Plan};
 use crate::resource::{ConcreteValue, DeferredValue, Value};
 use crate::utils::enum_display_value;
 
@@ -24,32 +24,10 @@ pub enum ChildRenderItem {
 }
 
 pub fn child_render_items(effects: &[Effect], child_indices: &[usize]) -> Vec<ChildRenderItem> {
-    let mut paired_deletes = HashSet::new();
-    let mut pairs: HashMap<usize, Vec<usize>> = HashMap::new();
-
-    for &expand_idx in child_indices {
-        let Effect::ExpandDeferredFor { template, .. } = &effects[expand_idx] else {
-            continue;
-        };
-        let delete_indices: Vec<usize> = child_indices
-            .iter()
-            .copied()
-            .filter(|delete_idx| {
-                matches!(
-                    &effects[*delete_idx],
-                    Effect::Delete { id, binding: Some(binding), .. }
-                        if id.resource_type == template.template_resource.id.resource_type
-                            && binding_matches_deferred_template(binding, &template.binding_name)
-                )
-            })
-            .collect();
-
-        if delete_indices.is_empty() {
-            continue;
-        }
-        paired_deletes.extend(delete_indices.iter().copied());
-        pairs.insert(expand_idx, delete_indices);
-    }
+    let PairedDeferredForSiblings {
+        paired_deletes,
+        mut pairs,
+    } = paired_deferred_for_siblings(effects, child_indices);
 
     child_indices
         .iter()
@@ -67,6 +45,119 @@ pub fn child_render_items(effects: &[Effect], child_indices: &[usize]) -> Vec<Ch
             }
         })
         .collect()
+}
+
+#[derive(Debug, Default)]
+struct PairedDeferredForSiblings {
+    paired_deletes: HashSet<usize>,
+    pairs: HashMap<usize, Vec<usize>>,
+}
+
+fn paired_deferred_for_siblings(
+    effects: &[Effect],
+    sibling_indices: &[usize],
+) -> PairedDeferredForSiblings {
+    let mut result = PairedDeferredForSiblings::default();
+
+    for &expand_idx in sibling_indices {
+        let Effect::ExpandDeferredFor { template, .. } = &effects[expand_idx] else {
+            continue;
+        };
+        let delete_indices: Vec<usize> = sibling_indices
+            .iter()
+            .copied()
+            .filter(|delete_idx| {
+                matches!(
+                    &effects[*delete_idx],
+                    Effect::Delete { id, binding: Some(binding), .. }
+                        if id.resource_type == template.template_resource.id.resource_type
+                            && binding_matches_deferred_template(binding, &template.binding_name)
+                )
+            })
+            .collect();
+
+        if delete_indices.is_empty() {
+            continue;
+        }
+        result.paired_deletes.extend(delete_indices.iter().copied());
+        result.pairs.insert(expand_idx, delete_indices);
+    }
+
+    result
+}
+
+#[derive(Debug, Default)]
+pub struct DeferredSummaryForPlan {
+    pub entries: Vec<DeferredSummaryEntry>,
+    pub paired_delete_indices: HashSet<usize>,
+}
+
+pub fn deferred_summary_for_plan(plan: &Plan) -> DeferredSummaryForPlan {
+    let graph = build_dependency_graph(plan);
+    let (roots, dependents) = build_single_parent_tree(plan, &graph);
+    let mut paired_expands = HashSet::new();
+    let mut paired_delete_indices = HashSet::new();
+
+    collect_paired_deferred_summary_for_siblings(
+        plan.effects(),
+        &roots,
+        &mut paired_expands,
+        &mut paired_delete_indices,
+    );
+
+    for idx in 0..plan.effects().len() {
+        let children = dependents.get(&idx).cloned().unwrap_or_default();
+        collect_paired_deferred_summary_for_siblings(
+            plan.effects(),
+            &children,
+            &mut paired_expands,
+            &mut paired_delete_indices,
+        );
+    }
+
+    let entries = plan
+        .effects()
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, effect)| {
+            let Effect::ExpandDeferredFor {
+                upstream_binding,
+                template,
+                ..
+            } = effect
+            else {
+                return None;
+            };
+            if is_synthetic_deferred_binding(&template.binding_name) {
+                return None;
+            }
+            let action = if paired_expands.contains(&idx) {
+                DeferredSummaryAction::Replace
+            } else {
+                DeferredSummaryAction::Add
+            };
+            Some(DeferredSummaryEntry {
+                upstream_binding: upstream_binding.clone(),
+                action,
+            })
+        })
+        .collect();
+
+    DeferredSummaryForPlan {
+        entries,
+        paired_delete_indices,
+    }
+}
+
+fn collect_paired_deferred_summary_for_siblings(
+    effects: &[Effect],
+    sibling_indices: &[usize],
+    paired_expands: &mut HashSet<usize>,
+    paired_delete_indices: &mut HashSet<usize>,
+) {
+    let paired = paired_deferred_for_siblings(effects, sibling_indices);
+    paired_expands.extend(paired.pairs.keys().copied());
+    paired_delete_indices.extend(paired.paired_deletes);
 }
 
 pub fn binding_matches_deferred_template(binding: &str, template_binding_name: &str) -> bool {

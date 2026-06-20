@@ -329,9 +329,14 @@ fn snapshot_deferred_for_with_paired_destroy() {
     let plan = build_deferred_for_with_paired_destroy_plan();
     let output = render_tui(&plan, 120, 30, 0);
     assert!(output.contains("+/-"));
-    assert!(output.contains("[from cert.domain_validation_options]"));
-    assert!(output.contains("- destroying validation_records[0]"));
-    assert!(output.contains("+ replaced by deferred for-loop, count known after cert applies"));
+    assert!(
+        output.contains(
+            "+/- aws.route53.Record validation_records[*] (N records after cert applies)"
+        )
+    );
+    assert!(output.contains("from: for opt in cert.domain_validation_options"));
+    assert!(!output.contains("- destroying validation_records[0]"));
+    assert!(!output.contains("+ replaced by deferred for-loop"));
     insta::assert_snapshot!(output);
 }
 

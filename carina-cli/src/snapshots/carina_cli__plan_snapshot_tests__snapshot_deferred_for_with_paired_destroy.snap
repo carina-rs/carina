@@ -8,8 +8,8 @@ Execution Plan:
       domain_name: "registry.example.com"
       validation_method: "DNS"
         │
-        └─ +/- aws.route53.RecordSet [from cert.domain_validation_options]
-              - destroying validation_records[0]
-              + replaced by deferred for-loop, count known after cert applies
+        └─ +/- aws.route53.RecordSet validation_records[*] (N records after cert applies)
+              from: for opt in cert.domain_validation_options
 
-Plan: 1 to add (+1 deferred, count unknown), 0 to change, 1 to destroy.
+Plan: 1 to add, 0 to change, 0 to destroy.
+       N to replace after cert applies.

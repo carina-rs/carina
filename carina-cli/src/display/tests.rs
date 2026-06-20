@@ -1083,16 +1083,15 @@ fn test_expand_deferred_for_renders_deferred_until_apply_marker() {
         None,
     ));
 
-    insta::assert_snapshot!(output, @r###"
-Execution Plan:
+    insta::assert_snapshot!(output, @"
+    Execution Plan:
 
-  + aws.route53.Record validation_records[?]
-      (deferred, count known after cert applies)
-      from: for opt in cert.domain_validation_options
+      + aws.route53.Record validation_records[*] (N records after cert applies)
+          from: for opt in cert.domain_validation_options
 
-Plan: 0 to add (+1 deferred, count unknown), 0 to change, 0 to destroy.
-
-"###);
+    Plan: 0 to add, 0 to change, 0 to destroy.
+           N to add after cert applies.
+    ");
 }
 
 fn deferred_validation_records_effect() -> Effect {
@@ -1158,16 +1157,15 @@ fn test_deferred_for_pairs_top_level_indexed_deletes() {
         None,
     ));
 
-    insta::assert_snapshot!(output, @r###"
-Execution Plan:
+    insta::assert_snapshot!(output, @"
+    Execution Plan:
 
-  +/- aws.route53.Record [from cert.domain_validation_options]
-      - destroying validation_records[0]
-      + replaced by deferred for-loop, count known after cert applies
+      +/- aws.route53.Record validation_records[*] (N records after cert applies)
+          from: for opt in cert.domain_validation_options
 
-Plan: 0 to add (+1 deferred, count unknown), 0 to change, 1 to destroy.
-
-"###);
+    Plan: 0 to add, 0 to change, 0 to destroy.
+           N to replace after cert applies.
+    ");
 }
 
 #[test]
@@ -1200,19 +1198,18 @@ fn test_paired_deferred_for_renders_dependent_children() {
         None,
     ));
 
-    insta::assert_snapshot!(output, @r###"
-Execution Plan:
+    insta::assert_snapshot!(output, @"
+    Execution Plan:
 
-  +/- aws.route53.Record [from cert.domain_validation_options]
-      - destroying validation_records[0]
-      + replaced by deferred for-loop, count known after cert applies
-        │
-        └─ + acm.CertificateValidation cert-validation
-              validation_record_id: __deferred_for.validation_records.id
+      +/- aws.route53.Record validation_records[*] (N records after cert applies)
+          from: for opt in cert.domain_validation_options
+            │
+            └─ + acm.CertificateValidation cert-validation
+                  validation_record_id: __deferred_for.validation_records.id
 
-Plan: 1 to add (+1 deferred, count unknown), 0 to change, 1 to destroy.
-
-"###);
+    Plan: 1 to add, 0 to change, 0 to destroy.
+           N to replace after cert applies.
+    ");
 }
 
 #[test]
@@ -1237,19 +1234,18 @@ fn test_deferred_for_does_not_pair_unrelated_same_type_delete() {
         None,
     ));
 
-    insta::assert_snapshot!(output, @r###"
-Execution Plan:
+    insta::assert_snapshot!(output, @"
+    Execution Plan:
 
-  + acm.Certificate cert
-        ├─ +/- aws.route53.Record [from cert.domain_validation_options]
-        │     - destroying validation_records[0]
-        │     + replaced by deferred for-loop, count known after cert applies
-        │
-        └─ - route53.Record old_record
+      + acm.Certificate cert
+            ├─ +/- aws.route53.Record validation_records[*] (N records after cert applies)
+            │     from: for opt in cert.domain_validation_options
+            │
+            └─ - route53.Record old_record
 
-Plan: 1 to add (+1 deferred, count unknown), 0 to change, 2 to destroy.
-
-"###);
+    Plan: 1 to add, 0 to change, 1 to destroy.
+           N to replace after cert applies.
+    ");
 }
 
 /// Test that cascading update diff only shows attributes referencing the replaced binding,
