@@ -1,0 +1,20 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  + aws.acm.Certificate cert
+      domain_name: "registry.example.com"
+      validation_method: "DNS"
+        │
+        └─ +/- aws.route53.RecordSet validation_records[*] (N records after cert applies)
+              <- for opt in cert.domain_validation_options
+              hosted_zone_id: "Z123"
+              name: (known after cert applies)
+              resource_records: (known after cert applies)
+              ttl: 60
+              type: (known after cert applies)
+
+Plan: 1 to add, 0 to change, 0 to destroy.
+       N to replace after cert applies.

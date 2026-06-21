@@ -1,0 +1,23 @@
+# Same-config deferred for-expression with a previously-applied iteration
+# in state. The old validation record cannot be mapped to a concrete
+# desired child until the Certificate apply refreshes domain_validation_options,
+# so display should pair its destroy with the deferred create family.
+
+provider aws {
+  region = "us-east-1"
+}
+
+let cert = aws.acm.Certificate {
+  domain_name       = "registry.example.com"
+  validation_method = "DNS"
+}
+
+let validation_records = for opt in cert.domain_validation_options {
+  aws.route53.RecordSet {
+    hosted_zone_id   = "Z123"
+    name             = opt.resource_record.name
+    type             = opt.resource_record.type
+    ttl              = 60
+    resource_records = [opt.resource_record.value]
+  }
+}

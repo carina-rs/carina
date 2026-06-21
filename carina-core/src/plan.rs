@@ -202,6 +202,7 @@ impl Plan {
     /// Generate a summary of the Plan for display
     pub fn summary(&self) -> PlanSummary {
         let mut summary = PlanSummary::default();
+        let deferred_summary = crate::plan_tree::deferred_summary_for_plan(self);
         for effect in &self.effects {
             match effect {
                 Effect::Read { .. } => summary.read += 1,
@@ -213,7 +214,7 @@ impl Plan {
                     summary.replace += 1;
                     summary.update += cascading_updates.len();
                 }
-                Effect::Delete { .. } => summary.delete += 1,
+                Effect::Delete { .. } => {}
                 Effect::Import { .. } => summary.import += 1,
                 Effect::Remove { .. } => summary.remove += 1,
                 Effect::Move { .. } => summary.moved += 1,
@@ -221,6 +222,16 @@ impl Plan {
                 Effect::ExpandDeferredFor { .. } => {}
             }
         }
+        summary.delete = self
+            .effects
+            .iter()
+            .enumerate()
+            .filter(|(idx, effect)| {
+                matches!(effect, Effect::Delete { .. })
+                    && !deferred_summary.paired_delete_indices.contains(idx)
+            })
+            .count();
+        summary.deferred = deferred_summary.entries;
         summary
     }
 }
@@ -232,37 +243,110 @@ pub struct PlanSummary {
     pub update: usize,
     pub replace: usize,
     pub delete: usize,
+    pub deferred: Vec<DeferredSummaryEntry>,
     pub import: usize,
     pub remove: usize,
     pub moved: usize,
     pub wait: usize,
 }
 
-impl std::fmt::Display for PlanSummary {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredSummaryEntry {
+    pub upstream_binding: String,
+    pub verb: String,
+    pub action: DeferredSummaryAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferredSummaryAction {
+    Add,
+    Replace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanSummaryPart {
+    Read { count: usize },
+    Import { count: usize },
+    Create { count: usize },
+    Update { count: usize },
+    Replace { count: usize },
+    Delete { count: usize },
+    Remove { count: usize },
+    Move { count: usize },
+    Wait { count: usize },
+}
+
+impl PlanSummary {
+    pub fn parts(&self) -> Vec<PlanSummaryPart> {
         let mut parts = Vec::new();
         if self.read > 0 {
-            parts.push(format!("{} to read", self.read));
+            parts.push(PlanSummaryPart::Read { count: self.read });
         }
         if self.import > 0 {
-            parts.push(format!("{} to import", self.import));
+            parts.push(PlanSummaryPart::Import { count: self.import });
         }
-        parts.push(format!("{} to create", self.create));
-        parts.push(format!("{} to update", self.update));
+        parts.push(PlanSummaryPart::Create { count: self.create });
+        parts.push(PlanSummaryPart::Update { count: self.update });
         if self.replace > 0 {
-            parts.push(format!("{} to replace", self.replace));
+            parts.push(PlanSummaryPart::Replace {
+                count: self.replace,
+            });
         }
-        parts.push(format!("{} to delete", self.delete));
+        parts.push(PlanSummaryPart::Delete { count: self.delete });
         if self.remove > 0 {
-            parts.push(format!("{} to remove from state", self.remove));
+            parts.push(PlanSummaryPart::Remove { count: self.remove });
         }
         if self.moved > 0 {
-            parts.push(format!("{} to move", self.moved));
+            parts.push(PlanSummaryPart::Move { count: self.moved });
         }
         if self.wait > 0 {
-            parts.push(format!("{} to wait", self.wait));
+            parts.push(PlanSummaryPart::Wait { count: self.wait });
         }
-        write!(f, "Plan: {}", parts.join(", "))
+        parts
+    }
+
+    pub fn render_line(&self) -> String {
+        format!("Plan: {}", self.render_body())
+    }
+
+    pub fn render_body(&self) -> String {
+        self.parts()
+            .into_iter()
+            .map(|part| match part {
+                PlanSummaryPart::Read { count } => format!("{count} to read"),
+                PlanSummaryPart::Import { count } => format!("{count} to import"),
+                PlanSummaryPart::Create { count } => format!("{count} to create"),
+                PlanSummaryPart::Update { count } => format!("{count} to update"),
+                PlanSummaryPart::Replace { count } => format!("{count} to replace"),
+                PlanSummaryPart::Delete { count } => format!("{count} to delete"),
+                PlanSummaryPart::Remove { count } => format!("{count} to remove from state"),
+                PlanSummaryPart::Move { count } => format!("{count} to move"),
+                PlanSummaryPart::Wait { count } => format!("{count} to wait"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    pub fn deferred_lines(&self) -> Vec<String> {
+        self.deferred
+            .iter()
+            .map(|entry| {
+                let action = match entry.action {
+                    DeferredSummaryAction::Add => "add",
+                    DeferredSummaryAction::Replace => "replace",
+                };
+                format!(
+                    "N to {action} after {} {}.",
+                    entry.upstream_binding, entry.verb
+                )
+            })
+            .collect()
+    }
+}
+
+impl std::fmt::Display for PlanSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.render_line())
     }
 }
 
@@ -387,17 +471,7 @@ impl ModularPlan {
 
         // Add summary
         let summary = self.plan.summary();
-        if summary.replace > 0 {
-            output.push_str(&format!(
-                "Summary: {} to create, {} to update, {} to replace, {} to delete\n",
-                summary.create, summary.update, summary.replace, summary.delete
-            ));
-        } else {
-            output.push_str(&format!(
-                "Summary: {} to create, {} to update, {} to delete\n",
-                summary.create, summary.update, summary.delete
-            ));
-        }
+        output.push_str(&format!("Summary: {}\n", summary.render_body()));
 
         output
     }
@@ -406,19 +480,16 @@ impl ModularPlan {
 /// Format an effect briefly for display
 fn format_effect_brief(effect: &Effect) -> String {
     match effect {
-        Effect::Create(r) => format!("+ {}", r.id),
-        Effect::Update { id, .. } => format!("~ {}", id),
-        Effect::Replace { id, directives, .. } => {
-            if directives.create_before_destroy {
-                format!("+/- {}", id)
-            } else {
-                format!("-/+ {}", id)
-            }
+        Effect::Create(r) => format!("{} {}", effect.display_glyph(), r.id),
+        Effect::Update { id, .. } => format!("{} {}", effect.display_glyph(), id),
+        Effect::Replace { id, .. } => format!("{} {}", effect.display_glyph(), id),
+        Effect::Delete { id, .. } => format!("{} {}", effect.display_glyph(), id),
+        Effect::Read { resource } => {
+            format!("{} {} (data source)", effect.display_glyph(), resource.id)
         }
-        Effect::Delete { id, .. } => format!("- {}", id),
-        Effect::Read { resource } => format!("<= {} (data source)", resource.id),
         Effect::Import { id, identifier } => format!(
-            "<- {} (import: {})",
+            "{} {} (import: {})",
+            effect.display_glyph(),
             id,
             crate::effect::format_import_identifier(identifier)
         ),
@@ -426,18 +497,28 @@ fn format_effect_brief(effect: &Effect) -> String {
         // indicator used elsewhere in apply output. Use `~` here too —
         // matches the `display`/TUI plan-tree Remove symbol and the
         // operation word disambiguates from Update.
-        Effect::Remove { id } => format!("~ {} (remove from state)", id),
-        Effect::Move { from, to } => format!("-> {} (from: {})", to, from),
+        Effect::Remove { id } => format!("{} {} (remove from state)", effect.display_glyph(), id),
+        Effect::Move { from, to } => format!("{} {} (from: {})", effect.display_glyph(), to, from),
         Effect::Wait {
             binding,
             until_surface,
             ..
-        } => format!("> {} (until {})", binding, until_surface),
+        } => format!(
+            "{} {} (until {})",
+            effect.display_glyph(),
+            binding,
+            until_surface
+        ),
         Effect::ExpandDeferredFor {
             id,
             upstream_binding,
             ..
-        } => format!("~ {} (deferred for: waits on {})", id, upstream_binding),
+        } => format!(
+            "{} {} (deferred for: waits on {})",
+            effect.display_glyph(),
+            id,
+            upstream_binding
+        ),
     }
 }
 
@@ -572,6 +653,46 @@ mod tests {
         let summary = plan.summary();
         assert_eq!(summary.create, 2);
         assert_eq!(summary.delete, 1);
+    }
+
+    #[test]
+    fn plan_summary_records_deferred_adds() {
+        use crate::parser::ForBinding;
+        use crate::resource::ResourceId;
+
+        let template_resource = Resource::new("route53.RecordSet", "validation_records[?]");
+        let deferred = crate::parser::DeferredForExpression {
+            file: None,
+            line: 1,
+            header: "for opt in cert.domain_validation_options".to_string(),
+            resource_type: "aws.route53.RecordSet".to_string(),
+            attributes: Vec::new(),
+            binding_name: "validation_records".to_string(),
+            iterable_binding: "cert".to_string(),
+            iterable_attr: "domain_validation_options".to_string(),
+            binding: ForBinding::Simple("opt".to_string()),
+            template_resource,
+        };
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(
+            Resource::new("acm.Certificate", "cert").with_binding("cert"),
+        ));
+        plan.add(Effect::ExpandDeferredFor {
+            id: ResourceId::new("route53.RecordSet", "validation_records"),
+            upstream_binding: "cert".to_string(),
+            template: Box::new(deferred),
+        });
+
+        let summary = plan.summary();
+        assert_eq!(summary.create, 1);
+        assert_eq!(summary.deferred.len(), 1);
+        assert_eq!(summary.deferred[0].upstream_binding, "cert");
+        assert_eq!(summary.deferred[0].action, DeferredSummaryAction::Add);
+        assert!(summary.to_string().contains("1 to create"));
+        assert_eq!(
+            summary.deferred_lines(),
+            vec!["N to add after cert applies."]
+        );
     }
 
     #[test]

@@ -10,11 +10,13 @@ use carina_core::detail_rows::{
 #[cfg(test)]
 use carina_core::effect::CascadingUpdate;
 use carina_core::effect::Effect;
-use carina_core::plan::Plan;
+use carina_core::plan::{DeferredSummaryAction, Plan, PlanSummaryPart};
 #[cfg(test)]
 use carina_core::plan_tree::shorten_attr_name;
 use carina_core::plan_tree::{
-    build_dependency_graph, build_single_parent_tree, extract_compact_hint,
+    ChildRenderItem, build_dependency_graph, build_single_parent_tree, child_render_items,
+    deferred_for_detail_rows, deferred_for_display_name, deferred_for_source, deferred_for_verb,
+    extract_compact_hint,
 };
 use carina_core::resource::{ConcreteValue, DeferredValue, ResourceId, Value};
 use carina_core::schema::SchemaRegistry;
@@ -61,46 +63,6 @@ fn format_compact_name(
         format!("({})", hint)
     } else {
         name.to_string()
-    }
-}
-
-/// Format a value in a deferred for-expression template.
-/// Placeholder values (`Value::Deferred(DeferredValue::Unknown)`) are shown dimmed; resolved
-/// values are shown normally.
-fn format_deferred_value(value: &Value) -> String {
-    /// Catch-all placeholder text for value variants whose contents
-    /// cannot be sensibly inlined into a deferred-for template
-    /// (e.g. `Interpolation`, `FunctionCall`, `Secret`). The wording
-    /// matches `render_unknown(ForValue)` so display stays uniform
-    /// across the deferred and resolved-Unknown paths.
-    const DEFERRED_FALLBACK: &str = "(known after upstream apply)";
-
-    match value {
-        Value::Deferred(DeferredValue::Unknown(reason)) => {
-            format!("{}", carina_core::value::render_unknown(reason).dimmed())
-        }
-        Value::Concrete(ConcreteValue::String(s)) => format!("'{}'", s),
-        Value::Concrete(ConcreteValue::Int(i)) => i.to_string(),
-        Value::Concrete(ConcreteValue::Float(f)) => f.to_string(),
-        Value::Concrete(ConcreteValue::Bool(b)) => b.to_string(),
-        Value::Concrete(ConcreteValue::Duration(d)) => carina_core::value::render_duration(*d),
-        Value::Deferred(DeferredValue::ResourceRef { path }) => path.to_dot_string().to_string(),
-        Value::Concrete(ConcreteValue::List(items)) => {
-            let formatted: Vec<String> = items.iter().map(format_deferred_value).collect();
-            format!("[{}]", formatted.join(", "))
-        }
-        Value::Concrete(ConcreteValue::StringList(items)) => {
-            let formatted: Vec<String> = items.iter().map(|s| format!("'{}'", s)).collect();
-            format!("[{}]", formatted.join(", "))
-        }
-        Value::Concrete(ConcreteValue::Map(map)) => {
-            let formatted: Vec<String> = map
-                .iter()
-                .map(|(k, v)| format!("{} = {}", k, format_deferred_value(v)))
-                .collect();
-            format!("{{{}}}", formatted.join(", "))
-        }
-        _ => format!("{}", DEFERRED_FALLBACK.dimmed()),
     }
 }
 
@@ -310,40 +272,35 @@ pub fn format_plan(
 
     writeln!(out).unwrap();
     let summary = plan.summary();
-    let mut parts = Vec::new();
-    if summary.read > 0 {
-        parts.push(format!("{} to read", summary.read.to_string().cyan()));
-    }
-    if summary.import > 0 {
-        parts.push(format!("{} to import", summary.import.to_string().cyan()));
-    }
-    parts.push(format!("{} to add", summary.create.to_string().green()));
-    parts.push(format!("{} to change", summary.update.to_string().yellow()));
-    if summary.replace > 0 {
-        parts.push(format!(
-            "{} to replace",
-            summary.replace.to_string().magenta()
-        ));
-    }
-    parts.push(format!("{} to destroy", summary.delete.to_string().red()));
-    if summary.remove > 0 {
-        // carina#3332: state-only removal is not a destructive failure;
-        // color the count yellow to agree with the `~` Remove row in
-        // the tree above instead of red (which pairs with `✗`/Delete).
-        parts.push(format!(
-            "{} to remove from state",
-            summary.remove.to_string().yellow()
-        ));
-    }
-    if summary.moved > 0 {
-        parts.push(format!("{} to move", summary.moved.to_string().yellow()));
-    }
-    if !deferred_for_expressions.is_empty() {
-        parts.push(format!(
-            "{} deferred",
-            deferred_for_expressions.len().to_string().cyan()
-        ));
-    }
+    let mut parts: Vec<String> = summary
+        .parts()
+        .into_iter()
+        .map(|part| match part {
+            PlanSummaryPart::Read { count } => format!("{} to read", count.to_string().cyan()),
+            PlanSummaryPart::Import { count } => format!("{} to import", count.to_string().cyan()),
+            PlanSummaryPart::Create { count } => {
+                let count = count.to_string().green();
+                format!("{} to add", count)
+            }
+            PlanSummaryPart::Update { count } => {
+                format!("{} to change", count.to_string().yellow())
+            }
+            PlanSummaryPart::Replace { count } => {
+                format!("{} to replace", count.to_string().magenta())
+            }
+            PlanSummaryPart::Delete { count } => {
+                format!("{} to destroy", count.to_string().red())
+            }
+            PlanSummaryPart::Remove { count } => {
+                // carina#3332: state-only removal is not a destructive failure;
+                // color the count yellow to agree with the `~` Remove row in
+                // the tree above instead of red (which pairs with `✗`/Delete).
+                format!("{} to remove from state", count.to_string().yellow())
+            }
+            PlanSummaryPart::Move { count } => format!("{} to move", count.to_string().yellow()),
+            PlanSummaryPart::Wait { count } => format!("{} to wait", count.to_string().magenta()),
+        })
+        .collect();
     if !export_changes.is_empty() {
         parts.push(format!(
             "{} export change(s)",
@@ -351,6 +308,31 @@ pub fn format_plan(
         ));
     }
     writeln!(out, "Plan: {}.", parts.join(", ")).unwrap();
+    for entry in &summary.deferred {
+        let action = match entry.action {
+            DeferredSummaryAction::Add => "add".green(),
+            DeferredSummaryAction::Replace => "replace".magenta(),
+        };
+        writeln!(
+            out,
+            "       {} to {} after {} {}.",
+            "N".green(),
+            action,
+            entry.upstream_binding,
+            entry.verb
+        )
+        .unwrap();
+    }
+    for deferred in deferred_for_expressions {
+        writeln!(
+            out,
+            "       {} to {} after {} resolves.",
+            "N".green(),
+            "add".green(),
+            deferred_for_source(deferred)
+        )
+        .unwrap();
+    }
     writeln!(out).unwrap();
 
     out
@@ -359,25 +341,24 @@ pub fn format_plan(
 /// Format a single deferred for-expression for plan display.
 fn format_deferred_for_expression(deferred: &carina_core::parser::DeferredForExpression) -> String {
     let mut out = String::new();
-    writeln!(out, "  {} {}", "?".cyan(), deferred.header).unwrap();
+    let upstream = deferred_for_source(deferred);
     writeln!(
         out,
-        "      {}",
-        format!(
-            "expands to one {} per element (count known after upstream apply)",
-            deferred.resource_type
-        )
-        .dimmed()
+        "  {} {} {}",
+        "+".green().bold(),
+        deferred.resource_type.cyan().bold(),
+        format!("(N records after {upstream} resolves)").dimmed()
     )
     .unwrap();
-    // Sort attributes for deterministic output
-    let mut attrs: Vec<_> = deferred.attributes.iter().collect();
-    attrs.sort_by_key(|(k, _)| k.clone());
-    for (key, value) in &attrs {
-        let formatted = format_deferred_value(value);
-        writeln!(out, "      {}: {}", key.dimmed(), formatted).unwrap();
+    for row in deferred_for_detail_rows(deferred, &upstream, "resolves") {
+        match row {
+            DetailRow::Text { text } => writeln!(out, "      {}", text.dimmed()).unwrap(),
+            DetailRow::Attribute { key, value, .. } => {
+                writeln!(out, "      {}: {}", key.dimmed(), value).unwrap();
+            }
+            _ => {}
+        }
     }
-    writeln!(out).unwrap();
     out
 }
 
@@ -452,28 +433,20 @@ impl<'a> TreeRenderContext<'a> {
         self.printed.insert(idx);
 
         let effect = &self.plan.effects()[idx];
+        let glyph = effect.display_glyph();
         let colored_symbol = match effect {
-            Effect::Create(_) => "+".green().bold(),
-            Effect::Update { .. } => "~".yellow().bold(),
-            Effect::Replace { directives, .. } => {
-                if directives.create_before_destroy {
-                    "+/-".magenta().bold()
-                } else {
-                    "-/+".magenta().bold()
-                }
-            }
-            Effect::Delete { .. } => "-".red().bold(),
-            Effect::Read { .. } => "<=".cyan().bold(),
-            Effect::Import { .. } => "<-".cyan().bold(),
+            Effect::Create(_) | Effect::ExpandDeferredFor { .. } => glyph.green().bold(),
+            Effect::Update { .. } => glyph.yellow().bold(),
+            Effect::Replace { .. } => glyph.magenta().bold(),
+            Effect::Delete { .. } => glyph.red().bold(),
+            Effect::Read { .. } | Effect::Import { .. } => glyph.cyan().bold(),
             // carina#3332: the previous `x` (red, bold) shape-collides
             // with the `✗` failure indicator used in apply output.
             // Use `~` (yellow, bold) — the same family as Move's `->`
             // and the trailing `(remove from state)` annotation
             // disambiguates from Update's `~` line.
-            Effect::Remove { .. } => "~".yellow().bold(),
-            Effect::Move { .. } => "->".yellow().bold(),
-            Effect::Wait { .. } => ">".magenta().bold(),
-            Effect::ExpandDeferredFor { .. } => "~".yellow().bold(),
+            Effect::Remove { .. } | Effect::Move { .. } => glyph.yellow().bold(),
+            Effect::Wait { .. } => glyph.magenta().bold(),
         };
 
         // Build the tree connector (shown before child resources)
@@ -728,13 +701,16 @@ impl<'a> TreeRenderContext<'a> {
                 template,
                 ..
             } => {
+                let verb = deferred_for_verb(self.plan, upstream_binding);
+                let display_name = deferred_for_display_name(template, upstream_binding, verb);
                 writeln!(
                     self.out,
-                    "{}{}{} {}",
+                    "{}{}{} {} {}",
                     base_indent,
                     connector,
                     colored_symbol,
-                    template.header.yellow().bold()
+                    template.resource_type.cyan().bold(),
+                    display_name.green().bold()
                 )
                 .unwrap();
                 let attr_prefix = if indent == 0 {
@@ -747,17 +723,9 @@ impl<'a> TreeRenderContext<'a> {
                     };
                     format!("{}{}   ", base_indent, continuation)
                 };
-                writeln!(
-                    self.out,
-                    "{}{}",
-                    attr_prefix,
-                    format!(
-                        "(deferred until apply: one {} per element after {} applies)",
-                        template.resource_type, upstream_binding
-                    )
-                    .dimmed()
-                )
-                .unwrap();
+                for row in deferred_for_detail_rows(template, upstream_binding, verb) {
+                    render_detail_row(&mut self.out, &row, effect, &attr_prefix);
+                }
                 has_displayed_attrs = true;
             }
         }
@@ -810,6 +778,7 @@ impl<'a> TreeRenderContext<'a> {
             .filter(|c| !self.printed.contains(c))
             .cloned()
             .collect();
+        let child_render_items = self.child_render_items(&unprinted_children);
 
         // New prefix for children: align with attribute indentation
         let new_prefix = if indent == 0 {
@@ -824,20 +793,170 @@ impl<'a> TreeRenderContext<'a> {
         };
 
         // Insert tree continuation line between attribute block and child resources
-        if has_displayed_attrs && !unprinted_children.is_empty() {
+        if has_displayed_attrs && !child_render_items.is_empty() {
             writeln!(self.out, "{}{}│", base_indent, new_prefix).unwrap();
         }
 
-        for (i, child_idx) in unprinted_children.iter().enumerate() {
-            let child_is_last = i == unprinted_children.len() - 1;
-            let child_had_attrs = self.format_effect_tree(
-                *child_idx,
+        for (i, item) in child_render_items.iter().enumerate() {
+            let child_is_last = i == child_render_items.len() - 1;
+            let child_had_attrs = self.format_render_item(
+                item,
                 indent + 1,
                 child_is_last,
                 &new_prefix,
                 current_binding.as_deref(),
             );
             // Add separator line between siblings when previous sibling displayed attributes
+            if child_had_attrs && !child_is_last {
+                let separator_continuation = if is_last {
+                    format!("{}   ", prefix)
+                } else {
+                    format!("{}│  ", prefix)
+                };
+                let separator_prefix = if indent == 0 {
+                    format!("{}  ", attr_base)
+                } else {
+                    format!("{}   ", separator_continuation)
+                };
+                writeln!(self.out, "{}{}│", base_indent, separator_prefix).unwrap();
+            }
+            if child_had_attrs {
+                has_displayed_attrs = true;
+            }
+        }
+
+        has_displayed_attrs
+    }
+
+    fn format_render_item(
+        &mut self,
+        item: &ChildRenderItem,
+        indent: usize,
+        is_last: bool,
+        prefix: &str,
+        parent_binding: Option<&str>,
+    ) -> bool {
+        match item {
+            ChildRenderItem::Normal(idx) => {
+                self.format_effect_tree(*idx, indent, is_last, prefix, parent_binding)
+            }
+            ChildRenderItem::PairedDeferredFor {
+                expand_idx,
+                delete_indices,
+            } => self.format_paired_deferred_for(
+                *expand_idx,
+                delete_indices,
+                indent,
+                is_last,
+                prefix,
+            ),
+        }
+    }
+
+    fn child_render_items(&self, child_indices: &[usize]) -> Vec<ChildRenderItem> {
+        child_render_items(self.plan.effects(), child_indices)
+    }
+
+    fn format_paired_deferred_for(
+        &mut self,
+        expand_idx: usize,
+        delete_indices: &[usize],
+        indent: usize,
+        is_last: bool,
+        prefix: &str,
+    ) -> bool {
+        if self.printed.contains(&expand_idx) {
+            return false;
+        }
+        self.printed.insert(expand_idx);
+        for delete_idx in delete_indices {
+            self.printed.insert(*delete_idx);
+        }
+
+        let Effect::ExpandDeferredFor {
+            upstream_binding,
+            template,
+            ..
+        } = &self.plan.effects()[expand_idx]
+        else {
+            return false;
+        };
+
+        let connector = if indent == 0 {
+            "".to_string()
+        } else if is_last {
+            format!("{}└─ ", prefix)
+        } else {
+            format!("{}├─ ", prefix)
+        };
+        let base_indent = "  ";
+        let attr_base = "    ";
+        let verb = deferred_for_verb(self.plan, upstream_binding);
+        writeln!(
+            self.out,
+            "{}{}{} {} {}",
+            base_indent,
+            connector,
+            "+/-".magenta().bold(),
+            template.resource_type.cyan().bold(),
+            deferred_for_display_name(template, upstream_binding, verb)
+                .magenta()
+                .bold()
+        )
+        .unwrap();
+
+        let attr_prefix = if indent == 0 {
+            format!("{}{}", base_indent, attr_base)
+        } else {
+            let continuation = if is_last {
+                format!("{}   ", prefix)
+            } else {
+                format!("{}│  ", prefix)
+            };
+            format!("{}{}   ", base_indent, continuation)
+        };
+
+        for row in deferred_for_detail_rows(template, upstream_binding, verb) {
+            render_detail_row(
+                &mut self.out,
+                &row,
+                &self.plan.effects()[expand_idx],
+                &attr_prefix,
+            );
+        }
+
+        let children = self
+            .dependents
+            .get(&expand_idx)
+            .cloned()
+            .unwrap_or_default();
+        let unprinted_children: Vec<_> = children
+            .iter()
+            .filter(|c| !self.printed.contains(c))
+            .cloned()
+            .collect();
+        let child_render_items = self.child_render_items(&unprinted_children);
+
+        let new_prefix = if indent == 0 {
+            format!("{}  ", attr_base)
+        } else {
+            let continuation = if is_last {
+                format!("{}   ", prefix)
+            } else {
+                format!("{}│  ", prefix)
+            };
+            format!("{}   ", continuation)
+        };
+
+        if !child_render_items.is_empty() {
+            writeln!(self.out, "{}{}│", base_indent, new_prefix).unwrap();
+        }
+
+        let mut has_displayed_attrs = true;
+        for (i, item) in child_render_items.iter().enumerate() {
+            let child_is_last = i == child_render_items.len() - 1;
+            let child_had_attrs =
+                self.format_render_item(item, indent + 1, child_is_last, &new_prefix, None);
             if child_had_attrs && !child_is_last {
                 let separator_continuation = if is_last {
                     format!("{}   ", prefix)
@@ -916,10 +1035,10 @@ fn format_plan_tree<'a>(
 
     if composition_groups.has_any_grouping() {
         // First: render ungrouped roots (declared at the DSL root).
-        for (i, root_idx) in composition_groups.ungrouped.iter().enumerate() {
-            let last = i == composition_groups.ungrouped.len() - 1
-                && composition_groups.grouped.is_empty();
-            ctx.format_effect_tree(*root_idx, 0, last, "", None);
+        let ungrouped_items = ctx.child_render_items(&composition_groups.ungrouped);
+        for (i, item) in ungrouped_items.iter().enumerate() {
+            let last = i == ungrouped_items.len() - 1 && composition_groups.grouped.is_empty();
+            ctx.format_render_item(item, 0, last, "", None);
         }
         // Then: each composition group with its header. Each leaf
         // renders as a top-level row (indent 0, no prefix) — the
@@ -932,16 +1051,18 @@ fn format_plan_tree<'a>(
                 format_composition_header(&group.binding, group.source_path.as_deref())
             )
             .unwrap();
-            for (li, leaf_idx) in group.leaves.iter().enumerate() {
-                let leaf_last = li == group.leaves.len() - 1;
-                ctx.format_effect_tree(*leaf_idx, 0, leaf_last, "  ", None);
+            let leaf_items = ctx.child_render_items(&group.leaves);
+            for (li, item) in leaf_items.iter().enumerate() {
+                let leaf_last = li == leaf_items.len() - 1;
+                ctx.format_render_item(item, 0, leaf_last, "  ", None);
             }
         }
     } else {
         // No trace, or trace empty for this plan's leaves — use the
         // pre-#3307 flat layout so existing snapshots remain valid.
-        for (i, root_idx) in roots.iter().enumerate() {
-            ctx.format_effect_tree(*root_idx, 0, i == roots.len() - 1, "", None);
+        let root_items = ctx.child_render_items(&roots);
+        for (i, item) in root_items.iter().enumerate() {
+            ctx.format_render_item(item, 0, i == root_items.len() - 1, "", None);
         }
     }
 
@@ -950,8 +1071,9 @@ fn format_plan_tree<'a>(
     let remaining: Vec<_> = (0..plan.effects().len())
         .filter(|idx| !ctx.printed.contains(idx))
         .collect();
-    for idx in remaining {
-        ctx.format_effect_tree(idx, 0, true, "", None);
+    let remaining_items = ctx.child_render_items(&remaining);
+    for (i, item) in remaining_items.iter().enumerate() {
+        ctx.format_render_item(item, 0, i == remaining_items.len() - 1, "", None);
     }
 
     ctx.out
@@ -1400,6 +1522,9 @@ fn colored_value_dimmed(rendered: &str) -> String {
 /// Render a single `DetailRow` into the output string with ANSI colors.
 fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_prefix: &str) {
     match row {
+        DetailRow::Text { text } => {
+            writeln!(out, "{}{}", attr_prefix, text).unwrap();
+        }
         DetailRow::Attribute {
             key,
             value,

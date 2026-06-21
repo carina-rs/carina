@@ -195,6 +195,16 @@ plan-fixtures:
 	@echo "---"
 	@$(MAKE) plan-deferred-for
 	@echo "---"
+	@$(MAKE) plan-deferred-for-create-solo
+	@echo "---"
+	@$(MAKE) plan-deferred-for-anonymous
+	@echo "---"
+	@$(MAKE) plan-deferred-for-with-paired-destroy
+	@echo "---"
+	@$(MAKE) plan-deferred-for-with-dependent-wait
+	@echo "---"
+	@$(MAKE) plan-deferred-for-with-unrelated-delete
+	@echo "---"
 	@$(MAKE) plan-import-deferred-interpolation
 	@echo ""
 	@echo "=== policy_pretty ==="
@@ -236,6 +246,16 @@ plan-upstream-state-map-dot-notation:
 	$(PLAN_FIXTURE) upstream_state_map_dot_notation
 plan-deferred-for:
 	$(PLAN_FIXTURE) deferred_for
+plan-deferred-for-create-solo:
+	$(PLAN_FIXTURE) deferred_for_create_solo
+plan-deferred-for-anonymous:
+	$(PLAN_FIXTURE) deferred_for_anonymous
+plan-deferred-for-with-paired-destroy:
+	$(PLAN_FIXTURE) deferred_for_with_paired_destroy
+plan-deferred-for-with-dependent-wait:
+	$(PLAN_FIXTURE) deferred_for_with_dependent_wait
+plan-deferred-for-with-unrelated-delete:
+	$(PLAN_FIXTURE) deferred_for_with_unrelated_delete
 plan-import-deferred-interpolation:
 	$(PLAN_FIXTURE) import_deferred_interpolation
 plan-exports:
@@ -291,7 +311,9 @@ plan-multi-instance-module:
         plan-moved-claims-precede-heuristics \
         plan-upstream-state plan-upstream-state-unresolved plan-upstream-state-empty-exports \
         plan-upstream-state-map-subscript plan-upstream-state-map-dot-notation \
-        plan-deferred-for plan-exports plan-exports-multifile \
+        plan-deferred-for plan-deferred-for-create-solo plan-deferred-for-anonymous \
+        plan-deferred-for-with-paired-destroy plan-deferred-for-with-unrelated-delete \
+        plan-exports plan-exports-multifile \
         plan-exports-multifile-let-literal plan-exports-multifile-let-chain \
         plan-exports-multifile-let-chain-5hop \
         plan-exports-multifile-bare-resource-ref \

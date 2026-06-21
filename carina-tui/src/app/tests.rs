@@ -1,4 +1,5 @@
 use super::*;
+use carina_core::parser::{DeferredForExpression, ForBinding};
 use carina_core::resource::{ConcreteValue, Directives, Resource, ResourceId, State, Value};
 use carina_core::value::format_value;
 
@@ -57,6 +58,38 @@ fn remove_effect_uses_non_failure_symbol_and_kind() {
          and re-introduces the misread the symbol fix removed"
     );
     assert_eq!(app.nodes[0].kind, EffectKind::Update);
+}
+
+#[test]
+fn expand_deferred_for_uses_create_symbol_and_kind() {
+    let template_resource =
+        Resource::new("route53.Record", "validation_records").with_binding("validation_records");
+    let deferred = DeferredForExpression {
+        file: None,
+        line: 1,
+        header: "for opt in cert.domain_validation_options".to_string(),
+        resource_type: "aws.route53.Record".to_string(),
+        attributes: Vec::new(),
+        binding_name: "validation_records".to_string(),
+        iterable_binding: "cert".to_string(),
+        iterable_attr: "domain_validation_options".to_string(),
+        binding: ForBinding::Simple("opt".to_string()),
+        template_resource,
+    };
+
+    let mut plan = Plan::new();
+    plan.add(Effect::ExpandDeferredFor {
+        id: ResourceId::new("__deferred_for", "validation_records"),
+        upstream_binding: "cert".to_string(),
+        template: Box::new(deferred),
+    });
+
+    let app = App::new(&plan, &SchemaRegistry::new());
+    assert_eq!(app.nodes.len(), 1);
+    assert_eq!(app.nodes[0].symbol, "+");
+    assert_eq!(app.nodes[0].kind, EffectKind::Create);
+    assert_eq!(app.plan_summary.deferred.len(), 1);
+    assert!(app.summary.contains("0 to create"));
 }
 
 #[test]

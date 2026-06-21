@@ -2,15 +2,9 @@
 source: carina-tui/src/tui_snapshot_tests.rs
 expression: output
 ---
-┌ Plan (Plan: 1 to create, 1 to update, 0 to delete, 1 to move) ───────────────────────────────────────────────────────┐
-│~ ec2.Vpc new_vpc                                                                                                     │
-│    └── + ec2.Subnet (cidr_block: 10.0.1.0/24)                                                                        │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
+┌ Plan (Plan: 1 to create, 0 to update, 0 to delete; N to replace after cert applies.) ────────────────────────────────┐
+│+ acm.Certificate cert                                                                                                │
+│    └── +/- aws.route53.Record validation_records[*] (N records after cert applies)                                   │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
@@ -30,15 +24,13 @@ expression: output
 │                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ Details ─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│~ ec2.Vpc new_vpc                                                                                                     │
+│+/- aws.route53.Record validation_records[*] (N records after cert applies)                                           │
 │                                                                                                                      │
-│  tags:                                                                                                               │
-│    + Name: "updated"                                                                                                 │
-│  # (1 unchanged attribute hidden)                                                                                    │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
+│  <- for opt in cert.domain_validation_options                                                                        │
+│  hosted_zone_id: "Z123"                                                                                              │
+│  name: (known after cert applies)                                                                                    │
+│  resource_records: (known after cert applies)                                                                        │
+│  ttl: 60                                                                                                             │
+│  type: "CNAME"                                                                                                       │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
  / search  ↑↓/jk navigate  Tab switch panel  Enter detail  q/Esc quit

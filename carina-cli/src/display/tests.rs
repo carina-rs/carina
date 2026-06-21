@@ -1083,15 +1083,173 @@ fn test_expand_deferred_for_renders_deferred_until_apply_marker() {
         None,
     ));
 
-    insta::assert_snapshot!(output, @r###"
-Execution Plan:
+    insta::assert_snapshot!(output, @"
+    Execution Plan:
 
-  ~ for opt in cert.domain_validation_options
-      (deferred until apply: one aws.route53.Record per element after cert applies)
+      + aws.route53.Record validation_records[*] (N records after cert resolves)
+          <- for opt in cert.domain_validation_options
+          name: (known after cert resolves)
 
-Plan: 0 to add, 0 to change, 0 to destroy.
+    Plan: 0 to add, 0 to change, 0 to destroy.
+           N to add after cert resolves.
+    ");
+}
 
-"###);
+fn deferred_validation_records_effect() -> Effect {
+    let mut template_resource = Resource::new("route53.Record", "validation_records");
+    template_resource.binding = Some("validation_records".to_string());
+    template_resource.set_attr(
+        "name",
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValuePath {
+            path: AccessPath::with_fields("opt", "resource_record", vec!["name".to_string()]),
+        })),
+    );
+
+    let deferred = carina_core::parser::DeferredForExpression {
+        file: None,
+        line: 1,
+        header: "for opt in cert.domain_validation_options".to_string(),
+        resource_type: "aws.route53.Record".to_string(),
+        attributes: template_resource
+            .attributes
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        binding_name: "validation_records".to_string(),
+        iterable_binding: "cert".to_string(),
+        iterable_attr: "domain_validation_options".to_string(),
+        binding: carina_core::parser::ForBinding::Simple("opt".to_string()),
+        template_resource,
+    };
+
+    Effect::ExpandDeferredFor {
+        id: ResourceId::new("__deferred_for", "validation_records"),
+        upstream_binding: "cert".to_string(),
+        template: Box::new(deferred),
+    }
+}
+
+fn delete_record_effect(binding: &str) -> Effect {
+    Effect::Delete {
+        id: ResourceId::new("route53.Record", binding),
+        identifier: format!("{binding}-id"),
+        directives: Directives::default(),
+        binding: Some(binding.to_string()),
+        dependencies: HashSet::from(["cert".to_string()]),
+        explicit_dependencies: HashSet::new(),
+    }
+}
+
+#[test]
+fn test_deferred_for_pairs_top_level_indexed_deletes() {
+    let mut plan = Plan::new();
+    plan.add(delete_record_effect("validation_records[0]"));
+    plan.add(deferred_validation_records_effect());
+
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        None,
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+        None,
+    ));
+
+    insta::assert_snapshot!(output, @"
+    Execution Plan:
+
+      +/- aws.route53.Record validation_records[*] (N records after cert resolves)
+          <- for opt in cert.domain_validation_options
+          name: (known after cert resolves)
+
+    Plan: 0 to add, 0 to change, 0 to destroy.
+           N to replace after cert resolves.
+    ");
+}
+
+#[test]
+fn test_paired_deferred_for_renders_dependent_children() {
+    let mut dependent = Resource::new("acm.CertificateValidation", "cert-validation")
+        .with_binding("cert_validation");
+    dependent.set_attr(
+        "validation_record_id",
+        Value::resource_ref(
+            "__deferred_for.validation_records".to_string(),
+            "id".to_string(),
+            vec![],
+        ),
+    );
+
+    let mut plan = Plan::new();
+    plan.add(delete_record_effect("validation_records[0]"));
+    plan.add(deferred_validation_records_effect());
+    plan.add(Effect::Create(dependent));
+
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        None,
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+        None,
+    ));
+
+    insta::assert_snapshot!(output, @"
+    Execution Plan:
+
+      +/- aws.route53.Record validation_records[*] (N records after cert resolves)
+          <- for opt in cert.domain_validation_options
+          name: (known after cert resolves)
+            │
+            └─ + acm.CertificateValidation cert-validation
+                  validation_record_id: __deferred_for.validation_records.id
+
+    Plan: 1 to add, 0 to change, 0 to destroy.
+           N to replace after cert resolves.
+    ");
+}
+
+#[test]
+fn test_deferred_for_does_not_pair_unrelated_same_type_delete() {
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(
+        Resource::new("acm.Certificate", "cert").with_binding("cert"),
+    ));
+    plan.add(delete_record_effect("old_record"));
+    plan.add(delete_record_effect("validation_records[0]"));
+    plan.add(deferred_validation_records_effect());
+
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        None,
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+        None,
+    ));
+
+    insta::assert_snapshot!(output, @"
+    Execution Plan:
+
+      + acm.Certificate cert
+            ├─ +/- aws.route53.Record validation_records[*] (N records after cert applies)
+            │     <- for opt in cert.domain_validation_options
+            │     name: (known after cert applies)
+            │
+            └─ - route53.Record old_record
+
+    Plan: 1 to add, 0 to change, 1 to destroy.
+           N to replace after cert applies.
+    ");
 }
 
 /// Test that cascading update diff only shows attributes referencing the replaced binding,
@@ -1715,7 +1873,8 @@ fn format_export_value_duration_renders_canonical() {
 fn format_deferred_value_duration_renders_canonical() {
     // Same shape as format_export_value but on the deferred-for path.
     let v = Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(60)));
-    let result = format_deferred_value(&v);
+    let result =
+        carina_core::plan_tree::format_deferred_for_template_value(&v, "ttl", "cert", "applies");
     // The deferred path may inject ANSI dimming for Unknown variants,
     // but a resolved Duration must render verbatim.
     assert_eq!(result, "1min");

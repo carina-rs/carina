@@ -1,0 +1,51 @@
+{
+  "version": 7,
+  "serial": 1,
+  "lineage": "test-lineage-deferred-for-with-unrelated-delete",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "route53.RecordSet",
+      "name": "extra_record",
+      "provider": "aws",
+      "identifier": "Z123:_extra.registry.example.com:CNAME",
+      "attributes": {
+        "hosted_zone_id": "Z123",
+        "name": "_extra.registry.example.com",
+        "type": "CNAME",
+        "ttl": 60,
+        "resource_records": [
+          "_old-extra.example.com"
+        ]
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "extra_record",
+      "dependency_bindings": [
+        "cert"
+      ],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "hosted_zone_id": {
+            "kind": "leaf"
+          },
+          "name": {
+            "kind": "leaf"
+          },
+          "type": {
+            "kind": "leaf"
+          },
+          "ttl": {
+            "kind": "leaf"
+          },
+          "resource_records": {
+            "kind": "leaf"
+          }
+        }
+      }
+    }
+  ]
+}
