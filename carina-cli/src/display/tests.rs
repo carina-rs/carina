@@ -1,5 +1,7 @@
 use super::*;
 
+use colored::Colorize;
+
 use carina_core::effect::{CascadingUpdate, Effect};
 use carina_core::plan::Plan;
 use carina_core::resource::{
@@ -2070,7 +2072,7 @@ fn test_refresh_plan_separator_no_blank_line_without_refresh() {
 #[test]
 fn test_composition_header_renders_module_with_source_path() {
     let header = strip_ansi(&format_composition_header("r", Some("./modules/infra")));
-    assert_eq!(header, r#"+ module "r" (./modules/infra)"#);
+    assert_eq!(header, r#"  + module "r" (./modules/infra)"#);
 }
 
 /// Fallback shape when no `use` path was recorded for the call site
@@ -2080,7 +2082,64 @@ fn test_composition_header_renders_module_with_source_path() {
 #[test]
 fn test_composition_header_drops_parens_for_none_source_path() {
     let header = strip_ansi(&format_composition_header("r", None));
-    assert_eq!(header, r#"+ module "r""#);
+    assert_eq!(header, r#"  + module "r""#);
+}
+
+#[test]
+fn every_top_level_sigil_starts_at_left_margin_column() {
+    fn raw_sigil(raw: &'static str) -> Sigil {
+        Sigil {
+            raw,
+            rendered: raw.normal(),
+        }
+    }
+
+    let cases = vec![
+        ("effect_create", raw_sigil("+")),
+        ("effect_delete", raw_sigil("-")),
+        ("effect_update_or_remove", raw_sigil("~")),
+        ("effect_wait", raw_sigil(">")),
+        ("effect_read", raw_sigil("<=")),
+        ("effect_import", raw_sigil("<-")),
+        ("effect_move", raw_sigil("->")),
+        ("effect_replace_create_before_destroy", raw_sigil("+/-")),
+        ("effect_replace_delete_before_create", raw_sigil("-/+")),
+        ("module_header", Sigil::module_header()),
+        ("deferred_for", Sigil::deferred_for_expression()),
+        (
+            "paired_deferred_for",
+            Sigil::paired_deferred_for_create_before_destroy(),
+        ),
+        ("export_added", Sigil::export_added()),
+        ("export_modified", Sigil::export_modified()),
+        ("export_removed", Sigil::export_removed()),
+    ];
+
+    for (label, sigil) in cases {
+        let prefix = top_level_sigil_prefix(&sigil, 0);
+        let plain = strip_ansi(&prefix);
+        assert_eq!(
+            plain.find(sigil.raw),
+            Some(LEFT_MARGIN.len()),
+            "sigil {label} did not start at the left-margin column: {plain:?}",
+        );
+    }
+}
+
+#[test]
+fn module_child_sigil_starts_at_left_margin_plus_two() {
+    let sigil = Sigil {
+        raw: "+",
+        rendered: "+".normal(),
+    };
+    let prefix = top_level_sigil_prefix(&sigil, 2);
+    let plain = strip_ansi(&prefix);
+
+    assert_eq!(
+        plain.find(sigil.raw),
+        Some(LEFT_MARGIN.len() + 2),
+        "module-child sigil did not start at the inset column: {plain:?}",
+    );
 }
 
 /// carina#3356: `reindent_with_gutter` restores the tree gutter on every

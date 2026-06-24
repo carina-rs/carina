@@ -5,8 +5,8 @@ expression: output
 Execution Plan:
 
   + aws.s3.Bucket logs
-+ module "cluster" (./modules/cluster)
-  + aws.eks.Cluster cluster/inner
-  + aws.iam.Role cluster/inner-role
+  + module "cluster" (./modules/cluster)
+    + aws.eks.Cluster cluster/inner
+    + aws.iam.Role cluster/inner-role
 
 Plan: 3 to add, 0 to change, 0 to destroy.

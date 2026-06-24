@@ -319,6 +319,154 @@ impl<'a> BasicEffect<'a> {
 }
 
 impl Effect {
+    pub const fn replace_display_glyph(create_before_destroy: bool) -> &'static str {
+        if create_before_destroy { "+/-" } else { "-/+" }
+    }
+
+    #[cfg(test)]
+    pub fn all_display_glyphs() -> Vec<&'static str> {
+        let mut effects = Self::display_glyph_effects();
+        effects.push(Self::synthetic_replace_effect(true));
+        effects.iter().map(Self::display_glyph).collect()
+    }
+
+    #[cfg(test)]
+    fn display_glyph_effects() -> Vec<Self> {
+        use crate::resource::{ConcreteValue, Value};
+        use crate::wait::predicate::{AttrPath, WaitPredicate};
+        use std::time::Duration;
+
+        let id = ResourceId::new("test", "x");
+
+        macro_rules! effect_cases {
+            ($(($effect:expr, $pattern:pat)),+ $(,)?) => {{
+                let effects = vec![$($effect),+];
+
+                fn _check_exhaustive(effect: &Effect) {
+                    match effect {
+                        $($pattern => {})+
+                    }
+                }
+
+                for effect in &effects {
+                    _check_exhaustive(effect);
+                }
+                assert_eq!(
+                    effects.len(),
+                    10,
+                    "display_glyph_effects must list every Effect variant exactly once"
+                );
+                effects
+            }};
+        }
+
+        effect_cases![
+            (
+                Effect::Read {
+                    resource: DataSource::new("test", "x"),
+                },
+                Effect::Read { .. }
+            ),
+            (
+                Effect::Create(Resource::new("test", "x")),
+                Effect::Create(_)
+            ),
+            (
+                Effect::Update {
+                    id: id.clone(),
+                    from: Box::new(State::not_found(id.clone())),
+                    to: Resource::new("test", "x"),
+                    changed_attributes: vec![],
+                },
+                Effect::Update { .. }
+            ),
+            (
+                Self::synthetic_replace_effect(false),
+                Effect::Replace { .. }
+            ),
+            (
+                Effect::Delete {
+                    id: id.clone(),
+                    identifier: "x-1".to_string(),
+                    directives: Directives::default(),
+                    binding: None,
+                    dependencies: HashSet::new(),
+                    explicit_dependencies: HashSet::new(),
+                },
+                Effect::Delete { .. }
+            ),
+            (
+                Effect::Import {
+                    id: id.clone(),
+                    identifier: Value::Concrete(ConcreteValue::String("x-1".to_string())),
+                },
+                Effect::Import { .. }
+            ),
+            (Effect::Remove { id: id.clone() }, Effect::Remove { .. }),
+            (
+                Effect::Move {
+                    from: id.clone(),
+                    to: ResourceId::new("test", "y"),
+                },
+                Effect::Move { .. }
+            ),
+            (
+                Effect::Wait {
+                    binding: "w".to_string(),
+                    target_id: id.clone(),
+                    until: WaitPredicate::Equals {
+                        attr: AttrPath::single("status"),
+                        value: Value::Concrete(ConcreteValue::String("ready".to_string())),
+                    },
+                    until_surface: "status == 'ready'".to_string(),
+                    timeout: Duration::from_secs(60),
+                    interval: Duration::from_secs(1),
+                    explicit_dependencies: HashSet::new(),
+                },
+                Effect::Wait { .. }
+            ),
+            (
+                Effect::ExpandDeferredFor {
+                    id: ResourceId::new("route53.Record", "validation_records"),
+                    upstream_binding: "cert".to_string(),
+                    template: Box::new(crate::parser::DeferredForExpression {
+                        file: Some("main.crn".to_string()),
+                        line: 12,
+                        header: "for opt in cert.domain_validation_options".to_string(),
+                        resource_type: "route53.Record".to_string(),
+                        attributes: vec![],
+                        binding_name: "validation_records".to_string(),
+                        iterable_binding: "cert".to_string(),
+                        iterable_attr: "domain_validation_options".to_string(),
+                        binding: crate::parser::ForBinding::Simple("opt".to_string()),
+                        template_resource: Resource::new("route53.Record", "validation_records"),
+                    }),
+                },
+                Effect::ExpandDeferredFor { .. }
+            ),
+        ]
+    }
+
+    #[cfg(test)]
+    fn synthetic_replace_effect(create_before_destroy: bool) -> Self {
+        let id = ResourceId::new("test", "x");
+        let directives = Directives {
+            create_before_destroy,
+            ..Directives::default()
+        };
+
+        Effect::Replace {
+            id: id.clone(),
+            from: Box::new(State::not_found(id)),
+            to: Resource::new("test", "x"),
+            directives,
+            changed_create_only: ChangedCreateOnly::new(vec!["attr".to_string()]).unwrap(),
+            cascading_updates: vec![],
+            temporary_name: None,
+            cascade_ref_hints: vec![],
+        }
+    }
+
     /// Plain display glyph for this effect.
     ///
     /// Color and text styling stay in each UI sink; this method owns the
@@ -329,11 +477,7 @@ impl Effect {
             Effect::Create(_) => "+",
             Effect::Update { .. } => "~",
             Effect::Replace { directives, .. } => {
-                if directives.create_before_destroy {
-                    "+/-"
-                } else {
-                    "-/+"
-                }
+                Self::replace_display_glyph(directives.create_before_destroy)
             }
             Effect::Delete { .. } => "-",
             Effect::Read { .. } => "<=",
