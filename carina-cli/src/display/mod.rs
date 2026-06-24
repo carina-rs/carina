@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
-use colored::Colorize;
+use colored::{ColoredString, Colorize};
 
 use carina_core::detail_rows::{
     DetailRow, ListOfMapsDiffField, ListOfMapsDiffItem, ListOfMapsDiffItemKind,
@@ -25,6 +25,121 @@ use carina_core::value::format_value_pretty;
 use carina_core::value::format_value_with_key;
 
 use crate::DetailLevel;
+
+const LEFT_MARGIN: &str = "  ";
+const ATTR_BASE: &str = "    ";
+
+/// A plan-display sigil. Construction is the only place that fixes both the
+/// raw glyph (column width) and the colored rendering (visual output), so
+/// callers cannot pass mismatched values.
+struct Sigil {
+    raw: &'static str,
+    rendered: ColoredString,
+}
+
+impl Sigil {
+    fn from_effect(effect: &Effect) -> Self {
+        let raw = effect.display_glyph();
+        let rendered = match effect {
+            Effect::Create(_) | Effect::ExpandDeferredFor { .. } => raw.green().bold(),
+            Effect::Update { .. } => raw.yellow().bold(),
+            Effect::Replace { .. } => raw.magenta().bold(),
+            Effect::Delete { .. } => raw.red().bold(),
+            Effect::Read { .. } | Effect::Import { .. } => raw.cyan().bold(),
+            // carina#3332: the previous `x` (red, bold) shape-collides
+            // with the `✗` failure indicator used in apply output.
+            // Use `~` (yellow, bold) — the same family as Move's `->`
+            // and the trailing `(remove from state)` annotation
+            // disambiguates from Update's `~` line.
+            Effect::Remove { .. } | Effect::Move { .. } => raw.yellow().bold(),
+            Effect::Wait { .. } => raw.magenta().bold(),
+        };
+        Self { raw, rendered }
+    }
+
+    fn module_header() -> Self {
+        Self {
+            raw: "+",
+            rendered: "+".cyan().bold(),
+        }
+    }
+
+    fn deferred_for_expression() -> Self {
+        Self {
+            raw: "+",
+            rendered: "+".green().bold(),
+        }
+    }
+
+    fn export_added() -> Self {
+        // Export rows are intentionally quieter than operation rows, so omit bold.
+        Self {
+            raw: "+",
+            rendered: "+".green(),
+        }
+    }
+
+    fn export_modified() -> Self {
+        // Export rows are intentionally quieter than operation rows, so omit bold.
+        Self {
+            raw: "~",
+            rendered: "~".yellow(),
+        }
+    }
+
+    fn export_removed() -> Self {
+        // Export rows are intentionally quieter than operation rows, so omit bold.
+        Self {
+            raw: "-",
+            rendered: "-".red(),
+        }
+    }
+
+    fn paired_deferred_for_create_before_destroy() -> Self {
+        let raw = Effect::replace_display_glyph(true);
+        Self {
+            raw,
+            rendered: raw.magenta().bold(),
+        }
+    }
+}
+
+/// Returns the full leading prefix for a top-level row.
+fn top_level_sigil_prefix(sigil: &Sigil, extra_left_pad: usize) -> String {
+    debug_assert!(
+        !sigil.raw.is_empty(),
+        "plan sigil raw glyph must not be empty"
+    );
+    format!(
+        "{}{}{} ",
+        LEFT_MARGIN,
+        " ".repeat(extra_left_pad),
+        sigil.rendered,
+    )
+}
+
+fn tree_sigil_prefix(
+    indent: usize,
+    is_last: bool,
+    prefix: &str,
+    sigil: &Sigil,
+    top_level_extra_left_pad: usize,
+) -> String {
+    if indent == 0 {
+        top_level_sigil_prefix(sigil, top_level_extra_left_pad)
+    } else {
+        let connector = if is_last {
+            format!("{}└─ ", prefix)
+        } else {
+            format!("{}├─ ", prefix)
+        };
+        format!("{}{}{} ", LEFT_MARGIN, connector, sigil.rendered)
+    }
+}
+
+fn attr_base_indent() -> &'static str {
+    ATTR_BASE
+}
 
 /// Separator emitted between the state-refresh progress block and the plan's
 /// terminal section.
@@ -131,8 +246,8 @@ fn format_export_change(change: &crate::commands::plan::ExportChange) -> String 
                 .unwrap_or_default();
             writeln!(
                 out,
-                "  {} {}{} = {}",
-                "+".green(),
+                "{}{}{} = {}",
+                top_level_sigil_prefix(&Sigil::export_added(), 0),
                 name,
                 type_str.dimmed(),
                 format_export_value(new_value)
@@ -151,8 +266,8 @@ fn format_export_change(change: &crate::commands::plan::ExportChange) -> String 
                 .unwrap_or_default();
             writeln!(
                 out,
-                "  {} {}{} = {} {} {}",
-                "~".yellow(),
+                "{}{}{} = {} {} {}",
+                top_level_sigil_prefix(&Sigil::export_modified(), 0),
                 name,
                 type_str.dimmed(),
                 format_json_export_value(old_json),
@@ -164,8 +279,8 @@ fn format_export_change(change: &crate::commands::plan::ExportChange) -> String 
         ExportChange::Removed { name, old_json } => {
             writeln!(
                 out,
-                "  {} {} = {}",
-                "-".red(),
+                "{}{} = {}",
+                top_level_sigil_prefix(&Sigil::export_removed(), 0),
                 name,
                 format_json_export_value(old_json)
             )
@@ -342,19 +457,32 @@ pub fn format_plan(
 fn format_deferred_for_expression(deferred: &carina_core::parser::DeferredForExpression) -> String {
     let mut out = String::new();
     let upstream = deferred_for_source(deferred);
+    let sigil = Sigil::deferred_for_expression();
+    let line_prefix = top_level_sigil_prefix(&sigil, 0);
+    let attr_base = attr_base_indent();
     writeln!(
         out,
-        "  {} {} {}",
-        "+".green().bold(),
+        "{}{} {}",
+        line_prefix,
         deferred.resource_type.cyan().bold(),
         format!("(N records after {upstream} resolves)").dimmed()
     )
     .unwrap();
     for row in deferred_for_detail_rows(deferred, &upstream, "resolves") {
         match row {
-            DetailRow::Text { text } => writeln!(out, "      {}", text.dimmed()).unwrap(),
+            DetailRow::Text { text } => {
+                writeln!(out, "{}{}{}", LEFT_MARGIN, attr_base, text.dimmed()).unwrap();
+            }
             DetailRow::Attribute { key, value, .. } => {
-                writeln!(out, "      {}: {}", key.dimmed(), value).unwrap();
+                writeln!(
+                    out,
+                    "{}{}{}: {}",
+                    LEFT_MARGIN,
+                    attr_base,
+                    key.dimmed(),
+                    value
+                )
+                .unwrap();
             }
             _ => {}
         }
@@ -426,6 +554,7 @@ impl<'a> TreeRenderContext<'a> {
         is_last: bool,
         prefix: &str,
         parent_binding: Option<&str>,
+        top_level_extra_left_pad: usize,
     ) -> bool {
         if self.printed.contains(&idx) {
             return false;
@@ -433,35 +562,11 @@ impl<'a> TreeRenderContext<'a> {
         self.printed.insert(idx);
 
         let effect = &self.plan.effects()[idx];
-        let glyph = effect.display_glyph();
-        let colored_symbol = match effect {
-            Effect::Create(_) | Effect::ExpandDeferredFor { .. } => glyph.green().bold(),
-            Effect::Update { .. } => glyph.yellow().bold(),
-            Effect::Replace { .. } => glyph.magenta().bold(),
-            Effect::Delete { .. } => glyph.red().bold(),
-            Effect::Read { .. } | Effect::Import { .. } => glyph.cyan().bold(),
-            // carina#3332: the previous `x` (red, bold) shape-collides
-            // with the `✗` failure indicator used in apply output.
-            // Use `~` (yellow, bold) — the same family as Move's `->`
-            // and the trailing `(remove from state)` annotation
-            // disambiguates from Update's `~` line.
-            Effect::Remove { .. } | Effect::Move { .. } => glyph.yellow().bold(),
-            Effect::Wait { .. } => glyph.magenta().bold(),
-        };
-
-        // Build the tree connector (shown before child resources)
-        let connector = if indent == 0 {
-            "".to_string()
-        } else if is_last {
-            format!("{}└─ ", prefix)
-        } else {
-            format!("{}├─ ", prefix)
-        };
-
-        // Base indentation for this resource
-        let base_indent = "  ";
-        // Attribute indentation (4 spaces from resource line)
-        let attr_base = "    ";
+        let sigil = Sigil::from_effect(effect);
+        let line_prefix =
+            tree_sigil_prefix(indent, is_last, prefix, &sigil, top_level_extra_left_pad);
+        let base_indent = format!("{}{}", LEFT_MARGIN, " ".repeat(top_level_extra_left_pad));
+        let attr_base = attr_base_indent();
 
         let mut has_displayed_attrs = false;
 
@@ -476,10 +581,8 @@ impl<'a> TreeRenderContext<'a> {
                     );
                     writeln!(
                         self.out,
-                        "{}{}{} {} {}",
-                        base_indent,
-                        connector,
-                        colored_symbol,
+                        "{}{} {}",
+                        line_prefix,
                         r.id.display_type().cyan().bold(),
                         name_part.white().bold()
                     )
@@ -487,10 +590,8 @@ impl<'a> TreeRenderContext<'a> {
                 } else {
                     writeln!(
                         self.out,
-                        "{}{}{} {} {}",
-                        base_indent,
-                        connector,
-                        colored_symbol,
+                        "{}{} {}",
+                        line_prefix,
                         r.id.display_type().cyan().bold(),
                         r.id.name_str().white().bold()
                     )
@@ -510,10 +611,8 @@ impl<'a> TreeRenderContext<'a> {
                     );
                     writeln!(
                         self.out,
-                        "{}{}{} {} {}{}",
-                        base_indent,
-                        connector,
-                        colored_symbol,
+                        "{}{} {}{}",
+                        line_prefix,
                         id.display_type().cyan().bold(),
                         name_part.yellow().bold(),
                         moved_note.as_deref().unwrap_or("").yellow()
@@ -522,10 +621,8 @@ impl<'a> TreeRenderContext<'a> {
                 } else {
                     writeln!(
                         self.out,
-                        "{}{}{} {} {}{}",
-                        base_indent,
-                        connector,
-                        colored_symbol,
+                        "{}{} {}{}",
+                        line_prefix,
                         id.display_type().cyan().bold(),
                         id.name_str().yellow().bold(),
                         moved_note.as_deref().unwrap_or("").yellow()
@@ -553,10 +650,8 @@ impl<'a> TreeRenderContext<'a> {
                     );
                     writeln!(
                         self.out,
-                        "{}{}{} {} {} {}{}",
-                        base_indent,
-                        connector,
-                        colored_symbol,
+                        "{}{} {} {}{}",
+                        line_prefix,
                         id.display_type().cyan().bold(),
                         name_part.magenta().bold(),
                         replace_note.magenta(),
@@ -566,10 +661,8 @@ impl<'a> TreeRenderContext<'a> {
                 } else {
                     writeln!(
                         self.out,
-                        "{}{}{} {} {} {}{}",
-                        base_indent,
-                        connector,
-                        colored_symbol,
+                        "{}{} {} {}{}",
+                        line_prefix,
                         id.display_type().cyan().bold(),
                         id.name_str().magenta().bold(),
                         replace_note.magenta(),
@@ -582,10 +675,8 @@ impl<'a> TreeRenderContext<'a> {
                 let display_name = binding.as_deref().unwrap_or(id.name_str());
                 writeln!(
                     self.out,
-                    "{}{}{} {} {}",
-                    base_indent,
-                    connector,
-                    colored_symbol,
+                    "{}{} {}",
+                    line_prefix,
                     id.display_type().cyan().bold(),
                     display_name.red().bold().strikethrough()
                 )
@@ -600,10 +691,8 @@ impl<'a> TreeRenderContext<'a> {
                     );
                     writeln!(
                         self.out,
-                        "{}{}{} {} {} {}",
-                        base_indent,
-                        connector,
-                        colored_symbol,
+                        "{}{} {} {}",
+                        line_prefix,
                         resource.id.display_type().cyan().bold(),
                         name_part.cyan().bold(),
                         "(data source)".dimmed()
@@ -612,10 +701,8 @@ impl<'a> TreeRenderContext<'a> {
                 } else {
                     writeln!(
                         self.out,
-                        "{}{}{} {} {} {}",
-                        base_indent,
-                        connector,
-                        colored_symbol,
+                        "{}{} {} {}",
+                        line_prefix,
                         resource.id.display_type().cyan().bold(),
                         resource.id.name_str().cyan().bold(),
                         "(data source)".dimmed()
@@ -633,10 +720,8 @@ impl<'a> TreeRenderContext<'a> {
                 let identifier_str = carina_core::effect::format_import_identifier(identifier);
                 writeln!(
                     self.out,
-                    "{}{}{} {} {} {}",
-                    base_indent,
-                    connector,
-                    colored_symbol,
+                    "{}{} {} {}",
+                    line_prefix,
                     id.display_type().cyan().bold(),
                     id.name_str().cyan().bold(),
                     format!("(import: {})", identifier_str).dimmed()
@@ -646,10 +731,8 @@ impl<'a> TreeRenderContext<'a> {
             Effect::Remove { id } => {
                 writeln!(
                     self.out,
-                    "{}{}{} {} {} {}",
-                    base_indent,
-                    connector,
-                    colored_symbol,
+                    "{}{} {} {}",
+                    line_prefix,
                     id.display_type().cyan().bold(),
                     // carina#3332: name was previously `red().bold()`,
                     // which pairs with `✗`/Delete and re-introduces the
@@ -670,10 +753,8 @@ impl<'a> TreeRenderContext<'a> {
                 }
                 writeln!(
                     self.out,
-                    "{}{}{} {} {} {}",
-                    base_indent,
-                    connector,
-                    colored_symbol,
+                    "{}{} {} {}",
+                    line_prefix,
                     to.display_type().cyan().bold(),
                     to.name_str().yellow().bold(),
                     format!("(moved from: {})", from.name_str()).dimmed()
@@ -687,10 +768,8 @@ impl<'a> TreeRenderContext<'a> {
             } => {
                 writeln!(
                     self.out,
-                    "{}{}{} {} {}",
-                    base_indent,
-                    connector,
-                    colored_symbol,
+                    "{}{} {}",
+                    line_prefix,
                     binding.magenta().bold(),
                     format!("(until {})", until_surface).dimmed()
                 )
@@ -705,10 +784,8 @@ impl<'a> TreeRenderContext<'a> {
                 let display_name = deferred_for_display_name(template, upstream_binding, verb);
                 writeln!(
                     self.out,
-                    "{}{}{} {} {}",
-                    base_indent,
-                    connector,
-                    colored_symbol,
+                    "{}{} {}",
+                    line_prefix,
                     template.resource_type.cyan().bold(),
                     display_name.green().bold()
                 )
@@ -805,6 +882,7 @@ impl<'a> TreeRenderContext<'a> {
                 child_is_last,
                 &new_prefix,
                 current_binding.as_deref(),
+                top_level_extra_left_pad,
             );
             // Add separator line between siblings when previous sibling displayed attributes
             if child_had_attrs && !child_is_last {
@@ -835,11 +913,17 @@ impl<'a> TreeRenderContext<'a> {
         is_last: bool,
         prefix: &str,
         parent_binding: Option<&str>,
+        top_level_extra_left_pad: usize,
     ) -> bool {
         match item {
-            ChildRenderItem::Normal(idx) => {
-                self.format_effect_tree(*idx, indent, is_last, prefix, parent_binding)
-            }
+            ChildRenderItem::Normal(idx) => self.format_effect_tree(
+                *idx,
+                indent,
+                is_last,
+                prefix,
+                parent_binding,
+                top_level_extra_left_pad,
+            ),
             ChildRenderItem::PairedDeferredFor {
                 expand_idx,
                 delete_indices,
@@ -849,6 +933,7 @@ impl<'a> TreeRenderContext<'a> {
                 indent,
                 is_last,
                 prefix,
+                top_level_extra_left_pad,
             ),
         }
     }
@@ -864,6 +949,7 @@ impl<'a> TreeRenderContext<'a> {
         indent: usize,
         is_last: bool,
         prefix: &str,
+        top_level_extra_left_pad: usize,
     ) -> bool {
         if self.printed.contains(&expand_idx) {
             return false;
@@ -882,22 +968,18 @@ impl<'a> TreeRenderContext<'a> {
             return false;
         };
 
-        let connector = if indent == 0 {
-            "".to_string()
-        } else if is_last {
-            format!("{}└─ ", prefix)
-        } else {
-            format!("{}├─ ", prefix)
-        };
-        let base_indent = "  ";
-        let attr_base = "    ";
+        // ExpandDeferredFor carries no replacement directive; paired deferred-for
+        // display has always represented create-before-destroy ordering.
+        let sigil = Sigil::paired_deferred_for_create_before_destroy();
+        let line_prefix =
+            tree_sigil_prefix(indent, is_last, prefix, &sigil, top_level_extra_left_pad);
+        let base_indent = format!("{}{}", LEFT_MARGIN, " ".repeat(top_level_extra_left_pad));
+        let attr_base = attr_base_indent();
         let verb = deferred_for_verb(self.plan, upstream_binding);
         writeln!(
             self.out,
-            "{}{}{} {} {}",
-            base_indent,
-            connector,
-            "+/-".magenta().bold(),
+            "{}{} {}",
+            line_prefix,
             template.resource_type.cyan().bold(),
             deferred_for_display_name(template, upstream_binding, verb)
                 .magenta()
@@ -955,8 +1037,14 @@ impl<'a> TreeRenderContext<'a> {
         let mut has_displayed_attrs = true;
         for (i, item) in child_render_items.iter().enumerate() {
             let child_is_last = i == child_render_items.len() - 1;
-            let child_had_attrs =
-                self.format_render_item(item, indent + 1, child_is_last, &new_prefix, None);
+            let child_had_attrs = self.format_render_item(
+                item,
+                indent + 1,
+                child_is_last,
+                &new_prefix,
+                None,
+                top_level_extra_left_pad,
+            );
             if child_had_attrs && !child_is_last {
                 let separator_continuation = if is_last {
                     format!("{}   ", prefix)
@@ -1038,12 +1126,11 @@ fn format_plan_tree<'a>(
         let ungrouped_items = ctx.child_render_items(&composition_groups.ungrouped);
         for (i, item) in ungrouped_items.iter().enumerate() {
             let last = i == ungrouped_items.len() - 1 && composition_groups.grouped.is_empty();
-            ctx.format_render_item(item, 0, last, "", None);
+            ctx.format_render_item(item, 0, last, "", None, 0);
         }
         // Then: each composition group with its header. Each leaf
-        // renders as a top-level row (indent 0, no prefix) — the
-        // composition header marks the group, and the per-line `Composition`
-        // header visually separates groups.
+        // renders without tree connectors, but with one extra top-level
+        // padding step so it remains visually nested under the module header.
         for group in &composition_groups.grouped {
             writeln!(
                 ctx.out,
@@ -1054,7 +1141,8 @@ fn format_plan_tree<'a>(
             let leaf_items = ctx.child_render_items(&group.leaves);
             for (li, item) in leaf_items.iter().enumerate() {
                 let leaf_last = li == leaf_items.len() - 1;
-                ctx.format_render_item(item, 0, leaf_last, "  ", None);
+                // Top-level rows derive their own left margin from the sigil prefix.
+                ctx.format_render_item(item, 0, leaf_last, "", None, 2);
             }
         }
     } else {
@@ -1062,7 +1150,7 @@ fn format_plan_tree<'a>(
         // pre-#3307 flat layout so existing snapshots remain valid.
         let root_items = ctx.child_render_items(&roots);
         for (i, item) in root_items.iter().enumerate() {
-            ctx.format_render_item(item, 0, i == root_items.len() - 1, "", None);
+            ctx.format_render_item(item, 0, i == root_items.len() - 1, "", None, 0);
         }
     }
 
@@ -1073,7 +1161,7 @@ fn format_plan_tree<'a>(
         .collect();
     let remaining_items = ctx.child_render_items(&remaining);
     for (i, item) in remaining_items.iter().enumerate() {
-        ctx.format_render_item(item, 0, i == remaining_items.len() - 1, "", None);
+        ctx.format_render_item(item, 0, i == remaining_items.len() - 1, "", None, 0);
     }
 
     ctx.out
@@ -1089,12 +1177,13 @@ fn format_plan_tree<'a>(
 /// trace back to their own `.crn` — unlike the previous internal
 /// `Composition` label (carina#3322).
 fn format_composition_header(binding: &str, source_path: Option<&str>) -> String {
-    use colored::Colorize;
+    let sigil = Sigil::module_header();
+    let prefix = top_level_sigil_prefix(&sigil, 0);
     match source_path {
-        None => format!("{} module \"{}\"", "+".cyan(), binding.cyan().bold()),
+        None => format!("{}module \"{}\"", prefix, binding.cyan().bold()),
         Some(path) => format!(
-            "{} module \"{}\" {}",
-            "+".cyan(),
+            "{}module \"{}\" {}",
+            prefix,
             binding.cyan().bold(),
             format!("({})", path).dimmed(),
         ),

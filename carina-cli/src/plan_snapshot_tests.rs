@@ -2181,6 +2181,95 @@ fn snapshot_composition_folding() {
     );
 }
 
+/// carina#3593 acceptance: top-level resource rows, data-source rows,
+/// and folded module headers share one sigil column and one content
+/// column. Narrow sigils are padded after the sigil; wider sigils keep
+/// their natural width.
+#[test]
+fn snapshot_top_level_sigil_alignment() {
+    use carina_core::effect::Effect;
+    use carina_core::parser::{DeferredForExpression, ForBinding};
+    use carina_core::plan::Plan;
+    use carina_core::resource::{
+        CallSite, DataSource, EphemeralId, ExpansionTrace, PersistentId, Resource, ResourceId,
+        Value,
+    };
+    use carina_core::schema::SchemaRegistry;
+
+    let mut plan = Plan::new();
+
+    let bucket = Resource::new("aws.s3.Bucket", "logs");
+    let roles = DataSource::new("aws.iam.Roles", "admin_roles");
+    let cluster = Resource::new("aws.eks.Cluster", "cluster/inner");
+    let cluster_id = cluster.id.clone();
+
+    plan.add(Effect::Create(bucket));
+    plan.add(Effect::Read { resource: roles });
+    plan.add(Effect::Create(cluster));
+
+    let deferred_template = Resource::new("aws.route53.RecordSet", "validation_records");
+    let deferred = DeferredForExpression {
+        file: None,
+        line: 1,
+        header: "for option in cert.domain_validation_options".to_string(),
+        resource_type: "aws.route53.RecordSet".to_string(),
+        attributes: vec![(
+            "name".to_string(),
+            Value::resource_ref("option", "name", vec![]),
+        )],
+        binding_name: "validation_records".to_string(),
+        iterable_binding: "cert".to_string(),
+        iterable_attr: "domain_validation_options".to_string(),
+        binding: ForBinding::Simple("option".to_string()),
+        template_resource: deferred_template,
+    };
+    let deferred_for_expressions = vec![deferred];
+
+    let mut trace = ExpansionTrace::new();
+    let cluster_site = CallSite::new(
+        EphemeralId::new(ResourceId::new("_virtual", "cluster")),
+        "./modules/cluster",
+    );
+    trace.record(PersistentId::new(cluster_id), vec![cluster_site]);
+
+    let schemas = SchemaRegistry::new();
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::None,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &deferred_for_expressions,
+        None,
+        Some(&trace),
+    ));
+    insta::assert_snapshot!(output);
+
+    let rows = [
+        ("+", "aws.s3.Bucket", "create resource"),
+        ("<=", "aws.iam.Roles", "read data source"),
+        ("+", "aws.route53.RecordSet", "deferred for-expression"),
+        ("+", "module", "module header"),
+    ];
+    for (sigil, content, label) in rows {
+        let line = output
+            .lines()
+            .find(|line| line.contains(content))
+            .unwrap_or_else(|| panic!("missing {label} row in:\n{output}"));
+        let expected_prefix = format!("  {sigil} ");
+        assert_eq!(
+            line.find(sigil),
+            Some(2),
+            "{label} sigil must start at column 2: {line:?}",
+        );
+        assert!(
+            line.starts_with(&expected_prefix),
+            "{label} row must use a single separator after its sigil: {line:?}",
+        );
+    }
+}
+
 /// carina#3322 end-to-end: loading a real multi-file fixture
 /// (`module_anonymous_resource` — main.crn + an `oidc-module/`
 /// subdirectory referenced as `use { source = './oidc-module' }`)
