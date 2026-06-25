@@ -81,6 +81,7 @@ fn format_state_only_effect_line(effect: &Effect) -> Option<String> {
     match effect {
         Effect::Remove { id } => Some(format!("  {} removed-from-state {}", "~".yellow(), id)),
         Effect::Move { from, to } => Some(format!("  {} Moving {} -> {}", "->".yellow(), from, to)),
+        Effect::DeferredReplace { .. } => None,
         _ => None,
     }
 }

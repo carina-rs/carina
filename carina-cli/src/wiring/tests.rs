@@ -2522,6 +2522,30 @@ mod read_with_retry_identifier_tests {
 // `State::not_found` path the original resources already use under
 // `--refresh=false` (via the shared `children()` filter).
 // ---------------------------------------------------------------------
+#[test]
+fn deferred_template_binding_match_requires_single_numeric_index() {
+    assert!(binding_matches_deferred_template(
+        "validation_records[0]",
+        "validation_records"
+    ));
+    assert!(binding_matches_deferred_template(
+        "validation_records[42]",
+        "validation_records"
+    ));
+    assert!(!binding_matches_deferred_template(
+        "validation_records[]",
+        "validation_records"
+    ));
+    assert!(!binding_matches_deferred_template(
+        "validation_records[abc]",
+        "validation_records"
+    ));
+    assert!(!binding_matches_deferred_template(
+        "validation_records[0][1]",
+        "validation_records"
+    ));
+}
+
 mod expand_same_config_deferred_for_tests {
     use super::*;
     use carina_core::binding_index::WaitAliasSpec;

@@ -53,6 +53,38 @@ pub struct CascadingUpdate {
     pub to: Resource,
 }
 
+/// Delete payload absorbed into [`Effect::DeferredReplace`].
+///
+/// This carries the exact fields from [`Effect::Delete`]. Keeping the
+/// delete half in a named struct lets the deletes slot grow new fields later
+/// without re-shaping `DeferredReplace` itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeferredReplaceDelete {
+    pub id: ResourceId,
+    pub identifier: String,
+    #[serde(default)]
+    pub directives: Directives,
+    #[serde(default)]
+    pub binding: Option<String>,
+    #[serde(default)]
+    pub dependencies: HashSet<String>,
+    #[serde(default)]
+    pub explicit_dependencies: HashSet<String>,
+}
+
+impl DeferredReplaceDelete {
+    pub fn to_delete_effect(&self) -> Effect {
+        Effect::Delete {
+            id: self.id.clone(),
+            identifier: self.identifier.clone(),
+            directives: self.directives.clone(),
+            binding: self.binding.clone(),
+            dependencies: self.dependencies.clone(),
+            explicit_dependencies: self.explicit_dependencies.clone(),
+        }
+    }
+}
+
 /// Non-empty create-only attribute list for [`Effect::Replace`].
 ///
 /// An empty list would render a destroy-and-recreate plan with no visible
@@ -259,6 +291,20 @@ pub enum Effect {
         /// The for-expression body, replayed against the upstream state.
         template: Box<DeferredForExpression>,
     },
+
+    /// A deferred-for replacement whose delete side is known at plan time
+    /// and whose create side is materialized after the upstream binding is
+    /// available at apply time.
+    DeferredReplace {
+        /// Pre-apply iterations being destroyed.
+        deletes: Vec<DeferredReplaceDelete>,
+        /// Synthetic id used for plan-tree display and progress.
+        id: ResourceId,
+        /// The iterable's binding name (e.g. "cert").
+        upstream_binding: String,
+        /// The for-expression body, replayed against the upstream state.
+        template: Box<DeferredForExpression>,
+    },
 }
 
 /// A type-level narrowing of [`Effect`] to the variants the basic
@@ -353,7 +399,7 @@ impl Effect {
                 }
                 assert_eq!(
                     effects.len(),
-                    10,
+                    11,
                     "display_glyph_effects must list every Effect variant exactly once"
                 );
                 effects
@@ -444,6 +490,33 @@ impl Effect {
                 },
                 Effect::DeferredCreate { .. }
             ),
+            (
+                Effect::DeferredReplace {
+                    deletes: vec![DeferredReplaceDelete {
+                        id: ResourceId::new("route53.Record", "validation_records[0]"),
+                        identifier: "record-0".to_string(),
+                        directives: Directives::default(),
+                        binding: Some("validation_records[0]".to_string()),
+                        dependencies: HashSet::new(),
+                        explicit_dependencies: HashSet::new(),
+                    }],
+                    id: ResourceId::new("route53.Record", "validation_records"),
+                    upstream_binding: "cert".to_string(),
+                    template: Box::new(crate::parser::DeferredForExpression {
+                        file: Some("main.crn".to_string()),
+                        line: 12,
+                        header: "for opt in cert.domain_validation_options".to_string(),
+                        resource_type: "route53.Record".to_string(),
+                        attributes: vec![],
+                        binding_name: "validation_records".to_string(),
+                        iterable_binding: "cert".to_string(),
+                        iterable_attr: "domain_validation_options".to_string(),
+                        binding: crate::parser::ForBinding::Simple("opt".to_string()),
+                        template_resource: Resource::new("route53.Record", "validation_records"),
+                    }),
+                },
+                Effect::DeferredReplace { .. }
+            ),
         ]
     }
 
@@ -486,6 +559,7 @@ impl Effect {
             Effect::Move { .. } => "->",
             Effect::Wait { .. } => ">",
             Effect::DeferredCreate { .. } => "+",
+            Effect::DeferredReplace { .. } => "+/-",
         }
     }
 
@@ -550,7 +624,8 @@ impl Effect {
             | Effect::Remove { .. }
             | Effect::Move { .. }
             | Effect::Wait { .. }
-            | Effect::DeferredCreate { .. } => None,
+            | Effect::DeferredCreate { .. }
+            | Effect::DeferredReplace { .. } => None,
         }
     }
 
@@ -575,6 +650,7 @@ impl Effect {
             Effect::Move { .. } => "move",
             Effect::Wait { .. } => "wait",
             Effect::DeferredCreate { .. } => "deferred_create",
+            Effect::DeferredReplace { .. } => "deferred_replace",
         }
     }
 
@@ -591,6 +667,7 @@ impl Effect {
             Effect::Move { .. } => true,
             Effect::Wait { .. } => false,
             Effect::DeferredCreate { .. } => true,
+            Effect::DeferredReplace { .. } => true,
         }
     }
 
@@ -607,6 +684,7 @@ impl Effect {
             Effect::Move { .. } => true,
             Effect::Wait { .. } => false,
             Effect::DeferredCreate { .. } => false,
+            Effect::DeferredReplace { .. } => true,
         }
     }
 
@@ -624,6 +702,7 @@ impl Effect {
             Effect::Move { .. } => false,
             Effect::Wait { .. } => false,
             Effect::DeferredCreate { .. } => true,
+            Effect::DeferredReplace { .. } => true,
         }
     }
 
@@ -640,6 +719,7 @@ impl Effect {
             Effect::Move { to, .. } => to,
             Effect::Wait { target_id, .. } => target_id,
             Effect::DeferredCreate { id, .. } => id,
+            Effect::DeferredReplace { id, .. } => id,
         }
     }
 
@@ -664,7 +744,8 @@ impl Effect {
             | Effect::Remove { .. }
             | Effect::Move { .. }
             | Effect::Wait { .. }
-            | Effect::DeferredCreate { .. } => None,
+            | Effect::DeferredCreate { .. }
+            | Effect::DeferredReplace { .. } => None,
         }
     }
 
@@ -681,6 +762,7 @@ impl Effect {
             Effect::Move { .. } => None,
             Effect::Wait { binding, .. } => Some(binding.clone()),
             Effect::DeferredCreate { .. } => None,
+            Effect::DeferredReplace { template, .. } => Some(template.binding_name.clone()),
         }
     }
 
@@ -715,6 +797,7 @@ impl Effect {
                 ..
             } => explicit_dependencies.clone(),
             Effect::DeferredCreate { .. } => HashSet::new(),
+            Effect::DeferredReplace { .. } => HashSet::new(),
         }
     }
 
@@ -763,6 +846,9 @@ impl Effect {
                 deps.into_iter().collect()
             }
             Effect::DeferredCreate {
+                upstream_binding, ..
+            }
+            | Effect::DeferredReplace {
                 upstream_binding, ..
             } => vec![upstream_binding.clone()],
         }

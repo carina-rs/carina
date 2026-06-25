@@ -684,6 +684,15 @@ fn decompose<'a>(
             Effect::Delete { id, .. } if successfully_deleted.contains(id) => {
                 wb.add_cleanup(id.clone())?;
             }
+            Effect::DeferredReplace { deletes, .. } => {
+                for delete in deletes {
+                    if successfully_deleted.contains(&delete.id)
+                        && !wb.upserts.contains_key(&delete.id)
+                    {
+                        wb.add_cleanup(delete.id.clone())?;
+                    }
+                }
+            }
             Effect::Remove { id } => {
                 wb.add_cleanup(id.clone())?;
             }

@@ -14,7 +14,7 @@ use futures::stream::{self, StreamExt};
 use carina_core::binding_index::{PreApplyInputs, ResolvedBindings, WaitAliasSpec};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
-use carina_core::effect::Effect;
+use carina_core::effect::{DeferredReplaceDelete, Effect};
 use carina_core::executor::normalized::{
     is_value_fully_concrete_for_expansion, restore_stripped_attributes,
     run_desired_normalization_stages, states_contain_unknown, strip_provider_boundary_attributes,
@@ -1317,6 +1317,28 @@ impl DeferredCreateTarget {
             template: Box::new(self.template.clone()),
         }
     }
+
+    fn to_deferred_replace_effect(&self, deletes: Vec<DeferredReplaceDelete>) -> Effect {
+        Effect::DeferredReplace {
+            deletes,
+            id: self.id.clone(),
+            upstream_binding: self.upstream_binding.clone(),
+            template: Box::new(self.template.clone()),
+        }
+    }
+}
+
+pub(crate) fn binding_matches_deferred_template(
+    binding: &str,
+    template_binding_name: &str,
+) -> bool {
+    let Some(suffix) = binding.strip_prefix(template_binding_name) else {
+        return false;
+    };
+    let Some(inner) = suffix.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
+        return false;
+    };
+    !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Outcome of the carina#3132 post-refresh deferred-for expansion.
@@ -2689,6 +2711,7 @@ pub fn add_state_block_effects(
         plan.retain(|effect| match effect {
             Effect::Delete { id, .. } => !suppress_delete.contains(id),
             Effect::Create(resource) => !suppress_create.contains(&resource.id),
+            Effect::DeferredReplace { .. } => true,
             _ => true,
         });
     }
@@ -2701,8 +2724,61 @@ pub fn add_state_block_effects(
 
 /// Add apply-time deferred-for re-expansion effects to the plan.
 pub fn add_deferred_create_effects(plan: &mut Plan, targets: &[DeferredCreateTarget]) {
+    let mut deletes_to_absorb: HashSet<ResourceId> = HashSet::new();
+    let mut deferred_effects = Vec::new();
+
     for target in targets {
-        plan.add(target.to_effect());
+        let deletes: Vec<DeferredReplaceDelete> = plan
+            .effects()
+            .iter()
+            .filter_map(|effect| {
+                let Effect::Delete {
+                    id,
+                    identifier,
+                    directives,
+                    binding: Some(binding),
+                    dependencies,
+                    explicit_dependencies,
+                } = effect
+                else {
+                    return None;
+                };
+
+                if id.resource_type == target.template.template_resource.id.resource_type
+                    && binding_matches_deferred_template(binding, &target.template.binding_name)
+                {
+                    Some(DeferredReplaceDelete {
+                        id: id.clone(),
+                        identifier: identifier.clone(),
+                        directives: directives.clone(),
+                        binding: Some(binding.clone()),
+                        dependencies: dependencies.clone(),
+                        explicit_dependencies: explicit_dependencies.clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if deletes.is_empty() {
+            deferred_effects.push(target.to_effect());
+        } else {
+            deletes_to_absorb.extend(deletes.iter().map(|delete| delete.id.clone()));
+            deferred_effects.push(target.to_deferred_replace_effect(deletes));
+        }
+    }
+
+    if !deletes_to_absorb.is_empty() {
+        plan.retain(|effect| match effect {
+            Effect::Delete { id, .. } => !deletes_to_absorb.contains(id),
+            Effect::DeferredReplace { .. } => true,
+            _ => true,
+        });
+    }
+
+    for effect in deferred_effects {
+        plan.add(effect);
     }
 }
 
@@ -2746,6 +2822,7 @@ fn resolve_import_target(
         name_attr,
         plan.effects().iter().filter_map(|effect| match effect {
             Effect::Create(resource) => Some(resource),
+            Effect::DeferredReplace { .. } => None,
             _ => None,
         }),
     ) {

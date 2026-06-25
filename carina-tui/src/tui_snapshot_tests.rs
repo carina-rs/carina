@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
-use carina_core::effect::Effect;
+use carina_core::effect::{DeferredReplaceDelete, Effect};
 use carina_core::parser::{DeferredForExpression, ForBinding};
 use carina_core::plan::Plan;
 use carina_core::resource::{
@@ -256,7 +256,7 @@ fn build_anonymous_deferred_for_plan() -> Plan {
     plan
 }
 
-fn build_deferred_for_with_paired_destroy_plan() -> Plan {
+fn build_deferred_replace_plan() -> Plan {
     let template_resource =
         Resource::new("route53.Record", "validation_records").with_binding("validation_records");
     let deferred = DeferredForExpression {
@@ -274,18 +274,18 @@ fn build_deferred_for_with_paired_destroy_plan() -> Plan {
 
     let mut plan = Plan::new();
     plan.add(Effect::Create(certificate_resource()));
-    plan.add(Effect::DeferredCreate {
+    plan.add(Effect::DeferredReplace {
+        deletes: vec![DeferredReplaceDelete {
+            id: ResourceId::new("route53.Record", "old-record-0"),
+            identifier: "record-0".to_string(),
+            directives: Directives::default(),
+            binding: Some("validation_records[0]".to_string()),
+            dependencies: HashSet::from(["cert".to_string()]),
+            explicit_dependencies: HashSet::new(),
+        }],
         id: ResourceId::new("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(deferred),
-    });
-    plan.add(Effect::Delete {
-        id: ResourceId::new("route53.Record", "old-record-0"),
-        identifier: "record-0".to_string(),
-        directives: Directives::default(),
-        binding: Some("validation_records[0]".to_string()),
-        dependencies: HashSet::from(["cert".to_string()]),
-        explicit_dependencies: HashSet::new(),
     });
     plan
 }
@@ -365,8 +365,8 @@ fn snapshot_deferred_for_anonymous() {
 }
 
 #[test]
-fn snapshot_deferred_for_with_paired_destroy() {
-    let plan = build_deferred_for_with_paired_destroy_plan();
+fn snapshot_deferred_replace() {
+    let plan = build_deferred_replace_plan();
     let output = render_tui(&plan, 120, 32, 1);
     assert!(output.contains("+/-"));
     assert!(

@@ -158,6 +158,7 @@ impl Plan {
                     }
                     return;
                 }
+                Effect::DeferredReplace { .. } => {}
                 _ => {}
             }
         }
@@ -214,7 +215,7 @@ impl Plan {
                     summary.replace += 1;
                     summary.update += cascading_updates.len();
                 }
-                Effect::Delete { .. } => {}
+                Effect::Delete { .. } | Effect::DeferredReplace { .. } => {}
                 Effect::Import { .. } => summary.import += 1,
                 Effect::Remove { .. } => summary.remove += 1,
                 Effect::Move { .. } => summary.moved += 1,
@@ -225,11 +226,7 @@ impl Plan {
         summary.delete = self
             .effects
             .iter()
-            .enumerate()
-            .filter(|(idx, effect)| {
-                matches!(effect, Effect::Delete { .. })
-                    && !deferred_summary.paired_delete_indices.contains(idx)
-            })
+            .filter(|effect| matches!(effect, Effect::Delete { .. }))
             .count();
         summary.deferred = deferred_summary.entries;
         summary
@@ -387,7 +384,8 @@ impl ModularPlan {
                 | Effect::Remove { .. }
                 | Effect::Move { .. }
                 | Effect::Wait { .. }
-                | Effect::DeferredCreate { .. } => ModuleSource::Root,
+                | Effect::DeferredCreate { .. }
+                | Effect::DeferredReplace { .. } => ModuleSource::Root,
             };
             modular.effect_sources.insert(idx, source);
         }
@@ -515,6 +513,16 @@ fn format_effect_brief(effect: &Effect) -> String {
             ..
         } => format!(
             "{} {} (deferred for: waits on {})",
+            effect.display_glyph(),
+            id,
+            upstream_binding
+        ),
+        Effect::DeferredReplace {
+            id,
+            upstream_binding,
+            ..
+        } => format!(
+            "{} {} (deferred for replace: waits on {})",
             effect.display_glyph(),
             id,
             upstream_binding

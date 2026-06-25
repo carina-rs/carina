@@ -202,7 +202,9 @@ pub(super) fn build_phase_dependency_map(
         let mut dep_indices = HashSet::new();
         let effect = &effects[idx];
         match effect {
-            Effect::Wait { .. } | Effect::DeferredCreate { .. } => {
+            Effect::Wait { .. }
+            | Effect::DeferredCreate { .. }
+            | Effect::DeferredReplace { .. } => {
                 resolver.collect_from_effect(effect, &mut dep_indices);
             }
             _ if effect.as_resource_ref().is_some() => {
@@ -449,6 +451,10 @@ pub(super) async fn execute_effects_phased(
                         Effect::DeferredCreate {
                             upstream_binding,
                             ..
+                        }
+                        | Effect::DeferredReplace {
+                            upstream_binding,
+                            ..
                         } if replace_bindings.contains(upstream_binding)
                     )
                     && !post_replace_wait_set.contains(&idx)
@@ -535,6 +541,111 @@ pub(super) async fn execute_effects_phased(
                     ..
                 } = &effect
                 {
+                    let children = match materialize_deferred_create(
+                        upstream_binding,
+                        template,
+                        &input.bindings,
+                    ) {
+                        Ok(children) => children,
+                        Err(err) => {
+                            let message = err.message();
+                            observer.on_event(&ExecutionEvent::EffectFailed {
+                                effect: &effect,
+                                error: &message,
+                                duration: Duration::ZERO,
+                                progress: ProgressInfo {
+                                    completed: completed.load(Ordering::Relaxed),
+                                    total,
+                                },
+                            });
+                            failure_count += 1;
+                            failed_bindings.insert(template.binding_name.clone());
+                            completed_indices.insert(idx);
+                            completed_synchronous_dispatch = true;
+                            break;
+                        }
+                    };
+                    if !children.is_empty() {
+                        total += count_actionable_effects(&children);
+                        for child in children {
+                            let child_idx = effects.len();
+                            if let Effect::Create(resource) = &child {
+                                runtime_synthesized_resources.push(resource.clone());
+                            }
+                            effects.push(child);
+                            phase1_indices.push(child_idx);
+                        }
+                        deps_of = build_phase_dependency_map(
+                            &effects,
+                            &phase1_indices,
+                            input.unresolved_resources,
+                            input.compositions,
+                        );
+                    }
+                    completed_indices.insert(idx);
+                    completed_synchronous_dispatch = true;
+                    break;
+                }
+
+                if let Effect::DeferredReplace {
+                    deletes,
+                    upstream_binding,
+                    template,
+                    ..
+                } = &effect
+                {
+                    total += deletes.len();
+                    let binding_snapshot = input.bindings.clone();
+                    let pipeline = RenormalizePipeline {
+                        normalizer: input.normalizer,
+                        provider_configs: input.provider_configs,
+                        factories: input.factories,
+                        schemas: input.schemas,
+                    };
+                    let mut delete_failed = false;
+                    for delete in deletes {
+                        let delete_effect = delete.to_delete_effect();
+                        let basic = delete_effect
+                            .as_basic()
+                            .expect("deferred replace delete half must narrow to BasicEffect");
+                        let before_failures = failure_count;
+                        let result = execute_basic_effect(
+                            basic,
+                            &BasicEffectCtx {
+                                provider,
+                                bindings: &binding_snapshot,
+                                unresolved: input.unresolved_resources,
+                                pipeline: &pipeline,
+                                completed: &completed,
+                                total,
+                            },
+                            observer,
+                        )
+                        .await;
+                        process_basic_result(
+                            result,
+                            &mut ExecutionState {
+                                success_count: &mut success_count,
+                                failure_count: &mut failure_count,
+                                partial_count: &mut partial_count,
+                                partial_diagnostics: &mut partial_diagnostics,
+                                applied_states: &mut applied_states,
+                                failed_bindings: &mut failed_bindings,
+                                successfully_deleted: &mut successfully_deleted,
+                                pending_refreshes: &mut pending_refreshes,
+                                bindings: &mut input.bindings,
+                            },
+                        );
+                        delete_failed |= failure_count > before_failures;
+                    }
+
+                    if delete_failed {
+                        failed_bindings.insert(template.binding_name.clone());
+                        completed_indices.insert(idx);
+                        completed_synchronous_dispatch = true;
+                        break;
+                    }
+
                     let children = match materialize_deferred_create(
                         upstream_binding,
                         template,
@@ -1470,6 +1581,9 @@ pub(super) async fn execute_effects_phased(
             |(idx, effect)| match effect {
                 Effect::DeferredCreate {
                     upstream_binding, ..
+                }
+                | Effect::DeferredReplace {
+                    upstream_binding, ..
                 } if replace_bindings.contains(upstream_binding) => Some(idx),
                 Effect::Create(_)
                 | Effect::Update { .. }
@@ -1480,7 +1594,8 @@ pub(super) async fn execute_effects_phased(
                 | Effect::Remove { .. }
                 | Effect::Move { .. }
                 | Effect::Wait { .. }
-                | Effect::DeferredCreate { .. } => None,
+                | Effect::DeferredCreate { .. }
+                | Effect::DeferredReplace { .. } => None,
             },
         ));
         phase4_indices.sort();
@@ -1559,6 +1674,115 @@ pub(super) async fn execute_effects_phased(
                     ..
                 } = &effect
                 {
+                    let children = match materialize_deferred_create(
+                        upstream_binding,
+                        template,
+                        &input.bindings,
+                    ) {
+                        Ok(children) => children,
+                        Err(err) => {
+                            let message = err.message();
+                            observer.on_event(&ExecutionEvent::EffectFailed {
+                                effect: &effect,
+                                error: &message,
+                                duration: Duration::ZERO,
+                                progress: ProgressInfo {
+                                    completed: completed.load(Ordering::Relaxed),
+                                    total,
+                                },
+                            });
+                            failure_count += 1;
+                            failed_bindings.insert(template.binding_name.clone());
+                            completed_indices.insert(idx);
+                            completed_synchronous_dispatch = true;
+                            break;
+                        }
+                    };
+                    if !children.is_empty() {
+                        total += count_actionable_effects(&children);
+                        for child in children {
+                            let child_idx = effects.len();
+                            if let Effect::Create(resource) = &child {
+                                runtime_synthesized_resources.push(resource.clone());
+                                debug_assert!(
+                                    resource.dependency_bindings.contains(upstream_binding),
+                                    "apply-time deferred-for child must retain iterable dependency"
+                                );
+                            }
+                            effects.push(child);
+                            phase4_indices.push(child_idx);
+                        }
+                        deps_of = build_phase_dependency_map(
+                            &effects,
+                            &phase4_indices,
+                            input.unresolved_resources,
+                            input.compositions,
+                        );
+                    }
+                    completed_indices.insert(idx);
+                    completed_synchronous_dispatch = true;
+                    break;
+                }
+
+                if let Effect::DeferredReplace {
+                    deletes,
+                    upstream_binding,
+                    template,
+                    ..
+                } = &effect
+                {
+                    total += deletes.len();
+                    let binding_snapshot = input.bindings.clone();
+                    let pipeline = RenormalizePipeline {
+                        normalizer: input.normalizer,
+                        provider_configs: input.provider_configs,
+                        factories: input.factories,
+                        schemas: input.schemas,
+                    };
+                    let mut delete_failed = false;
+                    for delete in deletes {
+                        let delete_effect = delete.to_delete_effect();
+                        let basic = delete_effect
+                            .as_basic()
+                            .expect("deferred replace delete half must narrow to BasicEffect");
+                        let before_failures = failure_count;
+                        let result = execute_basic_effect(
+                            basic,
+                            &BasicEffectCtx {
+                                provider,
+                                bindings: &binding_snapshot,
+                                unresolved: input.unresolved_resources,
+                                pipeline: &pipeline,
+                                completed: &completed,
+                                total,
+                            },
+                            observer,
+                        )
+                        .await;
+                        process_basic_result(
+                            result,
+                            &mut ExecutionState {
+                                success_count: &mut success_count,
+                                failure_count: &mut failure_count,
+                                partial_count: &mut partial_count,
+                                partial_diagnostics: &mut partial_diagnostics,
+                                applied_states: &mut applied_states,
+                                failed_bindings: &mut failed_bindings,
+                                successfully_deleted: &mut successfully_deleted,
+                                pending_refreshes: &mut pending_refreshes,
+                                bindings: &mut input.bindings,
+                            },
+                        );
+                        delete_failed |= failure_count > before_failures;
+                    }
+
+                    if delete_failed {
+                        failed_bindings.insert(template.binding_name.clone());
+                        completed_indices.insert(idx);
+                        completed_synchronous_dispatch = true;
+                        break;
+                    }
+
                     let children = match materialize_deferred_create(
                         upstream_binding,
                         template,

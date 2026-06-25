@@ -306,6 +306,18 @@ fn effect_required_ops(effect: &Effect) -> Vec<(ResourceId, PlanOp)> {
         Effect::DeferredCreate { template, .. } => {
             effect_required_ops(&Effect::Create(template.template_resource.clone()))
         }
+        Effect::DeferredReplace {
+            deletes, template, ..
+        } => {
+            let mut ops: Vec<_> = deletes
+                .iter()
+                .map(|delete| (delete.id.clone(), PlanOp::Delete))
+                .collect();
+            ops.extend(effect_required_ops(&Effect::Create(
+                template.template_resource.clone(),
+            )));
+            ops
+        }
         Effect::Remove { .. } | Effect::Move { .. } | Effect::Wait { .. } => Vec::new(),
     }
 }
@@ -322,6 +334,11 @@ fn effect_resource_ids(effect: &Effect) -> Vec<&ResourceId> {
         Effect::Move { from, to } => vec![from, to],
         Effect::Wait { .. } => Vec::new(),
         Effect::DeferredCreate { id, .. } => vec![id],
+        Effect::DeferredReplace { deletes, id, .. } => {
+            let mut ids = vec![id];
+            ids.extend(deletes.iter().map(|delete| &delete.id));
+            ids
+        }
     }
 }
 

@@ -748,6 +748,115 @@ pub(super) async fn execute_effects_sequential(
                 break;
             }
 
+            if let Effect::DeferredReplace {
+                deletes,
+                upstream_binding,
+                template,
+                ..
+            } = &effect
+            {
+                total += deletes.len();
+                let binding_snapshot = input.bindings.clone();
+                let pipeline = RenormalizePipeline {
+                    normalizer: input.normalizer,
+                    provider_configs: input.provider_configs,
+                    factories: input.factories,
+                    schemas: input.schemas,
+                };
+                let mut delete_failed = false;
+                for delete in deletes {
+                    let delete_effect = delete.to_delete_effect();
+                    let basic = delete_effect
+                        .as_basic()
+                        .expect("deferred replace delete half must narrow to BasicEffect");
+                    let before_failures = failure_count;
+                    let result = execute_basic_effect(
+                        basic,
+                        &BasicEffectCtx {
+                            provider,
+                            bindings: &binding_snapshot,
+                            unresolved: input.unresolved_resources,
+                            pipeline: &pipeline,
+                            completed: &completed,
+                            total,
+                        },
+                        observer,
+                    )
+                    .await;
+                    process_basic_result(
+                        result,
+                        &mut ExecutionState {
+                            success_count: &mut success_count,
+                            failure_count: &mut failure_count,
+                            partial_count: &mut partial_count,
+                            partial_diagnostics: &mut partial_diagnostics,
+                            applied_states: &mut applied_states,
+                            failed_bindings: &mut failed_bindings,
+                            successfully_deleted: &mut successfully_deleted,
+                            pending_refreshes: &mut pending_refreshes,
+                            bindings: &mut input.bindings,
+                        },
+                    );
+                    delete_failed |= failure_count > before_failures;
+                }
+
+                if delete_failed {
+                    failed_bindings.insert(template.binding_name.clone());
+                    completed_indices.insert(idx);
+                    completed_synchronous_dispatch = true;
+                    break;
+                }
+
+                let children = match materialize_deferred_create(
+                    upstream_binding,
+                    template,
+                    &input.bindings,
+                ) {
+                    Ok(children) => children,
+                    Err(err) => {
+                        let message = err.message();
+                        observer.on_event(&ExecutionEvent::EffectFailed {
+                            effect: &effect,
+                            error: &message,
+                            duration: Duration::ZERO,
+                            progress: ProgressInfo {
+                                completed: completed.load(Ordering::Relaxed),
+                                total,
+                            },
+                        });
+                        failure_count += 1;
+                        failed_bindings.insert(template.binding_name.clone());
+                        completed_indices.insert(idx);
+                        completed_synchronous_dispatch = true;
+                        break;
+                    }
+                };
+                if !children.is_empty() {
+                    total += count_actionable_effects(&children);
+                    for child in children {
+                        let child_idx = effects.len();
+                        if let Effect::Create(resource) = &child {
+                            runtime_synthesized_resources.push(resource.clone());
+                        }
+                        if let Some(binding) = child.binding_name() {
+                            idx_to_binding.insert(child_idx, binding);
+                        }
+                        effects.push(child);
+                        actionable_indices.push(child_idx);
+                    }
+                    let mut analysis = build_dependency_analysis(
+                        &effects,
+                        input.unresolved_resources,
+                        input.compositions,
+                    );
+                    relax_update_update_edges(&effects, &mut analysis);
+                    deps_of = analysis.into_deps_of();
+                }
+                completed_indices.insert(idx);
+                completed_synchronous_dispatch = true;
+                break;
+            }
+
             // Snapshot bindings for this effect's resolution.
             let binding_snapshot = input.bindings.clone();
             let wait_identifiers = wait_identifiers.clone();
@@ -839,6 +948,9 @@ pub(super) async fn execute_effects_sequential(
                         }
                         Effect::DeferredCreate { .. } => unreachable!(
                             "DeferredCreate is handled synchronously before provider dispatch"
+                        ),
+                        Effect::DeferredReplace { .. } => unreachable!(
+                            "DeferredReplace is handled synchronously before provider dispatch"
                         ),
                         Effect::Wait {
                             binding,
@@ -1350,6 +1462,7 @@ mod tests {
                     resource.id.clone(),
                     UnresolvedResource::from_pre_resolve(resource.clone()),
                 )),
+                Effect::DeferredReplace { .. } => None,
                 _ => None,
             })
             .collect();
