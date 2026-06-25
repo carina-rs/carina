@@ -954,6 +954,25 @@ mod tests {
         }
     }
 
+    fn deferred_replace_effect() -> Effect {
+        let mut template = deferred_for_template();
+        template.file = None;
+        template.line = 0;
+        Effect::DeferredReplace {
+            deletes: vec![DeferredReplaceDelete {
+                id: ResourceId::new("route53.Record", "validation_records[0]"),
+                identifier: "old-record-id".to_string(),
+                directives: Directives::default(),
+                binding: Some("validation_records[0]".to_string()),
+                dependencies: HashSet::from(["cert".to_string()]),
+                explicit_dependencies: HashSet::new(),
+            }],
+            id: ResourceId::new("__deferred_for", "validation_records"),
+            upstream_binding: "cert".to_string(),
+            template: Box::new(template),
+        }
+    }
+
     fn every_effect_variant() -> Vec<(&'static str, Effect)> {
         use crate::resource::{ConcreteValue, State, Value};
         use crate::wait::predicate::{AttrPath, WaitPredicate};
@@ -1159,6 +1178,14 @@ mod tests {
             }
             other => panic!("expected DeferredCreate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn deferred_replace_serde_roundtrip() {
+        let original = deferred_replace_effect();
+        let json = serde_json::to_string(&original).expect("serialize");
+        let decoded: Effect = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, original);
     }
 
     #[test]

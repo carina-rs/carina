@@ -899,8 +899,10 @@ mod post_apply_states_tests {
 #[cfg(test)]
 mod apply_state_save_tests {
     use super::*;
+    use carina_core::effect::DeferredReplaceDelete;
+    use carina_core::parser::{DeferredForExpression, ForBinding};
     use carina_core::plan::Plan;
-    use carina_core::resource::{ConcreteValue, Resource, State, Value};
+    use carina_core::resource::{ConcreteValue, Directives, Resource, ResourceId, State, Value};
 
     #[test]
     fn build_state_after_apply_persists_runtime_synthesized_resources() {
@@ -942,6 +944,138 @@ mod apply_state_save_tests {
                     && row.name == "validation_records[0]"),
             "runtime-synthesized child must be persisted in state"
         );
+    }
+
+    fn deferred_replace_delete(id: &ResourceId) -> DeferredReplaceDelete {
+        DeferredReplaceDelete {
+            id: id.clone(),
+            identifier: "old-record-id".to_string(),
+            directives: Directives::default(),
+            binding: Some("validation_records[0]".to_string()),
+            dependencies: HashSet::from(["cert".to_string()]),
+            explicit_dependencies: HashSet::new(),
+        }
+    }
+
+    fn deferred_replace_effect(id: &ResourceId) -> Effect {
+        let template_resource = Resource::with_provider(
+            &id.provider,
+            &id.resource_type,
+            "validation_records",
+            id.provider_instance.clone(),
+        )
+        .with_binding("validation_records");
+        Effect::DeferredReplace {
+            deletes: vec![deferred_replace_delete(id)],
+            id: ResourceId::new("__deferred_for", "validation_records"),
+            upstream_binding: "cert".to_string(),
+            template: Box::new(DeferredForExpression {
+                file: Some("main.crn".to_string()),
+                line: 1,
+                header: "for opt in cert.domain_validation_options".to_string(),
+                resource_type: "aws.route53.Record".to_string(),
+                attributes: vec![],
+                binding_name: "validation_records".to_string(),
+                iterable_binding: "cert".to_string(),
+                iterable_attr: "domain_validation_options".to_string(),
+                binding: ForBinding::Simple("opt".to_string()),
+                template_resource,
+            }),
+        }
+    }
+
+    #[test]
+    fn deferred_replace_delete_and_create_same_id_writes_one_upsert_no_cleanup() {
+        let id = ResourceId::with_provider("aws", "route53.Record", "validation_records[0]", None);
+        let runtime_child =
+            Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
+                .with_binding("validation_records[0]");
+        let applied_state =
+            State::existing(id.clone(), HashMap::new()).with_identifier("new-record-id");
+        let mut plan = Plan::new();
+        plan.add(deferred_replace_effect(&id));
+        let current_states = HashMap::new();
+        let applied_states = HashMap::from([(id.clone(), applied_state)]);
+        let successfully_deleted = HashSet::from([id.clone()]);
+        let failed_refreshes = HashSet::new();
+
+        let wb = decompose(
+            &[],
+            std::slice::from_ref(&runtime_child),
+            &current_states,
+            &applied_states,
+            &plan,
+            &successfully_deleted,
+            &failed_refreshes,
+        )
+        .expect("successful DeferredReplace writeback must not collide");
+
+        assert_eq!(wb.upserts.len(), 1);
+        assert!(wb.upserts.contains_key(&id));
+        assert!(
+            !wb.cleanups.contains(&id),
+            "successful create half must suppress cleanup for the replaced id"
+        );
+        assert!(wb.cleanups.is_empty());
+    }
+
+    #[test]
+    fn deferred_replace_delete_success_create_failure_writes_cleanup() {
+        let id = ResourceId::with_provider("aws", "route53.Record", "validation_records[0]", None);
+        let mut plan = Plan::new();
+        plan.add(deferred_replace_effect(&id));
+        let current_states = HashMap::new();
+        let applied_states = HashMap::new();
+        let successfully_deleted = HashSet::from([id.clone()]);
+        let failed_refreshes = HashSet::new();
+
+        let wb = decompose(
+            &[],
+            &[],
+            &current_states,
+            &applied_states,
+            &plan,
+            &successfully_deleted,
+            &failed_refreshes,
+        )
+        .expect("delete-only half of DeferredReplace should still write cleanup");
+
+        assert!(wb.upserts.is_empty());
+        assert_eq!(wb.cleanups, HashSet::from([id]));
+    }
+
+    #[test]
+    fn move_from_overlapping_desired_resource_still_errors() {
+        let id = ResourceId::with_provider("aws", "route53.Record", "validation_records[0]", None);
+        let desired =
+            Resource::with_provider("aws", "route53.Record", "validation_records[0]", None);
+        let applied_state =
+            State::existing(id.clone(), HashMap::new()).with_identifier("new-record-id");
+        let mut plan = Plan::new();
+        plan.add(Effect::Move {
+            from: id.clone(),
+            to: ResourceId::with_provider("aws", "route53.Record", "validation_records[1]", None),
+        });
+        let current_states = HashMap::new();
+        let applied_states = HashMap::from([(id.clone(), applied_state)]);
+        let successfully_deleted = HashSet::new();
+        let failed_refreshes = HashSet::new();
+
+        let result = decompose(
+            std::slice::from_ref(&desired),
+            &[],
+            &current_states,
+            &applied_states,
+            &plan,
+            &successfully_deleted,
+            &failed_refreshes,
+        );
+        let err = match result {
+            Ok(_) => panic!("Move from-address cleanup must still collide with desired upsert"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, WritebackConflict::UpsertCleanupOverlap { id: got } if got == id));
     }
 }
 
