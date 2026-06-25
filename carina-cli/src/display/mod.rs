@@ -28,6 +28,34 @@ use crate::DetailLevel;
 
 const LEFT_MARGIN: &str = "  ";
 const ATTR_BASE: &str = "    ";
+const VERTICAL_CONNECTOR: &str = "│";
+const VERTICAL_CONTINUATION: &str = "│  ";
+/// Width consumed by a child-list connector (`├─ ` / `└─ `).
+const CONNECTOR_WIDTH: usize = 3;
+/// `├─ ` — branch connector (non-last child).
+const BRANCH_CONNECTOR: &str = "├─ ";
+/// `└─ ` — corner connector (last child).
+const CORNER_CONNECTOR: &str = "└─ ";
+/// Spaces-only continuation when no `│` spine continues at this depth.
+const SPACE_CONTINUATION: &str = "   ";
+
+const fn utf8_char_count(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut count = 0;
+    while i < bytes.len() {
+        if bytes[i] & 0b1100_0000 != 0b1000_0000 {
+            count += 1;
+        }
+        i += 1;
+    }
+    count
+}
+
+const _: () = assert!(utf8_char_count(BRANCH_CONNECTOR) == CONNECTOR_WIDTH);
+const _: () = assert!(utf8_char_count(CORNER_CONNECTOR) == CONNECTOR_WIDTH);
+const _: () = assert!(utf8_char_count(VERTICAL_CONTINUATION) == CONNECTOR_WIDTH);
+const _: () = assert!(SPACE_CONTINUATION.len() == CONNECTOR_WIDTH);
 
 /// A plan-display sigil. Construction is the only place that fixes both the
 /// raw glyph (column width) and the colored rendering (visual output), so
@@ -105,40 +133,33 @@ impl Sigil {
 }
 
 /// Returns the full leading prefix for a top-level row.
-fn top_level_sigil_prefix(sigil: &Sigil, extra_left_pad: usize) -> String {
+fn top_level_sigil_prefix(sigil: &Sigil) -> String {
     debug_assert!(
         !sigil.raw.is_empty(),
         "plan sigil raw glyph must not be empty"
     );
-    format!(
-        "{}{}{} ",
-        LEFT_MARGIN,
-        " ".repeat(extra_left_pad),
-        sigil.rendered,
-    )
+    format!("{}{} ", LEFT_MARGIN, sigil.rendered,)
 }
 
-fn tree_sigil_prefix(
-    indent: usize,
-    is_last: bool,
-    prefix: &str,
-    sigil: &Sigil,
-    top_level_extra_left_pad: usize,
-) -> String {
+fn tree_sigil_prefix(indent: usize, is_last: bool, prefix: &str, sigil: &Sigil) -> String {
     if indent == 0 {
-        top_level_sigil_prefix(sigil, top_level_extra_left_pad)
+        top_level_sigil_prefix(sigil)
     } else {
         let connector = if is_last {
-            format!("{}└─ ", prefix)
+            format!("{}{}", prefix, CORNER_CONNECTOR)
         } else {
-            format!("{}├─ ", prefix)
+            format!("{}{}", prefix, BRANCH_CONNECTOR)
         };
         format!("{}{}{} ", LEFT_MARGIN, connector, sigil.rendered)
     }
 }
 
-fn attr_base_indent() -> &'static str {
-    ATTR_BASE
+fn vertical_connector_line(child_prefix: &str) -> String {
+    format!("{}{}{}\n", LEFT_MARGIN, child_prefix, VERTICAL_CONNECTOR)
+}
+
+fn module_child_prefix() -> String {
+    SPACE_CONTINUATION.to_string()
 }
 
 /// Separator emitted between the state-refresh progress block and the plan's
@@ -247,7 +268,7 @@ fn format_export_change(change: &crate::commands::plan::ExportChange) -> String 
             writeln!(
                 out,
                 "{}{}{} = {}",
-                top_level_sigil_prefix(&Sigil::export_added(), 0),
+                top_level_sigil_prefix(&Sigil::export_added()),
                 name,
                 type_str.dimmed(),
                 format_export_value(new_value)
@@ -267,7 +288,7 @@ fn format_export_change(change: &crate::commands::plan::ExportChange) -> String 
             writeln!(
                 out,
                 "{}{}{} = {} {} {}",
-                top_level_sigil_prefix(&Sigil::export_modified(), 0),
+                top_level_sigil_prefix(&Sigil::export_modified()),
                 name,
                 type_str.dimmed(),
                 format_json_export_value(old_json),
@@ -280,7 +301,7 @@ fn format_export_change(change: &crate::commands::plan::ExportChange) -> String 
             writeln!(
                 out,
                 "{}{} = {}",
-                top_level_sigil_prefix(&Sigil::export_removed(), 0),
+                top_level_sigil_prefix(&Sigil::export_removed()),
                 name,
                 format_json_export_value(old_json)
             )
@@ -458,8 +479,8 @@ fn format_deferred_for_expression(deferred: &carina_core::parser::DeferredForExp
     let mut out = String::new();
     let upstream = deferred_for_source(deferred);
     let sigil = Sigil::deferred_for_expression();
-    let line_prefix = top_level_sigil_prefix(&sigil, 0);
-    let attr_base = attr_base_indent();
+    let line_prefix = top_level_sigil_prefix(&sigil);
+    let attr_base = ATTR_BASE;
     writeln!(
         out,
         "{}{} {}",
@@ -554,7 +575,6 @@ impl<'a> TreeRenderContext<'a> {
         is_last: bool,
         prefix: &str,
         parent_binding: Option<&str>,
-        top_level_extra_left_pad: usize,
     ) -> bool {
         if self.printed.contains(&idx) {
             return false;
@@ -563,10 +583,9 @@ impl<'a> TreeRenderContext<'a> {
 
         let effect = &self.plan.effects()[idx];
         let sigil = Sigil::from_effect(effect);
-        let line_prefix =
-            tree_sigil_prefix(indent, is_last, prefix, &sigil, top_level_extra_left_pad);
-        let base_indent = format!("{}{}", LEFT_MARGIN, " ".repeat(top_level_extra_left_pad));
-        let attr_base = attr_base_indent();
+        let line_prefix = tree_sigil_prefix(indent, is_last, prefix, &sigil);
+        let base_indent = LEFT_MARGIN;
+        let attr_base = ATTR_BASE;
 
         let mut has_displayed_attrs = false;
 
@@ -794,11 +813,11 @@ impl<'a> TreeRenderContext<'a> {
                     format!("{}{}", base_indent, attr_base)
                 } else {
                     let continuation = if is_last {
-                        format!("{}   ", prefix)
+                        format!("{}{}", prefix, SPACE_CONTINUATION)
                     } else {
-                        format!("{}│  ", prefix)
+                        format!("{}{}", prefix, VERTICAL_CONTINUATION)
                     };
-                    format!("{}{}   ", base_indent, continuation)
+                    format!("{}{}{}", base_indent, continuation, SPACE_CONTINUATION)
                 };
                 for row in deferred_for_detail_rows(template, upstream_binding, verb) {
                     render_detail_row(&mut self.out, &row, effect, &attr_prefix);
@@ -813,11 +832,11 @@ impl<'a> TreeRenderContext<'a> {
                 format!("{}{}", base_indent, attr_base)
             } else {
                 let continuation = if is_last {
-                    format!("{}   ", prefix)
+                    format!("{}{}", prefix, SPACE_CONTINUATION)
                 } else {
-                    format!("{}│  ", prefix)
+                    format!("{}{}", prefix, VERTICAL_CONTINUATION)
                 };
-                format!("{}{}   ", base_indent, continuation)
+                format!("{}{}{}", base_indent, continuation, SPACE_CONTINUATION)
             };
 
             let detail_rows = build_detail_rows(
@@ -848,7 +867,6 @@ impl<'a> TreeRenderContext<'a> {
             }
         };
 
-        // Print children (dependents)
         let children = self.dependents.get(&idx).cloned().unwrap_or_default();
         let unprinted_children: Vec<_> = children
             .iter()
@@ -857,51 +875,17 @@ impl<'a> TreeRenderContext<'a> {
             .collect();
         let child_render_items = self.child_render_items(&unprinted_children);
 
-        // New prefix for children: align with attribute indentation
-        let new_prefix = if indent == 0 {
-            format!("{}  ", attr_base)
-        } else {
-            let continuation = if is_last {
-                format!("{}   ", prefix)
-            } else {
-                format!("{}│  ", prefix)
-            };
-            format!("{}   ", continuation)
-        };
-
-        // Insert tree continuation line between attribute block and child resources
-        if has_displayed_attrs && !child_render_items.is_empty() {
-            writeln!(self.out, "{}{}│", base_indent, new_prefix).unwrap();
-        }
-
-        for (i, item) in child_render_items.iter().enumerate() {
-            let child_is_last = i == child_render_items.len() - 1;
-            let child_had_attrs = self.format_render_item(
-                item,
-                indent + 1,
-                child_is_last,
-                &new_prefix,
-                current_binding.as_deref(),
-                top_level_extra_left_pad,
-            );
-            // Add separator line between siblings when previous sibling displayed attributes
-            if child_had_attrs && !child_is_last {
-                let separator_continuation = if is_last {
-                    format!("{}   ", prefix)
-                } else {
-                    format!("{}│  ", prefix)
-                };
-                let separator_prefix = if indent == 0 {
-                    format!("{}  ", attr_base)
-                } else {
-                    format!("{}   ", separator_continuation)
-                };
-                writeln!(self.out, "{}{}│", base_indent, separator_prefix).unwrap();
-            }
-            if child_had_attrs {
-                has_displayed_attrs = true;
-            }
-        }
+        has_displayed_attrs |= self.render_children(
+            &child_render_items,
+            ChildRenderOptions {
+                parent_indent: indent,
+                parent_is_last: is_last,
+                parent_prefix: prefix,
+                parent_binding: current_binding.as_deref(),
+                parent_displayed_attrs: has_displayed_attrs,
+                child_prefix_override: None,
+            },
+        );
 
         has_displayed_attrs
     }
@@ -913,17 +897,11 @@ impl<'a> TreeRenderContext<'a> {
         is_last: bool,
         prefix: &str,
         parent_binding: Option<&str>,
-        top_level_extra_left_pad: usize,
     ) -> bool {
         match item {
-            ChildRenderItem::Normal(idx) => self.format_effect_tree(
-                *idx,
-                indent,
-                is_last,
-                prefix,
-                parent_binding,
-                top_level_extra_left_pad,
-            ),
+            ChildRenderItem::Normal(idx) => {
+                self.format_effect_tree(*idx, indent, is_last, prefix, parent_binding)
+            }
             ChildRenderItem::PairedDeferredFor {
                 expand_idx,
                 delete_indices,
@@ -933,13 +911,79 @@ impl<'a> TreeRenderContext<'a> {
                 indent,
                 is_last,
                 prefix,
-                top_level_extra_left_pad,
             ),
         }
     }
 
     fn child_render_items(&self, child_indices: &[usize]) -> Vec<ChildRenderItem> {
         child_render_items(self.plan.effects(), child_indices)
+    }
+
+    fn will_render(&self, item: &ChildRenderItem) -> bool {
+        match item {
+            ChildRenderItem::Normal(idx) => self.will_render_effect_tree(*idx),
+            ChildRenderItem::PairedDeferredFor { expand_idx, .. } => {
+                !self.printed.contains(expand_idx)
+                    && matches!(
+                        self.plan.effects().get(*expand_idx),
+                        Some(Effect::ExpandDeferredFor { .. })
+                    )
+            }
+        }
+    }
+
+    fn will_render_effect_tree(&self, idx: usize) -> bool {
+        if self.printed.contains(&idx) {
+            return false;
+        }
+
+        let Some(effect) = self.plan.effects().get(idx) else {
+            return false;
+        };
+
+        match effect {
+            Effect::Move { to, .. } => !self.update_or_replace_targets.contains(to),
+            Effect::Create(_)
+            | Effect::Update { .. }
+            | Effect::Replace { .. }
+            | Effect::Delete { .. }
+            | Effect::Read { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Wait { .. }
+            | Effect::ExpandDeferredFor { .. } => true,
+        }
+    }
+
+    fn consume_suppressed_item(&mut self, item: &ChildRenderItem) {
+        match item {
+            ChildRenderItem::Normal(idx) => {
+                if !self.will_render_effect_tree(*idx)
+                    && !self.printed.contains(idx)
+                    && matches!(
+                        self.plan.effects().get(*idx),
+                        Some(Effect::Move { to, .. })
+                            if self.update_or_replace_targets.contains(to)
+                    )
+                {
+                    self.printed.insert(*idx);
+                }
+            }
+            ChildRenderItem::PairedDeferredFor {
+                expand_idx,
+                delete_indices,
+            } => {
+                if !self.printed.contains(expand_idx)
+                    && !matches!(
+                        self.plan.effects().get(*expand_idx),
+                        Some(Effect::ExpandDeferredFor { .. })
+                    )
+                {
+                    self.printed.insert(*expand_idx);
+                    self.printed.extend(delete_indices.iter().copied());
+                }
+            }
+        }
     }
 
     fn format_paired_deferred_for(
@@ -949,7 +993,6 @@ impl<'a> TreeRenderContext<'a> {
         indent: usize,
         is_last: bool,
         prefix: &str,
-        top_level_extra_left_pad: usize,
     ) -> bool {
         if self.printed.contains(&expand_idx) {
             return false;
@@ -971,10 +1014,9 @@ impl<'a> TreeRenderContext<'a> {
         // ExpandDeferredFor carries no replacement directive; paired deferred-for
         // display has always represented create-before-destroy ordering.
         let sigil = Sigil::paired_deferred_for_create_before_destroy();
-        let line_prefix =
-            tree_sigil_prefix(indent, is_last, prefix, &sigil, top_level_extra_left_pad);
-        let base_indent = format!("{}{}", LEFT_MARGIN, " ".repeat(top_level_extra_left_pad));
-        let attr_base = attr_base_indent();
+        let line_prefix = tree_sigil_prefix(indent, is_last, prefix, &sigil);
+        let base_indent = LEFT_MARGIN;
+        let attr_base = ATTR_BASE;
         let verb = deferred_for_verb(self.plan, upstream_binding);
         writeln!(
             self.out,
@@ -991,11 +1033,11 @@ impl<'a> TreeRenderContext<'a> {
             format!("{}{}", base_indent, attr_base)
         } else {
             let continuation = if is_last {
-                format!("{}   ", prefix)
+                format!("{}{}", prefix, SPACE_CONTINUATION)
             } else {
-                format!("{}│  ", prefix)
+                format!("{}{}", prefix, VERTICAL_CONTINUATION)
             };
-            format!("{}{}   ", base_indent, continuation)
+            format!("{}{}{}", base_indent, continuation, SPACE_CONTINUATION)
         };
 
         for row in deferred_for_detail_rows(template, upstream_binding, verb) {
@@ -1019,51 +1061,92 @@ impl<'a> TreeRenderContext<'a> {
             .collect();
         let child_render_items = self.child_render_items(&unprinted_children);
 
-        let new_prefix = if indent == 0 {
-            format!("{}  ", attr_base)
-        } else {
-            let continuation = if is_last {
-                format!("{}   ", prefix)
-            } else {
-                format!("{}│  ", prefix)
-            };
-            format!("{}   ", continuation)
-        };
+        let _ = self.render_children(
+            &child_render_items,
+            ChildRenderOptions {
+                parent_indent: indent,
+                parent_is_last: is_last,
+                parent_prefix: prefix,
+                parent_binding: None,
+                parent_displayed_attrs: true,
+                child_prefix_override: None,
+            },
+        );
 
-        if !child_render_items.is_empty() {
-            writeln!(self.out, "{}{}│", base_indent, new_prefix).unwrap();
+        true
+    }
+
+    fn render_children(
+        &mut self,
+        items: &[ChildRenderItem],
+        options: ChildRenderOptions<'_>,
+    ) -> bool {
+        for item in items {
+            self.consume_suppressed_item(item);
         }
 
-        let mut has_displayed_attrs = true;
-        for (i, item) in child_render_items.iter().enumerate() {
-            let child_is_last = i == child_render_items.len() - 1;
+        let rendering_items: Vec<_> = items.iter().filter(|item| self.will_render(item)).collect();
+        if rendering_items.is_empty() {
+            return false;
+        }
+
+        let child_prefix = options.child_prefix_override.unwrap_or_else(|| {
+            child_prefix_for_parent(
+                options.parent_indent,
+                options.parent_is_last,
+                options.parent_prefix,
+            )
+        });
+
+        if options.parent_displayed_attrs {
+            self.out.push_str(&vertical_connector_line(&child_prefix));
+        }
+
+        let mut any_child_displayed_attrs = false;
+        for (i, item) in rendering_items.iter().enumerate() {
+            let child_is_last = i == rendering_items.len() - 1;
             let child_had_attrs = self.format_render_item(
                 item,
-                indent + 1,
+                options.parent_indent + 1,
                 child_is_last,
-                &new_prefix,
-                None,
-                top_level_extra_left_pad,
+                &child_prefix,
+                options.parent_binding,
             );
-            if child_had_attrs && !child_is_last {
-                let separator_continuation = if is_last {
-                    format!("{}   ", prefix)
-                } else {
-                    format!("{}│  ", prefix)
-                };
-                let separator_prefix = if indent == 0 {
-                    format!("{}  ", attr_base)
-                } else {
-                    format!("{}   ", separator_continuation)
-                };
-                writeln!(self.out, "{}{}│", base_indent, separator_prefix).unwrap();
-            }
             if child_had_attrs {
-                has_displayed_attrs = true;
+                any_child_displayed_attrs = true;
+            }
+            if child_had_attrs && !child_is_last {
+                self.out.push_str(&vertical_connector_line(&child_prefix));
             }
         }
 
-        has_displayed_attrs
+        any_child_displayed_attrs
+    }
+}
+
+struct ChildRenderOptions<'a> {
+    parent_indent: usize,
+    parent_is_last: bool,
+    parent_prefix: &'a str,
+    parent_binding: Option<&'a str>,
+    parent_displayed_attrs: bool,
+    child_prefix_override: Option<String>,
+}
+
+fn child_prefix_for_parent(
+    parent_indent: usize,
+    parent_is_last: bool,
+    parent_prefix: &str,
+) -> String {
+    if parent_indent == 0 {
+        format!("{}  ", ATTR_BASE)
+    } else {
+        let continuation = if parent_is_last {
+            format!("{}{}", parent_prefix, SPACE_CONTINUATION)
+        } else {
+            format!("{}{}", parent_prefix, VERTICAL_CONTINUATION)
+        };
+        format!("{}{}", continuation, SPACE_CONTINUATION)
     }
 }
 
@@ -1126,11 +1209,11 @@ fn format_plan_tree<'a>(
         let ungrouped_items = ctx.child_render_items(&composition_groups.ungrouped);
         for (i, item) in ungrouped_items.iter().enumerate() {
             let last = i == ungrouped_items.len() - 1 && composition_groups.grouped.is_empty();
-            ctx.format_render_item(item, 0, last, "", None, 0);
+            ctx.format_render_item(item, 0, last, "", None);
         }
-        // Then: each composition group with its header. Each leaf
-        // renders without tree connectors, but with one extra top-level
-        // padding step so it remains visually nested under the module header.
+        // Then: each composition group with its header. The header is a
+        // virtual parent, and the leaves render through the same child path
+        // used by resource dependents.
         for group in &composition_groups.grouped {
             writeln!(
                 ctx.out,
@@ -1139,18 +1222,24 @@ fn format_plan_tree<'a>(
             )
             .unwrap();
             let leaf_items = ctx.child_render_items(&group.leaves);
-            for (li, item) in leaf_items.iter().enumerate() {
-                let leaf_last = li == leaf_items.len() - 1;
-                // Top-level rows derive their own left margin from the sigil prefix.
-                ctx.format_render_item(item, 0, leaf_last, "", None, 2);
-            }
+            ctx.render_children(
+                &leaf_items,
+                ChildRenderOptions {
+                    parent_indent: 0,
+                    parent_is_last: true,
+                    parent_prefix: "",
+                    parent_binding: None,
+                    parent_displayed_attrs: false,
+                    child_prefix_override: Some(module_child_prefix()),
+                },
+            );
         }
     } else {
         // No trace, or trace empty for this plan's leaves — use the
         // pre-#3307 flat layout so existing snapshots remain valid.
         let root_items = ctx.child_render_items(&roots);
         for (i, item) in root_items.iter().enumerate() {
-            ctx.format_render_item(item, 0, i == root_items.len() - 1, "", None, 0);
+            ctx.format_render_item(item, 0, i == root_items.len() - 1, "", None);
         }
     }
 
@@ -1161,7 +1250,7 @@ fn format_plan_tree<'a>(
         .collect();
     let remaining_items = ctx.child_render_items(&remaining);
     for (i, item) in remaining_items.iter().enumerate() {
-        ctx.format_render_item(item, 0, i == remaining_items.len() - 1, "", None, 0);
+        ctx.format_render_item(item, 0, i == remaining_items.len() - 1, "", None);
     }
 
     ctx.out
@@ -1178,7 +1267,7 @@ fn format_plan_tree<'a>(
 /// `Composition` label (carina#3322).
 fn format_composition_header(binding: &str, source_path: Option<&str>) -> String {
     let sigil = Sigil::module_header();
-    let prefix = top_level_sigil_prefix(&sigil, 0);
+    let prefix = top_level_sigil_prefix(&sigil);
     match source_path {
         None => format!("{}module \"{}\"", prefix, binding.cyan().bold()),
         Some(path) => format!(
