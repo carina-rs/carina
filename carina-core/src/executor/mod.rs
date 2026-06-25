@@ -8,11 +8,12 @@
 //!
 //! - `basic`: Single-effect execution (Create/Update/Delete), resource resolution, binding map
 //! - `parallel`: Dependency computation and fine-grained parallel scheduling
+//! - `deferred_dispatch`: DeferredCreate and DeferredReplace materialization/dispatch
 //! - `replace`: Replace effect orchestration (CBD and DBD)
 //! - `phased`: Interdependent Replace ordering (4-phase execution)
 
 pub(crate) mod basic;
-mod deferred_create;
+mod deferred_dispatch;
 pub mod normalized;
 #[cfg(test)]
 mod normalized_tests;

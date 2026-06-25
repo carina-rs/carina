@@ -19,7 +19,7 @@ use super::basic::{
     count_actionable_effects, execute_basic_effect, process_basic_result, queue_state_refresh,
     refresh_pending_states, resolve_resource, resolve_resource_with_source,
 };
-use super::deferred_create::{
+use super::deferred_dispatch::{
     DeferredDispatchCtx, DeferredDispatchResult, dispatch_deferred_create,
     dispatch_deferred_replace,
 };

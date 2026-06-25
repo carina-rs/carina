@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
-use carina_core::effect::{DeferredReplaceDelete, Effect};
+use carina_core::effect::{DeferredReplaceDelete, Effect, NonEmptyDeletes};
 use carina_core::parser::{DeferredForExpression, ForBinding};
 use carina_core::plan::Plan;
 use carina_core::resource::{
@@ -275,14 +275,15 @@ fn build_deferred_replace_plan() -> Plan {
     let mut plan = Plan::new();
     plan.add(Effect::Create(certificate_resource()));
     plan.add(Effect::DeferredReplace {
-        deletes: vec![DeferredReplaceDelete {
+        deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
             id: ResourceId::new("route53.Record", "old-record-0"),
             identifier: "record-0".to_string(),
             directives: Directives::default(),
             binding: Some("validation_records[0]".to_string()),
             dependencies: HashSet::from(["cert".to_string()]),
             explicit_dependencies: HashSet::new(),
-        }],
+        }])
+        .expect("fixture has one delete"),
         id: ResourceId::new("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(deferred),

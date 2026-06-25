@@ -13,8 +13,9 @@ use futures::stream::{self, StreamExt};
 
 use carina_core::binding_index::{PreApplyInputs, ResolvedBindings, WaitAliasSpec};
 use carina_core::deps::sort_resources_by_dependencies;
+use carina_core::differ::binding_matches_deferred_template;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
-use carina_core::effect::{DeferredReplaceDelete, Effect};
+use carina_core::effect::{DeferredReplaceDelete, Effect, NonEmptyDeletes};
 use carina_core::executor::normalized::{
     is_value_fully_concrete_for_expansion, restore_stripped_attributes,
     run_desired_normalization_stages, states_contain_unknown, strip_provider_boundary_attributes,
@@ -1292,6 +1293,10 @@ impl RefreshableChildIds {
 
 /// A deferred-for expression whose iterable is not plan-time concrete,
 /// but has enough upstream identity for the apply executor to re-expand it.
+///
+/// This target emits `DeferredCreate` when no matching orphan delete exists,
+/// or `DeferredReplace` when `add_deferred_create_effects` absorbs matching
+/// delete effects for prior indexed iterations.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeferredCreateTarget {
     pub id: ResourceId,
@@ -1320,25 +1325,12 @@ impl DeferredCreateTarget {
 
     fn to_deferred_replace_effect(&self, deletes: Vec<DeferredReplaceDelete>) -> Effect {
         Effect::DeferredReplace {
-            deletes,
+            deletes: NonEmptyDeletes::try_new(deletes).expect("planner checked non-empty deletes"),
             id: self.id.clone(),
             upstream_binding: self.upstream_binding.clone(),
             template: Box::new(self.template.clone()),
         }
     }
-}
-
-pub(crate) fn binding_matches_deferred_template(
-    binding: &str,
-    template_binding_name: &str,
-) -> bool {
-    let Some(suffix) = binding.strip_prefix(template_binding_name) else {
-        return false;
-    };
-    let Some(inner) = suffix.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
-        return false;
-    };
-    !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Outcome of the carina#3132 post-refresh deferred-for expansion.
@@ -2722,6 +2714,9 @@ pub fn add_state_block_effects(
 }
 
 /// Add apply-time deferred-for re-expansion effects to the plan.
+///
+/// Matching orphan `Delete` effects are absorbed into `DeferredReplace`; targets
+/// with no matching deletes remain plain `DeferredCreate` effects.
 pub fn add_deferred_create_effects(plan: &mut Plan, targets: &[DeferredCreateTarget]) {
     let mut deletes_to_absorb: HashSet<ResourceId> = HashSet::new();
     let mut deferred_effects = Vec::new();

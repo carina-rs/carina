@@ -708,6 +708,50 @@ mod tests {
     }
 
     #[test]
+    fn plan_summary_counts_deferred_replace_deletes_individually() {
+        use crate::effect::{DeferredReplaceDelete, NonEmptyDeletes};
+        use crate::parser::{DeferredForExpression, ForBinding};
+        use crate::resource::{Directives, ResourceId};
+        use std::collections::HashSet;
+
+        let template_resource = Resource::new("route53.RecordSet", "validation_records[?]");
+        let template = DeferredForExpression {
+            file: None,
+            line: 1,
+            header: "for opt in cert.domain_validation_options".to_string(),
+            resource_type: "aws.route53.RecordSet".to_string(),
+            attributes: Vec::new(),
+            binding_name: "validation_records".to_string(),
+            iterable_binding: "cert".to_string(),
+            iterable_attr: "domain_validation_options".to_string(),
+            binding: ForBinding::Simple("opt".to_string()),
+            template_resource,
+        };
+        let deletes = (0..3)
+            .map(|idx| DeferredReplaceDelete {
+                id: ResourceId::new("route53.RecordSet", format!("validation_records[{idx}]")),
+                identifier: format!("record-{idx}"),
+                directives: Directives::default(),
+                binding: Some(format!("validation_records[{idx}]")),
+                dependencies: HashSet::new(),
+                explicit_dependencies: HashSet::new(),
+            })
+            .collect();
+
+        let mut plan = Plan::new();
+        plan.add(Effect::DeferredReplace {
+            deletes: NonEmptyDeletes::try_new(deletes).expect("fixture has deletes"),
+            id: ResourceId::new("route53.RecordSet", "validation_records"),
+            upstream_binding: "cert".to_string(),
+            template: Box::new(template),
+        });
+
+        let summary = plan.summary();
+        assert_eq!(summary.replace, 1);
+        assert_eq!(summary.delete, 3);
+    }
+
+    #[test]
     fn modular_plan_from_plan() {
         let mut plan = Plan::new();
 

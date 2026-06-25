@@ -6,7 +6,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use carina_core::effect::Effect;
 use carina_core::executor::ExecutionResult;
 use carina_core::plan::Plan;
 use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
@@ -680,32 +679,10 @@ fn decompose<'a>(
     }
 
     for effect in plan.effects() {
-        match effect {
-            Effect::Delete { id, .. } if successfully_deleted.contains(id) => {
-                wb.add_cleanup(id.clone())?;
-            }
-            Effect::DeferredReplace { deletes, .. } => {
-                for delete in deletes {
-                    if successfully_deleted.contains(&delete.id)
-                        && !wb.upserts.contains_key(&delete.id)
-                    {
-                        wb.add_cleanup(delete.id.clone())?;
-                    }
-                }
-            }
-            Effect::Remove { id } => {
-                wb.add_cleanup(id.clone())?;
-            }
-            Effect::Move { from, .. } => {
-                // Move's only writeback responsibility is to drop the
-                // stale `from` row. The `to` row is owned by Phase 1
-                // (`applied_states[to]` for Move + Replace/Update/Create,
-                // or `current_states[to]` for pure rename, which
-                // `materialize_moved_states` transferred from `from`
-                // before writeback runs).
-                wb.add_cleanup(from.clone())?;
-            }
-            _ => {}
+        for id in
+            effect.writeback_cleanup_ids(successfully_deleted, &|id| wb.upserts.contains_key(id))
+        {
+            wb.add_cleanup(id)?;
         }
     }
 
@@ -899,7 +876,7 @@ mod post_apply_states_tests {
 #[cfg(test)]
 mod apply_state_save_tests {
     use super::*;
-    use carina_core::effect::DeferredReplaceDelete;
+    use carina_core::effect::{DeferredReplaceDelete, Effect, NonEmptyDeletes};
     use carina_core::parser::{DeferredForExpression, ForBinding};
     use carina_core::plan::Plan;
     use carina_core::resource::{ConcreteValue, Directives, Resource, ResourceId, State, Value};
@@ -966,7 +943,8 @@ mod apply_state_save_tests {
         )
         .with_binding("validation_records");
         Effect::DeferredReplace {
-            deletes: vec![deferred_replace_delete(id)],
+            deletes: NonEmptyDeletes::try_new(vec![deferred_replace_delete(id)])
+                .expect("fixture has one delete"),
             id: ResourceId::new("__deferred_for", "validation_records"),
             upstream_binding: "cert".to_string(),
             template: Box::new(DeferredForExpression {

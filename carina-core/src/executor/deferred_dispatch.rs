@@ -19,15 +19,21 @@ use super::basic::{
 };
 use super::{ExecutionEvent, ExecutionObserver, ProgressInfo, UnresolvedResource};
 
+/// Failure while expanding a deferred-for create half against apply-time
+/// upstream state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum DeferredCreateFailure {
-    UpstreamBindingMissing {
-        upstream_binding: String,
-    },
+    /// The upstream binding that should have published iterable attributes is
+    /// absent from the runtime binding table.
+    UpstreamBindingMissing { upstream_binding: String },
+    /// The upstream binding exists but does not contain the iterable
+    /// attribute named by the deferred-for template.
     IterableAttrMissing {
         upstream_binding: String,
         attr: String,
     },
+    /// The iterable attribute exists but is not a collection shape supported
+    /// by deferred-for expansion.
     ShapeMismatch {
         upstream_binding: String,
         attr: String,
@@ -66,6 +72,8 @@ impl DeferredCreateFailure {
     }
 }
 
+/// Materialize `Effect::Create` children for a deferred-for template using the
+/// runtime value published under `upstream_binding`.
 pub(super) fn materialize_deferred_create(
     upstream_binding: &str,
     template: &DeferredForExpression,
@@ -94,12 +102,22 @@ pub(super) fn materialize_deferred_create(
         .collect())
 }
 
+/// Result of synchronously dispatching a deferred scheduler-meta effect.
 pub(super) enum DeferredDispatchResult {
+    /// DeferredCreate or DeferredReplace create children were materialized and
+    /// should be appended to the scheduler queue.
     Materialized(Vec<Effect>),
+    /// At least one DeferredReplace delete half failed. The helper already
+    /// processed those delete results, so callers must mark the template
+    /// binding failed but must not increment `failure_count` again.
     DeleteFailed,
+    /// Deferred-for materialization failed before any child effects existed.
+    /// Callers must increment `failure_count` for this meta-effect failure.
     MaterializeFailed,
 }
 
+/// Shared inputs required to dispatch DeferredCreate and DeferredReplace
+/// scheduler-meta effects.
 pub(super) struct DeferredDispatchCtx<'a> {
     pub(super) provider: &'a dyn Provider,
     pub(super) unresolved: &'a HashMap<ResourceId, UnresolvedResource>,
@@ -112,6 +130,9 @@ pub(super) struct DeferredDispatchCtx<'a> {
     pub(super) observer: &'a dyn ExecutionObserver,
 }
 
+/// Dispatch a DeferredCreate meta-effect by materializing its runtime
+/// `Effect::Create` children, or emitting the meta-effect failure event when
+/// upstream state is missing or has the wrong shape.
 pub(super) fn dispatch_deferred_create(
     effect: &Effect,
     upstream_binding: &str,
@@ -137,6 +158,11 @@ pub(super) fn dispatch_deferred_create(
     }
 }
 
+/// Dispatch a DeferredReplace meta-effect.
+///
+/// The delete half is executed through the basic delete path and joined before
+/// the create half is materialized, preserving the "deletes before create"
+/// invariant while allowing independent absorbed deletes to run concurrently.
 pub(super) async fn dispatch_deferred_replace(
     effect: &Effect,
     deletes: &[DeferredReplaceDelete],

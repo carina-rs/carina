@@ -6,7 +6,6 @@ use colored::Colorize;
 use serde::{Deserialize, Serialize};
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
-use carina_core::effect::Effect;
 use carina_core::parser::{BackendConfig, ProviderConfig, ProviderContext, UpstreamState};
 use carina_core::plan::Plan;
 use carina_core::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, State, Value};
@@ -136,20 +135,10 @@ pub(crate) fn collect_delete_attributes(
     let mut delete_attributes = HashMap::new();
 
     for effect in plan.effects() {
-        match effect {
-            Effect::Delete { id, .. } => {
-                if let Some(state) = current_states.get(id) {
-                    delete_attributes.insert(id.clone(), state.attributes.clone());
-                }
+        for id in effect.deleted_resource_attributes_ids() {
+            if let Some(state) = current_states.get(id) {
+                delete_attributes.insert(id.clone(), state.attributes.clone());
             }
-            Effect::DeferredReplace { deletes, .. } => {
-                for delete in deletes {
-                    if let Some(state) = current_states.get(&delete.id) {
-                        delete_attributes.insert(delete.id.clone(), state.attributes.clone());
-                    }
-                }
-            }
-            _ => {}
         }
     }
 

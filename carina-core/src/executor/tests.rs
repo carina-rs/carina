@@ -1,4 +1,5 @@
 use super::*;
+use crate::effect::{DeferredReplaceDelete, NonEmptyDeletes};
 use crate::plan::Plan;
 use crate::provider::{
     BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer, ProviderError, ProviderResult,
@@ -14,6 +15,7 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tokio::sync::Barrier;
 use tokio_util::sync::CancellationToken;
 
 fn validation_deferred_for_expression() -> crate::parser::DeferredForExpression {
@@ -6192,6 +6194,252 @@ async fn apply_time_deferred_create_emits_failed_on_shape_mismatch() {
             && event.contains("expected list")
             && event.contains("got map")
     }));
+}
+
+#[tokio::test]
+async fn dispatch_deferred_replace_runs_deletes_concurrently() {
+    struct ConcurrentDeleteProvider {
+        create_results: Mutex<Vec<ProviderResult<crate::provider::CreateOutcome>>>,
+        entered_deletes: Arc<AtomicUsize>,
+        delete_barrier: Arc<Barrier>,
+    }
+
+    impl Provider for ConcurrentDeleteProvider {
+        fn name(&self) -> &str {
+            "concurrent-delete"
+        }
+
+        fn read(
+            &self,
+            id: &ResourceId,
+            _identifier: Option<&str>,
+            _request: ReadRequest,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            let id = id.clone();
+            Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
+        }
+
+        fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+            self.read(&resource.id, None, ReadRequest)
+        }
+
+        fn create(
+            &self,
+            _id: &ResourceId,
+            _request: CreateRequest,
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
+            let result = self.create_results.lock().unwrap().remove(0);
+            Box::pin(async move { result })
+        }
+
+        fn update(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _request: UpdateRequest,
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
+            unreachable!("test does not update")
+        }
+
+        fn delete(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _request: DeleteRequest,
+        ) -> BoxFuture<'_, ProviderResult<()>> {
+            self.entered_deletes.fetch_add(1, Ordering::SeqCst);
+            let barrier = Arc::clone(&self.delete_barrier);
+            Box::pin(async move {
+                barrier.wait().await;
+                Ok(())
+            })
+        }
+
+        fn required_permissions(
+            &self,
+            _id: &ResourceId,
+            _op: crate::effect::PlanOp,
+        ) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    let cert_id = ResourceId::new("test", "cert_concurrent_deferred_replace");
+    let cert_state = State::existing(
+        cert_id.clone(),
+        HashMap::from([(
+            "domain_validation_options".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(indexmap::IndexMap::from([(
+                    "resource_record".to_string(),
+                    Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+                        (
+                            "name".to_string(),
+                            Value::Concrete(ConcreteValue::String("_name".to_string())),
+                        ),
+                        (
+                            "value".to_string(),
+                            Value::Concrete(ConcreteValue::String("_value".to_string())),
+                        ),
+                    ]))),
+                )])),
+            )])),
+        )]),
+    );
+    let validation_id = ResourceId::new("test", "validation_records[0]");
+    let validation_state =
+        State::existing(validation_id.clone(), HashMap::new()).with_identifier("new-validation");
+    let entered_deletes = Arc::new(AtomicUsize::new(0));
+    let delete_barrier = Arc::new(Barrier::new(3));
+    let provider = ConcurrentDeleteProvider {
+        create_results: Mutex::new(vec![
+            Ok(crate::provider::CreateOutcome::Success { state: cert_state }),
+            Ok(crate::provider::CreateOutcome::Success {
+                state: validation_state,
+            }),
+        ]),
+        entered_deletes: Arc::clone(&entered_deletes),
+        delete_barrier: Arc::clone(&delete_barrier),
+    };
+
+    let mut cert = Resource::new("test", "cert_concurrent_deferred_replace");
+    cert.binding = Some("cert".to_string());
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(cert));
+    plan.add(Effect::DeferredReplace {
+        deletes: NonEmptyDeletes::try_new(vec![
+            DeferredReplaceDelete {
+                id: ResourceId::new("test", "validation_records[0]"),
+                identifier: "old-validation-0".to_string(),
+                directives: Directives::default(),
+                binding: Some("validation_records[0]".to_string()),
+                dependencies: HashSet::new(),
+                explicit_dependencies: HashSet::new(),
+            },
+            DeferredReplaceDelete {
+                id: ResourceId::new("test", "validation_records[1]"),
+                identifier: "old-validation-1".to_string(),
+                directives: Directives::default(),
+                binding: Some("validation_records[1]".to_string()),
+                dependencies: HashSet::new(),
+                explicit_dependencies: HashSet::new(),
+            },
+        ])
+        .expect("fixture has deletes"),
+        id: ResourceId::new("__deferred_for", "validation_records"),
+        upstream_binding: "cert".to_string(),
+        template: Box::new(validation_deferred_for_expression()),
+    });
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+    let observer = MockObserver::new();
+    let wait_for_concurrent_deletes = async {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while entered_deletes.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both deletes must enter before either is released");
+        delete_barrier.wait().await;
+    };
+
+    let (outcome, _) = tokio::join!(
+        execute_plan(&provider, input, &observer, CancellationToken::new()),
+        wait_for_concurrent_deletes
+    );
+    let result = completed_result(outcome);
+    assert_eq!(result.failure_count, 0);
+    assert_eq!(entered_deletes.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn dispatch_deferred_replace_short_circuits_on_delete_failure() {
+    let cert_id = ResourceId::new("test", "cert_delete_failure");
+    let cert_state = State::existing(
+        cert_id.clone(),
+        HashMap::from([(
+            "domain_validation_options".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(indexmap::IndexMap::from([(
+                    "resource_record".to_string(),
+                    Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+                        (
+                            "name".to_string(),
+                            Value::Concrete(ConcreteValue::String("_name".to_string())),
+                        ),
+                        (
+                            "value".to_string(),
+                            Value::Concrete(ConcreteValue::String("_value".to_string())),
+                        ),
+                    ]))),
+                )])),
+            )])),
+        )]),
+    );
+    let provider = MockProvider::new();
+    provider.push_create(Ok(cert_state));
+    provider.push_delete(Err(ProviderError::api_error("delete failed")));
+    provider.push_read(Ok(State::not_found(ResourceId::new(
+        "test",
+        "validation_records[0]",
+    ))));
+
+    let mut cert = Resource::new("test", "cert_delete_failure");
+    cert.binding = Some("cert".to_string());
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(cert));
+    plan.add(Effect::DeferredReplace {
+        deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+            id: ResourceId::new("test", "validation_records[0]"),
+            identifier: "old-validation".to_string(),
+            directives: Directives::default(),
+            binding: Some("validation_records[0]".to_string()),
+            dependencies: HashSet::new(),
+            explicit_dependencies: HashSet::new(),
+        }])
+        .expect("fixture has one delete"),
+        id: ResourceId::new("__deferred_for", "validation_records"),
+        upstream_binding: "cert".to_string(),
+        template: Box::new(validation_deferred_for_expression()),
+    });
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+
+    assert_eq!(result.failure_count, 1);
+    assert!(
+        !provider
+            .calls()
+            .iter()
+            .any(|(op, id)| op == "create" && id == "test.validation_records[0]"),
+        "create half must not dispatch after delete failure; calls: {:?}",
+        provider.calls()
+    );
 }
 
 /// Regression for carina#3164: a plan that mixes `Effect::Move` with

@@ -2,7 +2,7 @@ use super::*;
 
 use colored::Colorize;
 
-use carina_core::effect::{CascadingUpdate, DeferredReplaceDelete, Effect};
+use carina_core::effect::{CascadingUpdate, DeferredReplaceDelete, Effect, NonEmptyDeletes};
 use carina_core::plan::Plan;
 use carina_core::resource::{
     AccessPath, ConcreteValue, DeferredValue, Directives, Resource, ResourceId, State,
@@ -1164,14 +1164,15 @@ fn deferred_replace_validation_records_effect() -> Effect {
     };
 
     Effect::DeferredReplace {
-        deletes: vec![DeferredReplaceDelete {
+        deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
             id: delete_id,
             identifier,
             directives,
             binding,
             dependencies,
             explicit_dependencies,
-        }],
+        }])
+        .expect("fixture has one delete"),
         id,
         upstream_binding,
         template,

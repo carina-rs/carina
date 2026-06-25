@@ -16,7 +16,7 @@ use super::basic::{
     BasicEffectCtx, ExecutionState, RenormalizePipeline, count_actionable_effects,
     execute_basic_effect, process_basic_result, refresh_pending_states,
 };
-use super::deferred_create::{
+use super::deferred_dispatch::{
     DeferredDispatchCtx, DeferredDispatchResult, dispatch_deferred_create,
     dispatch_deferred_replace,
 };

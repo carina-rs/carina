@@ -549,7 +549,7 @@ pub fn shorten_service_name<'a>(attr_name: &str, value: &'a str) -> Cow<'a, str>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effect::DeferredReplaceDelete;
+    use crate::effect::{DeferredReplaceDelete, NonEmptyDeletes};
     use crate::parser::{DeferredForExpression, ForBinding};
     use crate::plan::Plan;
     use crate::resource::{ConcreteValue, Directives, Resource, ResourceId, Value};
@@ -601,14 +601,15 @@ mod tests {
 
         let mut plan = Plan::new();
         plan.add(Effect::DeferredReplace {
-            deletes: vec![DeferredReplaceDelete {
+            deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
                 id: ResourceId::new("route53.Record", "validation_records[0]"),
                 identifier: "record-0".to_string(),
                 directives: Directives::default(),
                 binding: Some("validation_records[0]".to_string()),
                 dependencies: HashSet::new(),
                 explicit_dependencies: HashSet::new(),
-            }],
+            }])
+            .expect("fixture has one delete"),
             id: ResourceId::new("__deferred_for", "validation_records"),
             upstream_binding: "cert".to_string(),
             template: Box::new(deferred),
@@ -659,14 +660,15 @@ mod tests {
 
         let mut plan = Plan::new();
         plan.add(Effect::DeferredReplace {
-            deletes: vec![DeferredReplaceDelete {
+            deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
                 id: ResourceId::new("route53.Record", "validation_records[0]"),
                 identifier: "record-0".to_string(),
                 directives: Directives::default(),
                 binding: Some("validation_records[0]".to_string()),
                 dependencies: HashSet::new(),
                 explicit_dependencies: HashSet::new(),
-            }],
+            }])
+            .expect("fixture has one delete"),
             id: ResourceId::new("__deferred_for", "validation_records"),
             upstream_binding: "cert".to_string(),
             template: Box::new(deferred),
