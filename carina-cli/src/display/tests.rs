@@ -2116,7 +2116,7 @@ fn every_top_level_sigil_starts_at_left_margin_column() {
     ];
 
     for (label, sigil) in cases {
-        let prefix = top_level_sigil_prefix(&sigil, 0);
+        let prefix = top_level_sigil_prefix(&sigil);
         let plain = strip_ansi(&prefix);
         assert_eq!(
             plain.find(sigil.raw),
@@ -2127,18 +2127,208 @@ fn every_top_level_sigil_starts_at_left_margin_column() {
 }
 
 #[test]
-fn module_child_sigil_starts_at_left_margin_plus_two() {
-    let sigil = Sigil {
-        raw: "+",
-        rendered: "+".normal(),
-    };
-    let prefix = top_level_sigil_prefix(&sigil, 2);
-    let plain = strip_ansi(&prefix);
+fn module_children_render_with_tree_connectors() {
+    use carina_core::resource::{CallSite, EphemeralId, ExpansionTrace, PersistentId};
+    use carina_core::schema::SchemaRegistry;
 
-    assert_eq!(
-        plain.find(sigil.raw),
-        Some(LEFT_MARGIN.len() + 2),
-        "module-child sigil did not start at the inset column: {plain:?}",
+    let inner = make_resource("aws.eks.Cluster", "cluster/inner", "inner", &[]);
+    let role = make_resource("aws.iam.Role", "cluster/inner-role", "inner_role", &[]);
+    let inner_id = inner.id.clone();
+    let role_id = role.id.clone();
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(inner));
+    plan.add(Effect::Create(role));
+
+    let cluster_site = CallSite::new(
+        EphemeralId::new(ResourceId::new("_virtual", "cluster")),
+        "./modules/cluster",
+    );
+    let mut trace = ExpansionTrace::new();
+    trace.record(PersistentId::new(inner_id), vec![cluster_site.clone()]);
+    trace.record(PersistentId::new(role_id), vec![cluster_site]);
+
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::None,
+        &HashMap::new(),
+        Some(&SchemaRegistry::new()),
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+        Some(&trace),
+    ));
+
+    assert!(
+        output.contains(
+            "  + module \"cluster\" (./modules/cluster)\n     │\n     ├─ + aws.eks.Cluster cluster/inner\n     └─ + aws.iam.Role cluster/inner-role"
+        ),
+        "module leaves must render as connector children:\n{output}",
+    );
+}
+
+#[test]
+fn module_child_connector_gutter_extends_through_nested_dependents() {
+    use carina_core::resource::{CallSite, EphemeralId, ExpansionTrace, PersistentId};
+    use carina_core::schema::SchemaRegistry;
+
+    let cluster = make_resource("aws.eks.Cluster", "cluster/inner", "inner", &[]);
+    let node_role = make_resource("aws.iam.Role", "cluster/node-role", "node_role", &["inner"]);
+    let bucket = make_resource("aws.s3.Bucket", "cluster/logs", "logs", &[]);
+    let cluster_id = cluster.id.clone();
+    let bucket_id = bucket.id.clone();
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(cluster));
+    plan.add(Effect::Create(node_role));
+    plan.add(Effect::Create(bucket));
+
+    let cluster_site = CallSite::new(
+        EphemeralId::new(ResourceId::new("_virtual", "cluster")),
+        "./modules/cluster",
+    );
+    let mut trace = ExpansionTrace::new();
+    trace.record(PersistentId::new(cluster_id), vec![cluster_site.clone()]);
+    trace.record(PersistentId::new(bucket_id), vec![cluster_site]);
+
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::None,
+        &HashMap::new(),
+        Some(&SchemaRegistry::new()),
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+        Some(&trace),
+    ));
+
+    assert!(
+        output.contains(
+            "     ├─ + aws.eks.Cluster cluster/inner\n     │     └─ + aws.iam.Role cluster/node-role\n     └─ + aws.s3.Bucket cluster/logs"
+        ),
+        "outer module gutter must continue through the child subtree:\n{output}",
+    );
+}
+
+#[test]
+fn module_group_with_only_suppressed_move_does_not_emit_orphan_gutter() {
+    let from_id = ResourceId::new("aws.s3.Bucket", "cluster/old_logs");
+    let to_id = ResourceId::new("aws.s3.Bucket", "cluster/logs");
+    let mut updated = Resource::new("aws.s3.Bucket", "cluster/logs");
+    updated.id = to_id.clone();
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Move {
+        from: from_id,
+        to: to_id.clone(),
+    });
+    plan.add(Effect::Update {
+        id: to_id.clone(),
+        from: Box::new(State::not_found(to_id.clone())),
+        to: updated,
+        changed_attributes: Vec::new(),
+    });
+
+    let moved_origins = HashMap::new();
+    let mut ctx = TreeRenderContext {
+        out: format!(
+            "{}\n",
+            strip_ansi(&format_composition_header(
+                "cluster",
+                Some("./modules/cluster")
+            ))
+        ),
+        printed: HashSet::new(),
+        plan: &plan,
+        dependents: HashMap::new(),
+        detail: DetailLevel::None,
+        delete_attributes: None,
+        schemas: None,
+        moved_origins: &moved_origins,
+        prev_explicit: None,
+        update_or_replace_targets: [to_id].into_iter().collect(),
+    };
+
+    let rendered_attrs = ctx.render_children(
+        &[ChildRenderItem::Normal(0)],
+        ChildRenderOptions {
+            parent_indent: 0,
+            parent_is_last: true,
+            parent_prefix: "",
+            parent_binding: None,
+            leading: LeadingConnector::Forced,
+            child_prefix_override: Some(module_child_prefix()),
+        },
+    );
+
+    assert!(
+        !rendered_attrs,
+        "suppressed children should not report displayed attributes"
+    );
+    assert!(
+        !ctx.out
+            .contains("  + module \"cluster\" (./modules/cluster)\n     │\n"),
+        "module group with only suppressed children must not emit an orphan gutter:\n{output}",
+        output = ctx.out,
+    );
+    assert_eq!(ctx.out, "  + module \"cluster\" (./modules/cluster)\n");
+    assert!(
+        ctx.printed.contains(&0),
+        "suppressed move should be consumed"
+    );
+}
+
+#[test]
+fn resource_with_only_suppressed_move_dependent_does_not_emit_orphan_gutter() {
+    let parent = make_resource("aws.s3.Bucket", "parent", "parent", &[]).with_attribute(
+        "bucket",
+        Value::Concrete(ConcreteValue::String("parent".to_string())),
+    );
+    let from_id = ResourceId::new("aws.s3.Bucket", "old_child");
+    let to_id = ResourceId::new("aws.s3.Bucket", "new_child");
+    let mut updated = Resource::new("aws.s3.Bucket", "new_child");
+    updated.id = to_id.clone();
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(parent));
+    plan.add(Effect::Move {
+        from: from_id,
+        to: to_id.clone(),
+    });
+    plan.add(Effect::Update {
+        id: to_id.clone(),
+        from: Box::new(State::not_found(to_id.clone())),
+        to: updated,
+        changed_attributes: Vec::new(),
+    });
+
+    let moved_origins = HashMap::new();
+    let mut ctx = TreeRenderContext {
+        out: String::new(),
+        printed: HashSet::new(),
+        plan: &plan,
+        dependents: HashMap::from([(0, vec![1])]),
+        detail: DetailLevel::Full,
+        delete_attributes: None,
+        schemas: None,
+        moved_origins: &moved_origins,
+        prev_explicit: None,
+        update_or_replace_targets: [to_id].into_iter().collect(),
+    };
+
+    let rendered_attrs = ctx.format_render_item(&ChildRenderItem::Normal(0), 0, true, "", None);
+    let output = strip_ansi(&ctx.out);
+
+    assert!(rendered_attrs, "parent create should display attributes");
+    assert!(
+        !output.lines().any(|line| line == "        │"),
+        "resource with only suppressed move dependent must not emit an orphan gutter:\n{output}",
+    );
+    assert!(
+        ctx.printed.contains(&1),
+        "suppressed move dependent should be consumed"
     );
 }
 

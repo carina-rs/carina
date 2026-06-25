@@ -9,8 +9,9 @@
 //!
 //! ```text
 //! + module "cluster" (./modules/cluster)
-//!     + aws.eks.Cluster      cluster/inner
-//!     + aws.iam.Role         cluster/inner-role
+//!      │
+//!      ├─ + aws.eks.Cluster cluster/inner
+//!      └─ + aws.iam.Role cluster/inner-role
 //! + aws.s3.Bucket            logs
 //! ```
 //!

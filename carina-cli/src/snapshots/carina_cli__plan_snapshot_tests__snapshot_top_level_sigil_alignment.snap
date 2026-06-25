@@ -7,7 +7,8 @@ Execution Plan:
   <= aws.iam.Roles admin_roles (data source)
   + aws.s3.Bucket logs
   + module "cluster" (./modules/cluster)
-    + aws.eks.Cluster cluster/inner
+     │
+     └─ + aws.eks.Cluster cluster/inner
   + aws.route53.RecordSet (N records after cert.domain_validation_options resolves)
       <- for option in cert.domain_validation_options
       name: option.name
