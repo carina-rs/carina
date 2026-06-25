@@ -9,7 +9,8 @@ Design proposal for carina-rs/carina#3599.
 This document does not implement the change. It records the Effect-model
 seam needed so that the "deferred for-loop iteration is a planned
 replace" case is represented as one Effect — not as a `Delete` plus an
-`ExpandDeferredFor` that downstream consumers must re-pair themselves.
+`ExpandDeferredFor` (which this design also renames to `DeferredCreate`)
+that downstream consumers must re-pair themselves.
 
 Implementation lands in a follow-up PR after this design merges.
 
@@ -126,17 +127,51 @@ logical identity of a deferred replace, and it belongs in the
 
 <!-- derived-from #problem-statement -->
 
-Introduce a new `Effect::DeferredReplace` variant that combines what
-the planner currently emits as `Effect::Delete { id: <pre-apply
-iteration> }` (orphan-detected) and `Effect::ExpandDeferredFor { ... }`
-(apply-time re-expansion target) into a single typed effect. The
-planner merges the two during plan construction; downstream consumers
-(executor, writeback, display, TUI, progress) match exactly one
-variant for the "deferred replace" shape.
+Two changes, taken together as one design step:
+
+1. **Rename `Effect::ExpandDeferredFor` → `Effect::DeferredCreate`.**
+2. **Introduce `Effect::DeferredReplace`** that fuses what the planner
+   currently emits as `Effect::Delete { id: <pre-apply iteration> }`
+   (orphan-detected) plus `Effect::ExpandDeferredFor { ... }`
+   (apply-time re-expansion target) into a single typed effect.
+
+The planner merges the two during plan construction; downstream
+consumers (executor, writeback, display, TUI, progress) match exactly
+one variant for the "deferred replace" shape.
+
+### Naming convention: `Deferred<X>`
+
+The rename establishes a convention for every effect emitted by a
+deferred for-loop whose iterable is not knowable at plan time. Each
+such effect is named `Deferred<existing-effect-name>` and parallels
+its eager counterpart:
+
+| Eager effect       | Deferred counterpart   | When emitted                                                |
+| ------------------ | ---------------------- | ----------------------------------------------------------- |
+| `Effect::Create`   | `Effect::DeferredCreate` | iterable unresolved at plan time, no pre-apply iterations    |
+| `Effect::Replace`  | `Effect::DeferredReplace` | iterable unresolved at plan time AND pre-apply iterations exist that the planner cannot prove will be reused |
+
+This is preferable to the original `ExpandDeferredFor` name on three
+counts. First, `Expand` is implementation vocabulary (the executor
+"expands" the template); the eager-effect names describe what the
+effect does to the world, and the deferred names should match. Second,
+it makes the relationship between `DeferredReplace` and the existing
+`Replace` self-explanatory — both are "destroy + create against the
+same logical address", and `DeferredReplace` is the version that
+defers half of the work until apply-time upstream resolution. Third,
+if a future feature needs `Effect::DeferredUpdate` (a deferred-for
+iteration that is in-place updated against a new upstream value) the
+naming slot is already reserved; we are not picking a name today, but
+we are not closing the door on one either. `DeferredDelete` is *not*
+needed: a deferred for-loop whose body is removed from the desired
+config (or whose iterable resolves to empty) is covered by the
+existing orphan-delete path emitting plain `Effect::Delete`s.
+
+### `Effect::DeferredReplace`
 
 ```rust
 /// A `Effect::Delete` (against a pre-apply iteration of a deferred
-/// for-loop) paired with the `Effect::ExpandDeferredFor` that will
+/// for-loop) paired with the `Effect::DeferredCreate` that will
 /// re-create iterations of the same template at apply time. Emitted
 /// by the planner when a deferred-for's iterable is not knowable at
 /// plan time AND the previous apply materialized iteration(s) that
@@ -146,7 +181,13 @@ variant for the "deferred replace" shape.
 /// resource and a create of the new physical resource against the
 /// same logical address. The two halves intentionally share a
 /// `ResourceId` (e.g. `validation_records[0]`), so writeback must
-/// recognise it as one replace, not two writes that collide.
+/// recognise it as one replace, not two writes that collide. The
+/// relationship to `Effect::Replace` is the same as the relationship
+/// of `Effect::DeferredCreate` to `Effect::Create`: same intent at
+/// the resource-level, but the planner cannot enumerate the
+/// `to`-side cardinality until apply time, so the eager
+/// single-resource shape (`to: Resource` + `from: Box<State>`) does
+/// not fit.
 DeferredReplace {
     /// Pre-apply iteration(s) being destroyed. Keyed by the same
     /// `ResourceId` that will be re-used by the synthesised children.
@@ -156,7 +197,7 @@ DeferredReplace {
     /// unchanged.
     deletes: Vec<DeferredReplaceDelete>,
     /// The deferred-for expression to replay against post-apply
-    /// upstream state. Same payload as `ExpandDeferredFor`.
+    /// upstream state. Same payload as `DeferredCreate`.
     id: ResourceId,
     upstream_binding: String,
     template: Box<DeferredForExpression>,
@@ -169,11 +210,26 @@ dependencies, explicit_dependencies)` — the exact fields the
 deletes slot has a name and can grow new fields without re-shaping
 `DeferredReplace`.
 
-`Effect::ExpandDeferredFor` is retained for the pure-add case: a
-deferred-for whose iterable is unresolved and that has no pre-apply
-iterations in state. `Effect::Delete` continues to handle every
-non-deferred-for orphan. The new variant exists only to fuse the two
-into one effect when both are present for the same template.
+`Effect::DeferredCreate` (the renamed variant) is retained for the
+pure-add case: a deferred-for whose iterable is unresolved and that
+has no pre-apply iterations in state. `Effect::Delete` continues to
+handle every non-deferred-for orphan. The new variant exists only to
+fuse the two into one effect when both are present for the same
+template.
+
+### Why not extend `Effect::Replace` instead?
+
+`Effect::Replace { id, from: Box<State>, to: Resource, ... }` carries
+a single `from` state and a single `to` resource. The deferred
+for-loop case is N-to-M at the iteration level (N pre-apply
+iterations destroyed, M new iterations created where M is not known
+until apply time), so neither `from` nor `to` fits its eager shape.
+The two effects also take different paths through the executor —
+`Replace` dispatches the delete and create halves through the basic
+executor's existing provider arms, while a deferred replace's create
+half must go through the same synchronous template-expansion path
+that `DeferredCreate` uses. The distinction is necessary, not
+incidental.
 
 ### Apply semantics
 
@@ -186,8 +242,7 @@ At apply time the executor:
    completes), expands the `template` against the post-apply upstream
    value via the existing `expand_deferred_for_effects` and pushes
    synthesised `Effect::Create` children into the same
-   `runtime_synthesized_resources` list `ExpandDeferredFor` uses
-   today.
+   `runtime_synthesized_resources` list `DeferredCreate` uses today.
 
 Both halves use the existing execution mechanisms — no new provider
 contract, no new scheduling primitive. The seam is in the planner and
@@ -196,7 +251,7 @@ preserved.
 
 If a delete half fails, the expand half does not run (same ordering
 as today between an `Effect::Delete` and a downstream
-`Effect::ExpandDeferredFor` that depends on it via the upstream
+`Effect::DeferredCreate` that depends on it via the upstream
 binding). If the expand half's upstream-binding effect fails, the
 deletes still run — that matches today's behavior where
 `expand_deferred_for_effects` returns `UpstreamBindingMissing` and
@@ -246,7 +301,7 @@ deferred-replace shape, because that shape is now a different variant.
 `plan_tree.rs`'s `paired_deferred_for_siblings`,
 `deferred_summary_for_plan`'s pairing pass, and `child_render_items`'s
 deferred-pair branch all collapse to "render a `DeferredReplace` as
-`+/-`, render a plain `ExpandDeferredFor` as `+`". The pairing
+`+/-`, render a plain `DeferredCreate` as `+`". The pairing
 heuristic (resource_type match + binding base-name match against
 template) is deleted. The display layer reads the planner's
 classification rather than re-deriving it.
@@ -274,7 +329,7 @@ working sets, walk the apply-time targets and for each target T:
    delete set and absorb it into a `DeferredReplace` along with
    the apply-time target.
 3. Otherwise emit the apply-time target as a plain
-   `ExpandDeferredFor` (today's pure-add case).
+   `DeferredCreate` (today's pure-add case).
 
 The matching predicate is moved from `plan_tree.rs` to the planner
 unchanged. Both consumers can share the same `pub(crate)` helper in
@@ -323,7 +378,17 @@ pairing passes spread across plan, display, and writeback.
 
 <!-- derived-from #decision -->
 
-1. **Add `Effect::DeferredReplace` + `DeferredReplaceDelete` to
+1. **Rename `Effect::ExpandDeferredFor` → `Effect::DeferredCreate`**
+   in `carina-core/src/effect.rs`. Sweep every consumer that
+   exhaustively matches on `Effect` (planner, executor parallel /
+   phased schedulers, writeback decomposer, display, plan tree, TUI,
+   IAM preflight) — about 30 match sites identified by
+   `grep -rn "ExpandDeferredFor" --include="*.rs"`. Also rename the
+   helper `expand_deferred_for_effects` if its name reads
+   inconsistently after the variant rename. No semantic change in
+   this step; it lands as the first commit of the implementation PR
+   so the rest of the diff reads cleanly against the new name.
+2. **Add `Effect::DeferredReplace` + `DeferredReplaceDelete` to
    `carina-core/src/effect.rs`** with serde derives matching the
    sibling variants. Wire it into `Effect::is_mutating`,
    `Effect::as_resource_ref` (returns `None` — there is no single
@@ -331,37 +396,39 @@ pairing passes spread across plan, display, and writeback.
    accessor), `Effect::binding_name`, `Effect::blocking_bindings`,
    `Effect::display_glyph`, and any other `Effect`-method that
    exhaustively matches today.
-2. **Update the planner**: replace the current "emit `Delete` for
-   orphan + emit `ExpandDeferredFor` for re-expansion target"
-   sequence with a fused pass that absorbs matching orphans into the
-   new variant. The matching predicate moves from `plan_tree.rs` to
-   the planner.
-3. **Update the executor**: schedule the deletes half exactly like
+3. **Update the planner**: replace the current "emit `Delete` for
+   orphan + emit `DeferredCreate` for re-expansion target" sequence
+   with a fused pass that absorbs matching orphans into the new
+   variant. The matching predicate moves from `plan_tree.rs` to the
+   planner.
+4. **Update the executor**: schedule the deletes half exactly like
    the current `Effect::Delete` dispatch (sharing
    `execute_basic_effect`'s delete arm via a small adapter), then
-   run the expand half exactly like the current
-   `ExpandDeferredFor` dispatch. Reuse `BasicEffect::Delete` for the
-   delete half so the basic executor's typestate stays the only
-   delete path.
-4. **Update writeback** as sketched above — Phase 2 gets a
+   run the expand half exactly like the current `DeferredCreate`
+   dispatch. Reuse `BasicEffect::Delete` for the delete half so the
+   basic executor's typestate stays the only delete path.
+5. **Update writeback** as sketched above — Phase 2 gets a
    `DeferredReplace` arm that emits cleanups only for deletes whose
    id is not also an upsert. The `add_upsert` /
    `add_cleanup` collision detectors are unchanged.
-5. **Collapse the display pairing**: delete
+6. **Collapse the display pairing**: delete
    `paired_deferred_for_siblings`,
    `collect_paired_deferred_summary_for_siblings`,
    `binding_matches_deferred_template` (move to planner), and the
    `paired_delete_indices` machinery; render `DeferredReplace`
    directly as `+/-` with `delete_indices` derived from the variant.
-6. **Update TUI** in `carina-tui/src/app/mod.rs` (effect match site)
+7. **Update TUI** in `carina-tui/src/app/mod.rs` (effect match site)
    to handle the new variant — should follow the same display
    classification as the CLI tree.
-7. **Saved-plan compatibility**: `Plan` serdes Effect into JSON
+8. **Saved-plan compatibility**: `Plan` serdes Effect into JSON
    today (saved-plan file format). The new variant gets the same
    default-handling treatment as `Effect::Wait` /
-   `Effect::ExpandDeferredFor`. No special compatibility shim — saved
+   `Effect::DeferredCreate`. No special compatibility shim — saved
    plans across the boundary are not load-bearing per
-   `feedback_no_backward_compat`.
+   `feedback_no_backward_compat`. The variant rename also changes
+   the serde tag from `"ExpandDeferredFor"` to `"DeferredCreate"`;
+   any pre-rename saved plan in the wild fails to deserialize, which
+   matches the project policy.
 
 ## Tests
 
@@ -372,7 +439,7 @@ pairing passes spread across plan, display, and writeback.
    deferred-for body and a pre-apply state with `validation_records[0]`,
    the resulting plan must contain exactly one `DeferredReplace`
    carrying the absorbed delete *and* the apply-time expand target —
-   no separate `Delete` or `ExpandDeferredFor` for the same template.
+   no separate `Delete` or `DeferredCreate` for the same template.
 2. **Planner negative test**: an orphan `Delete` whose binding does
    not match any deferred-for template is emitted as a plain
    `Effect::Delete` (no false absorption).
@@ -381,10 +448,10 @@ pairing passes spread across plan, display, and writeback.
    `DeferredReplace` whose delete half succeeds *and* whose expand
    half produced a successful Create at the same id must produce a
    writeback plan with one upsert and zero cleanups for that id.
-   The same shape under `Effect::Delete + ExpandDeferredFor` (i.e.
-   the pre-fix Effect layout, constructed by hand in the test) is
-   *not* a regression target — the planner is the only producer and
-   the planner will never emit that layout once the change lands.
+   The same shape under `Effect::Delete + DeferredCreate` (i.e. the
+   pre-fix Effect layout, constructed by hand in the test) is *not*
+   a regression target — the planner is the only producer and the
+   planner will never emit that layout once the change lands.
 4. **Writeback partial-failure**: a `DeferredReplace` whose delete
    half succeeded but whose expand half failed (no upsert) must emit
    one cleanup for the deleted id. State after writeback drops the
@@ -417,8 +484,17 @@ pairing passes spread across plan, display, and writeback.
 - The orphan AWS-side resources from the regression run (infra-side
   cleanup).
 - Generalisation to non-deferred-for "logical replace at same id"
-  shapes. The planner only fuses `Delete + ExpandDeferredFor` pairs
+  shapes. The planner only fuses `Delete + DeferredCreate` pairs
   whose binding-base matches the template. If a future feature
   needs the same fusion for a different reason, it adds a sibling
   variant or extends `DeferredReplace`; it does not silently
   inherit the writeback suppression rule.
+- `Effect::DeferredUpdate` and `Effect::DeferredDelete`. The
+  `Deferred<X>` naming convention reserves the slots — see the
+  Decision section — but the actual variants are not needed today.
+  `DeferredUpdate` would only be justified if a future feature
+  asked for "deferred-for iteration in-place updated against a new
+  upstream value", which has no caller today. `DeferredDelete` is
+  unnecessary: a deferred-for whose body leaves the desired config
+  (or whose iterable resolves to empty) is already covered by the
+  existing orphan-delete path emitting plain `Effect::Delete`s.
