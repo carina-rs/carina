@@ -2162,7 +2162,7 @@ fn module_children_render_with_tree_connectors() {
 
     assert!(
         output.contains(
-            "  + module \"cluster\" (./modules/cluster)\n     │\n     ├─ + aws.eks.Cluster cluster/inner\n     └─ + aws.iam.Role cluster/inner-role"
+            "  + module \"cluster\" (./modules/cluster)\n     ├─ + aws.eks.Cluster cluster/inner\n     └─ + aws.iam.Role cluster/inner-role"
         ),
         "module leaves must render as connector children:\n{output}",
     );
@@ -2258,7 +2258,7 @@ fn module_group_with_only_suppressed_move_does_not_emit_orphan_gutter() {
             parent_is_last: true,
             parent_prefix: "",
             parent_binding: None,
-            leading: LeadingConnector::Forced,
+            parent_displayed_attrs: false,
             child_prefix_override: Some(module_child_prefix()),
         },
     );

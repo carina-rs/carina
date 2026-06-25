@@ -882,9 +882,7 @@ impl<'a> TreeRenderContext<'a> {
                 parent_is_last: is_last,
                 parent_prefix: prefix,
                 parent_binding: current_binding.as_deref(),
-                leading: LeadingConnector::FromParentAttrs {
-                    displayed: has_displayed_attrs,
-                },
+                parent_displayed_attrs: has_displayed_attrs,
                 child_prefix_override: None,
             },
         );
@@ -1070,7 +1068,7 @@ impl<'a> TreeRenderContext<'a> {
                 parent_is_last: is_last,
                 parent_prefix: prefix,
                 parent_binding: None,
-                leading: LeadingConnector::FromParentAttrs { displayed: true },
+                parent_displayed_attrs: true,
                 child_prefix_override: None,
             },
         );
@@ -1100,7 +1098,7 @@ impl<'a> TreeRenderContext<'a> {
             )
         });
 
-        if options.leading.emit() {
+        if options.parent_displayed_attrs {
             self.out.push_str(&vertical_connector_line(&child_prefix));
         }
 
@@ -1126,28 +1124,12 @@ impl<'a> TreeRenderContext<'a> {
     }
 }
 
-enum LeadingConnector {
-    /// Emit the leading connector only when the parent displayed attribute rows.
-    FromParentAttrs { displayed: bool },
-    /// Force a leading connector for a virtual parent that has no attribute rows.
-    Forced,
-}
-
-impl LeadingConnector {
-    fn emit(&self) -> bool {
-        match self {
-            Self::FromParentAttrs { displayed } => *displayed,
-            Self::Forced => true,
-        }
-    }
-}
-
 struct ChildRenderOptions<'a> {
     parent_indent: usize,
     parent_is_last: bool,
     parent_prefix: &'a str,
     parent_binding: Option<&'a str>,
-    leading: LeadingConnector,
+    parent_displayed_attrs: bool,
     child_prefix_override: Option<String>,
 }
 
@@ -1247,7 +1229,7 @@ fn format_plan_tree<'a>(
                     parent_is_last: true,
                     parent_prefix: "",
                     parent_binding: None,
-                    leading: LeadingConnector::Forced,
+                    parent_displayed_attrs: false,
                     child_prefix_override: Some(module_child_prefix()),
                 },
             );
