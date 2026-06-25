@@ -5,7 +5,7 @@ expression: output
 Execution Plan:
 
   + aws.s3.Bucket logs
-  + module "cluster" (./modules/cluster)
+  ▾ module "cluster" (./modules/cluster)
      ├─ + aws.eks.Cluster cluster/inner
      └─ + aws.iam.Role cluster/inner-role
 

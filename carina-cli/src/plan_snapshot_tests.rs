@@ -2250,7 +2250,7 @@ fn snapshot_top_level_sigil_alignment() {
         ("+", "aws.s3.Bucket", "create resource"),
         ("<=", "aws.iam.Roles", "read data source"),
         ("+", "aws.route53.RecordSet", "deferred for-expression"),
-        ("+", "module", "module header"),
+        ("▾", "module", "module header"),
     ];
     for (sigil, content, label) in rows {
         let line = output
@@ -2259,7 +2259,8 @@ fn snapshot_top_level_sigil_alignment() {
             .unwrap_or_else(|| panic!("missing {label} row in:\n{output}"));
         let expected_prefix = format!("  {sigil} ");
         assert_eq!(
-            line.find(sigil),
+            line.chars()
+                .position(|c| c == sigil.chars().next().unwrap()),
             Some(2),
             "{label} sigil must start at column 2: {line:?}",
         );
@@ -2299,8 +2300,8 @@ fn snapshot_module_header_renders_use_source_path_for_real_fixture() {
     ));
 
     assert!(
-        output.contains(r#"module "bootstrap" (./oidc-module)"#),
-        "expected `module \"bootstrap\" (./oidc-module)` header from real \
+        output.contains(r#"▾ module "bootstrap" (./oidc-module)"#),
+        "expected `▾ module \"bootstrap\" (./oidc-module)` header from real \
          fixture in:\n{}",
         output,
     );

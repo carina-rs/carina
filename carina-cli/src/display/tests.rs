@@ -2064,7 +2064,7 @@ fn test_refresh_plan_separator_no_blank_line_without_refresh() {
 }
 
 /// carina#3322: the composition group header reads
-/// `+ module "<binding>" (<source_path>)`. The keyword is `module`,
+/// `▾ module "<binding>" (<source_path>)`. The keyword is `module`,
 /// not the internal `Composition`; the binding name is the user's
 /// `let` LHS, and the parenthesized suffix surfaces the DSL `use`
 /// path so the operator can trace the group back to a real `.crn`
@@ -2072,17 +2072,29 @@ fn test_refresh_plan_separator_no_blank_line_without_refresh() {
 #[test]
 fn test_composition_header_renders_module_with_source_path() {
     let header = strip_ansi(&format_composition_header("r", Some("./modules/infra")));
-    assert_eq!(header, r#"  + module "r" (./modules/infra)"#);
+    assert_eq!(header, r#"  ▾ module "r" (./modules/infra)"#);
 }
 
 /// Fallback shape when no `use` path was recorded for the call site
 /// (test fixtures, hand-built traces). The parenthesized suffix is
-/// dropped so the header still reads as a clean `+ module "<binding>"`
+/// dropped so the header still reads as a clean `▾ module "<binding>"`
 /// line — never as a literal "None" or an empty `()`.
 #[test]
 fn test_composition_header_drops_parens_for_none_source_path() {
     let header = strip_ansi(&format_composition_header("r", None));
-    assert_eq!(header, r#"  + module "r""#);
+    assert_eq!(header, r#"  ▾ module "r""#);
+}
+
+#[test]
+fn module_header_sigil_is_module_specific_not_create() {
+    let module_sigil = Sigil::module_header();
+    let create_sigil = Effect::Create(Resource::new("aws.s3.Bucket", "x")).display_glyph();
+
+    assert_eq!(module_sigil.raw, "▾");
+    assert_ne!(
+        module_sigil.raw, create_sigil,
+        "module header sigil must differ from Effect::Create's display glyph"
+    );
 }
 
 #[test]
@@ -2162,7 +2174,7 @@ fn module_children_render_with_tree_connectors() {
 
     assert!(
         output.contains(
-            "  + module \"cluster\" (./modules/cluster)\n     ├─ + aws.eks.Cluster cluster/inner\n     └─ + aws.iam.Role cluster/inner-role"
+            "  ▾ module \"cluster\" (./modules/cluster)\n     ├─ + aws.eks.Cluster cluster/inner\n     └─ + aws.iam.Role cluster/inner-role"
         ),
         "module leaves must render as connector children:\n{output}",
     );
@@ -2269,11 +2281,11 @@ fn module_group_with_only_suppressed_move_does_not_emit_orphan_gutter() {
     );
     assert!(
         !ctx.out
-            .contains("  + module \"cluster\" (./modules/cluster)\n     │\n"),
+            .contains("  ▾ module \"cluster\" (./modules/cluster)\n     │\n"),
         "module group with only suppressed children must not emit an orphan gutter:\n{output}",
         output = ctx.out,
     );
-    assert_eq!(ctx.out, "  + module \"cluster\" (./modules/cluster)\n");
+    assert_eq!(ctx.out, "  ▾ module \"cluster\" (./modules/cluster)\n");
     assert!(
         ctx.printed.contains(&0),
         "suppressed move should be consumed"

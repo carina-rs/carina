@@ -8,7 +8,7 @@
 //! it can fold leaf rows under their originating composition row:
 //!
 //! ```text
-//! + module "cluster" (./modules/cluster)
+//! ▾ module "cluster" (./modules/cluster)
 //!      │
 //!      ├─ + aws.eks.Cluster cluster/inner
 //!      └─ + aws.iam.Role cluster/inner-role
