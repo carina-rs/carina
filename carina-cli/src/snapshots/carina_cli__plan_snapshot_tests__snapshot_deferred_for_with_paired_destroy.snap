@@ -16,5 +16,5 @@ Execution Plan:
               ttl: 60
               type: (known after cert applies)
 
-Plan: 1 to add, 0 to change, 0 to destroy.
+Plan: 1 to add, 0 to change, 1 to replace, 1 to destroy.
        N to replace after cert applies.

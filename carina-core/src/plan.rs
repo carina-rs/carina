@@ -215,7 +215,11 @@ impl Plan {
                     summary.replace += 1;
                     summary.update += cascading_updates.len();
                 }
-                Effect::Delete { .. } | Effect::DeferredReplace { .. } => {}
+                Effect::Delete { .. } => {}
+                Effect::DeferredReplace { deletes, .. } => {
+                    summary.replace += 1;
+                    summary.delete += deletes.len();
+                }
                 Effect::Import { .. } => summary.import += 1,
                 Effect::Remove { .. } => summary.remove += 1,
                 Effect::Move { .. } => summary.moved += 1,
@@ -223,7 +227,7 @@ impl Plan {
                 Effect::DeferredCreate { .. } => {}
             }
         }
-        summary.delete = self
+        summary.delete += self
             .effects
             .iter()
             .filter(|effect| matches!(effect, Effect::Delete { .. }))

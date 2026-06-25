@@ -250,8 +250,17 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
                     upstream_binding,
                     template,
                     ..
+                } => {
+                    let fallback = id.to_string();
+                    binding_to_effect.insert(fallback.clone(), idx);
+                    binding_to_effect.insert(template.binding_name.clone(), idx);
+                    effect_bindings.insert(idx, fallback);
+                    effect_types.insert(idx, "deferred_for".to_string());
+                    effect_deps.insert(idx, HashSet::from([upstream_binding.clone()]));
+                    continue;
                 }
-                | Effect::DeferredReplace {
+                Effect::DeferredReplace {
+                    deletes,
                     id,
                     upstream_binding,
                     template,
@@ -260,6 +269,11 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
                     let fallback = id.to_string();
                     binding_to_effect.insert(fallback.clone(), idx);
                     binding_to_effect.insert(template.binding_name.clone(), idx);
+                    for delete in deletes {
+                        if let Some(binding) = &delete.binding {
+                            binding_to_effect.insert(binding.clone(), idx);
+                        }
+                    }
                     effect_bindings.insert(idx, fallback);
                     effect_types.insert(idx, "deferred_for".to_string());
                     effect_deps.insert(idx, HashSet::from([upstream_binding.clone()]));
@@ -538,7 +552,9 @@ mod tests {
     use crate::effect::DeferredReplaceDelete;
     use crate::parser::{DeferredForExpression, ForBinding};
     use crate::plan::Plan;
-    use crate::resource::{Directives, Resource, ResourceId};
+    use crate::resource::{ConcreteValue, Directives, Resource, ResourceId, Value};
+    use crate::wait::predicate::{AttrPath, WaitPredicate};
+    use std::time::Duration;
 
     #[test]
     fn explicit_only_depends_on_edge_is_in_dependency_graph() {
@@ -622,6 +638,73 @@ mod tests {
                 ChildRenderItem::Normal(2),
             ]
         );
+    }
+
+    #[test]
+    fn dependency_graph_indexes_deferred_replace_delete_bindings() {
+        let template_resource = Resource::new("route53.Record", "validation_records")
+            .with_binding("validation_records");
+        let deferred = DeferredForExpression {
+            file: None,
+            line: 1,
+            header: "for opt in cert.domain_validation_options".to_string(),
+            resource_type: "aws.route53.Record".to_string(),
+            attributes: Vec::new(),
+            binding_name: "validation_records".to_string(),
+            iterable_binding: "cert".to_string(),
+            iterable_attr: "domain_validation_options".to_string(),
+            binding: ForBinding::Simple("opt".to_string()),
+            template_resource,
+        };
+
+        let mut plan = Plan::new();
+        plan.add(Effect::DeferredReplace {
+            deletes: vec![DeferredReplaceDelete {
+                id: ResourceId::new("route53.Record", "validation_records[0]"),
+                identifier: "record-0".to_string(),
+                directives: Directives::default(),
+                binding: Some("validation_records[0]".to_string()),
+                dependencies: HashSet::new(),
+                explicit_dependencies: HashSet::new(),
+            }],
+            id: ResourceId::new("__deferred_for", "validation_records"),
+            upstream_binding: "cert".to_string(),
+            template: Box::new(deferred),
+        });
+        plan.add(Effect::Wait {
+            binding: "wait_validation_record_0".to_string(),
+            target_id: ResourceId::new("route53.Record", "validation_records[0]"),
+            until: WaitPredicate::Equals {
+                attr: AttrPath::single("status"),
+                value: Value::Concrete(ConcreteValue::String("ready".to_string())),
+            },
+            until_surface: "status == 'ready'".to_string(),
+            timeout: Duration::from_secs(60),
+            interval: Duration::from_secs(1),
+            explicit_dependencies: HashSet::new(),
+        });
+
+        let graph = build_dependency_graph(&plan);
+        assert_eq!(
+            graph.binding_to_effect.get("validation_records[0]"),
+            Some(&0)
+        );
+
+        let wait_idx = *graph
+            .binding_to_effect
+            .get("wait_validation_record_0")
+            .expect("wait effect indexed by binding");
+        let wait_deps = graph
+            .effect_deps
+            .get(&wait_idx)
+            .expect("wait effect has deps map entry");
+        assert!(
+            wait_deps.contains("validation_records[0]"),
+            "wait should depend on the deferred replace's absorbed delete binding; got {wait_deps:?}"
+        );
+
+        let (_roots, dependents) = build_single_parent_tree(&plan, &graph);
+        assert_eq!(dependents.get(&0), Some(&vec![1]));
     }
 
     #[test]

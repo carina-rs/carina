@@ -955,6 +955,8 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    const EFFECT_VARIANT_COUNT: usize = 11;
+
     fn deferred_for_template() -> crate::parser::DeferredForExpression {
         crate::parser::DeferredForExpression {
             file: Some("main.crn".to_string()),
@@ -1075,7 +1077,13 @@ mod tests {
                 },
             ),
             ("DeferredCreate", deferred_create_effect()),
+            ("DeferredReplace", deferred_replace_effect()),
         ]
+    }
+
+    #[test]
+    fn every_effect_variant_covers_all_effect_variants() {
+        assert_eq!(every_effect_variant().len(), EFFECT_VARIANT_COUNT);
     }
 
     #[test]
@@ -1213,22 +1221,22 @@ mod tests {
     }
 
     #[test]
-    fn is_scheduler_meta_only_true_for_deferred_create() {
+    fn is_scheduler_meta_only_true_for_deferred_variants() {
         for (label, effect) in every_effect_variant() {
             assert_eq!(
                 effect.is_scheduler_meta(),
-                label == "DeferredCreate",
+                matches!(label, "DeferredCreate" | "DeferredReplace"),
                 "{label} scheduler-meta classification mismatch",
             );
         }
     }
 
     #[test]
-    fn is_state_operation_excludes_deferred_create() {
+    fn is_state_operation_includes_state_only_variants() {
         for (label, effect) in every_effect_variant() {
             assert_eq!(
                 effect.is_state_operation(),
-                matches!(label, "Import" | "Remove" | "Move"),
+                matches!(label, "Import" | "Remove" | "Move" | "DeferredReplace"),
                 "{label} state-operation classification mismatch",
             );
         }

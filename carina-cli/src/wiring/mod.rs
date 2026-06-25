@@ -2711,7 +2711,6 @@ pub fn add_state_block_effects(
         plan.retain(|effect| match effect {
             Effect::Delete { id, .. } => !suppress_delete.contains(id),
             Effect::Create(resource) => !suppress_create.contains(&resource.id),
-            Effect::DeferredReplace { .. } => true,
             _ => true,
         });
     }
@@ -2772,7 +2771,6 @@ pub fn add_deferred_create_effects(plan: &mut Plan, targets: &[DeferredCreateTar
     if !deletes_to_absorb.is_empty() {
         plan.retain(|effect| match effect {
             Effect::Delete { id, .. } => !deletes_to_absorb.contains(id),
-            Effect::DeferredReplace { .. } => true,
             _ => true,
         });
     }
@@ -2822,7 +2820,6 @@ fn resolve_import_target(
         name_attr,
         plan.effects().iter().filter_map(|effect| match effect {
             Effect::Create(resource) => Some(resource),
-            Effect::DeferredReplace { .. } => None,
             _ => None,
         }),
     ) {

@@ -12,7 +12,6 @@ use carina_core::binding_index::{ResolvedBindings, WaitAliasSpec};
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
-use carina_core::effect::Effect;
 use carina_core::executor::normalized::apply_desired_normalization;
 use carina_core::executor::{
     ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult, UnresolvedResource,
@@ -31,7 +30,7 @@ use carina_core::parser::{ProviderConfig, ProviderContext};
 
 use super::{DriftCommand, validate_and_resolve_with_config, verify_for_mutation};
 use crate::DetailLevel;
-use crate::commands::plan::PlanFile;
+use crate::commands::plan::{PlanFile, collect_delete_attributes};
 use crate::commands::shared::effect_execution::{
     execute_import_effects, execute_state_only_effects,
 };
@@ -1501,19 +1500,7 @@ async fn run_apply_locked(
     }
 
     // Build delete attributes map from current states for display
-    let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = plan
-        .effects()
-        .iter()
-        .filter_map(|e| {
-            if let Effect::Delete { id, .. } = e {
-                current_states
-                    .get(id)
-                    .map(|s| (id.clone(), s.attributes.clone()))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let delete_attributes = collect_delete_attributes(&plan, &current_states);
 
     let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
         .iter()
@@ -1971,19 +1958,7 @@ async fn run_apply_from_plan_locked(
     }
 
     // Build delete attributes map from current states for display
-    let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = plan
-        .effects()
-        .iter()
-        .filter_map(|e| {
-            if let Effect::Delete { id, .. } = e {
-                current_states
-                    .get(id)
-                    .map(|s| (id.clone(), s.attributes.clone()))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let delete_attributes = collect_delete_attributes(plan, &current_states);
 
     print_plan(
         plan,

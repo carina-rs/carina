@@ -129,6 +129,33 @@ pub struct PlanFile {
     pub wait_bindings: Vec<PlanWaitBinding>,
 }
 
+pub(crate) fn collect_delete_attributes(
+    plan: &Plan,
+    current_states: &HashMap<ResourceId, State>,
+) -> HashMap<ResourceId, HashMap<String, Value>> {
+    let mut delete_attributes = HashMap::new();
+
+    for effect in plan.effects() {
+        match effect {
+            Effect::Delete { id, .. } => {
+                if let Some(state) = current_states.get(id) {
+                    delete_attributes.insert(id.clone(), state.attributes.clone());
+                }
+            }
+            Effect::DeferredReplace { deletes, .. } => {
+                for delete in deletes {
+                    if let Some(state) = current_states.get(&delete.id) {
+                        delete_attributes.insert(delete.id.clone(), state.attributes.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    delete_attributes
+}
+
 /// Serializable `(binding, target)` pair for a `wait` declaration —
 /// the value-layer half of a wait binding (carina#3085). The parser
 /// `carina_core::parser::WaitBinding` is not `Serialize`/`Deserialize`
@@ -733,20 +760,7 @@ pub async fn run_plan(
             .is_some_and(crate::commands::iam_preflight::should_fail_strict);
 
     // Build delete attributes map from current states for display
-    let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = ctx
-        .plan
-        .effects()
-        .iter()
-        .filter_map(|e| {
-            if let Effect::Delete { id, .. } = e {
-                ctx.current_states
-                    .get(id)
-                    .map(|s| (id.clone(), s.attributes.clone()))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let delete_attributes = collect_delete_attributes(&ctx.plan, &ctx.current_states);
 
     if json {
         if let Some(note) = drift_note.as_ref() {

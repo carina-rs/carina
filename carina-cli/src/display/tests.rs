@@ -1202,7 +1202,7 @@ fn test_deferred_replace_renders_top_level() {
           <- for opt in cert.domain_validation_options
           name: (known after cert resolves)
 
-    Plan: 0 to add, 0 to change, 0 to destroy.
+    Plan: 0 to add, 0 to change, 1 to replace, 1 to destroy.
            N to replace after cert resolves.
     ");
 }
@@ -1246,7 +1246,7 @@ fn test_deferred_replace_renders_dependent_children() {
             └─ + acm.CertificateValidation cert-validation
                   validation_record_id: __deferred_for.validation_records.id
 
-    Plan: 1 to add, 0 to change, 0 to destroy.
+    Plan: 1 to add, 0 to change, 1 to replace, 1 to destroy.
            N to replace after cert resolves.
     ");
 }
@@ -1282,7 +1282,7 @@ fn test_deferred_replace_keeps_unrelated_same_type_delete() {
             │
             └─ - route53.Record old_record
 
-    Plan: 1 to add, 0 to change, 1 to destroy.
+    Plan: 1 to add, 0 to change, 1 to replace, 2 to destroy.
            N to replace after cert applies.
     ");
 }
