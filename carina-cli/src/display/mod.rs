@@ -87,8 +87,8 @@ impl Sigil {
 
     fn module_header() -> Self {
         Self {
-            raw: "+",
-            rendered: "+".cyan().bold(),
+            raw: "▾",
+            rendered: "▾".cyan().bold(),
         }
     }
 
@@ -1258,7 +1258,7 @@ fn format_plan_tree<'a>(
 
 /// Header row for a composition group in the folded plan layout.
 ///
-/// Renders `+ module "<binding>" (<source_path>)`, dropping the
+/// Renders `▾ module "<binding>" (<source_path>)`, dropping the
 /// parenthesized suffix when the call site has no recorded
 /// `source_path` (hand-built traces, test fixtures). The keyword
 /// `module` matches the DSL `module_call` construct the operator
