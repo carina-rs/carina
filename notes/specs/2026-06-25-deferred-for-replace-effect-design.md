@@ -239,22 +239,23 @@ At apply time the executor:
    the provider runs the delete, success populates
    `successfully_deleted`, the freed binding-set is updated.
 2. After the deletes succeed (and after `upstream_binding`'s effect
-   completes), expands the `template` against the post-apply upstream
-   value via the existing `expand_deferred_for_effects` and pushes
-   synthesised `Effect::Create` children into the same
-   `runtime_synthesized_resources` list `DeferredCreate` uses today.
+   completes), materialises the `template` against the post-apply
+   upstream value via the renamed `materialize_deferred_create`
+   helper and pushes the synthesised `Effect::Create` children into
+   the same `runtime_synthesized_resources` list `DeferredCreate`
+   uses today.
 
 Both halves use the existing execution mechanisms — no new provider
 contract, no new scheduling primitive. The seam is in the planner and
 in the writeback decomposer; the executor's per-half code paths are
 preserved.
 
-If a delete half fails, the expand half does not run (same ordering
+If a delete half fails, the create half does not run (same ordering
 as today between an `Effect::Delete` and a downstream
 `Effect::DeferredCreate` that depends on it via the upstream
-binding). If the expand half's upstream-binding effect fails, the
+binding). If the create half's upstream-binding effect fails, the
 deletes still run — that matches today's behavior where
-`expand_deferred_for_effects` returns `UpstreamBindingMissing` and
+`materialize_deferred_create` returns `UpstreamBindingMissing` and
 the deferred children never materialize but the orphan deletes are
 unchanged. Either way the writeback sees a coherent state.
 
@@ -267,12 +268,12 @@ Effect::DeferredReplace { deletes, .. } => {
     for delete in deletes {
         if successfully_deleted.contains(&delete.id) {
             // Same id will appear in `runtime_synthesized_resources`
-            // (and thus in Phase 1's upserts) if the expand half
+            // (and thus in Phase 1's upserts) if the create half
             // succeeded. The deferred replace is one operation, so
             // either:
-            //   - the upsert wins (expand succeeded → record the
+            //   - the upsert wins (create succeeded → record the
             //     new state under the same address), or
-            //   - no upsert exists (expand failed) → emit the
+            //   - no upsert exists (create failed) → emit the
             //     cleanup as today.
             if !wb.upserts.contains_key(&delete.id) {
                 wb.add_cleanup(delete.id.clone())?;
@@ -379,15 +380,32 @@ pairing passes spread across plan, display, and writeback.
 <!-- derived-from #decision -->
 
 1. **Rename `Effect::ExpandDeferredFor` → `Effect::DeferredCreate`**
-   in `carina-core/src/effect.rs`. Sweep every consumer that
-   exhaustively matches on `Effect` (planner, executor parallel /
+   in `carina-core/src/effect.rs`, and rename the surrounding
+   `Expand` / `ApplyTimeReexpansion` vocabulary to the
+   `DeferredCreate` family so the variant and its supporting symbols
+   read consistently:
+
+   | Before                              | After                              | Location                                  |
+   | ----------------------------------- | ---------------------------------- | ----------------------------------------- |
+   | `Effect::ExpandDeferredFor`         | `Effect::DeferredCreate`           | `carina-core/src/effect.rs`               |
+   | `expand_deferred_for_effects`       | `materialize_deferred_create`      | `carina-core/src/executor/expand.rs`      |
+   | module `executor/expand.rs`         | `executor/deferred_create.rs`      | `carina-core/src/executor/`               |
+   | `ExpansionFailure`                  | `DeferredCreateFailure`            | same module                               |
+   | `ApplyTimeReexpansionTarget`        | `DeferredCreateTarget`             | `carina-cli/src/wiring/mod.rs`            |
+   | `add_apply_time_reexpansion_effects`| `add_deferred_create_effects`      | `carina-cli/src/wiring/mod.rs`            |
+
+   `materialize_deferred_create` mirrors the existing
+   `materialize_moved_states` ([`state_writeback.rs`'s pre-writeback
+   helper for `Effect::Move`'s `from`→`to` state transfer]) so the
+   "materialize the state-side consequence of a non-provider effect"
+   shape stays consistent across the codebase. Sweep every consumer
+   that exhaustively matches on `Effect` (planner, executor parallel /
    phased schedulers, writeback decomposer, display, plan tree, TUI,
    IAM preflight) — about 30 match sites identified by
-   `grep -rn "ExpandDeferredFor" --include="*.rs"`. Also rename the
-   helper `expand_deferred_for_effects` if its name reads
-   inconsistently after the variant rename. No semantic change in
-   this step; it lands as the first commit of the implementation PR
-   so the rest of the diff reads cleanly against the new name.
+   `grep -rn "ExpandDeferredFor" --include="*.rs"`. No semantic
+   change in this step; it lands as the first commit of the
+   implementation PR so the rest of the diff reads cleanly against
+   the new names.
 2. **Add `Effect::DeferredReplace` + `DeferredReplaceDelete` to
    `carina-core/src/effect.rs`** with serde derives matching the
    sibling variants. Wire it into `Effect::is_mutating`,
@@ -404,7 +422,7 @@ pairing passes spread across plan, display, and writeback.
 4. **Update the executor**: schedule the deletes half exactly like
    the current `Effect::Delete` dispatch (sharing
    `execute_basic_effect`'s delete arm via a small adapter), then
-   run the expand half exactly like the current `DeferredCreate`
+   run the create half exactly like the current `DeferredCreate`
    dispatch. Reuse `BasicEffect::Delete` for the delete half so the
    basic executor's typestate stays the only delete path.
 5. **Update writeback** as sketched above — Phase 2 gets a
@@ -438,14 +456,15 @@ pairing passes spread across plan, display, and writeback.
    `carina-cli::wiring::tests`: given a desired set that drops a
    deferred-for body and a pre-apply state with `validation_records[0]`,
    the resulting plan must contain exactly one `DeferredReplace`
-   carrying the absorbed delete *and* the apply-time expand target —
-   no separate `Delete` or `DeferredCreate` for the same template.
+   carrying the absorbed delete *and* the apply-time
+   `DeferredCreate` target — no separate `Delete` or
+   `DeferredCreate` for the same template.
 2. **Planner negative test**: an orphan `Delete` whose binding does
    not match any deferred-for template is emitted as a plain
    `Effect::Delete` (no false absorption).
 3. **Writeback collision regression** in
    `carina-cli::commands::shared::state_writeback` tests: a
-   `DeferredReplace` whose delete half succeeds *and* whose expand
+   `DeferredReplace` whose delete half succeeds *and* whose create
    half produced a successful Create at the same id must produce a
    writeback plan with one upsert and zero cleanups for that id.
    The same shape under `Effect::Delete + DeferredCreate` (i.e. the
@@ -453,10 +472,10 @@ pairing passes spread across plan, display, and writeback.
    a regression target — the planner is the only producer and the
    planner will never emit that layout once the change lands.
 4. **Writeback partial-failure**: a `DeferredReplace` whose delete
-   half succeeded but whose expand half failed (no upsert) must emit
+   half succeeded but whose create half failed (no upsert) must emit
    one cleanup for the deleted id. State after writeback drops the
    pre-apply iteration; the operator re-runs `carina apply` to
-   re-expand.
+   re-materialise the create half.
 5. **End-to-end repro coverage**: a `cargo nextest` test under
    `carina-cli/tests/` that drives `run_apply_from_plan_locked`
    (or the smallest equivalent integration surface) over a fixture
