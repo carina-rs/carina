@@ -33,6 +33,18 @@ pub(crate) use comparison::{
     type_aware_equal,
 };
 
+/// Returns true when `binding` is `template_binding_name` with one numeric
+/// deferred-for index suffix, e.g. `validation_records[0]`.
+pub fn binding_matches_deferred_template(binding: &str, template_binding_name: &str) -> bool {
+    let Some(suffix) = binding.strip_prefix(template_binding_name) else {
+        return false;
+    };
+    let Some(inner) = suffix.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
+        return false;
+    };
+    !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit())
+}
+
 /// Result of a diff operation
 #[derive(Debug, Clone, PartialEq)]
 pub enum Diff {

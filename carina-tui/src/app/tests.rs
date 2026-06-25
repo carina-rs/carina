@@ -61,7 +61,7 @@ fn remove_effect_uses_non_failure_symbol_and_kind() {
 }
 
 #[test]
-fn expand_deferred_for_uses_create_symbol_and_kind() {
+fn deferred_create_uses_create_symbol_and_kind() {
     let template_resource =
         Resource::new("route53.Record", "validation_records").with_binding("validation_records");
     let deferred = DeferredForExpression {
@@ -78,7 +78,7 @@ fn expand_deferred_for_uses_create_symbol_and_kind() {
     };
 
     let mut plan = Plan::new();
-    plan.add(Effect::ExpandDeferredFor {
+    plan.add(Effect::DeferredCreate {
         id: ResourceId::new("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(deferred),

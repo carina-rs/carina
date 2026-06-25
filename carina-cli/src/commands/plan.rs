@@ -6,7 +6,6 @@ use colored::Colorize;
 use serde::{Deserialize, Serialize};
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
-use carina_core::effect::Effect;
 use carina_core::parser::{BackendConfig, ProviderConfig, ProviderContext, UpstreamState};
 use carina_core::plan::Plan;
 use carina_core::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, State, Value};
@@ -127,6 +126,23 @@ pub struct PlanFile {
     /// Empty when the configuration declares no `wait` bindings.
     #[serde(default)]
     pub wait_bindings: Vec<PlanWaitBinding>,
+}
+
+pub(crate) fn collect_delete_attributes(
+    plan: &Plan,
+    current_states: &HashMap<ResourceId, State>,
+) -> HashMap<ResourceId, HashMap<String, Value>> {
+    let mut delete_attributes = HashMap::new();
+
+    for effect in plan.effects() {
+        for id in effect.deleted_resource_attributes_ids() {
+            if let Some(state) = current_states.get(id) {
+                delete_attributes.insert(id.clone(), state.attributes.clone());
+            }
+        }
+    }
+
+    delete_attributes
 }
 
 /// Serializable `(binding, target)` pair for a `wait` declaration —
@@ -733,20 +749,7 @@ pub async fn run_plan(
             .is_some_and(crate::commands::iam_preflight::should_fail_strict);
 
     // Build delete attributes map from current states for display
-    let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = ctx
-        .plan
-        .effects()
-        .iter()
-        .filter_map(|e| {
-            if let Effect::Delete { id, .. } = e {
-                ctx.current_states
-                    .get(id)
-                    .map(|s| (id.clone(), s.attributes.clone()))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let delete_attributes = collect_delete_attributes(&ctx.plan, &ctx.current_states);
 
     if json {
         if let Some(note) = drift_note.as_ref() {

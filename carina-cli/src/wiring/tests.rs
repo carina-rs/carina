@@ -6,6 +6,7 @@ use carina_core::provider::{
     BoxFuture, CreateOutcome, DeleteRequest, ProviderResult, ReadRequest, UpdateOutcome,
     UpdateRequest,
 };
+use carina_core::resource::Directives;
 
 enum ReadBehavior {
     NotFound,
@@ -2522,6 +2523,177 @@ mod read_with_retry_identifier_tests {
 // `State::not_found` path the original resources already use under
 // `--refresh=false` (via the shared `children()` filter).
 // ---------------------------------------------------------------------
+#[test]
+fn deferred_template_binding_match_requires_single_numeric_index() {
+    assert!(binding_matches_deferred_template(
+        "validation_records[0]",
+        "validation_records"
+    ));
+    assert!(binding_matches_deferred_template(
+        "validation_records[42]",
+        "validation_records"
+    ));
+    assert!(!binding_matches_deferred_template(
+        "validation_records[]",
+        "validation_records"
+    ));
+    assert!(!binding_matches_deferred_template(
+        "validation_records[abc]",
+        "validation_records"
+    ));
+    assert!(!binding_matches_deferred_template(
+        "validation_records[0][1]",
+        "validation_records"
+    ));
+}
+
+fn deferred_replace_test_template() -> carina_core::parser::DeferredForExpression {
+    let template_resource =
+        Resource::with_provider("aws", "route53.Record", "validation_records", None)
+            .with_binding("validation_records");
+
+    carina_core::parser::DeferredForExpression {
+        file: Some("main.crn".to_string()),
+        line: 12,
+        header: "for opt in cert.domain_validation_options".to_string(),
+        resource_type: "aws.route53.Record".to_string(),
+        attributes: vec![],
+        binding_name: "validation_records".to_string(),
+        iterable_binding: "cert".to_string(),
+        iterable_attr: "domain_validation_options".to_string(),
+        binding: carina_core::parser::ForBinding::Simple("opt".to_string()),
+        template_resource,
+    }
+}
+
+fn deferred_replace_test_target() -> DeferredCreateTarget {
+    DeferredCreateTarget {
+        id: ResourceId::with_provider("aws", "__deferred_for", "validation_records", None),
+        upstream_binding: "cert".to_string(),
+        template: deferred_replace_test_template(),
+    }
+}
+
+fn delete_effect_for_binding(binding: &str) -> Effect {
+    Effect::Delete {
+        id: ResourceId::with_provider("aws", "route53.Record", binding, None),
+        identifier: format!("{binding}-old-id"),
+        directives: Directives::default(),
+        binding: Some(binding.to_string()),
+        dependencies: std::collections::HashSet::from(["cert".to_string()]),
+        explicit_dependencies: std::collections::HashSet::new(),
+    }
+}
+
+fn cert_replace_effect() -> Effect {
+    let id = ResourceId::with_provider("aws", "acm.Certificate", "cert", None);
+    Effect::Replace {
+        id: id.clone(),
+        from: Box::new(State::existing(id, HashMap::new()).with_identifier("cert-old-id")),
+        to: Resource::with_provider("aws", "acm.Certificate", "cert", None).with_binding("cert"),
+        directives: Directives::default(),
+        changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec![
+            "domain_name".to_string(),
+        ])
+        .unwrap(),
+        cascading_updates: vec![],
+        temporary_name: None,
+        cascade_ref_hints: vec![],
+    }
+}
+
+#[test]
+fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace() {
+    let target = deferred_replace_test_target();
+    let mut plan = Plan::new();
+    plan.add(cert_replace_effect());
+    plan.add(delete_effect_for_binding("validation_records[0]"));
+
+    add_deferred_create_effects(&mut plan, std::slice::from_ref(&target));
+
+    let mut deferred_replaces = plan.effects().iter().filter_map(|effect| match effect {
+        Effect::DeferredReplace {
+            deletes,
+            id,
+            upstream_binding,
+            template,
+        } => Some((deletes, id, upstream_binding, template)),
+        _ => None,
+    });
+    let (deletes, id, upstream_binding, template) = deferred_replaces
+        .next()
+        .expect("matching delete + deferred target must produce DeferredReplace");
+    assert!(
+        deferred_replaces.next().is_none(),
+        "plan must contain exactly one DeferredReplace"
+    );
+    assert_eq!(id, &target.id);
+    assert_eq!(upstream_binding, "cert");
+    assert_eq!(template.binding_name, "validation_records");
+    assert_eq!(deletes.len(), 1);
+    assert_eq!(
+        deletes[0].id,
+        ResourceId::with_provider("aws", "route53.Record", "validation_records[0]", None)
+    );
+    assert_eq!(deletes[0].binding.as_deref(), Some("validation_records[0]"));
+
+    assert!(
+        !plan.effects().iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::Delete {
+                    binding: Some(binding),
+                    ..
+                } if binding == "validation_records[0]"
+            )
+        }),
+        "absorbed delete must not remain as a standalone Delete"
+    );
+    assert!(
+        !plan
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::DeferredCreate { .. })),
+        "absorbed target must not also remain as DeferredCreate"
+    );
+}
+
+#[test]
+fn deferred_create_targets_do_not_absorb_unrelated_orphan_deletes() {
+    let target = deferred_replace_test_target();
+    let mut plan = Plan::new();
+    plan.add(cert_replace_effect());
+    plan.add(delete_effect_for_binding("some_other_resource[0]"));
+
+    add_deferred_create_effects(&mut plan, std::slice::from_ref(&target));
+
+    assert!(
+        plan.effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::DeferredCreate { .. })),
+        "unmatched target must stay a plain DeferredCreate"
+    );
+    assert!(
+        plan.effects().iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::Delete {
+                    binding: Some(binding),
+                    ..
+                } if binding == "some_other_resource[0]"
+            )
+        }),
+        "unrelated orphan delete must stay a plain Delete"
+    );
+    assert!(
+        !plan
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::DeferredReplace { .. })),
+        "unrelated delete must not be falsely absorbed"
+    );
+}
+
 mod expand_same_config_deferred_for_tests {
     use super::*;
     use carina_core::binding_index::WaitAliasSpec;
@@ -2700,7 +2872,7 @@ mod expand_same_config_deferred_for_tests {
     }
 
     #[test]
-    fn expand_same_config_emits_expand_deferred_for_when_iterable_is_unresolved() {
+    fn expand_same_config_emits_deferred_create_when_iterable_is_unresolved() {
         let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let states = states_with_cert(&parsed, "account_ids", unknown_account_ids());
@@ -2717,14 +2889,11 @@ mod expand_same_config_deferred_for_tests {
         .expect("expand");
 
         assert_eq!(
-            out.apply_time_reexpansion_targets.len(),
+            out.deferred_create_targets.len(),
             1,
             "one deferred-for expression should be carried for apply-time re-expansion"
         );
-        assert_eq!(
-            out.apply_time_reexpansion_targets[0].upstream_binding,
-            "cert"
-        );
+        assert_eq!(out.deferred_create_targets[0].upstream_binding, "cert");
         assert!(
             out.sorted_resources
                 .iter()
@@ -2761,8 +2930,8 @@ mod expand_same_config_deferred_for_tests {
             .collect();
         assert_eq!(assignments.len(), 2);
         assert!(
-            out.apply_time_reexpansion_targets.is_empty(),
-            "fully concrete iterable must pre-expand instead of emitting ExpandDeferredFor"
+            out.deferred_create_targets.is_empty(),
+            "fully concrete iterable must pre-expand instead of emitting DeferredCreate"
         );
     }
 
@@ -2869,7 +3038,7 @@ mod expand_same_config_deferred_for_tests {
             "no Assignment may materialize without a resolvable iterable"
         );
         assert_eq!(
-            out.apply_time_reexpansion_targets.len(),
+            out.deferred_create_targets.len(),
             1,
             "the unresolvable loop must become an apply-time re-expansion target"
         );

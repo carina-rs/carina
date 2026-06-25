@@ -69,9 +69,9 @@ impl Sigil {
     fn from_effect(effect: &Effect) -> Self {
         let raw = effect.display_glyph();
         let rendered = match effect {
-            Effect::Create(_) | Effect::ExpandDeferredFor { .. } => raw.green().bold(),
+            Effect::Create(_) | Effect::DeferredCreate { .. } => raw.green().bold(),
             Effect::Update { .. } => raw.yellow().bold(),
-            Effect::Replace { .. } => raw.magenta().bold(),
+            Effect::Replace { .. } | Effect::DeferredReplace { .. } => raw.magenta().bold(),
             Effect::Delete { .. } => raw.red().bold(),
             Effect::Read { .. } | Effect::Import { .. } => raw.cyan().bold(),
             // carina#3332: the previous `x` (red, bold) shape-collides
@@ -120,14 +120,6 @@ impl Sigil {
         Self {
             raw: "-",
             rendered: "-".red(),
-        }
-    }
-
-    fn paired_deferred_for_create_before_destroy() -> Self {
-        let raw = Effect::replace_display_glyph(true);
-        Self {
-            raw,
-            rendered: raw.magenta().bold(),
         }
     }
 }
@@ -794,19 +786,29 @@ impl<'a> TreeRenderContext<'a> {
                 )
                 .unwrap();
             }
-            Effect::ExpandDeferredFor {
+            Effect::DeferredCreate {
+                upstream_binding,
+                template,
+                ..
+            }
+            | Effect::DeferredReplace {
                 upstream_binding,
                 template,
                 ..
             } => {
                 let verb = deferred_for_verb(self.plan, upstream_binding);
                 let display_name = deferred_for_display_name(template, upstream_binding, verb);
+                let display_name = if matches!(effect, Effect::DeferredReplace { .. }) {
+                    display_name.magenta().bold()
+                } else {
+                    display_name.green().bold()
+                };
                 writeln!(
                     self.out,
                     "{}{} {}",
                     line_prefix,
                     template.resource_type.cyan().bold(),
-                    display_name.green().bold()
+                    display_name
                 )
                 .unwrap();
                 let attr_prefix = if indent == 0 {
@@ -902,16 +904,6 @@ impl<'a> TreeRenderContext<'a> {
             ChildRenderItem::Normal(idx) => {
                 self.format_effect_tree(*idx, indent, is_last, prefix, parent_binding)
             }
-            ChildRenderItem::PairedDeferredFor {
-                expand_idx,
-                delete_indices,
-            } => self.format_paired_deferred_for(
-                *expand_idx,
-                delete_indices,
-                indent,
-                is_last,
-                prefix,
-            ),
         }
     }
 
@@ -922,13 +914,6 @@ impl<'a> TreeRenderContext<'a> {
     fn will_render(&self, item: &ChildRenderItem) -> bool {
         match item {
             ChildRenderItem::Normal(idx) => self.will_render_effect_tree(*idx),
-            ChildRenderItem::PairedDeferredFor { expand_idx, .. } => {
-                !self.printed.contains(expand_idx)
-                    && matches!(
-                        self.plan.effects().get(*expand_idx),
-                        Some(Effect::ExpandDeferredFor { .. })
-                    )
-            }
         }
     }
 
@@ -951,7 +936,8 @@ impl<'a> TreeRenderContext<'a> {
             | Effect::Import { .. }
             | Effect::Remove { .. }
             | Effect::Wait { .. }
-            | Effect::ExpandDeferredFor { .. } => true,
+            | Effect::DeferredCreate { .. }
+            | Effect::DeferredReplace { .. } => true,
         }
     }
 
@@ -969,111 +955,7 @@ impl<'a> TreeRenderContext<'a> {
                     self.printed.insert(*idx);
                 }
             }
-            ChildRenderItem::PairedDeferredFor {
-                expand_idx,
-                delete_indices,
-            } => {
-                if !self.printed.contains(expand_idx)
-                    && !matches!(
-                        self.plan.effects().get(*expand_idx),
-                        Some(Effect::ExpandDeferredFor { .. })
-                    )
-                {
-                    self.printed.insert(*expand_idx);
-                    self.printed.extend(delete_indices.iter().copied());
-                }
-            }
         }
-    }
-
-    fn format_paired_deferred_for(
-        &mut self,
-        expand_idx: usize,
-        delete_indices: &[usize],
-        indent: usize,
-        is_last: bool,
-        prefix: &str,
-    ) -> bool {
-        if self.printed.contains(&expand_idx) {
-            return false;
-        }
-        self.printed.insert(expand_idx);
-        for delete_idx in delete_indices {
-            self.printed.insert(*delete_idx);
-        }
-
-        let Effect::ExpandDeferredFor {
-            upstream_binding,
-            template,
-            ..
-        } = &self.plan.effects()[expand_idx]
-        else {
-            return false;
-        };
-
-        // ExpandDeferredFor carries no replacement directive; paired deferred-for
-        // display has always represented create-before-destroy ordering.
-        let sigil = Sigil::paired_deferred_for_create_before_destroy();
-        let line_prefix = tree_sigil_prefix(indent, is_last, prefix, &sigil);
-        let base_indent = LEFT_MARGIN;
-        let attr_base = ATTR_BASE;
-        let verb = deferred_for_verb(self.plan, upstream_binding);
-        writeln!(
-            self.out,
-            "{}{} {}",
-            line_prefix,
-            template.resource_type.cyan().bold(),
-            deferred_for_display_name(template, upstream_binding, verb)
-                .magenta()
-                .bold()
-        )
-        .unwrap();
-
-        let attr_prefix = if indent == 0 {
-            format!("{}{}", base_indent, attr_base)
-        } else {
-            let continuation = if is_last {
-                format!("{}{}", prefix, SPACE_CONTINUATION)
-            } else {
-                format!("{}{}", prefix, VERTICAL_CONTINUATION)
-            };
-            format!("{}{}{}", base_indent, continuation, SPACE_CONTINUATION)
-        };
-
-        for row in deferred_for_detail_rows(template, upstream_binding, verb) {
-            render_detail_row(
-                &mut self.out,
-                &row,
-                &self.plan.effects()[expand_idx],
-                &attr_prefix,
-            );
-        }
-
-        let children = self
-            .dependents
-            .get(&expand_idx)
-            .cloned()
-            .unwrap_or_default();
-        let unprinted_children: Vec<_> = children
-            .iter()
-            .filter(|c| !self.printed.contains(c))
-            .cloned()
-            .collect();
-        let child_render_items = self.child_render_items(&unprinted_children);
-
-        let _ = self.render_children(
-            &child_render_items,
-            ChildRenderOptions {
-                parent_indent: indent,
-                parent_is_last: is_last,
-                parent_prefix: prefix,
-                parent_binding: None,
-                parent_displayed_attrs: true,
-                child_prefix_override: None,
-            },
-        );
-
-        true
     }
 
     fn render_children(
@@ -1176,6 +1058,7 @@ fn format_plan_tree<'a>(
         .filter_map(|e| match e {
             Effect::Update { to, .. } => Some(to.id.clone()),
             Effect::Replace { to, .. } => Some(to.id.clone()),
+            Effect::DeferredReplace { .. } => None,
             _ => None,
         })
         .collect();
@@ -2352,13 +2235,24 @@ pub fn format_effect(effect: &Effect) -> String {
         } => {
             format!("Wait {} (until {})", binding, until_surface)
         }
-        Effect::ExpandDeferredFor {
+        Effect::DeferredCreate {
             id,
             upstream_binding,
             ..
         } => {
             format!(
                 "Expand deferred for {} (waits on {})",
+                id.human(),
+                upstream_binding
+            )
+        }
+        Effect::DeferredReplace {
+            id,
+            upstream_binding,
+            ..
+        } => {
+            format!(
+                "Deferred replace {} (waits on {})",
                 id.human(),
                 upstream_binding
             )

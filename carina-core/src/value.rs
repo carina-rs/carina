@@ -1085,7 +1085,7 @@ pub fn redact_secrets_in_effect(
         // typed predicate over scalar values, surface form is the
         // user-authored source. Clone through unchanged.
         Effect::Wait { .. } => effect.clone(),
-        Effect::ExpandDeferredFor {
+        Effect::DeferredCreate {
             id,
             upstream_binding,
             template,
@@ -1098,7 +1098,28 @@ pub fn redact_secrets_in_effect(
                 .collect::<Result<Vec<_>, SerializationError>>()?;
             redacted_template.template_resource =
                 redact_secrets_in_managed_only(&redacted_template.template_resource)?;
-            Effect::ExpandDeferredFor {
+            Effect::DeferredCreate {
+                id: id.clone(),
+                upstream_binding: upstream_binding.clone(),
+                template: Box::new(redacted_template),
+            }
+        }
+        Effect::DeferredReplace {
+            deletes,
+            id,
+            upstream_binding,
+            template,
+        } => {
+            let mut redacted_template = (**template).clone();
+            redacted_template.attributes = redacted_template
+                .attributes
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), redact_secrets_only(value)?)))
+                .collect::<Result<Vec<_>, SerializationError>>()?;
+            redacted_template.template_resource =
+                redact_secrets_in_managed_only(&redacted_template.template_resource)?;
+            Effect::DeferredReplace {
+                deletes: deletes.clone(),
                 id: id.clone(),
                 upstream_binding: upstream_binding.clone(),
                 template: Box::new(redacted_template),
@@ -5126,7 +5147,7 @@ mod tests {
     }
 
     #[test]
-    fn redact_secrets_in_expand_deferred_for_preserves_for_unknowns() {
+    fn redact_secrets_in_deferred_create_preserves_for_unknowns() {
         use crate::effect::Effect;
         use crate::parser::{DeferredForExpression, ForBinding};
         use crate::plan::Plan;
@@ -5139,7 +5160,7 @@ mod tests {
         }));
         let mut template_resource = Resource::new("aws.route53.RecordSet", "validation_records");
         template_resource.set_attr("name", placeholder.clone());
-        let effect = Effect::ExpandDeferredFor {
+        let effect = Effect::DeferredCreate {
             id: ResourceId::new("__deferred_for", "validation_records"),
             upstream_binding: "cert".to_string(),
             template: Box::new(DeferredForExpression {
@@ -5158,16 +5179,16 @@ mod tests {
 
         let redacted = redact_secrets_in_effect(&effect)
             .expect("deferred-for template placeholders must survive effect redaction");
-        assert_expand_deferred_for_placeholder_survives(&redacted, &placeholder);
+        assert_deferred_create_placeholder_survives(&redacted, &placeholder);
 
         let mut plan = Plan::new();
         plan.add(effect);
         let redacted_plan = redact_secrets_in_plan(&plan)
             .expect("deferred-for template placeholders must survive plan redaction");
-        assert_expand_deferred_for_placeholder_survives(&redacted_plan.effects()[0], &placeholder);
+        assert_deferred_create_placeholder_survives(&redacted_plan.effects()[0], &placeholder);
     }
 
-    fn assert_expand_deferred_for_placeholder_survives(
+    fn assert_deferred_create_placeholder_survives(
         effect: &crate::effect::Effect,
         expected: &Value,
     ) {
@@ -5192,7 +5213,7 @@ mod tests {
         }
 
         match effect {
-            crate::effect::Effect::ExpandDeferredFor { template, .. } => {
+            crate::effect::Effect::DeferredCreate { template, .. } => {
                 assert_for_value_path(
                     template
                         .attributes
@@ -5203,7 +5224,7 @@ mod tests {
                 );
                 assert_for_value_path(template.template_resource.attributes.get("name"), expected);
             }
-            other => panic!("expected Effect::ExpandDeferredFor, got {other:?}"),
+            other => panic!("expected Effect::DeferredCreate, got {other:?}"),
         }
     }
 }

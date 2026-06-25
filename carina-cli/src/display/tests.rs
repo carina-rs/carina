@@ -2,7 +2,7 @@ use super::*;
 
 use colored::Colorize;
 
-use carina_core::effect::{CascadingUpdate, Effect};
+use carina_core::effect::{CascadingUpdate, DeferredReplaceDelete, Effect, NonEmptyDeletes};
 use carina_core::plan::Plan;
 use carina_core::resource::{
     AccessPath, ConcreteValue, DeferredValue, Directives, Resource, ResourceId, State,
@@ -1039,7 +1039,7 @@ fn test_replace_cascade_ref_hints_show_binding() {
 }
 
 #[test]
-fn test_expand_deferred_for_renders_deferred_until_apply_marker() {
+fn test_deferred_create_renders_deferred_until_apply_marker() {
     let mut template_resource = Resource::new("route53.Record", "validation_records");
     template_resource.binding = Some("validation_records".to_string());
     template_resource.set_attr(
@@ -1067,7 +1067,7 @@ fn test_expand_deferred_for_renders_deferred_until_apply_marker() {
     };
 
     let mut plan = Plan::new();
-    plan.add(Effect::ExpandDeferredFor {
+    plan.add(Effect::DeferredCreate {
         id: ResourceId::new("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(deferred),
@@ -1124,7 +1124,7 @@ fn deferred_validation_records_effect() -> Effect {
         template_resource,
     };
 
-    Effect::ExpandDeferredFor {
+    Effect::DeferredCreate {
         id: ResourceId::new("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(deferred),
@@ -1142,11 +1142,47 @@ fn delete_record_effect(binding: &str) -> Effect {
     }
 }
 
+fn deferred_replace_validation_records_effect() -> Effect {
+    let Effect::DeferredCreate {
+        id,
+        upstream_binding,
+        template,
+    } = deferred_validation_records_effect()
+    else {
+        unreachable!("helper constructs DeferredCreate")
+    };
+    let Effect::Delete {
+        id: delete_id,
+        identifier,
+        directives,
+        binding,
+        dependencies,
+        explicit_dependencies,
+    } = delete_record_effect("validation_records[0]")
+    else {
+        unreachable!("helper constructs Delete")
+    };
+
+    Effect::DeferredReplace {
+        deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+            id: delete_id,
+            identifier,
+            directives,
+            binding,
+            dependencies,
+            explicit_dependencies,
+        }])
+        .expect("fixture has one delete"),
+        id,
+        upstream_binding,
+        template,
+    }
+}
+
 #[test]
-fn test_deferred_for_pairs_top_level_indexed_deletes() {
+fn test_deferred_replace_renders_top_level() {
     let mut plan = Plan::new();
-    plan.add(delete_record_effect("validation_records[0]"));
-    plan.add(deferred_validation_records_effect());
+    plan.add(deferred_replace_validation_records_effect());
 
     let output = strip_ansi(&format_plan(
         &plan,
@@ -1167,13 +1203,13 @@ fn test_deferred_for_pairs_top_level_indexed_deletes() {
           <- for opt in cert.domain_validation_options
           name: (known after cert resolves)
 
-    Plan: 0 to add, 0 to change, 0 to destroy.
+    Plan: 0 to add, 0 to change, 1 to replace, 1 to destroy.
            N to replace after cert resolves.
     ");
 }
 
 #[test]
-fn test_paired_deferred_for_renders_dependent_children() {
+fn test_deferred_replace_renders_dependent_children() {
     let mut dependent = Resource::new("acm.CertificateValidation", "cert-validation")
         .with_binding("cert_validation");
     dependent.set_attr(
@@ -1186,8 +1222,7 @@ fn test_paired_deferred_for_renders_dependent_children() {
     );
 
     let mut plan = Plan::new();
-    plan.add(delete_record_effect("validation_records[0]"));
-    plan.add(deferred_validation_records_effect());
+    plan.add(deferred_replace_validation_records_effect());
     plan.add(Effect::Create(dependent));
 
     let output = strip_ansi(&format_plan(
@@ -1212,20 +1247,19 @@ fn test_paired_deferred_for_renders_dependent_children() {
             └─ + acm.CertificateValidation cert-validation
                   validation_record_id: __deferred_for.validation_records.id
 
-    Plan: 1 to add, 0 to change, 0 to destroy.
+    Plan: 1 to add, 0 to change, 1 to replace, 1 to destroy.
            N to replace after cert resolves.
     ");
 }
 
 #[test]
-fn test_deferred_for_does_not_pair_unrelated_same_type_delete() {
+fn test_deferred_replace_keeps_unrelated_same_type_delete() {
     let mut plan = Plan::new();
     plan.add(Effect::Create(
         Resource::new("acm.Certificate", "cert").with_binding("cert"),
     ));
     plan.add(delete_record_effect("old_record"));
-    plan.add(delete_record_effect("validation_records[0]"));
-    plan.add(deferred_validation_records_effect());
+    plan.add(deferred_replace_validation_records_effect());
 
     let output = strip_ansi(&format_plan(
         &plan,
@@ -1249,7 +1283,7 @@ fn test_deferred_for_does_not_pair_unrelated_same_type_delete() {
             │
             └─ - route53.Record old_record
 
-    Plan: 1 to add, 0 to change, 1 to destroy.
+    Plan: 1 to add, 0 to change, 1 to replace, 2 to destroy.
            N to replace after cert applies.
     ");
 }
@@ -2118,10 +2152,6 @@ fn every_top_level_sigil_starts_at_left_margin_column() {
         ("effect_replace_delete_before_create", raw_sigil("-/+")),
         ("module_header", Sigil::module_header()),
         ("deferred_for", Sigil::deferred_for_expression()),
-        (
-            "paired_deferred_for",
-            Sigil::paired_deferred_for_create_before_destroy(),
-        ),
         ("export_added", Sigil::export_added()),
         ("export_modified", Sigil::export_modified()),
         ("export_removed", Sigil::export_removed()),

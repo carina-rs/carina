@@ -6,8 +6,8 @@ use carina_core::detail_rows::{DetailLevel, DetailRow, build_detail_rows};
 use carina_core::effect::Effect;
 use carina_core::plan::{Plan, PlanSummary};
 use carina_core::plan_tree::{
-    ChildRenderItem, build_dependency_graph, build_single_parent_tree, child_render_items,
-    deferred_for_detail_rows, deferred_for_display_name, deferred_for_verb, extract_compact_hint,
+    build_dependency_graph, build_single_parent_tree, deferred_for_detail_rows,
+    deferred_for_display_name, deferred_for_verb, extract_compact_hint,
 };
 use carina_core::resource::ResourceId;
 use carina_core::schema::SchemaRegistry;
@@ -115,7 +115,7 @@ impl App {
         // Shorten effect labels: strip provider prefix, use binding or compact hint
         shorten_effect_labels(plan, &mut nodes);
 
-        let mut suppressed: HashSet<usize> = pair_deferred_for_nodes(plan, &mut nodes);
+        let mut suppressed: HashSet<usize> = HashSet::new();
 
         // Suppress Move nodes when an Update/Replace exists for the same target,
         // matching CLI behavior (the move info is shown as annotation on Update/Replace).
@@ -124,6 +124,7 @@ impl App {
             .iter()
             .filter_map(|e| match e {
                 Effect::Update { id, .. } | Effect::Replace { id, .. } => Some(id.clone()),
+                Effect::DeferredReplace { .. } => None,
                 _ => None,
             })
             .collect();
@@ -675,58 +676,6 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
     }
 }
 
-fn pair_deferred_for_nodes(plan: &Plan, nodes: &mut [TreeNode]) -> HashSet<usize> {
-    let mut suppressed = HashSet::new();
-    let root_indices: Vec<usize> = nodes
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, node)| node.parent.is_none().then_some(idx))
-        .collect();
-    collect_paired_deferred_for(plan, nodes, &root_indices, &mut suppressed);
-
-    for parent_idx in 0..nodes.len() {
-        let children = nodes[parent_idx].children.clone();
-        collect_paired_deferred_for(plan, nodes, &children, &mut suppressed);
-    }
-
-    suppressed
-}
-
-fn collect_paired_deferred_for(
-    plan: &Plan,
-    nodes: &mut [TreeNode],
-    siblings: &[usize],
-    suppressed: &mut HashSet<usize>,
-) {
-    for item in child_render_items(plan.effects(), siblings) {
-        if let ChildRenderItem::PairedDeferredFor {
-            expand_idx,
-            delete_indices,
-        } = item
-        {
-            let Effect::ExpandDeferredFor {
-                upstream_binding,
-                template,
-                ..
-            } = &plan.effects()[expand_idx]
-            else {
-                continue;
-            };
-            let verb = deferred_for_verb(plan, upstream_binding);
-            nodes[expand_idx].resource_type = template.resource_type.clone();
-            nodes[expand_idx].name_part =
-                deferred_for_display_name(template, upstream_binding, verb);
-            nodes[expand_idx].effect_label =
-                format!("{} {}", template.resource_type, nodes[expand_idx].name_part);
-            nodes[expand_idx].symbol = "+/-".to_string();
-            nodes[expand_idx].kind = EffectKind::Replace;
-            nodes[expand_idx].detail_rows =
-                deferred_for_detail_rows(template, upstream_binding, verb);
-            suppressed.extend(delete_indices);
-        }
-    }
-}
-
 fn effect_to_node(plan: &Plan, effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode {
     let detail_rows = build_detail_rows(effect, schemas, DetailLevel::Full, None, None);
 
@@ -855,7 +804,7 @@ fn effect_to_node(plan: &Plan, effect: &Effect, schemas: Option<&SchemaRegistry>
             depth: 0,
             parent: None,
         },
-        Effect::ExpandDeferredFor {
+        Effect::DeferredCreate {
             upstream_binding,
             template,
             ..
@@ -872,6 +821,29 @@ fn effect_to_node(plan: &Plan, effect: &Effect, schemas: Option<&SchemaRegistry>
                 name_part: deferred_for_display_name(template, upstream_binding, verb),
                 symbol: effect.display_glyph().to_string(),
                 kind: EffectKind::Create,
+                detail_rows: rows,
+                children: Vec::new(),
+                depth: 0,
+                parent: None,
+            }
+        }
+        Effect::DeferredReplace {
+            upstream_binding,
+            template,
+            ..
+        } => {
+            let verb = deferred_for_verb(plan, upstream_binding);
+            let rows = deferred_for_detail_rows(template, upstream_binding, verb);
+            TreeNode {
+                effect_label: format!(
+                    "{} {}",
+                    template.resource_type,
+                    deferred_for_display_name(template, upstream_binding, verb)
+                ),
+                resource_type: template.resource_type.clone(),
+                name_part: deferred_for_display_name(template, upstream_binding, verb),
+                symbol: effect.display_glyph().to_string(),
+                kind: EffectKind::Replace,
                 detail_rows: rows,
                 children: Vec::new(),
                 depth: 0,
