@@ -85,6 +85,22 @@ impl DeferredReplaceDelete {
     }
 }
 
+fn deferred_replace_delete_dependencies(deletes: &[DeferredReplaceDelete]) -> BTreeSet<String> {
+    deletes
+        .iter()
+        .flat_map(|delete| delete.dependencies.iter().cloned())
+        .collect()
+}
+
+fn deferred_replace_delete_explicit_dependencies(
+    deletes: &[DeferredReplaceDelete],
+) -> HashSet<String> {
+    deletes
+        .iter()
+        .flat_map(|delete| delete.explicit_dependencies.iter().cloned())
+        .collect()
+}
+
 /// Non-empty create-only attribute list for [`Effect::Replace`].
 ///
 /// An empty list would render a destroy-and-recreate plan with no visible
@@ -797,7 +813,9 @@ impl Effect {
                 ..
             } => explicit_dependencies.clone(),
             Effect::DeferredCreate { .. } => HashSet::new(),
-            Effect::DeferredReplace { .. } => HashSet::new(),
+            Effect::DeferredReplace { deletes, .. } => {
+                deferred_replace_delete_explicit_dependencies(deletes)
+            }
         }
     }
 
@@ -847,10 +865,16 @@ impl Effect {
             }
             Effect::DeferredCreate {
                 upstream_binding, ..
-            }
-            | Effect::DeferredReplace {
-                upstream_binding, ..
             } => vec![upstream_binding.clone()],
+            Effect::DeferredReplace {
+                upstream_binding,
+                deletes,
+                ..
+            } => {
+                let mut deps = deferred_replace_delete_dependencies(deletes);
+                deps.insert(upstream_binding.clone());
+                deps.into_iter().collect()
+            }
         }
     }
 }
