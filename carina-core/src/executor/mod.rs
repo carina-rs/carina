@@ -12,7 +12,7 @@
 //! - `phased`: Interdependent Replace ordering (4-phase execution)
 
 pub(crate) mod basic;
-mod expand;
+mod deferred_create;
 pub mod normalized;
 #[cfg(test)]
 mod normalized_tests;

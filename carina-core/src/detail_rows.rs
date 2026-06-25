@@ -470,7 +470,7 @@ pub fn build_detail_rows(
         Effect::Remove { .. }
         | Effect::Move { .. }
         | Effect::Wait { .. }
-        | Effect::ExpandDeferredFor { .. } => Vec::new(),
+        | Effect::DeferredCreate { .. } => Vec::new(),
     }
 }
 

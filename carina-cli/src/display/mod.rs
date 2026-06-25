@@ -69,7 +69,7 @@ impl Sigil {
     fn from_effect(effect: &Effect) -> Self {
         let raw = effect.display_glyph();
         let rendered = match effect {
-            Effect::Create(_) | Effect::ExpandDeferredFor { .. } => raw.green().bold(),
+            Effect::Create(_) | Effect::DeferredCreate { .. } => raw.green().bold(),
             Effect::Update { .. } => raw.yellow().bold(),
             Effect::Replace { .. } => raw.magenta().bold(),
             Effect::Delete { .. } => raw.red().bold(),
@@ -794,7 +794,7 @@ impl<'a> TreeRenderContext<'a> {
                 )
                 .unwrap();
             }
-            Effect::ExpandDeferredFor {
+            Effect::DeferredCreate {
                 upstream_binding,
                 template,
                 ..
@@ -926,7 +926,7 @@ impl<'a> TreeRenderContext<'a> {
                 !self.printed.contains(expand_idx)
                     && matches!(
                         self.plan.effects().get(*expand_idx),
-                        Some(Effect::ExpandDeferredFor { .. })
+                        Some(Effect::DeferredCreate { .. })
                     )
             }
         }
@@ -951,7 +951,7 @@ impl<'a> TreeRenderContext<'a> {
             | Effect::Import { .. }
             | Effect::Remove { .. }
             | Effect::Wait { .. }
-            | Effect::ExpandDeferredFor { .. } => true,
+            | Effect::DeferredCreate { .. } => true,
         }
     }
 
@@ -976,7 +976,7 @@ impl<'a> TreeRenderContext<'a> {
                 if !self.printed.contains(expand_idx)
                     && !matches!(
                         self.plan.effects().get(*expand_idx),
-                        Some(Effect::ExpandDeferredFor { .. })
+                        Some(Effect::DeferredCreate { .. })
                     )
                 {
                     self.printed.insert(*expand_idx);
@@ -1002,7 +1002,7 @@ impl<'a> TreeRenderContext<'a> {
             self.printed.insert(*delete_idx);
         }
 
-        let Effect::ExpandDeferredFor {
+        let Effect::DeferredCreate {
             upstream_binding,
             template,
             ..
@@ -1011,7 +1011,7 @@ impl<'a> TreeRenderContext<'a> {
             return false;
         };
 
-        // ExpandDeferredFor carries no replacement directive; paired deferred-for
+        // DeferredCreate carries no replacement directive; paired deferred-for
         // display has always represented create-before-destroy ordering.
         let sigil = Sigil::paired_deferred_for_create_before_destroy();
         let line_prefix = tree_sigil_prefix(indent, is_last, prefix, &sigil);
@@ -2352,7 +2352,7 @@ pub fn format_effect(effect: &Effect) -> String {
         } => {
             format!("Wait {} (until {})", binding, until_surface)
         }
-        Effect::ExpandDeferredFor {
+        Effect::DeferredCreate {
             id,
             upstream_binding,
             ..

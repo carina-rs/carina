@@ -303,7 +303,7 @@ fn effect_required_ops(effect: &Effect) -> Vec<(ResourceId, PlanOp)> {
         }
         Effect::Delete { id, .. } => vec![(id.clone(), PlanOp::Delete)],
         Effect::Import { id, .. } => vec![(id.clone(), PlanOp::Read)],
-        Effect::ExpandDeferredFor { template, .. } => {
+        Effect::DeferredCreate { template, .. } => {
             effect_required_ops(&Effect::Create(template.template_resource.clone()))
         }
         Effect::Remove { .. } | Effect::Move { .. } | Effect::Wait { .. } => Vec::new(),
@@ -321,7 +321,7 @@ fn effect_resource_ids(effect: &Effect) -> Vec<&ResourceId> {
         Effect::Remove { id, .. } => vec![id],
         Effect::Move { from, to } => vec![from, to],
         Effect::Wait { .. } => Vec::new(),
-        Effect::ExpandDeferredFor { id, .. } => vec![id],
+        Effect::DeferredCreate { id, .. } => vec![id],
     }
 }
 
@@ -868,11 +868,11 @@ mod tests {
     }
 
     #[test]
-    fn collect_required_actions_includes_expand_deferred_for_template_create() {
+    fn collect_required_actions_includes_deferred_create_template_create() {
         let template_resource =
             Resource::with_provider("aws", "route53.RecordSet", "validation_records", None);
         let mut plan = Plan::new();
-        plan.add(Effect::ExpandDeferredFor {
+        plan.add(Effect::DeferredCreate {
             id: ResourceId::new("__deferred_for", "validation_records"),
             upstream_binding: "cert".to_string(),
             template: Box::new(DeferredForExpression {

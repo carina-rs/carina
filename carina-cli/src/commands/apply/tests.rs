@@ -2269,7 +2269,7 @@ mod apply_deferred_for_parity {
                 .all(|r| !r.id.resource_type.contains("RecordSet")),
             "no RecordSet materializes without a resolvable iterable on apply"
         );
-        assert_eq!(out.apply_time_reexpansion_targets.len(), 1);
+        assert_eq!(out.deferred_create_targets.len(), 1);
         assert!(out.residual_deferred_for.is_empty());
         assert!(out.new_child_ids.is_empty());
     }

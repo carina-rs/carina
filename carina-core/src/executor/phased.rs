@@ -19,7 +19,7 @@ use super::basic::{
     count_actionable_effects, execute_basic_effect, process_basic_result, queue_state_refresh,
     refresh_pending_states, resolve_resource, resolve_resource_with_source,
 };
-use super::expand::expand_deferred_for_effects;
+use super::deferred_create::materialize_deferred_create;
 use super::parallel::is_runtime_dispatchable;
 use super::replace::{compute_full_diff_patch, single_attribute_patch};
 use super::wait::{
@@ -202,7 +202,7 @@ pub(super) fn build_phase_dependency_map(
         let mut dep_indices = HashSet::new();
         let effect = &effects[idx];
         match effect {
-            Effect::Wait { .. } | Effect::ExpandDeferredFor { .. } => {
+            Effect::Wait { .. } | Effect::DeferredCreate { .. } => {
                 resolver.collect_from_effect(effect, &mut dep_indices);
             }
             _ if effect.as_resource_ref().is_some() => {
@@ -446,7 +446,7 @@ pub(super) async fn execute_effects_phased(
                     && is_runtime_dispatchable(&effects[idx])
                     && !matches!(
                         &effects[idx],
-                        Effect::ExpandDeferredFor {
+                        Effect::DeferredCreate {
                             upstream_binding,
                             ..
                         } if replace_bindings.contains(upstream_binding)
@@ -529,13 +529,13 @@ pub(super) async fn execute_effects_phased(
                     continue;
                 }
 
-                if let Effect::ExpandDeferredFor {
+                if let Effect::DeferredCreate {
                     upstream_binding,
                     template,
                     ..
                 } = &effect
                 {
-                    let children = match expand_deferred_for_effects(
+                    let children = match materialize_deferred_create(
                         upstream_binding,
                         template,
                         &input.bindings,
@@ -1468,7 +1468,7 @@ pub(super) async fn execute_effects_phased(
         let mut phase4_indices: Vec<usize> = sorted_indices.clone();
         phase4_indices.extend(effects.iter().enumerate().filter_map(
             |(idx, effect)| match effect {
-                Effect::ExpandDeferredFor {
+                Effect::DeferredCreate {
                     upstream_binding, ..
                 } if replace_bindings.contains(upstream_binding) => Some(idx),
                 Effect::Create(_)
@@ -1480,7 +1480,7 @@ pub(super) async fn execute_effects_phased(
                 | Effect::Remove { .. }
                 | Effect::Move { .. }
                 | Effect::Wait { .. }
-                | Effect::ExpandDeferredFor { .. } => None,
+                | Effect::DeferredCreate { .. } => None,
             },
         ));
         phase4_indices.sort();
@@ -1553,13 +1553,13 @@ pub(super) async fn execute_effects_phased(
                     continue;
                 }
 
-                if let Effect::ExpandDeferredFor {
+                if let Effect::DeferredCreate {
                     upstream_binding,
                     template,
                     ..
                 } = &effect
                 {
-                    let children = match expand_deferred_for_effects(
+                    let children = match materialize_deferred_create(
                         upstream_binding,
                         template,
                         &input.bindings,

@@ -704,7 +704,7 @@ fn collect_paired_deferred_for(
             delete_indices,
         } = item
         {
-            let Effect::ExpandDeferredFor {
+            let Effect::DeferredCreate {
                 upstream_binding,
                 template,
                 ..
@@ -855,7 +855,7 @@ fn effect_to_node(plan: &Plan, effect: &Effect, schemas: Option<&SchemaRegistry>
             depth: 0,
             parent: None,
         },
-        Effect::ExpandDeferredFor {
+        Effect::DeferredCreate {
             upstream_binding,
             template,
             ..

@@ -3,7 +3,7 @@ use crate::effect::Effect;
 use crate::parser::{DeferredForExpression, ShapeMismatch, expand_deferred_children};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum ExpansionFailure {
+pub(super) enum DeferredCreateFailure {
     UpstreamBindingMissing {
         upstream_binding: String,
     },
@@ -18,15 +18,15 @@ pub(super) enum ExpansionFailure {
     },
 }
 
-impl ExpansionFailure {
+impl DeferredCreateFailure {
     pub(super) fn message(&self) -> String {
         match self {
-            ExpansionFailure::UpstreamBindingMissing { upstream_binding } => {
+            DeferredCreateFailure::UpstreamBindingMissing { upstream_binding } => {
                 format!(
                     "deferred-for expansion upstream binding `{upstream_binding}` was not published before dispatch"
                 )
             }
-            ExpansionFailure::IterableAttrMissing {
+            DeferredCreateFailure::IterableAttrMissing {
                 upstream_binding,
                 attr,
             } => {
@@ -34,7 +34,7 @@ impl ExpansionFailure {
                     "deferred-for expansion upstream binding `{upstream_binding}` does not contain iterable attribute `{attr}`"
                 )
             }
-            ExpansionFailure::ShapeMismatch {
+            DeferredCreateFailure::ShapeMismatch {
                 upstream_binding,
                 attr,
                 mismatch,
@@ -49,26 +49,25 @@ impl ExpansionFailure {
     }
 }
 
-pub(super) fn expand_deferred_for_effects(
+pub(super) fn materialize_deferred_create(
     upstream_binding: &str,
     template: &DeferredForExpression,
     bindings: &ResolvedBindings,
-) -> Result<Vec<Effect>, ExpansionFailure> {
-    let upstream_attrs =
-        bindings
-            .get(upstream_binding)
-            .ok_or_else(|| ExpansionFailure::UpstreamBindingMissing {
-                upstream_binding: upstream_binding.to_string(),
-            })?;
+) -> Result<Vec<Effect>, DeferredCreateFailure> {
+    let upstream_attrs = bindings.get(upstream_binding).ok_or_else(|| {
+        DeferredCreateFailure::UpstreamBindingMissing {
+            upstream_binding: upstream_binding.to_string(),
+        }
+    })?;
     let iterable = upstream_attrs.get(&template.iterable_attr).ok_or_else(|| {
-        ExpansionFailure::IterableAttrMissing {
+        DeferredCreateFailure::IterableAttrMissing {
             upstream_binding: upstream_binding.to_string(),
             attr: template.iterable_attr.clone(),
         }
     })?;
 
     Ok(expand_deferred_children(template, iterable)
-        .map_err(|mismatch| ExpansionFailure::ShapeMismatch {
+        .map_err(|mismatch| DeferredCreateFailure::ShapeMismatch {
             upstream_binding: upstream_binding.to_string(),
             attr: template.iterable_attr.clone(),
             mismatch,

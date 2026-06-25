@@ -2700,7 +2700,7 @@ mod expand_same_config_deferred_for_tests {
     }
 
     #[test]
-    fn expand_same_config_emits_expand_deferred_for_when_iterable_is_unresolved() {
+    fn expand_same_config_emits_deferred_create_when_iterable_is_unresolved() {
         let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let states = states_with_cert(&parsed, "account_ids", unknown_account_ids());
@@ -2717,14 +2717,11 @@ mod expand_same_config_deferred_for_tests {
         .expect("expand");
 
         assert_eq!(
-            out.apply_time_reexpansion_targets.len(),
+            out.deferred_create_targets.len(),
             1,
             "one deferred-for expression should be carried for apply-time re-expansion"
         );
-        assert_eq!(
-            out.apply_time_reexpansion_targets[0].upstream_binding,
-            "cert"
-        );
+        assert_eq!(out.deferred_create_targets[0].upstream_binding, "cert");
         assert!(
             out.sorted_resources
                 .iter()
@@ -2761,8 +2758,8 @@ mod expand_same_config_deferred_for_tests {
             .collect();
         assert_eq!(assignments.len(), 2);
         assert!(
-            out.apply_time_reexpansion_targets.is_empty(),
-            "fully concrete iterable must pre-expand instead of emitting ExpandDeferredFor"
+            out.deferred_create_targets.is_empty(),
+            "fully concrete iterable must pre-expand instead of emitting DeferredCreate"
         );
     }
 
@@ -2869,7 +2866,7 @@ mod expand_same_config_deferred_for_tests {
             "no Assignment may materialize without a resolvable iterable"
         );
         assert_eq!(
-            out.apply_time_reexpansion_targets.len(),
+            out.deferred_create_targets.len(),
             1,
             "the unresolvable loop must become an apply-time re-expansion target"
         );

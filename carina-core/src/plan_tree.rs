@@ -62,7 +62,7 @@ fn paired_deferred_for_siblings(
     let mut result = PairedDeferredForSiblings::default();
 
     for &expand_idx in sibling_indices {
-        let Effect::ExpandDeferredFor { template, .. } = &effects[expand_idx] else {
+        let Effect::DeferredCreate { template, .. } = &effects[expand_idx] else {
             continue;
         };
         let delete_indices: Vec<usize> = sibling_indices
@@ -122,7 +122,7 @@ pub fn deferred_summary_for_plan(plan: &Plan) -> DeferredSummaryForPlan {
         .iter()
         .enumerate()
         .filter_map(|(idx, effect)| {
-            let Effect::ExpandDeferredFor {
+            let Effect::DeferredCreate {
                 upstream_binding, ..
             } = effect
             else {
@@ -352,7 +352,7 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
                     effect_deps.insert(idx, deps);
                     continue;
                 }
-                Effect::ExpandDeferredFor {
+                Effect::DeferredCreate {
                     id,
                     upstream_binding,
                     template,
@@ -684,7 +684,7 @@ mod tests {
         };
 
         let mut plan = Plan::new();
-        plan.add(Effect::ExpandDeferredFor {
+        plan.add(Effect::DeferredCreate {
             id: ResourceId::new("__deferred_for", "validation_records"),
             upstream_binding: "cert".to_string(),
             template: Box::new(deferred),

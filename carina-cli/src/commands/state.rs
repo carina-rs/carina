@@ -1008,7 +1008,7 @@ pub(crate) async fn run_state_refresh_locked(
         new_child_ids: _,
         refreshable_child_ids: _,
         residual_deferred_for: _,
-        apply_time_reexpansion_targets: _,
+        deferred_create_targets: _,
         printed_warnings: _,
     } = crate::wiring::expand_refresh_and_lift_states(crate::wiring::ExpandRefreshAndLiftInputs {
         parsed,

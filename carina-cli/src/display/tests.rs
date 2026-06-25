@@ -1039,7 +1039,7 @@ fn test_replace_cascade_ref_hints_show_binding() {
 }
 
 #[test]
-fn test_expand_deferred_for_renders_deferred_until_apply_marker() {
+fn test_deferred_create_renders_deferred_until_apply_marker() {
     let mut template_resource = Resource::new("route53.Record", "validation_records");
     template_resource.binding = Some("validation_records".to_string());
     template_resource.set_attr(
@@ -1067,7 +1067,7 @@ fn test_expand_deferred_for_renders_deferred_until_apply_marker() {
     };
 
     let mut plan = Plan::new();
-    plan.add(Effect::ExpandDeferredFor {
+    plan.add(Effect::DeferredCreate {
         id: ResourceId::new("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(deferred),
@@ -1124,7 +1124,7 @@ fn deferred_validation_records_effect() -> Effect {
         template_resource,
     };
 
-    Effect::ExpandDeferredFor {
+    Effect::DeferredCreate {
         id: ResourceId::new("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(deferred),

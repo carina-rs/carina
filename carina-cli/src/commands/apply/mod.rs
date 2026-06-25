@@ -1251,7 +1251,7 @@ async fn run_apply_locked(
     let crate::wiring::ExpandedRefreshState {
         sorted_resources: resorted,
         residual_deferred_for,
-        apply_time_reexpansion_targets,
+        deferred_create_targets,
         new_child_ids: _,
         refreshable_child_ids: _,
         // `printed_warnings` drives the plan path's spinner-bar-region
@@ -1408,7 +1408,7 @@ async fn run_apply_locked(
         &bindings,
         &no_unresolved_upstreams,
     );
-    crate::wiring::add_apply_time_reexpansion_effects(&mut plan, &apply_time_reexpansion_targets);
+    crate::wiring::add_deferred_create_effects(&mut plan, &deferred_create_targets);
 
     // Check for prevent_destroy violations
     if plan.has_errors() {

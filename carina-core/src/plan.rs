@@ -219,7 +219,7 @@ impl Plan {
                 Effect::Remove { .. } => summary.remove += 1,
                 Effect::Move { .. } => summary.moved += 1,
                 Effect::Wait { .. } => summary.wait += 1,
-                Effect::ExpandDeferredFor { .. } => {}
+                Effect::DeferredCreate { .. } => {}
             }
         }
         summary.delete = self
@@ -387,7 +387,7 @@ impl ModularPlan {
                 | Effect::Remove { .. }
                 | Effect::Move { .. }
                 | Effect::Wait { .. }
-                | Effect::ExpandDeferredFor { .. } => ModuleSource::Root,
+                | Effect::DeferredCreate { .. } => ModuleSource::Root,
             };
             modular.effect_sources.insert(idx, source);
         }
@@ -509,7 +509,7 @@ fn format_effect_brief(effect: &Effect) -> String {
             binding,
             until_surface
         ),
-        Effect::ExpandDeferredFor {
+        Effect::DeferredCreate {
             id,
             upstream_binding,
             ..
@@ -677,7 +677,7 @@ mod tests {
         plan.add(Effect::Create(
             Resource::new("acm.Certificate", "cert").with_binding("cert"),
         ));
-        plan.add(Effect::ExpandDeferredFor {
+        plan.add(Effect::DeferredCreate {
             id: ResourceId::new("route53.RecordSet", "validation_records"),
             upstream_binding: "cert".to_string(),
             template: Box::new(deferred),

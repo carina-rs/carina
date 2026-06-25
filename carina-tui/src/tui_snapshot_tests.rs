@@ -223,7 +223,7 @@ fn build_deferred_for_plan() -> Plan {
 
     let mut plan = Plan::new();
     plan.add(Effect::Create(certificate_resource()));
-    plan.add(Effect::ExpandDeferredFor {
+    plan.add(Effect::DeferredCreate {
         id: ResourceId::new("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(deferred),
@@ -248,7 +248,7 @@ fn build_anonymous_deferred_for_plan() -> Plan {
 
     let mut plan = Plan::new();
     plan.add(Effect::Create(certificate_resource()));
-    plan.add(Effect::ExpandDeferredFor {
+    plan.add(Effect::DeferredCreate {
         id: ResourceId::new("__deferred_for", "_anon_validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(deferred),
@@ -274,7 +274,7 @@ fn build_deferred_for_with_paired_destroy_plan() -> Plan {
 
     let mut plan = Plan::new();
     plan.add(Effect::Create(certificate_resource()));
-    plan.add(Effect::ExpandDeferredFor {
+    plan.add(Effect::DeferredCreate {
         id: ResourceId::new("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(deferred),

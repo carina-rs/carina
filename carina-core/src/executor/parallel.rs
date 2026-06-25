@@ -16,7 +16,7 @@ use super::basic::{
     BasicEffectCtx, ExecutionState, RenormalizePipeline, count_actionable_effects,
     execute_basic_effect, process_basic_result, refresh_pending_states,
 };
-use super::expand::expand_deferred_for_effects;
+use super::deferred_create::materialize_deferred_create;
 use super::replace::{ReplaceContext, SingleEffectResult, execute_replace_parallel};
 use super::wait::{
     AppliedStates, SKIP_REASON_CANCELLED, UnsatisfiableReason, WaitAwareInFlight, WaitOutcome,
@@ -589,7 +589,7 @@ pub(super) async fn execute_effects_sequential(
         .collect();
 
     // Mark Read and plain state operation effects as completed (they are no-ops in the executor).
-    // ExpandDeferredFor is state-only for progress/provider purposes, but it is a scheduler
+    // DeferredCreate is state-only for progress/provider purposes, but it is a scheduler
     // dispatch point that materializes dynamic Create effects.
     for (idx, effect) in effects.iter().enumerate() {
         if is_runtime_noop(effect) {
@@ -692,13 +692,13 @@ pub(super) async fn execute_effects_sequential(
                 continue;
             }
 
-            if let Effect::ExpandDeferredFor {
+            if let Effect::DeferredCreate {
                 upstream_binding,
                 template,
                 ..
             } = &effect
             {
-                let children = match expand_deferred_for_effects(
+                let children = match materialize_deferred_create(
                     upstream_binding,
                     template,
                     &input.bindings,
@@ -837,8 +837,8 @@ pub(super) async fn execute_effects_sequential(
                         Effect::Import { .. } | Effect::Remove { .. } | Effect::Move { .. } => {
                             SingleEffectResult::ReadNoOp
                         }
-                        Effect::ExpandDeferredFor { .. } => unreachable!(
-                            "ExpandDeferredFor is handled synchronously before provider dispatch"
+                        Effect::DeferredCreate { .. } => unreachable!(
+                            "DeferredCreate is handled synchronously before provider dispatch"
                         ),
                         Effect::Wait {
                             binding,

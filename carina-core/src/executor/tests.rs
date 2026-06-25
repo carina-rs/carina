@@ -5672,7 +5672,7 @@ async fn wait_resolves_target_identifier_from_just_replaced_state_phased() {
 }
 
 #[tokio::test]
-async fn expand_deferred_for_dispatches_after_upstream_replace_before_wait_phased() {
+async fn deferred_create_dispatches_after_upstream_replace_before_wait_phased() {
     use crate::effect::ChangedCreateOnly;
     use crate::wait::predicate::{AttrPath, WaitPredicate};
 
@@ -5758,7 +5758,7 @@ async fn expand_deferred_for_dispatches_after_upstream_replace_before_wait_phase
         temporary_name: None,
         cascade_ref_hints: Vec::new(),
     });
-    plan.add(Effect::ExpandDeferredFor {
+    plan.add(Effect::DeferredCreate {
         id: ResourceId::new("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(validation_deferred_for_expression()),
@@ -5841,7 +5841,7 @@ async fn expand_deferred_for_dispatches_after_upstream_replace_before_wait_phase
 }
 
 #[tokio::test]
-async fn expand_deferred_for_emits_zero_children_when_collection_is_empty() {
+async fn deferred_create_emits_zero_children_when_collection_is_empty() {
     use crate::effect::ChangedCreateOnly;
     use crate::wait::predicate::{AttrPath, WaitPredicate};
 
@@ -5884,7 +5884,7 @@ async fn expand_deferred_for_emits_zero_children_when_collection_is_empty() {
         temporary_name: None,
         cascade_ref_hints: Vec::new(),
     });
-    plan.add(Effect::ExpandDeferredFor {
+    plan.add(Effect::DeferredCreate {
         id: ResourceId::new("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(validation_deferred_for_expression()),
@@ -5936,7 +5936,7 @@ async fn expand_deferred_for_emits_zero_children_when_collection_is_empty() {
 }
 
 #[tokio::test]
-async fn expand_deferred_for_cancelled_after_upstream_create_reports_skipped() {
+async fn deferred_create_cancelled_after_upstream_create_reports_skipped() {
     use crate::effect::ChangedCreateOnly;
 
     struct CancelAfterCertProvider {
@@ -6039,7 +6039,7 @@ async fn expand_deferred_for_cancelled_after_upstream_create_reports_skipped() {
         temporary_name: None,
         cascade_ref_hints: Vec::new(),
     });
-    plan.add(Effect::ExpandDeferredFor {
+    plan.add(Effect::DeferredCreate {
         id: ResourceId::new("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(validation_deferred_for_expression()),
@@ -6075,10 +6075,10 @@ async fn expand_deferred_for_cancelled_after_upstream_create_reports_skipped() {
 }
 
 #[tokio::test]
-async fn expand_deferred_for_returns_error_when_upstream_binding_missing() {
+async fn deferred_create_returns_error_when_upstream_binding_missing() {
     let provider = MockProvider::new();
     let mut plan = Plan::new();
-    plan.add(Effect::ExpandDeferredFor {
+    plan.add(Effect::DeferredCreate {
         id: ResourceId::new("__deferred_for", "validation_records"),
         upstream_binding: "missing_cert".to_string(),
         template: Box::new(validation_deferred_for_expression()),
@@ -6107,7 +6107,7 @@ async fn expand_deferred_for_returns_error_when_upstream_binding_missing() {
 }
 
 #[tokio::test]
-async fn expand_deferred_for_returns_error_when_iterable_attr_missing() {
+async fn deferred_create_returns_error_when_iterable_attr_missing() {
     let mut cert = Resource::new("test", "cert_missing_attr");
     cert.binding = Some("cert".to_string());
     let cert_id = cert.id.clone();
@@ -6117,7 +6117,7 @@ async fn expand_deferred_for_returns_error_when_iterable_attr_missing() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Create(cert));
-    plan.add(Effect::ExpandDeferredFor {
+    plan.add(Effect::DeferredCreate {
         id: ResourceId::new("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(validation_deferred_for_expression()),
@@ -6147,7 +6147,7 @@ async fn expand_deferred_for_returns_error_when_iterable_attr_missing() {
 }
 
 #[tokio::test]
-async fn apply_time_expand_deferred_for_emits_failed_on_shape_mismatch() {
+async fn apply_time_deferred_create_emits_failed_on_shape_mismatch() {
     let mut cert = Resource::new("test", "cert_shape_mismatch");
     cert.binding = Some("cert".to_string());
     let cert_id = cert.id.clone();
@@ -6164,7 +6164,7 @@ async fn apply_time_expand_deferred_for_emits_failed_on_shape_mismatch() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Create(cert));
-    plan.add(Effect::ExpandDeferredFor {
+    plan.add(Effect::DeferredCreate {
         id: ResourceId::new("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(validation_deferred_for_expression()),

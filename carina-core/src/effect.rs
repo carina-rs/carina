@@ -251,7 +251,7 @@ pub enum Effect {
     ///
     /// Emitted by the planner when the iterable's plan-time value is
     /// unresolved. State-only: does not call the provider.
-    ExpandDeferredFor {
+    DeferredCreate {
         /// Synthetic id used for plan-tree display and progress.
         id: ResourceId,
         /// The iterable's binding name (e.g. "cert").
@@ -426,7 +426,7 @@ impl Effect {
                 Effect::Wait { .. }
             ),
             (
-                Effect::ExpandDeferredFor {
+                Effect::DeferredCreate {
                     id: ResourceId::new("route53.Record", "validation_records"),
                     upstream_binding: "cert".to_string(),
                     template: Box::new(crate::parser::DeferredForExpression {
@@ -442,7 +442,7 @@ impl Effect {
                         template_resource: Resource::new("route53.Record", "validation_records"),
                     }),
                 },
-                Effect::ExpandDeferredFor { .. }
+                Effect::DeferredCreate { .. }
             ),
         ]
     }
@@ -485,7 +485,7 @@ impl Effect {
             Effect::Remove { .. } => "~",
             Effect::Move { .. } => "->",
             Effect::Wait { .. } => ">",
-            Effect::ExpandDeferredFor { .. } => "+",
+            Effect::DeferredCreate { .. } => "+",
         }
     }
 
@@ -550,7 +550,7 @@ impl Effect {
             | Effect::Remove { .. }
             | Effect::Move { .. }
             | Effect::Wait { .. }
-            | Effect::ExpandDeferredFor { .. } => None,
+            | Effect::DeferredCreate { .. } => None,
         }
     }
 
@@ -574,7 +574,7 @@ impl Effect {
             Effect::Remove { .. } => "remove",
             Effect::Move { .. } => "move",
             Effect::Wait { .. } => "wait",
-            Effect::ExpandDeferredFor { .. } => "expand_deferred_for",
+            Effect::DeferredCreate { .. } => "deferred_create",
         }
     }
 
@@ -590,7 +590,7 @@ impl Effect {
             Effect::Remove { .. } => true,
             Effect::Move { .. } => true,
             Effect::Wait { .. } => false,
-            Effect::ExpandDeferredFor { .. } => true,
+            Effect::DeferredCreate { .. } => true,
         }
     }
 
@@ -606,7 +606,7 @@ impl Effect {
             Effect::Remove { .. } => true,
             Effect::Move { .. } => true,
             Effect::Wait { .. } => false,
-            Effect::ExpandDeferredFor { .. } => false,
+            Effect::DeferredCreate { .. } => false,
         }
     }
 
@@ -623,7 +623,7 @@ impl Effect {
             Effect::Remove { .. } => false,
             Effect::Move { .. } => false,
             Effect::Wait { .. } => false,
-            Effect::ExpandDeferredFor { .. } => true,
+            Effect::DeferredCreate { .. } => true,
         }
     }
 
@@ -639,7 +639,7 @@ impl Effect {
             Effect::Remove { id, .. } => id,
             Effect::Move { to, .. } => to,
             Effect::Wait { target_id, .. } => target_id,
-            Effect::ExpandDeferredFor { id, .. } => id,
+            Effect::DeferredCreate { id, .. } => id,
         }
     }
 
@@ -664,7 +664,7 @@ impl Effect {
             | Effect::Remove { .. }
             | Effect::Move { .. }
             | Effect::Wait { .. }
-            | Effect::ExpandDeferredFor { .. } => None,
+            | Effect::DeferredCreate { .. } => None,
         }
     }
 
@@ -680,7 +680,7 @@ impl Effect {
             Effect::Remove { .. } => None,
             Effect::Move { .. } => None,
             Effect::Wait { binding, .. } => Some(binding.clone()),
-            Effect::ExpandDeferredFor { .. } => None,
+            Effect::DeferredCreate { .. } => None,
         }
     }
 
@@ -714,7 +714,7 @@ impl Effect {
                 explicit_dependencies,
                 ..
             } => explicit_dependencies.clone(),
-            Effect::ExpandDeferredFor { .. } => HashSet::new(),
+            Effect::DeferredCreate { .. } => HashSet::new(),
         }
     }
 
@@ -762,7 +762,7 @@ impl Effect {
                 deps.extend(self.explicit_dependencies());
                 deps.into_iter().collect()
             }
-            Effect::ExpandDeferredFor {
+            Effect::DeferredCreate {
                 upstream_binding, ..
             } => vec![upstream_binding.clone()],
         }
@@ -860,8 +860,8 @@ mod tests {
         }
     }
 
-    fn expand_deferred_for_effect() -> Effect {
-        Effect::ExpandDeferredFor {
+    fn deferred_create_effect() -> Effect {
+        Effect::DeferredCreate {
             id: ResourceId::new("route53.Record", "validation_records"),
             upstream_binding: "cert".to_string(),
             template: Box::new(deferred_for_template()),
@@ -945,7 +945,7 @@ mod tests {
                     explicit_dependencies: HashSet::new(),
                 },
             ),
-            ("ExpandDeferredFor", expand_deferred_for_effect()),
+            ("DeferredCreate", deferred_create_effect()),
         ]
     }
 
@@ -1036,20 +1036,20 @@ mod tests {
     }
 
     #[test]
-    fn expand_deferred_for_blocking_bindings_is_upstream_only() {
-        let effect = expand_deferred_for_effect();
+    fn deferred_create_blocking_bindings_is_upstream_only() {
+        let effect = deferred_create_effect();
         assert_eq!(effect.blocking_bindings(), vec!["cert".to_string()]);
     }
 
     #[test]
-    fn expand_deferred_for_as_basic_returns_none() {
-        let effect = expand_deferred_for_effect();
+    fn deferred_create_as_basic_returns_none() {
+        let effect = deferred_create_effect();
         assert!(effect.as_basic().is_none());
     }
 
     #[test]
-    fn expand_deferred_for_resource_id_returns_synthetic_id() {
-        let effect = expand_deferred_for_effect();
+    fn deferred_create_resource_id_returns_synthetic_id() {
+        let effect = deferred_create_effect();
         assert_eq!(
             effect.resource_id(),
             &ResourceId::new("route53.Record", "validation_records")
@@ -1057,12 +1057,12 @@ mod tests {
     }
 
     #[test]
-    fn expand_deferred_for_serde_roundtrip() {
-        let original = expand_deferred_for_effect();
+    fn deferred_create_serde_roundtrip() {
+        let original = deferred_create_effect();
         let json = serde_json::to_string(&original).expect("serialize");
         let decoded: Effect = serde_json::from_str(&json).expect("deserialize");
         match decoded {
-            Effect::ExpandDeferredFor { template, .. } => {
+            Effect::DeferredCreate { template, .. } => {
                 assert_eq!(template.file, None);
                 assert_eq!(template.line, 0);
                 assert_eq!(template.header, "for opt in cert.domain_validation_options");
@@ -1071,23 +1071,23 @@ mod tests {
                 assert_eq!(template.iterable_binding, "cert");
                 assert_eq!(template.iterable_attr, "domain_validation_options");
             }
-            other => panic!("expected ExpandDeferredFor, got {other:?}"),
+            other => panic!("expected DeferredCreate, got {other:?}"),
         }
     }
 
     #[test]
-    fn is_scheduler_meta_only_true_for_expand_deferred_for() {
+    fn is_scheduler_meta_only_true_for_deferred_create() {
         for (label, effect) in every_effect_variant() {
             assert_eq!(
                 effect.is_scheduler_meta(),
-                label == "ExpandDeferredFor",
+                label == "DeferredCreate",
                 "{label} scheduler-meta classification mismatch",
             );
         }
     }
 
     #[test]
-    fn is_state_operation_excludes_expand_deferred_for() {
+    fn is_state_operation_excludes_deferred_create() {
         for (label, effect) in every_effect_variant() {
             assert_eq!(
                 effect.is_state_operation(),

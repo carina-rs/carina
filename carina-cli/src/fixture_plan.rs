@@ -22,7 +22,7 @@ use carina_state::{StateFile, check_and_migrate};
 
 use crate::commands::validate_and_resolve;
 use crate::wiring::{
-    WiringContext, add_apply_time_reexpansion_effects, compute_anonymous_identifiers_with_ctx,
+    WiringContext, add_deferred_create_effects, compute_anonymous_identifiers_with_ctx,
     expand_same_config_deferred_for, normalize_state_with_ctx,
     reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
     resolve_enum_aliases_in_states,
@@ -337,8 +337,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         .iter()
         .filter_map(|resource| resource.binding.clone())
         .collect();
-    let apply_time_reexpansion_targets: Vec<_> = deferred_for_expansion
-        .apply_time_reexpansion_targets
+    let deferred_create_targets: Vec<_> = deferred_for_expansion
+        .deferred_create_targets
         .into_iter()
         .filter(|target| managed_bindings.contains(&target.upstream_binding))
         .collect();
@@ -380,7 +380,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &plan_bindings,
         &upstream_binding_names,
     );
-    add_apply_time_reexpansion_effects(&mut plan, &apply_time_reexpansion_targets);
+    add_deferred_create_effects(&mut plan, &deferred_create_targets);
 
     let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
         .iter()
