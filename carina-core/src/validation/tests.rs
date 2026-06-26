@@ -1,5 +1,5 @@
 use super::*;
-use crate::parser::{ParsedFile, ProviderContext};
+use crate::parser::{BindingName, ParsedFile, ProviderContext, UntilPredicateAst, WaitBinding};
 use crate::resource::Resource;
 use crate::schema::{ResourceSchema, SchemaRegistry, TypeIdentity};
 
@@ -658,6 +658,132 @@ fn unknown_attribute_reference_suggests_similar_name() {
         "Expected 'did you mean' suggestion, got: {}",
         err
     );
+}
+
+#[test]
+fn unknown_attribute_reference_through_wait_binding_reports_error() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        make_schema(
+            "acm.Certificate",
+            vec![
+                ("certificate_arn", AttributeType::string()),
+                ("status", AttributeType::string()),
+            ],
+        ),
+    );
+    schemas.insert(
+        "awscc",
+        make_schema(
+            "elasticloadbalancingv2.Listener",
+            vec![("certificate_arn", AttributeType::string())],
+        ),
+    );
+
+    let cert = Resource::with_provider("aws", "acm.Certificate", "cert", None)
+        .with_binding("cert")
+        .with_attribute(
+            "status",
+            Value::Concrete(ConcreteValue::String("pending".to_string())),
+        );
+    let listener =
+        Resource::with_provider("awscc", "elasticloadbalancingv2.Listener", "listener", None)
+            .with_attribute(
+                "certificate_arn",
+                Value::resource_ref(
+                    "cert_issued".to_string(),
+                    "certificate_arnn".to_string(),
+                    vec![],
+                ),
+            );
+
+    let mut parsed = empty_parsed();
+    parsed.resources.push(cert); // allow: direct — fixture test inspection
+    parsed.wait_bindings.push(WaitBinding {
+        binding: BindingName::from("cert_issued"),
+        target: BindingName::from("cert"),
+        until_raw: "cert.status == 'issued'".to_string(),
+        until_predicate: UntilPredicateAst {
+            lhs_segments: vec!["cert".to_string(), "status".to_string()],
+            rhs: Value::Concrete(ConcreteValue::String("issued".to_string())),
+        },
+        timeout_secs: None,
+        depends_on: Vec::new(),
+        line: 1,
+    });
+    parsed.resources.push(listener); // allow: direct — fixture test inspection
+
+    let err = validate_resource_ref_types(&parsed, &schemas, &HashSet::new()).unwrap_err();
+    assert!(
+        err.contains("unknown attribute 'certificate_arnn' on 'cert_issued'"),
+        "expected wait binding attribute error, got: {err}",
+    );
+    assert!(
+        err.contains("reference cert_issued.certificate_arnn"),
+        "expected wait binding reference in error, got: {err}",
+    );
+    assert!(
+        err.contains("Did you mean 'certificate_arn'?"),
+        "expected target schema suggestion, got: {err}",
+    );
+}
+
+#[test]
+fn known_attribute_reference_through_wait_binding_is_accepted() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        make_schema(
+            "acm.Certificate",
+            vec![
+                ("certificate_arn", AttributeType::string()),
+                ("status", AttributeType::string()),
+            ],
+        ),
+    );
+    schemas.insert(
+        "awscc",
+        make_schema(
+            "elasticloadbalancingv2.Listener",
+            vec![("certificate_arn", AttributeType::string())],
+        ),
+    );
+
+    let cert = Resource::with_provider("aws", "acm.Certificate", "cert", None)
+        .with_binding("cert")
+        .with_attribute(
+            "status",
+            Value::Concrete(ConcreteValue::String("pending".to_string())),
+        );
+    let listener =
+        Resource::with_provider("awscc", "elasticloadbalancingv2.Listener", "listener", None)
+            .with_attribute(
+                "certificate_arn",
+                Value::resource_ref(
+                    "cert_issued".to_string(),
+                    "certificate_arn".to_string(),
+                    vec![],
+                ),
+            );
+
+    let mut parsed = empty_parsed();
+    parsed.resources.push(cert); // allow: direct — fixture test inspection
+    parsed.wait_bindings.push(WaitBinding {
+        binding: BindingName::from("cert_issued"),
+        target: BindingName::from("cert"),
+        until_raw: "cert.status == 'issued'".to_string(),
+        until_predicate: UntilPredicateAst {
+            lhs_segments: vec!["cert".to_string(), "status".to_string()],
+            rhs: Value::Concrete(ConcreteValue::String("issued".to_string())),
+        },
+        timeout_secs: None,
+        depends_on: Vec::new(),
+        line: 1,
+    });
+    parsed.resources.push(listener); // allow: direct — fixture test inspection
+
+    assert!(validate_resource_ref_types(&parsed, &schemas, &HashSet::new()).is_ok());
 }
 
 #[test]
