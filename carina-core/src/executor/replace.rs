@@ -173,10 +173,7 @@ pub(super) async fn execute_cbd_replace_parallel(
                 duration: ctx.started.elapsed(),
                 progress: ctx.progress,
             });
-            return SingleEffectResult::Basic(BasicEffectResult::Failure {
-                binding: ctx.effect.binding_name(),
-                refresh: None,
-            });
+            return SingleEffectResult::Basic(BasicEffectResult::Failure { refresh: None });
         }
     };
     let resolved_attrs = resolved.as_resource().resolved_attributes();

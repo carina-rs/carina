@@ -57,7 +57,6 @@ pub(super) enum BasicEffectResult {
         binding: Option<String>,
     },
     Failure {
-        binding: Option<String>,
         refresh: Option<(ResourceId, String)>,
     },
     Deleted {
@@ -70,12 +69,13 @@ pub(super) enum BasicEffectResult {
 /// Groups the counters, result maps, and binding state that are threaded
 /// through every call to `process_basic_result`, reducing parameter count.
 pub(super) struct ExecutionState<'a> {
+    pub(super) idx: usize,
     pub(super) success_count: &'a mut usize,
     pub(super) failure_count: &'a mut usize,
     pub(super) partial_count: &'a mut usize,
     pub(super) partial_diagnostics: &'a mut Vec<(ResourceId, PartialReadDiagnostic)>,
     pub(super) applied_states: &'a mut AppliedStates,
-    pub(super) failed_bindings: &'a mut std::collections::HashSet<String>,
+    pub(super) failed_indices: &'a mut std::collections::HashSet<usize>,
     pub(super) successfully_deleted: &'a mut std::collections::HashSet<ResourceId>,
     pub(super) pending_refreshes: &'a mut HashMap<ResourceId, String>,
     pub(super) bindings: &'a mut ResolvedBindings,
@@ -435,13 +435,9 @@ pub(super) fn process_basic_result(result: BasicEffectResult, exec: &mut Executi
                 exec.applied_states.insert(resource_id, s);
             }
         }
-        BasicEffectResult::Failure {
-            binding, refresh, ..
-        } => {
+        BasicEffectResult::Failure { refresh } => {
             *exec.failure_count += 1;
-            if let Some(binding) = binding {
-                exec.failed_bindings.insert(binding);
-            }
+            exec.failed_indices.insert(exec.idx);
             if let Some((id, identifier)) = &refresh {
                 queue_state_refresh(exec.pending_refreshes, id, Some(identifier.as_str()));
             }
@@ -534,10 +530,7 @@ pub(super) async fn execute_basic_effect<'a>(
                         duration: started.elapsed(),
                         progress,
                     });
-                    return BasicEffectResult::Failure {
-                        binding: effect.binding_name(),
-                        refresh: None,
-                    };
+                    return BasicEffectResult::Failure { refresh: None };
                 }
             };
             let resolved_attrs = resolved.as_resource().resolved_attributes();
@@ -586,10 +579,7 @@ pub(super) async fn execute_basic_effect<'a>(
                         duration: started.elapsed(),
                         progress,
                     });
-                    BasicEffectResult::Failure {
-                        binding: effect.binding_name(),
-                        refresh: None,
-                    }
+                    BasicEffectResult::Failure { refresh: None }
                 }
             }
         }
@@ -613,10 +603,7 @@ pub(super) async fn execute_basic_effect<'a>(
                             duration: started.elapsed(),
                             progress,
                         });
-                        return BasicEffectResult::Failure {
-                            binding: effect.binding_name(),
-                            refresh: None,
-                        };
+                        return BasicEffectResult::Failure { refresh: None };
                     }
                 };
             let identifier = from.identifier.as_deref().unwrap_or("");
@@ -720,7 +707,6 @@ pub(super) async fn execute_basic_effect<'a>(
                         progress,
                     });
                     BasicEffectResult::Failure {
-                        binding: effect.binding_name(),
                         refresh: Some((id.clone(), identifier.to_string())),
                     }
                 }
@@ -761,7 +747,6 @@ pub(super) async fn execute_basic_effect<'a>(
                     progress,
                 });
                 BasicEffectResult::Failure {
-                    binding: None,
                     refresh: Some((id.clone(), identifier.to_string())),
                 }
             }
@@ -791,17 +776,18 @@ mod process_basic_result_tests {
         let mut failure_count = 0;
         let mut partial_count = 0;
         let mut partial_diagnostics = Vec::new();
-        let mut failed_bindings = HashSet::new();
+        let mut failed_indices = HashSet::new();
         let mut successfully_deleted = HashSet::new();
         let mut pending_refreshes = HashMap::new();
         let mut bindings = ResolvedBindings::default();
         let mut exec = ExecutionState {
+            idx: 7,
             success_count: &mut success_count,
             failure_count: &mut failure_count,
             partial_count: &mut partial_count,
             partial_diagnostics: &mut partial_diagnostics,
             applied_states: &mut applied_states,
-            failed_bindings: &mut failed_bindings,
+            failed_indices: &mut failed_indices,
             successfully_deleted: &mut successfully_deleted,
             pending_refreshes: &mut pending_refreshes,
             bindings: &mut bindings,

@@ -85,7 +85,13 @@ pub(super) fn materialize_deferred_create(
             mismatch,
         })?
         .into_iter()
-        .map(Effect::Create)
+        .map(|resource| {
+            debug_assert!(
+                resource.dependency_bindings.contains(upstream_binding),
+                "apply-time deferred-for child must retain iterable dependency"
+            );
+            Effect::Create(resource)
+        })
         .collect())
 }
 

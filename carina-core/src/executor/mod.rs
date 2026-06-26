@@ -20,6 +20,7 @@ mod normalized_tests;
 mod parallel;
 mod phased;
 mod replace;
+pub(super) mod scheduler;
 pub(crate) mod wait;
 
 pub use parallel::UnresolvedResource;
