@@ -19,11 +19,10 @@ use super::basic::{
     count_actionable_effects, execute_basic_effect, process_basic_result, queue_state_refresh,
     refresh_pending_states, resolve_resource, resolve_resource_with_source,
 };
-use super::deferred_dispatch::{
-    DeferredDispatchCtx, DeferredDispatchResult, dispatch_deferred_create,
-    dispatch_deferred_replace,
+use super::deferred_dispatch::{DeferredDispatchResult, PureMetaCtx, dispatch_deferred_create};
+use super::parallel::{
+    apply_deferred_replace_delete_deps, expand_deferred_replace_effects, is_runtime_dispatchable,
 };
-use super::parallel::is_runtime_dispatchable;
 use super::replace::{compute_full_diff_patch, single_attribute_patch};
 use super::wait::{
     AppliedStates, SKIP_REASON_CANCELLED, UnsatisfiableReason, WaitAwareInFlight, WaitOutcome,
@@ -417,10 +416,12 @@ pub(super) async fn execute_effects_phased(
     let mut pending_refreshes: HashMap<ResourceId, String> = HashMap::new();
     let mut runtime_synthesized_resources: Vec<Resource> = Vec::new();
 
-    let mut total = count_actionable_effects(input.plan.effects());
+    let expanded = expand_deferred_replace_effects(input.plan.effects());
+    let deferred_replace_delete_deps = expanded.deferred_replace_delete_deps;
+    let mut total = count_actionable_effects(&expanded.effects);
     let completed = AtomicUsize::new(0);
 
-    let mut effects = input.plan.effects().to_vec();
+    let mut effects = expanded.effects;
     let replace_bindings = collect_replace_bindings(&effects);
     let sorted_indices = topological_sort_replaces(&effects, &replace_bindings);
     let replaced_ids: HashSet<ResourceId> = effects
@@ -471,6 +472,7 @@ pub(super) async fn execute_effects_phased(
             input.unresolved_resources,
             input.compositions,
         );
+        apply_deferred_replace_delete_deps(&mut deps_of, &deferred_replace_delete_deps);
         let mut completed_indices: HashSet<usize> = HashSet::new();
         let mut dispatched: HashSet<usize> = HashSet::new();
         let mut in_flight: WaitAwareInFlight<'_, PhaseEffectResult> = WaitAwareInFlight::new();
@@ -544,13 +546,7 @@ pub(super) async fn execute_effects_phased(
                     ..
                 } = &effect
                 {
-                    let dispatch_ctx = DeferredDispatchCtx {
-                        provider,
-                        unresolved: input.unresolved_resources,
-                        normalizer: input.normalizer,
-                        provider_configs: input.provider_configs,
-                        factories: input.factories,
-                        schemas: input.schemas,
+                    let dispatch_ctx = PureMetaCtx {
                         completed: &completed,
                         total,
                         observer,
@@ -570,9 +566,6 @@ pub(super) async fn execute_effects_phased(
                             completed_synchronous_dispatch = true;
                             break;
                         }
-                        DeferredDispatchResult::DeleteFailed => {
-                            unreachable!("deferred create dispatch cannot run delete halves")
-                        }
                     };
                     if !children.is_empty() {
                         total += count_actionable_effects(&children);
@@ -590,6 +583,10 @@ pub(super) async fn execute_effects_phased(
                             input.unresolved_resources,
                             input.compositions,
                         );
+                        apply_deferred_replace_delete_deps(
+                            &mut deps_of,
+                            &deferred_replace_delete_deps,
+                        );
                     }
                     completed_indices.insert(idx);
                     completed_synchronous_dispatch = true;
@@ -597,52 +594,24 @@ pub(super) async fn execute_effects_phased(
                 }
 
                 if let Effect::DeferredReplace {
-                    deletes,
                     upstream_binding,
                     template,
                     ..
                 } = &effect
                 {
-                    total += deletes.len();
-                    let dispatch_ctx = DeferredDispatchCtx {
-                        provider,
-                        unresolved: input.unresolved_resources,
-                        normalizer: input.normalizer,
-                        provider_configs: input.provider_configs,
-                        factories: input.factories,
-                        schemas: input.schemas,
+                    let dispatch_ctx = PureMetaCtx {
                         completed: &completed,
                         total,
                         observer,
                     };
-                    let mut exec = ExecutionState {
-                        success_count: &mut success_count,
-                        failure_count: &mut failure_count,
-                        partial_count: &mut partial_count,
-                        partial_diagnostics: &mut partial_diagnostics,
-                        applied_states: &mut applied_states,
-                        failed_bindings: &mut failed_bindings,
-                        successfully_deleted: &mut successfully_deleted,
-                        pending_refreshes: &mut pending_refreshes,
-                        bindings: &mut input.bindings,
-                    };
-                    let children = match dispatch_deferred_replace(
+                    let children = match dispatch_deferred_create(
                         &effect,
-                        deletes,
                         upstream_binding,
                         template,
+                        &input.bindings,
                         &dispatch_ctx,
-                        &mut exec,
-                    )
-                    .await
-                    {
+                    ) {
                         DeferredDispatchResult::Materialized(children) => children,
-                        DeferredDispatchResult::DeleteFailed => {
-                            failed_bindings.insert(template.binding_name.clone());
-                            completed_indices.insert(idx);
-                            completed_synchronous_dispatch = true;
-                            break;
-                        }
                         DeferredDispatchResult::MaterializeFailed => {
                             failure_count += 1;
                             failed_bindings.insert(template.binding_name.clone());
@@ -666,6 +635,10 @@ pub(super) async fn execute_effects_phased(
                             &phase1_indices,
                             input.unresolved_resources,
                             input.compositions,
+                        );
+                        apply_deferred_replace_delete_deps(
+                            &mut deps_of,
+                            &deferred_replace_delete_deps,
                         );
                     }
                     completed_indices.insert(idx);
@@ -1587,6 +1560,7 @@ pub(super) async fn execute_effects_phased(
             input.unresolved_resources,
             input.compositions,
         );
+        apply_deferred_replace_delete_deps(&mut deps_of, &deferred_replace_delete_deps);
         let mut completed_indices: HashSet<usize> = HashSet::new();
         let mut dispatched: HashSet<usize> = HashSet::new();
         type PhaseFuture<'a> =
@@ -1655,13 +1629,7 @@ pub(super) async fn execute_effects_phased(
                     ..
                 } = &effect
                 {
-                    let dispatch_ctx = DeferredDispatchCtx {
-                        provider,
-                        unresolved: input.unresolved_resources,
-                        normalizer: input.normalizer,
-                        provider_configs: input.provider_configs,
-                        factories: input.factories,
-                        schemas: input.schemas,
+                    let dispatch_ctx = PureMetaCtx {
                         completed: &completed,
                         total,
                         observer,
@@ -1680,9 +1648,6 @@ pub(super) async fn execute_effects_phased(
                             completed_indices.insert(idx);
                             completed_synchronous_dispatch = true;
                             break;
-                        }
-                        DeferredDispatchResult::DeleteFailed => {
-                            unreachable!("deferred create dispatch cannot run delete halves")
                         }
                     };
                     if !children.is_empty() {
@@ -1705,6 +1670,10 @@ pub(super) async fn execute_effects_phased(
                             input.unresolved_resources,
                             input.compositions,
                         );
+                        apply_deferred_replace_delete_deps(
+                            &mut deps_of,
+                            &deferred_replace_delete_deps,
+                        );
                     }
                     completed_indices.insert(idx);
                     completed_synchronous_dispatch = true;
@@ -1712,52 +1681,24 @@ pub(super) async fn execute_effects_phased(
                 }
 
                 if let Effect::DeferredReplace {
-                    deletes,
                     upstream_binding,
                     template,
                     ..
                 } = &effect
                 {
-                    total += deletes.len();
-                    let dispatch_ctx = DeferredDispatchCtx {
-                        provider,
-                        unresolved: input.unresolved_resources,
-                        normalizer: input.normalizer,
-                        provider_configs: input.provider_configs,
-                        factories: input.factories,
-                        schemas: input.schemas,
+                    let dispatch_ctx = PureMetaCtx {
                         completed: &completed,
                         total,
                         observer,
                     };
-                    let mut exec = ExecutionState {
-                        success_count: &mut success_count,
-                        failure_count: &mut failure_count,
-                        partial_count: &mut partial_count,
-                        partial_diagnostics: &mut partial_diagnostics,
-                        applied_states: &mut applied_states,
-                        failed_bindings: &mut failed_bindings,
-                        successfully_deleted: &mut successfully_deleted,
-                        pending_refreshes: &mut pending_refreshes,
-                        bindings: &mut input.bindings,
-                    };
-                    let children = match dispatch_deferred_replace(
+                    let children = match dispatch_deferred_create(
                         &effect,
-                        deletes,
                         upstream_binding,
                         template,
+                        &input.bindings,
                         &dispatch_ctx,
-                        &mut exec,
-                    )
-                    .await
-                    {
+                    ) {
                         DeferredDispatchResult::Materialized(children) => children,
-                        DeferredDispatchResult::DeleteFailed => {
-                            failed_bindings.insert(template.binding_name.clone());
-                            completed_indices.insert(idx);
-                            completed_synchronous_dispatch = true;
-                            break;
-                        }
                         DeferredDispatchResult::MaterializeFailed => {
                             failure_count += 1;
                             failed_bindings.insert(template.binding_name.clone());
@@ -1785,6 +1726,10 @@ pub(super) async fn execute_effects_phased(
                             &phase4_indices,
                             input.unresolved_resources,
                             input.compositions,
+                        );
+                        apply_deferred_replace_delete_deps(
+                            &mut deps_of,
+                            &deferred_replace_delete_deps,
                         );
                     }
                     completed_indices.insert(idx);
