@@ -7,67 +7,28 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::effect::Effect;
-use crate::parser::{DeferredForExpression, ResourceRef};
+use crate::parser::ResourceRef;
 use crate::provider::Provider;
 use crate::resource::{Resource, ResourceId, Value};
 
 use super::basic::{
-    BasicEffectCtx, BasicEffectResult, RenormalizePipeline, count_actionable_effects,
-    execute_basic_effect, refresh_pending_states,
+    BasicEffectCtx, ExecutionState, RenormalizePipeline, count_actionable_effects,
+    execute_basic_effect, process_basic_result, refresh_pending_states,
 };
-use super::deferred_dispatch::{DeferredDispatchResult, PureMetaCtx, dispatch_deferred_create};
+use super::deferred_dispatch::PureMetaCtx;
 use super::replace::{ReplaceContext, SingleEffectResult, execute_replace_parallel};
+use super::scheduler::{
+    PureMetaOutcome, build_scheduler_deps, dependency_failed_reason,
+    emit_cancelled_skips_with_progress, failed_binding_names_for_wait_terminal_check,
+    failure_binding_name, find_failed_dependency_index, try_dispatch_pure_meta,
+    wait_dependency_failed_reason,
+};
 use super::wait::{
-    AppliedStates, SKIP_REASON_CANCELLED, UnsatisfiableReason, WaitAwareInFlight, WaitOutcome,
-    WaitSignal, count_effectively_undispatched, resolve_wait_identifier,
-    unsatisfiable_reason_message, wait_failure_message,
+    AppliedStates, SKIP_REASON_CANCELLED, WaitAwareInFlight, WaitOutcome, WaitSignal,
+    count_effectively_undispatched, resolve_wait_identifier, unsatisfiable_reason_message,
+    wait_failure_message,
 };
 use super::{ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, ProgressInfo};
-
-struct PureMetaStep<'a> {
-    effect: &'a Effect,
-    upstream_binding: &'a str,
-    template: &'a DeferredForExpression,
-}
-
-impl<'a> PureMetaStep<'a> {
-    fn from_effect(effect: &'a Effect) -> Option<Self> {
-        match effect {
-            Effect::DeferredCreate {
-                upstream_binding,
-                template,
-                ..
-            }
-            | Effect::DeferredReplace {
-                upstream_binding,
-                template,
-                ..
-            } => Some(Self {
-                effect,
-                upstream_binding,
-                template,
-            }),
-            Effect::Create(_)
-            | Effect::Update { .. }
-            | Effect::Replace { .. }
-            | Effect::Delete { .. }
-            | Effect::Wait { .. }
-            | Effect::Read { .. }
-            | Effect::Import { .. }
-            | Effect::Remove { .. }
-            | Effect::Move { .. } => None,
-        }
-    }
-}
-
-fn failure_binding_name(effect: &Effect) -> Option<String> {
-    match effect {
-        Effect::DeferredCreate { template, .. } | Effect::DeferredReplace { template, .. } => {
-            Some(template.binding_name.clone())
-        }
-        _ => effect.binding_name(),
-    }
-}
 
 pub(super) struct ExpandedEffects {
     pub(super) effects: Vec<Effect>,
@@ -109,48 +70,10 @@ pub(super) fn apply_deferred_replace_delete_deps(
     deferred_replace_delete_deps: &[(usize, usize)],
 ) {
     for &(gate_idx, delete_idx) in deferred_replace_delete_deps {
-        if deps_of.contains_key(&gate_idx) && deps_of.contains_key(&delete_idx) {
+        if deps_of.contains_key(&gate_idx) {
             deps_of.entry(gate_idx).or_default().insert(delete_idx);
         }
     }
-}
-
-fn build_scheduler_deps(
-    effects: &[Effect],
-    unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
-    compositions: &[crate::resource::Composition],
-    deferred_replace_delete_deps: &[(usize, usize)],
-) -> HashMap<usize, HashSet<usize>> {
-    let mut analysis = build_dependency_analysis(effects, unresolved_resources, compositions);
-    relax_update_update_edges(effects, &mut analysis);
-    let mut deps_of = analysis.into_deps_of();
-    apply_deferred_replace_delete_deps(&mut deps_of, deferred_replace_delete_deps);
-    deps_of
-}
-
-fn find_failed_dependency_index(
-    idx: usize,
-    deps_of: &HashMap<usize, HashSet<usize>>,
-    failed_indices: &HashSet<usize>,
-    effects: &[Effect],
-) -> Option<String> {
-    deps_of.get(&idx).and_then(|deps| {
-        deps.iter()
-            .find(|dep_idx| failed_indices.contains(dep_idx))
-            .map(|dep_idx| {
-                effects
-                    .get(*dep_idx)
-                    .and_then(failure_binding_name)
-                    .unwrap_or_else(|| format!("#{dep_idx}"))
-            })
-    })
-}
-
-fn failed_binding_names(effects: &[Effect], failed_indices: &HashSet<usize>) -> HashSet<String> {
-    failed_indices
-        .iter()
-        .filter_map(|idx| effects.get(*idx).and_then(failure_binding_name))
-        .collect()
 }
 
 pub(super) fn is_runtime_dispatchable(effect: &Effect) -> bool {
@@ -285,39 +208,6 @@ mod reads {
 }
 
 use reads::{KnownReads, ReadsSet};
-
-struct CancelSkipCtx<'a> {
-    effects: &'a [Effect],
-    completed: &'a AtomicUsize,
-    total: usize,
-    observer: &'a dyn ExecutionObserver,
-}
-
-fn emit_cancelled_skips(
-    ctx: &CancelSkipCtx<'_>,
-    indices: &[usize],
-    dispatched: &mut HashSet<usize>,
-    completed_indices: &mut HashSet<usize>,
-    skip_count: &mut usize,
-) {
-    for &idx in indices {
-        if dispatched.contains(&idx) {
-            continue;
-        }
-        dispatched.insert(idx);
-        completed_indices.insert(idx);
-        let c = ctx.completed.fetch_add(1, Ordering::Relaxed) + 1;
-        ctx.observer.on_event(&ExecutionEvent::EffectSkipped {
-            effect: &ctx.effects[idx],
-            reason: SKIP_REASON_CANCELLED,
-            progress: ProgressInfo {
-                completed: c,
-                total: ctx.total,
-            },
-        });
-        *skip_count += 1;
-    }
-}
 
 pub(super) struct DependencyAnalysis {
     deps_of: HashMap<usize, HashSet<usize>>,
@@ -805,13 +695,9 @@ pub(super) async fn execute_effects_sequential(
                     completed.fetch_add(1, Ordering::Relaxed) + 1
                 };
                 let reason = if effect.is_wait() {
-                    let detail =
-                        unsatisfiable_reason_message(&UnsatisfiableReason::DependencyFailed {
-                            binding: failed_dep,
-                        });
-                    format!("unsatisfiable: {detail}")
+                    wait_dependency_failed_reason(&failed_dep)
                 } else {
-                    format!("dependency '{}' failed", failed_dep)
+                    dependency_failed_reason(&failed_dep)
                 };
                 observer.on_event(&ExecutionEvent::EffectSkipped {
                     effect: &effect,
@@ -827,51 +713,45 @@ pub(super) async fn execute_effects_sequential(
                 continue;
             }
 
-            if let Some(step) = PureMetaStep::from_effect(&effect) {
-                let dispatch_ctx = PureMetaCtx {
-                    completed: &completed,
-                    total,
-                    observer,
-                };
-                let children = match dispatch_deferred_create(
-                    step.effect,
-                    step.upstream_binding,
-                    step.template,
-                    &input.bindings,
-                    &dispatch_ctx,
-                ) {
-                    DeferredDispatchResult::Materialized(children) => children,
-                    DeferredDispatchResult::MaterializeFailed => {
-                        failure_count += 1;
-                        failed_indices.insert(idx);
-                        completed_indices.insert(idx);
-                        completed_synchronous_dispatch = true;
-                        break;
-                    }
-                };
-                if !children.is_empty() {
-                    total += count_actionable_effects(&children);
-                    for child in children {
-                        let child_idx = effects.len();
-                        if let Effect::Create(resource) = &child {
-                            runtime_synthesized_resources.push(resource.clone());
-                        }
-                        if let Some(binding) = failure_binding_name(&child) {
-                            idx_to_binding.insert(child_idx, binding);
-                        }
-                        effects.push(child);
-                        actionable_indices.push(child_idx);
-                    }
-                    deps_of = build_scheduler_deps(
-                        &effects,
-                        input.unresolved_resources,
-                        input.compositions,
-                        &deferred_replace_delete_deps,
-                    );
+            let dispatch_ctx = PureMetaCtx {
+                completed: &completed,
+                total,
+                observer,
+            };
+            match try_dispatch_pure_meta(&effect, &input.bindings, &dispatch_ctx) {
+                PureMetaOutcome::NotPureMeta => {}
+                PureMetaOutcome::Failed => {
+                    failure_count += 1;
+                    failed_indices.insert(idx);
+                    completed_indices.insert(idx);
+                    completed_synchronous_dispatch = true;
+                    break;
                 }
-                completed_indices.insert(idx);
-                completed_synchronous_dispatch = true;
-                break;
+                PureMetaOutcome::Materialized(children) => {
+                    if !children.is_empty() {
+                        total += count_actionable_effects(&children);
+                        for child in children {
+                            let child_idx = effects.len();
+                            if let Effect::Create(resource) = &child {
+                                runtime_synthesized_resources.push(resource.clone());
+                            }
+                            if let Some(binding) = failure_binding_name(&child) {
+                                idx_to_binding.insert(child_idx, binding);
+                            }
+                            effects.push(child);
+                            actionable_indices.push(child_idx);
+                        }
+                        deps_of = build_scheduler_deps(
+                            &effects,
+                            input.unresolved_resources,
+                            input.compositions,
+                            &deferred_replace_delete_deps,
+                        );
+                    }
+                    completed_indices.insert(idx);
+                    completed_synchronous_dispatch = true;
+                    break;
+                }
             }
 
             // Snapshot bindings for this effect's resolution.
@@ -1024,7 +904,8 @@ pub(super) async fn execute_effects_sequential(
         }
 
         let count_undispatched = |dispatched: &HashSet<usize>, failed_indices: &HashSet<usize>| {
-            let failed_bindings = failed_binding_names(&effects, failed_indices);
+            let failed_bindings =
+                failed_binding_names_for_wait_terminal_check(&effects, failed_indices);
             count_effectively_undispatched(
                 &actionable_indices,
                 dispatched,
@@ -1045,17 +926,18 @@ pub(super) async fn execute_effects_sequential(
                 .filter(|idx| !dispatched.contains(idx))
                 .count();
             if cancelled {
-                emit_cancelled_skips(
-                    &CancelSkipCtx {
-                        effects: &effects,
-                        completed: &completed,
-                        total,
-                        observer,
-                    },
+                let mut progress_for = |_| ProgressInfo {
+                    completed: completed.fetch_add(1, Ordering::Relaxed) + 1,
+                    total,
+                };
+                emit_cancelled_skips_with_progress(
+                    &effects,
                     &actionable_indices,
                     &mut dispatched,
                     &mut completed_indices,
                     &mut skip_count,
+                    observer,
+                    &mut progress_for,
                 );
             } else if remaining > 0 {
                 // Cycle detected: skip remaining effects as failures
@@ -1104,53 +986,23 @@ pub(super) async fn execute_effects_sequential(
 
         // Process the result and update shared state immediately
         match result {
-            SingleEffectResult::Basic(basic) => match basic {
-                BasicEffectResult::Success {
-                    state,
-                    resource_id,
-                    resolved_attrs,
-                    binding,
-                } => {
-                    success_count += 1;
-                    if let Some(state) = state {
-                        if let Some(attrs) = &resolved_attrs {
-                            input
-                                .bindings
-                                .record_applied(binding.as_deref(), attrs, &state);
-                        }
-                        applied_states.insert(resource_id, state);
-                    }
-                }
-                BasicEffectResult::Failure { refresh, .. } => {
-                    failure_count += 1;
-                    failed_indices.insert(finished_idx);
-                    if let Some((id, identifier)) = refresh
-                        && !identifier.is_empty()
-                    {
-                        pending_refreshes.insert(id, identifier);
-                    }
-                }
-                BasicEffectResult::PartialSuccess {
-                    state,
-                    resource_id,
-                    diagnostic,
-                    resolved_attrs,
-                    binding,
-                } => {
-                    partial_count += 1;
-                    if let Some(attrs) = &resolved_attrs {
-                        input
-                            .bindings
-                            .record_applied(binding.as_deref(), attrs, &state);
-                    }
-                    applied_states.insert(resource_id.clone(), state);
-                    partial_diagnostics.push((resource_id, diagnostic));
-                }
-                BasicEffectResult::Deleted { resource_id } => {
-                    success_count += 1;
-                    successfully_deleted.insert(resource_id);
-                }
-            },
+            SingleEffectResult::Basic(basic) => {
+                process_basic_result(
+                    basic,
+                    &mut ExecutionState {
+                        idx: finished_idx,
+                        success_count: &mut success_count,
+                        failure_count: &mut failure_count,
+                        partial_count: &mut partial_count,
+                        partial_diagnostics: &mut partial_diagnostics,
+                        applied_states: &mut applied_states,
+                        failed_indices: &mut failed_indices,
+                        successfully_deleted: &mut successfully_deleted,
+                        pending_refreshes: &mut pending_refreshes,
+                        bindings: &mut input.bindings,
+                    },
+                );
+            }
             SingleEffectResult::Replace {
                 success,
                 state,

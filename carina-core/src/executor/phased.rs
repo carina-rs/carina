@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio_util::sync::CancellationToken;
 
-use crate::deps::{find_failed_dependency, get_resource_dependencies};
+use crate::deps::get_resource_dependencies;
 use crate::effect::Effect;
 use crate::provider::{
     CreateRequest, DeleteRequest, PartialReadDiagnostic, Provider, UpdateOutcome, UpdateRequest,
@@ -19,13 +19,17 @@ use super::basic::{
     count_actionable_effects, execute_basic_effect, process_basic_result, queue_state_refresh,
     refresh_pending_states, resolve_resource, resolve_resource_with_source,
 };
-use super::deferred_dispatch::{DeferredDispatchResult, PureMetaCtx, dispatch_deferred_create};
-use super::parallel::{
-    apply_deferred_replace_delete_deps, expand_deferred_replace_effects, is_runtime_dispatchable,
-};
+use super::deferred_dispatch::PureMetaCtx;
+use super::parallel::{expand_deferred_replace_effects, is_runtime_dispatchable};
 use super::replace::{compute_full_diff_patch, single_attribute_patch};
+use super::scheduler::{
+    PureMetaOutcome, build_phase_scheduler_deps, build_post_replace_wait_scheduler_deps,
+    dependency_failed_reason, emit_cancelled_skips_with_progress,
+    failed_binding_names_for_wait_terminal_check, find_failed_dependency_index,
+    try_dispatch_pure_meta, wait_dependency_failed_reason,
+};
 use super::wait::{
-    AppliedStates, SKIP_REASON_CANCELLED, UnsatisfiableReason, WaitAwareInFlight, WaitOutcome,
+    AppliedStates, SKIP_REASON_CANCELLED, WaitAwareInFlight, WaitOutcome,
     count_effectively_undispatched, resolve_wait_identifier, unsatisfiable_reason_message,
     wait_failure_message,
 };
@@ -33,32 +37,6 @@ use super::{
     ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, ProgressInfo,
     UnresolvedResource,
 };
-
-fn emit_cancelled_skips_with_progress<F>(
-    effects: &[Effect],
-    indices: &[usize],
-    dispatched: &mut HashSet<usize>,
-    completed_indices: &mut HashSet<usize>,
-    skip_count: &mut usize,
-    observer: &dyn ExecutionObserver,
-    mut progress_for: F,
-) where
-    F: FnMut(usize) -> ProgressInfo,
-{
-    for &idx in indices {
-        if dispatched.contains(&idx) {
-            continue;
-        }
-        dispatched.insert(idx);
-        completed_indices.insert(idx);
-        observer.on_event(&ExecutionEvent::EffectSkipped {
-            effect: &effects[idx],
-            reason: SKIP_REASON_CANCELLED,
-            progress: progress_for(idx),
-        });
-        *skip_count += 1;
-    }
-}
 
 /// Check if the plan contains multiple Replace effects that depend on each other.
 pub(super) fn has_interdependent_replaces(effects: &[Effect]) -> bool {
@@ -355,14 +333,12 @@ pub(super) enum PhaseEffectResult {
     },
     /// Phase 2: CBD create failed
     CbdCreateFailure {
-        binding: Option<String>,
         refreshes: Vec<(ResourceId, String)>,
     },
     /// Phase 3: Replace delete succeeded
     ReplaceDeleteSuccess,
     /// Phase 3: Replace delete failed
     ReplaceDeleteFailure {
-        binding: Option<String>,
         refresh: Option<(ResourceId, String)>,
         cbd_refresh: Option<(ResourceId, String)>,
     },
@@ -375,7 +351,7 @@ pub(super) enum PhaseEffectResult {
         binding: Option<String>,
     },
     /// Phase 4: Non-CBD create failed
-    NonCbdCreateFailure { binding: Option<String> },
+    NonCbdCreateFailure,
     /// Phase 4: CBD finalization succeeded
     CbdFinalizeSuccess {
         state: State,
@@ -387,7 +363,6 @@ pub(super) enum PhaseEffectResult {
     CbdFinalizeFailed {
         state: State,
         resource_id: ResourceId,
-        binding: Option<String>,
     },
 }
 
@@ -410,7 +385,7 @@ pub(super) async fn execute_effects_phased(
     let mut partial_diagnostics = Vec::new();
     let mut skip_count = 0;
     let (mut applied_states, wait_identifiers) = AppliedStates::with_initial(&input.current_states);
-    let mut failed_bindings: HashSet<String> = HashSet::new();
+    let mut failed_indices: HashSet<usize> = HashSet::new();
     let mut successfully_deleted: HashSet<ResourceId> = HashSet::new();
     let mut permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
     let mut pending_refreshes: HashMap<ResourceId, String> = HashMap::new();
@@ -441,6 +416,8 @@ pub(super) async fn execute_effects_phased(
         .collect();
     let post_replace_wait_set: HashSet<usize> = post_replace_wait_indices.iter().copied().collect();
     let mut cancelled = false;
+    let phase1_completed_indices_for_later: HashSet<usize>;
+    let mut phase4_completed_indices_for_later: HashSet<usize> = HashSet::new();
 
     // -----------------------------------------------------------------------
     // Phase 1: Non-Replace effects with parallel execution
@@ -466,13 +443,13 @@ pub(super) async fn execute_effects_phased(
             .collect();
 
         let mut phase1_indices = phase1_indices;
-        let mut deps_of = build_phase_dependency_map(
+        let mut deps_of = build_phase_scheduler_deps(
             &effects,
             &phase1_indices,
             input.unresolved_resources,
             input.compositions,
+            &deferred_replace_delete_deps,
         );
-        apply_deferred_replace_delete_deps(&mut deps_of, &deferred_replace_delete_deps);
         let mut completed_indices: HashSet<usize> = HashSet::new();
         let mut dispatched: HashSet<usize> = HashSet::new();
         let mut in_flight: WaitAwareInFlight<'_, PhaseEffectResult> = WaitAwareInFlight::new();
@@ -509,20 +486,18 @@ pub(super) async fn execute_effects_phased(
                 dispatched.insert(idx);
                 let effect = effects[idx].clone();
 
-                if let Some(failed_dep) = find_failed_dependency(&effect, &failed_bindings) {
+                if let Some(failed_dep) =
+                    find_failed_dependency_index(idx, &deps_of, &failed_indices, &effects)
+                {
                     let c = if effect.is_scheduler_meta() {
                         completed.load(Ordering::Relaxed)
                     } else {
                         completed.fetch_add(1, Ordering::Relaxed) + 1
                     };
                     let reason = if effect.is_wait() {
-                        let detail =
-                            unsatisfiable_reason_message(&UnsatisfiableReason::DependencyFailed {
-                                binding: failed_dep,
-                            });
-                        format!("unsatisfiable: {detail}")
+                        wait_dependency_failed_reason(&failed_dep)
                     } else {
-                        format!("dependency '{}' failed", failed_dep)
+                        dependency_failed_reason(&failed_dep)
                     };
                     observer.on_event(&ExecutionEvent::EffectSkipped {
                         effect: &effect,
@@ -533,117 +508,48 @@ pub(super) async fn execute_effects_phased(
                         },
                     });
                     skip_count += 1;
-                    if let Some(binding) = effect.binding_name() {
-                        failed_bindings.insert(binding);
-                    }
+                    failed_indices.insert(idx);
                     completed_indices.insert(idx);
                     continue;
                 }
 
-                if let Effect::DeferredCreate {
-                    upstream_binding,
-                    template,
-                    ..
-                } = &effect
-                {
-                    let dispatch_ctx = PureMetaCtx {
-                        completed: &completed,
-                        total,
-                        observer,
-                    };
-                    let children = match dispatch_deferred_create(
-                        &effect,
-                        upstream_binding,
-                        template,
-                        &input.bindings,
-                        &dispatch_ctx,
-                    ) {
-                        DeferredDispatchResult::Materialized(children) => children,
-                        DeferredDispatchResult::MaterializeFailed => {
-                            failure_count += 1;
-                            failed_bindings.insert(template.binding_name.clone());
-                            completed_indices.insert(idx);
-                            completed_synchronous_dispatch = true;
-                            break;
-                        }
-                    };
-                    if !children.is_empty() {
-                        total += count_actionable_effects(&children);
-                        for child in children {
-                            let child_idx = effects.len();
-                            if let Effect::Create(resource) = &child {
-                                runtime_synthesized_resources.push(resource.clone());
-                            }
-                            effects.push(child);
-                            phase1_indices.push(child_idx);
-                        }
-                        deps_of = build_phase_dependency_map(
-                            &effects,
-                            &phase1_indices,
-                            input.unresolved_resources,
-                            input.compositions,
-                        );
-                        apply_deferred_replace_delete_deps(
-                            &mut deps_of,
-                            &deferred_replace_delete_deps,
-                        );
+                let dispatch_ctx = PureMetaCtx {
+                    completed: &completed,
+                    total,
+                    observer,
+                };
+                match try_dispatch_pure_meta(&effect, &input.bindings, &dispatch_ctx) {
+                    PureMetaOutcome::NotPureMeta => {}
+                    PureMetaOutcome::Failed => {
+                        failure_count += 1;
+                        failed_indices.insert(idx);
+                        completed_indices.insert(idx);
+                        completed_synchronous_dispatch = true;
+                        break;
                     }
-                    completed_indices.insert(idx);
-                    completed_synchronous_dispatch = true;
-                    break;
-                }
-
-                if let Effect::DeferredReplace {
-                    upstream_binding,
-                    template,
-                    ..
-                } = &effect
-                {
-                    let dispatch_ctx = PureMetaCtx {
-                        completed: &completed,
-                        total,
-                        observer,
-                    };
-                    let children = match dispatch_deferred_create(
-                        &effect,
-                        upstream_binding,
-                        template,
-                        &input.bindings,
-                        &dispatch_ctx,
-                    ) {
-                        DeferredDispatchResult::Materialized(children) => children,
-                        DeferredDispatchResult::MaterializeFailed => {
-                            failure_count += 1;
-                            failed_bindings.insert(template.binding_name.clone());
-                            completed_indices.insert(idx);
-                            completed_synchronous_dispatch = true;
-                            break;
-                        }
-                    };
-                    if !children.is_empty() {
-                        total += count_actionable_effects(&children);
-                        for child in children {
-                            let child_idx = effects.len();
-                            if let Effect::Create(resource) = &child {
-                                runtime_synthesized_resources.push(resource.clone());
+                    PureMetaOutcome::Materialized(children) => {
+                        if !children.is_empty() {
+                            total += count_actionable_effects(&children);
+                            for child in children {
+                                let child_idx = effects.len();
+                                if let Effect::Create(resource) = &child {
+                                    runtime_synthesized_resources.push(resource.clone());
+                                }
+                                effects.push(child);
+                                phase1_indices.push(child_idx);
                             }
-                            effects.push(child);
-                            phase1_indices.push(child_idx);
+                            deps_of = build_phase_scheduler_deps(
+                                &effects,
+                                &phase1_indices,
+                                input.unresolved_resources,
+                                input.compositions,
+                                &deferred_replace_delete_deps,
+                            );
                         }
-                        deps_of = build_phase_dependency_map(
-                            &effects,
-                            &phase1_indices,
-                            input.unresolved_resources,
-                            input.compositions,
-                        );
-                        apply_deferred_replace_delete_deps(
-                            &mut deps_of,
-                            &deferred_replace_delete_deps,
-                        );
+                        completed_indices.insert(idx);
+                        completed_synchronous_dispatch = true;
+                        break;
                     }
-                    completed_indices.insert(idx);
-                    completed_synchronous_dispatch = true;
-                    break;
                 }
 
                 if let Effect::Wait {
@@ -752,22 +658,27 @@ pub(super) async fn execute_effects_phased(
                 continue;
             }
 
-            let count_undispatched =
-                |dispatched: &HashSet<usize>, failed_bindings: &HashSet<String>| {
-                    count_effectively_undispatched(
-                        &phase1_indices,
-                        dispatched,
-                        &effects,
-                        failed_bindings,
-                    )
-                };
+            let failed_binding_name_set =
+                failed_binding_names_for_wait_terminal_check(&effects, &failed_indices);
+            let count_undispatched = |dispatched: &HashSet<usize>| {
+                count_effectively_undispatched(
+                    &phase1_indices,
+                    dispatched,
+                    &effects,
+                    &failed_binding_name_set,
+                )
+            };
             in_flight
-                .check_terminal(count_undispatched(&dispatched, &failed_bindings))
+                .check_terminal(count_undispatched(&dispatched))
                 .cancel_if_terminal()
                 .drop_without_awaiting();
 
             if in_flight.is_empty() {
                 if cancelled {
+                    let mut progress_for = |_| ProgressInfo {
+                        completed: completed.fetch_add(1, Ordering::Relaxed) + 1,
+                        total,
+                    };
                     emit_cancelled_skips_with_progress(
                         &effects,
                         &phase1_indices,
@@ -775,10 +686,7 @@ pub(super) async fn execute_effects_phased(
                         &mut completed_indices,
                         &mut skip_count,
                         observer,
-                        |_| ProgressInfo {
-                            completed: completed.fetch_add(1, Ordering::Relaxed) + 1,
-                            total,
-                        },
+                        &mut progress_for,
                     );
                 }
                 break;
@@ -786,7 +694,7 @@ pub(super) async fn execute_effects_phased(
 
             let (finished_idx, result) = if cancelled {
                 let Some(finished) = in_flight
-                    .check_terminal(count_undispatched(&dispatched, &failed_bindings))
+                    .check_terminal(count_undispatched(&dispatched))
                     .cancel_if_terminal()
                     .next_completed()
                     .await
@@ -803,7 +711,7 @@ pub(super) async fn execute_effects_phased(
                         continue;
                     }
                     finished = in_flight
-                        .check_terminal(count_undispatched(&dispatched, &failed_bindings))
+                        .check_terminal(count_undispatched(&dispatched))
                         .cancel_if_terminal()
                         .next_completed() => {
                         let Some(finished) = finished else {
@@ -820,12 +728,13 @@ pub(super) async fn execute_effects_phased(
                     process_basic_result(
                         basic,
                         &mut ExecutionState {
+                            idx: finished_idx,
                             success_count: &mut success_count,
                             failure_count: &mut failure_count,
                             partial_count: &mut partial_count,
                             partial_diagnostics: &mut partial_diagnostics,
                             applied_states: &mut applied_states,
-                            failed_bindings: &mut failed_bindings,
+                            failed_indices: &mut failed_indices,
                             successfully_deleted: &mut successfully_deleted,
                             pending_refreshes: &mut pending_refreshes,
                             bindings: &mut input.bindings,
@@ -866,7 +775,7 @@ pub(super) async fn execute_effects_phased(
                             progress,
                         });
                         skip_count += 1;
-                        failed_bindings.insert(binding);
+                        failed_indices.insert(finished_idx);
                     }
                     WaitOutcome::Cancelled => {
                         observer.on_event(&ExecutionEvent::EffectSkipped {
@@ -888,16 +797,17 @@ pub(super) async fn execute_effects_phased(
                             progress,
                         });
                         failure_count += 1;
-                        failed_bindings.insert(binding);
+                        failed_indices.insert(finished_idx);
                     }
                 },
                 _ => unreachable!(),
             }
             in_flight
-                .check_terminal(count_undispatched(&dispatched, &failed_bindings))
+                .check_terminal(count_undispatched(&dispatched))
                 .cancel_if_terminal()
                 .drop_without_awaiting();
         }
+        phase1_completed_indices_for_later = completed_indices;
     }
     // -----------------------------------------------------------------------
     // Phase 2: CBD creates with parallel execution (forward dependency order)
@@ -977,16 +887,16 @@ pub(super) async fn execute_effects_phased(
                 let effect = &effects[idx];
                 let progress = replace_progress[&idx];
 
-                if let Some(failed_dep) = find_failed_dependency(effect, &failed_bindings) {
-                    let reason = format!("dependency '{}' failed", failed_dep);
+                if let Some(failed_dep) =
+                    find_failed_dependency_index(idx, &deps_of, &failed_indices, &effects)
+                {
+                    let reason = dependency_failed_reason(&failed_dep);
                     observer.on_event(&ExecutionEvent::EffectSkipped {
                         effect,
                         reason: &reason,
                         progress,
                     });
-                    if let Some(binding) = effect.binding_name() {
-                        failed_bindings.insert(binding);
-                    }
+                    failed_indices.insert(idx);
                     completed_indices.insert(idx);
                     continue;
                 }
@@ -1033,7 +943,6 @@ pub(super) async fn execute_effects_phased(
                                     idx,
                                     started,
                                     PhaseEffectResult::Basic(BasicEffectResult::Failure {
-                                        binding: effect.binding_name(),
                                         refresh: None,
                                     }),
                                 );
@@ -1161,10 +1070,7 @@ pub(super) async fn execute_effects_phased(
                                     (
                                         idx,
                                         started,
-                                        PhaseEffectResult::CbdCreateFailure {
-                                            binding: effect.binding_name(),
-                                            refreshes,
-                                        },
+                                        PhaseEffectResult::CbdCreateFailure { refreshes },
                                     )
                                 } else {
                                     (
@@ -1192,7 +1098,6 @@ pub(super) async fn execute_effects_phased(
                                     idx,
                                     started,
                                     PhaseEffectResult::CbdCreateFailure {
-                                        binding: effect.binding_name(),
                                         refreshes: Vec::new(),
                                     },
                                 )
@@ -1206,6 +1111,7 @@ pub(super) async fn execute_effects_phased(
 
             if in_flight.is_empty() {
                 if cancelled {
+                    let mut progress_for = |idx| replace_progress[&idx];
                     emit_cancelled_skips_with_progress(
                         &effects,
                         &cbd_indices,
@@ -1213,7 +1119,7 @@ pub(super) async fn execute_effects_phased(
                         &mut completed_indices,
                         &mut skip_count,
                         observer,
-                        |idx| replace_progress[&idx],
+                        &mut progress_for,
                     );
                 }
                 break;
@@ -1269,13 +1175,9 @@ pub(super) async fn execute_effects_phased(
                     replace_start_times.insert(idx, started);
                     cbd_create_states.insert(idx, state);
                 }
-                PhaseEffectResult::CbdCreateFailure {
-                    binding, refreshes, ..
-                } => {
+                PhaseEffectResult::CbdCreateFailure { refreshes, .. } => {
                     failure_count += 1;
-                    if let Some(binding) = binding {
-                        failed_bindings.insert(binding);
-                    }
+                    failed_indices.insert(finished_idx);
                     for (id, identifier) in refreshes {
                         queue_state_refresh(&mut pending_refreshes, &id, Some(&identifier));
                     }
@@ -1284,12 +1186,13 @@ pub(super) async fn execute_effects_phased(
                     process_basic_result(
                         basic,
                         &mut ExecutionState {
+                            idx: finished_idx,
                             success_count: &mut success_count,
                             failure_count: &mut failure_count,
                             partial_count: &mut partial_count,
                             partial_diagnostics: &mut partial_diagnostics,
                             applied_states: &mut applied_states,
-                            failed_bindings: &mut failed_bindings,
+                            failed_indices: &mut failed_indices,
                             successfully_deleted: &mut successfully_deleted,
                             pending_refreshes: &mut pending_refreshes,
                             bindings: &mut input.bindings,
@@ -1304,6 +1207,12 @@ pub(super) async fn execute_effects_phased(
     // Phase 3: All deletes with parallel execution (reverse dependency order)
     // -----------------------------------------------------------------------
     if !cancelled {
+        let replace_deps_of = build_phase_dependency_map(
+            &effects,
+            &sorted_indices,
+            input.unresolved_resources,
+            input.compositions,
+        );
         // Collect indices for deletes that should execute: all Replace effects
         // that haven't been failed/skipped. For CBD, skip if create phase failed.
         let delete_indices: Vec<usize> = sorted_indices
@@ -1314,7 +1223,14 @@ pub(super) async fn execute_effects_phased(
                 let effect = &effects[idx];
                 if let Effect::Replace { directives, .. } = effect {
                     // Skip if dependency failed
-                    if find_failed_dependency(effect, &failed_bindings).is_some() {
+                    if find_failed_dependency_index(
+                        idx,
+                        &replace_deps_of,
+                        &failed_indices,
+                        &effects,
+                    )
+                    .is_some()
+                    {
                         return false;
                     }
                     // For CBD, skip if create didn't succeed
@@ -1330,26 +1246,12 @@ pub(super) async fn execute_effects_phased(
 
         // For phase 3, dependencies are reversed: dependents should delete before parents.
         // Build a reverse dependency map for the delete phase.
-        let phase_set: HashSet<usize> = delete_indices.iter().copied().collect();
-        let mut binding_to_idx: HashMap<String, usize> = HashMap::new();
-        for &idx in &delete_indices {
-            if let Some(binding) = effects[idx].binding_name() {
-                binding_to_idx.insert(binding, idx);
-            }
-        }
-        let resolver = DepResolver::new(&binding_to_idx, input.compositions, Some(&phase_set));
-        let mut deps_of: HashMap<usize, HashSet<usize>> = HashMap::new();
-        for &idx in &delete_indices {
-            let effect = &effects[idx];
-            let mut dep_indices = HashSet::new();
-            if effect.as_resource_ref().is_some() {
-                resolver.collect_from_effect(effect, &mut dep_indices);
-                if let Some(unresolved) = input.unresolved_resources.get(effect.resource_id()) {
-                    resolver.collect_from_resource(unresolved.as_resource(), &mut dep_indices);
-                }
-            }
-            deps_of.insert(idx, dep_indices);
-        }
+        let deps_of = build_phase_dependency_map(
+            &effects,
+            &delete_indices,
+            input.unresolved_resources,
+            input.compositions,
+        );
 
         // For reverse order: swap the dependency direction.
         // In forward order, parent has no deps, child depends on parent.
@@ -1457,7 +1359,6 @@ pub(super) async fn execute_effects_phased(
                                 (
                                     idx,
                                     PhaseEffectResult::ReplaceDeleteFailure {
-                                        binding: effect.binding_name(),
                                         refresh: Some((id.clone(), identifier.to_string())),
                                         cbd_refresh: cbd_refresh_info,
                                     },
@@ -1472,6 +1373,7 @@ pub(super) async fn execute_effects_phased(
 
             if in_flight.is_empty() {
                 if cancelled {
+                    let mut progress_for = |idx| replace_progress[&idx];
                     emit_cancelled_skips_with_progress(
                         &effects,
                         &delete_indices,
@@ -1479,7 +1381,7 @@ pub(super) async fn execute_effects_phased(
                         &mut completed_indices,
                         &mut skip_count,
                         observer,
-                        |idx| replace_progress[&idx],
+                        &mut progress_for,
                     );
                 }
                 break;
@@ -1504,14 +1406,11 @@ pub(super) async fn execute_effects_phased(
                     // Delete succeeded, will be finalized in phase 4
                 }
                 PhaseEffectResult::ReplaceDeleteFailure {
-                    binding,
                     refresh,
                     cbd_refresh,
                 } => {
                     failure_count += 1;
-                    if let Some(binding) = binding {
-                        failed_bindings.insert(binding);
-                    }
+                    failed_indices.insert(finished_idx);
                     if let Some((id, identifier)) = refresh {
                         queue_state_refresh(&mut pending_refreshes, &id, Some(&identifier));
                     }
@@ -1554,14 +1453,23 @@ pub(super) async fn execute_effects_phased(
         ));
         phase4_indices.sort();
 
-        let mut deps_of = build_phase_dependency_map(
+        let phase4_set: HashSet<usize> = phase4_indices.iter().copied().collect();
+        let phase4_pre_completed_indices: HashSet<usize> = deferred_replace_delete_deps
+            .iter()
+            .filter_map(|&(gate_idx, delete_idx)| {
+                (phase4_set.contains(&gate_idx)
+                    && phase1_completed_indices_for_later.contains(&delete_idx))
+                .then_some(delete_idx)
+            })
+            .collect();
+        let mut deps_of = build_phase_scheduler_deps(
             &effects,
             &phase4_indices,
             input.unresolved_resources,
             input.compositions,
+            &deferred_replace_delete_deps,
         );
-        apply_deferred_replace_delete_deps(&mut deps_of, &deferred_replace_delete_deps);
-        let mut completed_indices: HashSet<usize> = HashSet::new();
+        let mut completed_indices: HashSet<usize> = phase4_pre_completed_indices;
         let mut dispatched: HashSet<usize> = HashSet::new();
         type PhaseFuture<'a> =
             std::pin::Pin<Box<dyn std::future::Future<Output = (usize, PhaseEffectResult)> + 'a>>;
@@ -1601,8 +1509,10 @@ pub(super) async fn execute_effects_phased(
                 dispatched.insert(idx);
                 let effect = effects[idx].clone();
 
-                if let Some(failed_dep) = find_failed_dependency(&effect, &failed_bindings) {
-                    let reason = format!("dependency '{}' failed", failed_dep);
+                if let Some(failed_dep) =
+                    find_failed_dependency_index(idx, &deps_of, &failed_indices, &effects)
+                {
+                    let reason = dependency_failed_reason(&failed_dep);
                     let progress =
                         replace_progress
                             .get(&idx)
@@ -1616,125 +1526,48 @@ pub(super) async fn execute_effects_phased(
                         reason: &reason,
                         progress,
                     });
-                    if let Some(binding) = effect.binding_name() {
-                        failed_bindings.insert(binding);
-                    }
+                    failed_indices.insert(idx);
                     completed_indices.insert(idx);
                     continue;
                 }
 
-                if let Effect::DeferredCreate {
-                    upstream_binding,
-                    template,
-                    ..
-                } = &effect
-                {
-                    let dispatch_ctx = PureMetaCtx {
-                        completed: &completed,
-                        total,
-                        observer,
-                    };
-                    let children = match dispatch_deferred_create(
-                        &effect,
-                        upstream_binding,
-                        template,
-                        &input.bindings,
-                        &dispatch_ctx,
-                    ) {
-                        DeferredDispatchResult::Materialized(children) => children,
-                        DeferredDispatchResult::MaterializeFailed => {
-                            failure_count += 1;
-                            failed_bindings.insert(template.binding_name.clone());
-                            completed_indices.insert(idx);
-                            completed_synchronous_dispatch = true;
-                            break;
-                        }
-                    };
-                    if !children.is_empty() {
-                        total += count_actionable_effects(&children);
-                        for child in children {
-                            let child_idx = effects.len();
-                            if let Effect::Create(resource) = &child {
-                                runtime_synthesized_resources.push(resource.clone());
-                                debug_assert!(
-                                    resource.dependency_bindings.contains(upstream_binding),
-                                    "apply-time deferred-for child must retain iterable dependency"
-                                );
-                            }
-                            effects.push(child);
-                            phase4_indices.push(child_idx);
-                        }
-                        deps_of = build_phase_dependency_map(
-                            &effects,
-                            &phase4_indices,
-                            input.unresolved_resources,
-                            input.compositions,
-                        );
-                        apply_deferred_replace_delete_deps(
-                            &mut deps_of,
-                            &deferred_replace_delete_deps,
-                        );
+                let dispatch_ctx = PureMetaCtx {
+                    completed: &completed,
+                    total,
+                    observer,
+                };
+                match try_dispatch_pure_meta(&effect, &input.bindings, &dispatch_ctx) {
+                    PureMetaOutcome::NotPureMeta => {}
+                    PureMetaOutcome::Failed => {
+                        failure_count += 1;
+                        failed_indices.insert(idx);
+                        completed_indices.insert(idx);
+                        completed_synchronous_dispatch = true;
+                        break;
                     }
-                    completed_indices.insert(idx);
-                    completed_synchronous_dispatch = true;
-                    break;
-                }
-
-                if let Effect::DeferredReplace {
-                    upstream_binding,
-                    template,
-                    ..
-                } = &effect
-                {
-                    let dispatch_ctx = PureMetaCtx {
-                        completed: &completed,
-                        total,
-                        observer,
-                    };
-                    let children = match dispatch_deferred_create(
-                        &effect,
-                        upstream_binding,
-                        template,
-                        &input.bindings,
-                        &dispatch_ctx,
-                    ) {
-                        DeferredDispatchResult::Materialized(children) => children,
-                        DeferredDispatchResult::MaterializeFailed => {
-                            failure_count += 1;
-                            failed_bindings.insert(template.binding_name.clone());
-                            completed_indices.insert(idx);
-                            completed_synchronous_dispatch = true;
-                            break;
-                        }
-                    };
-                    if !children.is_empty() {
-                        total += count_actionable_effects(&children);
-                        for child in children {
-                            let child_idx = effects.len();
-                            if let Effect::Create(resource) = &child {
-                                runtime_synthesized_resources.push(resource.clone());
-                                debug_assert!(
-                                    resource.dependency_bindings.contains(upstream_binding),
-                                    "apply-time deferred-for child must retain iterable dependency"
-                                );
+                    PureMetaOutcome::Materialized(children) => {
+                        if !children.is_empty() {
+                            total += count_actionable_effects(&children);
+                            for child in children {
+                                let child_idx = effects.len();
+                                if let Effect::Create(resource) = &child {
+                                    runtime_synthesized_resources.push(resource.clone());
+                                }
+                                effects.push(child);
+                                phase4_indices.push(child_idx);
                             }
-                            effects.push(child);
-                            phase4_indices.push(child_idx);
+                            deps_of = build_phase_scheduler_deps(
+                                &effects,
+                                &phase4_indices,
+                                input.unresolved_resources,
+                                input.compositions,
+                                &deferred_replace_delete_deps,
+                            );
                         }
-                        deps_of = build_phase_dependency_map(
-                            &effects,
-                            &phase4_indices,
-                            input.unresolved_resources,
-                            input.compositions,
-                        );
-                        apply_deferred_replace_delete_deps(
-                            &mut deps_of,
-                            &deferred_replace_delete_deps,
-                        );
+                        completed_indices.insert(idx);
+                        completed_synchronous_dispatch = true;
+                        break;
                     }
-                    completed_indices.insert(idx);
-                    completed_synchronous_dispatch = true;
-                    break;
                 }
 
                 if effect.as_basic().is_some() {
@@ -1890,7 +1723,6 @@ pub(super) async fn execute_effects_phased(
                                             PhaseEffectResult::CbdFinalizeFailed {
                                                 state,
                                                 resource_id: to.id.clone(),
-                                                binding: effect_for_future.binding_name(),
                                             },
                                         )
                                     }
@@ -1939,9 +1771,7 @@ pub(super) async fn execute_effects_phased(
                         }));
                     } else {
                         // Non-CBD: skip if own delete failed
-                        if let Some(binding) = effect.binding_name()
-                            && failed_bindings.contains(&binding)
-                        {
+                        if failed_indices.contains(&idx) {
                             completed_indices.insert(idx);
                             continue;
                         }
@@ -1973,7 +1803,6 @@ pub(super) async fn execute_effects_phased(
                                         return (
                                             idx,
                                             PhaseEffectResult::Basic(BasicEffectResult::Failure {
-                                                binding: effect_for_future.binding_name(),
                                                 refresh: None,
                                             }),
                                         );
@@ -2035,12 +1864,7 @@ pub(super) async fn execute_effects_phased(
                                             duration: started.elapsed(),
                                             progress,
                                         });
-                                        (
-                                            idx,
-                                            PhaseEffectResult::NonCbdCreateFailure {
-                                                binding: effect_for_future.binding_name(),
-                                            },
-                                        )
+                                        (idx, PhaseEffectResult::NonCbdCreateFailure)
                                     }
                                 }
                             } else {
@@ -2057,6 +1881,15 @@ pub(super) async fn execute_effects_phased(
 
             if in_flight.is_empty() {
                 if cancelled {
+                    let mut progress_for = |idx| {
+                        replace_progress
+                            .get(&idx)
+                            .copied()
+                            .unwrap_or_else(|| ProgressInfo {
+                                completed: completed.fetch_add(1, Ordering::Relaxed) + 1,
+                                total,
+                            })
+                    };
                     emit_cancelled_skips_with_progress(
                         &effects,
                         &phase4_indices,
@@ -2064,15 +1897,7 @@ pub(super) async fn execute_effects_phased(
                         &mut completed_indices,
                         &mut skip_count,
                         observer,
-                        |idx| {
-                            replace_progress
-                                .get(&idx)
-                                .copied()
-                                .unwrap_or_else(|| ProgressInfo {
-                                    completed: completed.fetch_add(1, Ordering::Relaxed) + 1,
-                                    total,
-                                })
-                        },
+                        &mut progress_for,
                     );
                 }
                 break;
@@ -2114,18 +1939,12 @@ pub(super) async fn execute_effects_phased(
                         permanent_name_overrides.insert(id, overrides);
                     }
                 }
-                PhaseEffectResult::CbdFinalizeFailed {
-                    state,
-                    resource_id,
-                    binding,
-                } => {
+                PhaseEffectResult::CbdFinalizeFailed { state, resource_id } => {
                     cbd_create_states.remove(&finished_idx);
                     cbd_create_diagnostics.remove(&finished_idx);
                     failure_count += 1;
                     applied_states.insert(resource_id, state);
-                    if let Some(binding) = binding {
-                        failed_bindings.insert(binding);
-                    }
+                    failed_indices.insert(finished_idx);
                 }
                 PhaseEffectResult::NonCbdCreateSuccess {
                     state,
@@ -2145,22 +1964,21 @@ pub(super) async fn execute_effects_phased(
                         .bindings
                         .record_applied(binding.as_deref(), &resolved_attrs, &state);
                 }
-                PhaseEffectResult::NonCbdCreateFailure { binding } => {
+                PhaseEffectResult::NonCbdCreateFailure => {
                     failure_count += 1;
-                    if let Some(binding) = binding {
-                        failed_bindings.insert(binding);
-                    }
+                    failed_indices.insert(finished_idx);
                 }
                 PhaseEffectResult::Basic(basic) => {
                     process_basic_result(
                         basic,
                         &mut ExecutionState {
+                            idx: finished_idx,
                             success_count: &mut success_count,
                             failure_count: &mut failure_count,
                             partial_count: &mut partial_count,
                             partial_diagnostics: &mut partial_diagnostics,
                             applied_states: &mut applied_states,
-                            failed_bindings: &mut failed_bindings,
+                            failed_indices: &mut failed_indices,
                             successfully_deleted: &mut successfully_deleted,
                             pending_refreshes: &mut pending_refreshes,
                             bindings: &mut input.bindings,
@@ -2170,19 +1988,30 @@ pub(super) async fn execute_effects_phased(
                 _ => unreachable!(),
             }
         }
+        phase4_completed_indices_for_later = completed_indices;
     }
 
     // -----------------------------------------------------------------------
     // Phase 5: Waits whose targets were replaced in this phased run
     // -----------------------------------------------------------------------
     if !cancelled && !post_replace_wait_indices.is_empty() {
-        let deps_of = build_phase_dependency_map(
+        let deps_of = build_post_replace_wait_scheduler_deps(
             &effects,
             &post_replace_wait_indices,
             input.unresolved_resources,
             input.compositions,
         );
-        let mut completed_indices: HashSet<usize> = HashSet::new();
+        let post_replace_wait_set: HashSet<usize> =
+            post_replace_wait_indices.iter().copied().collect();
+        let mut completed_indices: HashSet<usize> = deps_of
+            .values()
+            .flat_map(|deps| deps.iter().copied())
+            .filter(|dep_idx| {
+                !post_replace_wait_set.contains(dep_idx)
+                    && (phase4_completed_indices_for_later.contains(dep_idx)
+                        || failed_indices.contains(dep_idx))
+            })
+            .collect();
         let mut dispatched: HashSet<usize> = HashSet::new();
         let mut in_flight: WaitAwareInFlight<'_, PhaseEffectResult> = WaitAwareInFlight::new();
 
@@ -2215,13 +2044,11 @@ pub(super) async fn execute_effects_phased(
                 dispatched.insert(idx);
                 let effect = &effects[idx];
 
-                if let Some(failed_dep) = find_failed_dependency(effect, &failed_bindings) {
+                if let Some(failed_dep) =
+                    find_failed_dependency_index(idx, &deps_of, &failed_indices, &effects)
+                {
                     let c = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                    let detail =
-                        unsatisfiable_reason_message(&UnsatisfiableReason::DependencyFailed {
-                            binding: failed_dep,
-                        });
-                    let reason = format!("unsatisfiable: {detail}");
+                    let reason = wait_dependency_failed_reason(&failed_dep);
                     observer.on_event(&ExecutionEvent::EffectSkipped {
                         effect,
                         reason: &reason,
@@ -2231,9 +2058,7 @@ pub(super) async fn execute_effects_phased(
                         },
                     });
                     skip_count += 1;
-                    if let Some(binding) = effect.binding_name() {
-                        failed_bindings.insert(binding);
-                    }
+                    failed_indices.insert(idx);
                     completed_indices.insert(idx);
                     continue;
                 }
@@ -2285,22 +2110,27 @@ pub(super) async fn execute_effects_phased(
                 }
             }
 
-            let count_undispatched =
-                |dispatched: &HashSet<usize>, failed_bindings: &HashSet<String>| {
-                    count_effectively_undispatched(
-                        &post_replace_wait_indices,
-                        dispatched,
-                        &effects,
-                        failed_bindings,
-                    )
-                };
+            let failed_binding_name_set =
+                failed_binding_names_for_wait_terminal_check(&effects, &failed_indices);
+            let count_undispatched = |dispatched: &HashSet<usize>| {
+                count_effectively_undispatched(
+                    &post_replace_wait_indices,
+                    dispatched,
+                    &effects,
+                    &failed_binding_name_set,
+                )
+            };
             in_flight
-                .check_terminal(count_undispatched(&dispatched, &failed_bindings))
+                .check_terminal(count_undispatched(&dispatched))
                 .cancel_if_terminal()
                 .drop_without_awaiting();
 
             if in_flight.is_empty() {
                 if cancelled {
+                    let mut progress_for = |_| ProgressInfo {
+                        completed: completed.fetch_add(1, Ordering::Relaxed) + 1,
+                        total,
+                    };
                     emit_cancelled_skips_with_progress(
                         &effects,
                         &post_replace_wait_indices,
@@ -2308,10 +2138,7 @@ pub(super) async fn execute_effects_phased(
                         &mut completed_indices,
                         &mut skip_count,
                         observer,
-                        |_| ProgressInfo {
-                            completed: completed.fetch_add(1, Ordering::Relaxed) + 1,
-                            total,
-                        },
+                        &mut progress_for,
                     );
                 }
                 break;
@@ -2319,7 +2146,7 @@ pub(super) async fn execute_effects_phased(
 
             let (finished_idx, result) = if cancelled {
                 let Some(finished) = in_flight
-                    .check_terminal(count_undispatched(&dispatched, &failed_bindings))
+                    .check_terminal(count_undispatched(&dispatched))
                     .cancel_if_terminal()
                     .next_completed()
                     .await
@@ -2336,7 +2163,7 @@ pub(super) async fn execute_effects_phased(
                         continue;
                     }
                     finished = in_flight
-                        .check_terminal(count_undispatched(&dispatched, &failed_bindings))
+                        .check_terminal(count_undispatched(&dispatched))
                         .cancel_if_terminal()
                         .next_completed() => {
                         let Some(finished) = finished else {
@@ -2383,7 +2210,7 @@ pub(super) async fn execute_effects_phased(
                             progress,
                         });
                         skip_count += 1;
-                        failed_bindings.insert(binding);
+                        failed_indices.insert(finished_idx);
                     }
                     WaitOutcome::Cancelled => {
                         observer.on_event(&ExecutionEvent::EffectSkipped {
@@ -2405,7 +2232,7 @@ pub(super) async fn execute_effects_phased(
                             progress,
                         });
                         failure_count += 1;
-                        failed_bindings.insert(binding);
+                        failed_indices.insert(finished_idx);
                     }
                 },
                 _ => unreachable!(),
