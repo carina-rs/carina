@@ -15,7 +15,7 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::Barrier;
+use tokio::sync::{Barrier, Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 fn validation_deferred_for_expression() -> crate::parser::DeferredForExpression {
@@ -6440,6 +6440,283 @@ async fn dispatch_deferred_replace_short_circuits_on_delete_failure() {
         "create half must not dispatch after delete failure; calls: {:?}",
         provider.calls()
     );
+}
+
+#[tokio::test]
+async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_normalizer() {
+    #[derive(Clone)]
+    struct LockOrderScenario {
+        aws_normalize: Arc<AsyncMutex<()>>,
+        awscc_shared: Arc<AsyncMutex<()>>,
+        alb_waiting_for_awscc: Arc<Notify>,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl LockOrderScenario {
+        fn new() -> Self {
+            Self {
+                aws_normalize: Arc::new(AsyncMutex::new(())),
+                awscc_shared: Arc::new(AsyncMutex::new(())),
+                alb_waiting_for_awscc: Arc::new(Notify::new()),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn record(&self, call: impl Into<String>) {
+            self.calls.lock().unwrap().push(call.into());
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[derive(Clone)]
+    struct LockOrderNormalizer {
+        scenario: LockOrderScenario,
+    }
+
+    impl crate::provider::ProviderNormalizer for LockOrderNormalizer {
+        fn normalize_desired<'a>(&'a self, resources: &'a mut [Resource]) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                let is_alb = resources
+                    .iter()
+                    .any(|resource| resource.id.name_str() == "alb");
+                {
+                    let _aws = self.scenario.aws_normalize.lock().await;
+                    tokio::task::yield_now().await;
+                }
+                if is_alb {
+                    self.scenario.record("alb-normalize-wait-awscc");
+                    self.scenario.alb_waiting_for_awscc.notify_one();
+                }
+                let _awscc = self.scenario.awscc_shared.lock().await;
+                tokio::task::yield_now().await;
+            })
+        }
+
+        fn normalize_state<'a>(
+            &'a self,
+            _current_states: &'a mut HashMap<ResourceId, State>,
+        ) -> BoxFuture<'a, ()> {
+            crate::provider::ready_noop()
+        }
+
+        fn hydrate_read_state<'a>(
+            &'a self,
+            _current_states: &'a mut HashMap<ResourceId, State>,
+            _saved_attrs: &'a crate::provider::SavedAttrs,
+        ) -> BoxFuture<'a, ()> {
+            crate::provider::ready_noop()
+        }
+
+        fn merge_default_tags<'a>(
+            &'a self,
+            _resources: &'a mut [Resource],
+            _default_tags: &'a indexmap::IndexMap<String, Value>,
+            _registry: &'a crate::schema::SchemaRegistry,
+        ) -> BoxFuture<'a, ()> {
+            crate::provider::ready_noop()
+        }
+    }
+
+    #[derive(Clone)]
+    struct LockOrderProvider {
+        scenario: LockOrderScenario,
+    }
+
+    impl LockOrderProvider {
+        async fn create_state(
+            &self,
+            id: &ResourceId,
+        ) -> ProviderResult<crate::provider::CreateOutcome> {
+            self.scenario.record(format!("create:{id}"));
+            if id.name_str() == "cert" {
+                let _provider_lock = self.scenario.awscc_shared.lock().await;
+                self.scenario.alb_waiting_for_awscc.notified().await;
+                return Ok(crate::provider::CreateOutcome::Success {
+                    state: cert_state_for_deferred_replace_deadlock(id),
+                });
+            }
+
+            if id.name_str() == "alb" {
+                let _provider_lock = self.scenario.awscc_shared.lock().await;
+                return Ok(crate::provider::CreateOutcome::Success {
+                    state: State::existing(id.clone(), HashMap::new()).with_identifier("alb-id"),
+                });
+            }
+
+            Ok(crate::provider::CreateOutcome::Success {
+                state: State::existing(id.clone(), HashMap::new())
+                    .with_identifier(format!("{}-id", id.name_str())),
+            })
+        }
+
+        async fn delete_id(&self, id: &ResourceId) -> ProviderResult<()> {
+            self.scenario.record(format!("delete:{id}"));
+            let _provider_lock = self.scenario.awscc_shared.lock().await;
+            Ok(())
+        }
+    }
+
+    impl Provider for LockOrderProvider {
+        fn name(&self) -> &str {
+            "lock-order"
+        }
+
+        fn read(
+            &self,
+            id: &ResourceId,
+            _identifier: Option<&str>,
+            _request: ReadRequest,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            let id = id.clone();
+            Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
+        }
+
+        fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+            self.read(&resource.id, None, ReadRequest)
+        }
+
+        fn create(
+            &self,
+            id: &ResourceId,
+            _request: CreateRequest,
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
+            let id = id.clone();
+            Box::pin(async move { self.create_state(&id).await })
+        }
+
+        fn update(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _request: UpdateRequest,
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
+            Box::pin(async { Err(ProviderError::internal("update not used")) })
+        }
+
+        fn delete(
+            &self,
+            id: &ResourceId,
+            _identifier: &str,
+            _request: DeleteRequest,
+        ) -> BoxFuture<'_, ProviderResult<()>> {
+            let id = id.clone();
+            Box::pin(async move { self.delete_id(&id).await })
+        }
+
+        fn required_permissions(
+            &self,
+            _id: &ResourceId,
+            _op: crate::effect::PlanOp,
+        ) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    let scenario = LockOrderScenario::new();
+    let provider = LockOrderProvider {
+        scenario: scenario.clone(),
+    };
+    let normalizer = LockOrderNormalizer {
+        scenario: scenario.clone(),
+    };
+    let mut plan = Plan::new();
+    let cert = resource_with_binding("cert", "cert");
+    let cert_id = cert.id.clone();
+    plan.add(Effect::Create(cert.clone()));
+    plan.add(Effect::Create(resource_with_binding("alb", "alb")));
+    plan.add(Effect::DeferredReplace {
+        deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+            id: ResourceId::new("test", "validation_records[0]"),
+            identifier: "old-validation".to_string(),
+            directives: Directives::default(),
+            binding: Some("validation_records[0]".to_string()),
+            dependencies: HashSet::from(["cert".to_string()]),
+            explicit_dependencies: HashSet::new(),
+        }])
+        .expect("fixture has one delete"),
+        id: ResourceId::new("__deferred_for", "validation_records"),
+        upstream_binding: "cert".to_string(),
+        template: Box::new(validation_deferred_for_expression()),
+    });
+
+    let unresolved = HashMap::from([(cert_id, UnresolvedResource::from_pre_resolve(cert.clone()))]);
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &unresolved,
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        normalizer: &normalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(2).unwrap(),
+    };
+    let observer = MockObserver::new();
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        execute_plan(&provider, input, &observer, CancellationToken::new()),
+    )
+    .await
+    .expect("expanded DeferredReplace deletes must stay in in_flight");
+    let result = completed_result(outcome);
+
+    assert_eq!(result.failure_count, 0);
+    assert!(
+        result
+            .runtime_synthesized_resources
+            .iter()
+            .any(|resource| resource.id == ResourceId::new("test", "validation_records[0]")),
+        "deferred replace gate must synthesize the child create"
+    );
+    assert!(
+        result
+            .applied_states
+            .contains_key(&ResourceId::new("test", "validation_records[0]")),
+        "post-state must include the synthesized child create"
+    );
+    assert!(
+        scenario
+            .calls()
+            .iter()
+            .any(|call| call == "delete:test.validation_records[0]"),
+        "absorbed delete must run through the provider delete path"
+    );
+}
+
+fn resource_with_binding(name: &str, binding: &str) -> Resource {
+    let mut resource = Resource::new("test", name);
+    resource.binding = Some(binding.to_string());
+    resource
+}
+
+fn cert_state_for_deferred_replace_deadlock(id: &ResourceId) -> State {
+    State::existing(
+        id.clone(),
+        HashMap::from([(
+            "domain_validation_options".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(indexmap::IndexMap::from([(
+                    "resource_record".to_string(),
+                    Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+                        (
+                            "name".to_string(),
+                            Value::Concrete(ConcreteValue::String("_name".to_string())),
+                        ),
+                        (
+                            "value".to_string(),
+                            Value::Concrete(ConcreteValue::String("_value".to_string())),
+                        ),
+                    ]))),
+                )])),
+            )])),
+        )]),
+    )
+    .with_identifier("cert-id")
 }
 
 /// Regression for carina#3164: a plan that mixes `Effect::Move` with
