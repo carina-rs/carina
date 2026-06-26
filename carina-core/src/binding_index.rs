@@ -22,15 +22,18 @@
 //! (no schema), `BindingNameSet` requires only the name and an origin
 //! tag. Callers that need more than one view hold them side by side.
 //!
-//! Built once at the parse → validate boundary, then borrowed. The walk
-//! is **top-level only** (`parsed.resources`) on purpose: for-body
-//! template resources carry a parser-synthesised binding name used for
-//! address derivation, but those names are an internal detail and were
-//! never visible to validation's `binding_map` pre-#2231. Surfacing them
-//! through `BindingIndex` would let ResourceRefs name them, which is a
-//! behaviour change neither validation nor the LSP wants. The LSP still
-//! walks `iter_all_resources` separately for its own checks (so for-body
-//! type/enum diagnostics fire); only the binding-name table is scoped.
+//! Built once at the parse → validate boundary, then borrowed. Resource
+//! discovery is **top-level only** (`parsed.resources`) on purpose:
+//! for-body template resources carry a parser-synthesised binding name
+//! used for address derivation, but those names are an internal detail
+//! and were never visible to validation's `binding_map` pre-#2231.
+//! Surfacing them through `BindingIndex` would let ResourceRefs name
+//! them, which is a behaviour change neither validation nor the LSP
+//! wants. Wait bindings are then layered on top as aliases of their
+//! target resource schema because `<wait>.<attr>` is addressable DSL.
+//! The LSP still walks `iter_all_resources` separately for its own
+//! checks (so for-body type/enum diagnostics fire); only the
+//! binding-name table is scoped.
 //!
 //! ```ignore
 //! let index = BindingIndex::from_parsed(&parsed, &registry);
@@ -114,6 +117,22 @@ impl<'a> BindingIndex<'a> {
                 continue;
             };
             entries.insert(binding_name.to_string(), BindingEntry { schema });
+        }
+        // Wait bindings are addressable aliases for their target
+        // resource (`let ready = wait cert { ... }` means
+        // `ready.certificate_arn` has the same schema surface as
+        // `cert.certificate_arn`). The target binding has already been
+        // processed above for managed resources and data sources. If the
+        // target lacks an entry (composition target, unknown resource
+        // type, or future parser expansion), keep the wait name in
+        // `known_names` so callers preserve the "known binding, schema
+        // absent" diagnostic split.
+        for wb in &parsed.wait_bindings {
+            let wait_name = wb.binding.as_str();
+            known_names.insert(wait_name.to_string());
+            if let Some(schema) = entries.get(wb.target.as_str()).map(|entry| entry.schema) {
+                entries.insert(wait_name.to_string(), BindingEntry { schema });
+            }
         }
         Self {
             entries,
@@ -918,6 +937,30 @@ let vpc = aws.ec2.Vpc {
         assert!(
             index.is_declared("vpc"),
             "binding declared in source must show up in `known_names`",
+        );
+    }
+
+    #[test]
+    fn build_records_wait_binding_name_when_target_schema_is_unknown() {
+        let src = r#"
+let cert = aws.acm.Certificate {
+    name = "cert"
+}
+
+let cert_issued = wait cert {
+    until = cert.status == "issued"
+}
+"#;
+        let parsed = parse(src, &Default::default()).expect("parse");
+        let registry = SchemaRegistry::new();
+
+        let index = BindingIndex::from_parsed(&parsed, &registry);
+        assert!(index.get("cert").is_none());
+        assert!(index.get("cert_issued").is_none());
+        assert!(index.is_declared("cert"));
+        assert!(
+            index.is_declared("cert_issued"),
+            "wait binding declared in source must show up in `known_names`",
         );
     }
 
