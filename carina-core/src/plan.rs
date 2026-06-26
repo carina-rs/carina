@@ -216,10 +216,7 @@ impl Plan {
                     summary.update += cascading_updates.len();
                 }
                 Effect::Delete { .. } => {}
-                Effect::DeferredReplace { deletes, .. } => {
-                    summary.replace += 1;
-                    summary.delete += deletes.len();
-                }
+                Effect::DeferredReplace { .. } => {}
                 Effect::Import { .. } => summary.import += 1,
                 Effect::Remove { .. } => summary.remove += 1,
                 Effect::Move { .. } => summary.moved += 1,
@@ -708,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_summary_counts_deferred_replace_deletes_individually() {
+    fn plan_summary_excludes_deferred_replace_from_totals() {
         use crate::effect::{DeferredReplaceDelete, NonEmptyDeletes};
         use crate::parser::{DeferredForExpression, ForBinding};
         use crate::resource::{Directives, ResourceId};
@@ -747,8 +744,15 @@ mod tests {
         });
 
         let summary = plan.summary();
-        assert_eq!(summary.replace, 1);
-        assert_eq!(summary.delete, 3);
+        assert_eq!(summary.replace, 0);
+        assert_eq!(summary.delete, 0);
+        assert_eq!(summary.deferred.len(), 1);
+        assert_eq!(summary.deferred[0].upstream_binding, "cert");
+        assert_eq!(summary.deferred[0].action, DeferredSummaryAction::Replace);
+        assert_eq!(
+            summary.deferred_lines(),
+            vec!["N to replace after cert resolves."]
+        );
     }
 
     #[test]

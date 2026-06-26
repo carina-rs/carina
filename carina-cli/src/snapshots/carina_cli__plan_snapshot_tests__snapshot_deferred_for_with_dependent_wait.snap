@@ -20,5 +20,5 @@ Execution Plan:
                     certificate_arn: "arn:aws:acm:us-east-1:123456789012:certificate/example"
                     validation_record_id: "known-after-validation-records"
 
-Plan: 2 to add, 0 to change, 1 to replace, 1 to destroy.
+Plan: 2 to add, 0 to change, 0 to destroy.
        N to replace after cert applies.
