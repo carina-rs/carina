@@ -18,9 +18,8 @@ use super::basic::{
 use super::deferred_dispatch::PureMetaCtx;
 use super::replace::{ReplaceContext, SingleEffectResult, execute_replace_parallel};
 use super::scheduler::{
-    PureMetaOutcome, build_scheduler_deps, dependency_failed_reason,
-    emit_cancelled_skips_with_progress, failed_binding_names_for_wait_terminal_check,
-    failure_binding_name, find_failed_dependency_index, try_dispatch_pure_meta,
+    FailureView, PureMetaOutcome, build_scheduler_deps, dependency_failed_reason,
+    emit_cancelled_skips_with_progress, failure_binding_name, try_dispatch_pure_meta,
     wait_dependency_failed_reason,
 };
 use super::wait::{
@@ -686,9 +685,8 @@ pub(super) async fn execute_effects_sequential(
             dispatched.insert(idx);
             let effect = effects[idx].clone();
 
-            if let Some(failed_dep) =
-                find_failed_dependency_index(idx, &deps_of, &failed_indices, &effects)
-            {
+            let failure_view = FailureView::new(&effects, &deps_of, &failed_indices);
+            if let Some(failed_dep) = failure_view.find_failed_dependency(idx) {
                 let c = if effect.is_scheduler_meta() {
                     completed.load(Ordering::Relaxed)
                 } else {
@@ -904,14 +902,8 @@ pub(super) async fn execute_effects_sequential(
         }
 
         let count_undispatched = |dispatched: &HashSet<usize>, failed_indices: &HashSet<usize>| {
-            let failed_bindings =
-                failed_binding_names_for_wait_terminal_check(&effects, failed_indices);
-            count_effectively_undispatched(
-                &actionable_indices,
-                dispatched,
-                &effects,
-                &failed_bindings,
-            )
+            let failure_view = FailureView::new(&effects, &deps_of, failed_indices);
+            count_effectively_undispatched(&actionable_indices, dispatched, &failure_view)
         };
         in_flight
             .check_terminal(count_undispatched(&dispatched, &failed_indices))

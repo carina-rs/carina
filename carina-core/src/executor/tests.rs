@@ -6780,8 +6780,8 @@ async fn phased_anonymous_replace_failure_propagates_to_dependent_wait() {
     use crate::effect::ChangedCreateOnly;
     use crate::wait::predicate::{AttrPath, WaitPredicate};
 
-    // Regression for carina#3611 + carina#3615: current phased.rs keeps
-    // failed_bindings: HashSet<String>, so a failed anonymous Replace
+    // Regression for carina#3611 + carina#3615: phased execution previously
+    // kept failed_bindings: HashSet<String>, so a failed anonymous Replace
     // (binding_name() == None) is not recorded and a dependent Wait can run
     // until timeout instead of being skipped as dependency-failed.
     let a_id = ResourceId::new("test", "a_anonymous_wait_gate");
@@ -6914,6 +6914,222 @@ async fn phased_anonymous_replace_failure_propagates_to_dependent_wait() {
     assert_eq!(
         result.skip_count, 1,
         "dependent wait should be skipped, not polled to timeout; events: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn phased_cross_phase_explicit_dependency_failure_triggers_wait_terminal() {
+    use crate::effect::ChangedCreateOnly;
+    use crate::wait::predicate::{AttrPath, WaitPredicate};
+
+    let failed_id = ResourceId::new("test", "failed_cross_phase_update");
+    let old_failed_state =
+        State::existing(failed_id.clone(), HashMap::new()).with_identifier("failed-old");
+    let mut failed_to = Resource::new("test", "failed_cross_phase_update");
+    failed_to.binding = Some("b".to_string());
+
+    let parent_id = ResourceId::new("test", "cross_phase_wait_parent");
+    let mut parent = Resource::new("test", "cross_phase_wait_parent");
+    parent.binding = Some("parent".to_string());
+    let old_parent_state =
+        State::existing(parent_id.clone(), HashMap::new()).with_identifier("parent-old");
+
+    let child_id = ResourceId::new("test", "cross_phase_wait_child");
+    let mut child = Resource::new("test", "cross_phase_wait_child");
+    child.binding = Some("child".to_string());
+    child.dependency_bindings.insert("parent".to_string());
+    let old_child_state =
+        State::existing(child_id.clone(), HashMap::new()).with_identifier("child-old");
+
+    let provider = MockProvider::new();
+    provider.push_update(Err(ProviderError::api_error("phase1 update failed")));
+    provider.push_delete(Ok(()));
+    provider.push_delete(Ok(()));
+    provider.push_create(Ok(ok_state(&parent_id)));
+    provider.push_create(Ok(ok_state(&child_id)));
+    for _ in 0..100 {
+        provider.push_read(Ok(State::existing(
+            parent_id.clone(),
+            HashMap::from([(
+                "status".to_string(),
+                Value::Concrete(ConcreteValue::String("pending".to_string())),
+            )]),
+        )));
+    }
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        id: failed_id.clone(),
+        from: Box::new(old_failed_state.clone()),
+        to: failed_to,
+        changed_attributes: vec!["name".to_string()],
+    });
+    plan.add(Effect::Replace {
+        id: parent_id.clone(),
+        from: Box::new(old_parent_state.clone()),
+        to: parent,
+        directives: Directives::default(),
+        changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
+        cascading_updates: Vec::new(),
+        temporary_name: None,
+        cascade_ref_hints: Vec::new(),
+    });
+    plan.add(Effect::Replace {
+        id: child_id.clone(),
+        from: Box::new(old_child_state.clone()),
+        to: child,
+        directives: Directives::default(),
+        changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
+        cascading_updates: Vec::new(),
+        temporary_name: None,
+        cascade_ref_hints: Vec::new(),
+    });
+    plan.add(Effect::Wait {
+        binding: "sibling_ready".to_string(),
+        target_id: parent_id.clone(),
+        until: WaitPredicate::Equals {
+            attr: AttrPath::single("status"),
+            value: Value::Concrete(ConcreteValue::String("ready".to_string())),
+        },
+        until_surface: "cross_phase_wait_parent.status == \"ready\"".to_string(),
+        timeout: std::time::Duration::from_millis(80),
+        interval: std::time::Duration::from_millis(1),
+        explicit_dependencies: HashSet::new(),
+    });
+    plan.add(Effect::Wait {
+        binding: "blocked_ready".to_string(),
+        target_id: child_id.clone(),
+        until: WaitPredicate::Equals {
+            attr: AttrPath::single("status"),
+            value: Value::Concrete(ConcreteValue::String("ready".to_string())),
+        },
+        until_surface: "cross_phase_wait_child.status == \"ready\"".to_string(),
+        timeout: std::time::Duration::from_millis(80),
+        interval: std::time::Duration::from_millis(1),
+        explicit_dependencies: HashSet::from(["b".to_string(), "sibling_ready".to_string()]),
+    });
+    assert!(
+        has_interdependent_replaces(plan.effects()),
+        "test must exercise phased execution"
+    );
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::from([
+            (failed_id.clone(), old_failed_state),
+            (parent_id.clone(), old_parent_state),
+            (child_id.clone(), old_child_state),
+        ]),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+
+    let events = observer.events();
+    assert!(
+        events.iter().any(|event| {
+            event
+                == "skipped:test.cross_phase_wait_child:unsatisfiable: dependency 'sibling_ready' failed"
+        }),
+        "blocked wait must be skipped as dependency-failed after terminal cancellation completes the sibling dependency; events: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event == "skipped:test.cross_phase_wait_parent:unsatisfiable: no mutator remaining"
+        }),
+        "terminal check must cancel the in-flight sibling wait instead of letting it time out; events: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.starts_with("failed:test.cross_phase_wait_parent:wait")),
+        "sibling wait must not poll to timeout; events: {events:?}"
+    );
+    assert_eq!(
+        result.failure_count, 1,
+        "only the update should fail; events: {events:?}"
+    );
+    assert_eq!(
+        result.skip_count, 2,
+        "both waits should be skipped after terminal detection; events: {events:?}"
+    );
+}
+
+#[test]
+fn phased_anonymous_replace_failure_unblocks_wait_terminal_check() {
+    use crate::effect::ChangedCreateOnly;
+    use crate::executor::scheduler::{FailedDependency, FailureView};
+    use crate::executor::wait::count_effectively_undispatched;
+    use crate::wait::predicate::{AttrPath, WaitPredicate};
+
+    // Regression for carina#3618: this isolates the phased Wait terminal
+    // check instead of the dispatch-time skip covered by
+    // `phased_anonymous_replace_failure_propagates_to_dependent_wait`.
+    // The scheduler graph proves the Wait depends on the failed anonymous
+    // Replace, and the terminal counter must consult the same FailureView
+    // rather than a lossy failed-binding-name projection.
+    let anonymous_id = ResourceId::new("test", "anonymous_wait_terminal_target");
+    let old_anonymous_state =
+        State::existing(anonymous_id.clone(), HashMap::new()).with_identifier("anon-old");
+    let anonymous_to = Resource::new("test", "anonymous_wait_terminal_target");
+
+    let effects = vec![
+        Effect::Replace {
+            id: anonymous_id.clone(),
+            from: Box::new(old_anonymous_state),
+            to: anonymous_to,
+            directives: Directives::default(),
+            changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
+            cascading_updates: Vec::new(),
+            temporary_name: None,
+            cascade_ref_hints: Vec::new(),
+        },
+        Effect::Wait {
+            binding: "anonymous_terminal_ready".to_string(),
+            target_id: anonymous_id.clone(),
+            until: WaitPredicate::Equals {
+                attr: AttrPath::single("status"),
+                value: Value::Concrete(ConcreteValue::String("ready".to_string())),
+            },
+            until_surface: "anonymous_wait_terminal_target.status == \"ready\"".to_string(),
+            timeout: std::time::Duration::from_millis(20),
+            interval: std::time::Duration::from_millis(1),
+            explicit_dependencies: HashSet::new(),
+        },
+    ];
+    assert_eq!(
+        effects[0].binding_name(),
+        None,
+        "fixture must use an anonymous Replace"
+    );
+
+    let wait_idx = 1;
+    let mut failed_indices = HashSet::new();
+    failed_indices.insert(0);
+    let deps_of = HashMap::from([(wait_idx, HashSet::from([0]))]);
+    let failure_view = FailureView::new(&effects, &deps_of, &failed_indices);
+    assert!(
+        matches!(
+            failure_view.find_failed_dependency(wait_idx),
+            Some(FailedDependency::Anonymous)
+        ),
+        "dispatch-time dependency check must already see the anonymous failed Replace"
+    );
+
+    let dispatched = HashSet::new();
+
+    assert_eq!(
+        count_effectively_undispatched(&[wait_idx], &dispatched, &failure_view),
+        0,
+        "terminal check must treat the Wait as effectively dispatched/skippable once its anonymous Replace dependency failed"
     );
 }
 

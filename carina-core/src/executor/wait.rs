@@ -15,8 +15,7 @@ use std::time::{Duration, Instant};
 
 use futures::stream::{FuturesUnordered, StreamExt};
 
-use crate::deps::find_failed_dependency;
-use crate::effect::Effect;
+use crate::executor::scheduler::FailureView;
 use crate::executor::{ExecutionEvent, ExecutionObserver};
 use crate::provider::{Provider, ProviderError, ReadRequest};
 use crate::resource::{ResourceId, State, Value};
@@ -215,20 +214,19 @@ pub(super) fn cancel_waits_if_terminal(
 
 /// Count effects that are not yet dispatched and not effectively
 /// pre-skipped by a failed dependency. An effect whose direct dependency is
-/// already in `failed_bindings` will be skipped on its next dispatch attempt
+/// already visible through `view` will be skipped on its next dispatch attempt
 /// without producing work; treating it as still "undispatched" for the
 /// terminal-with-pending-waits check would keep waits polling forever when
 /// their consumer downstream is blocked on a failing sibling. (carina#3544)
 pub(super) fn count_effectively_undispatched(
     actionable_indices: &[usize],
     dispatched: &HashSet<usize>,
-    effects: &[Effect],
-    failed_bindings: &HashSet<String>,
+    view: &FailureView<'_>,
 ) -> usize {
     actionable_indices
         .iter()
         .filter(|&&idx| !dispatched.contains(&idx))
-        .filter(|&&idx| find_failed_dependency(&effects[idx], failed_bindings).is_none())
+        .filter(|&&idx| !view.is_effectively_pre_skipped(idx))
         .count()
 }
 
