@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::deps::get_resource_dependencies;
 use crate::effect::Effect;
+use crate::effect::deps::{ScheduleInputs, build_effect_dependency_analysis};
 use crate::provider::{
     CreateRequest, DeleteRequest, PartialReadDiagnostic, Provider, UpdateOutcome, UpdateRequest,
 };
@@ -148,10 +149,9 @@ pub(super) fn topological_sort_replaces(
 /// Build a dependency map for a subset of effects identified by their indices.
 ///
 /// Only considers dependencies between effects in the given subset. Dependencies
-/// on effects outside the subset are ignored (assumed already completed). Wait
-/// blockers, including both target and explicit wait-block dependencies, are
-/// handled uniformly by `DepResolver::collect_from_effect` via
-/// `Effect::blocking_bindings()`.
+/// on effects outside the subset are ignored (assumed already completed).
+/// Edges are sourced from the same apply dependency analysis used by the
+/// parallel scheduler, then filtered down to the current phase.
 ///
 /// `Virtual` resources (the synthetic bindings module calls expose for their
 /// `attributes { }` block) have no Effect and would be invisible to a direct
@@ -165,149 +165,26 @@ pub(super) fn build_phase_dependency_map(
     unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
     compositions: &[crate::resource::Composition],
 ) -> HashMap<usize, HashSet<usize>> {
-    // Build binding -> effect index mapping for effects in this phase
     let phase_set: HashSet<usize> = phase_indices.iter().copied().collect();
-    let mut binding_to_idx: HashMap<String, usize> = HashMap::new();
-    for &idx in phase_indices {
-        if let Some(binding) = effects[idx].binding_name() {
-            binding_to_idx.insert(binding, idx);
-        }
-    }
+    let analysis = build_effect_dependency_analysis(
+        effects,
+        unresolved_resources,
+        compositions,
+        ScheduleInputs::Apply,
+    );
 
-    let resolver = DepResolver::new(&binding_to_idx, compositions, Some(&phase_set));
-
-    let mut deps_of: HashMap<usize, HashSet<usize>> = HashMap::new();
-    for &idx in phase_indices {
-        let mut dep_indices = HashSet::new();
-        let effect = &effects[idx];
-        match effect {
-            Effect::Wait { .. }
-            | Effect::DeferredCreate { .. }
-            | Effect::DeferredReplace { .. } => {
-                resolver.collect_from_effect(effect, &mut dep_indices);
-            }
-            _ if effect.as_resource_ref().is_some() => {
-                resolver.collect_from_effect(effect, &mut dep_indices);
-                if let Some(unresolved) = unresolved_resources.get(effect.resource_id()) {
-                    resolver.collect_from_resource(unresolved.as_resource(), &mut dep_indices);
-                }
-            }
-            _ => {}
-        }
-        deps_of.insert(idx, dep_indices);
-    }
-    deps_of
-}
-
-/// Resolve binding-name dependencies to the effect indices they reach,
-/// expanding any [`Composition`] proxy bindings transparently
-/// through their own attribute references (#2543).
-///
-/// carina#3181: composition resources are a distinct typestate, supplied to
-/// [`DepResolver::new`] as their own slice and indexed by `binding`
-/// name. A binding present in `compositions_by_binding` *is* the "this is a
-/// composition" condition — the `expand` walk follows such a binding through
-/// the composition's own attribute references.
-pub(super) struct DepResolver<'a> {
-    binding_to_idx: &'a HashMap<String, usize>,
-    /// Virtual resources owned by the resolver, keyed by their
-    /// `binding` name.
-    compositions_by_binding: HashMap<String, crate::resource::Composition>,
-    /// `Some` filters output indices to those in the phase; `None` retains
-    /// every reachable index.
-    phase_set: Option<&'a HashSet<usize>>,
-}
-
-impl<'a> DepResolver<'a> {
-    pub(super) fn new(
-        binding_to_idx: &'a HashMap<String, usize>,
-        compositions: &[crate::resource::Composition],
-        phase_set: Option<&'a HashSet<usize>>,
-    ) -> Self {
-        // carina#3181: composition resources are a distinct typestate, so
-        // they arrive as their own slice. Index them by `binding` name —
-        // a binding being present in `compositions_by_binding` *is* the
-        // "this is a composition" condition the `expand` walk checks.
-        let compositions_by_binding: HashMap<String, crate::resource::Composition> = compositions
-            .iter()
-            .filter_map(|v| v.binding.clone().map(|b| (b, v.clone())))
-            .collect();
-        Self {
-            binding_to_idx,
-            compositions_by_binding,
-            phase_set,
-        }
-    }
-
-    /// Walk a resource's dependencies (via `get_resource_dependencies`) and
-    /// merge the reached effect indices into `out`.
-    pub(super) fn collect_from_resource(&self, resource: &Resource, out: &mut HashSet<usize>) {
-        let dep_bindings = get_resource_dependencies(resource);
-        let mut visited: HashSet<&str> = HashSet::new();
-        for binding in &dep_bindings {
-            self.expand(binding.as_str(), out, &mut visited);
-        }
-    }
-
-    /// Walk an effect's dependencies and merge the reached effect indices
-    /// into `out`.
-    ///
-    /// `Effect::blocking_bindings` concentrates the blocker set: managed
-    /// resources/data sources contribute value refs plus explicit
-    /// `depends_on`, and waits contribute their target plus explicit
-    /// wait-block dependencies.
-    pub(super) fn collect_from_effect(&self, effect: &Effect, out: &mut HashSet<usize>) {
-        let dep_bindings = effect.blocking_bindings();
-        let mut visited: HashSet<&str> = HashSet::new();
-        for binding in &dep_bindings {
-            self.expand(binding.as_str(), out, &mut visited);
-        }
-    }
-
-    /// Recursive dependency walk. The `'b` lifetime is bound to the
-    /// `&self` borrow at the call site so the borrowed keys live
-    /// inside the resolver (`compositions_by_binding` / `binding_to_idx`).
-    fn expand<'b>(
-        &'b self,
-        binding: &'b str,
-        out: &mut HashSet<usize>,
-        visited: &mut HashSet<&'b str>,
-    ) {
-        if !visited.insert(binding) {
-            return;
-        }
-        if let Some(&idx) = self.binding_to_idx.get(binding) {
-            if self.phase_set.is_none_or(|s| s.contains(&idx)) {
-                out.insert(idx);
-            }
-            return;
-        }
-        // No effect for this binding. If it names a `Composition`
-        // (a module's attributes-block proxy), follow the
-        // references in its own attributes to the underlying
-        // resources the module exposes. The typed map answers
-        // "is this a composition?" by presence — no `matches!` probe.
-        let Some(virt) = self.compositions_by_binding.get(binding) else {
-            return;
-        };
-        // `get_composition_dependencies` returns owned `String`s,
-        // but the visit set borrows from this resolver's keys to
-        // avoid per-binding allocation. Re-borrow each inner
-        // binding from the resolver's own keys so the borrow
-        // lifetime matches `'b` (the `&self` borrow lifetime).
-        for inner in crate::deps::get_composition_dependencies(virt) {
-            let key: &'b str =
-                if let Some((k, _)) = self.compositions_by_binding.get_key_value(inner.as_str()) {
-                    k.as_str()
-                } else if let Some((k, _)) = self.binding_to_idx.get_key_value(inner.as_str()) {
-                    k.as_str()
-                } else {
-                    // Unknown binding: not in the resource graph, skip.
-                    continue;
-                };
-            self.expand(key, out, visited);
-        }
-    }
+    phase_indices
+        .iter()
+        .map(|idx| {
+            let deps = analysis
+                .deps_of(*idx)
+                .into_iter()
+                .flat_map(|deps| deps.iter().copied())
+                .filter(|dep| phase_set.contains(dep))
+                .collect();
+            (*idx, deps)
+        })
+        .collect()
 }
 
 /// Result of a phased effect operation within a single phase.

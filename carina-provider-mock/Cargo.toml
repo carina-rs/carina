@@ -17,7 +17,7 @@ carina-core = { path = "../carina-core" }
 carina-plugin-sdk = { path = "../carina-plugin-sdk" }
 carina-provider-protocol = { path = "../carina-provider-protocol" }
 serde_json = "1"
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["rt", "time"] }
 
 [dev-dependencies]
 tempfile = "3"
