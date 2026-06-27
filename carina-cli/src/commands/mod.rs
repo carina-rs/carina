@@ -471,10 +471,11 @@ pub fn validate_and_resolve_errors_with_factories(
         ) {
             errors.extend(split_validation_message(&msg));
         }
-        if let Err(msg) = carina_core::validation::validate_export_param_ref_types(
+        let export_bindings =
+            carina_core::binding_index::BindingIndex::from_parsed(parsed, ctx.schemas());
+        if let Err(msg) = carina_core::validation::validate_export_param_ref_types_with_bindings(
             &parsed.export_params,
-            &parsed.resources,
-            ctx.schemas(),
+            &export_bindings,
         ) {
             errors.extend(split_validation_message(&msg));
         }

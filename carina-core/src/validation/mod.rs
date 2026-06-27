@@ -448,18 +448,10 @@ fn check_attribute_param_ref_existence(
 ///
 /// This catches mismatches like `exports { x: list(bool) = [vpc.vpc_id] }` where
 /// `vpc_id` is a string attribute but the export declares `bool`.
-pub fn validate_export_param_ref_types(
+pub fn validate_export_param_ref_types_with_bindings(
     export_params: &[crate::parser::InferredExportParam],
-    resources: &[Resource],
-    registry: &SchemaRegistry,
+    bindings: &BindingIndex<'_>,
 ) -> Result<(), String> {
-    let mut binding_map: HashMap<String, &Resource> = HashMap::new();
-    for resource in resources {
-        if let Some(ref binding_name) = resource.binding {
-            binding_map.insert(binding_name.clone(), resource);
-        }
-    }
-
     let mut errors = Vec::new();
 
     for param in export_params {
@@ -473,14 +465,7 @@ pub fn validate_export_param_ref_types(
             continue;
         }
 
-        collect_ref_type_errors(
-            &param.type_expr,
-            value,
-            &param.name,
-            &binding_map,
-            registry,
-            &mut errors,
-        );
+        collect_ref_type_errors(&param.type_expr, value, &param.name, bindings, &mut errors);
     }
 
     if errors.is_empty() {
@@ -495,8 +480,7 @@ fn collect_ref_type_errors(
     type_expr: &crate::parser::TypeExpr,
     value: &Value,
     param_name: &str,
-    binding_map: &HashMap<String, &Resource>,
-    registry: &SchemaRegistry,
+    bindings: &BindingIndex<'_>,
     errors: &mut Vec<String>,
 ) {
     use crate::parser::TypeExpr;
@@ -506,15 +490,10 @@ fn collect_ref_type_errors(
             let ref_binding = path.binding();
             let ref_attr = path.attribute();
 
-            // TODO: `binding_map` is managed-resource only here. Thread
-            // `BindingIndex` through export-param validation before expecting
-            // wait aliases or data-source bindings to report this diagnostic.
-            let Some(ref_resource) = binding_map.get(ref_binding) else {
+            let Some(ref_entry) = bindings.get(ref_binding) else {
                 return;
             };
-            let Some(ref_schema) = registry.get_for(ref_resource) else {
-                return;
-            };
+            let ref_schema = ref_entry.schema;
             let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr) else {
                 let known_attrs: Vec<&str> =
                     ref_schema.attributes.keys().map(|s| s.as_str()).collect();
@@ -530,7 +509,30 @@ fn collect_ref_type_errors(
                 return;
             };
 
-            let ref_type = &ref_attr_schema.attr_type;
+            let ref_type = match narrow_attribute_type(
+                &ref_attr_schema.attr_type,
+                path.segments(),
+                &ref_schema.defs,
+            ) {
+                Ok(ref_type) => ref_type,
+                Err(NarrowError::UnknownStructField {
+                    field,
+                    known_fields,
+                    ..
+                }) => {
+                    let known_attrs: Vec<&str> = known_fields.iter().map(|s| s.as_str()).collect();
+                    errors.push(format!(
+                        "export '{}': unknown attribute '{}' on '{}' in reference {}{}",
+                        param_name,
+                        field,
+                        ref_binding,
+                        path.to_dot_string(),
+                        did_you_mean(&field, &known_attrs),
+                    ));
+                    return;
+                }
+                Err(NarrowError::ShapeMismatch) => return,
+            };
             if !is_type_expr_compatible_with_schema(type_expr, ref_type, &ref_schema.defs) {
                 let ref_type_name = ref_type.type_name();
                 errors.push(format!(
@@ -541,25 +543,18 @@ fn collect_ref_type_errors(
         }
         (TypeExpr::List(inner), Value::Concrete(ConcreteValue::List(items))) => {
             for item in items {
-                collect_ref_type_errors(inner, item, param_name, binding_map, registry, errors);
+                collect_ref_type_errors(inner, item, param_name, bindings, errors);
             }
         }
         (TypeExpr::Map(inner), Value::Concrete(ConcreteValue::Map(map))) => {
             for value in map.values() {
-                collect_ref_type_errors(inner, value, param_name, binding_map, registry, errors);
+                collect_ref_type_errors(inner, value, param_name, bindings, errors);
             }
         }
         (TypeExpr::Struct { fields }, Value::Concrete(ConcreteValue::Map(map))) => {
             for (name, field_ty) in fields {
                 if let Some(value) = map.get(name) {
-                    collect_ref_type_errors(
-                        field_ty,
-                        value,
-                        param_name,
-                        binding_map,
-                        registry,
-                        errors,
-                    );
+                    collect_ref_type_errors(field_ty, value, param_name, bindings, errors);
                 }
             }
         }

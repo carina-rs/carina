@@ -2529,7 +2529,10 @@ fn validate_export_param_ref_types_map_accepts_compatible_types() {
         value: Some(Value::Concrete(ConcreteValue::Map(map_value))),
     }];
 
-    let result = validate_export_param_ref_types(&exports, &[registry_prod], &schemas);
+    let mut parsed = empty_parsed();
+    parsed.resources.push(registry_prod); // allow: direct — fixture test inspection
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let result = validate_export_param_ref_types_with_bindings(&exports, &bindings);
     assert!(
         result.is_ok(),
         "map(String) = {{ prod = registry_prod.account_id (String) }} should pass, got: {:?}",
@@ -2574,7 +2577,10 @@ fn validate_export_param_ref_types_map_rejects_type_mismatch() {
         value: Some(Value::Concrete(ConcreteValue::Map(map_value))),
     }];
 
-    let result = validate_export_param_ref_types(&exports, &[registry_prod], &schemas);
+    let mut parsed = empty_parsed();
+    parsed.resources.push(registry_prod); // allow: direct — fixture test inspection
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let result = validate_export_param_ref_types_with_bindings(&exports, &bindings);
     assert!(
         result.is_err(),
         "map(Bool) = {{ prod = registry_prod.account_id }} (String) should be flagged as type mismatch"
@@ -2613,10 +2619,71 @@ fn export_param_ref_types_flags_unknown_attribute() {
         )),
     }];
 
-    let err = validate_export_param_ref_types(&exports, &[vpc], &schemas).unwrap_err();
+    let mut parsed = empty_parsed();
+    parsed.resources.push(vpc); // allow: direct — fixture test inspection
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings).unwrap_err();
     assert!(
         err.contains("export 'x': unknown attribute 'bad_attr' on 'vpc' in reference vpc.bad_attr"),
         "expected export unknown attribute error, got: {err}",
+    );
+}
+
+#[test]
+fn export_param_ref_types_flags_unknown_attribute_through_wait_binding() {
+    use crate::parser::InferredExportParam;
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        make_schema(
+            "acm.Certificate",
+            vec![
+                ("certificate_arn", AttributeType::string()),
+                ("status", AttributeType::string()),
+            ],
+        ),
+    );
+
+    let cert = Resource::with_provider("aws", "acm.Certificate", "cert", None)
+        .with_binding("cert")
+        .with_attribute(
+            "status",
+            Value::Concrete(ConcreteValue::String("pending".to_string())),
+        );
+
+    let exports = vec![InferredExportParam {
+        name: "x".to_string(),
+        type_expr: TypeExpr::String,
+        value: Some(Value::resource_ref(
+            "cert_issued".to_string(),
+            "bad_attr".to_string(),
+            vec![],
+        )),
+    }];
+
+    let mut parsed = empty_parsed();
+    parsed.resources.push(cert); // allow: direct — fixture test inspection
+    parsed.wait_bindings.push(WaitBinding {
+        binding: BindingName::from("cert_issued"),
+        target: BindingName::from("cert"),
+        until_raw: "cert.status == 'issued'".to_string(),
+        until_predicate: UntilPredicateAst {
+            lhs_segments: vec!["cert".to_string(), "status".to_string()],
+            rhs: Value::Concrete(ConcreteValue::String("issued".to_string())),
+        },
+        timeout_secs: None,
+        depends_on: Vec::new(),
+        line: 1,
+    });
+
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings).unwrap_err();
+    assert!(
+        err.contains(
+            "export 'x': unknown attribute 'bad_attr' on 'cert_issued' in reference cert_issued.bad_attr"
+        ),
+        "expected export wait binding unknown attribute error, got: {err}",
     );
 }
 
@@ -2635,7 +2702,8 @@ fn validate_export_param_ref_types_skips_unknown_sentinel() {
         ))),
     }];
 
-    let result = validate_export_param_ref_types(&exports, &[], &SchemaRegistry::new());
+    let bindings = crate::binding_index::BindingIndex::default();
+    let result = validate_export_param_ref_types_with_bindings(&exports, &bindings);
     assert!(
         result.is_ok(),
         "Unknown sentinel must be skipped, got {:?}",
@@ -2677,7 +2745,10 @@ fn validate_export_param_ref_types_against_inferred_inputs() {
     }];
 
     let _: &[UpstreamState] = &[]; // signature no longer takes upstream_states; doc only.
-    let result = validate_export_param_ref_types(&exports, &[registry_prod], &schemas);
+    let mut parsed = empty_parsed();
+    parsed.resources.push(registry_prod); // allow: direct — fixture test inspection
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let result = validate_export_param_ref_types_with_bindings(&exports, &bindings);
     assert!(result.is_ok(), "got {:?}", result);
 }
 
