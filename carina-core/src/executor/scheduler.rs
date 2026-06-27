@@ -189,63 +189,58 @@ pub(super) enum FailedDependency {
     Anonymous,
 }
 
-/// Find a failed dependency for `effects[idx]`, returning a typed
-/// [`FailedDependency`]. Checks both the in-phase dependency graph
-/// (`deps_of`) and cross-phase failures (any `Effect::blocking_bindings()`
-/// match on a failed-binding name derived from `failed_indices`).
-///
-/// The cross-phase set is derived internally rather than taken as a
-/// parameter: every caller would otherwise have to remember to compute it
-/// from the same `(effects, failed_indices)` it already passes, and a future
-/// caller passing an empty set would silently re-introduce the
-/// cross-phase-failure-missed class of bug (carina#3611).
-pub(super) fn find_failed_dependency_index(
-    idx: usize,
-    deps_of: &HashMap<usize, HashSet<usize>>,
-    failed_indices: &HashSet<usize>,
-    effects: &[Effect],
-) -> Option<FailedDependency> {
-    let graph_failed_dep = deps_of.get(&idx).and_then(|deps| {
-        deps.iter()
-            .find(|dep_idx| failed_indices.contains(dep_idx))
-            .map(|dep_idx| {
-                effects
-                    .get(*dep_idx)
-                    .and_then(failure_binding_name)
-                    .map_or(FailedDependency::Anonymous, FailedDependency::Named)
-            })
-    });
-    graph_failed_dep.or_else(|| {
-        let blocking = effects[idx].blocking_bindings();
-        if blocking.is_empty() {
-            return None;
-        }
-        let failed_binding_names: HashSet<String> = failed_indices
-            .iter()
-            .filter_map(|i| effects.get(*i).and_then(failure_binding_name))
-            .collect();
-        blocking
-            .into_iter()
-            .find(|binding| failed_binding_names.contains(binding))
-            .map(FailedDependency::Named)
-    })
+/// A snapshot of cumulative cross-phase failure state, paired with the
+/// dependency graph and effect list. Dispatch-time failure detection and
+/// Wait terminal checks share this view so their visibility cannot drift.
+pub(super) struct FailureView<'a> {
+    pub(super) effects: &'a [Effect],
+    pub(super) deps_of: &'a HashMap<usize, HashSet<usize>>,
+    pub(super) failed_indices: &'a HashSet<usize>,
+    failed_binding_names: HashSet<String>,
 }
 
-/// Collect the binding names of failed effects.
-///
-/// Used by the Wait-terminal-check path (`count_effectively_undispatched`)
-/// where the set is consumed standalone, not as input to
-/// `find_failed_dependency_index`. Do not pass the result of this function
-/// to `find_failed_dependency_index` — that function derives its own
-/// cross-phase set internally to keep failure attribution single-source.
-pub(super) fn failed_binding_names_for_wait_terminal_check(
-    effects: &[Effect],
-    failed_indices: &HashSet<usize>,
-) -> HashSet<String> {
-    failed_indices
-        .iter()
-        .filter_map(|idx| effects.get(*idx).and_then(failure_binding_name))
-        .collect()
+impl<'a> FailureView<'a> {
+    pub(super) fn new(
+        effects: &'a [Effect],
+        deps_of: &'a HashMap<usize, HashSet<usize>>,
+        failed_indices: &'a HashSet<usize>,
+    ) -> Self {
+        let failed_binding_names = failed_indices
+            .iter()
+            .filter_map(|idx| effects.get(*idx).and_then(failure_binding_name))
+            .collect();
+        Self {
+            effects,
+            deps_of,
+            failed_indices,
+            failed_binding_names,
+        }
+    }
+
+    /// Find the failed dependency that would cause `effects[idx]` to be
+    /// skipped before dispatch. Checks both in-phase graph edges and the
+    /// cross-phase binding fallback used for phase-scoped dependency maps.
+    pub(super) fn find_failed_dependency(&self, idx: usize) -> Option<FailedDependency> {
+        if let Some(deps) = self.deps_of.get(&idx)
+            && let Some(&dep_idx) = deps.iter().find(|d| self.failed_indices.contains(d))
+        {
+            let name = self.effects.get(dep_idx).and_then(failure_binding_name);
+            return Some(match name {
+                Some(name) => FailedDependency::Named(name),
+                None => FailedDependency::Anonymous,
+            });
+        }
+
+        self.effects[idx]
+            .blocking_bindings()
+            .into_iter()
+            .find(|binding| self.failed_binding_names.contains(binding))
+            .map(FailedDependency::Named)
+    }
+
+    pub(super) fn is_effectively_pre_skipped(&self, idx: usize) -> bool {
+        self.find_failed_dependency(idx).is_some()
+    }
 }
 
 pub(super) fn emit_cancelled_skips_with_progress(

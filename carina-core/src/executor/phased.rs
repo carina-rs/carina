@@ -23,10 +23,9 @@ use super::deferred_dispatch::PureMetaCtx;
 use super::parallel::{expand_deferred_replace_effects, is_runtime_dispatchable};
 use super::replace::{compute_full_diff_patch, single_attribute_patch};
 use super::scheduler::{
-    PureMetaOutcome, build_phase_scheduler_deps, build_post_replace_wait_scheduler_deps,
-    dependency_failed_reason, emit_cancelled_skips_with_progress,
-    failed_binding_names_for_wait_terminal_check, find_failed_dependency_index,
-    try_dispatch_pure_meta, wait_dependency_failed_reason,
+    FailureView, PureMetaOutcome, build_phase_scheduler_deps,
+    build_post_replace_wait_scheduler_deps, dependency_failed_reason,
+    emit_cancelled_skips_with_progress, try_dispatch_pure_meta, wait_dependency_failed_reason,
 };
 use super::wait::{
     AppliedStates, SKIP_REASON_CANCELLED, WaitAwareInFlight, WaitOutcome,
@@ -486,9 +485,8 @@ pub(super) async fn execute_effects_phased(
                 dispatched.insert(idx);
                 let effect = effects[idx].clone();
 
-                if let Some(failed_dep) =
-                    find_failed_dependency_index(idx, &deps_of, &failed_indices, &effects)
-                {
+                let failure_view = FailureView::new(&effects, &deps_of, &failed_indices);
+                if let Some(failed_dep) = failure_view.find_failed_dependency(idx) {
                     let c = if effect.is_scheduler_meta() {
                         completed.load(Ordering::Relaxed)
                     } else {
@@ -658,18 +656,13 @@ pub(super) async fn execute_effects_phased(
                 continue;
             }
 
-            let failed_binding_name_set =
-                failed_binding_names_for_wait_terminal_check(&effects, &failed_indices);
-            let count_undispatched = |dispatched: &HashSet<usize>| {
-                count_effectively_undispatched(
-                    &phase1_indices,
-                    dispatched,
-                    &effects,
-                    &failed_binding_name_set,
-                )
-            };
+            let count_undispatched =
+                |dispatched: &HashSet<usize>, failed_indices: &HashSet<usize>| {
+                    let failure_view = FailureView::new(&effects, &deps_of, failed_indices);
+                    count_effectively_undispatched(&phase1_indices, dispatched, &failure_view)
+                };
             in_flight
-                .check_terminal(count_undispatched(&dispatched))
+                .check_terminal(count_undispatched(&dispatched, &failed_indices))
                 .cancel_if_terminal()
                 .drop_without_awaiting();
 
@@ -694,7 +687,7 @@ pub(super) async fn execute_effects_phased(
 
             let (finished_idx, result) = if cancelled {
                 let Some(finished) = in_flight
-                    .check_terminal(count_undispatched(&dispatched))
+                    .check_terminal(count_undispatched(&dispatched, &failed_indices))
                     .cancel_if_terminal()
                     .next_completed()
                     .await
@@ -711,7 +704,7 @@ pub(super) async fn execute_effects_phased(
                         continue;
                     }
                     finished = in_flight
-                        .check_terminal(count_undispatched(&dispatched))
+                        .check_terminal(count_undispatched(&dispatched, &failed_indices))
                         .cancel_if_terminal()
                         .next_completed() => {
                         let Some(finished) = finished else {
@@ -803,7 +796,7 @@ pub(super) async fn execute_effects_phased(
                 _ => unreachable!(),
             }
             in_flight
-                .check_terminal(count_undispatched(&dispatched))
+                .check_terminal(count_undispatched(&dispatched, &failed_indices))
                 .cancel_if_terminal()
                 .drop_without_awaiting();
         }
@@ -887,9 +880,8 @@ pub(super) async fn execute_effects_phased(
                 let effect = &effects[idx];
                 let progress = replace_progress[&idx];
 
-                if let Some(failed_dep) =
-                    find_failed_dependency_index(idx, &deps_of, &failed_indices, &effects)
-                {
+                let failure_view = FailureView::new(&effects, &deps_of, &failed_indices);
+                if let Some(failed_dep) = failure_view.find_failed_dependency(idx) {
                     let reason = dependency_failed_reason(&failed_dep);
                     observer.on_event(&ExecutionEvent::EffectSkipped {
                         effect,
@@ -1223,14 +1215,9 @@ pub(super) async fn execute_effects_phased(
                 let effect = &effects[idx];
                 if let Effect::Replace { directives, .. } = effect {
                     // Skip if dependency failed
-                    if find_failed_dependency_index(
-                        idx,
-                        &replace_deps_of,
-                        &failed_indices,
-                        &effects,
-                    )
-                    .is_some()
-                    {
+                    let failure_view =
+                        FailureView::new(&effects, &replace_deps_of, &failed_indices);
+                    if failure_view.find_failed_dependency(idx).is_some() {
                         return false;
                     }
                     // For CBD, skip if create didn't succeed
@@ -1509,9 +1496,8 @@ pub(super) async fn execute_effects_phased(
                 dispatched.insert(idx);
                 let effect = effects[idx].clone();
 
-                if let Some(failed_dep) =
-                    find_failed_dependency_index(idx, &deps_of, &failed_indices, &effects)
-                {
+                let failure_view = FailureView::new(&effects, &deps_of, &failed_indices);
+                if let Some(failed_dep) = failure_view.find_failed_dependency(idx) {
                     let reason = dependency_failed_reason(&failed_dep);
                     let progress =
                         replace_progress
@@ -2044,9 +2030,8 @@ pub(super) async fn execute_effects_phased(
                 dispatched.insert(idx);
                 let effect = &effects[idx];
 
-                if let Some(failed_dep) =
-                    find_failed_dependency_index(idx, &deps_of, &failed_indices, &effects)
-                {
+                let failure_view = FailureView::new(&effects, &deps_of, &failed_indices);
+                if let Some(failed_dep) = failure_view.find_failed_dependency(idx) {
                     let c = completed.fetch_add(1, Ordering::Relaxed) + 1;
                     let reason = wait_dependency_failed_reason(&failed_dep);
                     observer.on_event(&ExecutionEvent::EffectSkipped {
@@ -2110,18 +2095,17 @@ pub(super) async fn execute_effects_phased(
                 }
             }
 
-            let failed_binding_name_set =
-                failed_binding_names_for_wait_terminal_check(&effects, &failed_indices);
-            let count_undispatched = |dispatched: &HashSet<usize>| {
-                count_effectively_undispatched(
-                    &post_replace_wait_indices,
-                    dispatched,
-                    &effects,
-                    &failed_binding_name_set,
-                )
-            };
+            let count_undispatched =
+                |dispatched: &HashSet<usize>, failed_indices: &HashSet<usize>| {
+                    let failure_view = FailureView::new(&effects, &deps_of, failed_indices);
+                    count_effectively_undispatched(
+                        &post_replace_wait_indices,
+                        dispatched,
+                        &failure_view,
+                    )
+                };
             in_flight
-                .check_terminal(count_undispatched(&dispatched))
+                .check_terminal(count_undispatched(&dispatched, &failed_indices))
                 .cancel_if_terminal()
                 .drop_without_awaiting();
 
@@ -2146,7 +2130,7 @@ pub(super) async fn execute_effects_phased(
 
             let (finished_idx, result) = if cancelled {
                 let Some(finished) = in_flight
-                    .check_terminal(count_undispatched(&dispatched))
+                    .check_terminal(count_undispatched(&dispatched, &failed_indices))
                     .cancel_if_terminal()
                     .next_completed()
                     .await
@@ -2163,7 +2147,7 @@ pub(super) async fn execute_effects_phased(
                         continue;
                     }
                     finished = in_flight
-                        .check_terminal(count_undispatched(&dispatched))
+                        .check_terminal(count_undispatched(&dispatched, &failed_indices))
                         .cancel_if_terminal()
                         .next_completed() => {
                         let Some(finished) = finished else {

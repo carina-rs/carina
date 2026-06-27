@@ -2,7 +2,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::effect::Effect;
 use crate::resource::{Resource, Value};
 
 /// Extract binding names that a resource depends on.
@@ -307,18 +306,6 @@ pub fn build_dependents_map(resources: &[&Resource]) -> HashMap<String, HashSet<
     dependents_map
 }
 
-/// Check if an effect has any dependency on failed bindings.
-/// Returns the name of the first failed dependency found, or None.
-pub fn find_failed_dependency(
-    effect: &Effect,
-    failed_bindings: &HashSet<String>,
-) -> Option<String> {
-    effect
-        .blocking_bindings()
-        .into_iter()
-        .find(|dep| failed_bindings.contains(dep))
-}
-
 /// Check if any dependent of the given binding has failed (is in failed_bindings).
 /// Returns the first failed dependent found, if any.
 pub fn find_failed_dependent<'a>(
@@ -344,7 +331,8 @@ pub fn find_failed_dependent<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::{DeferredValue, Directives, Resource, ResourceId, Value};
+    use crate::effect::Effect;
+    use crate::resource::{DeferredValue, Resource, ResourceId, Value};
     use crate::wait::predicate::{AttrPath, WaitPredicate};
 
     fn wait_effect_with_explicit_dependency(binding: Option<&str>) -> Effect {
@@ -526,110 +514,6 @@ mod tests {
     }
 
     #[test]
-    fn test_find_failed_dependency_direct() {
-        let resource = make_resource("b", &["a"]);
-        let effect = Effect::Create(resource.clone());
-
-        let mut failed = HashSet::new();
-        failed.insert("a".to_string());
-
-        let result = find_failed_dependency(&effect, &failed);
-        assert_eq!(result, Some("a".to_string()));
-    }
-
-    #[test]
-    fn test_find_failed_dependency_none() {
-        let resource = make_resource("b", &["a"]);
-        let effect = Effect::Create(resource.clone());
-
-        let failed: HashSet<String> = HashSet::new();
-
-        let result = find_failed_dependency(&effect, &failed);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_find_failed_dependency_no_deps() {
-        let resource = make_resource("a", &[]);
-        let effect = Effect::Create(resource.clone());
-
-        let mut failed = HashSet::new();
-        failed.insert("x".to_string());
-
-        let result = find_failed_dependency(&effect, &failed);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_find_failed_dependency_transitive_propagation() {
-        let resource_c = make_resource("c", &["b"]);
-        let effect_c = Effect::Create(resource_c.clone());
-
-        let mut failed = HashSet::new();
-        failed.insert("a".to_string());
-        failed.insert("b".to_string());
-
-        let result = find_failed_dependency(&effect_c, &failed);
-        assert_eq!(result, Some("b".to_string()));
-    }
-
-    #[test]
-    fn test_find_failed_dependency_delete_effect() {
-        let effect = Effect::Delete {
-            id: ResourceId::new("test", "a"),
-            identifier: "id-123".to_string(),
-            directives: Directives::default(),
-            binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: std::collections::HashSet::new(),
-        };
-
-        let mut failed = HashSet::new();
-        failed.insert("some_binding".to_string());
-
-        let result = find_failed_dependency(&effect, &failed);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn find_failed_dependency_returns_wait_explicit_dependency_when_failed() {
-        let effect = wait_effect_with_explicit_dependency(Some("failed_binding"));
-        let failed_bindings: HashSet<String> =
-            ["failed_binding"].into_iter().map(String::from).collect();
-
-        assert_eq!(
-            find_failed_dependency(&effect, &failed_bindings),
-            Some("failed_binding".to_string())
-        );
-    }
-
-    #[test]
-    fn find_failed_dependency_returns_wait_target_binding_when_failed() {
-        let effect = wait_effect_with_explicit_dependency(None);
-        let failed_bindings: HashSet<String> = ["cert"].into_iter().map(String::from).collect();
-
-        assert_eq!(
-            find_failed_dependency(&effect, &failed_bindings),
-            Some("cert".to_string())
-        );
-    }
-
-    #[test]
-    fn find_failed_dependency_returns_wait_target_binding_in_preference_to_explicit_when_both_fail()
-    {
-        let effect = wait_effect_with_explicit_dependency(Some("other_failed"));
-        let failed_bindings: HashSet<String> = ["cert", "other_failed"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-
-        assert_eq!(
-            find_failed_dependency(&effect, &failed_bindings),
-            Some("cert".to_string())
-        );
-    }
-
-    #[test]
     fn wait_blocking_bindings_include_target_before_explicit_dependencies() {
         let effect = wait_effect_with_explicit_dependency(Some("other_failed"));
         let blocking_bindings = effect.blocking_bindings();
@@ -639,14 +523,6 @@ mod tests {
             blocking_bindings.into_iter().collect::<HashSet<_>>(),
             HashSet::from(["cert".to_string(), "other_failed".to_string()])
         );
-    }
-
-    #[test]
-    fn find_failed_dependency_returns_none_when_wait_explicit_dependency_did_not_fail() {
-        let effect = wait_effect_with_explicit_dependency(Some("failed_binding"));
-        let failed_bindings: HashSet<String> = HashSet::new();
-
-        assert_eq!(find_failed_dependency(&effect, &failed_bindings), None);
     }
 
     #[test]
