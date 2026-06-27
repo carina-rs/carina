@@ -2126,6 +2126,43 @@ fn attribute_param_ref_types_flags_unknown_attribute_inside_nested_struct() {
 }
 
 #[test]
+fn attribute_param_ref_types_does_not_misreport_type_mismatch_for_nested_ref_to_existing_attribute()
+{
+    use crate::parser::AttributeParameter;
+    use crate::schema::{AttributeSchema, ResourceSchema};
+
+    let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc", None)
+        .with_binding("vpc")
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+        );
+
+    let mut vpc_schema = ResourceSchema::new("ec2.Vpc");
+    vpc_schema = vpc_schema.attribute(AttributeSchema::new("cidr_block", AttributeType::string()));
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", vpc_schema);
+
+    let mut nested = IndexMap::new();
+    nested.insert(
+        "id".to_string(),
+        Value::resource_ref("vpc".to_string(), "cidr_block".to_string(), vec![]),
+    );
+    let params = vec![AttributeParameter {
+        name: "network".to_string(),
+        type_expr: Some(TypeExpr::Simple("vpc_id".to_string())),
+        value: Some(Value::Concrete(ConcreteValue::Map(nested))),
+    }];
+
+    let result = validate_attribute_param_ref_types(&params, &[vpc], &schemas);
+    assert!(
+        result.is_ok(),
+        "nested refs should be existence-checked only, got: {result:?}",
+    );
+}
+
+#[test]
 fn validate_export_params_rejects_invalid_custom_type() {
     use crate::parser::InferredExportParam;
 

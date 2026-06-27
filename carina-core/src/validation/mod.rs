@@ -360,9 +360,8 @@ pub fn validate_attribute_param_ref_types(
             );
         } else {
             value.visit_resource_refs(&mut |path| {
-                check_attribute_param_ref_type(
+                check_attribute_param_ref_existence(
                     &param.name,
-                    expected_type,
                     path,
                     &binding_map,
                     registry,
@@ -415,6 +414,32 @@ fn check_attribute_param_ref_type(
     errors.push(format!(
         "attribute '{}': type mismatch: expected {}, got {} (from {}.{})",
         param_name, expected_type, ref_type_snake, ref_binding, ref_attr
+    ));
+}
+
+fn check_attribute_param_ref_existence(
+    param_name: &str,
+    path: &crate::resource::AccessPath,
+    binding_map: &HashMap<String, &Resource>,
+    registry: &SchemaRegistry,
+    errors: &mut Vec<String>,
+) {
+    let ref_binding = path.binding();
+    let ref_attr = path.attribute();
+
+    let Some(ref_resource) = binding_map.get(ref_binding) else {
+        return;
+    };
+    let Some(ref_schema) = registry.get_for(ref_resource) else {
+        return;
+    };
+    if ref_schema.attributes.contains_key(ref_attr) {
+        return;
+    }
+
+    errors.push(format!(
+        "attribute '{}': unknown attribute '{}' on '{}' in reference {}.{}",
+        param_name, ref_attr, ref_binding, ref_binding, ref_attr,
     ));
 }
 
