@@ -9,7 +9,7 @@ use crate::binding_index::ResolvedBindings;
 use crate::differ::{
     AttrComparison, TypedAttr, key_should_enter_patch, secret_grafted_comparison_view,
 };
-use crate::effect::{BasicEffect, Effect, UpdateBase};
+use crate::effect::{BasicEffect, Effect};
 use crate::executor::UnresolvedResource;
 use crate::executor::normalized::{NormalizedResource, apply_desired_normalization};
 use crate::parser::ProviderConfig;
@@ -89,15 +89,6 @@ pub(super) fn queue_state_refresh(
 ) {
     if let Some(identifier) = identifier.filter(|identifier| !identifier.is_empty()) {
         pending_refreshes.insert(id.clone(), identifier.to_string());
-    }
-}
-
-fn concrete_identifier_attr(resource: &Resource) -> Option<String> {
-    match resource.attributes.get("identifier") {
-        Some(Value::Concrete(ConcreteValue::String(identifier))) if !identifier.is_empty() => {
-            Some(identifier.clone())
-        }
-        _ => None,
     }
 }
 
@@ -489,7 +480,6 @@ pub(super) fn count_actionable_effects(effects: &[Effect]) -> usize {
 pub(super) struct BasicEffectCtx<'a> {
     pub(super) provider: &'a dyn Provider,
     pub(super) bindings: &'a ResolvedBindings,
-    pub(super) applied_states: &'a HashMap<ResourceId, State>,
     pub(super) unresolved: &'a HashMap<ResourceId, UnresolvedResource>,
     pub(super) pipeline: &'a RenormalizePipeline<'a>,
     pub(super) completed: &'a AtomicUsize,
@@ -600,28 +590,7 @@ pub(super) async fn execute_basic_effect<'a>(
             changed_attributes,
             ..
         } => {
-            let from = match from {
-                UpdateBase::Existing(state) => state.as_ref().clone(),
-                UpdateBase::CreatedBy { binding, id } => {
-                    match ctx.applied_states.get(id).cloned() {
-                        Some(state) => state,
-                        None => {
-                            let error =
-                                format!("update source for `{binding}` was not found after create");
-                            observer.on_event(&ExecutionEvent::EffectFailed {
-                                effect,
-                                error: &error,
-                                duration: started.elapsed(),
-                                progress,
-                            });
-                            return BasicEffectResult::Failure {
-                                refresh: concrete_identifier_attr(to)
-                                    .map(|identifier| (id.clone(), identifier)),
-                            };
-                        }
-                    }
-                }
-            };
+            let from = from.clone();
             let resolve_source = unresolved
                 .get(id)
                 .map_or(to, UnresolvedResource::as_resource);

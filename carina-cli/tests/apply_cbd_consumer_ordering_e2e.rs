@@ -337,38 +337,7 @@ let permanent = mock.test.resource {{
 }
 
 #[test]
-fn test_cbd_rename_update_runs_after_delete() {
-    let scenario = Scenario::new();
-    scenario.write_rename_config();
-    scenario.init();
-    scenario.seed_rename_state();
-    scenario.seed_rename_mock_provider_state();
-
-    let output = scenario.apply();
-    assert_success("carina apply", &output);
-
-    let op_log = scenario.op_log();
-    let create_pos = op_log
-        .iter()
-        .position(|entry| entry == "create test.renameable_resource.renamed")
-        .expect("operation log should contain renameable create");
-    let update_pos = op_log
-        .iter()
-        .position(|entry| entry == "update test.renameable_resource.renamed")
-        .expect("operation log should contain rename update");
-    let delete_pos = op_log
-        .iter()
-        .position(|entry| entry == "delete test.renameable_resource.renamed")
-        .expect("operation log should contain old resource delete");
-
-    assert!(
-        create_pos < delete_pos && delete_pos < update_pos,
-        "#3625: CBD rename update must run after old resource delete; observed log: {op_log:?}"
-    );
-}
-
-#[test]
-fn consumer_update_reading_renamed_attribute_does_not_cycle() {
+fn test_cbd_consumer_reading_name_does_not_break() {
     let scenario = Scenario::new();
     scenario.write_rename_consumer_config();
     scenario.init();
@@ -385,20 +354,27 @@ fn consumer_update_reading_renamed_attribute_does_not_cycle() {
     );
 
     let op_log = scenario.op_log();
+    let create_pos = op_log
+        .iter()
+        .position(|entry| entry == "create test.renameable_resource.renamed")
+        .expect("operation log should contain replacement create");
+    let consumer_update_pos = op_log
+        .iter()
+        .position(|entry| entry == "update test.resource.consumer")
+        .expect("operation log should contain consumer update");
+    let delete_pos = op_log
+        .iter()
+        .position(|entry| entry == "delete test.renameable_resource.renamed")
+        .expect("operation log should contain old resource delete");
     assert!(
-        op_log
+        create_pos < consumer_update_pos && consumer_update_pos < delete_pos,
+        "consumer update must run between CBD create and delete; observed log: {op_log:?}"
+    );
+    assert!(
+        !op_log
             .iter()
-            .any(|entry| entry == "create test.renameable_resource.renamed")
-            && op_log
-                .iter()
-                .any(|entry| entry == "delete test.renameable_resource.renamed")
-            && op_log
-                .iter()
-                .any(|entry| entry == "update test.renameable_resource.renamed")
-            && op_log
-                .iter()
-                .any(|entry| entry == "update test.resource.consumer"),
-        "all CBD and consumer effects should execute; observed log: {op_log:?}"
+            .any(|entry| entry == "update test.renameable_resource.renamed"),
+        "CBD must not issue a rename update; observed log: {op_log:?}"
     );
 }
 
@@ -451,7 +427,7 @@ fn test_cbd_permanent_name_override_persists() {
     let temporary_name = row
         .name_overrides
         .get("name")
-        .expect("CBD can_rename=false should persist a permanent name override")
+        .expect("CBD temporary name should persist a permanent name override")
         .clone();
     assert!(
         temporary_name.starts_with("stable-name-"),
@@ -470,7 +446,7 @@ fn test_cbd_permanent_name_override_persists() {
 }
 
 #[test]
-fn test_cbd_can_rename_delete_failure_records_new_with_temp_name() {
+fn test_cbd_delete_failure_records_new_with_temp_name_override() {
     let scenario = Scenario::new();
     scenario.write_rename_config();
     scenario.init();
@@ -509,11 +485,12 @@ fn test_cbd_can_rename_delete_failure_records_new_with_temp_name() {
     assert_eq!(
         row.attributes.get("force_replace"),
         Some(&serde_json::json!("new")),
-        "can_rename=true CBD should record the created replacement even when old delete fails"
+        "CBD should record the created replacement even when old delete fails"
     );
-    assert!(
-        row.name_overrides.is_empty(),
-        "renameable temporary names should not become permanent overrides"
+    assert_eq!(
+        row.name_overrides.get("name").map(String::as_str),
+        Some(temporary_name),
+        "CBD temporary names should become permanent overrides"
     );
 
     let op_log = scenario.op_log();
@@ -527,7 +504,7 @@ fn test_cbd_can_rename_delete_failure_records_new_with_temp_name() {
             && !op_log
                 .iter()
                 .any(|entry| entry == "update test.renameable_resource.renamed"),
-        "rename update should not run after failed delete; observed log: {op_log:?}"
+        "no rename update should run after failed delete; observed log: {op_log:?}"
     );
 }
 
@@ -555,7 +532,7 @@ fn test_cbd_permanent_temp_name_delete_failure_records_new() {
     assert_eq!(
         row.attributes.get("force_replace"),
         Some(&serde_json::json!("new")),
-        "can_rename=false CBD should record the created replacement even when old delete fails"
+        "CBD should record the created replacement even when old delete fails"
     );
     let temporary_name = row
         .name_overrides

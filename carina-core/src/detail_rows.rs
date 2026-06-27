@@ -126,7 +126,6 @@ pub enum DetailRow {
     },
     /// Temporary name note for create-before-destroy replacement
     TemporaryNameNote {
-        can_rename: bool,
         temporary_value: String,
         original_value: String,
         attribute: String,
@@ -402,14 +401,7 @@ pub fn build_detail_rows(
         } => {
             let explicit = prev_explicit.and_then(|map| map.get(&to.id));
             let schema = registry.and_then(|r| r.get_for(to));
-            match from {
-                crate::effect::UpdateBase::Existing(from) => {
-                    build_update_rows(from, to, changed_attributes, schema, detail, explicit)
-                }
-                crate::effect::UpdateBase::CreatedBy { .. } => {
-                    build_create_rows(&to.attributes, schema, detail)
-                }
-            }
+            build_update_rows(from, to, changed_attributes, schema, detail, explicit)
         }
         Effect::Delete { id, .. } => build_delete_rows(id, delete_attributes),
         Effect::Read { resource } => {
@@ -1013,7 +1005,6 @@ fn build_replace_rows(
     // Temporary name note
     if let Some(temp) = temporary_name {
         rows.push(DetailRow::TemporaryNameNote {
-            can_rename: temp.can_rename,
             temporary_value: temp.temporary_value.clone(),
             original_value: temp.original_value.clone(),
             attribute: temp.attribute.clone(),
@@ -1835,7 +1826,7 @@ mod tests {
         );
         let effect = Effect::Update {
             id: ResourceId::new("s3.Bucket", "my-bucket"),
-            from: crate::effect::UpdateBase::Existing(Box::new(from)),
+            from: Box::new(from),
             to,
             changed_attributes: vec!["versioning".to_string()],
         };
@@ -1881,7 +1872,7 @@ mod tests {
             );
         let effect = Effect::Update {
             id: ResourceId::new("s3.Bucket", "my-bucket"),
-            from: crate::effect::UpdateBase::Existing(Box::new(from)),
+            from: Box::new(from),
             to,
             changed_attributes: vec!["versioning".to_string()],
         };
@@ -1935,7 +1926,7 @@ mod tests {
             );
         let effect = Effect::Update {
             id: ResourceId::new("s3.Bucket", "my-bucket"),
-            from: crate::effect::UpdateBase::Existing(Box::new(from)),
+            from: Box::new(from),
             to,
             changed_attributes: vec!["trigger_diff".to_string()],
         };
@@ -2027,7 +2018,7 @@ mod tests {
         );
         let effect = Effect::Update {
             id: ResourceId::new("s3.Bucket", "my-bucket"),
-            from: crate::effect::UpdateBase::Existing(Box::new(from)),
+            from: Box::new(from),
             to,
             changed_attributes: vec!["removed_attr".to_string()],
         };
@@ -2057,7 +2048,7 @@ mod tests {
         let to = Resource::new("test.Widget", "beta");
         let effect = Effect::Update {
             id: ResourceId::new("test.Widget", "beta"),
-            from: crate::effect::UpdateBase::Existing(Box::new(from)),
+            from: Box::new(from),
             to,
             changed_attributes: vec!["rules".to_string()],
         };
@@ -2579,7 +2570,7 @@ mod tests {
         );
         let effect = Effect::Update {
             id: ResourceId::new("iam.Role", "r"),
-            from: crate::effect::UpdateBase::Existing(Box::new(from)),
+            from: Box::new(from),
             to,
             changed_attributes: vec!["policy".to_string()],
         };
@@ -2628,7 +2619,7 @@ mod tests {
             );
         let effect = Effect::Update {
             id: ResourceId::new("iam.Role", "r"),
-            from: crate::effect::UpdateBase::Existing(Box::new(from)),
+            from: Box::new(from),
             to,
             changed_attributes: vec!["policy".to_string(), "description".to_string()],
         };
@@ -2672,7 +2663,7 @@ mod tests {
         );
         let effect = Effect::Update {
             id: ResourceId::new("iam.Role", "r"),
-            from: crate::effect::UpdateBase::Existing(Box::new(from)),
+            from: Box::new(from),
             to,
             changed_attributes: vec!["policy".to_string()],
         };
@@ -2712,7 +2703,7 @@ mod tests {
         );
         let effect = Effect::Update {
             id: ResourceId::new("iam.Role", "r"),
-            from: crate::effect::UpdateBase::Existing(Box::new(from)),
+            from: Box::new(from),
             to,
             changed_attributes: vec!["policy".to_string()],
         };
@@ -2774,7 +2765,7 @@ mod tests {
             .with_attribute("modes", mk(ConcreteValue::String("On".to_string())));
         let effect = Effect::Update {
             id: ResourceId::new("x.Thing", "t"),
-            from: crate::effect::UpdateBase::Existing(Box::new(from)),
+            from: Box::new(from),
             to,
             changed_attributes: vec!["modes".to_string()],
         };
@@ -2814,7 +2805,7 @@ mod tests {
         );
         let effect = Effect::Update {
             id: ResourceId::new("iam.Role", "r"),
-            from: crate::effect::UpdateBase::Existing(Box::new(from)),
+            from: Box::new(from),
             to,
             changed_attributes: vec!["policy".to_string()],
         };
@@ -2875,7 +2866,7 @@ mod tests {
             );
         let effect = Effect::Update {
             id: ResourceId::new("iam.Role", "r"),
-            from: crate::effect::UpdateBase::Existing(Box::new(from)),
+            from: Box::new(from),
             to,
             changed_attributes: vec!["policy".to_string(), "description".to_string()],
         };
@@ -2964,7 +2955,7 @@ mod tests {
             Resource::new("x.Thing", "t").with_attribute("modes", enum_list(&["Allow", "Deny"]));
         let effect = Effect::Update {
             id: ResourceId::new("x.Thing", "t"),
-            from: crate::effect::UpdateBase::Existing(Box::new(from)),
+            from: Box::new(from),
             to,
             changed_attributes: vec!["modes".to_string()],
         };
@@ -3179,7 +3170,7 @@ mod tests {
         );
         let effect = Effect::Update {
             id: ResourceId::new("x.Thing", "t"),
-            from: crate::effect::UpdateBase::Existing(Box::new(from)),
+            from: Box::new(from),
             to,
             changed_attributes: vec!["tags".to_string()],
         };
@@ -3222,7 +3213,7 @@ mod tests {
         );
         let effect = Effect::Update {
             id: ResourceId::new("x.Thing", "t"),
-            from: crate::effect::UpdateBase::Existing(Box::new(from)),
+            from: Box::new(from),
             to,
             changed_attributes: vec!["password".to_string()],
         };
@@ -3444,7 +3435,7 @@ mod tests {
             Resource::new("x.Thing", "t").with_attribute("modes", enum_list(&["Allow", "Deny"]));
         let effect = Effect::Update {
             id: ResourceId::new("x.Thing", "t"),
-            from: crate::effect::UpdateBase::Existing(Box::new(from)),
+            from: Box::new(from),
             to,
             changed_attributes: vec!["modes".to_string()],
         };

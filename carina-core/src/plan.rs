@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::effect::{ChangedCreateOnly, Effect, TemporaryName, UpdateBase};
+use crate::effect::{ChangedCreateOnly, Effect, TemporaryName};
 use crate::module::DependencyGraph;
 pub use crate::resource::ModuleSource;
 use crate::resource::ResourceId;
@@ -29,8 +29,6 @@ pub struct ReplaceDisplayMetadata {
     pub binding: Option<String>,
     pub create_idx: usize,
     pub delete_idx: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rename_idx: Option<usize>,
     pub create_before_destroy: bool,
     pub changed_create_only: ChangedCreateOnly,
     #[serde(default)]
@@ -60,19 +58,10 @@ pub(crate) struct PendingReplace {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ReplacementRename {
-    pub id: ResourceId,
-    pub binding: String,
-    pub to: Resource,
-    pub changed_attributes: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ReplacementGroup {
     pub id: ResourceId,
     pub binding: Option<String>,
     pub create: Resource,
-    pub rename: Option<ReplacementRename>,
     pub delete: Effect,
     pub create_before_destroy: bool,
     pub changed_create_only: ChangedCreateOnly,
@@ -117,8 +106,20 @@ impl Plan {
         &self.effects
     }
 
+    pub(crate) fn effects_mut(&mut self) -> &mut Vec<Effect> {
+        &mut self.effects
+    }
+
     pub fn replace_display(&self) -> &[ReplaceDisplayMetadata] {
         &self.replace_display
+    }
+
+    pub(crate) fn replace_display_mut(&mut self) -> &mut [ReplaceDisplayMetadata] {
+        &mut self.replace_display
+    }
+
+    pub(crate) fn pending_replaces_mut(&mut self) -> &mut [PendingReplace] {
+        &mut self.pending_replaces
     }
 
     pub fn permanent_name_overrides(&self) -> &[PermanentNameOverride] {
@@ -150,25 +151,14 @@ impl Plan {
     }
 
     pub(crate) fn add_replacement(&mut self, group: ReplacementGroup) {
-        let (create_idx, delete_idx, rename_idx) = if group.create_before_destroy {
+        let (create_idx, delete_idx) = if group.create_before_destroy {
             let create_idx = self.add(Effect::Create(group.create));
             let delete_idx = self.add(group.delete);
-            let rename_idx = group.rename.map(|rename| {
-                self.add(Effect::Update {
-                    id: rename.id.clone(),
-                    from: UpdateBase::CreatedBy {
-                        binding: rename.binding,
-                        id: rename.id,
-                    },
-                    to: rename.to,
-                    changed_attributes: rename.changed_attributes,
-                })
-            });
-            (create_idx, delete_idx, rename_idx)
+            (create_idx, delete_idx)
         } else {
             let delete_idx = self.add(group.delete);
             let create_idx = self.add(Effect::Create(group.create));
-            (create_idx, delete_idx, None)
+            (create_idx, delete_idx)
         };
 
         self.add_replace_display(ReplaceDisplayMetadata {
@@ -176,7 +166,6 @@ impl Plan {
             binding: group.binding,
             create_idx,
             delete_idx,
-            rename_idx,
             create_before_destroy: group.create_before_destroy,
             changed_create_only: group.changed_create_only,
             cascade_ref_hints: group.cascade_ref_hints,
@@ -252,15 +241,9 @@ impl Plan {
                 dropped_replace_ids.insert(metadata.id);
                 continue;
             };
-            let rename_idx = if let Some(rename_idx) = metadata.rename_idx {
-                old_to_new.get(rename_idx).and_then(|mapped| *mapped)
-            } else {
-                None
-            };
 
             metadata.create_idx = create_idx;
             metadata.delete_idx = delete_idx;
-            metadata.rename_idx = rename_idx;
             remapped.push(metadata);
         }
 
@@ -310,12 +293,6 @@ impl Plan {
             .iter()
             .map(|metadata| metadata.delete_idx)
             .collect();
-        let replace_rename_indices: HashSet<usize> = self
-            .replace_display
-            .iter()
-            .filter_map(|metadata| metadata.rename_idx)
-            .collect();
-
         for (idx, effect) in self.effects.iter().enumerate() {
             match effect {
                 Effect::Read { .. } => summary.read += 1,
@@ -323,10 +300,7 @@ impl Plan {
                     summary.create += 1;
                 }
                 Effect::Create(_) => {}
-                Effect::Update { .. } if !replace_rename_indices.contains(&idx) => {
-                    summary.update += 1;
-                }
-                Effect::Update { .. } => {}
+                Effect::Update { .. } => summary.update += 1,
                 Effect::Delete { .. } if !replace_delete_indices.contains(&idx) => {
                     summary.delete += 1;
                 }
@@ -690,7 +664,6 @@ mod tests {
         replacement.id = id.clone();
         let create_idx = 1;
         let delete_idx = 3;
-        let rename_idx = 4;
         let mut plan = Plan::new();
         plan.add(Effect::Read {
             resource: crate::resource::DataSource::new("data.source", "before"),
@@ -706,21 +679,11 @@ mod tests {
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
         });
-        plan.add(Effect::Update {
-            id: id.clone(),
-            from: UpdateBase::CreatedBy {
-                binding: "bucket".to_string(),
-                id: id.clone(),
-            },
-            to: replacement,
-            changed_attributes: vec!["name".to_string()],
-        });
         plan.add_replace_display(ReplaceDisplayMetadata {
             id,
             binding: Some("bucket".to_string()),
             create_idx,
             delete_idx,
-            rename_idx: Some(rename_idx),
             create_before_destroy: true,
             changed_create_only: ChangedCreateOnly::new(vec!["force_replace".to_string()])
                 .expect("fixture has a create-only attr"),
@@ -741,62 +704,6 @@ mod tests {
             .expect("replace metadata should survive when all group effects survive");
         assert_eq!(metadata.create_idx, 0);
         assert_eq!(metadata.delete_idx, 1);
-        assert_eq!(metadata.rename_idx, Some(2));
-    }
-
-    #[test]
-    fn plan_retain_removes_only_rename_keeps_replace_group() {
-        let id = ResourceId::new("test.resource", "bucket");
-        let replacement = Resource::new("test.resource", "bucket").with_binding("bucket");
-        let mut plan = Plan::new();
-        let create_idx = plan.add(Effect::Create(replacement.clone()));
-        let delete_idx = plan.add(Effect::Delete {
-            id: id.clone(),
-            identifier: "old-id".to_string(),
-            directives: Directives::default(),
-            binding: Some("bucket".to_string()),
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
-        });
-        let rename_idx = plan.add(Effect::Update {
-            id: id.clone(),
-            from: UpdateBase::CreatedBy {
-                binding: "bucket".to_string(),
-                id: id.clone(),
-            },
-            to: replacement,
-            changed_attributes: vec!["name".to_string()],
-        });
-        plan.add_replace_display(ReplaceDisplayMetadata {
-            id: id.clone(),
-            binding: Some("bucket".to_string()),
-            create_idx,
-            delete_idx,
-            rename_idx: Some(rename_idx),
-            create_before_destroy: true,
-            changed_create_only: ChangedCreateOnly::new(vec!["force_replace".to_string()])
-                .expect("fixture has a create-only attr"),
-            cascade_ref_hints: Vec::new(),
-            temporary_name: None,
-            previous_attributes: HashMap::new(),
-        });
-        plan.add_permanent_name_override(
-            id.clone(),
-            HashMap::from([("name".to_string(), "bucket-temp".to_string())]),
-        );
-
-        plan.retain(|effect| !matches!(effect, Effect::Update { .. }));
-
-        let metadata = plan
-            .replace_display()
-            .first()
-            .expect("replace metadata should survive when only rename is removed");
-        assert_eq!(metadata.create_idx, 0);
-        assert_eq!(metadata.delete_idx, 1);
-        assert_eq!(metadata.rename_idx, None);
-        assert_eq!(plan.permanent_name_overrides().len(), 1);
-        assert_eq!(plan.permanent_name_overrides()[0].id, id);
     }
 
     #[test]
@@ -819,7 +726,6 @@ mod tests {
             binding: Some("bucket".to_string()),
             create_idx,
             delete_idx,
-            rename_idx: None,
             create_before_destroy: true,
             changed_create_only: ChangedCreateOnly::new(vec!["force_replace".to_string()])
                 .expect("fixture has a create-only attr"),

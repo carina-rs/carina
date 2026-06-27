@@ -17,9 +17,9 @@ use crate::error::AppError;
 
 /// Apply permanent name overrides from state to desired resources.
 ///
-/// When a create_before_destroy replacement produces a non-renameable temporary name
-/// (can_rename=false), the state stores the permanent name. This function applies
-/// those overrides so the plan doesn't detect a false diff.
+/// When a create_before_destroy replacement uses a temporary name, the state
+/// stores that permanent override. This function applies those overrides so the
+/// plan doesn't detect a false diff.
 pub(crate) fn apply_name_overrides(resources: &mut [Resource], state_file: &Option<StateFile>) {
     let state_file = match state_file {
         Some(sf) => sf,
@@ -1013,7 +1013,6 @@ mod apply_state_save_tests {
                 binding: desired.binding.clone(),
                 create_idx,
                 delete_idx,
-                rename_idx: None,
                 create_before_destroy: true,
                 changed_create_only: ChangedCreateOnly::new(vec!["force_replace".to_string()])
                     .expect("fixture has a create-only attr"),
@@ -1177,7 +1176,7 @@ mod apply_state_save_tests {
     }
 
     #[test]
-    fn test_cbd_can_rename_delete_failure_records_new_with_temp_name() {
+    fn test_cbd_delete_failure_records_new_with_temp_name_override() {
         let desired = Resource::with_provider("mock", "test.resource", "bucket", None)
             .with_binding("bucket")
             .with_attribute(
@@ -1228,104 +1227,11 @@ mod apply_state_save_tests {
             attribute: "name".to_string(),
             original_value: "stable-name".to_string(),
             temporary_value: "stable-name-temp".to_string(),
-            can_rename: true,
         };
         let plan = cbd_plan_for_with_temporary_name(&desired, "old-id", Some(temporary_name));
-
-        let state = build_state_after_apply(ApplyStateSave {
-            state_file: Some(state_file),
-            sorted_resources: std::slice::from_ref(&desired),
-            runtime_synthesized_resources: &[],
-            current_states: &HashMap::from([(id.clone(), current_state)]),
-            applied_states: &HashMap::from([(id.clone(), applied_state)]),
-            permanent_name_overrides: &HashMap::new(),
-            plan: &plan,
-            successfully_deleted: &HashSet::new(),
-            failed_refreshes: &HashSet::new(),
-            schemas: &carina_core::schema::SchemaRegistry::new(),
-        })
-        .expect("incomplete CBD writeback should record the applied create");
-
-        let row = state
-            .find_resource("mock", "test.resource", "bucket")
-            .expect("new resource row should be written");
-        assert_eq!(row.identifier.as_deref(), Some("new-id"));
-        assert_eq!(
-            row.attributes.get("name"),
-            Some(&serde_json::json!("stable-name-temp"))
-        );
-        assert_eq!(
-            row.attributes.get("force_replace"),
-            Some(&serde_json::json!("new"))
-        );
-        assert!(
-            row.name_overrides.is_empty(),
-            "renameable temporary names should not become permanent overrides"
-        );
-    }
-
-    #[test]
-    fn test_cbd_permanent_temp_name_delete_failure_records_new() {
-        let desired = Resource::with_provider("mock", "test.resource", "bucket", None)
-            .with_binding("bucket")
-            .with_attribute(
-                "name",
-                Value::Concrete(ConcreteValue::String("stable-name-temp".to_string())),
-            )
-            .with_attribute(
-                "force_replace",
-                Value::Concrete(ConcreteValue::String("new".to_string())),
-            );
-        let id = desired.id.clone();
-        let mut existing_row = ResourceState::new("test.resource", "bucket", "mock")
-            .with_identifier("old-id")
-            .with_attribute("name", serde_json::json!("stable-name"))
-            .with_attribute("force_replace", serde_json::json!("old"));
-        existing_row.binding = Some("bucket".to_string());
-        let mut state_file = StateFile::new();
-        state_file.upsert_resource(existing_row);
-        let current_state = State::existing(
-            id.clone(),
-            HashMap::from([
-                (
-                    "name".to_string(),
-                    Value::Concrete(ConcreteValue::String("stable-name".to_string())),
-                ),
-                (
-                    "force_replace".to_string(),
-                    Value::Concrete(ConcreteValue::String("old".to_string())),
-                ),
-            ]),
-        )
-        .with_identifier("old-id");
-        let applied_state = State::existing(
-            id.clone(),
-            HashMap::from([
-                (
-                    "name".to_string(),
-                    Value::Concrete(ConcreteValue::String("stable-name-temp".to_string())),
-                ),
-                (
-                    "force_replace".to_string(),
-                    Value::Concrete(ConcreteValue::String("new".to_string())),
-                ),
-            ]),
-        )
-        .with_identifier("new-id");
-        let temporary_name = TemporaryName {
-            attribute: "name".to_string(),
-            original_value: "stable-name".to_string(),
-            temporary_value: "stable-name-temp".to_string(),
-            can_rename: false,
-        };
-        let plan =
-            cbd_plan_for_with_temporary_name(&desired, "old-id", Some(temporary_name.clone()));
         let overrides = HashMap::from([(
             id.clone(),
-            HashMap::from([(
-                temporary_name.attribute.clone(),
-                temporary_name.temporary_value.clone(),
-            )]),
+            HashMap::from([("name".to_string(), "stable-name-temp".to_string())]),
         )]);
 
         let state = build_state_after_apply(ApplyStateSave {
@@ -1340,7 +1246,7 @@ mod apply_state_save_tests {
             failed_refreshes: &HashSet::new(),
             schemas: &carina_core::schema::SchemaRegistry::new(),
         })
-        .expect("permanent temp-name CBD writeback should record the applied create");
+        .expect("incomplete CBD writeback should record the applied create");
 
         let row = state
             .find_resource("mock", "test.resource", "bucket")

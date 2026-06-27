@@ -145,7 +145,7 @@ impl App {
                     if plan
                         .replace_display()
                         .iter()
-                        .any(|metadata| metadata.delete_idx == i || metadata.rename_idx == Some(i))
+                        .any(|metadata| metadata.delete_idx == i)
                     {
                         return Some(i);
                     }

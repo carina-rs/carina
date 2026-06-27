@@ -383,28 +383,16 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
             lines.push(line);
         }
         DetailRow::TemporaryNameNote {
-            can_rename,
             temporary_value,
             original_value,
             attribute,
         } => {
-            let mut line = if *can_rename {
-                Line::from(Span::styled(
-                    format!(
-                        "  # New resource created with {attribute} = \"{temporary_value}\", \
-                         then renamed to \"{original_value}\" after old resource is deleted"
-                    ),
-                    dim_style,
-                ))
-            } else {
-                Line::from(Span::styled(
-                    format!(
-                        "  # {attribute} = \"{temporary_value}\" (temporary); \
-                         original \"{original_value}\" reused after old resource deleted"
-                    ),
-                    dim_style,
-                ))
-            };
+            let mut line = Line::from(Span::styled(
+                format!(
+                    "  # {attribute} uses temporary name \"{temporary_value}\" instead of \"{original_value}\""
+                ),
+                dim_style,
+            ));
             if is_selected {
                 line = line.style(Style::default().bg(Color::DarkGray));
             }

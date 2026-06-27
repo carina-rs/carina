@@ -3,10 +3,10 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::deps::get_resource_dependencies;
-use crate::effect::{ChangedCreateOnly, Effect, TemporaryName, UpdateBase};
+use crate::effect::{ChangedCreateOnly, Effect, TemporaryName};
 use crate::identifier::generate_random_suffix;
 use crate::parser::WaitBinding;
-use crate::plan::{PendingReplace, Plan, PlanError, ReplacementGroup, ReplacementRename};
+use crate::plan::{PendingReplace, Plan, PlanError, ReplacementGroup};
 use crate::provider::Provider;
 use crate::resource::{
     ConcreteValue, DataSource, Directives, PlanInputState, Resource, ResourceId, State, Value,
@@ -146,20 +146,12 @@ fn generate_temporary_name(
         return None;
     }
 
-    // Check if the name attribute is create-only (cannot be renamed after creation)
-    let can_rename = schema
-        .attributes
-        .get(name_attr)
-        .map(|attr| !attr.create_only)
-        .unwrap_or(false);
-
     let temporary_value = format!("{}-{}", original_value, generate_random_suffix());
 
     Some(TemporaryName {
         attribute: name_attr.clone(),
         original_value,
         temporary_value,
-        can_rename,
     })
 }
 
@@ -211,30 +203,8 @@ pub(crate) fn decompose_replace_into_effects(
         blocked_by_updates,
     };
 
-    let rename = if pending.create_before_destroy {
-        match (&pending.temporary_name, binding.clone()) {
-            (Some(temp), Some(binding)) if temp.can_rename => {
-                let mut renamed = pending.to.clone();
-                renamed.set_attr(
-                    temp.attribute.clone(),
-                    Value::Concrete(ConcreteValue::String(temp.original_value.clone())),
-                );
-                Some(ReplacementRename {
-                    id: pending.id.clone(),
-                    binding,
-                    to: renamed,
-                    changed_attributes: vec![temp.attribute.clone()],
-                })
-            }
-            _ => None,
-        }
-    } else {
-        None
-    };
-
     if pending.create_before_destroy
         && let Some(temp) = &pending.temporary_name
-        && !temp.can_rename
     {
         plan.add_permanent_name_override(
             pending.id.clone(),
@@ -246,7 +216,6 @@ pub(crate) fn decompose_replace_into_effects(
         id: pending.id,
         binding,
         create: pending.to,
-        rename,
         delete,
         create_before_destroy: pending.create_before_destroy,
         changed_create_only: pending.changed_create_only,
@@ -465,7 +434,7 @@ pub fn create_plan(
                 } else {
                     plan.add(Effect::Update {
                         id,
-                        from: UpdateBase::Existing(from),
+                        from,
                         to,
                         changed_attributes,
                     });
@@ -788,28 +757,9 @@ pub fn cascade_dependent_updates(
             });
             remove_indices.insert(metadata.create_idx);
             remove_indices.insert(metadata.delete_idx);
-            if let Some(rename_idx) = metadata.rename_idx {
-                remove_indices.insert(rename_idx);
-            }
         }
         if !remove_indices.is_empty() {
-            let replace_ids: HashSet<ResourceId> = decomposed_replaces
-                .iter()
-                .map(|pending| pending.id.clone())
-                .collect();
-            plan.retain_indexed(|idx, effect| {
-                if remove_indices.contains(&idx) {
-                    return false;
-                }
-                !matches!(
-                    effect,
-                    Effect::Update {
-                        id,
-                        from: UpdateBase::CreatedBy { .. },
-                        ..
-                    } if replace_ids.contains(id)
-                )
-            });
+            plan.retain_indexed(|idx, _| !remove_indices.contains(&idx));
             plan.clear_replace_display();
             pending_replaces.extend(decomposed_replaces);
         }
@@ -944,10 +894,7 @@ pub fn cascade_dependent_updates(
                         continue;
                     }
                     let from = match &existing_update {
-                        Effect::Update {
-                            from: UpdateBase::Existing(from),
-                            ..
-                        } => from.clone(),
+                        Effect::Update { from, .. } => from.clone(),
                         _ => continue,
                     };
                     let ref_hints: Vec<(String, String)> = ref_attrs
@@ -1042,7 +989,7 @@ pub fn cascade_dependent_updates(
                 if !ref_attr_names.is_empty() {
                     let update = Effect::Update {
                         id: unresolved.id.clone(),
-                        from: UpdateBase::Existing(Box::new(from)),
+                        from: Box::new(from),
                         to: (*unresolved).clone(),
                         changed_attributes: ref_attr_names,
                     };

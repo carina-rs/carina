@@ -33,12 +33,6 @@ pub enum PlanOp {
 pub enum ScheduleEdge {
     /// This effect must wait for the named binding to complete.
     DependsOn(String),
-    /// This effect must wait for the named binding's initial create/update.
-    ///
-    /// Used by the CBD post-create rename update: ordinary consumers should
-    /// see the final replacement state when there is one, but the rename
-    /// itself must wait on the create half rather than on its own final binding.
-    DependsOnCreated(String),
     /// This effect must complete before the named binding can proceed.
     BlockedBy(String),
     /// This effect must complete before the named binding can be deleted.
@@ -61,19 +55,6 @@ pub struct TemporaryName {
     pub original_value: String,
     /// The generated temporary name (e.g., "my-bucket-a1b2c3d4")
     pub temporary_value: String,
-    /// Whether the name attribute can be updated after creation (not create-only)
-    pub can_rename: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum UpdateBase {
-    Existing(Box<State>),
-    /// Rename Update for create-before-destroy: from state is the
-    /// just-created resource, resolved at apply time from bindings.
-    CreatedBy {
-        binding: String,
-        id: ResourceId,
-    },
 }
 
 /// Delete payload absorbed into [`Effect::DeferredReplace`].
@@ -260,7 +241,7 @@ pub enum Effect {
     /// Update an existing resource
     Update {
         id: ResourceId,
-        from: UpdateBase,
+        from: Box<State>,
         to: Resource,
         /// Attribute names that changed (including removed attributes)
         changed_attributes: Vec<String>,
@@ -423,7 +404,7 @@ pub enum BasicEffect<'a> {
     Update {
         effect: &'a Effect,
         id: &'a ResourceId,
-        from: &'a UpdateBase,
+        from: &'a State,
         to: &'a Resource,
         changed_attributes: &'a [String],
     },
@@ -506,9 +487,7 @@ impl Effect {
             (
                 Effect::Update {
                     id: id.clone(),
-                    from: crate::effect::UpdateBase::Existing(Box::new(State::not_found(
-                        id.clone()
-                    ))),
+                    from: Box::new(State::not_found(id.clone())),
                     to: Resource::new("test", "x"),
                     changed_attributes: vec![],
                 },
@@ -667,7 +646,7 @@ impl Effect {
             } => Some(BasicEffect::Update {
                 effect: self,
                 id,
-                from,
+                from: from.as_ref(),
                 to,
                 changed_attributes,
             }),
@@ -1005,10 +984,6 @@ impl Effect {
                         .map(ScheduleEdge::DependsOn),
                 )
                 .collect(),
-            Effect::Update {
-                from: UpdateBase::CreatedBy { binding, .. },
-                ..
-            } => vec![ScheduleEdge::DependsOnCreated(binding.clone())],
             Effect::Wait { .. }
             | Effect::DeferredCreate { .. }
             | Effect::DeferredReplace { .. } => self
@@ -1018,10 +993,7 @@ impl Effect {
                 .collect(),
             Effect::Read { .. }
             | Effect::Create(_)
-            | Effect::Update {
-                from: UpdateBase::Existing(_),
-                ..
-            }
+            | Effect::Update { .. }
             | Effect::Import { .. }
             | Effect::Remove { .. }
             | Effect::Move { .. } => Vec::new(),
@@ -1193,9 +1165,7 @@ mod tests {
                 "Update",
                 Effect::Update {
                     id: rid.clone(),
-                    from: crate::effect::UpdateBase::Existing(Box::new(State::not_found(
-                        rid.clone(),
-                    ))),
+                    from: Box::new(State::not_found(rid.clone())),
                     to: Resource::new("test", "x"),
                     changed_attributes: vec![],
                 },
@@ -1558,13 +1528,13 @@ mod tests {
             },
             Effect::Update {
                 id: ResourceId::new("s3.Bucket", "my-bucket"),
-                from: crate::effect::UpdateBase::Existing(Box::new(State::existing(
+                from: Box::new(State::existing(
                     ResourceId::new("s3.Bucket", "my-bucket"),
                     HashMap::from([(
                         "versioning".to_string(),
                         Value::Concrete(ConcreteValue::String("Disabled".to_string())),
                     )]),
-                ))),
+                )),
                 to: Resource::new("s3.Bucket", "my-bucket").with_attribute(
                     "versioning",
                     Value::Concrete(ConcreteValue::String("Enabled".to_string())),
@@ -1800,7 +1770,7 @@ mod tests {
 
         let update = Effect::Update {
             id: rid.clone(),
-            from: crate::effect::UpdateBase::Existing(Box::new(ResState::not_found(rid.clone()))),
+            from: Box::new(ResState::not_found(rid.clone())),
             to: Resource::new("test", "x"),
             changed_attributes: vec![],
         };

@@ -1628,7 +1628,7 @@ async fn test_apply_reapplies_enum_alias_stage_update_path() {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
         id: rid.clone(),
-        from: crate::effect::UpdateBase::Existing(Box::new(from_state)),
+        from: Box::new(from_state),
         to: to_resource,
         changed_attributes: vec!["ip_protocol".to_string()],
     });
@@ -1745,7 +1745,7 @@ async fn test_apply_renormalizes_update_path() {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
         id: rid.clone(),
-        from: crate::effect::UpdateBase::Existing(Box::new(from_state)),
+        from: Box::new(from_state),
         to: to_resource,
         changed_attributes: vec!["marker".to_string()],
     });
@@ -1832,7 +1832,7 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
         id: rid.clone(),
-        from: crate::effect::UpdateBase::Existing(Box::new(from_state)),
+        from: Box::new(from_state),
         to: to_resource,
         changed_attributes: vec!["tags".to_string()],
     });
@@ -1942,7 +1942,7 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
         id: rid.clone(),
-        from: crate::effect::UpdateBase::Existing(Box::new(from_state)),
+        from: Box::new(from_state),
         to: to_resource,
         changed_attributes: vec!["description".to_string()],
     });
@@ -2002,7 +2002,7 @@ async fn test_apply_effective_changed_skips_internal_and_write_only_attributes()
     let mut plan = Plan::new();
     plan.add(Effect::Update {
         id: rid.clone(),
-        from: crate::effect::UpdateBase::Existing(Box::new(from_state)),
+        from: Box::new(from_state),
         to: to_resource,
         changed_attributes: vec!["description".to_string()],
     });
@@ -2063,7 +2063,7 @@ async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
         id: rid.clone(),
-        from: crate::effect::UpdateBase::Existing(Box::new(from_state)),
+        from: Box::new(from_state),
         to: to_resource,
         changed_attributes: vec![],
     });
@@ -2129,7 +2129,7 @@ async fn test_apply_effective_changed_skips_secret_shape_divergence() {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
         id: rid.clone(),
-        from: crate::effect::UpdateBase::Existing(Box::new(from_state)),
+        from: Box::new(from_state),
         to: to_resource,
         changed_attributes: vec![],
     });
@@ -2491,7 +2491,7 @@ async fn test_cbd_cascade_update_patch_uses_plan_time_comparison_semantics() {
     plan.add(Effect::Create(replace_to));
     plan.add(Effect::Update {
         id: cascade_id.clone(),
-        from: crate::effect::UpdateBase::Existing(Box::new(cascade_from)),
+        from: Box::new(cascade_from),
         to: cascade_to,
         changed_attributes: vec!["description".to_string()],
     });
@@ -3168,7 +3168,7 @@ async fn run_tag_sweep(parallelism: NonZeroUsize) -> (std::time::Duration, usize
         current_states.insert(resource.id.clone(), from.clone());
         plan.add(Effect::Update {
             id: resource.id.clone(),
-            from: crate::effect::UpdateBase::Existing(Box::new(from)),
+            from: Box::new(from),
             to: resource.clone(),
             changed_attributes: vec!["tags".to_string()],
         });
@@ -3237,7 +3237,7 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
         current_states.insert(resource.id.clone(), from.clone());
         plan.add(Effect::Update {
             id: resource.id.clone(),
-            from: crate::effect::UpdateBase::Existing(Box::new(from)),
+            from: Box::new(from),
             to: resource.clone(),
             changed_attributes: vec!["tags".to_string()],
         });
@@ -3285,33 +3285,11 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
 }
 
 #[tokio::test]
-async fn provider_contract_violation_does_not_relax_unknown_read_edges() {
+async fn provider_contract_violation_keeps_dependency_edges_serial() {
     let max_active = run_provider_contract_case(true).await;
     assert_eq!(
         max_active, 1,
-        "unknown reads must keep the child update serialized even if the provider mutates unrelated attrs",
-    );
-}
-
-#[tokio::test]
-async fn provider_contract_violation_known_disjoint_edge_still_relaxes_by_static_invariant() {
-    let max_active = run_provider_contract_case(false).await;
-    assert_eq!(
-        max_active, 2,
-        "known disjoint reads should relax by the static read/write invariant even under a violating mock provider",
-    );
-}
-
-#[tokio::test]
-async fn test_parallel_update_relaxation_with_cap_eight_finishes_in_two_rounds() {
-    let (_elapsed, max_active) = run_tag_sweep(NonZeroUsize::new(8).unwrap()).await;
-    assert!(
-        max_active <= 8,
-        "scheduler must not dispatch more than the cap, max_active={max_active}",
-    );
-    assert!(
-        max_active > 1,
-        "relaxed update edges should allow concurrent updates, max_active={max_active}",
+        "dependent updates must remain serialized even if the provider mutates unrelated attrs",
     );
 }
 
@@ -3507,7 +3485,7 @@ async fn test_update_effect_binding_map_propagation() {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
         id: ra_id.clone(),
-        from: crate::effect::UpdateBase::Existing(Box::new(from_state)),
+        from: Box::new(from_state),
         to: to_resource,
         changed_attributes: vec!["some_attr".to_string()],
     });

@@ -1,4 +1,4 @@
-//! CLI-level coverage for apply parallelism and update-update edge retention.
+//! CLI-level coverage for apply parallelism and dependency edge retention.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -281,17 +281,17 @@ fn apply_parallelism_cli_e2e_covers_caps_and_unknown_update_edges() {
         "known-ref case must still respect --parallelism 8, got {known_ref_max}"
     );
     assert!(
-        known_ref_elapsed <= Duration::from_millis(DELAY_MS * 3 + 300),
-        "known-disjoint refs should finish within the relaxed parallel window plus CLI overhead; got {known_ref_elapsed:?}"
+        known_ref_elapsed >= Duration::from_millis(DELAY_MS * 3 - 200),
+        "known refs should retain the parent gate, got {known_ref_elapsed:?}"
     );
     assert!(
-        known_ref_elapsed + Duration::from_millis(DELAY_MS / 2) < depends_elapsed,
-        "known-disjoint refs should finish materially faster than depends_on; known={known_ref_elapsed:?}, depends_on={depends_elapsed:?}"
+        known_ref_elapsed <= Duration::from_millis(DELAY_MS * 4),
+        "known refs should still execute through the capped scheduler, got {known_ref_elapsed:?}"
     );
 }
 
 #[test]
-fn apply_saved_plan_parallelism_relaxes_known_disjoint_refs() {
+fn apply_saved_plan_parallelism_keeps_known_refs_parent_gate() {
     let (depends_elapsed, depends_max) = saved_plan_update_scenario(
         parent_child_resources("old", |_| "  directives { depends_on = [vpc] }".to_string()),
         parent_child_resources("new", |_| "  directives { depends_on = [vpc] }".to_string()),
@@ -311,19 +311,16 @@ fn apply_saved_plan_parallelism_relaxes_known_disjoint_refs() {
         parent_child_resources("new", |_| "  parent_name = vpc.name".to_string()),
         8,
     );
-    eprintln!(
-        "saved-plan apply elapsed: known_ref={known_ref_elapsed:?}, depends_on={depends_elapsed:?}"
-    );
     assert!(
         known_ref_max <= 8,
         "saved-plan known-ref case must respect --parallelism 8, got {known_ref_max}"
     );
     assert!(
-        known_ref_elapsed <= Duration::from_millis(DELAY_MS * 3 + 600),
-        "saved-plan known-disjoint refs should finish within the relaxed parallel window plus CLI overhead; got {known_ref_elapsed:?}"
+        known_ref_elapsed >= Duration::from_millis(DELAY_MS * 3 - 200),
+        "saved-plan known refs should retain the parent gate, got {known_ref_elapsed:?}"
     );
     assert!(
-        known_ref_elapsed + Duration::from_millis(DELAY_MS / 2) < depends_elapsed,
-        "saved-plan known-disjoint refs should finish materially faster than depends_on; known={known_ref_elapsed:?}, depends_on={depends_elapsed:?}"
+        known_ref_elapsed <= Duration::from_millis(DELAY_MS * 4),
+        "saved-plan known refs should still execute through the capped scheduler, got {known_ref_elapsed:?}"
     );
 }

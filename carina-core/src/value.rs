@@ -1018,17 +1018,7 @@ pub fn redact_secrets_in_effect(
             changed_attributes,
         } => Effect::Update {
             id: id.clone(),
-            from: match from {
-                crate::effect::UpdateBase::Existing(state) => {
-                    crate::effect::UpdateBase::Existing(Box::new(redact_secrets_in_state(state)?))
-                }
-                crate::effect::UpdateBase::CreatedBy { binding, id } => {
-                    crate::effect::UpdateBase::CreatedBy {
-                        binding: binding.clone(),
-                        id: id.clone(),
-                    }
-                }
-            },
+            from: Box::new(redact_secrets_in_state(from)?),
             to: redact_secrets_in_managed(to)?,
             changed_attributes: changed_attributes.clone(),
         },
@@ -1116,10 +1106,24 @@ pub fn redact_secrets_in_effect(
 pub fn redact_secrets_in_plan(
     plan: &crate::plan::Plan,
 ) -> Result<crate::plan::Plan, SerializationError> {
-    let mut redacted = crate::plan::Plan::new();
-    for effect in plan.effects() {
-        redacted.add(redact_secrets_in_effect(effect)?);
+    let mut redacted = plan.clone();
+
+    let effects = redacted
+        .effects()
+        .iter()
+        .map(redact_secrets_in_effect)
+        .collect::<Result<Vec<_>, _>>()?;
+    *redacted.effects_mut() = effects;
+
+    for metadata in redacted.replace_display_mut() {
+        metadata.previous_attributes = redact_secrets_in_attributes(&metadata.previous_attributes)?;
     }
+
+    for pending in redacted.pending_replaces_mut() {
+        *pending.from = redact_secrets_in_state(&pending.from)?;
+        pending.to = redact_secrets_in_managed(&pending.to)?;
+    }
+
     Ok(redacted)
 }
 
@@ -5128,6 +5132,128 @@ mod tests {
             }
             other => panic!("expected Effect::Import, got {other:?}"),
         }
+    }
+
+    fn replacement_plan_with_previous_attrs(
+        previous_attributes: HashMap<String, Value>,
+    ) -> crate::plan::Plan {
+        use crate::effect::{ChangedCreateOnly, Effect};
+        use crate::plan::{Plan, ReplaceDisplayMetadata};
+        use crate::resource::{Directives, Resource, ResourceId};
+        use std::collections::HashSet;
+
+        let id = ResourceId::new("test.Widget", "w");
+        let mut plan = Plan::new();
+        let create_idx = plan.add(Effect::Create(Resource::new("test.Widget", "w")));
+        let delete_idx = plan.add(Effect::Delete {
+            id: id.clone(),
+            identifier: "old-id".to_string(),
+            directives: Directives::default(),
+            binding: Some("w".to_string()),
+            dependencies: HashSet::new(),
+            explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
+        });
+        plan.add_replace_display(ReplaceDisplayMetadata {
+            id,
+            binding: Some("w".to_string()),
+            create_idx,
+            delete_idx,
+            create_before_destroy: true,
+            changed_create_only: ChangedCreateOnly::new(vec!["force_replace".to_string()])
+                .expect("fixture has a create-only attr"),
+            cascade_ref_hints: Vec::new(),
+            temporary_name: None,
+            previous_attributes,
+        });
+        plan
+    }
+
+    #[test]
+    fn redact_secrets_in_plan_preserves_replace_display() {
+        use crate::plan::PlanError;
+        use crate::resource::ResourceId;
+
+        let id = ResourceId::new("test.Widget", "w");
+        let mut plan = replacement_plan_with_previous_attrs(HashMap::new());
+        plan.add_error(PlanError {
+            resource_id: id.clone(),
+            message: "prevent_destroy violation".to_string(),
+        });
+
+        let redacted = redact_secrets_in_plan(&plan).expect("plan redaction succeeds");
+
+        assert_eq!(redacted.effects().len(), plan.effects().len());
+        assert_eq!(redacted.replace_display().len(), 1);
+        assert_eq!(redacted.replace_display()[0].id, id);
+        assert_eq!(redacted.errors().len(), 1);
+        assert_eq!(redacted.errors()[0].message, "prevent_destroy violation");
+    }
+
+    #[test]
+    fn redact_secrets_in_plan_preserves_permanent_name_overrides() {
+        use crate::resource::ResourceId;
+
+        let id = ResourceId::new("test.Widget", "w");
+        let mut plan = replacement_plan_with_previous_attrs(HashMap::new());
+        plan.add_permanent_name_override(
+            id.clone(),
+            HashMap::from([("name".to_string(), "widget-temp".to_string())]),
+        );
+
+        let redacted = redact_secrets_in_plan(&plan).expect("plan redaction succeeds");
+
+        assert_eq!(redacted.permanent_name_overrides().len(), 1);
+        assert_eq!(redacted.permanent_name_overrides()[0].id, id);
+        assert_eq!(
+            redacted.permanent_name_overrides()[0].overrides.get("name"),
+            Some(&"widget-temp".to_string())
+        );
+    }
+
+    #[test]
+    fn redact_secrets_in_plan_redacts_secret_in_previous_attributes() {
+        use crate::resource::{ConcreteValue, DeferredValue, Value};
+
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("plain-secret".to_string()),
+        ))));
+        let plan =
+            replacement_plan_with_previous_attrs(HashMap::from([("password".to_string(), secret)]));
+
+        let redacted = redact_secrets_in_plan(&plan).expect("plan redaction succeeds");
+        let value = redacted.replace_display()[0]
+            .previous_attributes
+            .get("password")
+            .expect("previous attribute entry must remain");
+
+        assert!(
+            matches!(value, Value::Concrete(ConcreteValue::String(s)) if s.starts_with(SECRET_PREFIX)),
+            "secret previous attribute should be redacted, got {value:?}"
+        );
+    }
+
+    #[test]
+    fn saved_plan_round_trip_preserves_permanent_name_overrides() {
+        use crate::resource::ResourceId;
+
+        let id = ResourceId::new("test.Widget", "w");
+        let mut plan = replacement_plan_with_previous_attrs(HashMap::new());
+        plan.add_permanent_name_override(
+            id.clone(),
+            HashMap::from([("name".to_string(), "widget-temp".to_string())]),
+        );
+
+        let redacted = redact_secrets_in_plan(&plan).expect("plan redaction succeeds");
+        let encoded = serde_json::to_string(&redacted).expect("plan serializes");
+        let decoded: crate::plan::Plan = serde_json::from_str(&encoded).expect("plan deserializes");
+
+        assert_eq!(decoded.replace_display().len(), 1);
+        assert_eq!(decoded.permanent_name_overrides().len(), 1);
+        assert_eq!(
+            decoded.permanent_name_overrides()[0].overrides.get("name"),
+            Some(&"widget-temp".to_string())
+        );
     }
 
     #[test]

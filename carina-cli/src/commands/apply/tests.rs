@@ -843,10 +843,7 @@ fn move_plus_update_keeps_post_update_attributes() {
     let from_id = ResourceId::with_provider("awscc", "ec2.Tag", "tag_old", None);
     plan.add(Effect::Update {
         id: new_id.clone(),
-        from: carina_core::effect::UpdateBase::Existing(Box::new(State::existing(
-            from_id.clone(),
-            HashMap::new(),
-        ))),
+        from: Box::new(State::existing(from_id.clone(), HashMap::new())),
         to: sorted_resources[0].clone(),
         changed_attributes: vec!["value".to_string()],
     });

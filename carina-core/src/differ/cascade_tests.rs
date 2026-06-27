@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::effect::{ChangedCreateOnly, UpdateBase};
+use crate::effect::ChangedCreateOnly;
 use crate::resource::ConcreteValue;
 use crate::schema::{AttributeSchema, ResourceSchema};
 
@@ -71,7 +71,6 @@ fn seed_web_acl_replace(plan: &mut Plan, current_states: &HashMap<ResourceId, St
         binding: Some("web_acl".to_string()),
         create_idx,
         delete_idx,
-        rename_idx: None,
         create_before_destroy: true,
         changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
         cascade_ref_hints: vec![],
@@ -199,7 +198,7 @@ fn cascade_dependent_updates_adds_independent_update_for_dependent() {
     assert_eq!(updates.len(), 1, "expected one cascade Update");
     match updates[0] {
         Effect::Update {
-            from: UpdateBase::Existing(from),
+            from,
             to,
             changed_attributes,
             ..
@@ -239,9 +238,7 @@ fn cascade_dependent_updates_does_not_duplicate_when_existing_update() {
     seed_web_acl_replace(&mut plan, &current_states);
     plan.add(Effect::Update {
         id: distribution_id.clone(),
-        from: UpdateBase::Existing(Box::new(
-            current_states.get(&distribution_id).unwrap().clone(),
-        )),
+        from: Box::new(current_states.get(&distribution_id).unwrap().clone()),
         to: distribution(),
         changed_attributes: vec!["comment".to_string()],
     });

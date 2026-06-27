@@ -788,10 +788,10 @@ fn forcing_changed_uses_plain_green_cli_value() {
     };
     let effect = Effect::Update {
         id: ResourceId::new("test.Widget", "w"),
-        from: carina_core::effect::UpdateBase::Existing(Box::new(State::existing(
+        from: Box::new(State::existing(
             ResourceId::new("test.Widget", "w"),
             HashMap::new(),
-        ))),
+        )),
         to: Resource::new("test.Widget", "w"),
         changed_attributes: vec!["name".to_string()],
     };
@@ -816,10 +816,10 @@ fn forcing_changed_multiline_green_style_does_not_cross_newline() {
     };
     let effect = Effect::Update {
         id: ResourceId::new("test.Widget", "w"),
-        from: carina_core::effect::UpdateBase::Existing(Box::new(State::existing(
+        from: Box::new(State::existing(
             ResourceId::new("test.Widget", "w"),
             HashMap::new(),
-        ))),
+        )),
         to: Resource::new("test.Widget", "w"),
         changed_attributes: vec!["rules".to_string()],
     };
@@ -1021,7 +1021,7 @@ fn module_group_with_only_suppressed_move_does_not_emit_orphan_gutter() {
     });
     plan.add(Effect::Update {
         id: to_id.clone(),
-        from: carina_core::effect::UpdateBase::Existing(Box::new(State::not_found(to_id.clone()))),
+        from: Box::new(State::not_found(to_id.clone())),
         to: updated,
         changed_attributes: Vec::new(),
     });
@@ -1096,7 +1096,7 @@ fn resource_with_only_suppressed_move_dependent_does_not_emit_orphan_gutter() {
     });
     plan.add(Effect::Update {
         id: to_id.clone(),
-        from: carina_core::effect::UpdateBase::Existing(Box::new(State::not_found(to_id.clone()))),
+        from: Box::new(State::not_found(to_id.clone())),
         to: updated,
         changed_attributes: Vec::new(),
     });

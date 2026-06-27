@@ -172,7 +172,6 @@ fn create_before_destroy_generates_temporary_name_for_name_attribute() {
         temp.temporary_value
     );
     assert_eq!(temp.temporary_value.len(), "my-bucket-".len() + 8);
-    assert!(!temp.can_rename);
     assert_eq!(plan.permanent_name_overrides().len(), 1);
     assert_eq!(
         plan.permanent_name_overrides()[0].id,
@@ -196,7 +195,7 @@ fn create_before_destroy_generates_temporary_name_for_name_attribute() {
 }
 
 #[test]
-fn create_before_destroy_generates_temporary_name_with_can_rename() {
+fn create_before_destroy_generates_permanent_temporary_name_for_updateable_name_attribute() {
     use crate::schema::{AttributeSchema, AttributeType};
 
     let mut resource = Resource::new("logs.LogGroup", "my-log-group")
@@ -232,7 +231,7 @@ fn create_before_destroy_generates_temporary_name_with_can_rename() {
         "",
         ResourceSchema::new("logs.LogGroup")
             .attribute(
-                // log_group_name is NOT create-only in this test (can be renamed)
+                // log_group_name is NOT create-only, but CBD still keeps the temporary name.
                 AttributeSchema::new("log_group_name", AttributeType::string()),
             )
             .attribute(AttributeSchema::new("kms_key_id", AttributeType::string()).create_only())
@@ -260,10 +259,12 @@ fn create_before_destroy_generates_temporary_name_with_can_rename() {
         .expect("Should have temporary_name");
     assert_eq!(temp.attribute, "log_group_name");
     assert_eq!(temp.original_value, "my-log-group");
-    assert!(temp.can_rename);
-    assert!(
-        plan.permanent_name_overrides().is_empty(),
-        "renameable temporary names should not become permanent overrides"
+    assert_eq!(plan.permanent_name_overrides().len(), 1);
+    assert_eq!(
+        plan.permanent_name_overrides()[0]
+            .overrides
+            .get("log_group_name"),
+        Some(&temp.temporary_value)
     );
 }
 

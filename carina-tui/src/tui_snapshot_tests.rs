@@ -84,7 +84,7 @@ fn build_mixed_operations_plan() -> Plan {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
         id: ResourceId::new("ec2.Vpc", "my-vpc"),
-        from: carina_core::effect::UpdateBase::Existing(Box::new(State::existing(
+        from: Box::new(State::existing(
             ResourceId::new("ec2.Vpc", "my-vpc"),
             [
                 (
@@ -98,7 +98,7 @@ fn build_mixed_operations_plan() -> Plan {
             ]
             .into_iter()
             .collect(),
-        ))),
+        )),
         to: Resource::new("ec2.Vpc", "my-vpc")
             .with_binding("vpc")
             .with_attribute(
@@ -175,7 +175,7 @@ fn build_map_key_diff_plan() -> Plan {
 
     plan.add(Effect::Update {
         id: ResourceId::new("ec2.Vpc", "my-vpc"),
-        from: carina_core::effect::UpdateBase::Existing(Box::new(State::existing(
+        from: Box::new(State::existing(
             ResourceId::new("ec2.Vpc", "my-vpc"),
             [
                 (
@@ -193,7 +193,7 @@ fn build_map_key_diff_plan() -> Plan {
             ]
             .into_iter()
             .collect(),
-        ))),
+        )),
         to: Resource::new("ec2.Vpc", "my-vpc")
             .with_binding("vpc")
             .with_attribute(
@@ -502,7 +502,7 @@ fn build_moved_with_changes_plan() -> Plan {
     });
     plan.add(Effect::Update {
         id: ResourceId::new("ec2.Vpc", "new_vpc"),
-        from: carina_core::effect::UpdateBase::Existing(Box::new(State::existing(
+        from: Box::new(State::existing(
             ResourceId::new("ec2.Vpc", "new_vpc"),
             [
                 (
@@ -516,7 +516,7 @@ fn build_moved_with_changes_plan() -> Plan {
             ]
             .into_iter()
             .collect(),
-        ))),
+        )),
         to: Resource::new("ec2.Vpc", "new_vpc")
             .with_binding("new_vpc")
             .with_attribute(

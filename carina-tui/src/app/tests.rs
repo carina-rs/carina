@@ -129,7 +129,7 @@ fn update_effect_has_detail_rows() {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
         id: ResourceId::new("s3.Bucket", "my-bucket"),
-        from: carina_core::effect::UpdateBase::Existing(Box::new(State::existing(
+        from: Box::new(State::existing(
             ResourceId::new("s3.Bucket", "my-bucket"),
             [(
                 "versioning".to_string(),
@@ -137,7 +137,7 @@ fn update_effect_has_detail_rows() {
             )]
             .into_iter()
             .collect(),
-        ))),
+        )),
         to: Resource::new("s3.Bucket", "my-bucket").with_attribute(
             "versioning",
             Value::Concrete(ConcreteValue::String("Enabled".to_string())),
@@ -693,7 +693,7 @@ fn move_suppressed_when_update_exists_for_same_target() {
     // Update for the same target
     plan.add(Effect::Update {
         id: ResourceId::new("s3.Bucket", "new-name"),
-        from: carina_core::effect::UpdateBase::Existing(Box::new(State::existing(
+        from: Box::new(State::existing(
             ResourceId::new("s3.Bucket", "new-name"),
             [(
                 "versioning".to_string(),
@@ -701,7 +701,7 @@ fn move_suppressed_when_update_exists_for_same_target() {
             )]
             .into_iter()
             .collect(),
-        ))),
+        )),
         to: Resource::new("s3.Bucket", "new-name").with_attribute(
             "versioning",
             Value::Concrete(ConcreteValue::String("Enabled".to_string())),

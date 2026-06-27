@@ -1152,16 +1152,11 @@ fn format_plan_tree<'a>(
         .iter()
         .map(|metadata| (metadata.create_idx, metadata))
         .collect();
-    let mut replace_hidden_indices: HashSet<usize> = plan
+    let replace_hidden_indices: HashSet<usize> = plan
         .replace_display()
         .iter()
         .map(|metadata| metadata.delete_idx)
         .collect();
-    replace_hidden_indices.extend(
-        plan.replace_display()
-            .iter()
-            .filter_map(|metadata| metadata.rename_idx),
-    );
 
     let mut ctx = TreeRenderContext {
         out: String::new(),
@@ -1929,32 +1924,20 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
             .unwrap();
         }
         DetailRow::TemporaryNameNote {
-            can_rename,
             temporary_value,
             original_value,
             attribute,
         } => {
-            if *can_rename {
-                writeln!(
-                    out,
-                    "{}  {} via temporary name \"{}\", will rename back to \"{}\" after old resource is deleted",
-                    attr_prefix,
-                    "note:".magenta().bold(),
-                    temporary_value.magenta(),
-                    original_value.green()
-                )
-                .unwrap();
-            } else {
-                writeln!(
-                    out,
-                    "{}  {} name will be \"{}\" (cannot rename create-only attribute \"{}\")",
-                    attr_prefix,
-                    "note:".magenta().bold(),
-                    temporary_value.magenta(),
-                    attribute.magenta()
-                )
-                .unwrap();
-            }
+            writeln!(
+                out,
+                "{}  {} {} will use temporary name \"{}\" instead of \"{}\"",
+                attr_prefix,
+                "note:".magenta().bold(),
+                attribute.magenta(),
+                temporary_value.magenta(),
+                original_value.green()
+            )
+            .unwrap();
         }
     }
 }
