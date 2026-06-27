@@ -6,7 +6,6 @@ use carina_core::provider::{
     BoxFuture, CreateOutcome, DeleteRequest, ProviderResult, ReadRequest, UpdateOutcome,
     UpdateRequest,
 };
-use carina_core::resource::Directives;
 
 enum ReadBehavior {
     NotFound,
@@ -706,6 +705,7 @@ fn removed_block_suppresses_delete_when_state_resource_is_routed_to_named_instan
         binding: None,
         dependencies: std::collections::HashSet::new(),
         explicit_dependencies: std::collections::HashSet::new(),
+        blocked_by_updates: std::collections::HashSet::new(),
     });
 
     // `removed` block addresses are routing-agnostic by construction
@@ -2545,153 +2545,6 @@ fn deferred_template_binding_match_requires_single_numeric_index() {
         "validation_records[0][1]",
         "validation_records"
     ));
-}
-
-fn deferred_replace_test_template() -> carina_core::parser::DeferredForExpression {
-    let template_resource =
-        Resource::with_provider("aws", "route53.Record", "validation_records", None)
-            .with_binding("validation_records");
-
-    carina_core::parser::DeferredForExpression {
-        file: Some("main.crn".to_string()),
-        line: 12,
-        header: "for opt in cert.domain_validation_options".to_string(),
-        resource_type: "aws.route53.Record".to_string(),
-        attributes: vec![],
-        binding_name: "validation_records".to_string(),
-        iterable_binding: "cert".to_string(),
-        iterable_attr: "domain_validation_options".to_string(),
-        binding: carina_core::parser::ForBinding::Simple("opt".to_string()),
-        template_resource,
-    }
-}
-
-fn deferred_replace_test_target() -> DeferredCreateTarget {
-    DeferredCreateTarget {
-        id: ResourceId::with_provider("aws", "__deferred_for", "validation_records", None),
-        upstream_binding: "cert".to_string(),
-        template: deferred_replace_test_template(),
-    }
-}
-
-fn delete_effect_for_binding(binding: &str) -> Effect {
-    Effect::Delete {
-        id: ResourceId::with_provider("aws", "route53.Record", binding, None),
-        identifier: format!("{binding}-old-id"),
-        directives: Directives::default(),
-        binding: Some(binding.to_string()),
-        dependencies: std::collections::HashSet::from(["cert".to_string()]),
-        explicit_dependencies: std::collections::HashSet::new(),
-    }
-}
-
-fn cert_replace_effect() -> Effect {
-    let id = ResourceId::with_provider("aws", "acm.Certificate", "cert", None);
-    Effect::Replace {
-        id: id.clone(),
-        from: Box::new(State::existing(id, HashMap::new()).with_identifier("cert-old-id")),
-        to: Resource::with_provider("aws", "acm.Certificate", "cert", None).with_binding("cert"),
-        directives: Directives::default(),
-        changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec![
-            "domain_name".to_string(),
-        ])
-        .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    }
-}
-
-#[test]
-fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace() {
-    let target = deferred_replace_test_target();
-    let mut plan = Plan::new();
-    plan.add(cert_replace_effect());
-    plan.add(delete_effect_for_binding("validation_records[0]"));
-
-    add_deferred_create_effects(&mut plan, std::slice::from_ref(&target));
-
-    let mut deferred_replaces = plan.effects().iter().filter_map(|effect| match effect {
-        Effect::DeferredReplace {
-            deletes,
-            id,
-            upstream_binding,
-            template,
-        } => Some((deletes, id, upstream_binding, template)),
-        _ => None,
-    });
-    let (deletes, id, upstream_binding, template) = deferred_replaces
-        .next()
-        .expect("matching delete + deferred target must produce DeferredReplace");
-    assert!(
-        deferred_replaces.next().is_none(),
-        "plan must contain exactly one DeferredReplace"
-    );
-    assert_eq!(id, &target.id);
-    assert_eq!(upstream_binding, "cert");
-    assert_eq!(template.binding_name, "validation_records");
-    assert_eq!(deletes.len(), 1);
-    assert_eq!(
-        deletes[0].id,
-        ResourceId::with_provider("aws", "route53.Record", "validation_records[0]", None)
-    );
-    assert_eq!(deletes[0].binding.as_deref(), Some("validation_records[0]"));
-
-    assert!(
-        !plan.effects().iter().any(|effect| {
-            matches!(
-                effect,
-                Effect::Delete {
-                    binding: Some(binding),
-                    ..
-                } if binding == "validation_records[0]"
-            )
-        }),
-        "absorbed delete must not remain as a standalone Delete"
-    );
-    assert!(
-        !plan
-            .effects()
-            .iter()
-            .any(|effect| matches!(effect, Effect::DeferredCreate { .. })),
-        "absorbed target must not also remain as DeferredCreate"
-    );
-}
-
-#[test]
-fn deferred_create_targets_do_not_absorb_unrelated_orphan_deletes() {
-    let target = deferred_replace_test_target();
-    let mut plan = Plan::new();
-    plan.add(cert_replace_effect());
-    plan.add(delete_effect_for_binding("some_other_resource[0]"));
-
-    add_deferred_create_effects(&mut plan, std::slice::from_ref(&target));
-
-    assert!(
-        plan.effects()
-            .iter()
-            .any(|effect| matches!(effect, Effect::DeferredCreate { .. })),
-        "unmatched target must stay a plain DeferredCreate"
-    );
-    assert!(
-        plan.effects().iter().any(|effect| {
-            matches!(
-                effect,
-                Effect::Delete {
-                    binding: Some(binding),
-                    ..
-                } if binding == "some_other_resource[0]"
-            )
-        }),
-        "unrelated orphan delete must stay a plain Delete"
-    );
-    assert!(
-        !plan
-            .effects()
-            .iter()
-            .any(|effect| matches!(effect, Effect::DeferredReplace { .. })),
-        "unrelated delete must not be falsely absorbed"
-    );
 }
 
 mod expand_same_config_deferred_for_tests {

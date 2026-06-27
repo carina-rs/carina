@@ -3,14 +3,16 @@
 //! A Plan is an ordered list of Effects to be executed.
 //! No side effects occur until the Plan is applied.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::effect::{ChangedCreateOnly, Effect};
+use crate::effect::{ChangedCreateOnly, Effect, TemporaryName, UpdateBase};
 use crate::module::DependencyGraph;
 pub use crate::resource::ModuleSource;
 use crate::resource::ResourceId;
+use crate::resource::Value;
+use crate::resource::{Directives, Resource, State};
 
 /// Error when a plan would violate a directive constraint
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -19,6 +21,64 @@ pub struct PlanError {
     pub resource_id: ResourceId,
     /// Human-readable description of the violation
     pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplaceDisplayMetadata {
+    pub id: ResourceId,
+    pub binding: Option<String>,
+    pub create_idx: usize,
+    pub delete_idx: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rename_idx: Option<usize>,
+    pub create_before_destroy: bool,
+    pub changed_create_only: ChangedCreateOnly,
+    #[serde(default)]
+    pub cascade_ref_hints: Vec<(String, String)>,
+    #[serde(default)]
+    pub temporary_name: Option<TemporaryName>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub previous_attributes: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermanentNameOverride {
+    pub id: ResourceId,
+    pub overrides: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PendingReplace {
+    pub id: ResourceId,
+    pub from: Box<State>,
+    pub to: Resource,
+    pub directives: Directives,
+    pub changed_create_only: ChangedCreateOnly,
+    pub cascade_ref_hints: Vec<(String, String)>,
+    pub create_before_destroy: bool,
+    pub temporary_name: Option<TemporaryName>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ReplacementRename {
+    pub id: ResourceId,
+    pub binding: String,
+    pub to: Resource,
+    pub changed_attributes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ReplacementGroup {
+    pub id: ResourceId,
+    pub binding: Option<String>,
+    pub create: Resource,
+    pub rename: Option<ReplacementRename>,
+    pub delete: Effect,
+    pub create_before_destroy: bool,
+    pub changed_create_only: ChangedCreateOnly,
+    pub cascade_ref_hints: Vec<(String, String)>,
+    pub temporary_name: Option<TemporaryName>,
+    pub previous_attributes: HashMap<String, Value>,
 }
 
 impl std::fmt::Display for PlanError {
@@ -31,6 +91,12 @@ impl std::fmt::Display for PlanError {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Plan {
     effects: Vec<Effect>,
+    #[serde(default)]
+    pub(crate) replace_display: Vec<ReplaceDisplayMetadata>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    permanent_name_overrides: Vec<PermanentNameOverride>,
+    #[serde(skip)]
+    pub(crate) pending_replaces: Vec<PendingReplace>,
     /// Directive constraint violations detected during plan generation
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     errors: Vec<PlanError>,
@@ -41,12 +107,82 @@ impl Plan {
         Self::default()
     }
 
-    pub fn add(&mut self, effect: Effect) {
+    pub fn add(&mut self, effect: Effect) -> usize {
+        let idx = self.effects.len();
         self.effects.push(effect);
+        idx
     }
 
     pub fn effects(&self) -> &[Effect] {
         &self.effects
+    }
+
+    pub fn replace_display(&self) -> &[ReplaceDisplayMetadata] {
+        &self.replace_display
+    }
+
+    pub fn permanent_name_overrides(&self) -> &[PermanentNameOverride] {
+        &self.permanent_name_overrides
+    }
+
+    pub(crate) fn add_pending_replace(&mut self, pending: PendingReplace) {
+        self.pending_replaces.push(pending);
+    }
+
+    pub(crate) fn take_pending_replaces(&mut self) -> Vec<PendingReplace> {
+        std::mem::take(&mut self.pending_replaces)
+    }
+
+    pub(crate) fn add_replace_display(&mut self, metadata: ReplaceDisplayMetadata) {
+        self.replace_display.push(metadata);
+    }
+
+    pub(crate) fn add_permanent_name_override(
+        &mut self,
+        id: ResourceId,
+        overrides: HashMap<String, String>,
+    ) {
+        if overrides.is_empty() {
+            return;
+        }
+        self.permanent_name_overrides
+            .push(PermanentNameOverride { id, overrides });
+    }
+
+    pub(crate) fn add_replacement(&mut self, group: ReplacementGroup) {
+        let (create_idx, delete_idx, rename_idx) = if group.create_before_destroy {
+            let create_idx = self.add(Effect::Create(group.create));
+            let delete_idx = self.add(group.delete);
+            let rename_idx = group.rename.map(|rename| {
+                self.add(Effect::Update {
+                    id: rename.id.clone(),
+                    from: UpdateBase::CreatedBy {
+                        binding: rename.binding,
+                        id: rename.id,
+                    },
+                    to: rename.to,
+                    changed_attributes: rename.changed_attributes,
+                })
+            });
+            (create_idx, delete_idx, rename_idx)
+        } else {
+            let delete_idx = self.add(group.delete);
+            let create_idx = self.add(Effect::Create(group.create));
+            (create_idx, delete_idx, None)
+        };
+
+        self.add_replace_display(ReplaceDisplayMetadata {
+            id: group.id,
+            binding: group.binding,
+            create_idx,
+            delete_idx,
+            rename_idx,
+            create_before_destroy: group.create_before_destroy,
+            changed_create_only: group.changed_create_only,
+            cascade_ref_hints: group.cascade_ref_hints,
+            temporary_name: group.temporary_name,
+            previous_attributes: group.previous_attributes,
+        });
     }
 
     // No `Plan::is_empty()`: it ambiguously straddled "no effects at
@@ -78,106 +214,66 @@ impl Plan {
     where
         F: FnMut(&Effect) -> bool,
     {
-        self.effects.retain(f);
+        let mut f = f;
+        self.retain_indexed(|_, effect| f(effect));
     }
 
-    /// Set cascading updates on Replace effects that match the given replaced bindings.
-    pub fn set_cascading_updates(
-        &mut self,
-        replaced_bindings: &std::collections::HashSet<String>,
-        updates_by_binding: &std::collections::HashMap<String, Vec<crate::effect::CascadingUpdate>>,
-    ) {
-        for effect in &mut self.effects {
-            if let Effect::Replace {
-                to,
-                cascading_updates,
-                ..
-            } = effect
-            {
-                let binding = to.binding.clone();
-                if let Some(binding) = binding
-                    && replaced_bindings.contains(&binding)
-                    && let Some(updates) = updates_by_binding.get(&binding)
-                {
-                    *cascading_updates = updates.clone();
-                }
+    pub(crate) fn retain_indexed<F>(&mut self, mut f: F)
+    where
+        F: FnMut(usize, &Effect) -> bool,
+    {
+        let old_effects = std::mem::take(&mut self.effects);
+        let mut old_to_new = vec![None; old_effects.len()];
+        for (idx, effect) in old_effects.into_iter().enumerate() {
+            if f(idx, &effect) {
+                old_to_new[idx] = Some(self.effects.len());
+                self.effects.push(effect);
             }
         }
+        self.remap_replace_display_indices(&old_to_new);
     }
 
-    /// Merge cascade-triggered create-only attributes into existing effects.
-    ///
-    /// For a resource already in the plan:
-    /// - If it is a Replace, add the new create-only attrs to `changed_create_only`
-    /// - If it is an Update, upgrade it to a Replace with the cascade attrs as `changed_create_only`
-    /// - Other effect types (Create, Delete, Read) are left unchanged
-    pub fn merge_cascade_create_only(
-        &mut self,
-        resource_id: &crate::resource::ResourceId,
-        cascade_attrs: ChangedCreateOnly,
-        directives: crate::resource::Directives,
-        ref_hints: Vec<(String, String)>,
-    ) {
-        for effect in &mut self.effects {
-            match effect {
-                Effect::Replace {
-                    id,
-                    changed_create_only,
-                    cascade_ref_hints,
-                    ..
-                } if id == resource_id => {
-                    for attr in cascade_attrs.iter() {
-                        if !changed_create_only.contains(attr) {
-                            changed_create_only.push(attr.to_string());
-                        }
-                    }
-                    for hint in &ref_hints {
-                        if !cascade_ref_hints.contains(hint) {
-                            cascade_ref_hints.push(hint.clone());
-                        }
-                    }
-                    return;
-                }
-                Effect::Update { id, .. } if id == resource_id => {
-                    // Take ownership of the Update fields and upgrade to Replace.
-                    // The `Create` here is a throwaway placeholder overwritten
-                    // on the next line.
-                    let placeholder = crate::resource::Resource::new("", "");
-                    let old = std::mem::replace(effect, Effect::Create(placeholder));
-                    if let Effect::Update { id, from, to, .. } = old {
-                        *effect = Effect::Replace {
-                            id,
-                            from,
-                            to,
-                            directives,
-                            changed_create_only: cascade_attrs,
-                            cascading_updates: vec![],
-                            temporary_name: None,
-                            cascade_ref_hints: ref_hints,
-                        };
-                    }
-                    return;
-                }
-                Effect::DeferredReplace { .. } => {}
-                _ => {}
-            }
+    fn remap_replace_display_indices(&mut self, old_to_new: &[Option<usize>]) {
+        let mut dropped_replace_ids = HashSet::new();
+        let mut remapped = Vec::with_capacity(self.replace_display.len());
+
+        for mut metadata in self.replace_display.drain(..) {
+            let Some(create_idx) = old_to_new
+                .get(metadata.create_idx)
+                .and_then(|mapped| *mapped)
+            else {
+                dropped_replace_ids.insert(metadata.id);
+                continue;
+            };
+            let Some(delete_idx) = old_to_new
+                .get(metadata.delete_idx)
+                .and_then(|mapped| *mapped)
+            else {
+                dropped_replace_ids.insert(metadata.id);
+                continue;
+            };
+            let rename_idx = if let Some(rename_idx) = metadata.rename_idx {
+                old_to_new.get(rename_idx).and_then(|mapped| *mapped)
+            } else {
+                None
+            };
+
+            metadata.create_idx = create_idx;
+            metadata.delete_idx = delete_idx;
+            metadata.rename_idx = rename_idx;
+            remapped.push(metadata);
         }
+
+        if !dropped_replace_ids.is_empty() {
+            self.permanent_name_overrides
+                .retain(|override_| !dropped_replace_ids.contains(&override_.id));
+        }
+        self.replace_display = remapped;
     }
 
-    /// Promote a Replace effect to create_before_destroy.
-    ///
-    /// This is used by auto-detection: when a resource being replaced is
-    /// referenced by other resources, it should use create_before_destroy
-    /// to avoid breaking dependents during replacement.
-    pub fn promote_to_create_before_destroy(&mut self, resource_id: &crate::resource::ResourceId) {
-        for effect in &mut self.effects {
-            if let Effect::Replace { id, directives, .. } = effect
-                && id == resource_id
-            {
-                directives.create_before_destroy = true;
-                return;
-            }
-        }
+    pub(crate) fn clear_replace_display(&mut self) {
+        self.replace_display.clear();
+        self.permanent_name_overrides.clear();
     }
 
     /// Number of mutating Effects
@@ -204,16 +300,35 @@ impl Plan {
     pub fn summary(&self) -> PlanSummary {
         let mut summary = PlanSummary::default();
         let deferred_summary = crate::plan_tree::deferred_summary_for_plan(self);
-        for effect in &self.effects {
+        let replace_create_indices: HashSet<usize> = self
+            .replace_display
+            .iter()
+            .map(|metadata| metadata.create_idx)
+            .collect();
+        let replace_delete_indices: HashSet<usize> = self
+            .replace_display
+            .iter()
+            .map(|metadata| metadata.delete_idx)
+            .collect();
+        let replace_rename_indices: HashSet<usize> = self
+            .replace_display
+            .iter()
+            .filter_map(|metadata| metadata.rename_idx)
+            .collect();
+
+        for (idx, effect) in self.effects.iter().enumerate() {
             match effect {
                 Effect::Read { .. } => summary.read += 1,
-                Effect::Create(_) => summary.create += 1,
-                Effect::Update { .. } => summary.update += 1,
-                Effect::Replace {
-                    cascading_updates, ..
-                } => {
-                    summary.replace += 1;
-                    summary.update += cascading_updates.len();
+                Effect::Create(_) if !replace_create_indices.contains(&idx) => {
+                    summary.create += 1;
+                }
+                Effect::Create(_) => {}
+                Effect::Update { .. } if !replace_rename_indices.contains(&idx) => {
+                    summary.update += 1;
+                }
+                Effect::Update { .. } => {}
+                Effect::Delete { .. } if !replace_delete_indices.contains(&idx) => {
+                    summary.delete += 1;
                 }
                 Effect::Delete { .. } => {}
                 Effect::DeferredReplace { .. } => {}
@@ -224,11 +339,7 @@ impl Plan {
                 Effect::DeferredCreate { .. } => {}
             }
         }
-        summary.delete += self
-            .effects
-            .iter()
-            .filter(|effect| matches!(effect, Effect::Delete { .. }))
-            .count();
+        summary.replace += self.replace_display.len();
         summary.deferred = deferred_summary.entries;
         summary
     }
@@ -378,7 +489,6 @@ impl ModularPlan {
             let source = match effect {
                 Effect::Create(r) => Self::extract_source(&r.module_source),
                 Effect::Update { to, .. } => Self::extract_source(&to.module_source),
-                Effect::Replace { to, .. } => Self::extract_source(&to.module_source),
                 Effect::Read { resource } => Self::extract_source(&resource.module_source),
                 Effect::Delete { .. }
                 | Effect::Import { .. }
@@ -481,7 +591,6 @@ fn format_effect_brief(effect: &Effect) -> String {
     match effect {
         Effect::Create(r) => format!("{} {}", effect.display_glyph(), r.id),
         Effect::Update { id, .. } => format!("{} {}", effect.display_glyph(), id),
-        Effect::Replace { id, .. } => format!("{} {}", effect.display_glyph(), id),
         Effect::Delete { id, .. } => format!("{} {}", effect.display_glyph(), id),
         Effect::Read { resource } => {
             format!("{} {} (data source)", effect.display_glyph(), resource.id)
@@ -574,6 +683,158 @@ mod tests {
         assert_eq!(plan.mutation_count(), 1);
     }
 
+    #[test]
+    fn plan_retain_updates_replace_display_indices() {
+        let id = ResourceId::new("test.resource", "bucket");
+        let mut replacement = Resource::new("test.resource", "bucket").with_binding("bucket");
+        replacement.id = id.clone();
+        let create_idx = 1;
+        let delete_idx = 3;
+        let rename_idx = 4;
+        let mut plan = Plan::new();
+        plan.add(Effect::Read {
+            resource: crate::resource::DataSource::new("data.source", "before"),
+        });
+        plan.add(Effect::Create(replacement.clone()));
+        plan.add(Effect::Create(Resource::new("test.resource", "unrelated")));
+        plan.add(Effect::Delete {
+            id: id.clone(),
+            identifier: "old-id".to_string(),
+            directives: Directives::default(),
+            binding: Some("bucket".to_string()),
+            dependencies: HashSet::new(),
+            explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
+        });
+        plan.add(Effect::Update {
+            id: id.clone(),
+            from: UpdateBase::CreatedBy {
+                binding: "bucket".to_string(),
+                id: id.clone(),
+            },
+            to: replacement,
+            changed_attributes: vec!["name".to_string()],
+        });
+        plan.add_replace_display(ReplaceDisplayMetadata {
+            id,
+            binding: Some("bucket".to_string()),
+            create_idx,
+            delete_idx,
+            rename_idx: Some(rename_idx),
+            create_before_destroy: true,
+            changed_create_only: ChangedCreateOnly::new(vec!["force_replace".to_string()])
+                .expect("fixture has a create-only attr"),
+            cascade_ref_hints: Vec::new(),
+            temporary_name: None,
+            previous_attributes: HashMap::new(),
+        });
+
+        plan.retain(|effect| match effect {
+            Effect::Read { .. } => false,
+            Effect::Create(resource) if resource.id.name_str() == "unrelated" => false,
+            _ => true,
+        });
+
+        let metadata = plan
+            .replace_display()
+            .first()
+            .expect("replace metadata should survive when all group effects survive");
+        assert_eq!(metadata.create_idx, 0);
+        assert_eq!(metadata.delete_idx, 1);
+        assert_eq!(metadata.rename_idx, Some(2));
+    }
+
+    #[test]
+    fn plan_retain_removes_only_rename_keeps_replace_group() {
+        let id = ResourceId::new("test.resource", "bucket");
+        let replacement = Resource::new("test.resource", "bucket").with_binding("bucket");
+        let mut plan = Plan::new();
+        let create_idx = plan.add(Effect::Create(replacement.clone()));
+        let delete_idx = plan.add(Effect::Delete {
+            id: id.clone(),
+            identifier: "old-id".to_string(),
+            directives: Directives::default(),
+            binding: Some("bucket".to_string()),
+            dependencies: HashSet::new(),
+            explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
+        });
+        let rename_idx = plan.add(Effect::Update {
+            id: id.clone(),
+            from: UpdateBase::CreatedBy {
+                binding: "bucket".to_string(),
+                id: id.clone(),
+            },
+            to: replacement,
+            changed_attributes: vec!["name".to_string()],
+        });
+        plan.add_replace_display(ReplaceDisplayMetadata {
+            id: id.clone(),
+            binding: Some("bucket".to_string()),
+            create_idx,
+            delete_idx,
+            rename_idx: Some(rename_idx),
+            create_before_destroy: true,
+            changed_create_only: ChangedCreateOnly::new(vec!["force_replace".to_string()])
+                .expect("fixture has a create-only attr"),
+            cascade_ref_hints: Vec::new(),
+            temporary_name: None,
+            previous_attributes: HashMap::new(),
+        });
+        plan.add_permanent_name_override(
+            id.clone(),
+            HashMap::from([("name".to_string(), "bucket-temp".to_string())]),
+        );
+
+        plan.retain(|effect| !matches!(effect, Effect::Update { .. }));
+
+        let metadata = plan
+            .replace_display()
+            .first()
+            .expect("replace metadata should survive when only rename is removed");
+        assert_eq!(metadata.create_idx, 0);
+        assert_eq!(metadata.delete_idx, 1);
+        assert_eq!(metadata.rename_idx, None);
+        assert_eq!(plan.permanent_name_overrides().len(), 1);
+        assert_eq!(plan.permanent_name_overrides()[0].id, id);
+    }
+
+    #[test]
+    fn plan_retain_drops_replace_display_when_group_effect_is_removed() {
+        let id = ResourceId::new("test.resource", "bucket");
+        let replacement = Resource::new("test.resource", "bucket").with_binding("bucket");
+        let mut plan = Plan::new();
+        let create_idx = plan.add(Effect::Create(replacement));
+        let delete_idx = plan.add(Effect::Delete {
+            id: id.clone(),
+            identifier: "old-id".to_string(),
+            directives: Directives::default(),
+            binding: Some("bucket".to_string()),
+            dependencies: HashSet::new(),
+            explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
+        });
+        plan.add_replace_display(ReplaceDisplayMetadata {
+            id: id.clone(),
+            binding: Some("bucket".to_string()),
+            create_idx,
+            delete_idx,
+            rename_idx: None,
+            create_before_destroy: true,
+            changed_create_only: ChangedCreateOnly::new(vec!["force_replace".to_string()])
+                .expect("fixture has a create-only attr"),
+            cascade_ref_hints: Vec::new(),
+            temporary_name: None,
+            previous_attributes: HashMap::new(),
+        });
+
+        plan.retain(
+            |effect| !matches!(effect, Effect::Delete { id: delete_id, .. } if delete_id == &id),
+        );
+
+        assert!(plan.replace_display().is_empty());
+    }
+
     /// carina#3332: `Effect::Remove` in the brief renderer must not
     /// lead with `x` (shape-collides with the `✗` failure indicator
     /// used in apply output). Pin the new `~ ... (remove from state)`
@@ -657,6 +918,7 @@ mod tests {
             binding: None,
             dependencies: std::collections::HashSet::new(),
             explicit_dependencies: std::collections::HashSet::new(),
+            blocked_by_updates: std::collections::HashSet::new(),
         });
 
         let summary = plan.summary();
@@ -732,6 +994,7 @@ mod tests {
                 binding: Some(format!("validation_records[{idx}]")),
                 dependencies: HashSet::new(),
                 explicit_dependencies: HashSet::new(),
+                blocked_by_updates: HashSet::new(),
             })
             .collect();
 
@@ -812,91 +1075,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_summary_counts_cascading_updates() {
-        use crate::effect::CascadingUpdate;
-        use crate::resource::State;
-        use crate::resource::{Directives, ResourceId};
-
-        let mut plan = Plan::new();
-
-        // A Replace effect with one cascading update
-        let from = State::not_found(ResourceId::new("ec2.Vpc", "vpc")).with_identifier("vpc-123");
-        let to = Resource::new("ec2.Vpc", "vpc");
-        let cascading = CascadingUpdate {
-            id: ResourceId::new("ec2.Subnet", "subnet"),
-            from: Box::new(
-                State::not_found(ResourceId::new("ec2.Subnet", "subnet"))
-                    .with_identifier("subnet-123"),
-            ),
-            to: (Resource::new("ec2.Subnet", "subnet")),
-        };
-        plan.add(Effect::Replace {
-            id: ResourceId::new("ec2.Vpc", "vpc"),
-            from: Box::new(from),
-            to,
-            directives: Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
-                "cidr_block".to_string(),
-            ])
-            .unwrap(),
-            cascading_updates: vec![cascading],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        });
-
-        let summary = plan.summary();
-        assert_eq!(summary.replace, 1);
-        assert_eq!(summary.update, 1, "cascading updates should be counted");
-        assert_eq!(summary.create, 0);
-        assert_eq!(summary.delete, 0);
-    }
-
-    #[test]
-    fn plan_summary_display_includes_cascading_updates() {
-        use crate::effect::CascadingUpdate;
-        use crate::resource::State;
-        use crate::resource::{Directives, ResourceId};
-
-        let mut plan = Plan::new();
-
-        let from = State::not_found(ResourceId::new("ec2.Vpc", "vpc")).with_identifier("vpc-123");
-        let to = Resource::new("ec2.Vpc", "vpc");
-        let cascading = CascadingUpdate {
-            id: ResourceId::new("ec2.Subnet", "subnet"),
-            from: Box::new(
-                State::not_found(ResourceId::new("ec2.Subnet", "subnet"))
-                    .with_identifier("subnet-123"),
-            ),
-            to: (Resource::new("ec2.Subnet", "subnet")),
-        };
-        plan.add(Effect::Replace {
-            id: ResourceId::new("ec2.Vpc", "vpc"),
-            from: Box::new(from),
-            to,
-            directives: Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
-                "cidr_block".to_string(),
-            ])
-            .unwrap(),
-            cascading_updates: vec![cascading],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        });
-
-        let display = format!("{}", plan.summary());
-        assert!(
-            display.contains("1 to update"),
-            "display should show cascading updates: {}",
-            display
-        );
-        assert!(
-            display.contains("1 to replace"),
-            "display should show replace: {}",
-            display
-        );
-    }
-
-    #[test]
     fn plan_serde_round_trip() {
         use crate::resource::ResourceId;
 
@@ -909,6 +1087,7 @@ mod tests {
             binding: None,
             dependencies: std::collections::HashSet::new(),
             explicit_dependencies: std::collections::HashSet::new(),
+            blocked_by_updates: std::collections::HashSet::new(),
         });
 
         let json = serde_json::to_string(&plan).unwrap();

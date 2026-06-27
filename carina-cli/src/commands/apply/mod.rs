@@ -361,6 +361,7 @@ pub(crate) async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), 
         failed_refreshes: &input.result.failed_refreshes,
         schemas: input.schemas,
     })?;
+    warn_incomplete_cbd_replacements(input.plan, input.result);
 
     // `Some([])` is meaningful: the user removed the `exports {}` block,
     // so stale entries the previous apply persisted must be cleared
@@ -389,6 +390,21 @@ pub(crate) async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), 
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
 
     Ok(())
+}
+
+fn warn_incomplete_cbd_replacements(plan: &Plan, result: &ExecutionResult) {
+    for metadata in plan.replace_display() {
+        if metadata.create_before_destroy
+            && result.applied_states.contains_key(&metadata.id)
+            && !result.successfully_deleted.contains(&metadata.id)
+        {
+            eprintln!(
+                "{} create_before_destroy replacement for {} was created, but the old resource delete did not complete. State now records the replacement; check the provider for the old resource before retrying.",
+                "Warning:".yellow().bold(),
+                metadata.id
+            );
+        }
+    }
 }
 
 /// Renew the lock and write state with lock validation.
@@ -1382,8 +1398,9 @@ async fn run_apply_locked(
         &wait_bindings,
     );
 
-    // Populate cascading updates for create_before_destroy Replace effects.
-    // Uses unresolved resources (sorted_resources) so dependents retain ResourceRef values.
+    // Drive cascade_dependent_updates to add independent consumer Updates
+    // for resources whose dependencies are being replaced (CBD), and to
+    // decompose PendingReplaces into Create + Update + Delete effects.
     cascade_dependent_updates(&mut plan, &sorted_resources, &plan_input_states, schemas);
 
     // Add state block effects (import/removed/moved) to the plan.
@@ -1694,10 +1711,18 @@ async fn run_apply_from_plan_with_observer_factory(
     // Read and deserialize the plan file
     let content =
         fs::read_to_string(plan_path).map_err(|e| format!("Failed to read plan file: {}", e))?;
-    let plan_file: PlanFile =
+    let plan_value: serde_json::Value =
         serde_json::from_str(&content).map_err(|e| format!("Failed to parse plan file: {}", e))?;
+    let plan_version = plan_value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| AppError::Config("Plan file is missing numeric version".to_string()))?;
 
-    // Validate version compatibility. Plan-file version 6
+    // Validate version compatibility. Plan-file version 7
+    // (carina#3625) decomposes Replace into Create/Update/Delete and
+    // persists replace_display metadata.
+    //
+    // Plan-file version 6
     // (carina#3486) persists the pre-resolution resource snapshot used
     // by apply-time dependency analysis and reference re-resolution.
     //
@@ -1716,13 +1741,15 @@ async fn run_apply_from_plan_with_observer_factory(
     // view as the live-apply path (carina#3246). Older plans cannot be
     // applied by the post-#3248 binding-construction path and are
     // rejected outright per the repo's no-backward-compat policy.
-    if plan_file.version != 6 {
+    if plan_version != 7 {
         return Err(AppError::Config(format!(
-            "Unsupported plan file version: {} (expected 6). \
+            "Unsupported plan file version: {} (expected 7). \
              Re-run 'carina plan' to produce a plan in the current format.",
-            plan_file.version
+            plan_version
         )));
     }
+    let plan_file: PlanFile = serde_json::from_value(plan_value)
+        .map_err(|e| format!("Failed to parse plan file: {}", e))?;
 
     let current_version = env!("CARGO_PKG_VERSION");
     if plan_file.carina_version != current_version {

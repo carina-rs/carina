@@ -5,14 +5,11 @@ use colored::{ColoredString, Colorize};
 
 use carina_core::detail_rows::{
     DetailRow, ListOfMapsDiffField, ListOfMapsDiffItem, ListOfMapsDiffItemKind,
-    ListOfMapsDiffModified, MapDiffEntryIR, build_detail_rows, hidden_unchanged_summary,
+    ListOfMapsDiffModified, MapDiffEntryIR, build_detail_rows, build_replace_display_rows,
+    hidden_unchanged_summary,
 };
-#[cfg(test)]
-use carina_core::effect::CascadingUpdate;
 use carina_core::effect::Effect;
-use carina_core::plan::{DeferredSummaryAction, Plan, PlanSummaryPart};
-#[cfg(test)]
-use carina_core::plan_tree::shorten_attr_name;
+use carina_core::plan::{DeferredSummaryAction, Plan, PlanSummaryPart, ReplaceDisplayMetadata};
 use carina_core::plan_tree::{
     ChildRenderItem, build_dependency_graph, build_single_parent_tree, child_render_items,
     deferred_for_detail_rows, deferred_for_display_name, deferred_for_source, deferred_for_verb,
@@ -21,8 +18,6 @@ use carina_core::plan_tree::{
 use carina_core::resource::{ConcreteValue, DeferredValue, ResourceId, Value};
 use carina_core::schema::SchemaRegistry;
 use carina_core::value::format_value_pretty;
-#[cfg(test)]
-use carina_core::value::format_value_with_key;
 
 use crate::DetailLevel;
 
@@ -71,7 +66,7 @@ impl Sigil {
         let rendered = match effect {
             Effect::Create(_) | Effect::DeferredCreate { .. } => raw.green().bold(),
             Effect::Update { .. } => raw.yellow().bold(),
-            Effect::Replace { .. } | Effect::DeferredReplace { .. } => raw.magenta().bold(),
+            Effect::DeferredReplace { .. } => raw.magenta().bold(),
             Effect::Delete { .. } => raw.red().bold(),
             Effect::Read { .. } | Effect::Import { .. } => raw.cyan().bold(),
             // carina#3332: the previous `x` (red, bold) shape-collides
@@ -96,6 +91,14 @@ impl Sigil {
         Self {
             raw: "+",
             rendered: "+".green().bold(),
+        }
+    }
+
+    fn replace(create_before_destroy: bool) -> Self {
+        let raw = if create_before_destroy { "+/-" } else { "-/+" };
+        Self {
+            raw,
+            rendered: raw.magenta().bold(),
         }
     }
 
@@ -554,9 +557,11 @@ struct TreeRenderContext<'a> {
     /// to project the actual-state side before unchanged-attribute
     /// counting (refs awscc#206).
     prev_explicit: Option<&'a HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
-    /// ResourceIds that are targets of Update or Replace effects.
+    /// ResourceIds that are targets of Updates or replacement display rows.
     /// Used to skip Move line display when the move is already shown via annotation.
     update_or_replace_targets: HashSet<ResourceId>,
+    replace_by_create_idx: HashMap<usize, &'a ReplaceDisplayMetadata>,
+    replace_hidden_indices: HashSet<usize>,
 }
 
 impl<'a> TreeRenderContext<'a> {
@@ -571,9 +576,18 @@ impl<'a> TreeRenderContext<'a> {
         if self.printed.contains(&idx) {
             return false;
         }
+        if self.replace_hidden_indices.contains(&idx) {
+            self.printed.insert(idx);
+            return false;
+        }
         self.printed.insert(idx);
 
         let effect = &self.plan.effects()[idx];
+        if let Some(metadata) = self.replace_by_create_idx.get(&idx).copied() {
+            self.printed.insert(metadata.delete_idx);
+            return self.format_replace_tree(metadata, indent, is_last, prefix, parent_binding);
+        }
+
         let sigil = Sigil::from_effect(effect);
         let line_prefix = tree_sigil_prefix(indent, is_last, prefix, &sigil);
         let base_indent = LEFT_MARGIN;
@@ -637,47 +651,6 @@ impl<'a> TreeRenderContext<'a> {
                         id.display_type().cyan().bold(),
                         id.name_str().yellow().bold(),
                         moved_note.as_deref().unwrap_or("").yellow()
-                    )
-                    .unwrap();
-                }
-            }
-            Effect::Replace {
-                id, to, directives, ..
-            } => {
-                let replace_note = if directives.create_before_destroy {
-                    "(must be replaced, create before destroy)"
-                } else {
-                    "(must be replaced)"
-                };
-                let moved_note = self
-                    .moved_origins
-                    .get(id)
-                    .map(|from| format!(" (moved from: {})", from.name_str()));
-                if self.detail == DetailLevel::None {
-                    let name_part = format_compact_name(
-                        carina_core::parser::ResourceRef::Resource(to),
-                        id.name_str(),
-                        parent_binding,
-                    );
-                    writeln!(
-                        self.out,
-                        "{}{} {} {}{}",
-                        line_prefix,
-                        id.display_type().cyan().bold(),
-                        name_part.magenta().bold(),
-                        replace_note.magenta(),
-                        moved_note.as_deref().unwrap_or("").magenta()
-                    )
-                    .unwrap();
-                } else {
-                    writeln!(
-                        self.out,
-                        "{}{} {} {}{}",
-                        line_prefix,
-                        id.display_type().cyan().bold(),
-                        id.name_str().magenta().bold(),
-                        replace_note.magenta(),
-                        moved_note.as_deref().unwrap_or("").magenta()
                     )
                     .unwrap();
                 }
@@ -756,9 +729,9 @@ impl<'a> TreeRenderContext<'a> {
                 .unwrap();
             }
             Effect::Move { from, to } => {
-                // Skip Move line display when an Update/Replace effect already exists
-                // for this target — those effects show "(moved from: ...)" annotation.
-                // Pure moves (no Update/Replace) must be displayed.
+                // Skip Move line display when an Update or replacement display row
+                // already exists for this target; those rows show "(moved from: ...)".
+                // Pure moves (no Update/replacement) must be displayed.
                 if self.update_or_replace_targets.contains(to) {
                     return false;
                 }
@@ -892,6 +865,108 @@ impl<'a> TreeRenderContext<'a> {
         has_displayed_attrs
     }
 
+    fn format_replace_tree(
+        &mut self,
+        metadata: &ReplaceDisplayMetadata,
+        indent: usize,
+        is_last: bool,
+        prefix: &str,
+        parent_binding: Option<&str>,
+    ) -> bool {
+        let Some(Effect::Create(resource)) = self.plan.effects().get(metadata.create_idx) else {
+            return false;
+        };
+
+        let sigil = Sigil::replace(metadata.create_before_destroy);
+        let line_prefix = tree_sigil_prefix(indent, is_last, prefix, &sigil);
+        let replace_note = if metadata.create_before_destroy {
+            "(must be replaced, create before destroy)"
+        } else {
+            "(must be replaced)"
+        };
+        let moved_note = self
+            .moved_origins
+            .get(&metadata.id)
+            .map(|from| format!(" (moved from: {})", from.name_str()));
+        let name = if self.detail == DetailLevel::None {
+            format_compact_name(
+                carina_core::parser::ResourceRef::Resource(resource),
+                resource.id.name_str(),
+                parent_binding,
+            )
+        } else {
+            resource.id.name_str().to_string()
+        };
+        writeln!(
+            self.out,
+            "{}{} {} {}{}",
+            line_prefix,
+            metadata.id.display_type().cyan().bold(),
+            name.magenta().bold(),
+            replace_note.magenta(),
+            moved_note.as_deref().unwrap_or("").magenta()
+        )
+        .unwrap();
+
+        let mut has_displayed_attrs = false;
+        if self.detail != DetailLevel::None {
+            let attr_prefix = if indent == 0 {
+                format!("{}{}", LEFT_MARGIN, ATTR_BASE)
+            } else {
+                let continuation = if is_last {
+                    format!("{}{}", prefix, SPACE_CONTINUATION)
+                } else {
+                    format!("{}{}", prefix, VERTICAL_CONTINUATION)
+                };
+                format!("{}{}{}", LEFT_MARGIN, continuation, SPACE_CONTINUATION)
+            };
+            let rows = build_replace_display_rows(
+                metadata,
+                resource,
+                self.delete_attributes,
+                self.schemas,
+                self.detail.to_core(),
+                self.prev_explicit,
+            );
+            has_displayed_attrs = !rows.is_empty();
+            for row in &rows {
+                render_detail_row(
+                    &mut self.out,
+                    row,
+                    &Effect::Create(resource.clone()),
+                    &attr_prefix,
+                );
+            }
+        }
+
+        let current_binding = metadata.binding.as_deref().or(resource.binding.as_deref());
+        let children = self
+            .dependents
+            .get(&metadata.create_idx)
+            .cloned()
+            .unwrap_or_default();
+        let unprinted_children: Vec<_> = children
+            .iter()
+            .filter(|c| !self.printed.contains(c))
+            .cloned()
+            .collect();
+        let child_render_items = self.child_render_items(&unprinted_children);
+
+        has_displayed_attrs |= self.render_children(
+            &child_render_items,
+            ChildRenderOptions {
+                parent_indent: indent,
+                parent_is_last: is_last,
+                parent_prefix: prefix,
+                parent_binding: current_binding,
+                parent_displayed_attrs: has_displayed_attrs,
+                child_prefix_override: None,
+            },
+        );
+
+        has_displayed_attrs
+    }
+
     fn format_render_item(
         &mut self,
         item: &ChildRenderItem,
@@ -921,6 +996,9 @@ impl<'a> TreeRenderContext<'a> {
         if self.printed.contains(&idx) {
             return false;
         }
+        if self.replace_hidden_indices.contains(&idx) {
+            return false;
+        }
 
         let Some(effect) = self.plan.effects().get(idx) else {
             return false;
@@ -930,7 +1008,6 @@ impl<'a> TreeRenderContext<'a> {
             Effect::Move { to, .. } => !self.update_or_replace_targets.contains(to),
             Effect::Create(_)
             | Effect::Update { .. }
-            | Effect::Replace { .. }
             | Effect::Delete { .. }
             | Effect::Read { .. }
             | Effect::Import { .. }
@@ -944,6 +1021,10 @@ impl<'a> TreeRenderContext<'a> {
     fn consume_suppressed_item(&mut self, item: &ChildRenderItem) {
         match item {
             ChildRenderItem::Normal(idx) => {
+                if self.replace_hidden_indices.contains(idx) && !self.printed.contains(idx) {
+                    self.printed.insert(*idx);
+                    return;
+                }
                 if !self.will_render_effect_tree(*idx)
                     && !self.printed.contains(idx)
                     && matches!(
@@ -1057,11 +1138,30 @@ fn format_plan_tree<'a>(
         .iter()
         .filter_map(|e| match e {
             Effect::Update { to, .. } => Some(to.id.clone()),
-            Effect::Replace { to, .. } => Some(to.id.clone()),
             Effect::DeferredReplace { .. } => None,
             _ => None,
         })
+        .chain(
+            plan.replace_display()
+                .iter()
+                .map(|metadata| metadata.id.clone()),
+        )
         .collect();
+    let replace_by_create_idx: HashMap<usize, &ReplaceDisplayMetadata> = plan
+        .replace_display()
+        .iter()
+        .map(|metadata| (metadata.create_idx, metadata))
+        .collect();
+    let mut replace_hidden_indices: HashSet<usize> = plan
+        .replace_display()
+        .iter()
+        .map(|metadata| metadata.delete_idx)
+        .collect();
+    replace_hidden_indices.extend(
+        plan.replace_display()
+            .iter()
+            .filter_map(|metadata| metadata.rename_idx),
+    );
 
     let mut ctx = TreeRenderContext {
         out: String::new(),
@@ -1074,6 +1174,8 @@ fn format_plan_tree<'a>(
         moved_origins,
         prev_explicit,
         update_or_replace_targets,
+        replace_by_create_idx,
+        replace_hidden_indices,
     };
 
     // #3307: when an ExpansionTrace is supplied AND it actually
@@ -1854,31 +1956,6 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
                 .unwrap();
             }
         }
-        DetailRow::CascadingUpdates { count, updates } => {
-            writeln!(out, "{}  {} cascading update(s):", attr_prefix, count).unwrap();
-            for update in updates {
-                writeln!(
-                    out,
-                    "{}    ~ {} {}",
-                    attr_prefix,
-                    update.display_type.as_str().cyan(),
-                    update.name.as_str().magenta()
-                )
-                .unwrap();
-                for attr in &update.changed_attrs {
-                    writeln!(
-                        out,
-                        "{}        {}: {} → {} {}",
-                        attr_prefix,
-                        attr.key,
-                        attr.old.as_str().red().strikethrough(),
-                        attr.new.as_str().green(),
-                        "(known after apply)".dimmed()
-                    )
-                    .unwrap();
-                }
-            }
-        }
     }
 }
 
@@ -2188,26 +2265,6 @@ pub fn format_effect(effect: &Effect) -> String {
     match effect {
         Effect::Create(r) => format!("Create {}", r.id.human()),
         Effect::Update { id, .. } => format!("Update {}", id.human()),
-        Effect::Replace {
-            id,
-            directives,
-            cascading_updates,
-            ..
-        } => {
-            if directives.create_before_destroy {
-                if cascading_updates.is_empty() {
-                    format!("Replace {} (create-before-destroy)", id.human())
-                } else {
-                    format!(
-                        "Replace {} (create-before-destroy, {} cascade)",
-                        id.human(),
-                        cascading_updates.len()
-                    )
-                }
-            } else {
-                format!("Replace {}", id.human())
-            }
-        }
         Effect::Delete { id, binding, .. } => {
             let display_name = binding.as_deref().unwrap_or(id.name_str());
             format!("Delete {} {}", id.display_type(), display_name)
@@ -2258,59 +2315,6 @@ pub fn format_effect(effect: &Effect) -> String {
             )
         }
     }
-}
-
-#[cfg(test)]
-fn format_cascading_update_diff(
-    cascade: &CascadingUpdate,
-    attr_prefix: &str,
-    replaced_binding: &str,
-) -> String {
-    let mut lines = Vec::new();
-    let mut keys: Vec<_> = cascade
-        .to
-        .attributes
-        .keys()
-        .filter(|k| !k.starts_with('_'))
-        .collect();
-    keys.sort();
-    for key in keys {
-        let new_value = &cascade.to.attributes[key];
-        if !value_references_binding(new_value, replaced_binding) {
-            continue;
-        }
-        let old_value = cascade.from.attributes.get(key);
-        let old_str = old_value
-            .map(|v| format_value_with_key(v, Some(key)))
-            .unwrap_or_else(|| "(none)".to_string());
-        let new_str = format_value_with_key(new_value, Some(key));
-        lines.push(format!(
-            "{}    {}: {} → {} {}",
-            attr_prefix,
-            key,
-            old_str.red().strikethrough(),
-            new_str.green(),
-            "(known after apply)".dimmed()
-        ));
-    }
-    lines.join("\n")
-}
-
-#[cfg(test)]
-/// Check whether a Value references the given binding name (either ResourceRef or bare BindingRef).
-fn value_references_binding(value: &Value, binding: &str) -> bool {
-    let mut found = false;
-    value.visit_resource_refs(&mut |path| {
-        if path.binding() == binding {
-            found = true;
-        }
-    });
-    value.visit_binding_refs(&mut |bare_binding| {
-        if bare_binding == binding {
-            found = true;
-        }
-    });
-    found
 }
 
 #[cfg(test)]

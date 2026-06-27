@@ -232,6 +232,7 @@ impl DependencyAnalysis {
 
 struct DependencyAnalyzer {
     binding_to_idx: HashMap<String, usize>,
+    binding_to_final_idx: HashMap<String, usize>,
     name_to_delete_idx: HashMap<String, usize>,
     compositions_by_binding: HashMap<String, crate::resource::Composition>,
 }
@@ -239,6 +240,7 @@ struct DependencyAnalyzer {
 impl DependencyAnalyzer {
     fn new(
         binding_to_idx: HashMap<String, usize>,
+        binding_to_final_idx: HashMap<String, usize>,
         name_to_delete_idx: HashMap<String, usize>,
         compositions: &[crate::resource::Composition],
     ) -> Self {
@@ -253,21 +255,40 @@ impl DependencyAnalyzer {
             .collect();
         Self {
             binding_to_idx,
+            binding_to_final_idx,
             name_to_delete_idx,
             compositions_by_binding,
         }
     }
 
-    fn lookup_idx(&self, binding: &str) -> Option<usize> {
-        self.binding_to_idx
-            .get(binding)
-            .or_else(|| self.name_to_delete_idx.get(binding))
-            .copied()
+    fn lookup_initial_idx(&self, binding: &str) -> Option<usize> {
+        self.binding_to_idx.get(binding).copied()
+    }
+
+    fn lookup_delete_idx(&self, binding: &str) -> Option<usize> {
+        self.name_to_delete_idx.get(binding).copied()
+    }
+
+    fn lookup_idxs(&self, binding: &str) -> Vec<usize> {
+        let mut out = Vec::with_capacity(2);
+        if let Some(initial) = self.binding_to_idx.get(binding).copied() {
+            out.push(initial);
+        }
+        if let Some(final_idx) = self.binding_to_final_idx.get(binding).copied()
+            && !out.contains(&final_idx)
+        {
+            out.push(final_idx);
+        }
+        if out.is_empty()
+            && let Some(delete_idx) = self.name_to_delete_idx.get(binding).copied()
+        {
+            out.push(delete_idx);
+        }
+        out
     }
 
     fn collect_from_schedule_edges(
         &self,
-        effects: &[Effect],
         edges: Vec<ScheduleEdge>,
         analysis: &mut DependencyAnalysis,
         self_idx: usize,
@@ -277,17 +298,25 @@ impl DependencyAnalyzer {
                 ScheduleEdge::DependsOn(binding) => {
                     self.record_binding_edge(&binding, ReadsSet::unknown(), analysis, self_idx);
                 }
+                ScheduleEdge::DependsOnCreated(binding) => {
+                    if let Some(parent) = self.lookup_initial_idx(&binding) {
+                        analysis.add_edge(self_idx, parent, ReadsSet::unknown());
+                    }
+                }
                 ScheduleEdge::BlockedBy(binding) => {
-                    if let Some(blocked_idx) = self.lookup_idx(&binding) {
+                    for blocked_idx in self.lookup_idxs(&binding) {
                         analysis.add_edge(blocked_idx, self_idx, ReadsSet::unknown());
                     }
                 }
                 ScheduleEdge::BlockedByIfDelete(binding) => {
-                    if let Some(blocked_idx) = self.lookup_idx(&binding)
-                        && blocked_idx < effects.len()
-                        && matches!(effects[blocked_idx], Effect::Delete { .. })
-                    {
+                    if let Some(blocked_idx) = self.lookup_delete_idx(&binding) {
                         analysis.add_edge(blocked_idx, self_idx, ReadsSet::unknown());
+                    } else {
+                        tracing::warn!(
+                            binding = %binding,
+                            effect_idx = self_idx,
+                            "BlockedByIfDelete target did not resolve to a Delete effect; dropping scheduler edge"
+                        );
                     }
                 }
             }
@@ -360,22 +389,28 @@ impl DependencyAnalyzer {
         if !visited.insert(binding) {
             return;
         }
-        if let Some(parent) = self.lookup_idx(binding) {
-            analysis.add_edge(child, parent, reads);
+        let parents = self.lookup_idxs(binding);
+        if !parents.is_empty() {
+            for parent in parents {
+                analysis.add_edge(child, parent, reads.clone());
+            }
             return;
         }
         let Some(composition) = self.compositions_by_binding.get(binding) else {
             return;
         };
         for inner in crate::deps::get_composition_dependencies(composition) {
-            let key: &'a str =
-                if let Some((k, _)) = self.compositions_by_binding.get_key_value(inner.as_str()) {
-                    k.as_str()
-                } else if let Some((k, _)) = self.binding_to_idx.get_key_value(inner.as_str()) {
-                    k.as_str()
-                } else {
-                    continue;
-                };
+            let key: &'a str = if let Some((k, _)) =
+                self.compositions_by_binding.get_key_value(inner.as_str())
+            {
+                k.as_str()
+            } else if let Some((k, _)) = self.binding_to_idx.get_key_value(inner.as_str()) {
+                k.as_str()
+            } else if let Some((k, _)) = self.binding_to_final_idx.get_key_value(inner.as_str()) {
+                k.as_str()
+            } else {
+                continue;
+            };
             self.record_binding_edge_inner(key, ReadsSet::unknown(), analysis, child, visited);
         }
     }
@@ -396,19 +431,32 @@ pub fn build_effect_dependency_analysis(
     inputs: ScheduleInputs<'_>,
 ) -> DependencyAnalysis {
     let mut binding_to_idx: HashMap<String, usize> = HashMap::new();
+    let mut binding_to_final_idx: HashMap<String, usize> = HashMap::new();
     let mut name_to_delete_idx: HashMap<String, usize> = HashMap::new();
     let aliases = match inputs {
         ScheduleInputs::Apply => &[][..],
         ScheduleInputs::Destroy { aliases } => aliases,
     };
     for (idx, effect) in effects.iter().enumerate() {
-        if let Some(binding) = effect.binding_name() {
-            binding_to_idx.insert(binding, idx);
-        }
-        if let Effect::Delete { id, binding, .. } = effect
-            && binding.is_none()
+        if !(matches!(inputs, ScheduleInputs::Apply) && matches!(effect, Effect::Delete { .. }))
+            && let Some(binding) = effect.binding_name()
         {
-            name_to_delete_idx.insert(id.name_str().to_string(), idx);
+            binding_to_idx.entry(binding).or_insert(idx);
+        }
+        if matches!(inputs, ScheduleInputs::Apply)
+            && let Effect::Update {
+                from: crate::effect::UpdateBase::CreatedBy { binding, .. },
+                ..
+            } = effect
+        {
+            binding_to_final_idx.insert(binding.clone(), idx);
+        }
+        if let Effect::Delete { id, binding, .. } = effect {
+            if let Some(binding) = binding {
+                name_to_delete_idx.insert(binding.clone(), idx);
+            } else {
+                name_to_delete_idx.insert(id.name_str().to_string(), idx);
+            }
         }
     }
     let alias_offset = effects.len();
@@ -416,19 +464,19 @@ pub fn build_effect_dependency_analysis(
         binding_to_idx.insert(alias.binding.clone(), alias_offset + alias_idx);
     }
 
-    let analyzer = DependencyAnalyzer::new(binding_to_idx, name_to_delete_idx, compositions);
+    let analyzer = DependencyAnalyzer::new(
+        binding_to_idx,
+        binding_to_final_idx,
+        name_to_delete_idx,
+        compositions,
+    );
     let mut analysis = DependencyAnalysis::new(effects.len() + aliases.len());
 
     for (idx, effect) in effects.iter().enumerate() {
         match inputs {
             ScheduleInputs::Apply => {
                 if effect.is_scheduler_meta() {
-                    analyzer.collect_from_schedule_edges(
-                        effects,
-                        effect.apply_edges(),
-                        &mut analysis,
-                        idx,
-                    );
+                    analyzer.collect_from_schedule_edges(effect.apply_edges(), &mut analysis, idx);
                     continue;
                 }
                 if effect.as_resource_ref().is_some() {
@@ -442,35 +490,70 @@ pub fn build_effect_dependency_analysis(
                         analyzer.collect_from_resource_ref(resource, &mut analysis, idx);
                     }
                 }
-                analyzer.collect_from_schedule_edges(
-                    effects,
-                    effect.apply_edges(),
-                    &mut analysis,
-                    idx,
-                );
+                analyzer.collect_from_schedule_edges(effect.apply_edges(), &mut analysis, idx);
             }
             ScheduleInputs::Destroy { .. } => {
-                analyzer.collect_from_schedule_edges(
-                    effects,
-                    effect.destroy_edges(),
-                    &mut analysis,
-                    idx,
-                );
+                analyzer.collect_from_schedule_edges(effect.destroy_edges(), &mut analysis, idx);
             }
         }
     }
     if let ScheduleInputs::Destroy { .. } = inputs {
         for (alias_idx, alias) in aliases.iter().enumerate() {
             analyzer.collect_from_schedule_edges(
-                effects,
                 alias.destroy_edges(),
                 &mut analysis,
                 alias_offset + alias_idx,
             );
         }
     }
+    if matches!(inputs, ScheduleInputs::Apply) {
+        collect_cbd_create_delete_edges(effects, &mut analysis);
+        collect_created_by_update_delete_edges(effects, &mut analysis);
+    }
 
     analysis
+}
+
+fn collect_created_by_update_delete_edges(effects: &[Effect], analysis: &mut DependencyAnalysis) {
+    let mut delete_by_id: HashMap<&ResourceId, usize> = HashMap::new();
+    let mut created_by_update_by_id: HashMap<&ResourceId, usize> = HashMap::new();
+    for (idx, effect) in effects.iter().enumerate() {
+        match effect {
+            Effect::Update {
+                id,
+                from: crate::effect::UpdateBase::CreatedBy { .. },
+                ..
+            } => {
+                created_by_update_by_id.insert(id, idx);
+            }
+            Effect::Delete { id, .. } => {
+                delete_by_id.insert(id, idx);
+            }
+            _ => {}
+        }
+    }
+    for (id, update_idx) in created_by_update_by_id {
+        if let Some(delete_idx) = delete_by_id.get(id) {
+            analysis.add_edge(update_idx, *delete_idx, ReadsSet::unknown());
+        }
+    }
+}
+
+fn collect_cbd_create_delete_edges(effects: &[Effect], analysis: &mut DependencyAnalysis) {
+    let mut create_by_id: HashMap<&ResourceId, usize> = HashMap::new();
+    for (idx, effect) in effects.iter().enumerate() {
+        match effect {
+            Effect::Create(resource) => {
+                create_by_id.entry(&resource.id).or_insert(idx);
+            }
+            Effect::Delete { id, .. } => {
+                if let Some(create_idx) = create_by_id.get(id) {
+                    analysis.add_edge(idx, *create_idx, ReadsSet::unknown());
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 pub fn relax_update_update_edges(effects: &[Effect], analysis: &mut DependencyAnalysis) {
@@ -488,6 +571,19 @@ pub fn relax_update_update_edges(effects: &[Effect], analysis: &mut DependencyAn
             let Some(reads) = analysis.reads_for_edge(child, parent) else {
                 continue;
             };
+            if let Effect::Update {
+                id,
+                from: crate::effect::UpdateBase::CreatedBy { .. },
+                ..
+            } = &effects[parent]
+            {
+                if !reads.disjoint(&writes) {
+                    remove_cbd_delete_wait_for_final_state_consumer(effects, analysis, id, child);
+                } else {
+                    analysis.remove_edge(child, parent);
+                }
+                continue;
+            }
             if reads.disjoint(&writes) {
                 analysis.remove_edge(child, parent);
             }
@@ -495,10 +591,35 @@ pub fn relax_update_update_edges(effects: &[Effect], analysis: &mut DependencyAn
     }
 }
 
+/// Remove the CBD Delete -> consumer edge only when that edge came from the
+/// Delete's captured `blocked_by_updates` set. Other future Delete -> consumer
+/// edges must not be silently removed by the rename cycle breaker.
+fn remove_cbd_delete_wait_for_final_state_consumer(
+    effects: &[Effect],
+    analysis: &mut DependencyAnalysis,
+    replacement_id: &ResourceId,
+    consumer_idx: usize,
+) {
+    let Some(consumer_binding) = effects[consumer_idx].binding_name() else {
+        return;
+    };
+    for (delete_idx, effect) in effects.iter().enumerate() {
+        if matches!(
+            effect,
+            Effect::Delete {
+                id,
+                blocked_by_updates,
+                ..
+            } if id == replacement_id && blocked_by_updates.contains(&consumer_binding)
+        ) {
+            analysis.remove_edge(delete_idx, consumer_idx);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effect::ChangedCreateOnly;
     use crate::resource::{State, Value};
 
     fn state_for(id: &ResourceId) -> State {
@@ -516,10 +637,571 @@ mod tests {
         }
         Effect::Update {
             id: resource.id.clone(),
-            from: Box::new(state_for(&resource.id)),
+            from: crate::effect::UpdateBase::Existing(Box::new(state_for(&resource.id))),
             to: resource,
             changed_attributes: changed.iter().map(|s| (*s).to_string()).collect(),
         }
+    }
+
+    fn delete_effect(
+        binding: &str,
+        blocked_by_updates: HashSet<String>,
+        dependencies: HashSet<String>,
+    ) -> Effect {
+        Effect::Delete {
+            id: ResourceId::new("test", binding),
+            identifier: format!("{binding}-old-id"),
+            directives: Default::default(),
+            binding: Some(binding.to_string()),
+            dependencies,
+            explicit_dependencies: HashSet::new(),
+            blocked_by_updates,
+        }
+    }
+
+    fn cbd_rename_update(binding: &str, changed_attr: &str) -> Effect {
+        let id = ResourceId::new("test", binding);
+        let mut renamed = Resource::new("test", binding);
+        renamed.binding = Some(binding.to_string());
+        renamed.set_attr(
+            changed_attr,
+            Value::Concrete(crate::resource::ConcreteValue::String("final".to_string())),
+        );
+        Effect::Update {
+            id: id.clone(),
+            from: crate::effect::UpdateBase::CreatedBy {
+                binding: binding.to_string(),
+                id,
+            },
+            to: renamed,
+            changed_attributes: vec![changed_attr.to_string()],
+        }
+    }
+
+    fn create_effect(binding: &str) -> Effect {
+        let mut created = Resource::new("test", binding);
+        created.binding = Some(binding.to_string());
+        Effect::Create(created)
+    }
+
+    fn deps_after_relax(
+        effects: &[Effect],
+        unresolved: &HashMap<ResourceId, UnresolvedResource>,
+    ) -> HashMap<usize, HashSet<usize>> {
+        let mut analysis =
+            build_effect_dependency_analysis(effects, unresolved, &[], ScheduleInputs::Apply);
+        relax_update_update_edges(effects, &mut analysis);
+        analysis.into_deps_of()
+    }
+
+    fn assert_cycle_free(deps: &HashMap<usize, HashSet<usize>>, effect_count: usize) {
+        let mut remaining: HashMap<usize, HashSet<usize>> = (0..effect_count)
+            .map(|idx| (idx, deps.get(&idx).cloned().unwrap_or_default()))
+            .collect();
+        let mut ready: Vec<usize> = remaining
+            .iter()
+            .filter_map(|(idx, deps)| deps.is_empty().then_some(*idx))
+            .collect();
+        let mut visited = 0;
+
+        while let Some(idx) = ready.pop() {
+            let Some(_) = remaining.remove(&idx) else {
+                continue;
+            };
+            visited += 1;
+            let newly_ready: Vec<usize> = remaining
+                .iter_mut()
+                .filter_map(|(candidate, deps)| {
+                    deps.remove(&idx);
+                    deps.is_empty().then_some(*candidate)
+                })
+                .collect();
+            ready.extend(newly_ready);
+        }
+
+        assert_eq!(
+            visited, effect_count,
+            "dependency graph must be cycle-free, remaining={remaining:?}, deps={deps:?}"
+        );
+    }
+
+    struct CapturingSubscriber {
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl tracing::Subscriber for CapturingSubscriber {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = WarningVisitor::default();
+            event.record(&mut visitor);
+            self.events.lock().unwrap().push(visitor.rendered);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[derive(Default)]
+    struct WarningVisitor {
+        rendered: String,
+    }
+
+    impl tracing::field::Visit for WarningVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+
+            let _ = write!(self.rendered, "{}={value:?};", field.name());
+        }
+    }
+
+    #[test]
+    fn created_by_update_depends_on_create_with_same_binding() {
+        let id = ResourceId::new("test", "renamed");
+        let mut created = Resource::new("test", "renamed");
+        created.binding = Some("renamed".to_string());
+        let mut renamed = created.clone();
+        renamed.set_attr(
+            "name",
+            Value::Concrete(crate::resource::ConcreteValue::String("final".to_string())),
+        );
+        let effects = vec![
+            Effect::Create(created),
+            Effect::Update {
+                id: id.clone(),
+                from: crate::effect::UpdateBase::CreatedBy {
+                    binding: "renamed".to_string(),
+                    id,
+                },
+                to: renamed,
+                changed_attributes: vec!["name".to_string()],
+            },
+        ];
+
+        let deps =
+            build_effect_dependency_analysis(&effects, &HashMap::new(), &[], ScheduleInputs::Apply)
+                .into_deps_of();
+
+        assert!(
+            deps[&1].contains(&0),
+            "rename update must wait for the replacement create"
+        );
+    }
+
+    #[test]
+    fn created_by_rename_update_waits_for_delete_with_same_id() {
+        let id = ResourceId::new("test", "renamed");
+        let mut created = Resource::new("test", "renamed");
+        created.binding = Some("renamed".to_string());
+        let mut renamed = created.clone();
+        renamed.set_attr(
+            "name",
+            Value::Concrete(crate::resource::ConcreteValue::String("final".to_string())),
+        );
+        let effects = vec![
+            Effect::Create(created),
+            Effect::Delete {
+                id: id.clone(),
+                identifier: "old-id".to_string(),
+                directives: Default::default(),
+                binding: Some("renamed".to_string()),
+                dependencies: HashSet::new(),
+                explicit_dependencies: HashSet::new(),
+                blocked_by_updates: HashSet::new(),
+            },
+            Effect::Update {
+                id: id.clone(),
+                from: crate::effect::UpdateBase::CreatedBy {
+                    binding: "renamed".to_string(),
+                    id: id.clone(),
+                },
+                to: renamed,
+                changed_attributes: vec!["name".to_string()],
+            },
+        ];
+
+        let deps =
+            build_effect_dependency_analysis(&effects, &HashMap::new(), &[], ScheduleInputs::Apply)
+                .into_deps_of();
+
+        assert!(
+            deps[&2].contains(&1),
+            "post-create rename update must wait for the old resource delete"
+        );
+    }
+
+    #[test]
+    fn consumer_update_reading_renamed_attribute_does_not_cycle() {
+        let consumer = match update_effect("consumer", &[("renamed", "name")], &["target_name"]) {
+            Effect::Update { to, .. } => to,
+            _ => unreachable!(),
+        };
+        let effects = vec![
+            create_effect("renamed"),
+            Effect::Update {
+                id: consumer.id.clone(),
+                from: crate::effect::UpdateBase::Existing(Box::new(state_for(&consumer.id))),
+                to: consumer.clone(),
+                changed_attributes: vec!["target_name".to_string()],
+            },
+            delete_effect(
+                "renamed",
+                HashSet::from(["consumer".to_string()]),
+                HashSet::new(),
+            ),
+            cbd_rename_update("renamed", "name"),
+        ];
+        let unresolved = HashMap::from([(
+            consumer.id.clone(),
+            UnresolvedResource::from_pre_resolve(consumer),
+        )]);
+
+        let deps = deps_after_relax(&effects, &unresolved);
+
+        assert!(
+            deps[&1].contains(&3),
+            "consumer reading the renamed attribute must use the rename final state"
+        );
+        assert!(
+            !deps[&2].contains(&1),
+            "delete cannot also wait on that final-state consumer without forming a CBD cycle"
+        );
+        assert_cycle_free(&deps, effects.len());
+    }
+
+    #[test]
+    fn consumer_with_depends_on_directive_waits_for_rename() {
+        let mut consumer = Resource::new("test", "consumer");
+        consumer.binding = Some("consumer".to_string());
+        consumer.directives.depends_on.push("renamed".to_string());
+        let effects = vec![
+            create_effect("renamed"),
+            Effect::Update {
+                id: consumer.id.clone(),
+                from: crate::effect::UpdateBase::Existing(Box::new(state_for(&consumer.id))),
+                to: consumer.clone(),
+                changed_attributes: vec!["target".to_string()],
+            },
+            delete_effect(
+                "renamed",
+                HashSet::from(["consumer".to_string()]),
+                HashSet::new(),
+            ),
+            cbd_rename_update("renamed", "name"),
+        ];
+        let unresolved = HashMap::from([(
+            consumer.id.clone(),
+            UnresolvedResource::from_pre_resolve(consumer),
+        )]);
+
+        let deps = deps_after_relax(&effects, &unresolved);
+
+        assert!(
+            deps[&1].contains(&3),
+            "Unknown reads from depends_on must conservatively wait for the rename final state"
+        );
+        assert!(
+            !deps[&2].contains(&1),
+            "Delete must not also wait on the final-state consumer in the CBD cycle"
+        );
+        assert_cycle_free(&deps, effects.len());
+    }
+
+    #[test]
+    fn consumer_update_reading_renamed_identifier_uses_final_state() {
+        let consumer = match update_effect("consumer", &[("renamed", "name")], &["target_name"]) {
+            Effect::Update { to, .. } => to,
+            _ => unreachable!(),
+        };
+        let effects = vec![
+            create_effect("renamed"),
+            Effect::Update {
+                id: consumer.id.clone(),
+                from: crate::effect::UpdateBase::Existing(Box::new(state_for(&consumer.id))),
+                to: consumer.clone(),
+                changed_attributes: vec!["target_name".to_string()],
+            },
+            delete_effect(
+                "renamed",
+                HashSet::from(["consumer".to_string()]),
+                HashSet::new(),
+            ),
+            cbd_rename_update("renamed", "name"),
+        ];
+        let unresolved = HashMap::from([(
+            consumer.id.clone(),
+            UnresolvedResource::from_pre_resolve(consumer),
+        )]);
+
+        let deps = deps_after_relax(&effects, &unresolved);
+
+        assert!(deps[&1].contains(&3));
+        assert!(deps[&3].contains(&2));
+        assert_cycle_free(&deps, effects.len());
+    }
+
+    #[test]
+    fn consumer_update_reading_non_renamed_attribute_uses_created_state() {
+        let consumer = match update_effect("consumer", &[("renamed", "id")], &["target_id"]) {
+            Effect::Update { to, .. } => to,
+            _ => unreachable!(),
+        };
+        let effects = vec![
+            create_effect("renamed"),
+            Effect::Update {
+                id: consumer.id.clone(),
+                from: crate::effect::UpdateBase::Existing(Box::new(state_for(&consumer.id))),
+                to: consumer.clone(),
+                changed_attributes: vec!["target_id".to_string()],
+            },
+            delete_effect(
+                "renamed",
+                HashSet::from(["consumer".to_string()]),
+                HashSet::new(),
+            ),
+            cbd_rename_update("renamed", "name"),
+        ];
+        let unresolved = HashMap::from([(
+            consumer.id.clone(),
+            UnresolvedResource::from_pre_resolve(consumer),
+        )]);
+
+        let deps = deps_after_relax(&effects, &unresolved);
+
+        assert!(deps[&1].contains(&0));
+        assert!(
+            !deps[&1].contains(&3),
+            "consumer reading a non-renamed attribute should not wait for rename final state"
+        );
+        assert!(
+            deps[&2].contains(&1),
+            "delete still waits for consumers that can update from created state"
+        );
+        assert_cycle_free(&deps, effects.len());
+    }
+
+    #[test]
+    fn cbd_ordering_patterns_are_cycle_free() {
+        let no_consumers = vec![
+            create_effect("renamed"),
+            delete_effect("renamed", HashSet::new(), HashSet::new()),
+            cbd_rename_update("renamed", "name"),
+        ];
+        let deps = deps_after_relax(&no_consumers, &HashMap::new());
+        assert_cycle_free(&deps, no_consumers.len());
+
+        let consumer = match update_effect("consumer", &[("renamed", "id")], &["target_id"]) {
+            Effect::Update { to, .. } => to,
+            _ => unreachable!(),
+        };
+        let one_consumer = vec![
+            create_effect("renamed"),
+            Effect::Update {
+                id: consumer.id.clone(),
+                from: crate::effect::UpdateBase::Existing(Box::new(state_for(&consumer.id))),
+                to: consumer.clone(),
+                changed_attributes: vec!["target_id".to_string()],
+            },
+            delete_effect(
+                "renamed",
+                HashSet::from(["consumer".to_string()]),
+                HashSet::new(),
+            ),
+            cbd_rename_update("renamed", "name"),
+        ];
+        let unresolved = HashMap::from([(
+            consumer.id.clone(),
+            UnresolvedResource::from_pre_resolve(consumer),
+        )]);
+        let deps = deps_after_relax(&one_consumer, &unresolved);
+        assert_cycle_free(&deps, one_consumer.len());
+
+        let promoted_consumer = Resource::new("test", "promoted").with_binding("promoted");
+        let promoted = vec![
+            create_effect("renamed"),
+            delete_effect("renamed", HashSet::new(), HashSet::new()),
+            cbd_rename_update("renamed", "name"),
+            Effect::Create(promoted_consumer.clone()),
+            delete_effect("promoted", HashSet::new(), HashSet::new()),
+        ];
+        let deps = deps_after_relax(&promoted, &HashMap::new());
+        assert_cycle_free(&deps, promoted.len());
+    }
+
+    #[test]
+    fn cbd_delete_waits_for_create_with_same_id() {
+        let id = ResourceId::new("test", "renamed");
+        let mut created = Resource::new("test", "renamed");
+        created.binding = Some("renamed".to_string());
+        let effects = vec![
+            Effect::Create(created),
+            Effect::Delete {
+                id,
+                identifier: "old-id".to_string(),
+                directives: Default::default(),
+                binding: Some("renamed".to_string()),
+                dependencies: HashSet::new(),
+                explicit_dependencies: HashSet::new(),
+                blocked_by_updates: HashSet::new(),
+            },
+        ];
+
+        let deps =
+            build_effect_dependency_analysis(&effects, &HashMap::new(), &[], ScheduleInputs::Apply)
+                .into_deps_of();
+
+        assert!(
+            deps[&1].contains(&0),
+            "CBD old delete must wait for the replacement create"
+        );
+    }
+
+    #[test]
+    fn consumer_ref_waits_for_create_and_rename_final_state() {
+        let id = ResourceId::new("test", "renamed");
+        let mut created = Resource::new("test", "renamed");
+        created.binding = Some("renamed".to_string());
+        let mut renamed = created.clone();
+        renamed.set_attr(
+            "name",
+            Value::Concrete(crate::resource::ConcreteValue::String("final".to_string())),
+        );
+        let mut consumer = Resource::new("test", "consumer");
+        consumer.binding = Some("consumer".to_string());
+        consumer.set_attr(
+            "target_name",
+            Value::resource_ref("renamed".to_string(), "name".to_string(), vec![]),
+        );
+        let effects = vec![
+            Effect::Create(created),
+            Effect::Update {
+                id: id.clone(),
+                from: crate::effect::UpdateBase::CreatedBy {
+                    binding: "renamed".to_string(),
+                    id,
+                },
+                to: renamed,
+                changed_attributes: vec!["name".to_string()],
+            },
+            Effect::Update {
+                id: consumer.id.clone(),
+                from: crate::effect::UpdateBase::Existing(Box::new(state_for(&consumer.id))),
+                to: consumer.clone(),
+                changed_attributes: vec!["target_name".to_string()],
+            },
+        ];
+        let unresolved = HashMap::from([(
+            consumer.id.clone(),
+            UnresolvedResource::from_pre_resolve(consumer),
+        )]);
+
+        let deps =
+            build_effect_dependency_analysis(&effects, &unresolved, &[], ScheduleInputs::Apply)
+                .into_deps_of();
+
+        assert!(deps[&2].contains(&0), "consumer must wait for create");
+        assert!(
+            deps[&2].contains(&1),
+            "consumer must also wait for the rename final state when it reads the renamed attribute"
+        );
+    }
+
+    #[test]
+    fn delete_dependencies_only_block_delete_targets_during_apply() {
+        let mut created = Resource::new("test", "a");
+        created.binding = Some("a".to_string());
+        let mut consumer = Resource::new("test", "b");
+        consumer.binding = Some("b".to_string());
+        consumer.set_attr(
+            "a_id",
+            Value::resource_ref("a".to_string(), "id".to_string(), vec![]),
+        );
+        let effects = vec![
+            Effect::Create(created),
+            Effect::Update {
+                id: consumer.id.clone(),
+                from: crate::effect::UpdateBase::Existing(Box::new(state_for(&consumer.id))),
+                to: consumer.clone(),
+                changed_attributes: vec!["a_id".to_string()],
+            },
+            Effect::Delete {
+                id: ResourceId::new("test", "a"),
+                identifier: "old-a".to_string(),
+                directives: Default::default(),
+                binding: Some("a".to_string()),
+                dependencies: HashSet::from(["b".to_string()]),
+                explicit_dependencies: HashSet::new(),
+                blocked_by_updates: HashSet::from(["b".to_string()]),
+            },
+        ];
+        let unresolved = HashMap::from([(
+            consumer.id.clone(),
+            UnresolvedResource::from_pre_resolve(consumer),
+        )]);
+
+        let deps =
+            build_effect_dependency_analysis(&effects, &unresolved, &[], ScheduleInputs::Apply)
+                .into_deps_of();
+
+        assert!(
+            deps[&2].contains(&1),
+            "CBD delete still waits for explicit blocked_by_updates"
+        );
+        assert!(
+            !deps[&1].contains(&2),
+            "old dependency bindings must not make an Update wait for the Delete"
+        );
+    }
+
+    #[test]
+    fn blocked_by_if_delete_warns_when_target_not_a_delete() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CapturingSubscriber {
+            events: std::sync::Arc::clone(&events),
+        };
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let mut created = Resource::new("test", "target");
+        created.binding = Some("target".to_string());
+        let effects = vec![
+            Effect::Create(created),
+            Effect::Delete {
+                id: ResourceId::new("test", "dependent"),
+                identifier: "dependent-old-id".to_string(),
+                directives: Default::default(),
+                binding: Some("dependent".to_string()),
+                dependencies: HashSet::from(["target".to_string()]),
+                explicit_dependencies: HashSet::new(),
+                blocked_by_updates: HashSet::new(),
+            },
+        ];
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            let _ = build_effect_dependency_analysis(
+                &effects,
+                &HashMap::new(),
+                &[],
+                ScheduleInputs::Apply,
+            );
+        });
+
+        let events = events.lock().unwrap();
+        assert!(
+            events.iter().any(|event| event
+                .contains("BlockedByIfDelete target did not resolve to a Delete effect")
+                && event.contains("target")),
+            "expected BlockedByIfDelete warning, got {events:?}"
+        );
     }
 
     #[test]
@@ -531,6 +1213,7 @@ mod tests {
             binding: Some("parent".to_string()),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
+            blocked_by_updates: std::collections::HashSet::new(),
         };
         let child = Effect::Delete {
             id: ResourceId::new("test", "child"),
@@ -539,6 +1222,7 @@ mod tests {
             binding: Some("child".to_string()),
             dependencies: HashSet::from(["parent".to_string()]),
             explicit_dependencies: HashSet::new(),
+            blocked_by_updates: std::collections::HashSet::new(),
         };
         let effects = vec![parent, child];
 
@@ -562,6 +1246,7 @@ mod tests {
             binding: Some("cert".to_string()),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
+            blocked_by_updates: std::collections::HashSet::new(),
         };
         let listener = Effect::Delete {
             id: ResourceId::new("test", "listener"),
@@ -570,6 +1255,7 @@ mod tests {
             binding: Some("listener".to_string()),
             dependencies: HashSet::from(["cert_issued".to_string()]),
             explicit_dependencies: HashSet::new(),
+            blocked_by_updates: std::collections::HashSet::new(),
         };
         let wait = DestroyWaitAlias::new(
             "cert_issued".to_string(),
@@ -598,40 +1284,6 @@ mod tests {
     }
 
     #[test]
-    fn replace_from_dependency_only_blocks_delete_targets() {
-        let mut x = Resource::new("test", "x");
-        x.binding = Some("x".to_string());
-
-        let from = State::existing(ResourceId::new("test", "replace_me"), HashMap::new())
-            .with_dependency_bindings(std::collections::BTreeSet::from(["x".to_string()]));
-        let mut to = Resource::new("test", "replace_me");
-        to.binding = Some("replace_me".to_string());
-
-        let effects = vec![
-            Effect::Create(x),
-            Effect::Replace {
-                id: ResourceId::new("test", "replace_me"),
-                from: Box::new(from),
-                to,
-                directives: Default::default(),
-                changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
-                cascading_updates: Vec::new(),
-                temporary_name: None,
-                cascade_ref_hints: Vec::new(),
-            },
-        ];
-
-        let deps =
-            build_effect_dependency_analysis(&effects, &HashMap::new(), &[], ScheduleInputs::Apply)
-                .into_deps_of();
-
-        assert!(
-            deps[&0].is_empty(),
-            "create target must not be blocked by replace"
-        );
-    }
-
-    #[test]
     fn unknown_destroy_dependency_names_are_dropped() {
         let orphan = Effect::Delete {
             id: ResourceId::new("test", "listener"),
@@ -640,6 +1292,7 @@ mod tests {
             binding: Some("listener".to_string()),
             dependencies: HashSet::from(["missing_wait".to_string()]),
             explicit_dependencies: HashSet::new(),
+            blocked_by_updates: std::collections::HashSet::new(),
         };
         let deps = build_effect_dependency_analysis(
             &[orphan],

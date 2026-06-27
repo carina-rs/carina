@@ -18,6 +18,20 @@ fn explicit_top_level(keys: &[&str]) -> ExplicitFields {
     }
 }
 
+fn single_replace_metadata(plan: &Plan) -> &crate::plan::ReplaceDisplayMetadata {
+    assert_eq!(plan.replace_display().len(), 1);
+    let metadata = &plan.replace_display()[0];
+    assert!(matches!(
+        plan.effects().get(metadata.create_idx),
+        Some(Effect::Create(_))
+    ));
+    assert!(matches!(
+        plan.effects().get(metadata.delete_idx),
+        Some(Effect::Delete { .. })
+    ));
+    metadata
+}
+
 struct HintProvider {
     hints: Vec<crate::wait::BindingPattern>,
 }
@@ -144,34 +158,41 @@ fn create_before_destroy_generates_temporary_name_for_name_attribute() {
         &[],
     );
 
-    assert_eq!(plan.effects().len(), 1);
-    match &plan.effects()[0] {
-        Effect::Replace {
-            temporary_name, to, ..
-        } => {
-            let temp = temporary_name
-                .as_ref()
-                .expect("Should have temporary_name for create_before_destroy with name_attribute");
-            assert_eq!(temp.attribute, "bucket_name");
-            assert_eq!(temp.original_value, "my-bucket");
-            assert!(
-                temp.temporary_value.starts_with("my-bucket-"),
-                "Temporary value '{}' should start with 'my-bucket-'",
-                temp.temporary_value
-            );
-            assert_eq!(temp.temporary_value.len(), "my-bucket-".len() + 8);
-            // bucket_name is create-only, so can_rename should be false
-            assert!(!temp.can_rename);
-            // The `to` resource should have the temporary name
-            assert_eq!(
-                to.get_attr("bucket_name"),
-                Some(&Value::Concrete(ConcreteValue::String(
-                    temp.temporary_value.clone()
-                )))
-            );
-        }
-        other => panic!("Expected Replace, got {:?}", other),
-    }
+    assert_eq!(plan.effects().len(), 2);
+    let metadata = single_replace_metadata(&plan);
+    let temp = metadata
+        .temporary_name
+        .as_ref()
+        .expect("Should have temporary_name for create_before_destroy with name_attribute");
+    assert_eq!(temp.attribute, "bucket_name");
+    assert_eq!(temp.original_value, "my-bucket");
+    assert!(
+        temp.temporary_value.starts_with("my-bucket-"),
+        "Temporary value '{}' should start with 'my-bucket-'",
+        temp.temporary_value
+    );
+    assert_eq!(temp.temporary_value.len(), "my-bucket-".len() + 8);
+    assert!(!temp.can_rename);
+    assert_eq!(plan.permanent_name_overrides().len(), 1);
+    assert_eq!(
+        plan.permanent_name_overrides()[0].id,
+        ResourceId::new("s3.Bucket", "my-bucket")
+    );
+    assert_eq!(
+        plan.permanent_name_overrides()[0]
+            .overrides
+            .get("bucket_name"),
+        Some(&temp.temporary_value)
+    );
+    let Effect::Create(to) = &plan.effects()[metadata.create_idx] else {
+        unreachable!();
+    };
+    assert_eq!(
+        to.get_attr("bucket_name"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            temp.temporary_value.clone()
+        )))
+    );
 }
 
 #[test]
@@ -231,17 +252,19 @@ fn create_before_destroy_generates_temporary_name_with_can_rename() {
         &[],
     );
 
-    assert_eq!(plan.effects().len(), 1);
-    match &plan.effects()[0] {
-        Effect::Replace { temporary_name, .. } => {
-            let temp = temporary_name.as_ref().expect("Should have temporary_name");
-            assert_eq!(temp.attribute, "log_group_name");
-            assert_eq!(temp.original_value, "my-log-group");
-            // log_group_name is not create-only, so can_rename should be true
-            assert!(temp.can_rename);
-        }
-        other => panic!("Expected Replace, got {:?}", other),
-    }
+    assert_eq!(plan.effects().len(), 2);
+    let metadata = single_replace_metadata(&plan);
+    let temp = metadata
+        .temporary_name
+        .as_ref()
+        .expect("Should have temporary_name");
+    assert_eq!(temp.attribute, "log_group_name");
+    assert_eq!(temp.original_value, "my-log-group");
+    assert!(temp.can_rename);
+    assert!(
+        plan.permanent_name_overrides().is_empty(),
+        "renameable temporary names should not become permanent overrides"
+    );
 }
 
 #[test]
@@ -300,16 +323,11 @@ fn no_temporary_name_without_create_before_destroy() {
         &[],
     );
 
-    assert_eq!(plan.effects().len(), 1);
-    match &plan.effects()[0] {
-        Effect::Replace { temporary_name, .. } => {
-            assert!(
-                temporary_name.is_none(),
-                "Should not have temporary_name without create_before_destroy"
-            );
-        }
-        other => panic!("Expected Replace, got {:?}", other),
-    }
+    assert_eq!(plan.effects().len(), 2);
+    assert!(
+        single_replace_metadata(&plan).temporary_name.is_none(),
+        "Should not have temporary_name without create_before_destroy"
+    );
 }
 
 #[test]
@@ -372,16 +390,11 @@ fn no_temporary_name_when_name_prefix_is_used() {
         &[],
     );
 
-    assert_eq!(plan.effects().len(), 1);
-    match &plan.effects()[0] {
-        Effect::Replace { temporary_name, .. } => {
-            assert!(
-                temporary_name.is_none(),
-                "Should not generate temporary_name when name_prefix is used"
-            );
-        }
-        other => panic!("Expected Replace, got {:?}", other),
-    }
+    assert_eq!(plan.effects().len(), 2);
+    assert!(
+        single_replace_metadata(&plan).temporary_name.is_none(),
+        "Should not generate temporary_name when name_prefix is used"
+    );
 }
 
 #[test]
@@ -428,16 +441,11 @@ fn no_temporary_name_without_name_attribute_in_schema() {
         &[],
     );
 
-    assert_eq!(plan.effects().len(), 1);
-    match &plan.effects()[0] {
-        Effect::Replace { temporary_name, .. } => {
-            assert!(
-                temporary_name.is_none(),
-                "Should not generate temporary_name without name_attribute in schema"
-            );
-        }
-        other => panic!("Expected Replace, got {:?}", other),
-    }
+    assert_eq!(plan.effects().len(), 2);
+    assert!(
+        single_replace_metadata(&plan).temporary_name.is_none(),
+        "Should not generate temporary_name without name_attribute in schema"
+    );
 }
 
 #[test]
@@ -498,16 +506,11 @@ fn no_temporary_name_when_name_attribute_changes() {
         &[],
     );
 
-    assert_eq!(plan.effects().len(), 1);
-    match &plan.effects()[0] {
-        Effect::Replace { temporary_name, .. } => {
-            assert!(
-                temporary_name.is_none(),
-                "Should not generate temporary_name when name_attribute value changes"
-            );
-        }
-        other => panic!("Expected Replace, got {:?}", other),
-    }
+    assert_eq!(plan.effects().len(), 2);
+    assert!(
+        single_replace_metadata(&plan).temporary_name.is_none(),
+        "Should not generate temporary_name when name_attribute value changes"
+    );
 }
 
 #[test]
@@ -1048,10 +1051,10 @@ fn prevent_destroy_blocks_replace() {
         &[],
     );
 
-    // Should have NO replace effects
+    // Should have NO replacement effects
     assert!(
         plan.effects().is_empty(),
-        "Should not generate Replace effect for prevent_destroy resource, got {:?}",
+        "Should not generate replacement effects for prevent_destroy resource, got {:?}",
         plan.effects()
     );
 

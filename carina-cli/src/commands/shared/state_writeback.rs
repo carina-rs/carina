@@ -626,13 +626,29 @@ impl<'a> WritebackPlan<'a> {
     }
 
     /// Register a cleanup against `id`. Calling after `add_upsert(id)`
-    /// returns `UpsertCleanupOverlap`. Cleanup is idempotent.
+    /// returns `UpsertCleanupOverlap` when that upsert is an apply
+    /// result. A stale `CurrentState` upsert can be superseded by
+    /// cleanup: that is the DBD "delete succeeded, create failed" shape.
+    /// Cleanup is idempotent.
     fn add_cleanup(&mut self, id: ResourceId) -> Result<(), WritebackConflict> {
-        if self.upserts.contains_key(&id) {
-            return Err(WritebackConflict::UpsertCleanupOverlap { id });
+        if let Some(upsert) = self.upserts.get(&id) {
+            match upsert.source {
+                UpsertSource::Applied(_) => {
+                    return Err(WritebackConflict::UpsertCleanupOverlap { id });
+                }
+                UpsertSource::CurrentState(_) => {
+                    self.upserts.shift_remove(&id);
+                }
+            }
         }
         self.cleanups.insert(id);
         Ok(())
+    }
+
+    fn has_applied_upsert(&self, id: &ResourceId) -> bool {
+        self.upserts
+            .get(id)
+            .is_some_and(|upsert| matches!(upsert.source, UpsertSource::Applied(_)))
     }
 }
 
@@ -655,7 +671,6 @@ fn decompose<'a>(
     failed_refreshes: &HashSet<ResourceId>,
 ) -> Result<WritebackPlan<'a>, WritebackConflict> {
     let mut wb = WritebackPlan::new();
-
     for resource in sorted_resources {
         if let Some(applied) = applied_states.get(&resource.id) {
             wb.add_upsert(resource, UpsertSource::Applied(applied))?;
@@ -680,7 +695,7 @@ fn decompose<'a>(
 
     for effect in plan.effects() {
         for id in
-            effect.writeback_cleanup_ids(successfully_deleted, &|id| wb.upserts.contains_key(id))
+            effect.writeback_cleanup_ids(successfully_deleted, &|id| wb.has_applied_upsert(id))
         {
             wb.add_cleanup(id)?;
         }
@@ -876,9 +891,11 @@ mod post_apply_states_tests {
 #[cfg(test)]
 mod apply_state_save_tests {
     use super::*;
-    use carina_core::effect::{DeferredReplaceDelete, Effect, NonEmptyDeletes};
+    use carina_core::effect::{
+        ChangedCreateOnly, DeferredReplaceDelete, Effect, NonEmptyDeletes, TemporaryName,
+    };
     use carina_core::parser::{DeferredForExpression, ForBinding};
-    use carina_core::plan::Plan;
+    use carina_core::plan::{Plan, ReplaceDisplayMetadata};
     use carina_core::resource::{ConcreteValue, Directives, Resource, ResourceId, State, Value};
 
     #[test]
@@ -931,6 +948,7 @@ mod apply_state_save_tests {
             binding: Some("validation_records[0]".to_string()),
             dependencies: HashSet::from(["cert".to_string()]),
             explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
         }
     }
 
@@ -960,6 +978,50 @@ mod apply_state_save_tests {
                 template_resource,
             }),
         }
+    }
+
+    fn inject_replace_display(plan: Plan, metadata: ReplaceDisplayMetadata) -> Plan {
+        let mut value = serde_json::to_value(&plan).expect("plan serializes");
+        value["replace_display"] =
+            serde_json::to_value(vec![metadata]).expect("metadata serializes");
+        serde_json::from_value(value).expect("plan with metadata deserializes")
+    }
+
+    fn cbd_plan_for_with_temporary_name(
+        desired: &Resource,
+        identifier: &str,
+        temporary_name: Option<TemporaryName>,
+    ) -> Plan {
+        let mut plan = Plan::new();
+        let create_idx = plan.add(Effect::Create(desired.clone()));
+        let delete_idx = plan.add(Effect::Delete {
+            id: desired.id.clone(),
+            identifier: identifier.to_string(),
+            directives: Directives {
+                create_before_destroy: true,
+                ..Default::default()
+            },
+            binding: desired.binding.clone(),
+            dependencies: HashSet::new(),
+            explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
+        });
+        inject_replace_display(
+            plan,
+            ReplaceDisplayMetadata {
+                id: desired.id.clone(),
+                binding: desired.binding.clone(),
+                create_idx,
+                delete_idx,
+                rename_idx: None,
+                create_before_destroy: true,
+                changed_create_only: ChangedCreateOnly::new(vec!["force_replace".to_string()])
+                    .expect("fixture has a create-only attr"),
+                cascade_ref_hints: Vec::new(),
+                temporary_name,
+                previous_attributes: HashMap::new(),
+            },
+        )
     }
 
     #[test]
@@ -1020,6 +1082,278 @@ mod apply_state_save_tests {
 
         assert!(wb.upserts.is_empty());
         assert_eq!(wb.cleanups, HashSet::from([id]));
+    }
+
+    #[test]
+    fn dbd_delete_success_create_failure_cleans_up_current_state_upsert() {
+        let id = ResourceId::with_provider("aws", "s3.Bucket", "bucket", None);
+        let desired = Resource::with_provider("aws", "s3.Bucket", "bucket", None);
+        let current_state =
+            State::existing(id.clone(), HashMap::new()).with_identifier("old-bucket-id");
+        let mut plan = Plan::new();
+        plan.add(Effect::Delete {
+            id: id.clone(),
+            identifier: "old-bucket-id".to_string(),
+            directives: Directives::default(),
+            binding: Some("bucket".to_string()),
+            dependencies: HashSet::new(),
+            explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
+        });
+        plan.add(Effect::Create(desired.clone()));
+        let current_states = HashMap::from([(id.clone(), current_state)]);
+        let applied_states = HashMap::new();
+        let successfully_deleted = HashSet::from([id.clone()]);
+        let failed_refreshes = HashSet::new();
+
+        let wb = decompose(
+            std::slice::from_ref(&desired),
+            &[],
+            &current_states,
+            &applied_states,
+            &plan,
+            &successfully_deleted,
+            &failed_refreshes,
+        )
+        .expect("DBD create failure must let delete cleanup win over stale current state");
+
+        assert!(wb.upserts.is_empty());
+        assert_eq!(wb.cleanups, HashSet::from([id]));
+    }
+
+    #[test]
+    fn build_state_after_apply_persists_permanent_name_overrides() {
+        let desired = Resource::with_provider("mock", "test.resource", "bucket", None)
+            .with_binding("bucket")
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("stable-name-temp".to_string())),
+            )
+            .with_attribute(
+                "force_replace",
+                Value::Concrete(ConcreteValue::String("new".to_string())),
+            );
+        let id = desired.id.clone();
+        let applied_state = State::existing(
+            id.clone(),
+            HashMap::from([
+                (
+                    "name".to_string(),
+                    Value::Concrete(ConcreteValue::String("stable-name-temp".to_string())),
+                ),
+                (
+                    "force_replace".to_string(),
+                    Value::Concrete(ConcreteValue::String("new".to_string())),
+                ),
+            ]),
+        )
+        .with_identifier("new-id");
+        let overrides = HashMap::from([(
+            id.clone(),
+            HashMap::from([("name".to_string(), "stable-name-temp".to_string())]),
+        )]);
+
+        let state = build_state_after_apply(ApplyStateSave {
+            state_file: Some(StateFile::new()),
+            sorted_resources: std::slice::from_ref(&desired),
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &HashMap::from([(id.clone(), applied_state)]),
+            permanent_name_overrides: &overrides,
+            plan: &Plan::new(),
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &carina_core::schema::SchemaRegistry::new(),
+        })
+        .expect("state writeback should persist permanent overrides");
+
+        let row = state
+            .find_resource("mock", "test.resource", "bucket")
+            .expect("resource row should be written");
+        assert_eq!(
+            row.name_overrides.get("name"),
+            Some(&"stable-name-temp".to_string())
+        );
+    }
+
+    #[test]
+    fn test_cbd_can_rename_delete_failure_records_new_with_temp_name() {
+        let desired = Resource::with_provider("mock", "test.resource", "bucket", None)
+            .with_binding("bucket")
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("stable-name-temp".to_string())),
+            )
+            .with_attribute(
+                "force_replace",
+                Value::Concrete(ConcreteValue::String("new".to_string())),
+            );
+        let id = desired.id.clone();
+        let mut existing_row = ResourceState::new("test.resource", "bucket", "mock")
+            .with_identifier("old-id")
+            .with_attribute("name", serde_json::json!("stable-name"))
+            .with_attribute("force_replace", serde_json::json!("old"));
+        existing_row.binding = Some("bucket".to_string());
+        let mut state_file = StateFile::new();
+        state_file.upsert_resource(existing_row);
+        let current_state = State::existing(
+            id.clone(),
+            HashMap::from([
+                (
+                    "name".to_string(),
+                    Value::Concrete(ConcreteValue::String("stable-name".to_string())),
+                ),
+                (
+                    "force_replace".to_string(),
+                    Value::Concrete(ConcreteValue::String("old".to_string())),
+                ),
+            ]),
+        )
+        .with_identifier("old-id");
+        let applied_state = State::existing(
+            id.clone(),
+            HashMap::from([
+                (
+                    "name".to_string(),
+                    Value::Concrete(ConcreteValue::String("stable-name-temp".to_string())),
+                ),
+                (
+                    "force_replace".to_string(),
+                    Value::Concrete(ConcreteValue::String("new".to_string())),
+                ),
+            ]),
+        )
+        .with_identifier("new-id");
+        let temporary_name = TemporaryName {
+            attribute: "name".to_string(),
+            original_value: "stable-name".to_string(),
+            temporary_value: "stable-name-temp".to_string(),
+            can_rename: true,
+        };
+        let plan = cbd_plan_for_with_temporary_name(&desired, "old-id", Some(temporary_name));
+
+        let state = build_state_after_apply(ApplyStateSave {
+            state_file: Some(state_file),
+            sorted_resources: std::slice::from_ref(&desired),
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::from([(id.clone(), current_state)]),
+            applied_states: &HashMap::from([(id.clone(), applied_state)]),
+            permanent_name_overrides: &HashMap::new(),
+            plan: &plan,
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &carina_core::schema::SchemaRegistry::new(),
+        })
+        .expect("incomplete CBD writeback should record the applied create");
+
+        let row = state
+            .find_resource("mock", "test.resource", "bucket")
+            .expect("new resource row should be written");
+        assert_eq!(row.identifier.as_deref(), Some("new-id"));
+        assert_eq!(
+            row.attributes.get("name"),
+            Some(&serde_json::json!("stable-name-temp"))
+        );
+        assert_eq!(
+            row.attributes.get("force_replace"),
+            Some(&serde_json::json!("new"))
+        );
+        assert!(
+            row.name_overrides.is_empty(),
+            "renameable temporary names should not become permanent overrides"
+        );
+    }
+
+    #[test]
+    fn test_cbd_permanent_temp_name_delete_failure_records_new() {
+        let desired = Resource::with_provider("mock", "test.resource", "bucket", None)
+            .with_binding("bucket")
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("stable-name-temp".to_string())),
+            )
+            .with_attribute(
+                "force_replace",
+                Value::Concrete(ConcreteValue::String("new".to_string())),
+            );
+        let id = desired.id.clone();
+        let mut existing_row = ResourceState::new("test.resource", "bucket", "mock")
+            .with_identifier("old-id")
+            .with_attribute("name", serde_json::json!("stable-name"))
+            .with_attribute("force_replace", serde_json::json!("old"));
+        existing_row.binding = Some("bucket".to_string());
+        let mut state_file = StateFile::new();
+        state_file.upsert_resource(existing_row);
+        let current_state = State::existing(
+            id.clone(),
+            HashMap::from([
+                (
+                    "name".to_string(),
+                    Value::Concrete(ConcreteValue::String("stable-name".to_string())),
+                ),
+                (
+                    "force_replace".to_string(),
+                    Value::Concrete(ConcreteValue::String("old".to_string())),
+                ),
+            ]),
+        )
+        .with_identifier("old-id");
+        let applied_state = State::existing(
+            id.clone(),
+            HashMap::from([
+                (
+                    "name".to_string(),
+                    Value::Concrete(ConcreteValue::String("stable-name-temp".to_string())),
+                ),
+                (
+                    "force_replace".to_string(),
+                    Value::Concrete(ConcreteValue::String("new".to_string())),
+                ),
+            ]),
+        )
+        .with_identifier("new-id");
+        let temporary_name = TemporaryName {
+            attribute: "name".to_string(),
+            original_value: "stable-name".to_string(),
+            temporary_value: "stable-name-temp".to_string(),
+            can_rename: false,
+        };
+        let plan =
+            cbd_plan_for_with_temporary_name(&desired, "old-id", Some(temporary_name.clone()));
+        let overrides = HashMap::from([(
+            id.clone(),
+            HashMap::from([(
+                temporary_name.attribute.clone(),
+                temporary_name.temporary_value.clone(),
+            )]),
+        )]);
+
+        let state = build_state_after_apply(ApplyStateSave {
+            state_file: Some(state_file),
+            sorted_resources: std::slice::from_ref(&desired),
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::from([(id.clone(), current_state)]),
+            applied_states: &HashMap::from([(id.clone(), applied_state)]),
+            permanent_name_overrides: &overrides,
+            plan: &plan,
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &carina_core::schema::SchemaRegistry::new(),
+        })
+        .expect("permanent temp-name CBD writeback should record the applied create");
+
+        let row = state
+            .find_resource("mock", "test.resource", "bucket")
+            .expect("new resource row should be written");
+        assert_eq!(row.identifier.as_deref(), Some("new-id"));
+        assert_eq!(
+            row.attributes.get("force_replace"),
+            Some(&serde_json::json!("new"))
+        );
+        assert_eq!(
+            row.name_overrides.get("name"),
+            Some(&"stable-name-temp".to_string())
+        );
     }
 
     #[test]

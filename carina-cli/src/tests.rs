@@ -17,8 +17,7 @@ use carina_core::schema::{ResourceSchema, SchemaRegistry};
 use carina_state::{BackendError, LoadedState, LockInfo, ResourceState, StateBackend, StateFile};
 
 use crate::commands::apply::{
-    ApplyResult, detect_drift, execute_effects, finalize_apply, refresh_pending_states,
-    save_state_locked,
+    ApplyResult, detect_drift, finalize_apply, refresh_pending_states, save_state_locked,
 };
 use crate::commands::plan::{CurrentStateEntry, PlanFile};
 use crate::commands::shared::state_writeback::{
@@ -294,6 +293,7 @@ fn plan_file_serde_round_trip() {
         binding: None,
         dependencies: HashSet::new(),
         explicit_dependencies: std::collections::HashSet::new(),
+        blocked_by_updates: HashSet::new(),
     });
 
     let sorted_resources = vec![
@@ -1620,11 +1620,13 @@ async fn finalize_apply_uses_write_state_locked() {
 /// Mock provider that records update calls for verification.
 /// Used to test that dependents with their own Update effects get the new
 /// (post-replacement) dependency IDs, not stale pre-replacement IDs.
+#[allow(dead_code)]
 struct RecordingProvider {
     /// Tracks the `to` resource passed to each update call, keyed by resource ID string.
     update_calls: std::sync::Mutex<Vec<(String, Resource)>>,
 }
 
+#[allow(dead_code)]
 impl RecordingProvider {
     fn new() -> Self {
         Self {
@@ -1729,6 +1731,7 @@ impl Provider for RecordingProvider {
 }
 
 /// Mock provider where create and delete succeed but update (rename) fails.
+#[allow(dead_code)]
 struct RenameFailProvider;
 
 impl Provider for RenameFailProvider {
@@ -1788,289 +1791,6 @@ impl Provider for RenameFailProvider {
     ) -> Vec<String> {
         Vec::new()
     }
-}
-
-/// Regression test for #878: when a create_before_destroy rename fails,
-/// the effect should be counted as a failure, not a success.
-#[tokio::test]
-async fn rename_failure_in_create_before_destroy_counts_as_failure() {
-    use carina_core::effect::TemporaryName;
-
-    let id = ResourceId::with_provider("awscc", "s3.Bucket", "my-bucket", None);
-
-    let old_state = State::existing(
-        id.clone(),
-        HashMap::from([(
-            "bucket_name".to_string(),
-            Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
-        )]),
-    )
-    .with_identifier("my-bucket");
-
-    let new_resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None)
-        .with_attribute(
-            "bucket_name",
-            Value::Concrete(ConcreteValue::String("my-bucket-tmp123".to_string())),
-        );
-
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: id.clone(),
-        from: Box::new(old_state.clone()),
-        to: new_resource.clone(),
-        directives: Directives {
-            create_before_destroy: true,
-            ..Default::default()
-        },
-        changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec![
-            "bucket_name".to_string(),
-        ])
-        .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: Some(TemporaryName {
-            attribute: "bucket_name".to_string(),
-            original_value: "my-bucket".to_string(),
-            temporary_value: "my-bucket-tmp123".to_string(),
-            can_rename: true,
-        }),
-        cascade_ref_hints: vec![],
-    });
-
-    let provider = RenameFailProvider;
-    let mut bindings = carina_core::binding_index::ResolvedBindings::default();
-    let mut current_states = HashMap::from([(id.clone(), old_state)]);
-    let unresolved_resources = HashMap::from([(
-        id.clone(),
-        carina_core::executor::UnresolvedResource::from_pre_resolve(new_resource),
-    )]);
-
-    let outcome = execute_effects(
-        &plan,
-        &provider,
-        &carina_core::provider::NoopNormalizer,
-        &[],
-        &[],
-        &carina_core::schema::SchemaRegistry::new(),
-        &mut bindings,
-        &mut current_states,
-        &unresolved_resources,
-        &[],
-        tokio_util::sync::CancellationToken::new(),
-        carina_core::executor::TEST_UNCAPPED,
-    )
-    .await;
-    let result = match outcome {
-        carina_core::executor::ExecutionOutcome::Completed(result) => result,
-        carina_core::executor::ExecutionOutcome::Cancelled(_) => {
-            panic!("uncancelled execute_effects returned Cancelled")
-        }
-    };
-
-    // The rename failed, so the effect should be counted as a failure
-    assert_eq!(
-        result.failure_count, 1,
-        "Rename failure should increment failure_count"
-    );
-    assert_eq!(
-        result.success_count, 0,
-        "Rename failure should not increment success_count"
-    );
-
-    // The state should still be saved (resource exists with temp name)
-    assert!(
-        result.applied_states.contains_key(&id),
-        "State should still be saved even on rename failure"
-    );
-}
-
-/// Regression test for #865: when a resource is replaced via create_before_destroy
-/// and a dependent resource has its own Update effect, the dependent's `to` state
-/// should reference the new (post-replacement) resource ID, not the old one.
-#[tokio::test]
-async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
-
-    // --- Unresolved resources (before ref resolution) ---
-    let vpc_unresolved = Resource::new("ec2.Vpc", "my-vpc")
-        .with_binding("vpc")
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
-        );
-
-    let subnet_unresolved = Resource::new("ec2.Subnet", "my-subnet")
-        .with_binding("subnet")
-        .with_attribute(
-            "vpc_id",
-            Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-        )
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.2.0/24".to_string())),
-        );
-
-    // --- Resolved resources (after ref resolution with old state) ---
-    // The subnet's vpc_id has been eagerly resolved to "vpc-OLD"
-    let subnet_resolved = Resource::new("ec2.Subnet", "my-subnet")
-        .with_binding("subnet")
-        .with_attribute(
-            "vpc_id",
-            Value::Concrete(ConcreteValue::String("vpc-OLD".to_string())),
-        )
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.2.0/24".to_string())),
-        );
-
-    // --- Current states ---
-    let mut current_states = HashMap::new();
-
-    let mut vpc_attrs = HashMap::new();
-    vpc_attrs.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
-    );
-    vpc_attrs.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-OLD".to_string())),
-    );
-    current_states.insert(
-        vpc_id.clone(),
-        State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-OLD"),
-    );
-
-    let mut subnet_attrs = HashMap::new();
-    subnet_attrs.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-OLD".to_string())),
-    );
-    subnet_attrs.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
-    );
-    current_states.insert(
-        subnet_id.clone(),
-        State::existing(subnet_id.clone(), subnet_attrs).with_identifier("subnet-123"),
-    );
-
-    // --- Build plan ---
-    // VPC: Replace with create_before_destroy (no cascading updates for subnet
-    //       because subnet already has its own Update effect)
-    // Subnet: Update (cidr_block changed, vpc_id eagerly resolved to old value)
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: vpc_id.clone(),
-        from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: vpc_unresolved.clone().with_binding("vpc"),
-        directives: Directives {
-            create_before_destroy: true,
-            ..Default::default()
-        },
-        changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec![
-            "cidr_block".to_string(),
-        ])
-        .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-    plan.add(Effect::Update {
-        id: subnet_id.clone(),
-        from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
-        to: subnet_resolved.clone(), // Has stale "vpc-OLD" in vpc_id
-        changed_attributes: vec!["cidr_block".to_string()],
-    });
-
-    // --- Initial bindings (with old state) ---
-    use carina_core::binding_index::{BindingValueSource, ResolvedBindings};
-    let mut bindings = ResolvedBindings::default();
-    bindings.set(
-        "vpc",
-        HashMap::from([
-            (
-                "vpc_id".to_string(),
-                Value::Concrete(ConcreteValue::String("vpc-OLD".to_string())),
-            ),
-            (
-                "cidr_block".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
-            ),
-        ]),
-        BindingValueSource::Local,
-    );
-    bindings.set(
-        "subnet",
-        HashMap::from([
-            (
-                "vpc_id".to_string(),
-                Value::Concrete(ConcreteValue::String("vpc-OLD".to_string())),
-            ),
-            (
-                "cidr_block".to_string(),
-                Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
-            ),
-        ]),
-        BindingValueSource::Local,
-    );
-
-    // --- Unresolved resource map ---
-    let unresolved_resources = HashMap::from([
-        (
-            vpc_id.clone(),
-            carina_core::executor::UnresolvedResource::from_pre_resolve(vpc_unresolved),
-        ),
-        (
-            subnet_id.clone(),
-            carina_core::executor::UnresolvedResource::from_pre_resolve(subnet_unresolved),
-        ),
-    ]);
-
-    // --- Execute ---
-    let provider = RecordingProvider::new();
-    let outcome = execute_effects(
-        &plan,
-        &provider,
-        &carina_core::provider::NoopNormalizer,
-        &[],
-        &[],
-        &carina_core::schema::SchemaRegistry::new(),
-        &mut bindings,
-        &mut current_states,
-        &unresolved_resources,
-        &[],
-        tokio_util::sync::CancellationToken::new(),
-        carina_core::executor::TEST_UNCAPPED,
-    )
-    .await;
-    let result = match outcome {
-        carina_core::executor::ExecutionOutcome::Completed(result) => result,
-        carina_core::executor::ExecutionOutcome::Cancelled(_) => {
-            panic!("uncancelled execute_effects returned Cancelled")
-        }
-    };
-
-    assert_eq!(result.success_count, 2, "Both effects should succeed");
-    assert_eq!(result.failure_count, 0, "No effects should fail");
-
-    // --- Verify the subnet update received the NEW vpc_id ---
-    let update_calls = provider.get_update_calls();
-    let subnet_update = update_calls
-        .iter()
-        .find(|(id_str, _)| id_str.contains("subnet"))
-        .expect("Should have an update call for subnet");
-
-    let vpc_id_in_update = subnet_update
-        .1
-        .attributes
-        .get("vpc_id")
-        .expect("subnet update should have vpc_id attribute");
-
-    assert_eq!(
-        *vpc_id_in_update,
-        Value::Concrete(ConcreteValue::String("vpc-NEW".to_string())),
-        "Subnet update should reference the NEW vpc_id (vpc-NEW), not the stale old one (vpc-OLD)"
-    );
 }
 
 /// A mock StateBackend that returns a pre-configured state and captures writes.

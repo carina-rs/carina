@@ -121,11 +121,31 @@ impl MockProvider {
     }
 
     fn partial_config_matches(config: &PartialConfig, id: &ResourceId) -> bool {
+        Self::resource_pattern_matches(&config.resource_id_pattern, id)
+    }
+
+    fn resource_pattern_matches(pattern: &str, id: &ResourceId) -> bool {
         let full = format!("{}.{}.{}", id.provider, id.resource_type, id.name);
         let short = Self::resource_key(id);
-        config.resource_id_pattern == "*"
-            || config.resource_id_pattern == full
-            || config.resource_id_pattern == short
+        pattern == "*" || pattern == full || pattern == short
+    }
+
+    fn create_fail_matches(id: &ResourceId) -> bool {
+        env::var("CARINA_MOCK_CREATE_FAIL_FOR")
+            .ok()
+            .is_some_and(|pattern| Self::resource_pattern_matches(&pattern, id))
+    }
+
+    fn update_fail_matches(id: &ResourceId) -> bool {
+        env::var("CARINA_MOCK_UPDATE_FAIL_FOR")
+            .ok()
+            .is_some_and(|pattern| Self::resource_pattern_matches(&pattern, id))
+    }
+
+    fn delete_fail_matches(id: &ResourceId) -> bool {
+        env::var("CARINA_MOCK_DELETE_FAIL_FOR")
+            .ok()
+            .is_some_and(|pattern| Self::resource_pattern_matches(&pattern, id))
     }
 
     fn append_delete_log(path: PathBuf, id: &ResourceId) -> Result<(), std::io::Error> {
@@ -134,6 +154,14 @@ impl MockProvider {
         }
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         writeln!(file, "{}", Self::resource_key(id))
+    }
+
+    fn append_op_log(path: PathBuf, op: &str, id: &ResourceId) -> Result<(), std::io::Error> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        writeln!(file, "{} {}", op, Self::resource_key(id))
     }
 
     fn delete_delay_for(id: &ResourceId) -> Option<Duration> {
@@ -259,6 +287,15 @@ impl Provider for MockProvider {
                 .collect::<Result<_, _>>()
                 .map_err(|e| ProviderError::internal(format!("Failed to convert value: {}", e)))?;
 
+            if Self::create_fail_matches(&id) {
+                if let Some(path) = env::var_os("CARINA_MOCK_OP_LOG").map(PathBuf::from) {
+                    Self::append_op_log(path, "create-fail", &id).map_err(|e| {
+                        ProviderError::internal("Failed to append operation log").with_cause(e)
+                    })?;
+                }
+                return Err(ProviderError::internal("mock create failure"));
+            }
+
             let partial_create = self.partial_create_config_for(&id);
             if let Some(config) = partial_create {
                 for attr in &config.missing_attributes {
@@ -269,6 +306,12 @@ impl Provider for MockProvider {
             states.insert(key, attrs);
             self.save_states(&states)
                 .map_err(|e| ProviderError::internal("Failed to save state").with_cause(e))?;
+
+            if let Some(path) = env::var_os("CARINA_MOCK_OP_LOG").map(PathBuf::from) {
+                Self::append_op_log(path, "create", &id).map_err(|e| {
+                    ProviderError::internal("Failed to append operation log").with_cause(e)
+                })?;
+            }
 
             let mut state = State::existing(id.clone(), resource.resolved_attributes())
                 .with_identifier("mock-id");
@@ -298,6 +341,14 @@ impl Provider for MockProvider {
             let _active = ActiveUpdateGuard::enter();
             if let Some(delay) = update_delay() {
                 tokio::time::sleep(delay).await;
+            }
+            if Self::update_fail_matches(&id) {
+                if let Some(path) = env::var_os("CARINA_MOCK_OP_LOG").map(PathBuf::from) {
+                    Self::append_op_log(path, "update-fail", &id).map_err(|e| {
+                        ProviderError::internal("Failed to append operation log").with_cause(e)
+                    })?;
+                }
+                return Err(ProviderError::internal("mock update failure"));
             }
             // Apply the patch on top of `from` to construct the post-update
             // attribute map. The mock writes only what the user changed —
@@ -334,6 +385,12 @@ impl Provider for MockProvider {
             states.insert(key, attrs);
             self.save_states(&states)
                 .map_err(|e| ProviderError::internal("Failed to save state").with_cause(e))?;
+
+            if let Some(path) = env::var_os("CARINA_MOCK_OP_LOG").map(PathBuf::from) {
+                Self::append_op_log(path, "update", &id).map_err(|e| {
+                    ProviderError::internal("Failed to append operation log").with_cause(e)
+                })?;
+            }
 
             let mut state = State::existing(id, attributes).with_identifier("mock-id");
             if let Some(config) = partial_update {
@@ -372,9 +429,24 @@ impl Provider for MockProvider {
             let mut states = self.load_states();
             let key = Self::resource_key(&id);
 
+            if Self::delete_fail_matches(&id) {
+                if let Some(path) = env::var_os("CARINA_MOCK_OP_LOG").map(PathBuf::from) {
+                    Self::append_op_log(path, "delete-fail", &id).map_err(|e| {
+                        ProviderError::internal("Failed to append operation log").with_cause(e)
+                    })?;
+                }
+                return Err(ProviderError::internal("mock delete failure"));
+            }
+
             states.remove(&key);
             self.save_states(&states)
                 .map_err(|e| ProviderError::internal("Failed to save state").with_cause(e))?;
+
+            if let Some(path) = env::var_os("CARINA_MOCK_OP_LOG").map(PathBuf::from) {
+                Self::append_op_log(path, "delete", &id).map_err(|e| {
+                    ProviderError::internal("Failed to append operation log").with_cause(e)
+                })?;
+            }
 
             Ok(())
         })
@@ -442,6 +514,23 @@ mod tests {
         assert_eq!(
             fs::read_to_string(log_path).unwrap(),
             "test.resource.first\ntest.resource.second\n"
+        );
+    }
+
+    #[test]
+    fn append_op_log_records_operations_and_resource_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("nested").join("op.log");
+        let web_acl = ResourceId::with_provider("mock", "test.resource", "web_acl", None);
+        let distribution = ResourceId::with_provider("mock", "test.resource", "distribution", None);
+
+        MockProvider::append_op_log(log_path.clone(), "create", &web_acl).unwrap();
+        MockProvider::append_op_log(log_path.clone(), "update", &distribution).unwrap();
+        MockProvider::append_op_log(log_path.clone(), "delete", &web_acl).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(log_path).unwrap(),
+            "create test.resource.web_acl\nupdate test.resource.distribution\ndelete test.resource.web_acl\n"
         );
     }
 

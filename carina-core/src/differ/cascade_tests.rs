@@ -1,1806 +1,411 @@
 use super::*;
-use crate::resource::{ConcreteValue, DeferredValue};
 
-#[test]
-fn cascade_dependent_updates_adds_update_for_dependent() {
-    // VPC is being replaced with create_before_destroy
-    // Subnet depends on VPC via ResourceRef
-    // cascade_dependent_updates should add a CascadingUpdate to the Replace
+use crate::effect::{ChangedCreateOnly, UpdateBase};
+use crate::resource::ConcreteValue;
+use crate::schema::{AttributeSchema, ResourceSchema};
 
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
-
-    // Unresolved resources (before ref resolution)
-    let vpc = Resource::new("ec2.Vpc", "my-vpc")
-        .with_binding("vpc")
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
-        );
-
-    let subnet = Resource::new("ec2.Subnet", "my-subnet")
-        .with_binding("subnet")
-        .with_attribute(
-            "vpc_id",
-            Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-        )
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
-        );
-
-    let unresolved_resources = vec![vpc.clone(), subnet.clone()];
-
-    // Current states
-    let mut current_states = HashMap::new();
-    let mut vpc_attrs = HashMap::new();
-    vpc_attrs.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
-    );
-    vpc_attrs.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-    );
-    current_states.insert(
-        vpc_id.clone(),
-        State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
-    );
-
-    let mut subnet_attrs = HashMap::new();
-    subnet_attrs.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-    );
-    subnet_attrs.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
-    );
-    current_states.insert(
-        subnet_id.clone(),
-        State::existing(subnet_id.clone(), subnet_attrs).with_identifier("subnet-123"),
-    );
-
-    // Build a plan with Replace for VPC (create_before_destroy)
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: vpc_id.clone(),
-        from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: (vpc.clone().with_binding("vpc")),
-        directives: Directives {
-            create_before_destroy: true,
-            ..Default::default()
-        },
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-
-    // Apply cascade
-    let schemas = SchemaRegistry::new();
-    cascade_dependent_updates(
-        &mut plan,
-        &unresolved_resources,
-        &crate::resource::into_plan_input_map(current_states.clone()),
-        &schemas,
-    );
-
-    // Verify the Replace effect now has a cascading update for the subnet
-    let effects = plan.effects();
-    assert_eq!(effects.len(), 1);
-    if let Effect::Replace {
-        cascading_updates, ..
-    } = &effects[0]
-    {
-        assert_eq!(cascading_updates.len(), 1);
-        assert_eq!(cascading_updates[0].id, subnet_id);
-        // The `to` should have unresolved ResourceRef
-        assert!(matches!(
-            cascading_updates[0].to.get_attr("vpc_id"),
-            Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
-        ));
-        // The `from` should have the current state
-        assert_eq!(
-            cascading_updates[0].from.attributes.get("vpc_id"),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "vpc-old".to_string()
-            )))
-        );
-    } else {
-        panic!("Expected Replace effect");
-    }
+fn str_value(value: &str) -> Value {
+    Value::Concrete(ConcreteValue::String(value.to_string()))
 }
 
-#[test]
-fn cascade_skips_resources_already_in_plan() {
-    // If the dependent resource already has its own effect (e.g., Update),
-    // cascade should not add a duplicate
-
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
-
-    let vpc = Resource::new("ec2.Vpc", "my-vpc")
-        .with_binding("vpc")
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
-        );
-
-    let subnet = Resource::new("ec2.Subnet", "my-subnet")
-        .with_binding("subnet")
-        .with_attribute(
-            "vpc_id",
-            Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-        )
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.2.0/24".to_string())),
-        );
-
-    let unresolved_resources = vec![vpc.clone(), subnet.clone()];
-
-    let mut current_states = HashMap::new();
-    let mut vpc_attrs = HashMap::new();
-    vpc_attrs.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
-    );
-    current_states.insert(
-        vpc_id.clone(),
-        State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
-    );
-    let mut subnet_attrs = HashMap::new();
-    subnet_attrs.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-    );
-    subnet_attrs.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
-    );
-    current_states.insert(
-        subnet_id.clone(),
-        State::existing(subnet_id.clone(), subnet_attrs.clone()).with_identifier("subnet-123"),
-    );
-
-    // Plan with both Replace for VPC and Update for subnet
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: vpc_id.clone(),
-        from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: (vpc.clone()),
-        directives: Directives {
-            create_before_destroy: true,
-            ..Default::default()
-        },
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-    plan.add(Effect::Update {
-        id: subnet_id.clone(),
-        from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
-        to: (subnet.clone()),
-        changed_attributes: vec!["cidr_block".to_string()],
-    });
-
-    let schemas = SchemaRegistry::new();
-    cascade_dependent_updates(
-        &mut plan,
-        &unresolved_resources,
-        &crate::resource::into_plan_input_map(current_states.clone()),
-        &schemas,
-    );
-
-    // The Replace should have NO cascading updates since subnet already has an Update
-    if let Effect::Replace {
-        cascading_updates, ..
-    } = &plan.effects()[0]
-    {
-        assert!(
-            cascading_updates.is_empty(),
-            "Expected no cascading updates when dependent already has an effect"
-        );
-    } else {
-        panic!("Expected Replace effect");
-    }
+fn ref_value(binding: &str, attr: &str) -> Value {
+    Value::resource_ref(binding.to_string(), attr.to_string(), vec![])
 }
 
-#[test]
-fn cascade_no_op_without_create_before_destroy() {
-    // Replace without create_before_destroy should not trigger cascading
-
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-
-    let vpc = Resource::new("ec2.Vpc", "my-vpc")
-        .with_binding("vpc")
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
-        );
-
-    let subnet = Resource::new("ec2.Subnet", "my-subnet")
-        .with_binding("subnet")
-        .with_attribute(
-            "vpc_id",
-            Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-        );
-
-    let unresolved_resources = vec![vpc.clone(), subnet.clone()];
-
-    let mut current_states = HashMap::new();
-    let mut vpc_attrs = HashMap::new();
-    vpc_attrs.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
-    );
-    current_states.insert(
-        vpc_id.clone(),
-        State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
-    );
-
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: vpc_id.clone(),
-        from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: (vpc.clone()),
-        directives: Directives::default(), // create_before_destroy = false
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-
-    let schemas = SchemaRegistry::new();
-    cascade_dependent_updates(
-        &mut plan,
-        &unresolved_resources,
-        &crate::resource::into_plan_input_map(current_states.clone()),
-        &schemas,
-    );
-
-    if let Effect::Replace {
-        cascading_updates, ..
-    } = &plan.effects()[0]
-    {
-        assert!(cascading_updates.is_empty());
-    }
-}
-
-#[test]
-fn cascade_transitive_dependencies() {
-    // VPC → Subnet → Instance (transitive chain)
-    // Only Subnet directly depends on VPC, so only Subnet gets cascading update
-
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
-    let instance_id = ResourceId::new("ec2.Instance", "my-instance");
-
-    let vpc = Resource::new("ec2.Vpc", "my-vpc")
-        .with_binding("vpc")
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
-        );
-
-    let subnet = Resource::new("ec2.Subnet", "my-subnet")
-        .with_binding("subnet")
-        .with_attribute(
-            "vpc_id",
-            Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-        );
-
-    let instance = Resource::new("ec2.Instance", "my-instance")
-        .with_binding("instance")
-        .with_attribute(
-            "subnet_id",
-            Value::resource_ref("subnet".to_string(), "subnet_id".to_string(), vec![]),
-        );
-
-    let unresolved_resources = vec![vpc.clone(), subnet.clone(), instance.clone()];
-
-    let mut current_states = HashMap::new();
-    let mut vpc_attrs = HashMap::new();
-    vpc_attrs.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
-    );
-    vpc_attrs.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-    );
-    current_states.insert(
-        vpc_id.clone(),
-        State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
-    );
-    let mut subnet_attrs = HashMap::new();
-    subnet_attrs.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-    );
-    subnet_attrs.insert(
-        "subnet_id".to_string(),
-        Value::Concrete(ConcreteValue::String("subnet-123".to_string())),
-    );
-    current_states.insert(
-        subnet_id.clone(),
-        State::existing(subnet_id.clone(), subnet_attrs).with_identifier("subnet-123"),
-    );
-    let mut instance_attrs = HashMap::new();
-    instance_attrs.insert(
-        "subnet_id".to_string(),
-        Value::Concrete(ConcreteValue::String("subnet-123".to_string())),
-    );
-    current_states.insert(
-        instance_id.clone(),
-        State::existing(instance_id.clone(), instance_attrs).with_identifier("i-123"),
-    );
-
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: vpc_id.clone(),
-        from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: (vpc.clone()),
-        directives: Directives {
-            create_before_destroy: true,
-            ..Default::default()
-        },
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-
-    let schemas = SchemaRegistry::new();
-    cascade_dependent_updates(
-        &mut plan,
-        &unresolved_resources,
-        &crate::resource::into_plan_input_map(current_states.clone()),
-        &schemas,
-    );
-
-    // Only subnet directly depends on VPC, so only subnet gets cascading update
-    // Instance depends on subnet, not VPC directly
-    if let Effect::Replace {
-        cascading_updates, ..
-    } = &plan.effects()[0]
-    {
-        assert_eq!(cascading_updates.len(), 1);
-        assert_eq!(cascading_updates[0].id, subnet_id);
-    } else {
-        panic!("Expected Replace effect");
-    }
-}
-
-#[test]
-fn cascade_anonymous_resource_dependent() {
-    // Anonymous resource (no _binding) that depends on a replaced resource
-    // should still get a cascading update
-
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
-
-    let vpc = Resource::new("ec2.Vpc", "my-vpc")
-        .with_binding("vpc")
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
-        );
-
-    // Anonymous subnet (no _binding) with a ResourceRef to the VPC
-    let subnet = Resource::new("ec2.Subnet", "my-subnet").with_attribute(
-        "vpc_id",
-        Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-    );
-
-    let unresolved_resources = vec![vpc.clone(), subnet.clone()];
-
-    let mut current_states = HashMap::new();
-    let mut vpc_attrs = HashMap::new();
-    vpc_attrs.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
-    );
-    vpc_attrs.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-    );
-    current_states.insert(
-        vpc_id.clone(),
-        State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
-    );
-
-    let mut subnet_attrs = HashMap::new();
-    subnet_attrs.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-    );
-    current_states.insert(
-        subnet_id.clone(),
-        State::existing(subnet_id.clone(), subnet_attrs).with_identifier("subnet-123"),
-    );
-
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: vpc_id.clone(),
-        from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: (vpc.clone()),
-        directives: Directives {
-            create_before_destroy: true,
-            ..Default::default()
-        },
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-
-    let schemas = SchemaRegistry::new();
-    cascade_dependent_updates(
-        &mut plan,
-        &unresolved_resources,
-        &crate::resource::into_plan_input_map(current_states.clone()),
-        &schemas,
-    );
-
-    if let Effect::Replace {
-        cascading_updates, ..
-    } = &plan.effects()[0]
-    {
-        assert_eq!(
-            cascading_updates.len(),
-            1,
-            "Anonymous resource should get cascading update"
-        );
-        assert_eq!(cascading_updates[0].id, subnet_id);
-    } else {
-        panic!("Expected Replace effect for anonymous resource test");
-    }
-}
-
-#[test]
-fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
-    // When VPC is replaced, subnet's vpc_id changes.
-    // Since vpc_id is a create-only attribute on ec2.subnet,
-    // the subnet cannot be updated in-place — it must also be replaced.
-    // Currently, cascading updates always generate CascadingUpdate (Update),
-    // but this test asserts the correct behavior: a Replace effect for the subnet.
-
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
-
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
-
-    // Unresolved resources (before ref resolution)
-    let vpc = Resource::new("ec2.Vpc", "my-vpc")
-        .with_binding("vpc")
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
-        );
-
-    let subnet = Resource::new("ec2.Subnet", "my-subnet")
-        .with_binding("subnet")
-        .with_attribute(
-            "vpc_id",
-            Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-        )
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
-        );
-
-    let unresolved_resources = vec![vpc.clone(), subnet.clone()];
-
-    // Current states
-    let mut current_states = HashMap::new();
-    let mut vpc_attrs = HashMap::new();
-    vpc_attrs.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
-    );
-    vpc_attrs.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-    );
-    current_states.insert(
-        vpc_id.clone(),
-        State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
-    );
-
-    let mut subnet_attrs = HashMap::new();
-    subnet_attrs.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-    );
-    subnet_attrs.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
-    );
-    current_states.insert(
-        subnet_id.clone(),
-        State::existing(subnet_id.clone(), subnet_attrs).with_identifier("subnet-123"),
-    );
-
-    // Schema for ec2.subnet with vpc_id as create-only
-    let subnet_schema = ResourceSchema::new("ec2.Subnet")
-        .attribute(
-            AttributeSchema::new("vpc_id", AttributeType::string())
-                .required()
-                .create_only(),
-        )
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).required());
-
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert("", subnet_schema);
-
-    // Build a plan with Replace for VPC (create_before_destroy)
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: vpc_id.clone(),
-        from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: (vpc.clone().with_binding("vpc")),
-        directives: Directives {
-            create_before_destroy: true,
-            ..Default::default()
-        },
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-
-    // Apply cascade with schemas so it can detect create-only attributes
-    cascade_dependent_updates(
-        &mut plan,
-        &unresolved_resources,
-        &crate::resource::into_plan_input_map(current_states.clone()),
-        &schemas,
-    );
-
-    // After cascading, the subnet should appear as a separate Replace effect in the plan,
-    // NOT as a CascadingUpdate inside the VPC's Replace effect.
-    // This is because vpc_id is create-only on subnet — an in-place update is impossible.
-    let effects = plan.effects();
-
-    // We expect 2 effects: Replace for VPC and Replace for subnet
-    assert_eq!(
-        effects.len(),
-        2,
-        "Expected 2 effects (VPC Replace + subnet Replace), got {}: {:?}",
-        effects.len(),
-        effects
-            .iter()
-            .map(|e| format!("{} {}", e.kind(), e.resource_id()))
-            .collect::<Vec<_>>()
-    );
-
-    // The VPC Replace should have no cascading updates (subnet is promoted to its own Replace)
-    if let Effect::Replace {
+fn state(id: ResourceId, attrs: impl IntoIterator<Item = (&'static str, Value)>) -> State {
+    State::existing(
         id,
-        cascading_updates,
-        ..
-    } = &effects[0]
-    {
-        assert_eq!(id, &vpc_id);
-        assert!(
-            cascading_updates.is_empty(),
-            "VPC Replace should have no cascading updates; subnet should be a separate Replace"
-        );
-    } else {
-        panic!("Expected first effect to be Replace for VPC");
-    }
+        attrs
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect(),
+    )
+    .with_identifier("existing-id")
+}
 
-    // The subnet should be a Replace effect (not an Update)
-    if let Effect::Replace {
+fn base_registry() -> SchemaRegistry {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "",
+        ResourceSchema::new("waf.WebAcl")
+            .attribute(AttributeSchema::new("name", AttributeType::string()).create_only())
+            .attribute(AttributeSchema::new("arn", AttributeType::string())),
+    );
+    registry.insert(
+        "",
+        ResourceSchema::new("cdn.Distribution")
+            .attribute(AttributeSchema::new("web_acl_arn", AttributeType::string()))
+            .attribute(AttributeSchema::new("comment", AttributeType::string()))
+            .attribute(AttributeSchema::new("domain_name", AttributeType::string())),
+    );
+    registry
+}
+
+fn web_acl_id() -> ResourceId {
+    ResourceId::new("waf.WebAcl", "main")
+}
+
+fn distribution_id() -> ResourceId {
+    ResourceId::new("cdn.Distribution", "main")
+}
+
+fn seed_web_acl_replace(plan: &mut Plan, current_states: &HashMap<ResourceId, State>) {
+    let id = web_acl_id();
+    let from = current_states
+        .get(&id)
+        .unwrap_or_else(|| panic!("missing current state for {id}"));
+    let mut to = web_acl();
+    to.directives.create_before_destroy = true;
+    let create_idx = plan.add(Effect::Create(to.clone()));
+    let delete_idx = plan.add(Effect::Delete {
+        id: id.clone(),
+        identifier: from.identifier.clone().unwrap_or_default(),
+        directives: to.directives.clone(),
+        binding: Some("web_acl".to_string()),
+        dependencies: from.dependency_bindings.iter().cloned().collect(),
+        explicit_dependencies: std::collections::HashSet::new(),
+        blocked_by_updates: std::collections::HashSet::new(),
+    });
+    plan.add_replace_display(crate::plan::ReplaceDisplayMetadata {
         id,
-        changed_create_only,
-        cascade_ref_hints,
-        ..
-    } = &effects[1]
-    {
-        assert_eq!(id, &subnet_id);
-        assert!(
-            changed_create_only.contains("vpc_id"),
-            "Subnet Replace should list vpc_id as a changed create-only attribute"
-        );
-        assert!(
-            cascade_ref_hints.contains(&("vpc_id".to_string(), "vpc.vpc_id".to_string())),
-            "Subnet Replace should have cascade_ref_hint for vpc_id → vpc.vpc_id, got: {:?}",
-            cascade_ref_hints
-        );
-    } else {
-        panic!(
-            "Expected second effect to be Replace for subnet, got: {:?}",
-            effects[1].kind()
-        );
-    }
+        binding: Some("web_acl".to_string()),
+        create_idx,
+        delete_idx,
+        rename_idx: None,
+        create_before_destroy: true,
+        changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
+        cascade_ref_hints: vec![],
+        temporary_name: None,
+        previous_attributes: from.attributes.clone(),
+    });
 }
 
-#[test]
-fn cascade_generates_replace_when_create_only_list_contains_nested_ref() {
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
-
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let attachment_id = ResourceId::new("ec2.RouteTableAssociation", "my-assoc");
-
-    let vpc = Resource::new("ec2.Vpc", "my-vpc")
-        .with_binding("vpc")
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
-        );
-
-    let attachment = Resource::new("ec2.RouteTableAssociation", "my-assoc")
-        .with_binding("attachment")
-        .with_attribute(
-            "subnet_ids",
-            Value::Concrete(ConcreteValue::List(vec![Value::resource_ref(
-                "vpc".to_string(),
-                "vpc_id".to_string(),
-                vec![],
-            )])),
-        )
-        .with_attribute(
-            "name",
-            Value::Concrete(ConcreteValue::String("main".to_string())),
-        );
-
-    let unresolved_resources = vec![vpc.clone(), attachment.clone()];
-
-    let mut current_states = HashMap::new();
-    let mut vpc_attrs = HashMap::new();
-    vpc_attrs.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
-    );
-    vpc_attrs.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-    );
-    current_states.insert(
-        vpc_id.clone(),
-        State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
-    );
-
-    let mut attachment_attrs = HashMap::new();
-    attachment_attrs.insert(
-        "subnet_ids".to_string(),
-        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-            ConcreteValue::String("vpc-old".to_string()),
-        )])),
-    );
-    attachment_attrs.insert(
-        "name".to_string(),
-        Value::Concrete(ConcreteValue::String("main".to_string())),
-    );
-    current_states.insert(
-        attachment_id.clone(),
-        State::existing(attachment_id.clone(), attachment_attrs).with_identifier("assoc-123"),
-    );
-
-    let attachment_schema = ResourceSchema::new("ec2.RouteTableAssociation")
-        .attribute(
-            AttributeSchema::new("subnet_ids", AttributeType::list(AttributeType::string()))
-                .required()
-                .create_only(),
-        )
-        .attribute(AttributeSchema::new("name", AttributeType::string()).required());
-
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert("", attachment_schema);
-
+fn cascade_plan_for(
+    resources: &[Resource],
+    current_states: HashMap<ResourceId, State>,
+    registry: &SchemaRegistry,
+) -> Plan {
     let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: vpc_id.clone(),
-        from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: vpc.clone().with_binding("vpc"),
-        directives: Directives {
-            create_before_destroy: true,
-            ..Default::default()
-        },
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-
+    seed_web_acl_replace(&mut plan, &current_states);
     cascade_dependent_updates(
         &mut plan,
-        &unresolved_resources,
-        &crate::resource::into_plan_input_map(current_states.clone()),
-        &schemas,
+        resources,
+        &crate::resource::into_plan_input_map(current_states),
+        registry,
     );
-
-    let effects = plan.effects();
-    assert_eq!(
-        effects.len(),
-        2,
-        "Expected nested list ref on create-only attribute to promote dependent to Replace, got: {:?}",
-        effects
-            .iter()
-            .map(|e| format!("{} {}", e.kind(), e.resource_id()))
-            .collect::<Vec<_>>()
-    );
-
-    match &effects[1] {
-        Effect::Replace {
-            id,
-            changed_create_only,
-            cascade_ref_hints,
-            ..
-        } => {
-            assert_eq!(id, &attachment_id);
-            assert!(changed_create_only.contains("subnet_ids"));
-            assert!(
-                cascade_ref_hints.contains(&("subnet_ids".to_string(), "vpc.vpc_id".to_string()))
-            );
-        }
-        other => panic!(
-            "Expected nested list dependent to be Replace, got {}",
-            other.kind()
-        ),
-    }
+    plan
 }
 
-#[test]
-fn cascade_hint_prefers_resource_ref_over_binding_ref_in_mixed_list() {
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
-
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let attachment_id = ResourceId::new("ec2.RouteTableAssociation", "my-assoc");
-
-    let vpc = Resource::new("ec2.Vpc", "my-vpc")
-        .with_binding("vpc")
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
-        );
-
-    let attachment = Resource::new("ec2.RouteTableAssociation", "my-assoc")
-        .with_binding("attachment")
-        .with_attribute(
-            "targets",
-            Value::Concrete(ConcreteValue::List(vec![
-                Value::Deferred(DeferredValue::BindingRef {
-                    binding: "vpc".to_string(),
-                }),
-                Value::resource_ref("vpc".to_string(), "id".to_string(), vec![]),
-            ])),
-        );
-
-    let unresolved_resources = vec![vpc.clone(), attachment.clone()];
-
-    let mut current_states = HashMap::new();
-    let mut vpc_attrs = HashMap::new();
-    vpc_attrs.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
-    );
-    vpc_attrs.insert(
-        "id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-    );
-    current_states.insert(
-        vpc_id.clone(),
-        State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
-    );
-
-    let mut attachment_attrs = HashMap::new();
-    attachment_attrs.insert(
-        "targets".to_string(),
-        Value::Concrete(ConcreteValue::List(vec![
-            Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-            Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-        ])),
-    );
-    current_states.insert(
-        attachment_id.clone(),
-        State::existing(attachment_id.clone(), attachment_attrs).with_identifier("assoc-123"),
-    );
-
-    let attachment_schema = ResourceSchema::new("ec2.RouteTableAssociation").attribute(
-        AttributeSchema::new("targets", AttributeType::list(AttributeType::string()))
-            .required()
-            .create_only(),
-    );
-
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert("", attachment_schema);
-
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: vpc_id.clone(),
-        from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: vpc.clone().with_binding("vpc"),
-        directives: Directives {
-            create_before_destroy: true,
-            ..Default::default()
-        },
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-
-    cascade_dependent_updates(
-        &mut plan,
-        &unresolved_resources,
-        &crate::resource::into_plan_input_map(current_states.clone()),
-        &schemas,
-    );
-
-    match &plan.effects()[1] {
-        Effect::Replace {
-            cascade_ref_hints, ..
-        } => {
-            assert!(
-                cascade_ref_hints.contains(&("targets".to_string(), "vpc.id".to_string())),
-                "ResourceRef hint should win over BindingRef fallback, got: {:?}",
-                cascade_ref_hints
-            );
-        }
-        other => panic!(
-            "Expected mixed-list dependent to be Replace, got {}",
-            other.kind()
-        ),
-    }
+fn web_acl() -> Resource {
+    Resource::new("waf.WebAcl", "main")
+        .with_binding("web_acl")
+        .with_attribute("name", str_value("new-acl"))
+        .with_attribute("arn", str_value("arn:new"))
 }
 
-#[test]
-fn cascade_generates_replace_when_create_only_map_contains_nested_ref() {
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
-
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let tagged_id = ResourceId::new("ec2.TaggedResource", "my-tagged");
-
-    let vpc = Resource::new("ec2.Vpc", "my-vpc")
-        .with_binding("vpc")
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
-        );
-
-    let mut desired_tags = indexmap::IndexMap::new();
-    desired_tags.insert(
-        "vpc_ref".to_string(),
-        Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-    );
-    desired_tags.insert(
-        "env".to_string(),
-        Value::Concrete(ConcreteValue::String("prod".to_string())),
-    );
-
-    let tagged = Resource::new("ec2.TaggedResource", "my-tagged")
-        .with_binding("tagged")
-        .with_attribute("tags", Value::Concrete(ConcreteValue::Map(desired_tags)))
-        .with_attribute(
-            "name",
-            Value::Concrete(ConcreteValue::String("main".to_string())),
-        );
-
-    let unresolved_resources = vec![vpc.clone(), tagged.clone()];
-
-    let mut current_states = HashMap::new();
-    let mut vpc_attrs = HashMap::new();
-    vpc_attrs.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
-    );
-    vpc_attrs.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-    );
-    current_states.insert(
-        vpc_id.clone(),
-        State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
-    );
-
-    let mut state_tags = indexmap::IndexMap::new();
-    state_tags.insert(
-        "vpc_ref".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-    );
-    state_tags.insert(
-        "env".to_string(),
-        Value::Concrete(ConcreteValue::String("prod".to_string())),
-    );
-    let mut tagged_attrs = HashMap::new();
-    tagged_attrs.insert(
-        "tags".to_string(),
-        Value::Concrete(ConcreteValue::Map(state_tags)),
-    );
-    tagged_attrs.insert(
-        "name".to_string(),
-        Value::Concrete(ConcreteValue::String("main".to_string())),
-    );
-    current_states.insert(
-        tagged_id.clone(),
-        State::existing(tagged_id.clone(), tagged_attrs).with_identifier("tagged-123"),
-    );
-
-    let tagged_schema = ResourceSchema::new("ec2.TaggedResource")
-        .attribute(
-            AttributeSchema::new("tags", AttributeType::map(AttributeType::string()))
-                .required()
-                .create_only(),
-        )
-        .attribute(AttributeSchema::new("name", AttributeType::string()).required());
-
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert("", tagged_schema);
-
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: vpc_id.clone(),
-        from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: vpc.clone().with_binding("vpc"),
-        directives: Directives {
-            create_before_destroy: true,
-            ..Default::default()
-        },
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-
-    cascade_dependent_updates(
-        &mut plan,
-        &unresolved_resources,
-        &crate::resource::into_plan_input_map(current_states.clone()),
-        &schemas,
-    );
-
-    let effects = plan.effects();
-    assert_eq!(
-        effects.len(),
-        2,
-        "Expected nested map ref on create-only attribute to promote dependent to Replace, got: {:?}",
-        effects
-            .iter()
-            .map(|e| format!("{} {}", e.kind(), e.resource_id()))
-            .collect::<Vec<_>>()
-    );
-
-    match &effects[1] {
-        Effect::Replace {
-            id,
-            changed_create_only,
-            cascade_ref_hints,
-            ..
-        } => {
-            assert_eq!(id, &tagged_id);
-            assert!(changed_create_only.contains("tags"));
-            assert!(
-                cascade_ref_hints.contains(&("tags".to_string(), "vpc.vpc_id".to_string())),
-                "Expected tags cascade hint from nested map ref, got: {:?}",
-                cascade_ref_hints
-            );
-        }
-        other => panic!(
-            "Expected nested map dependent to be Replace, got {}",
-            other.kind()
-        ),
-    }
+fn distribution() -> Resource {
+    Resource::new("cdn.Distribution", "main")
+        .with_binding("distribution")
+        .with_attribute("web_acl_arn", ref_value("web_acl", "arn"))
+        .with_attribute("comment", str_value("unchanged"))
+        .with_attribute("domain_name", str_value("example.cloudfront.net"))
 }
 
-#[test]
-fn cascade_prevent_destroy_blocks_nested_map_ref_promotion_to_replace() {
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+fn current_web_acl_state() -> State {
+    state(
+        web_acl_id(),
+        [
+            ("name", str_value("old-acl")),
+            ("arn", str_value("arn:old")),
+        ],
+    )
+}
 
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let tagged_id = ResourceId::new("ec2.TaggedResource", "my-tagged");
+fn current_distribution_state(web_acl_value: Value, comment: &str) -> State {
+    state(
+        ResourceId::new("cdn.Distribution", "main"),
+        [
+            ("web_acl_arn", web_acl_value),
+            ("comment", str_value(comment)),
+            ("domain_name", str_value("example.cloudfront.net")),
+        ],
+    )
+}
 
-    let vpc = Resource::new("ec2.Vpc", "my-vpc")
-        .with_binding("vpc")
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
-        );
+fn delete_blockers_for<'a>(
+    plan: &'a Plan,
+    id: &ResourceId,
+) -> &'a std::collections::HashSet<String> {
+    plan.effects()
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Delete {
+                id: delete_id,
+                blocked_by_updates,
+                ..
+            } if delete_id == id => Some(blocked_by_updates),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("missing Delete for {id}"))
+}
 
-    let mut desired_tags = indexmap::IndexMap::new();
-    desired_tags.insert(
-        "vpc_ref".to_string(),
-        Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-    );
+fn updates_for<'a>(plan: &'a Plan, id: &ResourceId) -> Vec<&'a Effect> {
+    plan.effects()
+        .iter()
+        .filter(|effect| matches!(effect, Effect::Update { id: update_id, .. } if update_id == id))
+        .collect()
+}
 
-    let mut tagged = Resource::new("ec2.TaggedResource", "my-tagged")
-        .with_binding("tagged")
-        .with_attribute("tags", Value::Concrete(ConcreteValue::Map(desired_tags)))
-        .with_attribute(
-            "name",
-            Value::Concrete(ConcreteValue::String("main".to_string())),
-        );
-    tagged.directives.prevent_destroy = true;
+fn replace_metadata_for<'a>(
+    plan: &'a Plan,
+    id: &ResourceId,
+) -> &'a crate::plan::ReplaceDisplayMetadata {
+    plan.replace_display()
+        .iter()
+        .find(|metadata| &metadata.id == id)
+        .unwrap_or_else(|| panic!("missing replace display metadata for {id}"))
+}
 
-    let unresolved_resources = vec![vpc.clone(), tagged.clone()];
-
-    let mut current_states = HashMap::new();
-    let mut vpc_attrs = HashMap::new();
-    vpc_attrs.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
-    );
-    vpc_attrs.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-    );
-    current_states.insert(
-        vpc_id.clone(),
-        State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
-    );
-
-    let mut state_tags = indexmap::IndexMap::new();
-    state_tags.insert(
-        "vpc_ref".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-    );
-    let mut tagged_attrs = HashMap::new();
-    tagged_attrs.insert(
-        "tags".to_string(),
-        Value::Concrete(ConcreteValue::Map(state_tags)),
-    );
-    tagged_attrs.insert(
-        "name".to_string(),
-        Value::Concrete(ConcreteValue::String("main".to_string())),
-    );
-    current_states.insert(
-        tagged_id.clone(),
-        State::existing(tagged_id.clone(), tagged_attrs).with_identifier("tagged-123"),
-    );
-
-    let tagged_schema = ResourceSchema::new("ec2.TaggedResource")
-        .attribute(
-            AttributeSchema::new("tags", AttributeType::map(AttributeType::string()))
-                .required()
-                .create_only(),
-        )
-        .attribute(AttributeSchema::new("name", AttributeType::string()).required());
-
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert("", tagged_schema);
-
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: vpc_id.clone(),
-        from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: vpc.clone().with_binding("vpc"),
-        directives: Directives {
-            create_before_destroy: true,
-            ..Default::default()
-        },
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-
-    cascade_dependent_updates(
-        &mut plan,
-        &unresolved_resources,
-        &crate::resource::into_plan_input_map(current_states.clone()),
-        &schemas,
-    );
-
-    assert!(
-        plan.has_errors(),
-        "Expected PlanError for nested map ref promotion blocked by prevent_destroy"
-    );
-    assert_eq!(plan.errors().len(), 1);
-    assert_eq!(plan.errors()[0].resource_id, tagged_id);
-    assert!(plan.errors()[0].message.contains("prevent_destroy"));
-
-    let tagged_effects: Vec<_> = plan
+fn decomposed_replace_count(plan: &Plan, id: &ResourceId) -> (usize, usize) {
+    let creates = plan
         .effects()
         .iter()
-        .filter(|e| *e.resource_id() == tagged_id)
-        .collect();
-    assert!(
-        tagged_effects.is_empty(),
-        "Dependent should not be promoted when prevent_destroy blocks nested map ref cascade"
-    );
-}
-
-#[test]
-fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
-    // Pattern 2: Direct change + cascade
-    //
-    // VPC cidr_block changes → VPC Replace (create_before_destroy)
-    // Subnet availability_zone also changes (create-only) → Subnet Replace from differ
-    // Subnet vpc_id (create-only) references VPC → cascade should ALSO add vpc_id
-    //
-    // Expected: Subnet Replace shows BOTH availability_zone AND vpc_id in changed_create_only
-
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
-
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
-
-    // Unresolved resources (before ref resolution)
-    let vpc = Resource::new("ec2.Vpc", "my-vpc")
-        .with_binding("vpc")
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
-        );
-
-    let subnet = Resource::new("ec2.Subnet", "my-subnet")
-        .with_binding("subnet")
-        .with_attribute(
-            "vpc_id",
-            Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-        )
-        .with_attribute(
-            "availability_zone",
-            Value::Concrete(ConcreteValue::String("us-east-1b".to_string())),
-        )
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
-        );
-
-    let unresolved_resources = vec![vpc.clone(), subnet.clone()];
-
-    // Current states
-    let mut current_states = HashMap::new();
-    let mut vpc_attrs = HashMap::new();
-    vpc_attrs.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
-    );
-    vpc_attrs.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-    );
-    current_states.insert(
-        vpc_id.clone(),
-        State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
-    );
-
-    let mut subnet_attrs = HashMap::new();
-    subnet_attrs.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-    );
-    subnet_attrs.insert(
-        "availability_zone".to_string(),
-        Value::Concrete(ConcreteValue::String("us-east-1a".to_string())),
-    );
-    subnet_attrs.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
-    );
-    current_states.insert(
-        subnet_id.clone(),
-        State::existing(subnet_id.clone(), subnet_attrs).with_identifier("subnet-123"),
-    );
-
-    // Schema: vpc_id and availability_zone are both create-only on ec2.subnet
-    let subnet_schema = ResourceSchema::new("ec2.Subnet")
-        .attribute(
-            AttributeSchema::new("vpc_id", AttributeType::string())
-                .required()
-                .create_only(),
-        )
-        .attribute(
-            AttributeSchema::new("availability_zone", AttributeType::string())
-                .required()
-                .create_only(),
-        )
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).required());
-
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert("", subnet_schema);
-
-    // Build a plan:
-    // - VPC Replace (create_before_destroy) due to cidr_block change
-    // - Subnet Replace due to availability_zone change (direct change from differ)
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: vpc_id.clone(),
-        from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: (vpc.clone().with_binding("vpc")),
-        directives: Directives {
-            create_before_destroy: true,
-            ..Default::default()
-        },
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-    plan.add(Effect::Replace {
-        id: subnet_id.clone(),
-        from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
-        to: (subnet.clone().with_binding("subnet")),
-        directives: Directives::default(),
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
-            "availability_zone".to_string(),
-        ])
-        .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-
-    // Apply cascade
-    cascade_dependent_updates(
-        &mut plan,
-        &unresolved_resources,
-        &crate::resource::into_plan_input_map(current_states.clone()),
-        &schemas,
-    );
-
-    // After cascading, the subnet Replace should have BOTH availability_zone AND vpc_id
-    // in changed_create_only, because vpc_id is a create-only ref to the replaced VPC.
-    let effects = plan.effects();
-    assert_eq!(effects.len(), 2, "Should still have 2 effects");
-
-    let subnet_effect = effects.iter().find(|e| *e.resource_id() == subnet_id);
-    assert!(subnet_effect.is_some(), "Subnet effect should exist");
-
-    if let Effect::Replace {
-        changed_create_only,
-        cascade_ref_hints,
-        ..
-    } = subnet_effect.unwrap()
-    {
-        assert!(
-            changed_create_only.contains("availability_zone"),
-            "changed_create_only should contain availability_zone (direct change), got: {:?}",
-            changed_create_only
-        );
-        assert!(
-            changed_create_only.contains("vpc_id"),
-            "changed_create_only should contain vpc_id (cascade from VPC replace), got: {:?}",
-            changed_create_only
-        );
-        assert!(
-            cascade_ref_hints.contains(&("vpc_id".to_string(), "vpc.vpc_id".to_string())),
-            "cascade_ref_hints should contain vpc_id → vpc.vpc_id, got: {:?}",
-            cascade_ref_hints
-        );
-    } else {
-        panic!("Expected subnet to be a Replace effect");
-    }
-}
-
-#[test]
-fn auto_detect_create_before_destroy_when_resource_has_dependents() {
-    // Issue #947: When a resource being replaced is referenced by other resources,
-    // automatically use create_before_destroy strategy instead of the default
-    // delete-then-create.
-    //
-    // VPC cidr_block changes (create-only) → VPC Replace with default directives
-    // Subnet depends on VPC via vpc_id (ResourceRef)
-    // Expected: VPC Replace should auto-detect create_before_destroy = true
-    // because the subnet references it.
-
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
-
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
-
-    // Unresolved resources (before ref resolution)
-    let vpc = Resource::new("ec2.Vpc", "my-vpc")
-        .with_binding("vpc")
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
-        );
-
-    let subnet = Resource::new("ec2.Subnet", "my-subnet")
-        .with_binding("subnet")
-        .with_attribute(
-            "vpc_id",
-            Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-        )
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
-        );
-
-    let unresolved_resources = vec![vpc.clone(), subnet.clone()];
-
-    // Current states
-    let mut current_states = HashMap::new();
-    let mut vpc_attrs = HashMap::new();
-    vpc_attrs.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
-    );
-    vpc_attrs.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-    );
-    current_states.insert(
-        vpc_id.clone(),
-        State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
-    );
-
-    let mut subnet_attrs = HashMap::new();
-    subnet_attrs.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-    );
-    subnet_attrs.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
-    );
-    current_states.insert(
-        subnet_id.clone(),
-        State::existing(subnet_id.clone(), subnet_attrs).with_identifier("subnet-123"),
-    );
-
-    // Schema: cidr_block is create-only on ec2.vpc
-    let vpc_schema = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only());
-    let subnet_schema = ResourceSchema::new("ec2.Subnet")
-        .attribute(
-            AttributeSchema::new("vpc_id", AttributeType::string())
-                .required()
-                .create_only(),
-        )
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).required());
-
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert("", vpc_schema);
-    schemas.insert("", subnet_schema);
-
-    // Build a plan with Replace for VPC using DEFAULT directives (no explicit CBD)
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: vpc_id.clone(),
-        from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: (vpc.clone().with_binding("vpc")),
-        directives: Directives::default(), // create_before_destroy = false (user didn't set it)
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-
-    // Apply cascade — this should auto-detect that VPC has dependents and
-    // promote it to create_before_destroy
-    cascade_dependent_updates(
-        &mut plan,
-        &unresolved_resources,
-        &crate::resource::into_plan_input_map(current_states.clone()),
-        &schemas,
-    );
-
-    // The VPC Replace should now have create_before_destroy = true
-    // because the subnet references it
-    let vpc_effect = plan
+        .filter(|effect| matches!(effect, Effect::Create(resource) if &resource.id == id))
+        .count();
+    let deletes = plan
         .effects()
         .iter()
-        .find(|e| *e.resource_id() == vpc_id)
-        .expect("VPC Replace effect should exist");
-
-    if let Effect::Replace { directives, .. } = vpc_effect {
-        assert!(
-            directives.create_before_destroy,
-            "VPC Replace should have create_before_destroy auto-detected \
-             because subnet references it, but got create_before_destroy = false"
-        );
-    } else {
-        panic!("Expected Replace effect for VPC");
-    }
+        .filter(|effect| matches!(effect, Effect::Delete { id: delete_id, .. } if delete_id == id))
+        .count();
+    (creates, deletes)
 }
 
 #[test]
-fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
-    // Pattern 3: Direct non-create-only change + cascade
-    //
-    // VPC cidr_block changes → VPC Replace (create_before_destroy)
-    // Subnet tags changes (NOT create-only) → Subnet Update from differ
-    // Subnet vpc_id (create-only) references VPC → cascade should UPGRADE to Replace
-    //
-    // Expected: Subnet becomes Replace with vpc_id in changed_create_only
+fn cascade_dependent_updates_adds_independent_update_for_dependent() {
+    let registry = base_registry();
+    let web_acl_id = web_acl_id();
+    let distribution_id = distribution_id();
+    let current_states = HashMap::from([
+        (web_acl_id.clone(), current_web_acl_state()),
+        (
+            distribution_id.clone(),
+            current_distribution_state(ref_value("web_acl", "arn"), "unchanged"),
+        ),
+    ]);
 
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    let plan = cascade_plan_for(&[web_acl(), distribution()], current_states, &registry);
 
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
-
-    // Unresolved resources (before ref resolution)
-    let vpc = Resource::new("ec2.Vpc", "my-vpc")
-        .with_binding("vpc")
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
-        );
-
-    let subnet = Resource::new("ec2.Subnet", "my-subnet")
-        .with_binding("subnet")
-        .with_attribute(
-            "vpc_id",
-            Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-        )
-        .with_attribute(
-            "tags",
-            Value::Concrete(ConcreteValue::String("new-tag".to_string())),
-        )
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
-        );
-
-    let unresolved_resources = vec![vpc.clone(), subnet.clone()];
-
-    // Current states
-    let mut current_states = HashMap::new();
-    let mut vpc_attrs = HashMap::new();
-    vpc_attrs.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+    let updates = updates_for(&plan, &distribution_id);
+    assert_eq!(updates.len(), 1, "expected one cascade Update");
+    match updates[0] {
+        Effect::Update {
+            from: UpdateBase::Existing(from),
+            to,
+            changed_attributes,
+            ..
+        } => {
+            assert_eq!(
+                from.attributes.get("web_acl_arn"),
+                Some(&ref_value("web_acl", "arn"))
+            );
+            assert_eq!(
+                to.get_attr("web_acl_arn"),
+                Some(&ref_value("web_acl", "arn"))
+            );
+            assert_eq!(changed_attributes, &vec!["web_acl_arn".to_string()]);
+        }
+        other => panic!("expected Update, got {other:?}"),
+    }
+    assert!(
+        delete_blockers_for(&plan, &web_acl_id).contains("distribution"),
+        "web_acl delete must wait for distribution cascade update"
     );
-    vpc_attrs.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-    );
-    current_states.insert(
-        vpc_id.clone(),
-        State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
-    );
+}
 
-    let mut subnet_attrs = HashMap::new();
-    subnet_attrs.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-    );
-    subnet_attrs.insert(
-        "tags".to_string(),
-        Value::Concrete(ConcreteValue::String("old-tag".to_string())),
-    );
-    subnet_attrs.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
-    );
-    current_states.insert(
-        subnet_id.clone(),
-        State::existing(subnet_id.clone(), subnet_attrs).with_identifier("subnet-123"),
-    );
+#[test]
+fn cascade_dependent_updates_does_not_duplicate_when_existing_update() {
+    let registry = base_registry();
+    let web_acl_id = web_acl_id();
+    let distribution_id = distribution_id();
+    let current_states = HashMap::from([
+        (web_acl_id.clone(), current_web_acl_state()),
+        (
+            distribution_id.clone(),
+            current_distribution_state(ref_value("web_acl", "arn"), "old-comment"),
+        ),
+    ]);
 
-    // Schema: vpc_id is create-only, tags is NOT create-only
-    let subnet_schema = ResourceSchema::new("ec2.Subnet")
-        .attribute(
-            AttributeSchema::new("vpc_id", AttributeType::string())
-                .required()
-                .create_only(),
-        )
-        .attribute(AttributeSchema::new("tags", AttributeType::string()))
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).required());
-
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert("", subnet_schema);
-
-    // Build a plan:
-    // - VPC Replace (create_before_destroy) due to cidr_block change
-    // - Subnet Update due to tags change (non-create-only, from differ)
     let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: vpc_id.clone(),
-        from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: (vpc.clone().with_binding("vpc")),
-        directives: Directives {
-            create_before_destroy: true,
-            ..Default::default()
-        },
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
+    seed_web_acl_replace(&mut plan, &current_states);
     plan.add(Effect::Update {
-        id: subnet_id.clone(),
-        from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
-        to: (subnet.clone().with_binding("subnet")),
-        changed_attributes: vec!["tags".to_string()],
+        id: distribution_id.clone(),
+        from: UpdateBase::Existing(Box::new(
+            current_states.get(&distribution_id).unwrap().clone(),
+        )),
+        to: distribution(),
+        changed_attributes: vec!["comment".to_string()],
     });
-
-    // Apply cascade
     cascade_dependent_updates(
         &mut plan,
-        &unresolved_resources,
-        &crate::resource::into_plan_input_map(current_states.clone()),
-        &schemas,
+        &[web_acl(), distribution()],
+        &crate::resource::into_plan_input_map(current_states),
+        &registry,
     );
 
-    // After cascading, the subnet should be UPGRADED from Update to Replace,
-    // because vpc_id is a create-only attribute referencing the replaced VPC.
-    let effects = plan.effects();
-
-    let subnet_effect = effects.iter().find(|e| *e.resource_id() == subnet_id);
-    assert!(subnet_effect.is_some(), "Subnet effect should exist");
-
-    match subnet_effect.unwrap() {
-        Effect::Replace {
-            changed_create_only,
-            ..
+    let updates = updates_for(&plan, &distribution_id);
+    assert_eq!(updates.len(), 1, "existing Update should be reused");
+    match updates[0] {
+        Effect::Update {
+            changed_attributes, ..
         } => {
-            assert!(
-                changed_create_only.contains("vpc_id"),
-                "Subnet Replace should list vpc_id as changed create-only (cascade from VPC replace), got: {:?}",
-                changed_create_only
-            );
+            assert_eq!(changed_attributes, &vec!["comment".to_string()]);
         }
-        other => {
-            panic!(
-                "Expected subnet to be upgraded to Replace, but got {:?}",
-                other.kind()
-            );
-        }
+        other => panic!("expected Update, got {other:?}"),
     }
-}
-
-#[test]
-fn cascade_prevent_destroy_blocks_promotion_to_replace() {
-    // When resource A is being replaced and resource B depends on A
-    // via a create-only attribute, B would normally be promoted to Replace.
-    // But if B has prevent_destroy: true, it should generate a PlanError instead.
-
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
-
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
-
-    let vpc = Resource::new("ec2.Vpc", "my-vpc")
-        .with_binding("vpc")
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
-        );
-
-    let mut subnet = Resource::new("ec2.Subnet", "my-subnet")
-        .with_binding("subnet")
-        .with_attribute(
-            "vpc_id",
-            Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-        )
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
-        );
-    subnet.directives.prevent_destroy = true;
-
-    let unresolved_resources = vec![vpc.clone(), subnet.clone()];
-
-    let mut current_states = HashMap::new();
-    let mut vpc_attrs = HashMap::new();
-    vpc_attrs.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
-    );
-    vpc_attrs.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-    );
-    current_states.insert(
-        vpc_id.clone(),
-        State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
-    );
-
-    let mut subnet_attrs = HashMap::new();
-    subnet_attrs.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-    );
-    subnet_attrs.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
-    );
-    current_states.insert(
-        subnet_id.clone(),
-        State::existing(subnet_id.clone(), subnet_attrs).with_identifier("subnet-123"),
-    );
-
-    // Schema: vpc_id is create-only on ec2.subnet
-    let subnet_schema = ResourceSchema::new("ec2.Subnet")
-        .attribute(
-            AttributeSchema::new("vpc_id", AttributeType::string())
-                .required()
-                .create_only(),
-        )
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).required());
-
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert("", subnet_schema);
-
-    // Build a plan with Replace for VPC (create_before_destroy)
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: vpc_id.clone(),
-        from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: (vpc.clone().with_binding("vpc")),
-        directives: Directives {
-            create_before_destroy: true,
-            ..Default::default()
-        },
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-
-    // Apply cascade
-    cascade_dependent_updates(
-        &mut plan,
-        &unresolved_resources,
-        &crate::resource::into_plan_input_map(current_states.clone()),
-        &schemas,
-    );
-
-    // The subnet should NOT be promoted to Replace because it has prevent_destroy.
-    // Instead, a PlanError should be generated.
     assert!(
-        plan.has_errors(),
-        "Expected PlanError for subnet with prevent_destroy, but got no errors"
-    );
-
-    let errors = plan.errors();
-    assert_eq!(errors.len(), 1);
-    assert_eq!(errors[0].resource_id, subnet_id);
-    assert!(
-        errors[0].message.contains("prevent_destroy"),
-        "Error message should mention prevent_destroy, got: {}",
-        errors[0].message
-    );
-
-    // The subnet should NOT appear as a Replace effect in the plan
-    let subnet_effects: Vec<_> = plan
-        .effects()
-        .iter()
-        .filter(|e| *e.resource_id() == subnet_id)
-        .collect();
-    assert!(
-        subnet_effects.is_empty(),
-        "Subnet should not have any effect when prevent_destroy blocks promotion"
+        delete_blockers_for(&plan, &web_acl_id).contains("distribution"),
+        "web_acl delete must wait for the existing distribution update"
     );
 }
 
 #[test]
-fn cascade_prevent_destroy_blocks_merge_upgrade_to_replace() {
-    // When resource B already has an Update effect in the plan and would be
-    // upgraded to Replace via cascade (merge path), prevent_destroy should block it.
-
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
-
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
-
-    let vpc = Resource::new("ec2.Vpc", "my-vpc")
-        .with_binding("vpc")
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
-        );
-
-    let mut subnet = Resource::new("ec2.Subnet", "my-subnet")
-        .with_binding("subnet")
-        .with_attribute(
-            "vpc_id",
-            Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-        )
-        .with_attribute(
-            "tags",
-            Value::Concrete(ConcreteValue::String("new-tag".to_string())),
-        )
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
-        );
-    subnet.directives.prevent_destroy = true;
-
-    let unresolved_resources = vec![vpc.clone(), subnet.clone()];
-
-    let mut current_states = HashMap::new();
-    let mut vpc_attrs = HashMap::new();
-    vpc_attrs.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+fn cascade_dependent_updates_promotes_create_only_dependent_to_replace() {
+    let mut registry = base_registry();
+    registry.insert(
+        "",
+        ResourceSchema::new("cdn.Distribution")
+            .attribute(AttributeSchema::new("web_acl_arn", AttributeType::string()).create_only())
+            .attribute(AttributeSchema::new("comment", AttributeType::string()))
+            .attribute(AttributeSchema::new("domain_name", AttributeType::string())),
     );
-    vpc_attrs.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-    );
-    current_states.insert(
-        vpc_id.clone(),
-        State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
-    );
+    let web_acl_id = web_acl_id();
+    let distribution_id = distribution_id();
+    let current_states = HashMap::from([
+        (web_acl_id.clone(), current_web_acl_state()),
+        (
+            distribution_id.clone(),
+            current_distribution_state(ref_value("web_acl", "arn"), "unchanged"),
+        ),
+    ]);
 
-    let mut subnet_attrs = HashMap::new();
-    subnet_attrs.insert(
-        "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-old".to_string())),
-    );
-    subnet_attrs.insert(
-        "tags".to_string(),
-        Value::Concrete(ConcreteValue::String("old-tag".to_string())),
-    );
-    subnet_attrs.insert(
-        "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
-    );
-    current_states.insert(
-        subnet_id.clone(),
-        State::existing(subnet_id.clone(), subnet_attrs).with_identifier("subnet-123"),
-    );
+    let plan = cascade_plan_for(&[web_acl(), distribution()], current_states, &registry);
 
-    // Schema: vpc_id is create-only, tags is NOT
-    let subnet_schema = ResourceSchema::new("ec2.Subnet")
-        .attribute(
-            AttributeSchema::new("vpc_id", AttributeType::string())
-                .required()
-                .create_only(),
-        )
-        .attribute(AttributeSchema::new("tags", AttributeType::string()))
-        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).required());
-
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert("", subnet_schema);
-
-    // Build a plan with Replace for VPC and Update for subnet (tags changed)
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: vpc_id.clone(),
-        from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: (vpc.clone().with_binding("vpc")),
-        directives: Directives {
-            create_before_destroy: true,
-            ..Default::default()
-        },
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["cidr_block".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-    plan.add(Effect::Update {
-        id: subnet_id.clone(),
-        from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
-        to: (subnet.clone().with_binding("subnet")),
-        changed_attributes: vec!["tags".to_string()],
-    });
-
-    // Apply cascade
-    cascade_dependent_updates(
-        &mut plan,
-        &unresolved_resources,
-        &crate::resource::into_plan_input_map(current_states.clone()),
-        &schemas,
-    );
-
-    // The subnet should NOT be upgraded to Replace because it has prevent_destroy.
-    // A PlanError should be generated instead.
+    assert_eq!(updates_for(&plan, &distribution_id).len(), 0);
+    assert_eq!(decomposed_replace_count(&plan, &distribution_id), (1, 1));
+    let metadata = replace_metadata_for(&plan, &distribution_id);
+    assert!(metadata.changed_create_only.contains("web_acl_arn"));
     assert!(
-        plan.has_errors(),
-        "Expected PlanError for subnet with prevent_destroy on merge upgrade"
+        metadata
+            .cascade_ref_hints
+            .contains(&("web_acl_arn".to_string(), "web_acl.arn".to_string()))
+    );
+}
+
+#[test]
+fn cascade_dependent_updates_transitive() {
+    let registry = base_registry();
+    let web_acl_id = web_acl_id();
+    let distribution_id = distribution_id();
+    let cache_id = ResourceId::new("cdn.CachePolicy", "main");
+    let cache = Resource::new("cdn.CachePolicy", "main")
+        .with_binding("cache_policy")
+        .with_attribute(
+            "distribution_domain",
+            ref_value("distribution", "domain_name"),
+        );
+    let current_states = HashMap::from([
+        (web_acl_id.clone(), current_web_acl_state()),
+        (
+            distribution_id.clone(),
+            current_distribution_state(ref_value("web_acl", "arn"), "unchanged"),
+        ),
+        (
+            cache_id.clone(),
+            state(
+                cache_id.clone(),
+                [(
+                    "distribution_domain",
+                    ref_value("distribution", "domain_name"),
+                )],
+            ),
+        ),
+    ]);
+
+    let plan = cascade_plan_for(
+        &[web_acl(), distribution(), cache],
+        current_states,
+        &registry,
     );
 
-    let errors = plan.errors();
-    assert_eq!(errors.len(), 1);
-    assert_eq!(errors[0].resource_id, subnet_id);
-    assert!(
-        errors[0].message.contains("prevent_destroy"),
-        "Error message should mention prevent_destroy, got: {}",
-        errors[0].message
+    assert_eq!(updates_for(&plan, &distribution_id).len(), 1);
+    assert_eq!(
+        updates_for(&plan, &cache_id).len(),
+        0,
+        "updating B for A replacement must not cascade to C when B is not replaced"
     );
+    assert!(delete_blockers_for(&plan, &web_acl_id).contains("distribution"));
+}
+
+#[test]
+fn cascade_dependent_updates_anonymous_resource() {
+    let registry = base_registry();
+    let web_acl_id = web_acl_id();
+    let distribution_id = distribution_id();
+    let anonymous_distribution = Resource::new("cdn.Distribution", "main")
+        .with_attribute("web_acl_arn", ref_value("web_acl", "arn"))
+        .with_attribute("comment", str_value("unchanged"))
+        .with_attribute("domain_name", str_value("example.cloudfront.net"));
+    let current_states = HashMap::from([
+        (web_acl_id.clone(), current_web_acl_state()),
+        (
+            distribution_id.clone(),
+            current_distribution_state(ref_value("web_acl", "arn"), "unchanged"),
+        ),
+    ]);
+
+    let plan = cascade_plan_for(
+        &[web_acl(), anonymous_distribution],
+        current_states,
+        &registry,
+    );
+
+    assert_eq!(updates_for(&plan, &distribution_id).len(), 1);
+    assert!(
+        delete_blockers_for(&plan, &web_acl_id).contains("cdn.Distribution:main"),
+        "anonymous dependent should use <resource_type>:<name> as delete blocker key"
+    );
+}
+
+#[test]
+fn cascade_dependent_updates_prevent_destroy_blocks_promotion() {
+    let mut registry = base_registry();
+    registry.insert(
+        "",
+        ResourceSchema::new("cdn.Distribution")
+            .attribute(AttributeSchema::new("web_acl_arn", AttributeType::string()).create_only())
+            .attribute(AttributeSchema::new("comment", AttributeType::string()))
+            .attribute(AttributeSchema::new("domain_name", AttributeType::string())),
+    );
+    let web_acl_id = web_acl_id();
+    let distribution_id = distribution_id();
+    let mut protected_distribution = distribution();
+    protected_distribution.directives.prevent_destroy = true;
+    let current_states = HashMap::from([
+        (web_acl_id.clone(), current_web_acl_state()),
+        (
+            distribution_id.clone(),
+            current_distribution_state(ref_value("web_acl", "arn"), "unchanged"),
+        ),
+    ]);
+
+    let plan = cascade_plan_for(
+        &[web_acl(), protected_distribution],
+        current_states,
+        &registry,
+    );
+
+    assert!(plan.errors().iter().any(|error| {
+        error.resource_id == distribution_id && error.message.contains("prevent_destroy")
+    }));
+    assert_eq!(decomposed_replace_count(&plan, &distribution_id), (0, 0));
 }

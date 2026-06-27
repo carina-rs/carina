@@ -73,6 +73,10 @@ impl AppliedStates {
         self.states.insert(id, state);
     }
 
+    pub(crate) fn snapshot(&self) -> HashMap<ResourceId, State> {
+        self.states.clone()
+    }
+
     pub(crate) fn into_inner(self) -> HashMap<ResourceId, State> {
         self.states
     }

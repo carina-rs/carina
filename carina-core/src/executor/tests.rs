@@ -220,26 +220,13 @@ struct MockObserver {
     events: Mutex<Vec<String>>,
 }
 
-struct ProgressObserver {
-    events: MockObserver,
-    progress: Mutex<Vec<ProgressInfo>>,
-}
-
-fn format_execution_event(event: &ExecutionEvent<'_>) -> String {
+fn format_execution_event(event: &ExecutionEvent) -> String {
     match event {
         ExecutionEvent::Waiting {
             effect,
             pending_dependencies,
-        } => {
-            format!(
-                "waiting:{}:[{}]",
-                effect.resource_id(),
-                pending_dependencies.join(",")
-            )
-        }
-        ExecutionEvent::EffectStarted { effect } => {
-            format!("started:{}", effect.resource_id())
-        }
+        } => format!("waiting:{}:{pending_dependencies:?}", effect.resource_id()),
+        ExecutionEvent::EffectStarted { effect } => format!("started:{}", effect.resource_id()),
         ExecutionEvent::EffectSucceeded { effect, .. } => {
             format!("succeeded:{}", effect.resource_id())
         }
@@ -259,12 +246,6 @@ fn format_execution_event(event: &ExecutionEvent<'_>) -> String {
                 observation.target_id()
             )
         }
-        ExecutionEvent::CascadeUpdateSucceeded { id } => {
-            format!("cascade_ok:{}", id)
-        }
-        ExecutionEvent::CascadeUpdateFailed { id, error } => {
-            format!("cascade_fail:{}:{}", id, error)
-        }
         ExecutionEvent::RenameSucceeded { id, from, to } => {
             format!("rename_ok:{}:{}:{}", id, from, to)
         }
@@ -272,9 +253,7 @@ fn format_execution_event(event: &ExecutionEvent<'_>) -> String {
             format!("rename_fail:{}:{}", id, error)
         }
         ExecutionEvent::RefreshStarted => "refresh_started".to_string(),
-        ExecutionEvent::RefreshSucceeded { id } => {
-            format!("refresh_ok:{}", id)
-        }
+        ExecutionEvent::RefreshSucceeded { id } => format!("refresh_ok:{}", id),
         ExecutionEvent::RefreshFailed { id, error } => {
             format!("refresh_fail:{}:{}", id, error)
         }
@@ -299,47 +278,6 @@ impl ExecutionObserver for MockObserver {
             .lock()
             .unwrap()
             .push(format_execution_event(event));
-    }
-}
-
-impl ProgressObserver {
-    fn new() -> Self {
-        Self {
-            events: MockObserver::new(),
-            progress: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn events(&self) -> Vec<String> {
-        self.events.events()
-    }
-
-    fn progress(&self) -> Vec<ProgressInfo> {
-        self.progress.lock().unwrap().clone()
-    }
-}
-
-impl ExecutionObserver for ProgressObserver {
-    fn on_event(&self, event: &ExecutionEvent) {
-        self.events.on_event(event);
-        match event {
-            ExecutionEvent::EffectSucceeded { progress, .. }
-            | ExecutionEvent::EffectPartiallySucceeded { progress, .. }
-            | ExecutionEvent::EffectFailed { progress, .. }
-            | ExecutionEvent::EffectSkipped { progress, .. } => {
-                self.progress.lock().unwrap().push(*progress);
-            }
-            ExecutionEvent::Waiting { .. }
-            | ExecutionEvent::EffectStarted { .. }
-            | ExecutionEvent::WaitPolling { .. }
-            | ExecutionEvent::CascadeUpdateSucceeded { .. }
-            | ExecutionEvent::CascadeUpdateFailed { .. }
-            | ExecutionEvent::RenameSucceeded { .. }
-            | ExecutionEvent::RenameFailed { .. }
-            | ExecutionEvent::RefreshStarted
-            | ExecutionEvent::RefreshSucceeded { .. }
-            | ExecutionEvent::RefreshFailed { .. } => {}
-        }
     }
 }
 
@@ -789,85 +727,6 @@ fn create_independent_create_plan<const N: usize>(names: [&str; N]) -> Plan {
     plan
 }
 
-fn create_interdependent_replace_plan() -> Plan {
-    let a_id = ResourceId::new("test", "a");
-    let b_id = ResourceId::new("test", "b");
-
-    let a_from = State::existing(a_id.clone(), HashMap::new()).with_identifier("a-old");
-    let mut a_to = Resource::new("test", "a");
-    a_to.binding = Some("a".to_string());
-
-    let b_from = State::existing(b_id.clone(), HashMap::new()).with_identifier("b-old");
-    let mut b_to = Resource::new("test", "b");
-    b_to.binding = Some("b".to_string());
-    b_to.dependency_bindings = std::collections::BTreeSet::from(["a".to_string()]);
-
-    let directives = Directives {
-        create_before_destroy: true,
-        ..Default::default()
-    };
-
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: a_id,
-        from: Box::new(a_from),
-        to: a_to,
-        directives: directives.clone(),
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-    plan.add(Effect::Replace {
-        id: b_id,
-        from: Box::new(b_from),
-        to: b_to,
-        directives,
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-    plan
-}
-
-fn create_interdependent_replace_plan_with_renames<const N: usize>(names: [&str; N]) -> Plan {
-    let directives = Directives {
-        create_before_destroy: true,
-        ..Default::default()
-    };
-    let mut plan = Plan::new();
-    for (idx, name) in names.iter().enumerate() {
-        let id = ResourceId::new("test", *name);
-        let from =
-            State::existing(id.clone(), HashMap::new()).with_identifier(format!("{name}-old"));
-        let mut to = Resource::new("test", *name);
-        to.binding = Some((*name).to_string());
-        if idx > 0 {
-            to.dependency_bindings = std::collections::BTreeSet::from([names[idx - 1].to_string()]);
-        }
-        plan.add(Effect::Replace {
-            id,
-            from: Box::new(from),
-            to,
-            directives: directives.clone(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
-                .unwrap(),
-            cascading_updates: vec![],
-            temporary_name: Some(crate::effect::TemporaryName {
-                attribute: "name".to_string(),
-                original_value: format!("{name}-final"),
-                temporary_value: format!("{name}-temp"),
-                can_rename: true,
-            }),
-            cascade_ref_hints: vec![],
-        });
-    }
-    plan
-}
-
 struct DelayedCountingProvider {
     default_delay: std::time::Duration,
     delays: HashMap<String, std::time::Duration>,
@@ -889,12 +748,6 @@ impl DelayedCountingProvider {
 
     fn with_delay(mut self, name: &str, delay: std::time::Duration) -> Self {
         self.delays.insert(name.to_string(), delay);
-        self
-    }
-
-    fn with_cancel_after_create(mut self, name: &str, cancel: CancellationToken) -> Self {
-        self.cancel_after_create = Some(name.to_string());
-        self.cancel = Some(cancel);
         self
     }
 
@@ -1553,97 +1406,6 @@ async fn execute_plan_cancelled_while_effect_in_flight_records_that_effect() {
 }
 
 #[tokio::test]
-async fn execute_plan_phased_cancel_during_phase4_preserves_unprocessed_cbd_creates() {
-    let provider = DelayedCountingProvider::new(std::time::Duration::ZERO);
-    let observer = CancelsAfterSuccesses::new(2);
-    let cancel = observer.token();
-    let plan = create_interdependent_replace_plan_with_renames(["a", "b", "c", "d"]);
-    assert!(has_interdependent_replaces(plan.effects()));
-    let input = ExecutionInput {
-        plan: &plan,
-        unresolved_resources: &HashMap::new(),
-        compositions: &[],
-        bindings: ResolvedBindings::default(),
-        current_states: HashMap::new(),
-        normalizer: &NoopNormalizer,
-        provider_configs: &[],
-        factories: &[],
-        schemas: &TEST_SCHEMAS,
-        parallelism: NonZeroUsize::new(2).unwrap(),
-    };
-
-    let outcome = execute_plan(&provider, input, &observer, cancel).await;
-
-    let result = match outcome {
-        ExecutionOutcome::Cancelled(result) => result,
-        ExecutionOutcome::Completed(_) => panic!("phase-4 cancel returned Completed"),
-    };
-    assert_eq!(result.success_count, 4);
-    assert_eq!(result.applied_states.len(), 4);
-    for name in ["a", "b"] {
-        let state = result
-            .applied_states
-            .get(&ResourceId::new("test", name))
-            .expect("finalized resource should be recorded");
-        assert_eq!(
-            state.attributes.get("finalized"),
-            Some(&Value::Concrete(ConcreteValue::Bool(true)))
-        );
-    }
-    for name in ["c", "d"] {
-        let state = result
-            .applied_states
-            .get(&ResourceId::new("test", name))
-            .expect("unprocessed CBD create state should be preserved");
-        assert_eq!(
-            state.attributes.get("finalized"),
-            None,
-            "unprocessed resources must keep Phase-2 create state, not finalize state"
-        );
-    }
-}
-
-#[tokio::test]
-async fn execute_plan_phased_cancelled_between_phases_keeps_completed_resources_in_state() {
-    let cancel = CancellationToken::new();
-    let provider = DelayedCountingProvider::new(std::time::Duration::from_millis(1))
-        .with_cancel_after_create("a", cancel.clone());
-    let observer = MockObserver::new();
-    let plan = create_interdependent_replace_plan();
-    assert!(has_interdependent_replaces(plan.effects()));
-    let input = ExecutionInput {
-        plan: &plan,
-        unresolved_resources: &HashMap::new(),
-        compositions: &[],
-        bindings: ResolvedBindings::default(),
-        current_states: HashMap::new(),
-        normalizer: &NoopNormalizer,
-        provider_configs: &[],
-        factories: &[],
-        schemas: &TEST_SCHEMAS,
-        parallelism: NonZeroUsize::new(2).unwrap(),
-    };
-
-    let outcome = execute_plan(&provider, input, &observer, cancel).await;
-
-    let result = match outcome {
-        ExecutionOutcome::Cancelled(result) => result,
-        ExecutionOutcome::Completed(_) => panic!("phased cancel returned Completed"),
-    };
-    assert!(
-        result
-            .applied_states
-            .contains_key(&ResourceId::new("test", "a"))
-    );
-    assert!(
-        !provider
-            .started_names()
-            .iter()
-            .any(|name| name.starts_with("delete:"))
-    );
-}
-
-#[tokio::test]
 async fn test_simple_create() {
     let provider = MockProvider::new();
     let resource = make_resource("a", &[]);
@@ -1866,7 +1628,7 @@ async fn test_apply_reapplies_enum_alias_stage_update_path() {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
         id: rid.clone(),
-        from: Box::new(from_state),
+        from: crate::effect::UpdateBase::Existing(Box::new(from_state)),
         to: to_resource,
         changed_attributes: vec!["ip_protocol".to_string()],
     });
@@ -1983,7 +1745,7 @@ async fn test_apply_renormalizes_update_path() {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
         id: rid.clone(),
-        from: Box::new(from_state),
+        from: crate::effect::UpdateBase::Existing(Box::new(from_state)),
         to: to_resource,
         changed_attributes: vec!["marker".to_string()],
     });
@@ -2070,7 +1832,7 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
         id: rid.clone(),
-        from: Box::new(from_state),
+        from: crate::effect::UpdateBase::Existing(Box::new(from_state)),
         to: to_resource,
         changed_attributes: vec!["tags".to_string()],
     });
@@ -2180,7 +1942,7 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
         id: rid.clone(),
-        from: Box::new(from_state),
+        from: crate::effect::UpdateBase::Existing(Box::new(from_state)),
         to: to_resource,
         changed_attributes: vec!["description".to_string()],
     });
@@ -2240,7 +2002,7 @@ async fn test_apply_effective_changed_skips_internal_and_write_only_attributes()
     let mut plan = Plan::new();
     plan.add(Effect::Update {
         id: rid.clone(),
-        from: Box::new(from_state),
+        from: crate::effect::UpdateBase::Existing(Box::new(from_state)),
         to: to_resource,
         changed_attributes: vec!["description".to_string()],
     });
@@ -2301,7 +2063,7 @@ async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
         id: rid.clone(),
-        from: Box::new(from_state),
+        from: crate::effect::UpdateBase::Existing(Box::new(from_state)),
         to: to_resource,
         changed_attributes: vec![],
     });
@@ -2367,7 +2129,7 @@ async fn test_apply_effective_changed_skips_secret_shape_divergence() {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
         id: rid.clone(),
-        from: Box::new(from_state),
+        from: crate::effect::UpdateBase::Existing(Box::new(from_state)),
         to: to_resource,
         changed_attributes: vec![],
     });
@@ -2630,6 +2392,7 @@ async fn test_simple_delete() {
         binding: None,
         dependencies: HashSet::new(),
         explicit_dependencies: std::collections::HashSet::new(),
+        blocked_by_updates: std::collections::HashSet::new(),
     });
 
     provider.push_delete(Ok(()));
@@ -2698,58 +2461,6 @@ async fn test_failed_effect_propagates_to_dependent() {
 }
 
 #[tokio::test]
-async fn test_cbd_creates_before_deletes() {
-    // CBD Replace: create should happen before delete
-    let provider = MockProvider::new();
-    let rid = ResourceId::new("test", "a");
-    let from = State::existing(rid.clone(), HashMap::new()).with_identifier("old-id");
-    let to = Resource::new("test", "a");
-
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: rid.clone(),
-        from: Box::new(from),
-        to,
-        directives: Directives {
-            create_before_destroy: true,
-            ..Default::default()
-        },
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-
-    provider.push_create(Ok(ok_state(&rid)));
-    provider.push_delete(Ok(()));
-
-    let input = ExecutionInput {
-        plan: &plan,
-        unresolved_resources: &HashMap::new(),
-        compositions: &[],
-        bindings: ResolvedBindings::default(),
-        current_states: HashMap::new(),
-        normalizer: &NoopNormalizer,
-        provider_configs: &[],
-        factories: &[],
-        schemas: &TEST_SCHEMAS,
-        parallelism: crate::executor::TEST_UNCAPPED,
-    };
-
-    let observer = MockObserver::new();
-    let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
-
-    assert_eq!(result.success_count, 1);
-    assert_eq!(result.failure_count, 0);
-
-    let calls = provider.calls();
-    assert_eq!(calls[0].0, "create");
-    assert_eq!(calls[1].0, "delete");
-}
-
-#[tokio::test]
 async fn test_cbd_cascade_update_patch_uses_plan_time_comparison_semantics() {
     let provider = MockProvider::new();
     let replace_id = ResourceId::with_provider("test", "replace", "replace", None);
@@ -2777,23 +2488,24 @@ async fn test_cbd_cascade_update_patch_uses_plan_time_comparison_semantics() {
     cascade_to.set_attr("size", Value::Concrete(ConcreteValue::Float(1.0)));
 
     let mut plan = Plan::new();
-    plan.add(Effect::Replace {
+    plan.add(Effect::Create(replace_to));
+    plan.add(Effect::Update {
+        id: cascade_id.clone(),
+        from: crate::effect::UpdateBase::Existing(Box::new(cascade_from)),
+        to: cascade_to,
+        changed_attributes: vec!["description".to_string()],
+    });
+    plan.add(Effect::Delete {
         id: replace_id.clone(),
-        from: Box::new(replace_from),
-        to: replace_to,
+        identifier: replace_from.identifier.clone().unwrap_or_default(),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
         },
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".to_string()])
-            .unwrap(),
-        cascading_updates: vec![crate::effect::CascadingUpdate {
-            id: cascade_id.clone(),
-            from: Box::new(cascade_from),
-            to: cascade_to,
-        }],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
+        binding: Some("replace".to_string()),
+        dependencies: HashSet::new(),
+        explicit_dependencies: HashSet::new(),
+        blocked_by_updates: HashSet::from(["a".to_string()]),
     });
 
     provider.push_create(Ok(ok_state(&replace_id)));
@@ -2820,7 +2532,7 @@ async fn test_cbd_cascade_update_patch_uses_plan_time_comparison_semantics() {
     let observer = MockObserver::new();
     let result =
         completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
-    assert_eq!(result.success_count, 0);
+    assert_eq!(result.success_count, 2);
     assert_eq!(result.partial_count, 1);
     assert_eq!(result.partial_diagnostics.len(), 1);
     assert_eq!(result.partial_diagnostics[0].0, cascade_id);
@@ -2833,376 +2545,6 @@ async fn test_cbd_cascade_update_patch_uses_plan_time_comparison_semantics() {
     assert_eq!(reqs.len(), 1);
     let patched_keys: Vec<&str> = reqs[0].patch.ops.iter().map(|op| op.key.as_str()).collect();
     assert_eq!(patched_keys, vec!["description"]);
-}
-
-#[tokio::test]
-async fn test_cbd_rename_partial_create_partial_counts_once() {
-    let provider = MockProvider::new();
-    let id = ResourceId::with_provider("test", "replace", "replace", None);
-    let from = State::existing(id.clone(), HashMap::new()).with_identifier("replace-old");
-    let mut to = Resource::with_provider("test", "replace", "replace", None);
-    to.binding = Some("replace".to_string());
-
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: id.clone(),
-        from: Box::new(from),
-        to,
-        directives: Directives {
-            create_before_destroy: true,
-            ..Default::default()
-        },
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: Some(crate::effect::TemporaryName {
-            attribute: "name".to_string(),
-            original_value: "replace-final".to_string(),
-            temporary_value: "replace-temp".to_string(),
-            can_rename: true,
-        }),
-        cascade_ref_hints: vec![],
-    });
-
-    provider.push_create_outcome(Ok(crate::provider::CreateOutcome::partial_success(
-        ok_state(&id),
-        "create read incomplete".to_string(),
-        vec!["create_attr".to_string()],
-    )));
-    provider.push_delete(Ok(()));
-    provider.push_update_outcome(Ok(crate::provider::UpdateOutcome::partial_success(
-        ok_state(&id),
-        "rename read incomplete".to_string(),
-        vec!["rename_attr".to_string()],
-    )));
-
-    let input = ExecutionInput {
-        plan: &plan,
-        unresolved_resources: &HashMap::new(),
-        compositions: &[],
-        bindings: ResolvedBindings::default(),
-        current_states: HashMap::new(),
-        normalizer: &NoopNormalizer,
-        provider_configs: &[],
-        factories: &[],
-        schemas: &TEST_SCHEMAS,
-        parallelism: crate::executor::TEST_UNCAPPED,
-    };
-
-    let observer = MockObserver::new();
-    let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
-
-    assert_eq!(provider.calls()[0].0, "create");
-    assert_eq!(provider.calls()[1].0, "delete");
-    assert_eq!(provider.calls()[2].0, "update");
-    assert_eq!(result.success_count, 0);
-    assert_eq!(result.failure_count, 0);
-    assert_eq!(result.partial_count, 1);
-    assert_eq!(result.partial_diagnostics.len(), 1);
-    assert_eq!(result.partial_diagnostics[0].0, id);
-    assert_eq!(
-        result.partial_diagnostics[0].1.reason(),
-        "rename read incomplete"
-    );
-    let marker = result.applied_states[&id]
-        .partial_read
-        .as_ref()
-        .expect("partial marker should be written back");
-    assert_eq!(marker.detail, "rename read incomplete");
-    assert!(marker.missing_attributes.contains("rename_attr"));
-    assert!(marker.missing_attributes.contains("create_attr"));
-    assert_eq!(marker.missing_attributes.len(), 2);
-}
-
-#[tokio::test]
-async fn test_cbd_rename_success_create_partial_keeps_create_marker() {
-    let provider = MockProvider::new();
-    let id = ResourceId::with_provider("test", "replace", "replace", None);
-    let from = State::existing(id.clone(), HashMap::new()).with_identifier("replace-old");
-    let mut to = Resource::with_provider("test", "replace", "replace", None);
-    to.binding = Some("replace".to_string());
-
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: id.clone(),
-        from: Box::new(from),
-        to,
-        directives: Directives {
-            create_before_destroy: true,
-            ..Default::default()
-        },
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: Some(crate::effect::TemporaryName {
-            attribute: "name".to_string(),
-            original_value: "replace-final".to_string(),
-            temporary_value: "replace-temp".to_string(),
-            can_rename: true,
-        }),
-        cascade_ref_hints: vec![],
-    });
-
-    provider.push_create_outcome(Ok(crate::provider::CreateOutcome::partial_success(
-        ok_state(&id),
-        "create read incomplete".to_string(),
-        vec!["create_attr".to_string()],
-    )));
-    provider.push_delete(Ok(()));
-    provider.push_update(Ok(ok_state(&id)));
-
-    let input = ExecutionInput {
-        plan: &plan,
-        unresolved_resources: &HashMap::new(),
-        compositions: &[],
-        bindings: ResolvedBindings::default(),
-        current_states: HashMap::new(),
-        normalizer: &NoopNormalizer,
-        provider_configs: &[],
-        factories: &[],
-        schemas: &TEST_SCHEMAS,
-        parallelism: crate::executor::TEST_UNCAPPED,
-    };
-
-    let observer = MockObserver::new();
-    let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
-
-    assert_eq!(result.success_count, 0);
-    assert_eq!(result.failure_count, 0);
-    assert_eq!(result.partial_count, 1);
-    assert_eq!(result.partial_diagnostics.len(), 1);
-    assert_eq!(result.partial_diagnostics[0].0, id);
-    assert_eq!(
-        result.partial_diagnostics[0].1.reason(),
-        "create read incomplete"
-    );
-    let marker = result.applied_states[&id]
-        .partial_read
-        .as_ref()
-        .expect("partial marker should be written back");
-    assert_eq!(marker.detail, "create read incomplete");
-    assert!(marker.missing_attributes.contains("create_attr"));
-    assert_eq!(marker.missing_attributes.len(), 1);
-}
-
-#[tokio::test]
-async fn test_dbd_deletes_before_creates() {
-    // Non-CBD Replace: delete should happen before create
-    let provider = MockProvider::new();
-    let rid = ResourceId::new("test", "a");
-    let from = State::existing(rid.clone(), HashMap::new()).with_identifier("old-id");
-    let to = Resource::new("test", "a");
-
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: rid.clone(),
-        from: Box::new(from),
-        to,
-        directives: Directives::default(),
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-
-    provider.push_delete(Ok(()));
-    provider.push_create(Ok(ok_state(&rid)));
-
-    let input = ExecutionInput {
-        plan: &plan,
-        unresolved_resources: &HashMap::new(),
-        compositions: &[],
-        bindings: ResolvedBindings::default(),
-        current_states: HashMap::new(),
-        normalizer: &NoopNormalizer,
-        provider_configs: &[],
-        factories: &[],
-        schemas: &TEST_SCHEMAS,
-        parallelism: crate::executor::TEST_UNCAPPED,
-    };
-
-    let observer = MockObserver::new();
-    let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
-
-    assert_eq!(result.success_count, 1);
-    assert_eq!(result.failure_count, 0);
-
-    let calls = provider.calls();
-    assert_eq!(calls[0].0, "delete");
-    assert_eq!(calls[1].0, "create");
-}
-
-#[tokio::test]
-async fn test_phased_cbd_creates_in_forward_order_deletes_in_reverse() {
-    // Two interdependent replaces: vpc (parent) and subnet (depends on vpc)
-    // Both are CBD. Expected order:
-    //   Phase 2: create vpc, create subnet (forward)
-    //   Phase 3: delete subnet, delete vpc (reverse)
-    //   Phase 4: finalize (success events)
-    let provider = MockProvider::new();
-    let vpc_id = ResourceId::new("test", "vpc");
-    let subnet_id = ResourceId::new("test", "subnet");
-
-    let vpc_from = State::existing(vpc_id.clone(), HashMap::new()).with_identifier("vpc-old");
-    let mut vpc_to = Resource::new("test", "vpc");
-    vpc_to.binding = Some("vpc".to_string());
-
-    let subnet_from =
-        State::existing(subnet_id.clone(), HashMap::new()).with_identifier("subnet-old");
-    let mut subnet_to = Resource::new("test", "subnet");
-    subnet_to.binding = Some("subnet".to_string());
-    subnet_to.dependency_bindings = std::collections::BTreeSet::from(["vpc".to_string()]);
-
-    let cbd_directives = Directives {
-        create_before_destroy: true,
-        ..Default::default()
-    };
-
-    let mut plan = Plan::new();
-    // Order in plan: vpc first, subnet second
-    plan.add(Effect::Replace {
-        id: vpc_id.clone(),
-        from: Box::new(vpc_from),
-        to: vpc_to,
-        directives: cbd_directives.clone(),
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-    plan.add(Effect::Replace {
-        id: subnet_id.clone(),
-        from: Box::new(subnet_from),
-        to: subnet_to,
-        directives: cbd_directives,
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-
-    // Phase 2: create vpc, create subnet
-    provider.push_create(Ok(ok_state(&vpc_id)));
-    provider.push_create(Ok(ok_state(&subnet_id)));
-    // Phase 3: delete subnet (reverse), delete vpc (reverse)
-    provider.push_delete(Ok(()));
-    provider.push_delete(Ok(()));
-
-    let input = ExecutionInput {
-        plan: &plan,
-        unresolved_resources: &HashMap::new(),
-        compositions: &[],
-        bindings: ResolvedBindings::default(),
-        current_states: HashMap::new(),
-        normalizer: &NoopNormalizer,
-        provider_configs: &[],
-        factories: &[],
-        schemas: &TEST_SCHEMAS,
-        parallelism: crate::executor::TEST_UNCAPPED,
-    };
-
-    let observer = MockObserver::new();
-    let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
-
-    assert_eq!(result.success_count, 2);
-    assert_eq!(result.failure_count, 0);
-
-    let calls = provider.calls();
-    // Phase 2: creates in forward order (vpc before subnet)
-    assert_eq!(calls[0], ("create".to_string(), vpc_id.to_string()));
-    assert_eq!(calls[1], ("create".to_string(), subnet_id.to_string()));
-    // Phase 3: deletes in reverse order (subnet before vpc)
-    assert_eq!(calls[2], ("delete".to_string(), subnet_id.to_string()));
-    assert_eq!(calls[3], ("delete".to_string(), vpc_id.to_string()));
-}
-
-#[tokio::test]
-async fn test_phased_noncbd_creates_after_deletes() {
-    // Two interdependent non-CBD replaces: vpc (parent) and subnet (depends on vpc)
-    // Expected order:
-    //   Phase 3: delete subnet, delete vpc (reverse dependency)
-    //   Phase 4: create vpc, create subnet (forward dependency)
-    let provider = MockProvider::new();
-    let vpc_id = ResourceId::new("test", "vpc");
-    let subnet_id = ResourceId::new("test", "subnet");
-
-    let vpc_from = State::existing(vpc_id.clone(), HashMap::new()).with_identifier("vpc-old");
-    let mut vpc_to = Resource::new("test", "vpc");
-    vpc_to.binding = Some("vpc".to_string());
-
-    let subnet_from =
-        State::existing(subnet_id.clone(), HashMap::new()).with_identifier("subnet-old");
-    let mut subnet_to = Resource::new("test", "subnet");
-    subnet_to.binding = Some("subnet".to_string());
-    subnet_to.dependency_bindings = std::collections::BTreeSet::from(["vpc".to_string()]);
-
-    let dbd_directives = Directives::default();
-
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: vpc_id.clone(),
-        from: Box::new(vpc_from),
-        to: vpc_to,
-        directives: dbd_directives.clone(),
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-    plan.add(Effect::Replace {
-        id: subnet_id.clone(),
-        from: Box::new(subnet_from),
-        to: subnet_to,
-        directives: dbd_directives,
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-
-    // Phase 3: delete subnet, delete vpc
-    provider.push_delete(Ok(()));
-    provider.push_delete(Ok(()));
-    // Phase 4: create vpc, create subnet
-    provider.push_create(Ok(ok_state(&vpc_id)));
-    provider.push_create(Ok(ok_state(&subnet_id)));
-
-    let input = ExecutionInput {
-        plan: &plan,
-        unresolved_resources: &HashMap::new(),
-        compositions: &[],
-        bindings: ResolvedBindings::default(),
-        current_states: HashMap::new(),
-        normalizer: &NoopNormalizer,
-        provider_configs: &[],
-        factories: &[],
-        schemas: &TEST_SCHEMAS,
-        parallelism: crate::executor::TEST_UNCAPPED,
-    };
-
-    let observer = MockObserver::new();
-    let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
-
-    assert_eq!(result.success_count, 2);
-    assert_eq!(result.failure_count, 0);
-
-    let calls = provider.calls();
-    // Phase 3: deletes in reverse dependency order
-    assert_eq!(calls[0], ("delete".to_string(), subnet_id.to_string()));
-    assert_eq!(calls[1], ("delete".to_string(), vpc_id.to_string()));
-    // Phase 4: creates in forward dependency order
-    assert_eq!(calls[2], ("create".to_string(), vpc_id.to_string()));
-    assert_eq!(calls[3], ("create".to_string(), subnet_id.to_string()));
 }
 
 #[tokio::test]
@@ -3826,7 +3168,7 @@ async fn run_tag_sweep(parallelism: NonZeroUsize) -> (std::time::Duration, usize
         current_states.insert(resource.id.clone(), from.clone());
         plan.add(Effect::Update {
             id: resource.id.clone(),
-            from: Box::new(from),
+            from: crate::effect::UpdateBase::Existing(Box::new(from)),
             to: resource.clone(),
             changed_attributes: vec!["tags".to_string()],
         });
@@ -3895,7 +3237,7 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
         current_states.insert(resource.id.clone(), from.clone());
         plan.add(Effect::Update {
             id: resource.id.clone(),
-            from: Box::new(from),
+            from: crate::effect::UpdateBase::Existing(Box::new(from)),
             to: resource.clone(),
             changed_attributes: vec!["tags".to_string()],
         });
@@ -4052,7 +3394,7 @@ async fn test_waiting_events_emitted_for_dependent_effects() {
         .find(|e| e.contains("test.c"))
         .expect("Expected a waiting event for resource C");
     assert!(
-        c_waiting.contains("[a]"),
+        c_waiting.contains("[\"a\"]"),
         "Waiting event should list 'a' as pending dependency, got: {}",
         c_waiting
     );
@@ -4077,6 +3419,7 @@ fn test_build_dependency_levels_respects_delete_dependencies() {
         binding: Some("vpc".to_string()),
         dependencies: HashSet::new(), // vpc has no deps
         explicit_dependencies: HashSet::new(),
+        blocked_by_updates: std::collections::HashSet::new(),
     });
     plan.add(Effect::Delete {
         id: ResourceId::new("ec2.Subnet", "my-subnet"),
@@ -4085,23 +3428,21 @@ fn test_build_dependency_levels_respects_delete_dependencies() {
         binding: Some("subnet".to_string()),
         dependencies: HashSet::from(["vpc".to_string()]), // subnet depends on vpc
         explicit_dependencies: HashSet::new(),
+        blocked_by_updates: std::collections::HashSet::new(),
     });
 
-    let levels = build_dependency_levels(plan.effects(), &HashMap::new(), &[]);
+    let deps = build_dependency_analysis(
+        plan.effects(),
+        &HashMap::new(),
+        &[],
+        ScheduleInputs::Destroy { aliases: &[] },
+    )
+    .into_deps_of();
 
-    // Find levels for each effect
-    let vpc_level = levels.iter().position(|group| group.contains(&0)).unwrap();
-    let subnet_level = levels.iter().position(|group| group.contains(&1)).unwrap();
-
-    // vpc delete (idx 0) must be at a HIGHER level than subnet delete (idx 1)
-    // because vpc must wait for subnet to be deleted first (reverse ordering)
     assert!(
-        vpc_level > subnet_level,
-        "vpc delete (level {}) must be at a higher level than subnet delete (level {}). \
-         Delete ordering must be reversed: children deleted before parents. levels: {:?}",
-        vpc_level,
-        subnet_level,
-        levels
+        deps[&0].contains(&1),
+        "vpc delete must depend on subnet delete in destroy ordering. deps: {:?}",
+        deps
     );
 }
 
@@ -4166,7 +3507,7 @@ async fn test_update_effect_binding_map_propagation() {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
         id: ra_id.clone(),
-        from: Box::new(from_state),
+        from: crate::effect::UpdateBase::Existing(Box::new(from_state)),
         to: to_resource,
         changed_attributes: vec!["some_attr".to_string()],
     });
@@ -4212,6 +3553,7 @@ fn test_dependency_analysis_respects_delete_dependencies() {
         binding: Some("vpc".to_string()),
         dependencies: HashSet::new(),
         explicit_dependencies: std::collections::HashSet::new(),
+        blocked_by_updates: std::collections::HashSet::new(),
     });
     plan.add(Effect::Delete {
         id: ResourceId::new("ec2.Subnet", "my-subnet"),
@@ -4220,11 +3562,16 @@ fn test_dependency_analysis_respects_delete_dependencies() {
         binding: Some("subnet".to_string()),
         dependencies: HashSet::from(["vpc".to_string()]),
         explicit_dependencies: std::collections::HashSet::new(),
+        blocked_by_updates: std::collections::HashSet::new(),
     });
 
-    let deps =
-        build_dependency_analysis(plan.effects(), &HashMap::new(), &[], ScheduleInputs::Apply)
-            .into_deps_of();
+    let deps = build_dependency_analysis(
+        plan.effects(),
+        &HashMap::new(),
+        &[],
+        ScheduleInputs::Destroy { aliases: &[] },
+    )
+    .into_deps_of();
 
     // vpc delete (idx 0) must depend on subnet delete (idx 1)
     // because subnet must be deleted before vpc (reverse dependency)
@@ -4419,205 +3766,6 @@ impl Provider for RecordingMockProvider {
     fn required_permissions(&self, _id: &ResourceId, _op: crate::effect::PlanOp) -> Vec<String> {
         Vec::new()
     }
-}
-
-/// Regression test: when a resource is deleted and a dependent resource is
-/// replaced (CBD), the delete must wait for the replace to complete.
-///
-/// Scenario (TGW attachment):
-///   - tgw_a: Delete (binding removed from .crn)
-///   - tgw_attachment: Replace (CBD) — from depends on tgw_a, to depends on tgw_b
-///
-/// Without the fix, both execute in parallel and tgw_a delete fails because
-/// the old attachment (which references tgw_a) hasn't been deleted yet.
-#[tokio::test]
-async fn test_delete_waits_for_replace_cbd_of_dependent() {
-    let provider = MockProvider::new();
-    let tgw_a_id = ResourceId::new("test", "tgw_a");
-    let tgw_b_id = ResourceId::new("test", "tgw_b");
-    let attachment_id = ResourceId::new("test", "attachment");
-
-    // tgw_a is being deleted (binding removed from desired config)
-    let tgw_a_deps: HashSet<String> = HashSet::new();
-
-    // attachment: Replace (CBD)
-    // from: depends on tgw_a (recorded in state's dependency_bindings)
-    let attachment_from = State::existing(attachment_id.clone(), HashMap::new())
-        .with_identifier("attach-old")
-        .with_dependency_bindings(std::collections::BTreeSet::from(["tgw_a".to_string()]));
-    // to: depends on tgw_b (different TGW — dependency changed)
-    let mut attachment_to = Resource::new("test", "attachment");
-    attachment_to.binding = Some("attachment".to_string());
-    attachment_to.dependency_bindings = std::collections::BTreeSet::from(["tgw_b".to_string()]);
-
-    let cbd_directives = Directives {
-        create_before_destroy: true,
-        ..Default::default()
-    };
-
-    let mut plan = Plan::new();
-
-    // tgw_b: Create (new resource)
-    let mut tgw_b = Resource::new("test", "tgw_b");
-    tgw_b.binding = Some("tgw_b".to_string());
-    plan.add(Effect::Create(tgw_b));
-
-    // tgw_a: Delete
-    plan.add(Effect::Delete {
-        id: tgw_a_id.clone(),
-        identifier: "tgw-old".to_string(),
-        directives: Default::default(),
-        binding: Some("tgw_a".to_string()),
-        dependencies: tgw_a_deps,
-        explicit_dependencies: std::collections::HashSet::new(),
-    });
-
-    // attachment: Replace (CBD) — from depends on tgw_a
-    plan.add(Effect::Replace {
-        id: attachment_id.clone(),
-        from: Box::new(attachment_from),
-        to: attachment_to,
-        directives: cbd_directives,
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
-            "transit_gateway_id".to_string(),
-        ])
-        .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-
-    // tgw_b create
-    provider.push_create(Ok(ok_state(&tgw_b_id)));
-    // attachment CBD: create new
-    provider.push_create(Ok(ok_state(&attachment_id)));
-    // attachment CBD: delete old
-    provider.push_delete(Ok(()));
-    // tgw_a: delete (should happen AFTER attachment replace completes)
-    provider.push_delete(Ok(()));
-
-    let input = ExecutionInput {
-        plan: &plan,
-        unresolved_resources: &HashMap::new(),
-        compositions: &[],
-        bindings: ResolvedBindings::default(),
-        current_states: HashMap::new(),
-        normalizer: &NoopNormalizer,
-        provider_configs: &[],
-        factories: &[],
-        schemas: &TEST_SCHEMAS,
-        parallelism: crate::executor::TEST_UNCAPPED,
-    };
-
-    let observer = MockObserver::new();
-    let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
-
-    assert_eq!(result.success_count, 3);
-    assert_eq!(result.failure_count, 0);
-
-    let calls = provider.calls();
-    // tgw_b create must happen first (attachment depends on it)
-    assert_eq!(calls[0], ("create".to_string(), tgw_b_id.to_string()));
-    // attachment create (CBD: create before delete)
-    assert_eq!(calls[1], ("create".to_string(), attachment_id.to_string()));
-    // attachment delete (old)
-    assert_eq!(calls[2], ("delete".to_string(), attachment_id.to_string()));
-    // tgw_a delete MUST come after attachment replace completes
-    assert_eq!(calls[3], ("delete".to_string(), tgw_a_id.to_string()));
-}
-
-/// Regression test for carina-provider-awscc#47:
-/// When the Delete effect has binding: None (because the resource became anonymous
-/// in step2), the reverse dependency from Replace(CBD).from.dependency_bindings
-/// must still be resolved via the resource's state-recorded binding.
-#[tokio::test]
-async fn test_delete_waits_for_replace_cbd_even_when_delete_binding_is_none() {
-    let provider = MockProvider::new();
-    let tgw_a_id = ResourceId::new("test", "tgw_a");
-    let tgw_b_id = ResourceId::new("test", "tgw_b");
-    let attachment_id = ResourceId::new("test", "attachment");
-
-    // tgw_a Delete has binding: None (anonymous in step2 .crn)
-    // but state recorded it as "tgw_a"
-    let tgw_a_deps: HashSet<String> = HashSet::new();
-
-    // attachment Replace (CBD): from depends on tgw_a (state-recorded)
-    let attachment_from = State::existing(attachment_id.clone(), HashMap::new())
-        .with_identifier("attach-old")
-        .with_dependency_bindings(std::collections::BTreeSet::from(["tgw_a".to_string()]));
-    let mut attachment_to = Resource::new("test", "attachment");
-    attachment_to.binding = Some("attachment".to_string());
-    attachment_to.dependency_bindings = std::collections::BTreeSet::from(["tgw_b".to_string()]);
-
-    let cbd_directives = Directives {
-        create_before_destroy: true,
-        ..Default::default()
-    };
-
-    let mut plan = Plan::new();
-
-    // tgw_b: Create
-    let mut tgw_b = Resource::new("test", "tgw_b");
-    tgw_b.binding = Some("tgw_b".to_string());
-    plan.add(Effect::Create(tgw_b));
-
-    // tgw_a: Delete — binding is None (the key difference from the previous test)
-    plan.add(Effect::Delete {
-        id: tgw_a_id.clone(),
-        identifier: "tgw-old".to_string(),
-        directives: Default::default(),
-        binding: None,
-        dependencies: tgw_a_deps,
-        explicit_dependencies: std::collections::HashSet::new(),
-    });
-
-    // attachment: Replace (CBD)
-    plan.add(Effect::Replace {
-        id: attachment_id.clone(),
-        from: Box::new(attachment_from),
-        to: attachment_to,
-        directives: cbd_directives,
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
-            "transit_gateway_id".to_string(),
-        ])
-        .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-
-    provider.push_create(Ok(ok_state(&tgw_b_id)));
-    provider.push_create(Ok(ok_state(&attachment_id)));
-    provider.push_delete(Ok(()));
-    provider.push_delete(Ok(()));
-
-    let input = ExecutionInput {
-        plan: &plan,
-        unresolved_resources: &HashMap::new(),
-        compositions: &[],
-        bindings: ResolvedBindings::default(),
-        current_states: HashMap::new(),
-        normalizer: &NoopNormalizer,
-        provider_configs: &[],
-        factories: &[],
-        schemas: &TEST_SCHEMAS,
-        parallelism: crate::executor::TEST_UNCAPPED,
-    };
-
-    let observer = MockObserver::new();
-    let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
-
-    assert_eq!(result.success_count, 3);
-    assert_eq!(result.failure_count, 0);
-
-    let calls = provider.calls();
-    assert_eq!(calls[0], ("create".to_string(), tgw_b_id.to_string()));
-    assert_eq!(calls[1], ("create".to_string(), attachment_id.to_string()));
-    assert_eq!(calls[2], ("delete".to_string(), attachment_id.to_string()));
-    // tgw_a delete MUST still come after attachment replace, even though binding is None
-    assert_eq!(calls[3], ("delete".to_string(), tgw_a_id.to_string()));
 }
 
 #[tokio::test]
@@ -5464,625 +4612,6 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
     );
 }
 
-/// Regression for carina#3553: when a wait target is replaced in the same
-/// apply run, the wait must poll the post-replace identifier from the
-/// replacement state, not the pre-replace identifier snapshotted in the plan.
-#[tokio::test]
-async fn wait_resolves_target_identifier_from_just_replaced_state() {
-    use crate::effect::ChangedCreateOnly;
-    use crate::wait::predicate::{AttrPath, WaitPredicate};
-
-    let mut cert = Resource::new("test", "cert");
-    cert.binding = Some("cert".to_string());
-    let cert_id = cert.id.clone();
-    cert.set_attr(
-        "domain_name",
-        Value::Concrete(ConcreteValue::String("new.example.com".to_string())),
-    );
-
-    let old_state = State::existing(
-        cert_id.clone(),
-        HashMap::from([(
-            "status".to_string(),
-            Value::Concrete(ConcreteValue::String("pending".to_string())),
-        )]),
-    )
-    .with_identifier("old-arn");
-
-    let new_state = State::existing(
-        cert_id.clone(),
-        HashMap::from([(
-            "status".to_string(),
-            Value::Concrete(ConcreteValue::String("issued".to_string())),
-        )]),
-    )
-    .with_identifier("new-arn");
-
-    let provider = IdentifierAwareProvider::new("new-arn", new_state);
-
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: cert_id.clone(),
-        from: Box::new(old_state.clone()),
-        to: cert,
-        directives: Directives::default(),
-        changed_create_only: ChangedCreateOnly::new(vec!["domain_name".to_string()]).unwrap(),
-        cascading_updates: Vec::new(),
-        temporary_name: None,
-        cascade_ref_hints: Vec::new(),
-    });
-    plan.add(Effect::Wait {
-        binding: "cert_issued".to_string(),
-        target_id: cert_id.clone(),
-        until: WaitPredicate::Equals {
-            attr: AttrPath::single("status"),
-            value: Value::Concrete(ConcreteValue::String("issued".to_string())),
-        },
-        until_surface: "cert.status == \"issued\"".to_string(),
-        timeout: std::time::Duration::from_secs(5),
-        interval: std::time::Duration::from_millis(10),
-        explicit_dependencies: std::collections::HashSet::new(),
-    });
-
-    let input = ExecutionInput {
-        plan: &plan,
-        unresolved_resources: &HashMap::new(),
-        compositions: &[],
-        bindings: ResolvedBindings::default(),
-        current_states: HashMap::from([(cert_id.clone(), old_state)]),
-        normalizer: &NoopNormalizer,
-        provider_configs: &[],
-        factories: &[],
-        schemas: &TEST_SCHEMAS,
-        parallelism: crate::executor::TEST_UNCAPPED,
-    };
-
-    let observer = MockObserver::new();
-    let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
-    let read_identifiers = provider.read_identifiers();
-
-    assert!(
-        !read_identifiers
-            .iter()
-            .any(|identifier| identifier.as_deref() == Some("old-arn")),
-        "wait polled stale pre-replace identifier old-arn; read identifiers seen: {read_identifiers:?}"
-    );
-    assert_eq!(
-        result.failure_count, 0,
-        "wait must use the replacement identifier; read identifiers seen: {read_identifiers:?}"
-    );
-    assert_eq!(result.success_count, 2, "Replace and Wait must succeed");
-    assert!(
-        read_identifiers
-            .iter()
-            .any(|identifier| identifier.as_deref() == Some("new-arn")),
-        "wait read must use the replacement identifier from applied_states; got: {read_identifiers:?}"
-    );
-}
-
-/// Regression for carina#3553 in the phased executor: interdependent
-/// replacements force phased execution, and a wait targeting one of
-/// those replacements must not run before the replacement publishes its
-/// new identifier.
-#[tokio::test]
-async fn wait_resolves_target_identifier_from_just_replaced_state_phased() {
-    use crate::effect::ChangedCreateOnly;
-    use crate::wait::predicate::{AttrPath, WaitPredicate};
-
-    let mut cert = Resource::new("test", "cert");
-    cert.binding = Some("cert".to_string());
-    let cert_id = cert.id.clone();
-    cert.set_attr(
-        "domain_name",
-        Value::Concrete(ConcreteValue::String("new.example.com".to_string())),
-    );
-
-    let mut dep = Resource::new("test", "dep");
-    dep.binding = Some("dep".to_string());
-    dep.dependency_bindings.insert("cert".to_string());
-    let dep_id = dep.id.clone();
-
-    let old_cert_state = State::existing(
-        cert_id.clone(),
-        HashMap::from([(
-            "status".to_string(),
-            Value::Concrete(ConcreteValue::String("pending".to_string())),
-        )]),
-    )
-    .with_identifier("old-arn");
-    let new_cert_state = State::existing(
-        cert_id.clone(),
-        HashMap::from([(
-            "status".to_string(),
-            Value::Concrete(ConcreteValue::String("issued".to_string())),
-        )]),
-    )
-    .with_identifier("new-arn");
-    let old_dep_state = State::existing(dep_id.clone(), HashMap::new()).with_identifier("dep-old");
-
-    let provider = IdentifierAwareProvider::new("new-arn", new_cert_state);
-
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: cert_id.clone(),
-        from: Box::new(old_cert_state.clone()),
-        to: cert,
-        directives: Directives::default(),
-        changed_create_only: ChangedCreateOnly::new(vec!["domain_name".to_string()]).unwrap(),
-        cascading_updates: Vec::new(),
-        temporary_name: None,
-        cascade_ref_hints: Vec::new(),
-    });
-    plan.add(Effect::Replace {
-        id: dep_id.clone(),
-        from: Box::new(old_dep_state.clone()),
-        to: dep,
-        directives: Directives::default(),
-        changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
-        cascading_updates: Vec::new(),
-        temporary_name: None,
-        cascade_ref_hints: Vec::new(),
-    });
-    plan.add(Effect::Wait {
-        binding: "cert_issued".to_string(),
-        target_id: cert_id.clone(),
-        until: WaitPredicate::Equals {
-            attr: AttrPath::single("status"),
-            value: Value::Concrete(ConcreteValue::String("issued".to_string())),
-        },
-        until_surface: "cert.status == \"issued\"".to_string(),
-        timeout: std::time::Duration::from_secs(5),
-        interval: std::time::Duration::from_millis(10),
-        explicit_dependencies: std::collections::HashSet::new(),
-    });
-    assert!(
-        has_interdependent_replaces(plan.effects()),
-        "test must exercise phased execution"
-    );
-
-    let input = ExecutionInput {
-        plan: &plan,
-        unresolved_resources: &HashMap::new(),
-        compositions: &[],
-        bindings: ResolvedBindings::default(),
-        current_states: HashMap::from([
-            (cert_id.clone(), old_cert_state),
-            (dep_id.clone(), old_dep_state),
-        ]),
-        normalizer: &NoopNormalizer,
-        provider_configs: &[],
-        factories: &[],
-        schemas: &TEST_SCHEMAS,
-        parallelism: crate::executor::TEST_UNCAPPED,
-    };
-
-    let observer = MockObserver::new();
-    let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
-    let read_identifiers = provider.read_identifiers();
-
-    assert!(
-        !read_identifiers
-            .iter()
-            .any(|identifier| identifier.as_deref() == Some("old-arn")),
-        "phased wait polled stale pre-replace identifier old-arn; read identifiers seen: {read_identifiers:?}"
-    );
-    assert_eq!(
-        result.failure_count, 0,
-        "phased wait must use the replacement identifier; read identifiers seen: {read_identifiers:?}"
-    );
-    assert!(
-        read_identifiers
-            .iter()
-            .any(|identifier| identifier.as_deref() == Some("new-arn")),
-        "phased wait read must use the replacement identifier from applied_states; got: {read_identifiers:?}"
-    );
-}
-
-#[tokio::test]
-async fn deferred_create_dispatches_after_upstream_replace_before_wait_phased() {
-    use crate::effect::ChangedCreateOnly;
-    use crate::wait::predicate::{AttrPath, WaitPredicate};
-
-    let mut cert = Resource::new("test", "cert");
-    cert.binding = Some("cert".to_string());
-    cert.set_attr(
-        "domain_name",
-        Value::Concrete(ConcreteValue::String("example.com".to_string())),
-    );
-    let cert_id = cert.id.clone();
-
-    let mut dep = Resource::new("test", "dep");
-    dep.binding = Some("dep".to_string());
-    dep.dependency_bindings.insert("cert".to_string());
-    let dep_id = dep.id.clone();
-
-    let old_cert_state = State::existing(cert_id.clone(), HashMap::new()).with_identifier("old");
-    let old_dep_state = State::existing(dep_id.clone(), HashMap::new()).with_identifier("dep-old");
-
-    let cert_state = State::existing(
-        cert_id.clone(),
-        HashMap::from([
-            (
-                "domain_validation_options".to_string(),
-                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                    ConcreteValue::Map(indexmap::IndexMap::from([(
-                        "resource_record".to_string(),
-                        Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
-                            (
-                                "name".to_string(),
-                                Value::Concrete(ConcreteValue::String(
-                                    "_dns_record_name_".to_string(),
-                                )),
-                            ),
-                            (
-                                "value".to_string(),
-                                Value::Concrete(ConcreteValue::String(
-                                    "_dns_record_value_".to_string(),
-                                )),
-                            ),
-                        ]))),
-                    )])),
-                )])),
-            ),
-            (
-                "status".to_string(),
-                Value::Concrete(ConcreteValue::String("issued".to_string())),
-            ),
-        ]),
-    )
-    .with_identifier("new");
-    let dep_state = State::existing(dep_id.clone(), HashMap::new()).with_identifier("dep-new");
-    let validation_id = ResourceId::new("test", "validation_records[0]");
-    let validation_state =
-        State::existing(validation_id.clone(), HashMap::new()).with_identifier("validation");
-
-    let provider = MockProvider::new();
-    provider.push_delete(Ok(()));
-    provider.push_delete(Ok(()));
-    provider.push_create(Ok(cert_state.clone()));
-    provider.push_create(Ok(dep_state));
-    provider.push_create(Ok(validation_state));
-    provider.push_read(Ok(cert_state));
-
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: cert_id.clone(),
-        from: Box::new(old_cert_state.clone()),
-        to: cert,
-        directives: Directives::default(),
-        changed_create_only: ChangedCreateOnly::new(vec!["domain_name".to_string()]).unwrap(),
-        cascading_updates: Vec::new(),
-        temporary_name: None,
-        cascade_ref_hints: Vec::new(),
-    });
-    plan.add(Effect::Replace {
-        id: dep_id.clone(),
-        from: Box::new(old_dep_state.clone()),
-        to: dep,
-        directives: Directives::default(),
-        changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
-        cascading_updates: Vec::new(),
-        temporary_name: None,
-        cascade_ref_hints: Vec::new(),
-    });
-    plan.add(Effect::DeferredCreate {
-        id: ResourceId::new("__deferred_for", "validation_records"),
-        upstream_binding: "cert".to_string(),
-        template: Box::new(validation_deferred_for_expression()),
-    });
-    plan.add(Effect::Wait {
-        binding: "cert_issued".to_string(),
-        target_id: cert_id.clone(),
-        until: WaitPredicate::Equals {
-            attr: AttrPath::single("status"),
-            value: Value::Concrete(ConcreteValue::String("issued".to_string())),
-        },
-        until_surface: "cert.status == \"issued\"".to_string(),
-        timeout: std::time::Duration::from_secs(5),
-        interval: std::time::Duration::from_millis(10),
-        explicit_dependencies: HashSet::from(["validation_records[0]".to_string()]),
-    });
-    assert!(
-        has_interdependent_replaces(plan.effects()),
-        "test must exercise phased execution"
-    );
-
-    let input = ExecutionInput {
-        plan: &plan,
-        unresolved_resources: &HashMap::new(),
-        compositions: &[],
-        bindings: ResolvedBindings::default(),
-        current_states: HashMap::from([
-            (cert_id.clone(), old_cert_state),
-            (dep_id.clone(), old_dep_state),
-        ]),
-        normalizer: &NoopNormalizer,
-        provider_configs: &[],
-        factories: &[],
-        schemas: &TEST_SCHEMAS,
-        parallelism: crate::executor::TEST_UNCAPPED,
-    };
-
-    let observer = ProgressObserver::new();
-    let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
-
-    assert_eq!(result.failure_count, 0);
-    assert_eq!(result.skip_count, 0);
-    let events = observer.events();
-    let cert_success = events
-        .iter()
-        .position(|event| event == "succeeded:test.cert")
-        .expect("cert replace must succeed");
-    let validation_success = events
-        .iter()
-        .position(|event| event == "succeeded:test.validation_records[0]")
-        .expect("validation record create must succeed");
-    let wait_success = events
-        .iter()
-        .enumerate()
-        .skip(validation_success + 1)
-        .find_map(|(idx, event)| (event == "succeeded:test.cert").then_some(idx))
-        .expect("wait must succeed");
-    assert!(cert_success < validation_success);
-    assert!(validation_success < wait_success);
-    assert!(
-        observer
-            .progress()
-            .iter()
-            .all(|progress| progress.completed <= progress.total),
-        "dynamic creates must increase total before progress is emitted"
-    );
-
-    let created = provider.captured_create_resources();
-    let validation = created
-        .iter()
-        .find(|resource| resource.id == validation_id)
-        .expect("validation child must be passed through provider create");
-    assert_eq!(
-        validation.attributes.get("name"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "_dns_record_name_".to_string()
-        )))
-    );
-}
-
-#[tokio::test]
-async fn deferred_create_emits_zero_children_when_collection_is_empty() {
-    use crate::effect::ChangedCreateOnly;
-    use crate::wait::predicate::{AttrPath, WaitPredicate};
-
-    let mut cert = Resource::new("test", "cert_empty");
-    cert.binding = Some("cert".to_string());
-    cert.set_attr(
-        "domain_name",
-        Value::Concrete(ConcreteValue::String("example.com".to_string())),
-    );
-    let cert_id = cert.id.clone();
-    let old_cert_state = State::existing(cert_id.clone(), HashMap::new()).with_identifier("old");
-    let cert_state = State::existing(
-        cert_id.clone(),
-        HashMap::from([
-            (
-                "domain_validation_options".to_string(),
-                Value::Concrete(ConcreteValue::List(Vec::new())),
-            ),
-            (
-                "status".to_string(),
-                Value::Concrete(ConcreteValue::String("issued".to_string())),
-            ),
-        ]),
-    )
-    .with_identifier("new");
-
-    let provider = MockProvider::new();
-    provider.push_delete(Ok(()));
-    provider.push_create(Ok(cert_state.clone()));
-    provider.push_read(Ok(cert_state));
-
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: cert_id.clone(),
-        from: Box::new(old_cert_state.clone()),
-        to: cert,
-        directives: Directives::default(),
-        changed_create_only: ChangedCreateOnly::new(vec!["domain_name".to_string()]).unwrap(),
-        cascading_updates: Vec::new(),
-        temporary_name: None,
-        cascade_ref_hints: Vec::new(),
-    });
-    plan.add(Effect::DeferredCreate {
-        id: ResourceId::new("__deferred_for", "validation_records"),
-        upstream_binding: "cert".to_string(),
-        template: Box::new(validation_deferred_for_expression()),
-    });
-    plan.add(Effect::Wait {
-        binding: "cert_issued".to_string(),
-        target_id: cert_id.clone(),
-        until: WaitPredicate::Equals {
-            attr: AttrPath::single("status"),
-            value: Value::Concrete(ConcreteValue::String("issued".to_string())),
-        },
-        until_surface: "cert.status == \"issued\"".to_string(),
-        timeout: std::time::Duration::from_secs(5),
-        interval: std::time::Duration::from_millis(10),
-        explicit_dependencies: HashSet::new(),
-    });
-
-    let input = ExecutionInput {
-        plan: &plan,
-        unresolved_resources: &HashMap::new(),
-        compositions: &[],
-        bindings: ResolvedBindings::default(),
-        current_states: HashMap::from([(cert_id.clone(), old_cert_state)]),
-        normalizer: &NoopNormalizer,
-        provider_configs: &[],
-        factories: &[],
-        schemas: &TEST_SCHEMAS,
-        parallelism: crate::executor::TEST_UNCAPPED,
-    };
-
-    let observer = MockObserver::new();
-    let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
-
-    assert_eq!(result.failure_count, 0);
-    assert_eq!(result.skip_count, 0);
-    assert!(
-        provider
-            .calls()
-            .iter()
-            .all(|(op, id)| op != "create" || id != "test.validation_records[0]"),
-        "empty collection must not synthesize children"
-    );
-    let events = observer.events();
-    assert!(
-        events.contains(&"succeeded:test.cert_empty".to_string()),
-        "events: {events:?}"
-    );
-}
-
-#[tokio::test]
-async fn deferred_create_cancelled_after_upstream_create_reports_skipped() {
-    use crate::effect::ChangedCreateOnly;
-
-    struct CancelAfterCertProvider {
-        cancel: CancellationToken,
-        calls: Mutex<Vec<(String, String)>>,
-    }
-
-    impl Provider for CancelAfterCertProvider {
-        fn name(&self) -> &str {
-            "cancel-after-cert"
-        }
-
-        fn read(
-            &self,
-            id: &ResourceId,
-            _identifier: Option<&str>,
-            _request: ReadRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
-            let id = id.clone();
-            Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
-        }
-
-        fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
-            self.read(&resource.id, None, ReadRequest)
-        }
-
-        fn create(
-            &self,
-            id: &ResourceId,
-            _request: CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(("create".to_string(), id.to_string()));
-            let cancel = self.cancel.clone();
-            let id = id.clone();
-            Box::pin(async move {
-                cancel.cancel();
-                Ok(crate::provider::CreateOutcome::Success {
-                    state: State::existing(
-                        id,
-                        HashMap::from([(
-                            "domain_validation_options".to_string(),
-                            Value::Concrete(ConcreteValue::List(Vec::new())),
-                        )]),
-                    ),
-                })
-            })
-        }
-
-        fn update(
-            &self,
-            _id: &ResourceId,
-            _identifier: &str,
-            _request: UpdateRequest,
-        ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
-            unreachable!("test does not update")
-        }
-
-        fn delete(
-            &self,
-            id: &ResourceId,
-            _identifier: &str,
-            _request: DeleteRequest,
-        ) -> BoxFuture<'_, ProviderResult<()>> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(("delete".to_string(), id.to_string()));
-            Box::pin(async move { Ok(()) })
-        }
-
-        fn required_permissions(
-            &self,
-            _id: &ResourceId,
-            _op: crate::effect::PlanOp,
-        ) -> Vec<String> {
-            Vec::new()
-        }
-    }
-
-    let mut cert = Resource::new("test", "cert_cancel");
-    cert.binding = Some("cert".to_string());
-    cert.set_attr(
-        "domain_name",
-        Value::Concrete(ConcreteValue::String("example.com".to_string())),
-    );
-    let cert_id = cert.id.clone();
-    let old_cert_state = State::existing(cert_id.clone(), HashMap::new()).with_identifier("old");
-
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: cert_id.clone(),
-        from: Box::new(old_cert_state.clone()),
-        to: cert,
-        directives: Directives::default(),
-        changed_create_only: ChangedCreateOnly::new(vec!["domain_name".to_string()]).unwrap(),
-        cascading_updates: Vec::new(),
-        temporary_name: None,
-        cascade_ref_hints: Vec::new(),
-    });
-    plan.add(Effect::DeferredCreate {
-        id: ResourceId::new("__deferred_for", "validation_records"),
-        upstream_binding: "cert".to_string(),
-        template: Box::new(validation_deferred_for_expression()),
-    });
-
-    let cancel = CancellationToken::new();
-    let provider = CancelAfterCertProvider {
-        cancel: cancel.clone(),
-        calls: Mutex::new(Vec::new()),
-    };
-    let input = ExecutionInput {
-        plan: &plan,
-        unresolved_resources: &HashMap::new(),
-        compositions: &[],
-        bindings: ResolvedBindings::default(),
-        current_states: HashMap::from([(cert_id.clone(), old_cert_state)]),
-        normalizer: &NoopNormalizer,
-        provider_configs: &[],
-        factories: &[],
-        schemas: &TEST_SCHEMAS,
-        parallelism: NonZeroUsize::new(1).unwrap(),
-    };
-    let observer = MockObserver::new();
-    let outcome = execute_plan(&provider, input, &observer, cancel).await;
-
-    assert!(matches!(outcome, ExecutionOutcome::Cancelled(_)));
-    assert!(
-        observer
-            .events()
-            .iter()
-            .any(|event| { event == "skipped:__deferred_for.validation_records:cancelled" })
-    );
-}
-
 #[tokio::test]
 async fn deferred_create_returns_error_when_upstream_binding_missing() {
     let provider = MockProvider::new();
@@ -6322,6 +4851,7 @@ async fn dispatch_deferred_replace_runs_deletes_concurrently() {
                 binding: Some("validation_records[0]".to_string()),
                 dependencies: HashSet::new(),
                 explicit_dependencies: HashSet::new(),
+                blocked_by_updates: HashSet::new(),
             },
             DeferredReplaceDelete {
                 id: ResourceId::new("test", "validation_records[1]"),
@@ -6330,6 +4860,7 @@ async fn dispatch_deferred_replace_runs_deletes_concurrently() {
                 binding: Some("validation_records[1]".to_string()),
                 dependencies: HashSet::new(),
                 explicit_dependencies: HashSet::new(),
+                blocked_by_updates: HashSet::new(),
             },
         ])
         .expect("fixture has deletes"),
@@ -6415,6 +4946,7 @@ async fn dispatch_deferred_replace_short_circuits_on_delete_failure() {
             binding: Some("validation_records[0]".to_string()),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
         }])
         .expect("fixture has one delete"),
         id: ResourceId::new("__deferred_for", "validation_records"),
@@ -6446,697 +4978,6 @@ async fn dispatch_deferred_replace_short_circuits_on_delete_failure() {
             .any(|(op, id)| op == "create" && id == "test.validation_records[0]"),
         "create half must not dispatch after delete failure; calls: {:?}",
         provider.calls()
-    );
-}
-
-#[tokio::test]
-async fn phased_deferred_replace_gate_skips_on_absorbed_delete_failure() {
-    use crate::effect::ChangedCreateOnly;
-
-    // Regression for carina#3611: current phased.rs records failures by
-    // binding string only, so an expanded DeferredReplace delete failure can
-    // be missed by the DR gate and the child Create is materialized anyway.
-    let cert_id = ResourceId::new("test", "cert_delete_failure_phased");
-    let mut cert = Resource::new("test", "cert_delete_failure_phased");
-    cert.binding = Some("cert".to_string());
-    let old_cert_state =
-        State::existing(cert_id.clone(), HashMap::new()).with_identifier("cert-old");
-
-    let dep_id = ResourceId::new("test", "dep_delete_failure_phased");
-    let mut dep = Resource::new("test", "dep_delete_failure_phased");
-    dep.binding = Some("dep".to_string());
-    dep.dependency_bindings.insert("cert".to_string());
-    let old_dep_state = State::existing(dep_id.clone(), HashMap::new()).with_identifier("dep-old");
-
-    let validation_id = ResourceId::new("test", "validation_records[0]");
-    let validation_state =
-        State::existing(validation_id.clone(), HashMap::new()).with_identifier("new-validation");
-
-    let provider = MockProvider::new();
-    provider.push_delete(Err(ProviderError::api_error("delete failed")));
-    provider.push_delete(Ok(()));
-    provider.push_delete(Ok(()));
-    provider.push_create(Ok(cert_state_for_deferred_replace_deadlock(&cert_id)));
-    provider.push_create(Ok(ok_state(&dep_id)));
-    provider.push_create(Ok(validation_state));
-    for _ in 0..8 {
-        provider.push_read(Ok(State::not_found(validation_id.clone())));
-    }
-
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: cert_id.clone(),
-        from: Box::new(old_cert_state.clone()),
-        to: cert,
-        directives: Directives::default(),
-        changed_create_only: ChangedCreateOnly::new(vec!["domain_name".to_string()]).unwrap(),
-        cascading_updates: Vec::new(),
-        temporary_name: None,
-        cascade_ref_hints: Vec::new(),
-    });
-    plan.add(Effect::Replace {
-        id: dep_id.clone(),
-        from: Box::new(old_dep_state.clone()),
-        to: dep,
-        directives: Directives::default(),
-        changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
-        cascading_updates: Vec::new(),
-        temporary_name: None,
-        cascade_ref_hints: Vec::new(),
-    });
-    plan.add(Effect::DeferredReplace {
-        deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
-            id: validation_id.clone(),
-            identifier: "old-validation".to_string(),
-            directives: Directives::default(),
-            binding: Some("validation_records[0]".to_string()),
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-        }])
-        .expect("fixture has one delete"),
-        id: ResourceId::new("__deferred_for", "validation_records"),
-        upstream_binding: "cert".to_string(),
-        template: Box::new(validation_deferred_for_expression()),
-    });
-    assert!(
-        has_interdependent_replaces(plan.effects()),
-        "test must exercise phased execution"
-    );
-
-    let input = ExecutionInput {
-        plan: &plan,
-        unresolved_resources: &HashMap::new(),
-        compositions: &[],
-        bindings: ResolvedBindings::default(),
-        current_states: HashMap::from([
-            (cert_id.clone(), old_cert_state),
-            (dep_id.clone(), old_dep_state),
-        ]),
-        normalizer: &NoopNormalizer,
-        provider_configs: &[],
-        factories: &[],
-        schemas: &TEST_SCHEMAS,
-        parallelism: crate::executor::TEST_UNCAPPED,
-    };
-    let observer = MockObserver::new();
-    let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
-
-    let calls = provider.calls();
-    assert!(
-        calls
-            .iter()
-            .any(|(op, id)| op == "delete" && id == &validation_id.to_string()),
-        "absorbed delete must be attempted; calls: {calls:?}"
-    );
-    assert!(
-        !calls
-            .iter()
-            .any(|(op, id)| op == "create" && id == &validation_id.to_string()),
-        "DR child Create must not run after absorbed delete failure; calls: {calls:?}"
-    );
-    assert_eq!(
-        result.failure_count,
-        1,
-        "the absorbed delete failure must be reported; events: {:?}",
-        observer.events()
-    );
-    let events = observer.events();
-    assert!(
-        events
-            .iter()
-            .any(|event| event.starts_with("failed:test.validation_records[0]:")),
-        "delete failure must be visible in events: {events:?}"
-    );
-    assert!(
-        events.iter().any(|event| {
-            event.starts_with("skipped:__deferred_for.validation_records:")
-                || event.starts_with("failed:__deferred_for.validation_records:")
-        }),
-        "DR gate must be skipped or failed, not silently successful; events: {events:?}"
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|event| event == "succeeded:__deferred_for.validation_records"),
-        "DR gate must not be reported as success; events: {events:?}"
-    );
-    assert!(
-        !result
-            .runtime_synthesized_resources
-            .iter()
-            .any(|resource| resource.id == validation_id),
-        "failed DR gate must not synthesize a phantom child"
-    );
-}
-
-#[tokio::test]
-async fn phased_cbd_replace_skips_when_phase1_dependency_fails() {
-    use crate::effect::ChangedCreateOnly;
-
-    let mut bucket = Resource::new("test", "bucket_phase1_cbd_dep");
-    bucket.binding = Some("bucket".to_string());
-
-    let anchor_id = ResourceId::new("test", "anchor_phase1_cbd_dep");
-    let mut anchor_to = Resource::new("test", "anchor_phase1_cbd_dep");
-    anchor_to.binding = Some("anchor".to_string());
-    let anchor_from =
-        State::existing(anchor_id.clone(), HashMap::new()).with_identifier("old-anchor");
-
-    let policy_id = ResourceId::new("test", "policy_phase1_cbd_dep");
-    let mut policy_to = make_resource("policy", &["anchor"]);
-    policy_to.id = policy_id.clone();
-    policy_to.directives = Directives {
-        create_before_destroy: true,
-        depends_on: vec!["bucket".to_string()],
-        ..Default::default()
-    };
-    let policy_from =
-        State::existing(policy_id.clone(), HashMap::new()).with_identifier("old-policy");
-
-    let provider = MockProvider::new();
-    provider.push_create(Err(ProviderError::api_error("bucket create failed")));
-    provider.push_create(Ok(ok_state(&anchor_id)));
-    provider.push_delete(Ok(()));
-
-    let mut plan = Plan::new();
-    plan.add(Effect::Create(bucket));
-    plan.add(Effect::Replace {
-        id: anchor_id.clone(),
-        from: Box::new(anchor_from.clone()),
-        to: anchor_to,
-        directives: Directives::default(),
-        changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
-        cascading_updates: Vec::new(),
-        temporary_name: None,
-        cascade_ref_hints: Vec::new(),
-    });
-    plan.add(Effect::Replace {
-        id: policy_id.clone(),
-        from: Box::new(policy_from.clone()),
-        to: policy_to,
-        directives: Directives {
-            create_before_destroy: true,
-            depends_on: vec!["bucket".to_string()],
-            ..Default::default()
-        },
-        changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
-        cascading_updates: Vec::new(),
-        temporary_name: None,
-        cascade_ref_hints: Vec::new(),
-    });
-    assert!(
-        has_interdependent_replaces(plan.effects()),
-        "test must exercise phased execution"
-    );
-
-    let input = ExecutionInput {
-        plan: &plan,
-        unresolved_resources: &HashMap::new(),
-        compositions: &[],
-        bindings: ResolvedBindings::default(),
-        current_states: HashMap::from([
-            (anchor_id.clone(), anchor_from),
-            (policy_id.clone(), policy_from),
-        ]),
-        normalizer: &NoopNormalizer,
-        provider_configs: &[],
-        factories: &[],
-        schemas: &TEST_SCHEMAS,
-        parallelism: crate::executor::TEST_UNCAPPED,
-    };
-    let observer = MockObserver::new();
-    let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
-
-    let events = observer.events();
-    assert_eq!(result.failure_count, 1, "events: {events:?}");
-    assert!(
-        events
-            .iter()
-            .any(|event| event == "skipped:test.policy_phase1_cbd_dep:dependency 'bucket' failed"),
-        "CBD Replace must be skipped by the failed Phase 1 dependency; events: {events:?}"
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|event| event.starts_with("failed:test.policy_phase1_cbd_dep:")),
-        "CBD Replace must not fail from value-ref resolution; events: {events:?}"
-    );
-}
-
-#[tokio::test]
-async fn phased_replace_delete_skips_when_phase1_dependency_fails() {
-    use crate::effect::ChangedCreateOnly;
-
-    let mut bucket = Resource::new("test", "bucket_phase1_delete_dep");
-    bucket.binding = Some("bucket".to_string());
-
-    let anchor_id = ResourceId::new("test", "anchor_phase1_delete_dep");
-    let mut anchor_to = Resource::new("test", "anchor_phase1_delete_dep");
-    anchor_to.binding = Some("anchor".to_string());
-    let anchor_from =
-        State::existing(anchor_id.clone(), HashMap::new()).with_identifier("old-anchor");
-
-    let target_id = ResourceId::new("test", "anonymous_phase1_delete_dep");
-    let mut target_to = make_resource("anonymous_phase1_delete_dep", &["anchor"]);
-    target_to.binding = None;
-    target_to.directives.depends_on.push("bucket".to_string());
-    let target_from =
-        State::existing(target_id.clone(), HashMap::new()).with_identifier("old-target");
-
-    let provider = MockProvider::new();
-    provider.push_create(Err(ProviderError::api_error("bucket create failed")));
-    provider.push_create(Ok(ok_state(&anchor_id)));
-    provider.push_delete(Ok(()));
-
-    let mut plan = Plan::new();
-    plan.add(Effect::Create(bucket));
-    plan.add(Effect::Replace {
-        id: anchor_id.clone(),
-        from: Box::new(anchor_from.clone()),
-        to: anchor_to,
-        directives: Directives::default(),
-        changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
-        cascading_updates: Vec::new(),
-        temporary_name: None,
-        cascade_ref_hints: Vec::new(),
-    });
-    plan.add(Effect::Replace {
-        id: target_id.clone(),
-        from: Box::new(target_from.clone()),
-        to: target_to,
-        directives: Directives {
-            depends_on: vec!["bucket".to_string()],
-            ..Default::default()
-        },
-        changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
-        cascading_updates: Vec::new(),
-        temporary_name: None,
-        cascade_ref_hints: Vec::new(),
-    });
-    assert!(
-        has_interdependent_replaces(plan.effects()),
-        "test must exercise phased execution"
-    );
-    assert_eq!(
-        plan.effects()[2].binding_name(),
-        None,
-        "fixture must cover an anonymous Replace"
-    );
-
-    let input = ExecutionInput {
-        plan: &plan,
-        unresolved_resources: &HashMap::new(),
-        compositions: &[],
-        bindings: ResolvedBindings::default(),
-        current_states: HashMap::from([
-            (anchor_id.clone(), anchor_from),
-            (target_id.clone(), target_from),
-        ]),
-        normalizer: &NoopNormalizer,
-        provider_configs: &[],
-        factories: &[],
-        schemas: &TEST_SCHEMAS,
-        parallelism: crate::executor::TEST_UNCAPPED,
-    };
-    let observer = MockObserver::new();
-    let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
-
-    let calls = provider.calls();
-    assert!(
-        !calls
-            .iter()
-            .any(|(op, id)| op == "delete" && id == &target_id.to_string()),
-        "target Replace delete must not run after its Phase 1 dependency fails; calls: {calls:?}"
-    );
-    let events = observer.events();
-    assert_eq!(result.failure_count, 1, "events: {events:?}");
-    assert!(
-        events
-            .iter()
-            .any(|event| event
-                == "skipped:test.anonymous_phase1_delete_dep:dependency 'bucket' failed"),
-        "anonymous Replace must be skipped by the failed Phase 1 dependency; events: {events:?}"
-    );
-}
-
-#[tokio::test]
-async fn phased_anonymous_replace_failure_propagates_to_dependent_wait() {
-    use crate::effect::ChangedCreateOnly;
-    use crate::wait::predicate::{AttrPath, WaitPredicate};
-
-    // Regression for carina#3611 + carina#3615: phased execution previously
-    // kept failed_bindings: HashSet<String>, so a failed anonymous Replace
-    // (binding_name() == None) is not recorded and a dependent Wait can run
-    // until timeout instead of being skipped as dependency-failed.
-    let a_id = ResourceId::new("test", "a_anonymous_wait_gate");
-    let mut a = Resource::new("test", "a_anonymous_wait_gate");
-    a.binding = Some("a".to_string());
-    let old_a_state = State::existing(a_id.clone(), HashMap::new()).with_identifier("a-old");
-
-    let b_id = ResourceId::new("test", "b_anonymous_wait_gate");
-    let mut b = Resource::new("test", "b_anonymous_wait_gate");
-    b.binding = Some("b".to_string());
-    b.dependency_bindings.insert("a".to_string());
-    let old_b_state = State::existing(b_id.clone(), HashMap::new()).with_identifier("b-old");
-
-    let anonymous_id = ResourceId::new("test", "anonymous_wait_target");
-    let old_anonymous_state =
-        State::existing(anonymous_id.clone(), HashMap::new()).with_identifier("anon-old");
-    let anonymous_to = Resource::new("test", "anonymous_wait_target");
-
-    let provider = MockProvider::new();
-    provider.push_delete(Ok(()));
-    provider.push_delete(Err(ProviderError::api_error("anonymous replace failed")));
-    provider.push_delete(Ok(()));
-    provider.push_create(Ok(ok_state(&b_id)));
-    provider.push_create(Ok(ok_state(&a_id)));
-    provider.push_create(Ok(ok_state(&anonymous_id)));
-    provider.push_create(Ok(ok_state(&anonymous_id)));
-    for _ in 0..8 {
-        provider.push_read(Ok(State::existing(
-            anonymous_id.clone(),
-            HashMap::from([(
-                "status".to_string(),
-                Value::Concrete(ConcreteValue::String("pending".to_string())),
-            )]),
-        )));
-    }
-
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: a_id.clone(),
-        from: Box::new(old_a_state.clone()),
-        to: a,
-        directives: Directives::default(),
-        changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
-        cascading_updates: Vec::new(),
-        temporary_name: None,
-        cascade_ref_hints: Vec::new(),
-    });
-    plan.add(Effect::Replace {
-        id: b_id.clone(),
-        from: Box::new(old_b_state.clone()),
-        to: b,
-        directives: Directives::default(),
-        changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
-        cascading_updates: Vec::new(),
-        temporary_name: None,
-        cascade_ref_hints: Vec::new(),
-    });
-    plan.add(Effect::Replace {
-        id: anonymous_id.clone(),
-        from: Box::new(old_anonymous_state.clone()),
-        to: anonymous_to,
-        directives: Directives::default(),
-        changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
-        cascading_updates: Vec::new(),
-        temporary_name: None,
-        cascade_ref_hints: Vec::new(),
-    });
-    plan.add(Effect::Wait {
-        binding: "anonymous_ready".to_string(),
-        target_id: anonymous_id.clone(),
-        until: WaitPredicate::Equals {
-            attr: AttrPath::single("status"),
-            value: Value::Concrete(ConcreteValue::String("ready".to_string())),
-        },
-        until_surface: "anonymous_wait_target.status == \"ready\"".to_string(),
-        timeout: std::time::Duration::ZERO,
-        interval: std::time::Duration::from_millis(1),
-        explicit_dependencies: HashSet::new(),
-    });
-    assert!(
-        has_interdependent_replaces(plan.effects()),
-        "test must exercise phased execution"
-    );
-    assert_eq!(
-        plan.effects()[2].binding_name(),
-        None,
-        "fixture must use an anonymous Replace"
-    );
-
-    let input = ExecutionInput {
-        plan: &plan,
-        unresolved_resources: &HashMap::new(),
-        compositions: &[],
-        bindings: ResolvedBindings::default(),
-        current_states: HashMap::from([
-            (a_id.clone(), old_a_state),
-            (b_id.clone(), old_b_state),
-            (anonymous_id.clone(), old_anonymous_state),
-        ]),
-        normalizer: &NoopNormalizer,
-        provider_configs: &[],
-        factories: &[],
-        schemas: &TEST_SCHEMAS,
-        parallelism: crate::executor::TEST_UNCAPPED,
-    };
-    let observer = MockObserver::new();
-    let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
-
-    let events = observer.events();
-    // The skipped event carries the *real* Wait effect, whose
-    // resource_id is its `target_id` (the anonymous resource), and the
-    // reason renders the typed `FailedDependency::Anonymous` branch as
-    // `dependency-failed` rather than fabricating a `#N` placeholder
-    // shaped like a binding name. carina#3611 round-4 self-review: do
-    // not assert against a synthetic `__wait.<binding>` id — that was
-    // the bandaid we removed.
-    assert!(
-        events.iter().any(|event| {
-            event == "skipped:test.anonymous_wait_target:unsatisfiable: dependency-failed"
-        }),
-        "dependent wait must be skipped as dependency-failed; events: {events:?}"
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|event| event == "succeeded:test.anonymous_wait_target"),
-        "dependent wait must not be reported as success; events: {events:?}"
-    );
-    assert_eq!(
-        result.skip_count, 1,
-        "dependent wait should be skipped, not polled to timeout; events: {events:?}"
-    );
-}
-
-#[tokio::test]
-async fn phased_cross_phase_explicit_dependency_failure_triggers_wait_terminal() {
-    use crate::effect::ChangedCreateOnly;
-    use crate::wait::predicate::{AttrPath, WaitPredicate};
-
-    let failed_id = ResourceId::new("test", "failed_cross_phase_update");
-    let old_failed_state =
-        State::existing(failed_id.clone(), HashMap::new()).with_identifier("failed-old");
-    let mut failed_to = Resource::new("test", "failed_cross_phase_update");
-    failed_to.binding = Some("b".to_string());
-
-    let parent_id = ResourceId::new("test", "cross_phase_wait_parent");
-    let mut parent = Resource::new("test", "cross_phase_wait_parent");
-    parent.binding = Some("parent".to_string());
-    let old_parent_state =
-        State::existing(parent_id.clone(), HashMap::new()).with_identifier("parent-old");
-
-    let child_id = ResourceId::new("test", "cross_phase_wait_child");
-    let mut child = Resource::new("test", "cross_phase_wait_child");
-    child.binding = Some("child".to_string());
-    child.dependency_bindings.insert("parent".to_string());
-    let old_child_state =
-        State::existing(child_id.clone(), HashMap::new()).with_identifier("child-old");
-
-    let provider = MockProvider::new();
-    provider.push_update(Err(ProviderError::api_error("phase1 update failed")));
-    provider.push_delete(Ok(()));
-    provider.push_delete(Ok(()));
-    provider.push_create(Ok(ok_state(&parent_id)));
-    provider.push_create(Ok(ok_state(&child_id)));
-    for _ in 0..100 {
-        provider.push_read(Ok(State::existing(
-            parent_id.clone(),
-            HashMap::from([(
-                "status".to_string(),
-                Value::Concrete(ConcreteValue::String("pending".to_string())),
-            )]),
-        )));
-    }
-
-    let mut plan = Plan::new();
-    plan.add(Effect::Update {
-        id: failed_id.clone(),
-        from: Box::new(old_failed_state.clone()),
-        to: failed_to,
-        changed_attributes: vec!["name".to_string()],
-    });
-    plan.add(Effect::Replace {
-        id: parent_id.clone(),
-        from: Box::new(old_parent_state.clone()),
-        to: parent,
-        directives: Directives::default(),
-        changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
-        cascading_updates: Vec::new(),
-        temporary_name: None,
-        cascade_ref_hints: Vec::new(),
-    });
-    plan.add(Effect::Replace {
-        id: child_id.clone(),
-        from: Box::new(old_child_state.clone()),
-        to: child,
-        directives: Directives::default(),
-        changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
-        cascading_updates: Vec::new(),
-        temporary_name: None,
-        cascade_ref_hints: Vec::new(),
-    });
-    plan.add(Effect::Wait {
-        binding: "sibling_ready".to_string(),
-        target_id: parent_id.clone(),
-        until: WaitPredicate::Equals {
-            attr: AttrPath::single("status"),
-            value: Value::Concrete(ConcreteValue::String("ready".to_string())),
-        },
-        until_surface: "cross_phase_wait_parent.status == \"ready\"".to_string(),
-        timeout: std::time::Duration::from_millis(80),
-        interval: std::time::Duration::from_millis(1),
-        explicit_dependencies: HashSet::new(),
-    });
-    plan.add(Effect::Wait {
-        binding: "blocked_ready".to_string(),
-        target_id: child_id.clone(),
-        until: WaitPredicate::Equals {
-            attr: AttrPath::single("status"),
-            value: Value::Concrete(ConcreteValue::String("ready".to_string())),
-        },
-        until_surface: "cross_phase_wait_child.status == \"ready\"".to_string(),
-        timeout: std::time::Duration::from_millis(80),
-        interval: std::time::Duration::from_millis(1),
-        explicit_dependencies: HashSet::from(["b".to_string(), "sibling_ready".to_string()]),
-    });
-    assert!(
-        has_interdependent_replaces(plan.effects()),
-        "test must exercise phased execution"
-    );
-
-    let input = ExecutionInput {
-        plan: &plan,
-        unresolved_resources: &HashMap::new(),
-        compositions: &[],
-        bindings: ResolvedBindings::default(),
-        current_states: HashMap::from([
-            (failed_id.clone(), old_failed_state),
-            (parent_id.clone(), old_parent_state),
-            (child_id.clone(), old_child_state),
-        ]),
-        normalizer: &NoopNormalizer,
-        provider_configs: &[],
-        factories: &[],
-        schemas: &TEST_SCHEMAS,
-        parallelism: crate::executor::TEST_UNCAPPED,
-    };
-    let observer = MockObserver::new();
-    let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
-
-    let events = observer.events();
-    assert!(
-        events.iter().any(|event| {
-            event
-                == "skipped:test.cross_phase_wait_child:unsatisfiable: dependency 'sibling_ready' failed"
-        }),
-        "blocked wait must be skipped as dependency-failed after terminal cancellation completes the sibling dependency; events: {events:?}"
-    );
-    assert!(
-        events.iter().any(|event| {
-            event == "skipped:test.cross_phase_wait_parent:unsatisfiable: no mutator remaining"
-        }),
-        "terminal check must cancel the in-flight sibling wait instead of letting it time out; events: {events:?}"
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|event| event.starts_with("failed:test.cross_phase_wait_parent:wait")),
-        "sibling wait must not poll to timeout; events: {events:?}"
-    );
-    assert_eq!(
-        result.failure_count, 1,
-        "only the update should fail; events: {events:?}"
-    );
-    assert_eq!(
-        result.skip_count, 2,
-        "both waits should be skipped after terminal detection; events: {events:?}"
-    );
-}
-
-#[test]
-fn phased_anonymous_replace_failure_unblocks_wait_terminal_check() {
-    use crate::effect::ChangedCreateOnly;
-    use crate::executor::scheduler::{FailedDependency, FailureView};
-    use crate::executor::wait::count_effectively_undispatched;
-    use crate::wait::predicate::{AttrPath, WaitPredicate};
-
-    // Regression for carina#3618: this isolates the phased Wait terminal
-    // check instead of the dispatch-time skip covered by
-    // `phased_anonymous_replace_failure_propagates_to_dependent_wait`.
-    // The scheduler graph proves the Wait depends on the failed anonymous
-    // Replace, and the terminal counter must consult the same FailureView
-    // rather than a lossy failed-binding-name projection.
-    let anonymous_id = ResourceId::new("test", "anonymous_wait_terminal_target");
-    let old_anonymous_state =
-        State::existing(anonymous_id.clone(), HashMap::new()).with_identifier("anon-old");
-    let anonymous_to = Resource::new("test", "anonymous_wait_terminal_target");
-
-    let effects = vec![
-        Effect::Replace {
-            id: anonymous_id.clone(),
-            from: Box::new(old_anonymous_state),
-            to: anonymous_to,
-            directives: Directives::default(),
-            changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
-            cascading_updates: Vec::new(),
-            temporary_name: None,
-            cascade_ref_hints: Vec::new(),
-        },
-        Effect::Wait {
-            binding: "anonymous_terminal_ready".to_string(),
-            target_id: anonymous_id.clone(),
-            until: WaitPredicate::Equals {
-                attr: AttrPath::single("status"),
-                value: Value::Concrete(ConcreteValue::String("ready".to_string())),
-            },
-            until_surface: "anonymous_wait_terminal_target.status == \"ready\"".to_string(),
-            timeout: std::time::Duration::from_millis(20),
-            interval: std::time::Duration::from_millis(1),
-            explicit_dependencies: HashSet::new(),
-        },
-    ];
-    assert_eq!(
-        effects[0].binding_name(),
-        None,
-        "fixture must use an anonymous Replace"
-    );
-
-    let wait_idx = 1;
-    let mut failed_indices = HashSet::new();
-    failed_indices.insert(0);
-    let deps_of = HashMap::from([(wait_idx, HashSet::from([0]))]);
-    let failure_view = FailureView::new(&effects, &deps_of, &failed_indices);
-    assert!(
-        matches!(
-            failure_view.find_failed_dependency(wait_idx),
-            Some(FailedDependency::Anonymous)
-        ),
-        "dispatch-time dependency check must already see the anonymous failed Replace"
-    );
-
-    let dispatched = HashSet::new();
-
-    assert_eq!(
-        count_effectively_undispatched(&[wait_idx], &dispatched, &failure_view),
-        0,
-        "terminal check must treat the Wait as effectively dispatched/skippable once its anonymous Replace dependency failed"
     );
 }
 
@@ -7333,6 +5174,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
             binding: Some("validation_records[0]".to_string()),
             dependencies: HashSet::from(["cert".to_string()]),
             explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
         }])
         .expect("fixture has one delete"),
         id: ResourceId::new("__deferred_for", "validation_records"),
@@ -7415,91 +5257,6 @@ fn cert_state_for_deferred_replace_deadlock(id: &ResourceId) -> State {
         )]),
     )
     .with_identifier("cert-id")
-}
-
-/// Regression for carina#3164: a plan that mixes `Effect::Move` with
-/// interdependent `Effect::Replace` effects must not panic. The
-/// phased executor's Phase 1 was filtering only `Replace` and `Read`,
-/// so state-only `Move` effects were dispatched into
-/// `execute_basic_effect` and tripped its `unreachable!()` arm.
-/// Move effects are state-only and must be skipped by the runtime
-/// executor — the CLI's `execute_state_only_effects` step applies them
-/// to state.
-#[tokio::test]
-async fn test_phased_move_with_interdependent_replace_does_not_panic() {
-    let provider = MockProvider::new();
-
-    let role_id = ResourceId::new("test", "role");
-    let policy_old_id = ResourceId::new("test", "policy_old");
-    let policy_new_id = ResourceId::new("test", "policy_new");
-
-    let role_from = State::existing(role_id.clone(), HashMap::new()).with_identifier("role-old");
-    let mut role_to = Resource::new("test", "role");
-    role_to.binding = Some("role".to_string());
-
-    let policy_from =
-        State::existing(policy_new_id.clone(), HashMap::new()).with_identifier("policy-old");
-    let mut policy_to = Resource::new("test", "policy_new");
-    policy_to.dependency_bindings = std::collections::BTreeSet::from(["role".to_string()]);
-
-    let mut plan = Plan::new();
-    plan.add(Effect::Replace {
-        id: role_id.clone(),
-        from: Box::new(role_from),
-        to: role_to,
-        directives: Directives::default(),
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["role_name".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-    plan.add(Effect::Move {
-        from: policy_old_id,
-        to: policy_new_id.clone(),
-    });
-    plan.add(Effect::Replace {
-        id: policy_new_id,
-        from: Box::new(policy_from),
-        to: policy_to,
-        directives: Directives::default(),
-        changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["policy_name".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-
-    provider.push_delete(Ok(()));
-    provider.push_create(Ok(ok_state(&role_id)));
-    provider.push_delete(Ok(()));
-    provider.push_create(Ok(ok_state(&ResourceId::new("test", "policy_new"))));
-
-    let input = ExecutionInput {
-        plan: &plan,
-        unresolved_resources: &HashMap::new(),
-        compositions: &[],
-        bindings: ResolvedBindings::default(),
-        current_states: HashMap::new(),
-        normalizer: &NoopNormalizer,
-        provider_configs: &[],
-        factories: &[],
-        schemas: &TEST_SCHEMAS,
-        parallelism: crate::executor::TEST_UNCAPPED,
-    };
-
-    let observer = MockObserver::new();
-    let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
-
-    assert_eq!(
-        result.failure_count, 0,
-        "Replace effects must succeed; Move must be skipped, not dispatched to execute_basic_effect"
-    );
-    assert_eq!(
-        result.success_count, 2,
-        "two Replace effects should be counted as successes; Move is state-only and handled by the CLI"
-    );
 }
 
 // -----------------------------------------------------------------------

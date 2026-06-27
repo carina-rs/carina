@@ -192,6 +192,9 @@ fn build_plan_file<E>(
         .to_string();
 
     Ok(PlanFile {
+        // carina#3625: bumped 6→7 — replacement effects are decomposed
+        // into Create/Update/Delete with replace_display metadata.
+        //
         // carina#3486: bumped 5→6 — saved plans now persist
         // `unresolved_resources`, the pre-resolution snapshot needed by
         // apply-time dependency analysis and reference re-resolution.
@@ -207,7 +210,7 @@ fn build_plan_file<E>(
         // the same `ResolvedBindings` view as the live-apply path.
         // Older plans (version below current) are rejected with a
         // clear message pointing the user at re-running `plan`.
-        version: 6,
+        version: 7,
         carina_version: env!("CARGO_PKG_VERSION").to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
         source_path,

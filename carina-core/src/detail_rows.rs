@@ -11,7 +11,8 @@ use indexmap::IndexMap;
 use crate::diff_helpers::{compute_map_diff, compute_unchanged_count, schema_aware_equal};
 use crate::effect::Effect;
 use crate::non_empty::NonEmptyVec;
-use crate::resource::{ConcreteValue, DeferredValue, ResourceId, Value};
+use crate::plan::ReplaceDisplayMetadata;
+use crate::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, State, Value};
 use crate::schema::{AttributeType, ResourceSchema, SchemaRegistry, empty_defs_for_schema_walks};
 use crate::value::{format_value, format_value_with_key, is_list_of_maps, map_similarity};
 
@@ -113,7 +114,7 @@ pub enum DetailRow {
     Default { key: String, value: String },
     /// A read-only attribute (known after apply, for Create effects in Full mode)
     ReadOnly { key: String },
-    /// Summary of hidden unchanged attributes (for Update/Replace effects in Full mode)
+    /// Summary of hidden unchanged attributes (for Update or replacement rows in Full mode)
     HiddenUnchanged { count: usize },
     /// A removed create-only attribute that forces replacement.
     ReplaceRemoved { key: String, old: String },
@@ -129,11 +130,6 @@ pub enum DetailRow {
         temporary_value: String,
         original_value: String,
         attribute: String,
-    },
-    /// Cascading updates section
-    CascadingUpdates {
-        count: usize,
-        updates: Vec<CascadingUpdateIR>,
     },
 }
 
@@ -308,22 +304,6 @@ pub enum ListOfMapsDiffField {
     },
 }
 
-/// A cascading update entry
-#[derive(Debug, Clone, PartialEq)]
-pub struct CascadingUpdateIR {
-    pub display_type: String,
-    pub name: String,
-    pub changed_attrs: Vec<CascadingUpdateAttr>,
-}
-
-/// A changed attribute in a cascading update
-#[derive(Debug, Clone, PartialEq)]
-pub struct CascadingUpdateAttr {
-    pub key: String,
-    pub old: String,
-    pub new: String,
-}
-
 /// Resolve the subtype for map entry `key`: a `Map`'s `value` type, a
 /// `Struct` field's type, or `None`. `List`/`Union` are unwrapped so a
 /// nested `List<Map>`/`List<Struct>` still resolves its entries
@@ -422,30 +402,14 @@ pub fn build_detail_rows(
         } => {
             let explicit = prev_explicit.and_then(|map| map.get(&to.id));
             let schema = registry.and_then(|r| r.get_for(to));
-            build_update_rows(from, to, changed_attributes, schema, detail, explicit)
-        }
-        Effect::Replace {
-            from,
-            to,
-            changed_create_only,
-            cascading_updates,
-            temporary_name,
-            cascade_ref_hints,
-            ..
-        } => {
-            let explicit = prev_explicit.and_then(|map| map.get(&to.id));
-            let schema = registry.and_then(|r| r.get_for(to));
-            build_replace_rows(
-                from,
-                to,
-                changed_create_only,
-                cascading_updates,
-                temporary_name,
-                cascade_ref_hints,
-                schema,
-                detail,
-                explicit,
-            )
+            match from {
+                crate::effect::UpdateBase::Existing(from) => {
+                    build_update_rows(from, to, changed_attributes, schema, detail, explicit)
+                }
+                crate::effect::UpdateBase::CreatedBy { .. } => {
+                    build_create_rows(&to.attributes, schema, detail)
+                }
+            }
         }
         Effect::Delete { id, .. } => build_delete_rows(id, delete_attributes),
         Effect::Read { resource } => {
@@ -473,6 +437,38 @@ pub fn build_detail_rows(
         | Effect::DeferredCreate { .. }
         | Effect::DeferredReplace { .. } => Vec::new(),
     }
+}
+
+pub fn build_replace_display_rows(
+    metadata: &ReplaceDisplayMetadata,
+    create: &Resource,
+    delete_attributes: Option<&HashMap<ResourceId, HashMap<String, Value>>>,
+    registry: Option<&SchemaRegistry>,
+    detail: DetailLevel,
+    prev_explicit: Option<&HashMap<ResourceId, crate::explicit::ExplicitFields>>,
+) -> Vec<DetailRow> {
+    if detail == DetailLevel::NamesOnly {
+        return Vec::new();
+    }
+
+    let schema = registry.and_then(|r| r.get_for(create));
+    let explicit = prev_explicit.and_then(|map| map.get(&create.id));
+    let from_attrs = delete_attributes
+        .and_then(|attrs| attrs.get(&metadata.id))
+        .cloned()
+        .unwrap_or_else(|| metadata.previous_attributes.clone());
+    let from = State::existing(metadata.id.clone(), from_attrs);
+
+    build_replace_rows(
+        &from,
+        create,
+        &metadata.changed_create_only,
+        &metadata.temporary_name,
+        &metadata.cascade_ref_hints,
+        schema,
+        detail,
+        explicit,
+    )
 }
 
 fn build_create_rows(
@@ -953,7 +949,6 @@ fn build_replace_rows(
     from: &crate::resource::State,
     to: &crate::resource::Resource,
     changed_create_only: &[String],
-    cascading_updates: &[crate::effect::CascadingUpdate],
     temporary_name: &Option<crate::effect::TemporaryName>,
     cascade_ref_hints: &[(String, String)],
     schema: Option<&ResourceSchema>,
@@ -1038,33 +1033,6 @@ fn build_replace_rows(
                 count: unchanged_count,
             });
         }
-    }
-
-    // Cascading updates
-    if !cascading_updates.is_empty() {
-        let replaced_binding = to.binding.as_deref().unwrap_or("");
-
-        let mut updates = Vec::new();
-        for cascade in cascading_updates {
-            let mut changed_attrs = Vec::new();
-            collect_cascading_update_attrs(
-                &cascade.from.attributes,
-                &cascade.to.attributes,
-                replaced_binding,
-                &mut changed_attrs,
-            );
-
-            updates.push(CascadingUpdateIR {
-                display_type: cascade.id.display_type(),
-                name: cascade.id.name_str().to_string(),
-                changed_attrs,
-            });
-        }
-
-        rows.push(DetailRow::CascadingUpdates {
-            count: cascading_updates.len(),
-            updates,
-        });
     }
 
     rows
@@ -1781,7 +1749,7 @@ fn string_list_inner_type(attr_type: &AttributeType) -> Option<&AttributeType> {
     }
 }
 
-/// Check whether a Value references the given binding name.
+#[cfg(test)]
 fn value_references_binding(value: &Value, binding: &str) -> bool {
     let mut found = false;
     value.visit_resource_refs(&mut |path| {
@@ -1795,93 +1763,6 @@ fn value_references_binding(value: &Value, binding: &str) -> bool {
         }
     });
     found
-}
-
-fn collect_cascading_update_attrs(
-    old_attrs: &HashMap<String, Value>,
-    new_attrs: &IndexMap<String, Value>,
-    replaced_binding: &str,
-    changed_attrs: &mut Vec<CascadingUpdateAttr>,
-) {
-    let mut keys: Vec<_> = new_attrs.keys().filter(|k| !k.starts_with('_')).collect();
-    keys.sort();
-    for key in keys {
-        collect_cascading_update_attrs_for_value(
-            key,
-            old_attrs.get(key),
-            &new_attrs[key],
-            replaced_binding,
-            changed_attrs,
-        );
-    }
-}
-
-fn collect_cascading_update_attrs_for_value(
-    path: &str,
-    old_value: Option<&Value>,
-    new_value: &Value,
-    replaced_binding: &str,
-    changed_attrs: &mut Vec<CascadingUpdateAttr>,
-) {
-    if let Value::Concrete(ConcreteValue::Map(new_map)) = new_value {
-        let old_map = match old_value {
-            Some(Value::Concrete(ConcreteValue::Map(map))) => Some(map),
-            _ => None,
-        };
-        let mut keys: Vec<_> = new_map.keys().filter(|k| !k.starts_with('_')).collect();
-        keys.sort();
-        for key in keys {
-            let nested_path = format!("{path}.{key}");
-            collect_cascading_update_attrs_for_value(
-                &nested_path,
-                old_map.and_then(|map| map.get(key)),
-                &new_map[key],
-                replaced_binding,
-                changed_attrs,
-            );
-        }
-        return;
-    }
-
-    if let Value::Concrete(ConcreteValue::List(new_items)) = new_value {
-        let old_items = match old_value {
-            Some(Value::Concrete(ConcreteValue::List(items))) => Some(items),
-            _ => None,
-        };
-        for (idx, new_item) in new_items.iter().enumerate() {
-            let nested_path = format!("{path}[{idx}]");
-            collect_cascading_update_attrs_for_value(
-                &nested_path,
-                old_items.and_then(|items| items.get(idx)),
-                new_item,
-                replaced_binding,
-                changed_attrs,
-            );
-        }
-        return;
-    }
-
-    if !value_references_binding(new_value, replaced_binding) {
-        return;
-    }
-
-    let key_hint = cascade_key_hint(path);
-    let old_str = old_value
-        .map(|v| format_value_with_key(v, key_hint))
-        .unwrap_or_else(|| "(none)".to_string());
-    let new_str = format_value_with_key(new_value, key_hint);
-    changed_attrs.push(CascadingUpdateAttr {
-        key: path.to_string(),
-        old: old_str,
-        new: new_str,
-    });
-}
-
-fn cascade_key_hint(path: &str) -> Option<&str> {
-    debug_assert!(!path.starts_with('['));
-    let segment = path.rsplit('.').next()?;
-    let hint = segment.split('[').next().unwrap_or(segment);
-    if hint.is_empty() { None } else { Some(hint) }
 }
 
 #[cfg(test)]
@@ -1954,7 +1835,7 @@ mod tests {
         );
         let effect = Effect::Update {
             id: ResourceId::new("s3.Bucket", "my-bucket"),
-            from: Box::new(from),
+            from: crate::effect::UpdateBase::Existing(Box::new(from)),
             to,
             changed_attributes: vec!["versioning".to_string()],
         };
@@ -2000,7 +1881,7 @@ mod tests {
             );
         let effect = Effect::Update {
             id: ResourceId::new("s3.Bucket", "my-bucket"),
-            from: Box::new(from),
+            from: crate::effect::UpdateBase::Existing(Box::new(from)),
             to,
             changed_attributes: vec!["versioning".to_string()],
         };
@@ -2054,7 +1935,7 @@ mod tests {
             );
         let effect = Effect::Update {
             id: ResourceId::new("s3.Bucket", "my-bucket"),
-            from: Box::new(from),
+            from: crate::effect::UpdateBase::Existing(Box::new(from)),
             to,
             changed_attributes: vec!["trigger_diff".to_string()],
         };
@@ -2106,6 +1987,7 @@ mod tests {
             binding: None,
             dependencies: HashSet::new(),
             explicit_dependencies: std::collections::HashSet::new(),
+            blocked_by_updates: std::collections::HashSet::new(),
         };
         let mut delete_attrs: HashMap<ResourceId, HashMap<String, Value>> = HashMap::new();
         delete_attrs.insert(
@@ -2145,7 +2027,7 @@ mod tests {
         );
         let effect = Effect::Update {
             id: ResourceId::new("s3.Bucket", "my-bucket"),
-            from: Box::new(from),
+            from: crate::effect::UpdateBase::Existing(Box::new(from)),
             to,
             changed_attributes: vec!["removed_attr".to_string()],
         };
@@ -2175,7 +2057,7 @@ mod tests {
         let to = Resource::new("test.Widget", "beta");
         let effect = Effect::Update {
             id: ResourceId::new("test.Widget", "beta"),
-            from: Box::new(from),
+            from: crate::effect::UpdateBase::Existing(Box::new(from)),
             to,
             changed_attributes: vec!["rules".to_string()],
         };
@@ -2326,6 +2208,7 @@ mod tests {
             binding: None,
             dependencies: HashSet::new(),
             explicit_dependencies: std::collections::HashSet::new(),
+            blocked_by_updates: std::collections::HashSet::new(),
         };
         let mut tags = IndexMap::new();
         tags.insert(
@@ -2372,6 +2255,7 @@ mod tests {
             binding: None,
             dependencies: HashSet::new(),
             explicit_dependencies: std::collections::HashSet::new(),
+            blocked_by_updates: std::collections::HashSet::new(),
         };
         let mut entry = IndexMap::new();
         entry.insert(
@@ -2413,851 +2297,6 @@ mod tests {
                 Value::Concrete(ConcreteValue::List(_))
             ),
             "PrettyAttribute should carry the raw Value::Concrete(ConcreteValue::List)"
-        );
-    }
-
-    #[test]
-    fn test_replace_basic() {
-        let from = State::existing(
-            ResourceId::new("ec2.Vpc", "my-vpc"),
-            [(
-                "cidr_block".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
-            )]
-            .into_iter()
-            .collect(),
-        );
-        let to = Resource::new("ec2.Vpc", "my-vpc").with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
-        );
-        let effect = Effect::Replace {
-            id: ResourceId::new("ec2.Vpc", "my-vpc"),
-            from: Box::new(from),
-            to,
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
-                "cidr_block".to_string(),
-            ])
-            .unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
-        assert_eq!(rows.len(), 1);
-        assert!(matches!(
-            &rows[0],
-            DetailRow::ChangedForcesReplacement { key, .. } if key == "cidr_block"
-        ));
-    }
-
-    #[test]
-    fn replace_removed_create_only_attribute_emits_detail_row() {
-        let from = State::existing(
-            ResourceId::new("test.Widget", "beta"),
-            [(
-                "legacy_token".to_string(),
-                Value::Concrete(ConcreteValue::String("tok".to_string())),
-            )]
-            .into_iter()
-            .collect(),
-        );
-        let to = Resource::new("test.Widget", "beta");
-        let effect = Effect::Replace {
-            id: ResourceId::new("test.Widget", "beta"),
-            from: Box::new(from),
-            to,
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
-                "legacy_token".to_string(),
-            ])
-            .unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
-
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
-
-        assert_eq!(
-            rows,
-            vec![DetailRow::ReplaceRemoved {
-                key: "legacy_token".to_string(),
-                old: "\"tok\"".to_string(),
-            }]
-        );
-    }
-
-    #[test]
-    fn replace_removed_create_only_map_attribute_emits_map_diff_row() {
-        let mut settings = IndexMap::new();
-        settings.insert(
-            "mode".to_string(),
-            Value::Concrete(ConcreteValue::String("legacy".to_string())),
-        );
-        settings.insert(
-            "version".to_string(),
-            Value::Concrete(ConcreteValue::Int(1)),
-        );
-        let from = State::existing(
-            ResourceId::new("test.Widget", "beta"),
-            [(
-                "settings".to_string(),
-                Value::Concrete(ConcreteValue::Map(settings)),
-            )]
-            .into_iter()
-            .collect(),
-        );
-        let to = Resource::new("test.Widget", "beta");
-        let effect = Effect::Replace {
-            id: ResourceId::new("test.Widget", "beta"),
-            from: Box::new(from),
-            to,
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
-                "settings".to_string(),
-            ])
-            .unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
-
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
-
-        assert_eq!(
-            rows,
-            vec![DetailRow::MapDiffForcesReplacement {
-                key: "settings".to_string(),
-                entries: NonEmptyVec::from_vec(vec![
-                    MapDiffEntryIR::Removed {
-                        key: "mode".to_string(),
-                        value: "\"legacy\"".to_string(),
-                    },
-                    MapDiffEntryIR::Removed {
-                        key: "version".to_string(),
-                        value: "1".to_string(),
-                    },
-                ])
-                .unwrap(),
-            }]
-        );
-    }
-
-    #[test]
-    fn replace_removed_create_only_list_of_maps_attribute_emits_list_diff_row() {
-        let mut rule = IndexMap::new();
-        rule.insert(
-            "name".to_string(),
-            Value::Concrete(ConcreteValue::String("legacy".to_string())),
-        );
-        rule.insert(
-            "priority".to_string(),
-            Value::Concrete(ConcreteValue::Int(10)),
-        );
-        let old_rules = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-            ConcreteValue::Map(rule.clone()),
-        )]));
-        let from = State::existing(
-            ResourceId::new("test.Widget", "beta"),
-            [("rules".to_string(), old_rules)].into_iter().collect(),
-        );
-        let to = Resource::new("test.Widget", "beta");
-        let effect = Effect::Replace {
-            id: ResourceId::new("test.Widget", "beta"),
-            from: Box::new(from),
-            to,
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["rules".to_string()])
-                .unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
-
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
-
-        assert_eq!(
-            rows,
-            vec![DetailRow::ListOfMapsDiffForcesReplacement {
-                key: "rules".to_string(),
-                block: NonEmptyListOfMapsBlock::from_parts(
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![ListOfMapsDiffItem {
-                        fields: vec![
-                            (
-                                "name".to_string(),
-                                Value::Concrete(ConcreteValue::String("legacy".to_string())),
-                            ),
-                            (
-                                "priority".to_string(),
-                                Value::Concrete(ConcreteValue::Int(10))
-                            ),
-                        ],
-                    }],
-                )
-                .unwrap(),
-            }]
-        );
-    }
-
-    #[test]
-    fn replace_rows_include_non_forcing_attribute_diffs_and_count_only_equal_attributes() {
-        let from = State::existing(
-            ResourceId::new("wafv2.WebAcl", "edge"),
-            [
-                (
-                    "name".to_string(),
-                    Value::Concrete(ConcreteValue::String("edge-old".to_string())),
-                ),
-                (
-                    "description".to_string(),
-                    Value::Concrete(ConcreteValue::String("old description".to_string())),
-                ),
-                (
-                    "metric_name".to_string(),
-                    Value::Concrete(ConcreteValue::String("edge-old-metric".to_string())),
-                ),
-                (
-                    "rule_metric_name".to_string(),
-                    Value::Concrete(ConcreteValue::String("rule-old".to_string())),
-                ),
-                (
-                    "scope".to_string(),
-                    Value::Concrete(ConcreteValue::String("CLOUDFRONT".to_string())),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-        );
-        let to = Resource::new("wafv2.WebAcl", "edge")
-            .with_attribute(
-                "name",
-                Value::Concrete(ConcreteValue::String("edge-new".to_string())),
-            )
-            .with_attribute(
-                "description",
-                Value::Concrete(ConcreteValue::String("new description".to_string())),
-            )
-            .with_attribute(
-                "metric_name",
-                Value::Concrete(ConcreteValue::String("edge-new-metric".to_string())),
-            )
-            .with_attribute(
-                "rule_metric_name",
-                Value::Concrete(ConcreteValue::String("rule-new".to_string())),
-            )
-            .with_attribute(
-                "scope",
-                Value::Concrete(ConcreteValue::String("CLOUDFRONT".to_string())),
-            );
-        let effect = Effect::Replace {
-            id: ResourceId::new("wafv2.WebAcl", "edge"),
-            from: Box::new(from),
-            to,
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".to_string()])
-                .unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
-
-        let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, None);
-
-        assert!(
-            rows.iter().any(|row| matches!(
-                row,
-                DetailRow::ChangedForcesReplacement { key, old, new }
-                    if key == "name" && old == "\"edge-old\"" && new == "\"edge-new\""
-            )),
-            "create-only name diff should still be marked as forcing replacement: {rows:?}"
-        );
-        assert!(
-            rows.iter().any(|row| matches!(
-                row,
-                DetailRow::Changed { key, old, new }
-                    if key == "description"
-                        && old == "\"old description\""
-                        && new == "\"new description\""
-            )),
-            "non-forcing description diff must render as a normal diff row: {rows:?}"
-        );
-        assert!(
-            rows.iter().any(|row| matches!(
-                row,
-                DetailRow::Changed { key, old, new }
-                    if key == "metric_name"
-                        && old == "\"edge-old-metric\""
-                        && new == "\"edge-new-metric\""
-            )),
-            "non-forcing metric_name diff must render as a normal diff row: {rows:?}"
-        );
-        assert_eq!(
-            rows.iter().find_map(|row| match row {
-                DetailRow::HiddenUnchanged { count } => Some(*count),
-                _ => None,
-            }),
-            Some(1),
-            "HiddenUnchanged must count only genuinely equal attributes: {rows:?}"
-        );
-    }
-
-    #[test]
-    fn replace_cascading_updates_render_nested_ref_diffs_with_dotted_paths() {
-        use crate::effect::CascadingUpdate;
-        use crate::resource::InterpolationPart;
-
-        let from = State::existing(
-            ResourceId::new("wafv2.WebAcl", "edge"),
-            [(
-                "name".to_string(),
-                Value::Concrete(ConcreteValue::String("edge-old".to_string())),
-            )]
-            .into_iter()
-            .collect(),
-        );
-        let to = Resource::new("wafv2.WebAcl", "edge")
-            .with_binding("web_acl")
-            .with_attribute(
-                "name",
-                Value::Concrete(ConcreteValue::String("edge-new".to_string())),
-            );
-
-        let mut old_config = IndexMap::new();
-        old_config.insert(
-            "web_acl_id".to_string(),
-            Value::Concrete(ConcreteValue::String("arn:old-web-acl".to_string())),
-        );
-        old_config.insert(
-            "comment".to_string(),
-            Value::Concrete(ConcreteValue::String("old comment".to_string())),
-        );
-        let cascade_from = State::existing(
-            ResourceId::new("cloudfront.Distribution", "cdn"),
-            [(
-                "distribution_config".to_string(),
-                Value::Concrete(ConcreteValue::Map(old_config)),
-            )]
-            .into_iter()
-            .collect(),
-        );
-
-        let mut new_config = IndexMap::new();
-        new_config.insert(
-            "web_acl_id".to_string(),
-            Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
-                Value::resource_ref("web_acl", "arn", vec![]),
-            )])),
-        );
-        new_config.insert(
-            "comment".to_string(),
-            Value::Concrete(ConcreteValue::String("new comment".to_string())),
-        );
-        let cascade_to = Resource::new("cloudfront.Distribution", "cdn").with_attribute(
-            "distribution_config",
-            Value::Concrete(ConcreteValue::Map(new_config)),
-        );
-        let effect = Effect::Replace {
-            id: ResourceId::new("wafv2.WebAcl", "edge"),
-            from: Box::new(from),
-            to,
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".to_string()])
-                .unwrap(),
-            cascading_updates: vec![CascadingUpdate {
-                id: ResourceId::new("cloudfront.Distribution", "cdn"),
-                from: Box::new(cascade_from),
-                to: cascade_to,
-            }],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
-
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
-
-        let updates = rows
-            .iter()
-            .find_map(|row| match row {
-                DetailRow::CascadingUpdates { updates, .. } => Some(updates),
-                _ => None,
-            })
-            .expect("expected cascading update rows");
-        assert!(
-            updates[0].changed_attrs.iter().any(|attr| {
-                attr.key == "distribution_config.web_acl_id"
-                    && attr.old == "\"arn:old-web-acl\""
-                    && attr.new == "\"${web_acl.arn}\""
-            }),
-            "cascade rendering must surface the nested web_acl_id rewrite: {updates:?}"
-        );
-    }
-
-    #[test]
-    fn replace_cascading_updates_render_list_nested_ref_diffs_with_indexed_paths() {
-        use crate::effect::CascadingUpdate;
-
-        let from = State::existing(
-            ResourceId::new("wafv2.WebAcl", "edge"),
-            [(
-                "name".to_string(),
-                Value::Concrete(ConcreteValue::String("edge-old".to_string())),
-            )]
-            .into_iter()
-            .collect(),
-        );
-        let to = Resource::new("wafv2.WebAcl", "edge")
-            .with_binding("web_acl")
-            .with_attribute(
-                "name",
-                Value::Concrete(ConcreteValue::String("edge-new".to_string())),
-            );
-
-        let mut old_rule = IndexMap::new();
-        old_rule.insert(
-            "name".to_string(),
-            Value::Concrete(ConcreteValue::String("rule-1".to_string())),
-        );
-        old_rule.insert(
-            "web_acl_id".to_string(),
-            Value::Concrete(ConcreteValue::String("arn:old-web-acl".to_string())),
-        );
-        let cascade_from = State::existing(
-            ResourceId::new("test.RuleSet", "rules"),
-            [(
-                "rules".to_string(),
-                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                    ConcreteValue::Map(old_rule),
-                )])),
-            )]
-            .into_iter()
-            .collect(),
-        );
-
-        let mut new_rule = IndexMap::new();
-        new_rule.insert(
-            "name".to_string(),
-            Value::Concrete(ConcreteValue::String("rule-1".to_string())),
-        );
-        new_rule.insert(
-            "web_acl_id".to_string(),
-            Value::resource_ref("web_acl", "arn", vec![]),
-        );
-        let cascade_to = Resource::new("test.RuleSet", "rules").with_attribute(
-            "rules",
-            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::Map(new_rule),
-            )])),
-        );
-
-        let effect = Effect::Replace {
-            id: ResourceId::new("wafv2.WebAcl", "edge"),
-            from: Box::new(from),
-            to,
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".to_string()])
-                .unwrap(),
-            cascading_updates: vec![CascadingUpdate {
-                id: ResourceId::new("test.RuleSet", "rules"),
-                from: Box::new(cascade_from),
-                to: cascade_to,
-            }],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
-
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
-
-        let updates = rows
-            .iter()
-            .find_map(|row| match row {
-                DetailRow::CascadingUpdates { updates, .. } => Some(updates),
-                _ => None,
-            })
-            .expect("expected cascading update rows");
-        assert!(
-            updates[0].changed_attrs.iter().any(|attr| {
-                attr.key == "rules[0].web_acl_id"
-                    && attr.old == "\"arn:old-web-acl\""
-                    && attr.new == "web_acl.arn"
-            }),
-            "cascade rendering must surface the nested list web_acl_id rewrite: {updates:?}"
-        );
-    }
-
-    #[test]
-    fn cascade_key_hint_strips_top_level_list_index() {
-        assert_eq!(cascade_key_hint("rules[0]"), Some("rules"));
-    }
-
-    #[test]
-    fn cascade_key_hint_rejects_index_only_path() {
-        #[cfg(debug_assertions)]
-        {
-            assert!(
-                std::panic::catch_unwind(|| cascade_key_hint("[0]")).is_err(),
-                "index-only paths should trip the debug assertion"
-            );
-        }
-
-        #[cfg(not(debug_assertions))]
-        {
-            assert_eq!(cascade_key_hint("[0]"), None);
-        }
-    }
-
-    #[test]
-    fn replace_same_forcing_key_prefers_cascade_ref_hint() {
-        let from = State::existing(
-            ResourceId::new("test.Widget", "w"),
-            [(
-                "arn".to_string(),
-                Value::Concrete(ConcreteValue::String("arn:old".to_string())),
-            )]
-            .into_iter()
-            .collect(),
-        );
-        let to = Resource::new("test.Widget", "w").with_attribute(
-            "arn",
-            Value::Concrete(ConcreteValue::String("arn:old".to_string())),
-        );
-        let effect = Effect::Replace {
-            id: ResourceId::new("test.Widget", "w"),
-            from: Box::new(from),
-            to,
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["arn".to_string()])
-                .unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![("arn".to_string(), "${web_acl.arn}".to_string())],
-        };
-
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
-
-        assert!(
-            rows.iter().any(|row| matches!(
-                row,
-                DetailRow::ReplaceCascade { key, old, new }
-                    if key == "arn" && old == "\"arn:old\"" && new == "${web_acl.arn}"
-            )),
-            "same forcing key should render ReplaceCascade with the cascade hint: {rows:?}"
-        );
-    }
-
-    #[test]
-    fn replace_same_forcing_key_without_cascade_ref_hint_formats_new_value() {
-        let from = State::existing(
-            ResourceId::new("test.Widget", "w"),
-            [(
-                "arn".to_string(),
-                Value::Concrete(ConcreteValue::String("arn:old".to_string())),
-            )]
-            .into_iter()
-            .collect(),
-        );
-        let to = Resource::new("test.Widget", "w").with_attribute(
-            "arn",
-            Value::Concrete(ConcreteValue::String("arn:old".to_string())),
-        );
-        let effect = Effect::Replace {
-            id: ResourceId::new("test.Widget", "w"),
-            from: Box::new(from),
-            to,
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["arn".to_string()])
-                .unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
-
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
-
-        assert!(
-            rows.iter().any(|row| matches!(
-                row,
-                DetailRow::ReplaceCascade { key, old, new }
-                    if key == "arn" && old == "\"arn:old\"" && new == "\"arn:old\""
-            )),
-            "same forcing key should fall back to formatting the new value: {rows:?}"
-        );
-    }
-
-    #[test]
-    fn replace_forcing_list_of_maps_keeps_row_when_nested_diff_collapses() {
-        let mut old_condition = IndexMap::new();
-        old_condition.insert(
-            "string_equals".to_string(),
-            Value::Concrete(ConcreteValue::StringList(vec!["x".to_string()])),
-        );
-        let mut new_condition = IndexMap::new();
-        new_condition.insert(
-            "string_equals".to_string(),
-            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("x".to_string()),
-            )])),
-        );
-        let mut old_item = IndexMap::new();
-        old_item.insert(
-            "sid".to_string(),
-            Value::Concrete(ConcreteValue::String("shared".to_string())),
-        );
-        old_item.insert(
-            "condition".to_string(),
-            Value::Concrete(ConcreteValue::Map(old_condition)),
-        );
-        let mut new_item = IndexMap::new();
-        new_item.insert(
-            "sid".to_string(),
-            Value::Concrete(ConcreteValue::String("shared".to_string())),
-        );
-        new_item.insert(
-            "condition".to_string(),
-            Value::Concrete(ConcreteValue::Map(new_condition)),
-        );
-        let from = State::existing(
-            ResourceId::new("test.Widget", "w"),
-            [(
-                "rules".to_string(),
-                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                    ConcreteValue::Map(old_item),
-                )])),
-            )]
-            .into_iter()
-            .collect(),
-        );
-        let to = Resource::new("test.Widget", "w").with_attribute(
-            "rules",
-            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::Map(new_item),
-            )])),
-        );
-        let effect = Effect::Replace {
-            id: ResourceId::new("test.Widget", "w"),
-            from: Box::new(from),
-            to,
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["rules".to_string()])
-                .unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
-
-        let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, None);
-
-        assert!(
-            rows.iter().any(|row| matches!(
-                row,
-                DetailRow::ForceReplaceListOfMapsHeader { key } if key == "rules"
-            )),
-            "forcing list-of-maps key must render as a header-only row when nested diffs collapse: {rows:?}"
-        );
-    }
-
-    #[test]
-    fn replace_forcing_map_keeps_row_when_nested_diff_collapses() {
-        let mut old_settings = IndexMap::new();
-        old_settings.insert(
-            "principal".to_string(),
-            Value::Concrete(ConcreteValue::StringList(vec![
-                "arn:aws:iam::123:oidc-provider/x".to_string(),
-            ])),
-        );
-        let mut new_settings = IndexMap::new();
-        new_settings.insert(
-            "principal".to_string(),
-            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("arn:aws:iam::123:oidc-provider/x".to_string()),
-            )])),
-        );
-        let from = State::existing(
-            ResourceId::new("test.Widget", "w"),
-            [(
-                "settings".to_string(),
-                Value::Concrete(ConcreteValue::Map(old_settings)),
-            )]
-            .into_iter()
-            .collect(),
-        );
-        let to = Resource::new("test.Widget", "w").with_attribute(
-            "settings",
-            Value::Concrete(ConcreteValue::Map(new_settings)),
-        );
-        let effect = Effect::Replace {
-            id: ResourceId::new("test.Widget", "w"),
-            from: Box::new(from),
-            to,
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
-                "settings".to_string(),
-            ])
-            .unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
-
-        let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, None);
-
-        assert!(
-            rows.iter().any(|row| matches!(
-                row,
-                DetailRow::ForceReplaceMapHeader { key } if key == "settings"
-            )),
-            "forcing map key must render as a header-only row when nested diffs collapse: {rows:?}"
-        );
-    }
-
-    #[test]
-    fn replace_forcing_display_equal_scalar_still_renders_forcing_row() {
-        let from = State::existing(
-            ResourceId::new("test.Widget", "w"),
-            [(
-                "aliases".to_string(),
-                Value::Concrete(ConcreteValue::StringList(vec!["only-one".to_string()])),
-            )]
-            .into_iter()
-            .collect(),
-        );
-        let to = Resource::new("test.Widget", "w").with_attribute(
-            "aliases",
-            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("only-one".to_string()),
-            )])),
-        );
-        let effect = Effect::Replace {
-            id: ResourceId::new("test.Widget", "w"),
-            from: Box::new(from),
-            to,
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["aliases".to_string()])
-                .unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
-
-        let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, None);
-
-        assert!(
-            rows.iter().any(|row| matches!(
-                row,
-                DetailRow::ChangedForcesReplacement { key, old, new }
-                    if key == "aliases" && old == "[\"only-one\"]" && new == "[\"only-one\"]"
-            )),
-            "forcing display-equal scalar key must remain visible: {rows:?}"
-        );
-    }
-
-    #[test]
-    fn replace_forcing_key_uses_raw_old_value_when_explicit_projection_omits_it() {
-        use crate::explicit::ExplicitFields;
-
-        let id = ResourceId::new("test.Widget", "w");
-        let from = State::existing(
-            id.clone(),
-            [
-                (
-                    "server_defaulted_name".to_string(),
-                    Value::Concrete(ConcreteValue::String("old-name".to_string())),
-                ),
-                (
-                    "authored".to_string(),
-                    Value::Concrete(ConcreteValue::String("kept".to_string())),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-        );
-        let to = Resource::new("test.Widget", "w")
-            .with_attribute(
-                "server_defaulted_name",
-                Value::Concrete(ConcreteValue::String("new-name".to_string())),
-            )
-            .with_attribute(
-                "authored",
-                Value::Concrete(ConcreteValue::String("kept".to_string())),
-            );
-        let effect = Effect::Replace {
-            id: id.clone(),
-            from: Box::new(from),
-            to,
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
-                "server_defaulted_name".to_string(),
-            ])
-            .unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
-        let explicit = HashMap::from([(
-            id,
-            ExplicitFields::Struct {
-                children: HashMap::from([("authored".to_string(), ExplicitFields::Leaf)]),
-            },
-        )]);
-
-        let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, Some(&explicit));
-
-        assert!(
-            rows.iter().any(|row| matches!(
-                row,
-                DetailRow::ChangedForcesReplacement { key, old, new }
-                    if key == "server_defaulted_name"
-                        && old == "\"old-name\""
-                        && new == "\"new-name\""
-            )),
-            "forcing key should use raw state old value even when projection omits it: {rows:?}"
-        );
-    }
-
-    #[test]
-    fn replace_rows_include_non_forcing_removed_attributes() {
-        let from = State::existing(
-            ResourceId::new("test.Widget", "w"),
-            [
-                (
-                    "external_name".to_string(),
-                    Value::Concrete(ConcreteValue::String("old-name".to_string())),
-                ),
-                (
-                    "tag".to_string(),
-                    Value::Concrete(ConcreteValue::String("legacy".to_string())),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-        );
-        let to = Resource::new("test.Widget", "w").with_attribute(
-            "external_name",
-            Value::Concrete(ConcreteValue::String("new-name".to_string())),
-        );
-        let effect = Effect::Replace {
-            id: ResourceId::new("test.Widget", "w"),
-            from: Box::new(from),
-            to,
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
-                "external_name".to_string(),
-            ])
-            .unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
-
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
-
-        assert!(
-            rows.iter()
-                .any(|row| matches!(row, DetailRow::Removed { key, old } if key == "tag" && old == "\"legacy\"")),
-            "replace rows must render non-forcing removed attributes alongside forcing changes: {rows:?}"
         );
     }
 
@@ -3439,7 +2478,7 @@ mod tests {
         );
     }
 
-    // --- carina#3073: schema-aware Update/Replace renderer ---
+    // --- carina#3073: schema-aware Update/replacement renderer ---
 
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
@@ -3540,7 +2579,7 @@ mod tests {
         );
         let effect = Effect::Update {
             id: ResourceId::new("iam.Role", "r"),
-            from: Box::new(from),
+            from: crate::effect::UpdateBase::Existing(Box::new(from)),
             to,
             changed_attributes: vec!["policy".to_string()],
         };
@@ -3589,7 +2628,7 @@ mod tests {
             );
         let effect = Effect::Update {
             id: ResourceId::new("iam.Role", "r"),
-            from: Box::new(from),
+            from: crate::effect::UpdateBase::Existing(Box::new(from)),
             to,
             changed_attributes: vec!["policy".to_string(), "description".to_string()],
         };
@@ -3633,7 +2672,7 @@ mod tests {
         );
         let effect = Effect::Update {
             id: ResourceId::new("iam.Role", "r"),
-            from: Box::new(from),
+            from: crate::effect::UpdateBase::Existing(Box::new(from)),
             to,
             changed_attributes: vec!["policy".to_string()],
         };
@@ -3673,7 +2712,7 @@ mod tests {
         );
         let effect = Effect::Update {
             id: ResourceId::new("iam.Role", "r"),
-            from: Box::new(from),
+            from: crate::effect::UpdateBase::Existing(Box::new(from)),
             to,
             changed_attributes: vec!["policy".to_string()],
         };
@@ -3735,7 +2774,7 @@ mod tests {
             .with_attribute("modes", mk(ConcreteValue::String("On".to_string())));
         let effect = Effect::Update {
             id: ResourceId::new("x.Thing", "t"),
-            from: Box::new(from),
+            from: crate::effect::UpdateBase::Existing(Box::new(from)),
             to,
             changed_attributes: vec!["modes".to_string()],
         };
@@ -3775,7 +2814,7 @@ mod tests {
         );
         let effect = Effect::Update {
             id: ResourceId::new("iam.Role", "r"),
-            from: Box::new(from),
+            from: crate::effect::UpdateBase::Existing(Box::new(from)),
             to,
             changed_attributes: vec!["policy".to_string()],
         };
@@ -3836,7 +2875,7 @@ mod tests {
             );
         let effect = Effect::Update {
             id: ResourceId::new("iam.Role", "r"),
-            from: Box::new(from),
+            from: crate::effect::UpdateBase::Existing(Box::new(from)),
             to,
             changed_attributes: vec!["policy".to_string(), "description".to_string()],
         };
@@ -3925,7 +2964,7 @@ mod tests {
             Resource::new("x.Thing", "t").with_attribute("modes", enum_list(&["Allow", "Deny"]));
         let effect = Effect::Update {
             id: ResourceId::new("x.Thing", "t"),
-            from: Box::new(from),
+            from: crate::effect::UpdateBase::Existing(Box::new(from)),
             to,
             changed_attributes: vec!["modes".to_string()],
         };
@@ -4140,7 +3179,7 @@ mod tests {
         );
         let effect = Effect::Update {
             id: ResourceId::new("x.Thing", "t"),
-            from: Box::new(from),
+            from: crate::effect::UpdateBase::Existing(Box::new(from)),
             to,
             changed_attributes: vec!["tags".to_string()],
         };
@@ -4183,7 +3222,7 @@ mod tests {
         );
         let effect = Effect::Update {
             id: ResourceId::new("x.Thing", "t"),
-            from: Box::new(from),
+            from: crate::effect::UpdateBase::Existing(Box::new(from)),
             to,
             changed_attributes: vec!["password".to_string()],
         };
@@ -4405,7 +3444,7 @@ mod tests {
             Resource::new("x.Thing", "t").with_attribute("modes", enum_list(&["Allow", "Deny"]));
         let effect = Effect::Update {
             id: ResourceId::new("x.Thing", "t"),
-            from: Box::new(from),
+            from: crate::effect::UpdateBase::Existing(Box::new(from)),
             to,
             changed_attributes: vec!["modes".to_string()],
         };

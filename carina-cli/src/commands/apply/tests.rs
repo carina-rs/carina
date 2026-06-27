@@ -792,207 +792,6 @@ fn block_name_attribute_state_roundtrip() {
     }
 }
 
-/// Move + Replace targeting the same `to` ResourceId must end up with
-/// the post-Replace `identifier` and `attributes` in state, not the
-/// pre-Replace values inherited from the `from` row.
-///
-/// Regression coverage for carina#3170 (root cause of carina#3167).
-/// Before the WritebackPlan refactor, `build_state_after_apply`
-/// processed `Effect::Move` in a second loop that copied the
-/// pre-Replace `from` row's contents into the `to` row via
-/// `upsert_resource`, overwriting Phase 1's post-Replace Upsert. The
-/// result was a state row with the new SimHash address but the
-/// pre-Replace identifier and attributes, which on the next plan
-/// produces a spurious `+ Create` because `provider.read()` against
-/// the stale identifier returns `NoSuchEntity`.
-#[test]
-fn move_plus_replace_keeps_post_replace_identifier_and_attributes() {
-    use carina_core::effect::Effect;
-    use carina_core::resource::Directives;
-    use carina_state::{ResourceState, StateFile};
-
-    let mut schemas = SchemaRegistry::new();
-    let schema = ResourceSchema::new("iam.RolePolicy")
-        .attribute(AttributeSchema::new("role_name", AttributeType::string()).create_only())
-        .attribute(AttributeSchema::new("policy_name", AttributeType::string()).create_only())
-        .attribute(AttributeSchema::new(
-            "policy_document",
-            AttributeType::string(),
-        ));
-    schemas.insert("awscc", schema);
-
-    // Desired resource lives at the post-rename SimHash address with
-    // the post-rename role_name + policy_name (the values the user
-    // wrote in .crn after the IAM Role rename).
-    let new_id = ResourceId::with_provider(
-        "awscc",
-        "iam.RolePolicy",
-        "rd.awscc_iam_role_policy_0cd2c914",
-        None,
-    );
-    let mut resource = Resource {
-        id: new_id.clone(),
-        ..Resource::with_provider(
-            new_id.provider.clone(),
-            new_id.resource_type.clone(),
-            new_id.name.as_str(),
-            None,
-        )
-    };
-    resource.set_attr(
-        "role_name".to_string(),
-        Value::Concrete(ConcreteValue::String(
-            "carina-registry-infra-deploy".to_string(),
-        )),
-    );
-    resource.set_attr(
-        "policy_name".to_string(),
-        Value::Concrete(ConcreteValue::String(
-            "carina-registry-infra-deploy-inline".to_string(),
-        )),
-    );
-    resource.set_attr(
-        "policy_document".to_string(),
-        Value::Concrete(ConcreteValue::String("{}".to_string())),
-    );
-    let sorted_resources = vec![resource];
-
-    // applied_states holds the provider's post-create State for the
-    // new address: new identifier + new attribute values.
-    let mut applied_attrs = HashMap::new();
-    applied_attrs.insert(
-        "role_name".to_string(),
-        Value::Concrete(ConcreteValue::String(
-            "carina-registry-infra-deploy".to_string(),
-        )),
-    );
-    applied_attrs.insert(
-        "policy_name".to_string(),
-        Value::Concrete(ConcreteValue::String(
-            "carina-registry-infra-deploy-inline".to_string(),
-        )),
-    );
-    applied_attrs.insert(
-        "policy_document".to_string(),
-        Value::Concrete(ConcreteValue::String("{}".to_string())),
-    );
-    let applied = State::existing(new_id.clone(), applied_attrs)
-        .with_identifier("carina-registry-infra-deploy-inline|carina-registry-infra-deploy");
-    let mut applied_states = HashMap::new();
-    applied_states.insert(new_id.clone(), applied);
-
-    // Pre-existing state file has the old SimHash address row, with
-    // the pre-rename role_name + policy_name and the pre-rename
-    // identifier. materialize_moved_states normally transfers this
-    // row's State to the new id in current_states; build_state_after_apply
-    // is invoked here after that transfer would have happened, so the
-    // saved `from` row in the file still has the old values.
-    let old_row = ResourceState::new(
-        "iam.RolePolicy",
-        "rd.awscc_iam_role_policy_02942703",
-        "awscc",
-    )
-    .with_identifier("carina-registry-deploy-inline|carina-registry-deploy")
-    .with_attribute(
-        "role_name",
-        serde_json::Value::String("carina-registry-deploy".to_string()),
-    )
-    .with_attribute(
-        "policy_name",
-        serde_json::Value::String("carina-registry-deploy-inline".to_string()),
-    )
-    .with_attribute(
-        "policy_document",
-        serde_json::Value::String("{}".to_string()),
-    );
-    let mut state_file = StateFile::default();
-    state_file.resources.push(old_row);
-
-    // Plan has Replace (handled via applied_states in Phase 1) plus
-    // Move from the old address to the new one (Phase 2).
-    let mut plan = Plan::new();
-    let from_id = ResourceId::with_provider(
-        "awscc",
-        "iam.RolePolicy",
-        "rd.awscc_iam_role_policy_02942703",
-        None,
-    );
-    plan.add(Effect::Replace {
-        id: new_id.clone(),
-        from: Box::new(State::existing(from_id.clone(), HashMap::new())),
-        to: sorted_resources[0].clone(),
-        directives: Directives::default(),
-        changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec![
-            "role_name".to_string(),
-            "policy_name".to_string(),
-        ])
-        .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-    plan.add(Effect::Move {
-        from: from_id.clone(),
-        to: new_id.clone(),
-    });
-
-    let saved = build_state_after_apply(ApplyStateSave {
-        state_file: Some(state_file),
-        sorted_resources: &sorted_resources,
-        runtime_synthesized_resources: &[],
-        current_states: &HashMap::new(),
-        applied_states: &applied_states,
-        permanent_name_overrides: &HashMap::new(),
-        plan: &plan,
-        successfully_deleted: &HashSet::new(),
-        failed_refreshes: &HashSet::new(),
-        schemas: &schemas,
-    })
-    .expect("writeback should succeed");
-
-    // The old address must no longer exist in state.
-    assert!(
-        saved
-            .find_resource(
-                "awscc",
-                "iam.RolePolicy",
-                "rd.awscc_iam_role_policy_02942703"
-            )
-            .is_none(),
-        "old SimHash row must be removed after Move",
-    );
-
-    // The new address row must carry the post-Replace identifier and
-    // post-Replace attribute values, not the pre-Replace ones from the
-    // old row.
-    let new_row = saved
-        .find_resource(
-            "awscc",
-            "iam.RolePolicy",
-            "rd.awscc_iam_role_policy_0cd2c914",
-        )
-        .expect("new SimHash row must exist");
-    assert_eq!(
-        new_row.identifier.as_deref(),
-        Some("carina-registry-infra-deploy-inline|carina-registry-infra-deploy"),
-        "Move must not overwrite Replace's post-create identifier",
-    );
-    assert_eq!(
-        new_row.attributes.get("role_name"),
-        Some(&serde_json::Value::String(
-            "carina-registry-infra-deploy".to_string()
-        )),
-        "Move must not overwrite Replace's post-create role_name",
-    );
-    assert_eq!(
-        new_row.attributes.get("policy_name"),
-        Some(&serde_json::Value::String(
-            "carina-registry-infra-deploy-inline".to_string()
-        )),
-        "Move must not overwrite Replace's post-create policy_name",
-    );
-}
-
 /// Move + Update — same shape as the Replace case but the Update
 /// effect changes a non-create-only attribute. The post-Update
 /// attribute value must survive Phase 2's Move cleanup.
@@ -1044,7 +843,10 @@ fn move_plus_update_keeps_post_update_attributes() {
     let from_id = ResourceId::with_provider("awscc", "ec2.Tag", "tag_old", None);
     plan.add(Effect::Update {
         id: new_id.clone(),
-        from: Box::new(State::existing(from_id.clone(), HashMap::new())),
+        from: carina_core::effect::UpdateBase::Existing(Box::new(State::existing(
+            from_id.clone(),
+            HashMap::new(),
+        ))),
         to: sorted_resources[0].clone(),
         changed_attributes: vec!["value".to_string()],
     });
@@ -1081,7 +883,7 @@ fn move_plus_update_keeps_post_update_attributes() {
     );
 }
 
-/// Pure-rename `moved {}` block — no Create/Update/Replace on the
+/// Pure-rename `moved {}` block — no Create/Update/replacement on the
 /// `to` address. `materialize_moved_states` transferred the `from`
 /// State into `current_states[to]` before writeback runs, so Phase 1
 /// must pick up the row from `current_states` and the new address
@@ -2414,7 +2216,7 @@ mod saved_plan_version_tests {
             "error must name the rejected version, got: {msg}",
         );
         assert!(
-            msg.contains("expected 6"),
+            msg.contains("expected 7"),
             "error must name the expected version, got: {msg}",
         );
         assert!(

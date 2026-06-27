@@ -295,12 +295,6 @@ fn effect_required_ops(effect: &Effect) -> Vec<(ResourceId, PlanOp)> {
         Effect::Read { resource } => vec![(resource.id.clone(), PlanOp::Read)],
         Effect::Create(resource) => vec![(resource.id.clone(), PlanOp::Create)],
         Effect::Update { id, .. } => vec![(id.clone(), PlanOp::Update)],
-        Effect::Replace { id, to, .. } => {
-            vec![
-                (id.clone(), PlanOp::Delete),
-                (to.id.clone(), PlanOp::Create),
-            ]
-        }
         Effect::Delete { id, .. } => vec![(id.clone(), PlanOp::Delete)],
         Effect::Import { id, .. } => vec![(id.clone(), PlanOp::Read)],
         Effect::DeferredCreate { template, .. } => {
@@ -327,7 +321,6 @@ fn effect_resource_ids(effect: &Effect) -> Vec<&ResourceId> {
         Effect::Read { resource } => vec![&resource.id],
         Effect::Create(resource) => vec![&resource.id],
         Effect::Update { id, .. } => vec![id],
-        Effect::Replace { id, to, .. } => vec![id, &to.id],
         Effect::Delete { id, .. } => vec![id],
         Effect::Import { id, .. } => vec![id],
         Effect::Remove { id, .. } => vec![id],
@@ -757,13 +750,13 @@ fn plan_op_rank(op: PlanOp) -> u8 {
 mod tests {
     use super::*;
     use aws_sdk_iam::error::ErrorMetadata;
-    use carina_core::effect::ChangedCreateOnly;
+    use carina_core::effect::{DeferredReplaceDelete, NonEmptyDeletes};
     use carina_core::parser::{DeferredForExpression, ForBinding};
     use carina_core::provider::{
         BoxFuture, CreateRequest, DeleteRequest, ProviderError, ProviderResult, ReadRequest,
         UpdateRequest,
     };
-    use carina_core::resource::{ConcreteValue, DataSource, Resource, State, Value};
+    use carina_core::resource::{DataSource, Directives, Resource, State};
 
     struct PermissionProvider;
 
@@ -818,73 +811,6 @@ mod tests {
     }
 
     #[test]
-    fn collect_required_actions_maps_effect_variants() {
-        let mut plan = Plan::new();
-        let read = DataSource::with_provider("awscc", "identity.User", "me", None);
-        let create = Resource::with_provider("awscc", "ec2.Vpc", "new", None);
-        let update_id = ResourceId::with_provider("awscc", "ec2.Subnet", "old", None);
-        let update_to = Resource::with_provider("awscc", "ec2.Subnet", "old", None);
-        let replace_id = ResourceId::with_provider("awscc", "s3.Bucket", "old", None);
-        let replace_to = Resource::with_provider("awscc", "s3.Bucket", "new", None);
-        let delete_id = ResourceId::with_provider("awscc", "iam.Role", "old", None);
-        let import_id = ResourceId::with_provider("awscc", "logs.Group", "existing", None);
-
-        plan.add(Effect::Read { resource: read });
-        plan.add(Effect::Create(create));
-        plan.add(Effect::Update {
-            id: update_id.clone(),
-            from: Box::new(State::not_found(update_id.clone())),
-            to: update_to,
-            changed_attributes: vec!["cidr".to_string()],
-        });
-        plan.add(Effect::Replace {
-            id: replace_id.clone(),
-            from: Box::new(State::not_found(replace_id.clone())),
-            to: replace_to,
-            directives: Default::default(),
-            changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        });
-        plan.add(Effect::Delete {
-            id: delete_id.clone(),
-            identifier: "role-id".to_string(),
-            directives: Default::default(),
-            binding: None,
-            dependencies: Default::default(),
-            explicit_dependencies: Default::default(),
-        });
-        plan.add(Effect::Import {
-            id: import_id,
-            identifier: Value::Concrete(ConcreteValue::String("group".to_string())),
-        });
-        plan.add(Effect::Remove {
-            id: ResourceId::with_provider("awscc", "skip.Remove", "x", None),
-        });
-        plan.add(Effect::Move {
-            from: ResourceId::with_provider("awscc", "skip.Move", "x", None),
-            to: ResourceId::with_provider("awscc", "skip.Move", "y", None),
-        });
-
-        let entries = collect_required_actions(&plan, &PermissionProvider);
-        let actions: Vec<_> = entries.into_iter().map(|entry| entry.action).collect();
-
-        assert_eq!(
-            actions,
-            vec![
-                "test:read:identity.User",
-                "test:create:ec2.Vpc",
-                "test:update:ec2.Subnet",
-                "test:delete:s3.Bucket",
-                "test:create:s3.Bucket",
-                "test:delete:iam.Role",
-                "test:read:logs.Group",
-            ]
-        );
-    }
-
-    #[test]
     fn collect_required_actions_includes_deferred_create_template_create() {
         let template_resource =
             Resource::with_provider("aws", "route53.RecordSet", "validation_records", None);
@@ -910,6 +836,51 @@ mod tests {
         let actions: Vec<_> = entries.into_iter().map(|entry| entry.action).collect();
 
         assert_eq!(actions, vec!["test:create:route53.RecordSet"]);
+    }
+
+    #[test]
+    fn iam_preflight_deferred_replace_requires_create_and_delete_permissions() {
+        let delete_id =
+            ResourceId::with_provider("aws", "route53.RecordSet", "validation_records[0]", None);
+        let template_resource =
+            Resource::with_provider("aws", "route53.RecordSet", "validation_records", None);
+        let effect = Effect::DeferredReplace {
+            deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                id: delete_id.clone(),
+                identifier: "old-record-id".to_string(),
+                directives: Directives::default(),
+                binding: Some("validation_records[0]".to_string()),
+                dependencies: Default::default(),
+                explicit_dependencies: Default::default(),
+                blocked_by_updates: Default::default(),
+            }])
+            .expect("fixture has one delete"),
+            id: ResourceId::new("__deferred_for", "validation_records"),
+            upstream_binding: "cert".to_string(),
+            template: Box::new(DeferredForExpression {
+                file: None,
+                line: 1,
+                header: "for opt in cert.domain_validation_options".to_string(),
+                resource_type: "aws.route53.RecordSet".to_string(),
+                attributes: Default::default(),
+                binding_name: "validation_records".to_string(),
+                iterable_binding: "cert".to_string(),
+                iterable_attr: "domain_validation_options".to_string(),
+                binding: ForBinding::Simple("opt".to_string()),
+                template_resource,
+            }),
+        };
+
+        let ops = effect_required_ops(&effect);
+
+        assert!(ops.contains(&(delete_id.clone(), PlanOp::Delete)));
+        assert!(!ops.contains(&(delete_id, PlanOp::Update)));
+        assert!(
+            ops.iter()
+                .any(|(id, op)| id.resource_type == "route53.RecordSet"
+                    && id.name_str() == "validation_records"
+                    && *op == PlanOp::Create)
+        );
     }
 
     #[test]

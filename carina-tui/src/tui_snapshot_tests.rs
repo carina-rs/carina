@@ -84,7 +84,7 @@ fn build_mixed_operations_plan() -> Plan {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
         id: ResourceId::new("ec2.Vpc", "my-vpc"),
-        from: Box::new(State::existing(
+        from: carina_core::effect::UpdateBase::Existing(Box::new(State::existing(
             ResourceId::new("ec2.Vpc", "my-vpc"),
             [
                 (
@@ -98,7 +98,7 @@ fn build_mixed_operations_plan() -> Plan {
             ]
             .into_iter()
             .collect(),
-        )),
+        ))),
         to: Resource::new("ec2.Vpc", "my-vpc")
             .with_binding("vpc")
             .with_attribute(
@@ -130,6 +130,7 @@ fn build_mixed_operations_plan() -> Plan {
         binding: Some("old_subnet".to_string()),
         dependencies: HashSet::new(),
         explicit_dependencies: std::collections::HashSet::new(),
+        blocked_by_updates: HashSet::new(),
     });
     plan
 }
@@ -174,7 +175,7 @@ fn build_map_key_diff_plan() -> Plan {
 
     plan.add(Effect::Update {
         id: ResourceId::new("ec2.Vpc", "my-vpc"),
-        from: Box::new(State::existing(
+        from: carina_core::effect::UpdateBase::Existing(Box::new(State::existing(
             ResourceId::new("ec2.Vpc", "my-vpc"),
             [
                 (
@@ -192,7 +193,7 @@ fn build_map_key_diff_plan() -> Plan {
             ]
             .into_iter()
             .collect(),
-        )),
+        ))),
         to: Resource::new("ec2.Vpc", "my-vpc")
             .with_binding("vpc")
             .with_attribute(
@@ -282,6 +283,7 @@ fn build_deferred_replace_plan() -> Plan {
             binding: Some("validation_records[0]".to_string()),
             dependencies: HashSet::from(["cert".to_string()]),
             explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
         }])
         .expect("fixture has one delete"),
         id: ResourceId::new("__deferred_for", "validation_records"),
@@ -488,7 +490,7 @@ fn snapshot_filter_mode_route_table() {
 }
 
 // ---------------------------------------------------------------------------
-// Move effect dedup: Move suppressed when Update/Replace exists for same target
+// Move effect dedup: Move suppressed when Update or replacement exists for same target
 // ---------------------------------------------------------------------------
 
 /// Build a plan with Move + Update for the same target (Move should be suppressed).
@@ -500,7 +502,7 @@ fn build_moved_with_changes_plan() -> Plan {
     });
     plan.add(Effect::Update {
         id: ResourceId::new("ec2.Vpc", "new_vpc"),
-        from: Box::new(State::existing(
+        from: carina_core::effect::UpdateBase::Existing(Box::new(State::existing(
             ResourceId::new("ec2.Vpc", "new_vpc"),
             [
                 (
@@ -514,7 +516,7 @@ fn build_moved_with_changes_plan() -> Plan {
             ]
             .into_iter()
             .collect(),
-        )),
+        ))),
         to: Resource::new("ec2.Vpc", "new_vpc")
             .with_binding("new_vpc")
             .with_attribute(
@@ -548,7 +550,7 @@ fn build_moved_with_changes_plan() -> Plan {
     plan
 }
 
-/// Build a plan with a pure Move (no Update/Replace, Move should be kept).
+/// Build a plan with a pure Move (no Update/replacement, Move should be kept).
 fn build_moved_pure_plan() -> Plan {
     let mut plan = Plan::new();
     plan.add(Effect::Move {

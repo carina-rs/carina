@@ -802,7 +802,7 @@ fn canonical_or_resolved_create_only_value_string(
 /// hash-based identifier changes. This function detects such cases by comparing
 /// create-only property values and restores the original identifier from state
 /// when at least one create-only property matches (partial match), allowing the
-/// differ to generate a Replace effect instead of Create+Delete.
+/// differ to detect a replacement instead of an unrelated Create+Delete pair.
 ///
 /// `find_state_by_type` takes (provider, resource_type) and returns all state
 /// entries for that resource type with their create-only attribute values.

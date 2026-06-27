@@ -40,7 +40,7 @@ pub(crate) fn schema_aware_equal(
 ///
 /// Internal attributes (prefixed with `_`) are excluded from the count.
 /// An optional `exclude` set can be provided to skip additional attribute names
-/// (e.g., `changed_create_only` attributes in Replace effects).
+/// (e.g., `changed_create_only` attributes in replacement metadata).
 ///
 /// When `schema` is provided, equality is schema-aware (carina#3073):
 /// an attribute whose only difference is an enum-equal leaf

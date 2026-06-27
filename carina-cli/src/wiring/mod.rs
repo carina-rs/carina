@@ -49,7 +49,8 @@ pub struct PlanContext {
     pub sorted_resources: Vec<Resource>,
     pub current_states: HashMap<ResourceId, State>,
     /// Maps moved-to resource IDs to their original (moved-from) IDs.
-    /// Used by display to show "(moved from: ...)" annotations on Update/Replace effects.
+    /// Used by display to show "(moved from: ...)" annotations on Updates
+    /// and replacement display rows.
     pub moved_origins: HashMap<ResourceId, ResourceId>,
     /// Snapshot of `upstream_state` bindings as resolved at plan time.
     /// Persisted to the plan file (#2303) so apply-from-plan can verify
@@ -113,10 +114,28 @@ impl WiringContext {
                             .required()
                             .create_only(),
                     )
+                    .attribute(
+                        AttributeSchema::new("force_replace", AttributeType::string())
+                            .create_only(),
+                    )
+                    .attribute(AttributeSchema::new("identifier", AttributeType::string()))
+                    .attribute(AttributeSchema::new("comment", AttributeType::string()))
+                    .attribute(AttributeSchema::new("web_acl_arn", AttributeType::string()))
                     .attribute(AttributeSchema::new(
                         "tags",
                         AttributeType::map(AttributeType::string()),
-                    )),
+                    ))
+                    .with_name_attribute("name"),
+            );
+            schemas.insert(
+                "mock",
+                ResourceSchema::new("test.renameable_resource")
+                    .attribute(AttributeSchema::new("name", AttributeType::string()).required())
+                    .attribute(
+                        AttributeSchema::new("force_replace", AttributeType::string())
+                            .create_only(),
+                    )
+                    .with_name_attribute("name"),
             );
         }
         Self {
@@ -2188,8 +2207,10 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         &wait_bindings,
     );
 
-    // Populate cascading updates for Replace effects with create_before_destroy.
-    // Uses unresolved resources (sorted_resources) so dependent Update effects
+    // Drive cascade_dependent_updates to add independent consumer Updates
+    // for resources whose dependencies are being replaced (CBD), and to
+    // decompose PendingReplaces into Create + Update + Delete effects.
+    // Uses unresolved resources (sorted_resources) so dependent Updates
     // retain ResourceRef values for re-resolution at apply time.
     cascade_dependent_updates(
         &mut plan,
@@ -2238,8 +2259,8 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
 /// `saved_attrs` from the old resource name to the new name.
 ///
 /// This must be called BEFORE `create_plan()` so the differ sees the moved
-/// resource's state under its new name and can produce Update/Replace effects
-/// if attributes differ between state and desired. Transferring
+/// resource's state under its new name and can produce Updates or replacement
+/// display metadata if attributes differ between state and desired. Transferring
 /// `prev_explicit` ensures attribute removals are detected; transferring
 /// `saved_attrs` ensures hydrated attributes are found under the new name.
 ///
@@ -2689,7 +2710,7 @@ pub fn add_state_block_effects(
 
     // Add Move effects from pre-computed moved pairs.
     // Move effects are always added to the plan (for summary counting),
-    // but display skips the Move line when an Update/Replace with
+    // but display skips the Move line when an Update or replacement row with
     // "(moved from: ...)" annotation already conveys the information.
     // Also suppress orphan Delete for `to` when there is no desired resource
     // for the target (the moved state entry would otherwise appear as an orphan).
@@ -2737,6 +2758,7 @@ pub fn add_deferred_create_effects(plan: &mut Plan, targets: &[DeferredCreateTar
                     binding: Some(binding),
                     dependencies,
                     explicit_dependencies,
+                    blocked_by_updates,
                 } = effect
                 else {
                     return None;
@@ -2752,6 +2774,7 @@ pub fn add_deferred_create_effects(plan: &mut Plan, targets: &[DeferredCreateTar
                         binding: Some(binding.clone()),
                         dependencies: dependencies.clone(),
                         explicit_dependencies: explicit_dependencies.clone(),
+                        blocked_by_updates: blocked_by_updates.clone(),
                     })
                 } else {
                     None

@@ -22,6 +22,7 @@ fn app_from_plan_with_effects() {
         binding: None,
         dependencies: HashSet::new(),
         explicit_dependencies: std::collections::HashSet::new(),
+        blocked_by_updates: HashSet::new(),
     });
 
     let app = App::new(&plan, &SchemaRegistry::new());
@@ -128,7 +129,7 @@ fn update_effect_has_detail_rows() {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
         id: ResourceId::new("s3.Bucket", "my-bucket"),
-        from: Box::new(State::existing(
+        from: carina_core::effect::UpdateBase::Existing(Box::new(State::existing(
             ResourceId::new("s3.Bucket", "my-bucket"),
             [(
                 "versioning".to_string(),
@@ -136,7 +137,7 @@ fn update_effect_has_detail_rows() {
             )]
             .into_iter()
             .collect(),
-        )),
+        ))),
         to: Resource::new("s3.Bucket", "my-bucket").with_attribute(
             "versioning",
             Value::Concrete(ConcreteValue::String("Enabled".to_string())),
@@ -197,53 +198,6 @@ fn format_value_display() {
         ]))),
         "[1, 2]"
     );
-}
-
-#[test]
-fn replace_effect_symbols() {
-    let mut plan = Plan::new();
-    let from = Box::new(State::existing(
-        ResourceId::new("ec2.Vpc", "my-vpc"),
-        [(
-            "cidr".to_string(),
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
-        )]
-        .into_iter()
-        .collect(),
-    ));
-
-    // create_before_destroy = true -> "+/-"
-    plan.add(Effect::Replace {
-        id: ResourceId::new("ec2.Vpc", "my-vpc"),
-        from: from.clone(),
-        to: Resource::new("ec2.Vpc", "my-vpc"),
-        directives: Directives {
-            create_before_destroy: true,
-            ..Default::default()
-        },
-        changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec!["cidr".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-
-    // create_before_destroy = false -> "-/+"
-    plan.add(Effect::Replace {
-        id: ResourceId::new("ec2.Vpc", "my-vpc2"),
-        from,
-        to: Resource::new("ec2.Vpc", "my-vpc2"),
-        directives: Directives::default(),
-        changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec!["cidr".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-
-    let app = App::new(&plan, &SchemaRegistry::new());
-    assert_eq!(app.nodes[0].symbol, "+/-");
-    assert_eq!(app.nodes[1].symbol, "-/+");
 }
 
 #[test]
@@ -739,7 +693,7 @@ fn move_suppressed_when_update_exists_for_same_target() {
     // Update for the same target
     plan.add(Effect::Update {
         id: ResourceId::new("s3.Bucket", "new-name"),
-        from: Box::new(State::existing(
+        from: carina_core::effect::UpdateBase::Existing(Box::new(State::existing(
             ResourceId::new("s3.Bucket", "new-name"),
             [(
                 "versioning".to_string(),
@@ -747,7 +701,7 @@ fn move_suppressed_when_update_exists_for_same_target() {
             )]
             .into_iter()
             .collect(),
-        )),
+        ))),
         to: Resource::new("s3.Bucket", "new-name").with_attribute(
             "versioning",
             Value::Concrete(ConcreteValue::String("Enabled".to_string())),
@@ -762,38 +716,6 @@ fn move_suppressed_when_update_exists_for_same_target() {
 }
 
 #[test]
-fn move_suppressed_when_replace_exists_for_same_target() {
-    let mut plan = Plan::new();
-    plan.add(Effect::Move {
-        from: ResourceId::new("ec2.Vpc", "old-vpc"),
-        to: ResourceId::new("ec2.Vpc", "new-vpc"),
-    });
-    plan.add(Effect::Replace {
-        id: ResourceId::new("ec2.Vpc", "new-vpc"),
-        from: Box::new(State::existing(
-            ResourceId::new("ec2.Vpc", "new-vpc"),
-            [(
-                "cidr".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
-            )]
-            .into_iter()
-            .collect(),
-        )),
-        to: Resource::new("ec2.Vpc", "new-vpc"),
-        directives: Directives::default(),
-        changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec!["cidr".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-
-    let app = App::new(&plan, &SchemaRegistry::new());
-    assert_eq!(app.nodes.len(), 1);
-    assert_eq!(app.nodes[0].symbol, "-/+");
-}
-
-#[test]
 fn pure_move_not_suppressed() {
     let mut plan = Plan::new();
     plan.add(Effect::Move {
@@ -802,7 +724,7 @@ fn pure_move_not_suppressed() {
     });
 
     let app = App::new(&plan, &SchemaRegistry::new());
-    // Pure move (no Update/Replace for same target) should be kept
+    // Pure move (no Update/replacement for same target) should be kept
     assert_eq!(app.nodes.len(), 1);
     assert_eq!(app.nodes[0].symbol, "->");
 }

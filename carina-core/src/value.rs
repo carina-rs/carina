@@ -1018,37 +1018,19 @@ pub fn redact_secrets_in_effect(
             changed_attributes,
         } => Effect::Update {
             id: id.clone(),
-            from: Box::new(redact_secrets_in_state(from)?),
+            from: match from {
+                crate::effect::UpdateBase::Existing(state) => {
+                    crate::effect::UpdateBase::Existing(Box::new(redact_secrets_in_state(state)?))
+                }
+                crate::effect::UpdateBase::CreatedBy { binding, id } => {
+                    crate::effect::UpdateBase::CreatedBy {
+                        binding: binding.clone(),
+                        id: id.clone(),
+                    }
+                }
+            },
             to: redact_secrets_in_managed(to)?,
             changed_attributes: changed_attributes.clone(),
-        },
-        Effect::Replace {
-            id,
-            from,
-            to,
-            directives,
-            changed_create_only,
-            cascading_updates,
-            temporary_name,
-            cascade_ref_hints,
-        } => Effect::Replace {
-            id: id.clone(),
-            from: Box::new(redact_secrets_in_state(from)?),
-            to: redact_secrets_in_managed(to)?,
-            directives: directives.clone(),
-            changed_create_only: changed_create_only.clone(),
-            temporary_name: temporary_name.clone(),
-            cascade_ref_hints: cascade_ref_hints.clone(),
-            cascading_updates: cascading_updates
-                .iter()
-                .map(|cu| {
-                    Ok::<_, SerializationError>(crate::effect::CascadingUpdate {
-                        id: cu.id.clone(),
-                        from: Box::new(redact_secrets_in_state(&cu.from)?),
-                        to: redact_secrets_in_managed(&cu.to)?,
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?,
         },
         Effect::Delete {
             id,
@@ -1057,6 +1039,7 @@ pub fn redact_secrets_in_effect(
             binding,
             dependencies,
             explicit_dependencies,
+            blocked_by_updates,
         } => Effect::Delete {
             id: id.clone(),
             identifier: identifier.clone(),
@@ -1064,6 +1047,7 @@ pub fn redact_secrets_in_effect(
             binding: binding.clone(),
             dependencies: dependencies.clone(),
             explicit_dependencies: explicit_dependencies.clone(),
+            blocked_by_updates: blocked_by_updates.clone(),
         },
         Effect::Import { id, identifier } => Effect::Import {
             id: id.clone(),

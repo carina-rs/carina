@@ -2,7 +2,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use carina_core::detail_rows::{DetailLevel, DetailRow, build_detail_rows};
+use carina_core::detail_rows::{
+    DetailLevel, DetailRow, build_detail_rows, build_replace_display_rows,
+};
 use carina_core::effect::Effect;
 use carina_core::plan::{Plan, PlanSummary};
 use carina_core::plan_tree::{
@@ -114,19 +116,25 @@ impl App {
 
         // Shorten effect labels: strip provider prefix, use binding or compact hint
         shorten_effect_labels(plan, &mut nodes);
+        apply_replace_display_nodes(plan, schemas_opt, &mut nodes);
 
         let mut suppressed: HashSet<usize> = HashSet::new();
 
-        // Suppress Move nodes when an Update/Replace exists for the same target,
-        // matching CLI behavior (the move info is shown as annotation on Update/Replace).
+        // Suppress Move nodes when an Update or replacement row exists for the same target,
+        // matching CLI behavior (the move info is shown as an annotation there).
         let update_or_replace_targets: HashSet<ResourceId> = plan
             .effects()
             .iter()
             .filter_map(|e| match e {
-                Effect::Update { id, .. } | Effect::Replace { id, .. } => Some(id.clone()),
+                Effect::Update { id, .. } => Some(id.clone()),
                 Effect::DeferredReplace { .. } => None,
                 _ => None,
             })
+            .chain(
+                plan.replace_display()
+                    .iter()
+                    .map(|metadata| metadata.id.clone()),
+            )
             .collect();
 
         suppressed.extend(
@@ -134,6 +142,13 @@ impl App {
                 .iter()
                 .enumerate()
                 .filter_map(|(i, e)| {
+                    if plan
+                        .replace_display()
+                        .iter()
+                        .any(|metadata| metadata.delete_idx == i || metadata.rename_idx == Some(i))
+                    {
+                        return Some(i);
+                    }
                     if let Effect::Move { to, .. } = e
                         && update_or_replace_targets.contains(to)
                     {
@@ -630,6 +645,37 @@ fn build_tree_structure(plan: &Plan, nodes: &mut [TreeNode]) {
     // roots with depth 0, parent None, and no children -- the defaults are correct.
 }
 
+fn apply_replace_display_nodes(
+    plan: &Plan,
+    schemas: Option<&SchemaRegistry>,
+    nodes: &mut [TreeNode],
+) {
+    for metadata in plan.replace_display() {
+        let Some(Effect::Create(resource)) = plan.effects().get(metadata.create_idx) else {
+            continue;
+        };
+        let Some(node) = nodes.get_mut(metadata.create_idx) else {
+            continue;
+        };
+        let note = if metadata.create_before_destroy {
+            " (must be replaced, create before destroy)"
+        } else {
+            " (must be replaced)"
+        };
+        node.effect_label = format!("{}{}", resource.id.human(), note);
+        node.resource_type = resource.id.display_type();
+        node.name_part = resource.id.name_str().to_string();
+        node.symbol = if metadata.create_before_destroy {
+            "+/-".to_string()
+        } else {
+            "-/+".to_string()
+        };
+        node.kind = EffectKind::Replace;
+        node.detail_rows =
+            build_replace_display_rows(metadata, resource, None, schemas, DetailLevel::Full, None);
+    }
+}
+
 /// Shorten effect labels: strip provider prefix and use binding name or compact hint.
 fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
     for (idx, effect) in plan.effects().iter().enumerate() {
@@ -708,17 +754,6 @@ fn effect_to_node(plan: &Plan, effect: &Effect, schemas: Option<&SchemaRegistry>
             name_part: id.name_str().to_string(),
             symbol: effect.display_glyph().to_string(),
             kind: EffectKind::Update,
-            detail_rows,
-            children: Vec::new(),
-            depth: 0,
-            parent: None,
-        },
-        Effect::Replace { id, .. } => TreeNode {
-            effect_label: format!("{}", id.human()),
-            resource_type: id.display_type(),
-            name_part: id.name_str().to_string(),
-            symbol: effect.display_glyph().to_string(),
-            kind: EffectKind::Replace,
             detail_rows,
             children: Vec::new(),
             depth: 0,

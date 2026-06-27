@@ -1,0 +1,597 @@
+//! CLI-level regression coverage for CBD replace consumer update ordering.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+use carina_state::{ResourceState, StateFile};
+use tempfile::TempDir;
+
+const UPDATE_DELAY_MS: &str = "1500";
+
+struct Scenario {
+    _tmp: TempDir,
+    project: PathBuf,
+    state_path: PathBuf,
+    mock_state_path: PathBuf,
+    op_log_path: PathBuf,
+}
+
+impl Scenario {
+    fn new() -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().to_path_buf();
+        Self {
+            state_path: project.join("carina.state.json"),
+            mock_state_path: project.join("mock-state.json"),
+            op_log_path: project.join("op.log"),
+            project,
+            _tmp: tmp,
+        }
+    }
+
+    fn write_config(&self) {
+        fs::write(
+            self.project.join("main.crn"),
+            format!(
+                r#"backend local {{ path = "{}" }}
+provider mock {{}}
+
+let web_acl = mock.test.resource {{
+  name = "web-acl-new"
+  identifier = "new-web-acl-id"
+  directives {{ create_before_destroy = true }}
+}}
+
+let distribution = mock.test.resource {{
+  name = "distribution"
+  comment = "after"
+  web_acl_arn = web_acl.identifier
+}}
+"#,
+                self.state_path.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_rename_config(&self) {
+        fs::write(
+            self.project.join("main.crn"),
+            format!(
+                r#"backend local {{ path = "{}" }}
+provider mock {{}}
+
+let renamed = mock.test.renameable_resource {{
+  name = "rename-target"
+  force_replace = "new"
+  directives {{ create_before_destroy = true }}
+}}
+"#,
+                self.state_path.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_rename_consumer_config(&self) {
+        fs::write(
+            self.project.join("main.crn"),
+            format!(
+                r#"backend local {{ path = "{}" }}
+provider mock {{}}
+
+let renamed = mock.test.renameable_resource {{
+  name = "rename-target"
+  force_replace = "new"
+  directives {{ create_before_destroy = true }}
+}}
+
+let consumer = mock.test.resource {{
+  name = "consumer"
+  comment = renamed.name
+}}
+"#,
+                self.state_path.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_permanent_name_config(&self) {
+        fs::write(
+            self.project.join("main.crn"),
+            format!(
+                r#"backend local {{ path = "{}" }}
+provider mock {{}}
+
+let permanent = mock.test.resource {{
+  name = "stable-name"
+  force_replace = "new"
+  directives {{ create_before_destroy = true }}
+}}
+"#,
+                self.state_path.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    fn init(&self) {
+        let output = carina(&self.project)
+            .args(["init", "."])
+            .output()
+            .expect("failed to execute carina init");
+        assert_success("carina init", &output);
+    }
+
+    fn seed_carina_state(&self) {
+        let mut state = StateFile::new();
+
+        let mut web_acl = ResourceState::new("test.resource", "web_acl", "mock")
+            .with_identifier("old-web-acl-id")
+            .with_attribute("name", serde_json::json!("web-acl-old"))
+            .with_attribute("identifier", serde_json::json!("old-web-acl-id"));
+        web_acl.binding = Some("web_acl".to_string());
+        web_acl.directives.create_before_destroy = true;
+        state.upsert_resource(web_acl);
+
+        let mut distribution = ResourceState::new("test.resource", "distribution", "mock")
+            .with_identifier("distribution-id")
+            .with_attribute("name", serde_json::json!("distribution"))
+            .with_attribute("comment", serde_json::json!("before"))
+            .with_attribute("web_acl_arn", serde_json::json!("web-acl-old"));
+        distribution.binding = Some("distribution".to_string());
+        distribution
+            .dependency_bindings
+            .insert("web_acl".to_string());
+        state.upsert_resource(distribution);
+
+        fs::write(
+            &self.state_path,
+            carina_core::utils::pretty_with_newline(&state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn seed_mock_provider_state(&self) {
+        let provider_state = serde_json::json!({
+            "test.resource.web_acl": {
+                "name": "web-acl-old",
+                "identifier": "old-web-acl-id"
+            },
+            "test.resource.distribution": {
+                "name": "distribution",
+                "comment": "before",
+                "web_acl_arn": "web-acl-old"
+            }
+        });
+        fs::write(
+            &self.mock_state_path,
+            carina_core::utils::pretty_with_newline(&provider_state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn seed_rename_state(&self) {
+        let mut state = StateFile::new();
+        let mut renamed = ResourceState::new("test.renameable_resource", "renamed", "mock")
+            .with_identifier("old-rename-id")
+            .with_attribute("name", serde_json::json!("rename-target"))
+            .with_attribute("force_replace", serde_json::json!("old"));
+        renamed.binding = Some("renamed".to_string());
+        renamed.directives.create_before_destroy = true;
+        state.upsert_resource(renamed);
+
+        fs::write(
+            &self.state_path,
+            carina_core::utils::pretty_with_newline(&state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn seed_rename_mock_provider_state(&self) {
+        let provider_state = serde_json::json!({
+            "test.renameable_resource.renamed": {
+                "name": "rename-target",
+                "force_replace": "old"
+            }
+        });
+        fs::write(
+            &self.mock_state_path,
+            carina_core::utils::pretty_with_newline(&provider_state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn seed_rename_consumer_state(&self) {
+        let mut state = StateFile::new();
+        let mut renamed = ResourceState::new("test.renameable_resource", "renamed", "mock")
+            .with_identifier("old-rename-id")
+            .with_attribute("name", serde_json::json!("rename-target"))
+            .with_attribute("force_replace", serde_json::json!("old"));
+        renamed.binding = Some("renamed".to_string());
+        renamed.directives.create_before_destroy = true;
+        state.upsert_resource(renamed);
+
+        let mut consumer = ResourceState::new("test.resource", "consumer", "mock")
+            .with_identifier("consumer-id")
+            .with_attribute("name", serde_json::json!("consumer"))
+            .with_attribute("comment", serde_json::json!("before"));
+        consumer.binding = Some("consumer".to_string());
+        consumer.dependency_bindings.insert("renamed".to_string());
+        state.upsert_resource(consumer);
+
+        fs::write(
+            &self.state_path,
+            carina_core::utils::pretty_with_newline(&state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn seed_rename_consumer_mock_provider_state(&self) {
+        let provider_state = serde_json::json!({
+            "test.renameable_resource.renamed": {
+                "name": "rename-target",
+                "force_replace": "old"
+            },
+            "test.resource.consumer": {
+                "name": "consumer",
+                "comment": "before"
+            }
+        });
+        fs::write(
+            &self.mock_state_path,
+            carina_core::utils::pretty_with_newline(&provider_state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn seed_permanent_state(&self) {
+        let mut state = StateFile::new();
+        let mut permanent = ResourceState::new("test.resource", "permanent", "mock")
+            .with_identifier("old-permanent-id")
+            .with_attribute("name", serde_json::json!("stable-name"))
+            .with_attribute("force_replace", serde_json::json!("old"));
+        permanent.binding = Some("permanent".to_string());
+        permanent.directives.create_before_destroy = true;
+        state.upsert_resource(permanent);
+
+        fs::write(
+            &self.state_path,
+            carina_core::utils::pretty_with_newline(&state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn seed_permanent_mock_provider_state(&self, name: &str, force_replace: &str) {
+        let provider_state = serde_json::json!({
+            "test.resource.permanent": {
+                "name": name,
+                "force_replace": force_replace
+            }
+        });
+        fs::write(
+            &self.mock_state_path,
+            carina_core::utils::pretty_with_newline(&provider_state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn apply(&self) -> Output {
+        carina(&self.project)
+            .args([
+                "apply",
+                ".",
+                "--auto-approve",
+                "--lock=false",
+                "--parallelism",
+                "8",
+            ])
+            .env("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA", "1")
+            .env("CARINA_MOCK_OP_LOG", &self.op_log_path)
+            .env("CARINA_MOCK_STATE_FILE", &self.mock_state_path)
+            .env("CARINA_MOCK_UPDATE_DELAY_MS", UPDATE_DELAY_MS)
+            .output()
+            .expect("failed to execute carina apply")
+    }
+
+    fn apply_with_delete_failure(&self, pattern: &str) -> Output {
+        carina(&self.project)
+            .args([
+                "apply",
+                ".",
+                "--auto-approve",
+                "--lock=false",
+                "--parallelism",
+                "8",
+            ])
+            .env("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA", "1")
+            .env("CARINA_MOCK_OP_LOG", &self.op_log_path)
+            .env("CARINA_MOCK_STATE_FILE", &self.mock_state_path)
+            .env("CARINA_MOCK_DELETE_FAIL_FOR", pattern)
+            .output()
+            .expect("failed to execute carina apply")
+    }
+
+    fn plan(&self) -> Output {
+        carina(&self.project)
+            .args(["plan", "."])
+            .env("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA", "1")
+            .env("CARINA_MOCK_STATE_FILE", &self.mock_state_path)
+            .output()
+            .expect("failed to execute carina plan")
+    }
+
+    fn state(&self) -> StateFile {
+        serde_json::from_str(&fs::read_to_string(&self.state_path).unwrap()).unwrap()
+    }
+
+    fn op_log(&self) -> Vec<String> {
+        fs::read_to_string(&self.op_log_path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+#[test]
+fn test_cbd_rename_update_runs_after_delete() {
+    let scenario = Scenario::new();
+    scenario.write_rename_config();
+    scenario.init();
+    scenario.seed_rename_state();
+    scenario.seed_rename_mock_provider_state();
+
+    let output = scenario.apply();
+    assert_success("carina apply", &output);
+
+    let op_log = scenario.op_log();
+    let create_pos = op_log
+        .iter()
+        .position(|entry| entry == "create test.renameable_resource.renamed")
+        .expect("operation log should contain renameable create");
+    let update_pos = op_log
+        .iter()
+        .position(|entry| entry == "update test.renameable_resource.renamed")
+        .expect("operation log should contain rename update");
+    let delete_pos = op_log
+        .iter()
+        .position(|entry| entry == "delete test.renameable_resource.renamed")
+        .expect("operation log should contain old resource delete");
+
+    assert!(
+        create_pos < delete_pos && delete_pos < update_pos,
+        "#3625: CBD rename update must run after old resource delete; observed log: {op_log:?}"
+    );
+}
+
+#[test]
+fn consumer_update_reading_renamed_attribute_does_not_cycle() {
+    let scenario = Scenario::new();
+    scenario.write_rename_consumer_config();
+    scenario.init();
+    scenario.seed_rename_consumer_state();
+    scenario.seed_rename_consumer_mock_provider_state();
+
+    let output = scenario.apply();
+    assert_success("carina apply", &output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stdout.contains("cycle detected") && !stderr.contains("cycle detected"),
+        "CBD consumer apply must not be skipped by a dependency cycle\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let op_log = scenario.op_log();
+    assert!(
+        op_log
+            .iter()
+            .any(|entry| entry == "create test.renameable_resource.renamed")
+            && op_log
+                .iter()
+                .any(|entry| entry == "delete test.renameable_resource.renamed")
+            && op_log
+                .iter()
+                .any(|entry| entry == "update test.renameable_resource.renamed")
+            && op_log
+                .iter()
+                .any(|entry| entry == "update test.resource.consumer"),
+        "all CBD and consumer effects should execute; observed log: {op_log:?}"
+    );
+}
+
+#[test]
+fn cbd_replace_orders_consumer_update_between_create_and_delete() {
+    let scenario = Scenario::new();
+    scenario.write_config();
+    scenario.init();
+    scenario.seed_carina_state();
+    scenario.seed_mock_provider_state();
+
+    let output = scenario.apply();
+    assert_success("carina apply", &output);
+
+    let op_log = scenario.op_log();
+    let create_pos = op_log
+        .iter()
+        .position(|entry| entry == "create test.resource.web_acl")
+        .expect("operation log should contain web_acl create");
+    let update_pos = op_log
+        .iter()
+        .position(|entry| entry == "update test.resource.distribution")
+        .expect("operation log should contain distribution update");
+    let delete_pos = op_log
+        .iter()
+        .position(|entry| entry == "delete test.resource.web_acl")
+        .expect("operation log should contain web_acl delete");
+
+    assert!(
+        create_pos < update_pos && update_pos < delete_pos,
+        "#3625: consumer update must run between CBD create and delete; observed log: {op_log:?}"
+    );
+}
+
+#[test]
+fn test_cbd_permanent_name_override_persists() {
+    let scenario = Scenario::new();
+    scenario.write_permanent_name_config();
+    scenario.init();
+    scenario.seed_permanent_state();
+    scenario.seed_permanent_mock_provider_state("stable-name", "old");
+
+    let output = scenario.apply();
+    assert_success("carina apply", &output);
+
+    let state = scenario.state();
+    let row = state
+        .find_resource("mock", "test.resource", "permanent")
+        .expect("permanent resource should remain in state");
+    let temporary_name = row
+        .name_overrides
+        .get("name")
+        .expect("CBD can_rename=false should persist a permanent name override")
+        .clone();
+    assert!(
+        temporary_name.starts_with("stable-name-"),
+        "temporary name should be based on the desired name, got {temporary_name}"
+    );
+
+    scenario.seed_permanent_mock_provider_state(&temporary_name, "new");
+    let output = scenario.plan();
+    assert_success("carina plan", &output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("No changes. Infrastructure is up-to-date.")
+            && !stdout.contains("to replace"),
+        "permanent name override should prevent a follow-up replace plan\nstdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn test_cbd_can_rename_delete_failure_records_new_with_temp_name() {
+    let scenario = Scenario::new();
+    scenario.write_rename_config();
+    scenario.init();
+    scenario.seed_rename_state();
+    scenario.seed_rename_mock_provider_state();
+
+    let output = scenario.apply_with_delete_failure("test.renameable_resource.renamed");
+    assert!(
+        !output.status.success(),
+        "apply must fail when old CBD delete fails\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("create_before_destroy replacement")
+            && stderr.contains("old resource delete did not complete")
+            && stderr.contains("State now records the replacement"),
+        "delete failure should warn about the recorded replacement\nstderr:\n{stderr}"
+    );
+
+    let state = scenario.state();
+    let row = state
+        .find_resource("mock", "test.renameable_resource", "renamed")
+        .expect("renameable temp-name replacement should be recorded in state");
+    assert_eq!(row.identifier.as_deref(), Some("mock-id"));
+    let temporary_name = row
+        .attributes
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .expect("created replacement should keep its temporary name");
+    assert!(
+        temporary_name.starts_with("rename-target-"),
+        "temporary name should be based on the desired name, got {temporary_name}"
+    );
+    assert_eq!(
+        row.attributes.get("force_replace"),
+        Some(&serde_json::json!("new")),
+        "can_rename=true CBD should record the created replacement even when old delete fails"
+    );
+    assert!(
+        row.name_overrides.is_empty(),
+        "renameable temporary names should not become permanent overrides"
+    );
+
+    let op_log = scenario.op_log();
+    assert!(
+        op_log
+            .iter()
+            .any(|entry| entry == "create test.renameable_resource.renamed")
+            && op_log
+                .iter()
+                .any(|entry| entry == "delete-fail test.renameable_resource.renamed")
+            && !op_log
+                .iter()
+                .any(|entry| entry == "update test.renameable_resource.renamed"),
+        "rename update should not run after failed delete; observed log: {op_log:?}"
+    );
+}
+
+#[test]
+fn test_cbd_permanent_temp_name_delete_failure_records_new() {
+    let scenario = Scenario::new();
+    scenario.write_permanent_name_config();
+    scenario.init();
+    scenario.seed_permanent_state();
+    scenario.seed_permanent_mock_provider_state("stable-name", "old");
+
+    let output = scenario.apply_with_delete_failure("test.resource.permanent");
+    assert!(
+        !output.status.success(),
+        "apply must fail when old CBD delete fails\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let state = scenario.state();
+    let row = state
+        .find_resource("mock", "test.resource", "permanent")
+        .expect("permanent temp-name replacement should be recorded in state");
+    assert_eq!(row.identifier.as_deref(), Some("mock-id"));
+    assert_eq!(
+        row.attributes.get("force_replace"),
+        Some(&serde_json::json!("new")),
+        "can_rename=false CBD should record the created replacement even when old delete fails"
+    );
+    let temporary_name = row
+        .name_overrides
+        .get("name")
+        .expect("permanent temp-name replacement should persist name override");
+    assert!(
+        temporary_name.starts_with("stable-name-"),
+        "temporary name should be based on the desired name, got {temporary_name}"
+    );
+
+    let op_log = scenario.op_log();
+    assert!(
+        op_log
+            .iter()
+            .any(|entry| entry == "create test.resource.permanent")
+            && op_log
+                .iter()
+                .any(|entry| entry == "delete-fail test.resource.permanent"),
+        "create should be recorded before the failed delete; observed log: {op_log:?}"
+    );
+}
+
+fn carina(project: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_carina"));
+    command
+        .current_dir(project)
+        .env("NO_COLOR", "1")
+        .env_remove("CLICOLOR_FORCE");
+    command
+}
+
+fn assert_success(label: &str, output: &Output) {
+    assert!(
+        output.status.success(),
+        "{label} failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}

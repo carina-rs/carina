@@ -206,19 +206,6 @@ fn handle_tty(
                 .println(format_wait_polling_line(observation, *elapsed))
                 .ok();
         }
-        ExecutionEvent::CascadeUpdateSucceeded { id } => {
-            multi
-                .println(format!("  {} Update {} (cascade)", "✓".green(), id))
-                .ok();
-        }
-        ExecutionEvent::CascadeUpdateFailed { id, error } => {
-            multi
-                .println(format!("  {} Update {} (cascade)", "✗".red(), id))
-                .ok();
-            multi
-                .println(format!("      {} {}", "→".red(), error.red()))
-                .ok();
-        }
         ExecutionEvent::RenameSucceeded { id, from, to } => {
             multi
                 .println(format!(
@@ -343,13 +330,6 @@ fn format_plain(event: &ExecutionEvent) -> Vec<String> {
             observation,
             elapsed,
         } => vec![format_wait_polling_line(observation, *elapsed)],
-        ExecutionEvent::CascadeUpdateSucceeded { id } => {
-            vec![format!("  ✓ Update {} (cascade)", id)]
-        }
-        ExecutionEvent::CascadeUpdateFailed { id, error } => vec![
-            format!("  ✗ Update {} (cascade)", id),
-            format!("      → {}", error),
-        ],
         ExecutionEvent::RenameSucceeded { id, from, to } => {
             vec![format!("  ✓ Rename {} \"{}\" → \"{}\"", id, from, to)]
         }

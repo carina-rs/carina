@@ -3,6 +3,25 @@ use super::*;
 use crate::resource::ConcreteValue;
 use indexmap::IndexMap;
 
+fn assert_single_decomposed_replace<'a>(
+    plan: &'a Plan,
+    changed_create_only: &[&str],
+) -> &'a crate::plan::ReplaceDisplayMetadata {
+    assert_eq!(plan.replace_display().len(), 1);
+    let metadata = &plan.replace_display()[0];
+    assert!(matches!(
+        plan.effects().get(metadata.create_idx),
+        Some(Effect::Create(_))
+    ));
+    assert!(matches!(
+        plan.effects().get(metadata.delete_idx),
+        Some(Effect::Delete { .. })
+    ));
+    let expected: Vec<String> = changed_create_only.iter().map(|s| s.to_string()).collect();
+    assert_eq!(&metadata.changed_create_only[..], expected.as_slice());
+    metadata
+}
+
 #[test]
 fn diff_create_when_not_exists() {
     let desired = Resource::new("bucket", "test");
@@ -393,16 +412,8 @@ fn replace_when_create_only_attr_changed() {
         &[],
     );
 
-    assert_eq!(plan.effects().len(), 1);
-    match &plan.effects()[0] {
-        Effect::Replace {
-            changed_create_only,
-            ..
-        } => {
-            assert_eq!(&changed_create_only[..], &["cidr_block".to_string()]);
-        }
-        other => panic!("Expected Replace, got {:?}", other),
-    }
+    assert_eq!(plan.effects().len(), 2);
+    assert_single_decomposed_replace(&plan, &["cidr_block"]);
 }
 
 #[test]
@@ -513,16 +524,8 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
         &[],
     );
 
-    assert_eq!(plan.effects().len(), 1);
-    match &plan.effects()[0] {
-        Effect::Replace {
-            changed_create_only,
-            ..
-        } => {
-            assert_eq!(&changed_create_only[..], &["cidr_block".to_string()]);
-        }
-        other => panic!("Expected Replace, got {:?}", other),
-    }
+    assert_eq!(plan.effects().len(), 2);
+    assert_single_decomposed_replace(&plan, &["cidr_block"]);
 }
 
 #[test]
@@ -568,18 +571,9 @@ fn replace_carries_create_before_destroy_directives() {
         &[],
     );
 
-    assert_eq!(plan.effects().len(), 1);
-    match &plan.effects()[0] {
-        Effect::Replace {
-            directives,
-            changed_create_only,
-            ..
-        } => {
-            assert!(directives.create_before_destroy);
-            assert_eq!(&changed_create_only[..], &["cidr_block".to_string()]);
-        }
-        other => panic!("Expected Replace, got {:?}", other),
-    }
+    assert_eq!(plan.effects().len(), 2);
+    let metadata = assert_single_decomposed_replace(&plan, &["cidr_block"]);
+    assert!(metadata.create_before_destroy);
 }
 
 #[test]
@@ -691,12 +685,8 @@ fn replace_with_provider_prefixed_schema_key() {
         &[],
     );
 
-    assert_eq!(plan.effects().len(), 1);
-    assert!(
-        matches!(plan.effects()[0], Effect::Replace { .. }),
-        "Expected Replace with awscc-prefixed schema key, got {:?}",
-        plan.effects()[0]
-    );
+    assert_eq!(plan.effects().len(), 2);
+    assert_single_decomposed_replace(&plan, &["cidr_block"]);
 }
 
 /// Regression test for issue #172: desired has 2 fields in a struct,
