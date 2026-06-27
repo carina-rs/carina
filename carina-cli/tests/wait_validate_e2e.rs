@@ -15,7 +15,7 @@ use carina_core::provider::{
     BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer, ProviderResult,
 };
 use carina_core::resource::{DataSource, Value};
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use tempfile::TempDir;
@@ -65,7 +65,7 @@ impl ProviderFactory for WaitTestFactory {
         Box::pin(async { Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer> })
     }
     fn schemas(&self) -> Vec<ResourceSchema> {
-        vec![cert_schema()]
+        vec![cert_schema(), nested_holder_schema()]
     }
 }
 
@@ -77,7 +77,20 @@ fn cert_schema() -> ResourceSchema {
             AttributeType::string(),
         ))
         .attribute(AttributeSchema::new("status", AttributeType::string()))
-        .attribute(AttributeSchema::new("arn", AttributeType::string()))
+        .attribute(AttributeSchema::new(
+            "certificate_arn",
+            AttributeType::string(),
+        ))
+}
+
+fn nested_holder_schema() -> ResourceSchema {
+    ResourceSchema::new("test.NestedHolder").attribute(AttributeSchema::new(
+        "inner",
+        AttributeType::struct_(
+            "CertificateRef".to_string(),
+            vec![StructField::new("certificate_arn", AttributeType::string())],
+        ),
+    ))
 }
 
 struct NoopProvider;
@@ -269,6 +282,47 @@ fn validate_flags_wait_unknown_attribute() {
             .iter()
             .any(|d| d.contains("statu") && d.contains("unknown attribute")),
         "validate must surface unknown wait attribute; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn validate_flags_wait_binding_bad_attr_inside_nested_struct() {
+    let fixture = write_fixture(&[
+        (
+            "providers.crn",
+            r#"provider aws {
+    region = "us-east-1"
+}
+"#,
+        ),
+        (
+            "main.crn",
+            r#"let cert = aws.acm.Certificate {
+    domain_name       = "publish.example.com"
+    validation_method = "DNS"
+}
+
+let holder = aws.test.NestedHolder {
+    inner = { certificate_arn = cert_issued.arn }
+}
+"#,
+        ),
+        (
+            "wait.crn",
+            r#"let cert_issued = wait cert {
+    until = cert.status == "ISSUED"
+}
+"#,
+        ),
+    ]);
+
+    let diags = cli_validate(&fixture);
+    assert!(
+        diags
+            .iter()
+            .any(|d| { d.contains("unknown attribute 'arn'") && d.contains("cert_issued") }),
+        "validate must surface wait binding bad attr inside nested struct; got: {:?}",
         diags
     );
 }
