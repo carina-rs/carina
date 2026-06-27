@@ -28,6 +28,15 @@ fn empty_parsed() -> ParsedFile {
     }
 }
 
+fn validate_resource_ref_types_for_test<E>(
+    parsed: &crate::parser::File<E>,
+    schemas: &SchemaRegistry,
+    argument_names: &HashSet<String>,
+) -> Result<(), String> {
+    let bindings = crate::binding_index::BindingIndex::from_parsed(parsed, schemas);
+    super::validate_resource_ref_types(parsed, schemas, argument_names, &bindings)
+}
+
 fn context_with_iam_policy_arn_validator() -> ProviderContext {
     use crate::parser::ValidatorFn;
 
@@ -571,7 +580,7 @@ fn unknown_binding_reference_reports_error() {
 
     let mut parsed = empty_parsed();
     parsed.resources.push(subnet); // allow: direct — fixture test inspection
-    let result = validate_resource_ref_types(&parsed, &schemas, &HashSet::new());
+    let result = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new());
     assert_eq!(
         result.unwrap_err(),
         "awscc.ec2.Subnet.web-subnet: unknown binding 'vpc' in reference vpc.vpc_id"
@@ -607,7 +616,7 @@ fn unknown_attribute_reference_reports_error() {
     let mut parsed = empty_parsed();
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
     parsed.resources.push(subnet); // allow: direct — fixture test inspection
-    let result = validate_resource_ref_types(&parsed, &schemas, &HashSet::new());
+    let result = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new());
     assert_eq!(
         result.unwrap_err(),
         "awscc.ec2.Subnet.web-subnet: unknown attribute 'nonexistent_attr' on 'vpc' in reference vpc.nonexistent_attr"
@@ -651,7 +660,7 @@ fn unknown_attribute_reference_suggests_similar_name() {
     let mut parsed = empty_parsed();
     parsed.resources.push(igw); // allow: direct — fixture test inspection
     parsed.resources.push(route); // allow: direct — fixture test inspection
-    let result = validate_resource_ref_types(&parsed, &schemas, &HashSet::new());
+    let result = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new());
     let err = result.unwrap_err();
     assert!(
         err.contains("Did you mean 'internet_gateway_id'?"),
@@ -714,7 +723,7 @@ fn unknown_attribute_reference_through_wait_binding_reports_error() {
     });
     parsed.resources.push(listener); // allow: direct — fixture test inspection
 
-    let err = validate_resource_ref_types(&parsed, &schemas, &HashSet::new()).unwrap_err();
+    let err = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new()).unwrap_err();
     assert!(
         err.contains("unknown attribute 'certificate_arnn' on 'cert_issued'"),
         "expected wait binding attribute error, got: {err}",
@@ -783,7 +792,7 @@ fn known_attribute_reference_through_wait_binding_is_accepted() {
     });
     parsed.resources.push(listener); // allow: direct — fixture test inspection
 
-    assert!(validate_resource_ref_types(&parsed, &schemas, &HashSet::new()).is_ok());
+    assert!(validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new()).is_ok());
 }
 
 #[test]
@@ -851,7 +860,7 @@ fn unknown_attribute_reference_through_wait_binding_inside_nested_struct_reports
     });
     parsed.resources.push(listener); // allow: direct — fixture test inspection
 
-    let err = validate_resource_ref_types(&parsed, &schemas, &HashSet::new()).unwrap_err();
+    let err = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new()).unwrap_err();
     assert!(
         err.contains("unknown attribute 'arn' on 'cert_issued'"),
         "expected nested wait binding attribute error, got: {err}",
@@ -911,7 +920,7 @@ fn unknown_attribute_reference_through_managed_binding_inside_nested_struct_repo
     parsed.resources.push(cert); // allow: direct — fixture test inspection
     parsed.resources.push(listener); // allow: direct — fixture test inspection
 
-    let err = validate_resource_ref_types(&parsed, &schemas, &HashSet::new()).unwrap_err();
+    let err = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new()).unwrap_err();
     assert!(
         err.contains("unknown attribute 'arn' on 'cert'"),
         "expected nested managed binding attribute error, got: {err}",
@@ -944,7 +953,7 @@ fn unknown_outer_attr_does_not_mask_nested_unknown_binding_ref() {
     let mut parsed = empty_parsed();
     parsed.resources.push(listener); // allow: direct — fixture test inspection
 
-    let err = validate_resource_ref_types(&parsed, &schemas, &HashSet::new()).unwrap_err();
+    let err = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new()).unwrap_err();
     assert!(
         err.contains("unknown binding 'unknown_binding' in reference unknown_binding.foo"),
         "expected nested unknown binding under unknown outer attr, got: {err}",
@@ -978,7 +987,7 @@ fn unknown_attribute_reference_no_suggestion_when_too_different() {
     let mut parsed = empty_parsed();
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
     parsed.resources.push(subnet); // allow: direct — fixture test inspection
-    let result = validate_resource_ref_types(&parsed, &schemas, &HashSet::new());
+    let result = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new());
     let err = result.unwrap_err();
     assert!(
         !err.contains("Did you mean"),
@@ -1018,7 +1027,7 @@ fn ref_type_mismatch_inside_for_body_is_rejected() {
         make_schema("r.pool_user", vec![("pool_id", AttributeType::bool())]),
     );
 
-    let result = validate_resource_ref_types(&parsed, &schemas, &HashSet::new());
+    let result = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new());
     assert!(result.is_err(), "expected type-mismatch error in for body");
     let msg = result.unwrap_err();
     assert!(
@@ -2048,7 +2057,9 @@ fn attribute_param_ref_type_mismatch_detected() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert("awscc", role_schema);
 
-    let resources = vec![role];
+    let mut parsed = empty_parsed();
+    parsed.resources.push(role); // allow: direct — fixture test inspection
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
 
     // Attribute param: role_arn: iam_role_arn = role.role_name (MISMATCH: String vs iam_role_arn)
     let params_mismatch = vec![AttributeParameter {
@@ -2061,7 +2072,7 @@ fn attribute_param_ref_type_mismatch_detected() {
         )),
     }];
 
-    let result = validate_attribute_param_ref_types(&params_mismatch, &resources, &schemas);
+    let result = validate_attribute_param_ref_types_with_bindings(&params_mismatch, &bindings);
     assert!(
         result.is_err(),
         "Should reject String assigned to iam_role_arn"
@@ -2081,7 +2092,7 @@ fn attribute_param_ref_type_mismatch_detected() {
         )),
     }];
 
-    let result = validate_attribute_param_ref_types(&params_match, &resources, &schemas);
+    let result = validate_attribute_param_ref_types_with_bindings(&params_match, &bindings);
     assert!(
         result.is_ok(),
         "Should accept IamRoleArn assigned to iam_role_arn"
@@ -2117,11 +2128,68 @@ fn attribute_param_ref_types_flags_unknown_attribute_inside_nested_struct() {
         value: Some(Value::Concrete(ConcreteValue::Map(nested))),
     }];
 
-    let resources = vec![vpc];
-    let err = validate_attribute_param_ref_types(&params, &resources, &schemas).unwrap_err();
+    let mut parsed = empty_parsed();
+    parsed.resources.push(vpc); // allow: direct — fixture test inspection
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let err = validate_attribute_param_ref_types_with_bindings(&params, &bindings).unwrap_err();
     assert!(
         err.contains("attribute 'network': unknown attribute 'bad_attr' on 'vpc'"),
         "expected nested attribute-param ResourceRef error, got: {err}",
+    );
+}
+
+#[test]
+fn attribute_param_ref_types_flags_unknown_attribute_through_wait_binding() {
+    use crate::parser::AttributeParameter;
+    use crate::schema::{AttributeSchema, ResourceSchema};
+
+    let cert = Resource::with_provider("aws", "acm.Certificate", "cert", None)
+        .with_binding("cert")
+        .with_attribute(
+            "status",
+            Value::Concrete(ConcreteValue::String("pending".to_string())),
+        );
+
+    let mut cert_schema = ResourceSchema::new("acm.Certificate");
+    cert_schema = cert_schema.attribute(AttributeSchema::new(
+        "certificate_arn",
+        AttributeType::string(),
+    ));
+    cert_schema = cert_schema.attribute(AttributeSchema::new("status", AttributeType::string()));
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("aws", cert_schema);
+
+    let params = vec![AttributeParameter {
+        name: "certificate_arn".to_string(),
+        type_expr: Some(TypeExpr::Simple("string".to_string())),
+        value: Some(Value::resource_ref(
+            "cert_issued".to_string(),
+            "bad_attr".to_string(),
+            vec![],
+        )),
+    }];
+
+    let mut parsed = empty_parsed();
+    parsed.resources.push(cert); // allow: direct — fixture test inspection
+    parsed.wait_bindings.push(WaitBinding {
+        binding: BindingName::from("cert_issued"),
+        target: BindingName::from("cert"),
+        until_raw: "cert.status == 'issued'".to_string(),
+        until_predicate: UntilPredicateAst {
+            lhs_segments: vec!["cert".to_string(), "status".to_string()],
+            rhs: Value::Concrete(ConcreteValue::String("issued".to_string())),
+        },
+        timeout_secs: None,
+        depends_on: Vec::new(),
+        line: 1,
+    });
+
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let err = validate_attribute_param_ref_types_with_bindings(&params, &bindings).unwrap_err();
+    assert!(
+        err.contains("attribute 'certificate_arn': unknown attribute 'bad_attr' on 'cert_issued'"),
+        "expected attribute-param wait binding unknown attribute error, got: {err}",
     );
 }
 
@@ -2155,7 +2223,10 @@ fn attribute_param_ref_types_does_not_misreport_type_mismatch_for_nested_ref_to_
         value: Some(Value::Concrete(ConcreteValue::Map(nested))),
     }];
 
-    let result = validate_attribute_param_ref_types(&params, &[vpc], &schemas);
+    let mut parsed = empty_parsed();
+    parsed.resources.push(vpc); // allow: direct — fixture test inspection
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let result = validate_attribute_param_ref_types_with_bindings(&params, &bindings);
     assert!(
         result.is_ok(),
         "nested refs should be existence-checked only, got: {result:?}",
@@ -2684,6 +2755,55 @@ fn export_param_ref_types_flags_unknown_attribute_through_wait_binding() {
             "export 'x': unknown attribute 'bad_attr' on 'cert_issued' in reference cert_issued.bad_attr"
         ),
         "expected export wait binding unknown attribute error, got: {err}",
+    );
+}
+
+#[test]
+fn export_param_ref_types_flags_unknown_struct_field_inside_path() {
+    use crate::parser::InferredExportParam;
+    use crate::schema::StructField;
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        make_schema(
+            "ec2.Vpc",
+            vec![(
+                "config",
+                AttributeType::struct_(
+                    "VpcConfig".to_string(),
+                    vec![StructField::new("sub_attr", AttributeType::string())],
+                ),
+            )],
+        ),
+    );
+
+    let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc", None)
+        .with_binding("vpc")
+        .with_attribute(
+            "config",
+            Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+        );
+
+    let exports = vec![InferredExportParam {
+        name: "x".to_string(),
+        type_expr: TypeExpr::String,
+        value: Some(Value::resource_ref(
+            "vpc".to_string(),
+            "config".to_string(),
+            vec!["bad_field".to_string()],
+        )),
+    }];
+
+    let mut parsed = empty_parsed();
+    parsed.resources.push(vpc); // allow: direct — fixture test inspection
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings).unwrap_err();
+    assert!(
+        err.contains(
+            "export 'x': unknown attribute 'bad_field' on 'vpc' in reference vpc.config.bad_field"
+        ),
+        "expected export unknown struct field error, got: {err}",
     );
 }
 
@@ -3232,7 +3352,7 @@ fn ref_with_chained_subscript_then_field_narrows_through_list() {
     let mut parsed = empty_parsed();
     parsed.resources.push(cert); // allow: direct — fixture test inspection
     parsed.resources.push(record); // allow: direct — fixture test inspection
-    let result = validate_resource_ref_types(&parsed, &schemas, &HashSet::new());
+    let result = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new());
     assert!(
         result.is_ok(),
         "chained subscript-then-field should narrow List<Struct> → Struct → String, got: {:?}",
@@ -3291,7 +3411,7 @@ fn ref_with_chained_subscript_then_field_rejects_real_mismatch() {
     let mut parsed = empty_parsed();
     parsed.resources.push(cert); // allow: direct — fixture test inspection
     parsed.resources.push(record); // allow: direct — fixture test inspection
-    let err = validate_resource_ref_types(&parsed, &schemas, &HashSet::new()).unwrap_err();
+    let err = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new()).unwrap_err();
     assert!(
         err.contains("expected String"),
         "expected real Int→String mismatch to be flagged, got: {err}"
@@ -3375,7 +3495,7 @@ fn ref_with_chained_field_on_struct_flags_unknown_field() {
     let mut parsed = empty_parsed();
     parsed.resources.push(cert); // allow: direct — fixture test inspection
     parsed.resources.push(record); // allow: direct — fixture test inspection
-    let err = validate_resource_ref_types(&parsed, &schemas, &HashSet::new()).unwrap_err();
+    let err = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new()).unwrap_err();
     assert!(
         err.contains("resource_record_name"),
         "error must name the unknown field, got: {err}",

@@ -453,11 +453,7 @@ pub fn validate_and_resolve_errors_with_factories(
             parsed,
             &argument_names,
         ));
-        errors.extend(validate_attribute_param_ref_types_with_ctx(
-            &ctx,
-            &parsed.attribute_params,
-            &parsed.resources,
-        ));
+        errors.extend(validate_attribute_param_ref_types_with_ctx(&ctx, parsed));
         if !errors.is_empty() {
             return errors;
         }

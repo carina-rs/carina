@@ -312,23 +312,26 @@ pub fn validate_resource_ref_types_with_ctx<E>(
     parsed: &carina_core::parser::File<E>,
     argument_names: &HashSet<String>,
 ) -> Vec<AppError> {
+    let bindings = carina_core::binding_index::BindingIndex::from_parsed(parsed, ctx.schemas());
     lift_validation_result(validation::validate_resource_ref_types(
         parsed,
         ctx.schemas(),
         argument_names,
+        &bindings,
     ))
 }
 
-pub fn validate_attribute_param_ref_types_with_ctx(
+pub fn validate_attribute_param_ref_types_with_ctx<E>(
     ctx: &WiringContext,
-    attribute_params: &[carina_core::parser::AttributeParameter],
-    resources: &[Resource],
+    parsed: &carina_core::parser::File<E>,
 ) -> Vec<AppError> {
-    lift_validation_result(validation::validate_attribute_param_ref_types(
-        attribute_params,
-        resources,
-        ctx.schemas(),
-    ))
+    let bindings = carina_core::binding_index::BindingIndex::from_parsed(parsed, ctx.schemas());
+    lift_validation_result(
+        validation::validate_attribute_param_ref_types_with_bindings(
+            &parsed.attribute_params,
+            &bindings,
+        ),
+    )
 }
 
 /// Reject any resolved value that still carries
@@ -919,10 +922,11 @@ pub fn validate_module_attribute_param_types<E>(
         if module_parsed.attribute_params.is_empty() {
             continue;
         }
-        if let Err(joined) = validation::validate_attribute_param_ref_types(
+        let bindings =
+            carina_core::binding_index::BindingIndex::from_parsed(&module_parsed, ctx.schemas());
+        if let Err(joined) = validation::validate_attribute_param_ref_types_with_bindings(
             &module_parsed.attribute_params,
-            &module_parsed.resources,
-            ctx.schemas(),
+            &bindings,
         ) {
             // Preserve the module-path prefix the legacy wrapper emitted
             // so diagnostics point at which imported module failed.

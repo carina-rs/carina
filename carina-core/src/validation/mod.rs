@@ -14,7 +14,7 @@ use crate::parser::{
     ModuleCall, ProviderContext, ResourceRef, ResourceTypePath, TypeExpr, validate_custom_type,
 };
 use crate::provider::ProviderFactory;
-use crate::resource::{ConcreteValue, DeferredValue, Resource, Value};
+use crate::resource::{ConcreteValue, DeferredValue, Value};
 use crate::schema::{AttributeType, SchemaRegistry, Shape, TypeIdentity, suggest_similar_name};
 
 /// Render the trailing `" Did you mean 'X'?"` segment for an unknown
@@ -76,6 +76,24 @@ fn check_resource_ref_existence<'a>(
     };
 
     Some((ref_schema, ref_attr_schema))
+}
+
+fn check_nested_resource_ref_existence(
+    resource_id: &crate::resource::ResourceId,
+    attr_value: &Value,
+    argument_names: &HashSet<String>,
+    bindings: &BindingIndex<'_>,
+    all_errors: &mut Vec<String>,
+) {
+    attr_value.visit_resource_refs(&mut |ref_path| {
+        let _ = check_resource_ref_existence(
+            resource_id,
+            ref_path,
+            argument_names,
+            bindings,
+            all_errors,
+        );
+    });
 }
 
 /// Validate resources against their schemas.
@@ -187,13 +205,9 @@ pub fn validate_resource_ref_types<E>(
     parsed: &crate::parser::File<E>,
     registry: &SchemaRegistry,
     argument_names: &HashSet<String>,
+    bindings: &BindingIndex<'_>,
 ) -> Result<(), String> {
     let mut all_errors = Vec::new();
-
-    // Single source of truth for `binding_name → (resource, schema)` —
-    // shared with the LSP via `BindingIndex` so the two paths cannot drift
-    // (#2231).
-    let bindings = BindingIndex::from_parsed(parsed, registry);
 
     for rref in parsed.iter_all_resources() {
         // A deferred for-expression template body is always managed.
@@ -216,15 +230,13 @@ pub fn validate_resource_ref_types<E>(
             }
 
             let Some(attr_schema) = schema.attributes.get(attr_name) else {
-                attr_value.visit_resource_refs(&mut |ref_path| {
-                    let _ = check_resource_ref_existence(
-                        resource_id,
-                        ref_path,
-                        argument_names,
-                        &bindings,
-                        &mut all_errors,
-                    );
-                });
+                check_nested_resource_ref_existence(
+                    resource_id,
+                    attr_value,
+                    argument_names,
+                    bindings,
+                    &mut all_errors,
+                );
                 continue;
             };
 
@@ -233,7 +245,7 @@ pub fn validate_resource_ref_types<E>(
                     resource_id,
                     ref_path,
                     argument_names,
-                    &bindings,
+                    bindings,
                     &mut all_errors,
                 ) else {
                     continue;
@@ -296,15 +308,13 @@ pub fn validate_resource_ref_types<E>(
                 // existence only. Assignability for these refs needs the
                 // nested field type context from the surrounding Map/List/Struct
                 // shape and should be added where that context is threaded.
-                attr_value.visit_resource_refs(&mut |ref_path| {
-                    let _ = check_resource_ref_existence(
-                        resource_id,
-                        ref_path,
-                        argument_names,
-                        &bindings,
-                        &mut all_errors,
-                    );
-                });
+                check_nested_resource_ref_existence(
+                    resource_id,
+                    attr_value,
+                    argument_names,
+                    bindings,
+                    &mut all_errors,
+                );
             }
         }
     }
@@ -321,18 +331,10 @@ pub fn validate_resource_ref_types<E>(
 ///
 /// For example, `attributes { role_arn: iam_role_arn = role.role_name }` should
 /// be rejected because `role_name` is `String`, not `IamRoleArn`.
-pub fn validate_attribute_param_ref_types(
+pub fn validate_attribute_param_ref_types_with_bindings(
     attribute_params: &[crate::parser::AttributeParameter],
-    resources: &[Resource],
-    registry: &SchemaRegistry,
+    bindings: &BindingIndex<'_>,
 ) -> Result<(), String> {
-    let mut binding_map: HashMap<String, &Resource> = HashMap::new();
-    for resource in resources {
-        if let Some(ref binding_name) = resource.binding {
-            binding_map.insert(binding_name.clone(), resource);
-        }
-    }
-
     let mut errors = Vec::new();
 
     for param in attribute_params {
@@ -350,23 +352,10 @@ pub fn validate_attribute_param_ref_types(
         };
 
         if let Value::Deferred(DeferredValue::ResourceRef { path }) = value {
-            check_attribute_param_ref_type(
-                &param.name,
-                expected_type,
-                path,
-                &binding_map,
-                registry,
-                &mut errors,
-            );
+            check_attribute_param_ref_type(&param.name, expected_type, path, bindings, &mut errors);
         } else {
             value.visit_resource_refs(&mut |path| {
-                check_attribute_param_ref_existence(
-                    &param.name,
-                    path,
-                    &binding_map,
-                    registry,
-                    &mut errors,
-                );
+                check_attribute_param_ref_existence(&param.name, path, bindings, &mut errors);
             });
         }
     }
@@ -382,20 +371,16 @@ fn check_attribute_param_ref_type(
     param_name: &str,
     expected_type: &str,
     path: &crate::resource::AccessPath,
-    binding_map: &HashMap<String, &Resource>,
-    registry: &SchemaRegistry,
+    bindings: &BindingIndex<'_>,
     errors: &mut Vec<String>,
 ) {
     let ref_binding = path.binding();
     let ref_attr = path.attribute();
 
-    // Look up referenced resource's schema
-    let Some(ref_resource) = binding_map.get(ref_binding) else {
+    let Some(ref_entry) = bindings.get(ref_binding) else {
         return;
     };
-    let Some(ref_schema) = registry.get_for(ref_resource) else {
-        return;
-    };
+    let ref_schema = ref_entry.schema;
     let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr) else {
         errors.push(format!(
             "attribute '{}': unknown attribute '{}' on '{}' in reference {}.{}",
@@ -420,19 +405,16 @@ fn check_attribute_param_ref_type(
 fn check_attribute_param_ref_existence(
     param_name: &str,
     path: &crate::resource::AccessPath,
-    binding_map: &HashMap<String, &Resource>,
-    registry: &SchemaRegistry,
+    bindings: &BindingIndex<'_>,
     errors: &mut Vec<String>,
 ) {
     let ref_binding = path.binding();
     let ref_attr = path.attribute();
 
-    let Some(ref_resource) = binding_map.get(ref_binding) else {
+    let Some(ref_entry) = bindings.get(ref_binding) else {
         return;
     };
-    let Some(ref_schema) = registry.get_for(ref_resource) else {
-        return;
-    };
+    let ref_schema = ref_entry.schema;
     if ref_schema.attributes.contains_key(ref_attr) {
         return;
     }
