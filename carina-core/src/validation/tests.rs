@@ -2056,6 +2056,43 @@ fn attribute_param_ref_type_mismatch_detected() {
 }
 
 #[test]
+fn attribute_param_ref_types_flags_unknown_attribute_inside_nested_struct() {
+    use crate::parser::AttributeParameter;
+    use crate::schema::{AttributeSchema, ResourceSchema};
+
+    let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc", None)
+        .with_binding("vpc")
+        .with_attribute(
+            "vpc_id",
+            Value::Concrete(ConcreteValue::String("vpc-123".to_string())),
+        );
+
+    let mut vpc_schema = ResourceSchema::new("ec2.Vpc");
+    vpc_schema = vpc_schema.attribute(AttributeSchema::new("vpc_id", AttributeType::string()));
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", vpc_schema);
+
+    let mut nested = IndexMap::new();
+    nested.insert(
+        "id".to_string(),
+        Value::resource_ref("vpc".to_string(), "bad_attr".to_string(), vec![]),
+    );
+    let params = vec![AttributeParameter {
+        name: "network".to_string(),
+        type_expr: Some(TypeExpr::Simple("vpc_id".to_string())),
+        value: Some(Value::Concrete(ConcreteValue::Map(nested))),
+    }];
+
+    let resources = vec![vpc];
+    let err = validate_attribute_param_ref_types(&params, &resources, &schemas).unwrap_err();
+    assert!(
+        err.contains("attribute 'network': unknown attribute 'bad_attr' on 'vpc'"),
+        "expected nested attribute-param ResourceRef error, got: {err}",
+    );
+}
+
+#[test]
 fn validate_export_params_rejects_invalid_custom_type() {
     use crate::parser::InferredExportParam;
 

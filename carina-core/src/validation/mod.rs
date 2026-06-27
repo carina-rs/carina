@@ -335,41 +335,33 @@ pub fn validate_attribute_param_ref_types(
             continue;
         };
 
-        // Only check ResourceRef values
-        let Value::Deferred(DeferredValue::ResourceRef { path }) = value else {
-            continue;
-        };
-        let ref_binding = path.binding().to_string();
-        let ref_attr = path.attribute().to_string();
-
         // Get expected type name from TypeExpr
         let expected_type = match type_expr {
             crate::parser::TypeExpr::Simple(name) => name.as_str(),
             _ => continue, // String, Bool, etc. are handled by validate_type_expr_value
         };
 
-        // Look up referenced resource's schema
-        let Some(ref_resource) = binding_map.get(&ref_binding) else {
-            continue;
-        };
-        let Some(ref_schema) = registry.get_for(ref_resource) else {
-            continue;
-        };
-        let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr.as_str()) else {
-            continue;
-        };
-
-        let ref_type_name = ref_attr_schema.attr_type.type_name();
-        let ref_type_snake = crate::parser::pascal_to_snake(&ref_type_name);
-
-        if ref_type_snake == expected_type {
-            continue;
+        if let Value::Deferred(DeferredValue::ResourceRef { path }) = value {
+            check_attribute_param_ref_type(
+                &param.name,
+                expected_type,
+                path,
+                &binding_map,
+                registry,
+                &mut errors,
+            );
+        } else {
+            value.visit_resource_refs(&mut |path| {
+                check_attribute_param_ref_type(
+                    &param.name,
+                    expected_type,
+                    path,
+                    &binding_map,
+                    registry,
+                    &mut errors,
+                );
+            });
         }
-
-        errors.push(format!(
-            "attribute '{}': type mismatch: expected {}, got {} (from {}.{})",
-            param.name, expected_type, ref_type_snake, ref_binding, ref_attr
-        ));
     }
 
     if errors.is_empty() {
@@ -377,6 +369,45 @@ pub fn validate_attribute_param_ref_types(
     } else {
         Err(errors.join("\n"))
     }
+}
+
+fn check_attribute_param_ref_type(
+    param_name: &str,
+    expected_type: &str,
+    path: &crate::resource::AccessPath,
+    binding_map: &HashMap<String, &Resource>,
+    registry: &SchemaRegistry,
+    errors: &mut Vec<String>,
+) {
+    let ref_binding = path.binding();
+    let ref_attr = path.attribute();
+
+    // Look up referenced resource's schema
+    let Some(ref_resource) = binding_map.get(ref_binding) else {
+        return;
+    };
+    let Some(ref_schema) = registry.get_for(ref_resource) else {
+        return;
+    };
+    let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr) else {
+        errors.push(format!(
+            "attribute '{}': unknown attribute '{}' on '{}' in reference {}.{}",
+            param_name, ref_attr, ref_binding, ref_binding, ref_attr,
+        ));
+        return;
+    };
+
+    let ref_type_name = ref_attr_schema.attr_type.type_name();
+    let ref_type_snake = crate::parser::pascal_to_snake(&ref_type_name);
+
+    if ref_type_snake == expected_type {
+        return;
+    }
+
+    errors.push(format!(
+        "attribute '{}': type mismatch: expected {}, got {} (from {}.{})",
+        param_name, expected_type, ref_type_snake, ref_binding, ref_attr
+    ));
 }
 
 /// Validate export parameter values that are ResourceRef against their declared
