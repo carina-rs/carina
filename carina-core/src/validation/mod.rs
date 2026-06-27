@@ -27,6 +27,57 @@ fn did_you_mean(unknown: &str, known: &[&str]) -> String {
         .unwrap_or_default()
 }
 
+fn check_resource_ref_existence<'a>(
+    resource_id: &crate::resource::ResourceId,
+    ref_path: &crate::resource::AccessPath,
+    argument_names: &HashSet<String>,
+    bindings: &BindingIndex<'a>,
+    all_errors: &mut Vec<String>,
+) -> Option<(
+    &'a crate::schema::ResourceSchema,
+    &'a crate::schema::AttributeSchema,
+)> {
+    let ref_binding = ref_path.binding();
+    let ref_attr = ref_path.attribute();
+
+    // Skip type checking for argument parameter references (resolved at call site)
+    if argument_names.contains(ref_binding) {
+        return None;
+    }
+
+    // Look up the referenced binding's schema. `BindingIndex::get`
+    // returns `Some` only when both the binding and its schema
+    // resolved; `contains_name` distinguishes "unknown binding"
+    // from "known binding, schema absent" so we keep the original
+    // diagnostic shape (only the former gets reported here).
+    let Some(ref_entry) = bindings.get(ref_binding) else {
+        if !bindings.is_declared(ref_binding) {
+            all_errors.push(format!(
+                "{}: unknown binding '{}' in reference {}.{}",
+                resource_id, ref_binding, ref_binding, ref_attr,
+            ));
+        }
+        return None;
+    };
+
+    let ref_schema = ref_entry.schema;
+    let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr) else {
+        let known_attrs: Vec<&str> = ref_schema.attributes.keys().map(|s| s.as_str()).collect();
+        all_errors.push(format!(
+            "{}: unknown attribute '{}' on '{}' in reference {}.{}{}",
+            resource_id,
+            ref_attr,
+            ref_binding,
+            ref_binding,
+            ref_attr,
+            did_you_mean(ref_attr, &known_attrs),
+        ));
+        return None;
+    };
+
+    Some((ref_schema, ref_attr_schema))
+}
+
 /// Validate resources against their schemas.
 ///
 /// Two-sided check: a `read` resource requires a `DataSource` registry entry,
@@ -164,108 +215,89 @@ pub fn validate_resource_ref_types<E>(
                 continue;
             }
 
-            let (ref_binding, ref_attr, ref_path) = match attr_value {
-                Value::Deferred(DeferredValue::ResourceRef { path }) => (
-                    path.binding().to_string(),
-                    path.attribute().to_string(),
-                    path,
-                ),
-                _ => continue,
-            };
-
             // Get the expected type for this attribute
             let Some(attr_schema) = schema.attributes.get(attr_name) else {
                 continue;
             };
-            let expected_type_name = attr_schema.attr_type.type_name();
 
-            // Skip type checking for argument parameter references (resolved at call site)
-            if argument_names.contains(ref_binding.as_str()) {
-                continue;
-            }
-
-            // Look up the referenced binding's schema. `BindingIndex::get`
-            // returns `Some` only when both the binding and its schema
-            // resolved; `contains_name` distinguishes "unknown binding"
-            // from "known binding, schema absent" so we keep the original
-            // diagnostic shape (only the former gets reported here).
-            let Some(ref_entry) = bindings.get(ref_binding.as_str()) else {
-                if !bindings.is_declared(ref_binding.as_str()) {
-                    all_errors.push(format!(
-                        "{}: unknown binding '{}' in reference {}.{}",
-                        resource_id, ref_binding, ref_binding, ref_attr,
-                    ));
-                }
-                continue;
-            };
-            let ref_schema = ref_entry.schema;
-            let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr.as_str()) else {
-                let known_attrs: Vec<&str> =
-                    ref_schema.attributes.keys().map(|s| s.as_str()).collect();
-                all_errors.push(format!(
-                    "{}: unknown attribute '{}' on '{}' in reference {}.{}{}",
+            if let Value::Deferred(DeferredValue::ResourceRef { path: ref_path }) = attr_value {
+                let Some((ref_schema, ref_attr_schema)) = check_resource_ref_existence(
                     resource_id,
-                    ref_attr,
-                    ref_binding,
-                    ref_binding,
-                    ref_attr,
-                    did_you_mean(&ref_attr, &known_attrs),
-                ));
-                continue;
-            };
-
-            // Narrow through the path's segments — `[idx]` peels one
-            // `List<T>` / `Map<_,V>` layer, `.field` descends a
-            // `Struct`. carina#3028. Unknown struct fields are a
-            // real typo (carina#3041) and get reported here with a
-            // suggestion; other shape mismatches stay silent because
-            // resolver-time evaluation catches them with full location
-            // context.
-            let narrowed = match narrow_attribute_type(
-                &ref_attr_schema.attr_type,
-                ref_path.segments(),
-                &ref_schema.defs,
-            ) {
-                Ok(t) => t,
-                Err(NarrowError::UnknownStructField {
-                    field,
-                    struct_name,
-                    known_fields,
-                }) => {
-                    let known: Vec<&str> = known_fields.iter().map(|s| s.as_str()).collect();
-                    all_errors.push(format!(
-                        "{}: unknown field '{}' on struct '{}' in reference {}; \
-                         known fields: {}.{}",
-                        resource_id,
+                    ref_path,
+                    argument_names,
+                    &bindings,
+                    &mut all_errors,
+                ) else {
+                    continue;
+                };
+                // Narrow through the path's segments — `[idx]` peels one
+                // `List<T>` / `Map<_,V>` layer, `.field` descends a
+                // `Struct`. carina#3028. Unknown struct fields are a
+                // real typo (carina#3041) and get reported here with a
+                // suggestion; other shape mismatches stay silent because
+                // resolver-time evaluation catches them with full location
+                // context.
+                let narrowed = match narrow_attribute_type(
+                    &ref_attr_schema.attr_type,
+                    ref_path.segments(),
+                    &ref_schema.defs,
+                ) {
+                    Ok(t) => t,
+                    Err(NarrowError::UnknownStructField {
                         field,
                         struct_name,
-                        ref_path.to_dot_string(),
-                        known.join(", "),
-                        did_you_mean(&field, &known),
-                    ));
+                        known_fields,
+                    }) => {
+                        let known: Vec<&str> = known_fields.iter().map(|s| s.as_str()).collect();
+                        all_errors.push(format!(
+                            "{}: unknown field '{}' on struct '{}' in reference {}; \
+                             known fields: {}.{}",
+                            resource_id,
+                            field,
+                            struct_name,
+                            ref_path.to_dot_string(),
+                            known.join(", "),
+                            did_you_mean(&field, &known),
+                        ));
+                        continue;
+                    }
+                    Err(NarrowError::ShapeMismatch) => continue,
+                };
+                let ref_type_name = narrowed.type_name();
+                let expected_type_name = attr_schema.attr_type.type_name();
+
+                // Directional check: source (the referenced attribute, post
+                // path narrowing) must be assignable to the sink (the
+                // current resource's attribute).
+                if narrowed.is_assignable_to(&attr_schema.attr_type) {
                     continue;
                 }
-                Err(NarrowError::ShapeMismatch) => continue,
-            };
-            let ref_type_name = narrowed.type_name();
 
-            // Directional check: source (the referenced attribute, post
-            // path narrowing) must be assignable to the sink (the
-            // current resource's attribute).
-            if narrowed.is_assignable_to(&attr_schema.attr_type) {
-                continue;
+                all_errors.push(format!(
+                    "{}: cannot assign {} to '{}': expected {}, got {} (from {}.{})",
+                    resource_id,
+                    ref_type_name,
+                    attr_name,
+                    expected_type_name,
+                    ref_type_name,
+                    ref_path.binding(),
+                    ref_path.attribute(),
+                ));
+            } else {
+                // Nested ResourceRefs are checked for binding/attribute
+                // existence only. Assignability for these refs needs the
+                // nested field type context from the surrounding Map/List/Struct
+                // shape and should be added where that context is threaded.
+                attr_value.visit_resource_refs(&mut |ref_path| {
+                    let _ = check_resource_ref_existence(
+                        resource_id,
+                        ref_path,
+                        argument_names,
+                        &bindings,
+                        &mut all_errors,
+                    );
+                });
             }
-
-            all_errors.push(format!(
-                "{}: cannot assign {} to '{}': expected {}, got {} (from {}.{})",
-                resource_id,
-                ref_type_name,
-                attr_name,
-                expected_type_name,
-                ref_type_name,
-                ref_binding,
-                ref_attr,
-            ));
         }
     }
 

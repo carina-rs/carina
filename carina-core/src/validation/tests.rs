@@ -787,6 +787,138 @@ fn known_attribute_reference_through_wait_binding_is_accepted() {
 }
 
 #[test]
+fn unknown_attribute_reference_through_wait_binding_inside_nested_struct_reports_error() {
+    use crate::schema::StructField;
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        make_schema(
+            "acm.Certificate",
+            vec![
+                ("certificate_arn", AttributeType::string()),
+                ("status", AttributeType::string()),
+            ],
+        ),
+    );
+    schemas.insert(
+        "awscc",
+        make_schema(
+            "elasticloadbalancingv2.Listener",
+            vec![(
+                "certificates",
+                AttributeType::list(AttributeType::struct_(
+                    "Certificate".to_string(),
+                    vec![StructField::new("certificate_arn", AttributeType::string())],
+                )),
+            )],
+        ),
+    );
+
+    let cert = Resource::with_provider("aws", "acm.Certificate", "cert", None)
+        .with_binding("cert")
+        .with_attribute(
+            "status",
+            Value::Concrete(ConcreteValue::String("pending".to_string())),
+        );
+    let mut certificate = IndexMap::new();
+    certificate.insert(
+        "certificate_arn".to_string(),
+        Value::resource_ref("cert_issued".to_string(), "arn".to_string(), vec![]),
+    );
+    let listener =
+        Resource::with_provider("awscc", "elasticloadbalancingv2.Listener", "listener", None)
+            .with_attribute(
+                "certificates",
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::Map(certificate),
+                )])),
+            );
+
+    let mut parsed = empty_parsed();
+    parsed.resources.push(cert); // allow: direct — fixture test inspection
+    parsed.wait_bindings.push(WaitBinding {
+        binding: BindingName::from("cert_issued"),
+        target: BindingName::from("cert"),
+        until_raw: "cert.status == 'issued'".to_string(),
+        until_predicate: UntilPredicateAst {
+            lhs_segments: vec!["cert".to_string(), "status".to_string()],
+            rhs: Value::Concrete(ConcreteValue::String("issued".to_string())),
+        },
+        timeout_secs: None,
+        depends_on: Vec::new(),
+        line: 1,
+    });
+    parsed.resources.push(listener); // allow: direct — fixture test inspection
+
+    let err = validate_resource_ref_types(&parsed, &schemas, &HashSet::new()).unwrap_err();
+    assert!(
+        err.contains("unknown attribute 'arn' on 'cert_issued'"),
+        "expected nested wait binding attribute error, got: {err}",
+    );
+}
+
+#[test]
+fn unknown_attribute_reference_through_managed_binding_inside_nested_struct_reports_error() {
+    use crate::schema::StructField;
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        make_schema(
+            "acm.Certificate",
+            vec![
+                ("certificate_arn", AttributeType::string()),
+                ("status", AttributeType::string()),
+            ],
+        ),
+    );
+    schemas.insert(
+        "awscc",
+        make_schema(
+            "elasticloadbalancingv2.Listener",
+            vec![(
+                "certificates",
+                AttributeType::list(AttributeType::struct_(
+                    "Certificate".to_string(),
+                    vec![StructField::new("certificate_arn", AttributeType::string())],
+                )),
+            )],
+        ),
+    );
+
+    let cert = Resource::with_provider("aws", "acm.Certificate", "cert", None)
+        .with_binding("cert")
+        .with_attribute(
+            "status",
+            Value::Concrete(ConcreteValue::String("pending".to_string())),
+        );
+    let mut certificate = IndexMap::new();
+    certificate.insert(
+        "certificate_arn".to_string(),
+        Value::resource_ref("cert".to_string(), "arn".to_string(), vec![]),
+    );
+    let listener =
+        Resource::with_provider("awscc", "elasticloadbalancingv2.Listener", "listener", None)
+            .with_attribute(
+                "certificates",
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::Map(certificate),
+                )])),
+            );
+
+    let mut parsed = empty_parsed();
+    parsed.resources.push(cert); // allow: direct — fixture test inspection
+    parsed.resources.push(listener); // allow: direct — fixture test inspection
+
+    let err = validate_resource_ref_types(&parsed, &schemas, &HashSet::new()).unwrap_err();
+    assert!(
+        err.contains("unknown attribute 'arn' on 'cert'"),
+        "expected nested managed binding attribute error, got: {err}",
+    );
+}
+
+#[test]
 fn unknown_attribute_reference_no_suggestion_when_too_different() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
