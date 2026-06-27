@@ -170,6 +170,51 @@ See the codex skill for the full subcontracting protocol.
 - When bugs are found or issues are pointed out, write a test that captures the fix so the regression is caught and the expected behavior is documented.
 - Run full verify/review/CI gates before merge.
 
+## Review Checklist — Carina-Specific Concerns
+
+In addition to generic review dimensions (correctness, scope, tests,
+OWASP), the following concerns must be checked on every review round
+in this codebase.
+
+### Parser Output Boundary Validation
+
+Verify that raw values from the pest parser (strings, token sequences)
+do not flow into domain types without validation. A successful parse
+does not equal domain-level validation. At conversion points from
+`Rule` matches to `ResourceType`, `AttributeValue`, `NamespacedId`,
+etc., confirm that a step exists to reject inputs that are syntactically
+valid but domain-invalid.
+
+### Credential and Secret Leakage
+
+Confirm that AWS access keys, session tokens, and credentials included
+in provider responses do not leak into log output, `Debug` impls, error
+messages, or unintended fields in state files. Also check `tracing` span
+attributes and `Display` impls that expand provider responses verbatim.
+
+### Error Chain Preservation
+
+Check that `format!("{}", err)` or `.to_string()` is not used to
+stringify errors in a way that severs the `#[source]` chain. Also flag
+duplicate logging where the same error is emitted via `tracing::error!`
+at both the adapter layer and the use-case layer.
+
+### State Operation Atomicity
+
+Verify that the read → diff → write sequence for state is performed
+under a lock (`apply`/`destroy` paths). `plan` intentionally does not
+acquire a lock (see the plan concurrency contract), but drift detection
+must be functional. When adding a new state operation path, confirm
+consistency with the existing contract.
+
+### Property-Based Testing Applicability
+
+When modifying code with obvious invariants — parser round-trips
+(parse → display → re-parse yields identical result), `NamespacedId`
+parse/display round-trips, differ idempotency (same input → same plan)
+— consider adding property-based tests. Not required when existing
+example-based tests already provide sufficient coverage.
+
 ---
 
 # Part 2 — Build, Test, Verify
