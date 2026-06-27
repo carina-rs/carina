@@ -215,8 +215,16 @@ pub fn validate_resource_ref_types<E>(
                 continue;
             }
 
-            // Get the expected type for this attribute
             let Some(attr_schema) = schema.attributes.get(attr_name) else {
+                attr_value.visit_resource_refs(&mut |ref_path| {
+                    let _ = check_resource_ref_existence(
+                        resource_id,
+                        ref_path,
+                        argument_names,
+                        &bindings,
+                        &mut all_errors,
+                    );
+                });
                 continue;
             };
 
@@ -473,6 +481,9 @@ fn collect_ref_type_errors(
             let ref_binding = path.binding();
             let ref_attr = path.attribute();
 
+            // TODO: `binding_map` is managed-resource only here. Thread
+            // `BindingIndex` through export-param validation before expecting
+            // wait aliases or data-source bindings to report this diagnostic.
             let Some(ref_resource) = binding_map.get(ref_binding) else {
                 return;
             };
@@ -480,6 +491,17 @@ fn collect_ref_type_errors(
                 return;
             };
             let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr) else {
+                let known_attrs: Vec<&str> =
+                    ref_schema.attributes.keys().map(|s| s.as_str()).collect();
+                errors.push(format!(
+                    "export '{}': unknown attribute '{}' on '{}' in reference {}.{}{}",
+                    param_name,
+                    ref_attr,
+                    ref_binding,
+                    ref_binding,
+                    ref_attr,
+                    did_you_mean(ref_attr, &known_attrs),
+                ));
                 return;
             };
 

@@ -919,6 +919,39 @@ fn unknown_attribute_reference_through_managed_binding_inside_nested_struct_repo
 }
 
 #[test]
+fn unknown_outer_attr_does_not_mask_nested_unknown_binding_ref() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        make_schema(
+            "elasticloadbalancingv2.Listener",
+            vec![("certificates", AttributeType::string())],
+        ),
+    );
+
+    let mut nested = IndexMap::new();
+    nested.insert(
+        "certificate_arn".to_string(),
+        Value::resource_ref("unknown_binding".to_string(), "foo".to_string(), vec![]),
+    );
+    let listener =
+        Resource::with_provider("awscc", "elasticloadbalancingv2.Listener", "listener", None)
+            .with_attribute(
+                "certificates_typo",
+                Value::Concrete(ConcreteValue::Map(nested)),
+            );
+
+    let mut parsed = empty_parsed();
+    parsed.resources.push(listener); // allow: direct — fixture test inspection
+
+    let err = validate_resource_ref_types(&parsed, &schemas, &HashSet::new()).unwrap_err();
+    assert!(
+        err.contains("unknown binding 'unknown_binding' in reference unknown_binding.foo"),
+        "expected nested unknown binding under unknown outer attr, got: {err}",
+    );
+}
+
+#[test]
 fn unknown_attribute_reference_no_suggestion_when_too_different() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -2513,6 +2546,40 @@ fn validate_export_param_ref_types_map_rejects_type_mismatch() {
     assert!(
         err.contains("accounts") && err.contains("type mismatch"),
         "error should mention the export name and type mismatch, got: {err}"
+    );
+}
+
+#[test]
+fn export_param_ref_types_flags_unknown_attribute() {
+    use crate::parser::InferredExportParam;
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        make_schema("ec2.Vpc", vec![("vpc_id", AttributeType::string())]),
+    );
+
+    let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc", None)
+        .with_binding("vpc")
+        .with_attribute(
+            "vpc_id",
+            Value::Concrete(ConcreteValue::String("vpc-123".to_string())),
+        );
+
+    let exports = vec![InferredExportParam {
+        name: "x".to_string(),
+        type_expr: TypeExpr::String,
+        value: Some(Value::resource_ref(
+            "vpc".to_string(),
+            "bad_attr".to_string(),
+            vec![],
+        )),
+    }];
+
+    let err = validate_export_param_ref_types(&exports, &[vpc], &schemas).unwrap_err();
+    assert!(
+        err.contains("export 'x': unknown attribute 'bad_attr' on 'vpc' in reference vpc.bad_attr"),
+        "expected export unknown attribute error, got: {err}",
     );
 }
 
