@@ -8,7 +8,7 @@ use crate::document::Document;
 use crate::position;
 use carina_core::builtins;
 use carina_core::parser::{ArgumentParameter, ParsedFile, TypeExpr};
-use carina_core::resource::{ConcreteValue, DeferredValue, Resource, Value};
+use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 use carina_core::schema::{ResourceSchema, suggest_similar_name};
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 
@@ -1347,9 +1347,6 @@ impl DiagnosticEngine {
 
     /// Validate export parameter values against their type annotations.
     ///
-    /// `all_resources` provides cross-file resources for schema-level ref type
-    /// checking. If None, falls back to the current file's resources.
-    ///
     /// `merged` is the directory-merged parse used to feed inference so
     /// module-call / `upstream_state` bindings declared in sibling
     /// `.crn` files are visible — without it the export inference would
@@ -1360,7 +1357,6 @@ impl DiagnosticEngine {
         doc: &Document,
         parsed: &ParsedFile,
         merged: Option<&ParsedFile>,
-        all_resources: Option<&[Resource]>,
         sibling_bindings: &HashMap<String, String>,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
@@ -1404,7 +1400,6 @@ impl DiagnosticEngine {
         // whole `InferredFile`. Use the merged parse when available so
         // sibling-file `let` bindings (module calls, upstream_states)
         // are visible to inference (#2493).
-        let resources = all_resources.unwrap_or(&parsed.resources);
         let inference_input = merged.unwrap_or(parsed);
         let (inferred_export_params, inference_errors) =
             carina_core::validation::inference::infer_export_params(inference_input, &self.schemas);
@@ -1425,11 +1420,14 @@ impl DiagnosticEngine {
                 ));
             }
         }
-        if let Err(ref_errors) = carina_core::validation::validate_export_param_ref_types(
-            &inferred_export_params,
-            resources,
-            &self.schemas,
-        ) {
+        let export_bindings =
+            carina_core::binding_index::BindingIndex::from_parsed(inference_input, &self.schemas);
+        if let Err(ref_errors) =
+            carina_core::validation::validate_export_param_ref_types_with_bindings(
+                &inferred_export_params,
+                &export_bindings,
+            )
+        {
             for error_msg in ref_errors.split('\n') {
                 if let Some((line, col)) = self.find_ref_error_position(doc, error_msg) {
                     diagnostics.push(carina_diagnostic(

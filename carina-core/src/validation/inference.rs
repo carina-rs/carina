@@ -172,7 +172,7 @@ pub fn bindings_from_parsed(parsed: &crate::parser::ParsedFile) -> InferenceBind
 
 /// Build an [`InferenceBindings`] map from already-extracted resource
 /// and upstream-state slices. Used by callers that already work in
-/// terms of the slice arguments (e.g. `validate_export_param_ref_types`)
+/// terms of the slice arguments (e.g. `validate_export_param_ref_types_with_bindings`)
 /// so the binding-collection logic is in one place.
 ///
 /// Both resource bindings (`let <name> = <provider>.<resource> { ... }`)

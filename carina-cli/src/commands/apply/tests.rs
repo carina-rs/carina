@@ -56,6 +56,7 @@ impl ProviderFactory for FailBCreateFactory {
     fn schemas(&self) -> Vec<ResourceSchema> {
         vec![
             ResourceSchema::new("test.resource")
+                .attribute(AttributeSchema::new("id", AttributeType::string()))
                 .attribute(AttributeSchema::new("name", AttributeType::string())),
         ]
     }

@@ -14,7 +14,7 @@ use crate::parser::{
     ModuleCall, ProviderContext, ResourceRef, ResourceTypePath, TypeExpr, validate_custom_type,
 };
 use crate::provider::ProviderFactory;
-use crate::resource::{ConcreteValue, DeferredValue, Resource, Value};
+use crate::resource::{ConcreteValue, DeferredValue, Value};
 use crate::schema::{AttributeType, SchemaRegistry, Shape, TypeIdentity, suggest_similar_name};
 
 /// Render the trailing `" Did you mean 'X'?"` segment for an unknown
@@ -25,6 +25,75 @@ fn did_you_mean(unknown: &str, known: &[&str]) -> String {
     suggest_similar_name(unknown, known)
         .map(|s| format!(" Did you mean '{}'?", s))
         .unwrap_or_default()
+}
+
+fn check_resource_ref_existence<'a>(
+    resource_id: &crate::resource::ResourceId,
+    ref_path: &crate::resource::AccessPath,
+    argument_names: &HashSet<String>,
+    bindings: &BindingIndex<'a>,
+    all_errors: &mut Vec<String>,
+) -> Option<(
+    &'a crate::schema::ResourceSchema,
+    &'a crate::schema::AttributeSchema,
+)> {
+    let ref_binding = ref_path.binding();
+    let ref_attr = ref_path.attribute();
+
+    // Skip type checking for argument parameter references (resolved at call site)
+    if argument_names.contains(ref_binding) {
+        return None;
+    }
+
+    // Look up the referenced binding's schema. `BindingIndex::get`
+    // returns `Some` only when both the binding and its schema
+    // resolved; `contains_name` distinguishes "unknown binding"
+    // from "known binding, schema absent" so we keep the original
+    // diagnostic shape (only the former gets reported here).
+    let Some(ref_entry) = bindings.get(ref_binding) else {
+        if !bindings.is_declared(ref_binding) {
+            all_errors.push(format!(
+                "{}: unknown binding '{}' in reference {}.{}",
+                resource_id, ref_binding, ref_binding, ref_attr,
+            ));
+        }
+        return None;
+    };
+
+    let ref_schema = ref_entry.schema;
+    let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr) else {
+        let known_attrs: Vec<&str> = ref_schema.attributes.keys().map(|s| s.as_str()).collect();
+        all_errors.push(format!(
+            "{}: unknown attribute '{}' on '{}' in reference {}.{}{}",
+            resource_id,
+            ref_attr,
+            ref_binding,
+            ref_binding,
+            ref_attr,
+            did_you_mean(ref_attr, &known_attrs),
+        ));
+        return None;
+    };
+
+    Some((ref_schema, ref_attr_schema))
+}
+
+fn check_nested_resource_ref_existence(
+    resource_id: &crate::resource::ResourceId,
+    attr_value: &Value,
+    argument_names: &HashSet<String>,
+    bindings: &BindingIndex<'_>,
+    all_errors: &mut Vec<String>,
+) {
+    attr_value.visit_resource_refs(&mut |ref_path| {
+        let _ = check_resource_ref_existence(
+            resource_id,
+            ref_path,
+            argument_names,
+            bindings,
+            all_errors,
+        );
+    });
 }
 
 /// Validate resources against their schemas.
@@ -136,13 +205,9 @@ pub fn validate_resource_ref_types<E>(
     parsed: &crate::parser::File<E>,
     registry: &SchemaRegistry,
     argument_names: &HashSet<String>,
+    bindings: &BindingIndex<'_>,
 ) -> Result<(), String> {
     let mut all_errors = Vec::new();
-
-    // Single source of truth for `binding_name → (resource, schema)` —
-    // shared with the LSP via `BindingIndex` so the two paths cannot drift
-    // (#2231).
-    let bindings = BindingIndex::from_parsed(parsed, registry);
 
     for rref in parsed.iter_all_resources() {
         // A deferred for-expression template body is always managed.
@@ -164,108 +229,93 @@ pub fn validate_resource_ref_types<E>(
                 continue;
             }
 
-            let (ref_binding, ref_attr, ref_path) = match attr_value {
-                Value::Deferred(DeferredValue::ResourceRef { path }) => (
-                    path.binding().to_string(),
-                    path.attribute().to_string(),
-                    path,
-                ),
-                _ => continue,
-            };
-
-            // Get the expected type for this attribute
             let Some(attr_schema) = schema.attributes.get(attr_name) else {
-                continue;
-            };
-            let expected_type_name = attr_schema.attr_type.type_name();
-
-            // Skip type checking for argument parameter references (resolved at call site)
-            if argument_names.contains(ref_binding.as_str()) {
-                continue;
-            }
-
-            // Look up the referenced binding's schema. `BindingIndex::get`
-            // returns `Some` only when both the binding and its schema
-            // resolved; `contains_name` distinguishes "unknown binding"
-            // from "known binding, schema absent" so we keep the original
-            // diagnostic shape (only the former gets reported here).
-            let Some(ref_entry) = bindings.get(ref_binding.as_str()) else {
-                if !bindings.is_declared(ref_binding.as_str()) {
-                    all_errors.push(format!(
-                        "{}: unknown binding '{}' in reference {}.{}",
-                        resource_id, ref_binding, ref_binding, ref_attr,
-                    ));
-                }
-                continue;
-            };
-            let ref_schema = ref_entry.schema;
-            let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr.as_str()) else {
-                let known_attrs: Vec<&str> =
-                    ref_schema.attributes.keys().map(|s| s.as_str()).collect();
-                all_errors.push(format!(
-                    "{}: unknown attribute '{}' on '{}' in reference {}.{}{}",
+                check_nested_resource_ref_existence(
                     resource_id,
-                    ref_attr,
-                    ref_binding,
-                    ref_binding,
-                    ref_attr,
-                    did_you_mean(&ref_attr, &known_attrs),
-                ));
+                    attr_value,
+                    argument_names,
+                    bindings,
+                    &mut all_errors,
+                );
                 continue;
             };
 
-            // Narrow through the path's segments — `[idx]` peels one
-            // `List<T>` / `Map<_,V>` layer, `.field` descends a
-            // `Struct`. carina#3028. Unknown struct fields are a
-            // real typo (carina#3041) and get reported here with a
-            // suggestion; other shape mismatches stay silent because
-            // resolver-time evaluation catches them with full location
-            // context.
-            let narrowed = match narrow_attribute_type(
-                &ref_attr_schema.attr_type,
-                ref_path.segments(),
-                &ref_schema.defs,
-            ) {
-                Ok(t) => t,
-                Err(NarrowError::UnknownStructField {
-                    field,
-                    struct_name,
-                    known_fields,
-                }) => {
-                    let known: Vec<&str> = known_fields.iter().map(|s| s.as_str()).collect();
-                    all_errors.push(format!(
-                        "{}: unknown field '{}' on struct '{}' in reference {}; \
-                         known fields: {}.{}",
-                        resource_id,
+            if let Value::Deferred(DeferredValue::ResourceRef { path: ref_path }) = attr_value {
+                let Some((ref_schema, ref_attr_schema)) = check_resource_ref_existence(
+                    resource_id,
+                    ref_path,
+                    argument_names,
+                    bindings,
+                    &mut all_errors,
+                ) else {
+                    continue;
+                };
+                // Narrow through the path's segments — `[idx]` peels one
+                // `List<T>` / `Map<_,V>` layer, `.field` descends a
+                // `Struct`. carina#3028. Unknown struct fields are a
+                // real typo (carina#3041) and get reported here with a
+                // suggestion; other shape mismatches stay silent because
+                // resolver-time evaluation catches them with full location
+                // context.
+                let narrowed = match narrow_attribute_type(
+                    &ref_attr_schema.attr_type,
+                    ref_path.segments(),
+                    &ref_schema.defs,
+                ) {
+                    Ok(t) => t,
+                    Err(NarrowError::UnknownStructField {
                         field,
                         struct_name,
-                        ref_path.to_dot_string(),
-                        known.join(", "),
-                        did_you_mean(&field, &known),
-                    ));
+                        known_fields,
+                    }) => {
+                        let known: Vec<&str> = known_fields.iter().map(|s| s.as_str()).collect();
+                        all_errors.push(format!(
+                            "{}: unknown field '{}' on struct '{}' in reference {}; \
+                             known fields: {}.{}",
+                            resource_id,
+                            field,
+                            struct_name,
+                            ref_path.to_dot_string(),
+                            known.join(", "),
+                            did_you_mean(&field, &known),
+                        ));
+                        continue;
+                    }
+                    Err(NarrowError::ShapeMismatch) => continue,
+                };
+                let ref_type_name = narrowed.type_name();
+                let expected_type_name = attr_schema.attr_type.type_name();
+
+                // Directional check: source (the referenced attribute, post
+                // path narrowing) must be assignable to the sink (the
+                // current resource's attribute).
+                if narrowed.is_assignable_to(&attr_schema.attr_type) {
                     continue;
                 }
-                Err(NarrowError::ShapeMismatch) => continue,
-            };
-            let ref_type_name = narrowed.type_name();
 
-            // Directional check: source (the referenced attribute, post
-            // path narrowing) must be assignable to the sink (the
-            // current resource's attribute).
-            if narrowed.is_assignable_to(&attr_schema.attr_type) {
-                continue;
+                all_errors.push(format!(
+                    "{}: cannot assign {} to '{}': expected {}, got {} (from {}.{})",
+                    resource_id,
+                    ref_type_name,
+                    attr_name,
+                    expected_type_name,
+                    ref_type_name,
+                    ref_path.binding(),
+                    ref_path.attribute(),
+                ));
+            } else {
+                // Nested ResourceRefs are checked for binding/attribute
+                // existence only. Assignability for these refs needs the
+                // nested field type context from the surrounding Map/List/Struct
+                // shape and should be added where that context is threaded.
+                check_nested_resource_ref_existence(
+                    resource_id,
+                    attr_value,
+                    argument_names,
+                    bindings,
+                    &mut all_errors,
+                );
             }
-
-            all_errors.push(format!(
-                "{}: cannot assign {} to '{}': expected {}, got {} (from {}.{})",
-                resource_id,
-                ref_type_name,
-                attr_name,
-                expected_type_name,
-                ref_type_name,
-                ref_binding,
-                ref_attr,
-            ));
         }
     }
 
@@ -281,18 +331,10 @@ pub fn validate_resource_ref_types<E>(
 ///
 /// For example, `attributes { role_arn: iam_role_arn = role.role_name }` should
 /// be rejected because `role_name` is `String`, not `IamRoleArn`.
-pub fn validate_attribute_param_ref_types(
+pub fn validate_attribute_param_ref_types_with_bindings(
     attribute_params: &[crate::parser::AttributeParameter],
-    resources: &[Resource],
-    registry: &SchemaRegistry,
+    bindings: &BindingIndex<'_>,
 ) -> Result<(), String> {
-    let mut binding_map: HashMap<String, &Resource> = HashMap::new();
-    for resource in resources {
-        if let Some(ref binding_name) = resource.binding {
-            binding_map.insert(binding_name.clone(), resource);
-        }
-    }
-
     let mut errors = Vec::new();
 
     for param in attribute_params {
@@ -303,41 +345,19 @@ pub fn validate_attribute_param_ref_types(
             continue;
         };
 
-        // Only check ResourceRef values
-        let Value::Deferred(DeferredValue::ResourceRef { path }) = value else {
-            continue;
-        };
-        let ref_binding = path.binding().to_string();
-        let ref_attr = path.attribute().to_string();
-
         // Get expected type name from TypeExpr
         let expected_type = match type_expr {
             crate::parser::TypeExpr::Simple(name) => name.as_str(),
             _ => continue, // String, Bool, etc. are handled by validate_type_expr_value
         };
 
-        // Look up referenced resource's schema
-        let Some(ref_resource) = binding_map.get(&ref_binding) else {
-            continue;
-        };
-        let Some(ref_schema) = registry.get_for(ref_resource) else {
-            continue;
-        };
-        let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr.as_str()) else {
-            continue;
-        };
-
-        let ref_type_name = ref_attr_schema.attr_type.type_name();
-        let ref_type_snake = crate::parser::pascal_to_snake(&ref_type_name);
-
-        if ref_type_snake == expected_type {
-            continue;
+        if let Value::Deferred(DeferredValue::ResourceRef { path }) = value {
+            check_attribute_param_ref_type(&param.name, expected_type, path, bindings, &mut errors);
+        } else {
+            value.visit_resource_refs(&mut |path| {
+                check_attribute_param_ref_existence(&param.name, path, bindings, &mut errors);
+            });
         }
-
-        errors.push(format!(
-            "attribute '{}': type mismatch: expected {}, got {} (from {}.{})",
-            param.name, expected_type, ref_type_snake, ref_binding, ref_attr
-        ));
     }
 
     if errors.is_empty() {
@@ -347,23 +367,73 @@ pub fn validate_attribute_param_ref_types(
     }
 }
 
+fn check_attribute_param_ref_type(
+    param_name: &str,
+    expected_type: &str,
+    path: &crate::resource::AccessPath,
+    bindings: &BindingIndex<'_>,
+    errors: &mut Vec<String>,
+) {
+    let ref_binding = path.binding();
+    let ref_attr = path.attribute();
+
+    let Some(ref_entry) = bindings.get(ref_binding) else {
+        return;
+    };
+    let ref_schema = ref_entry.schema;
+    let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr) else {
+        errors.push(format!(
+            "attribute '{}': unknown attribute '{}' on '{}' in reference {}.{}",
+            param_name, ref_attr, ref_binding, ref_binding, ref_attr,
+        ));
+        return;
+    };
+
+    let ref_type_name = ref_attr_schema.attr_type.type_name();
+    let ref_type_snake = crate::parser::pascal_to_snake(&ref_type_name);
+
+    if ref_type_snake == expected_type {
+        return;
+    }
+
+    errors.push(format!(
+        "attribute '{}': type mismatch: expected {}, got {} (from {}.{})",
+        param_name, expected_type, ref_type_snake, ref_binding, ref_attr
+    ));
+}
+
+fn check_attribute_param_ref_existence(
+    param_name: &str,
+    path: &crate::resource::AccessPath,
+    bindings: &BindingIndex<'_>,
+    errors: &mut Vec<String>,
+) {
+    let ref_binding = path.binding();
+    let ref_attr = path.attribute();
+
+    let Some(ref_entry) = bindings.get(ref_binding) else {
+        return;
+    };
+    let ref_schema = ref_entry.schema;
+    if ref_schema.attributes.contains_key(ref_attr) {
+        return;
+    }
+
+    errors.push(format!(
+        "attribute '{}': unknown attribute '{}' on '{}' in reference {}.{}",
+        param_name, ref_attr, ref_binding, ref_binding, ref_attr,
+    ));
+}
+
 /// Validate export parameter values that are ResourceRef against their declared
 /// TypeExpr by looking up the referenced attribute's schema type.
 ///
 /// This catches mismatches like `exports { x: list(bool) = [vpc.vpc_id] }` where
 /// `vpc_id` is a string attribute but the export declares `bool`.
-pub fn validate_export_param_ref_types(
+pub fn validate_export_param_ref_types_with_bindings(
     export_params: &[crate::parser::InferredExportParam],
-    resources: &[Resource],
-    registry: &SchemaRegistry,
+    bindings: &BindingIndex<'_>,
 ) -> Result<(), String> {
-    let mut binding_map: HashMap<String, &Resource> = HashMap::new();
-    for resource in resources {
-        if let Some(ref binding_name) = resource.binding {
-            binding_map.insert(binding_name.clone(), resource);
-        }
-    }
-
     let mut errors = Vec::new();
 
     for param in export_params {
@@ -377,14 +447,7 @@ pub fn validate_export_param_ref_types(
             continue;
         }
 
-        collect_ref_type_errors(
-            &param.type_expr,
-            value,
-            &param.name,
-            &binding_map,
-            registry,
-            &mut errors,
-        );
+        collect_ref_type_errors(&param.type_expr, value, &param.name, bindings, &mut errors);
     }
 
     if errors.is_empty() {
@@ -399,8 +462,7 @@ fn collect_ref_type_errors(
     type_expr: &crate::parser::TypeExpr,
     value: &Value,
     param_name: &str,
-    binding_map: &HashMap<String, &Resource>,
-    registry: &SchemaRegistry,
+    bindings: &BindingIndex<'_>,
     errors: &mut Vec<String>,
 ) {
     use crate::parser::TypeExpr;
@@ -410,17 +472,49 @@ fn collect_ref_type_errors(
             let ref_binding = path.binding();
             let ref_attr = path.attribute();
 
-            let Some(ref_resource) = binding_map.get(ref_binding) else {
+            let Some(ref_entry) = bindings.get(ref_binding) else {
                 return;
             };
-            let Some(ref_schema) = registry.get_for(ref_resource) else {
-                return;
-            };
+            let ref_schema = ref_entry.schema;
             let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr) else {
+                let known_attrs: Vec<&str> =
+                    ref_schema.attributes.keys().map(|s| s.as_str()).collect();
+                errors.push(format!(
+                    "export '{}': unknown attribute '{}' on '{}' in reference {}.{}{}",
+                    param_name,
+                    ref_attr,
+                    ref_binding,
+                    ref_binding,
+                    ref_attr,
+                    did_you_mean(ref_attr, &known_attrs),
+                ));
                 return;
             };
 
-            let ref_type = &ref_attr_schema.attr_type;
+            let ref_type = match narrow_attribute_type(
+                &ref_attr_schema.attr_type,
+                path.segments(),
+                &ref_schema.defs,
+            ) {
+                Ok(ref_type) => ref_type,
+                Err(NarrowError::UnknownStructField {
+                    field,
+                    known_fields,
+                    ..
+                }) => {
+                    let known_attrs: Vec<&str> = known_fields.iter().map(|s| s.as_str()).collect();
+                    errors.push(format!(
+                        "export '{}': unknown attribute '{}' on '{}' in reference {}{}",
+                        param_name,
+                        field,
+                        ref_binding,
+                        path.to_dot_string(),
+                        did_you_mean(&field, &known_attrs),
+                    ));
+                    return;
+                }
+                Err(NarrowError::ShapeMismatch) => return,
+            };
             if !is_type_expr_compatible_with_schema(type_expr, ref_type, &ref_schema.defs) {
                 let ref_type_name = ref_type.type_name();
                 errors.push(format!(
@@ -431,25 +525,18 @@ fn collect_ref_type_errors(
         }
         (TypeExpr::List(inner), Value::Concrete(ConcreteValue::List(items))) => {
             for item in items {
-                collect_ref_type_errors(inner, item, param_name, binding_map, registry, errors);
+                collect_ref_type_errors(inner, item, param_name, bindings, errors);
             }
         }
         (TypeExpr::Map(inner), Value::Concrete(ConcreteValue::Map(map))) => {
             for value in map.values() {
-                collect_ref_type_errors(inner, value, param_name, binding_map, registry, errors);
+                collect_ref_type_errors(inner, value, param_name, bindings, errors);
             }
         }
         (TypeExpr::Struct { fields }, Value::Concrete(ConcreteValue::Map(map))) => {
             for (name, field_ty) in fields {
                 if let Some(value) = map.get(name) {
-                    collect_ref_type_errors(
-                        field_ty,
-                        value,
-                        param_name,
-                        binding_map,
-                        registry,
-                        errors,
-                    );
+                    collect_ref_type_errors(field_ty, value, param_name, bindings, errors);
                 }
             }
         }

@@ -956,7 +956,6 @@ impl DiagnosticEngine {
                 doc,
                 parsed,
                 merged.as_ref(),
-                None,
                 &sibling_bindings,
             ));
 
