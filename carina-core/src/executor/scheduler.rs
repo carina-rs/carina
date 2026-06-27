@@ -7,11 +7,12 @@ use crate::resource::ResourceId;
 
 use super::UnresolvedResource;
 use super::deferred_dispatch::{DeferredDispatchResult, PureMetaCtx, dispatch_deferred_create};
-use super::parallel::{
-    apply_deferred_replace_delete_deps, build_dependency_analysis, relax_update_update_edges,
-};
+use super::parallel::apply_deferred_replace_delete_deps;
 use super::wait::SKIP_REASON_CANCELLED;
 use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
+use crate::effect::deps::{
+    ScheduleInputs, build_effect_dependency_analysis, relax_update_update_edges,
+};
 
 pub(super) struct PureMetaStep<'a> {
     effect: &'a Effect,
@@ -91,7 +92,12 @@ pub(super) fn build_scheduler_deps(
     compositions: &[crate::resource::Composition],
     deferred_replace_delete_deps: &[(usize, usize)],
 ) -> HashMap<usize, HashSet<usize>> {
-    let mut analysis = build_dependency_analysis(effects, unresolved_resources, compositions);
+    let mut analysis = build_effect_dependency_analysis(
+        effects,
+        unresolved_resources,
+        compositions,
+        ScheduleInputs::Apply,
+    );
     relax_update_update_edges(effects, &mut analysis);
     let mut deps_of = analysis.into_deps_of();
     apply_deferred_replace_delete_deps(&mut deps_of, deferred_replace_delete_deps);

@@ -10,11 +10,13 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
-use carina_core::deps::{
-    build_dependents_map, find_failed_dependent, get_resource_dependencies,
-    sort_resources_for_destroy,
-};
+use carina_core::deps::get_resource_dependencies;
 use carina_core::effect::Effect;
+use carina_core::effect::deps::{
+    DependencyAnalysis, DestroyWaitAlias, ScheduleInputs, UnresolvedResource,
+    build_effect_dependency_analysis,
+};
+use carina_core::parser::WaitBinding;
 use carina_core::plan::Plan;
 use carina_core::provider::Provider;
 use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
@@ -339,20 +341,14 @@ async fn run_destroy_locked(
         }
     }
 
-    // Sort all resources (managed + orphans) for destroy ordering.
-    // Uses depth-based pre-sorting to ensure stable ordering for independent
-    // branches, then reverses for destroy order (dependents before dependencies).
-    let destroy_order: Vec<Resource> =
-        sort_resources_for_destroy(&all_resources).map_err(AppError::Config)?;
-
     // Collect resources that exist and will be destroyed
     // Skip the state bucket if it matches the backend bucket
     let mut protected_resources: Vec<&Resource> = Vec::new();
     let mut prevent_destroy_resources: Vec<&Resource> = Vec::new();
-    let resources_to_destroy: Vec<&Resource> = destroy_order
+    let mut resources_to_destroy: Vec<&Resource> = all_resources
         .iter()
         .filter(|r| {
-            // carina#3181: `destroy_order` is managed-only — data
+            // carina#3181: `all_resources` is managed-only — data
             // sources and compositions never enter the destroy set.
             if !current_states.get(&r.id).map(|s| s.exists).unwrap_or(false) {
                 return false;
@@ -378,6 +374,64 @@ async fn run_destroy_locked(
             true
         })
         .collect();
+    resources_to_destroy.sort_by(|left, right| {
+        let left_key = left
+            .binding
+            .as_deref()
+            .unwrap_or_else(|| left.id.name_str());
+        let right_key = right
+            .binding
+            .as_deref()
+            .unwrap_or_else(|| right.id.name_str());
+        left_key.cmp(right_key)
+    });
+
+    let mut delete_effects = Vec::with_capacity(resources_to_destroy.len());
+    for resource in &resources_to_destroy {
+        let identifier = current_states
+            .get(&resource.id)
+            .and_then(|s| s.identifier.clone())
+            .unwrap_or_default();
+        let dependencies = get_resource_dependencies(resource);
+        let explicit_dependencies = resource.directives.depends_on.iter().cloned().collect();
+        delete_effects.push(Effect::Delete {
+            id: resource.id.clone(),
+            identifier,
+            directives: resource.directives.clone(),
+            binding: resource.binding.clone(),
+            dependencies,
+            explicit_dependencies,
+        });
+    }
+
+    let wait_aliases = build_destroy_wait_aliases(&parsed.wait_bindings, &resources_to_destroy);
+    let dependency_analysis = build_effect_dependency_analysis(
+        &delete_effects,
+        &HashMap::<ResourceId, UnresolvedResource>::new(),
+        &[],
+        ScheduleInputs::Destroy {
+            aliases: &wait_aliases,
+        },
+    );
+    let delete_count = delete_effects.len();
+    let deletion_deps = transitive_delete_deps(&dependency_analysis, delete_count);
+    let delete_depths = compute_delete_depths(delete_count, &deletion_deps);
+    let resource_names: Vec<String> = resources_to_destroy
+        .iter()
+        .map(|resource| {
+            resource
+                .binding
+                .clone()
+                .unwrap_or_else(|| resource.id.name_str().to_string())
+        })
+        .collect();
+    let display_order = topological_delete_order(
+        delete_count,
+        &deletion_deps,
+        &delete_depths,
+        &resource_names,
+    )
+    .map_err(AppError::Config)?;
 
     if resources_to_destroy.is_empty()
         && protected_resources.is_empty()
@@ -389,21 +443,8 @@ async fn run_destroy_locked(
 
     // Build a Plan from the delete effects for tree display
     let mut destroy_plan = Plan::new();
-    for resource in &resources_to_destroy {
-        let identifier = current_states
-            .get(&resource.id)
-            .and_then(|s| s.identifier.clone())
-            .unwrap_or_default();
-        let dependencies = get_resource_dependencies(resource);
-        let explicit_dependencies = resource.directives.depends_on.iter().cloned().collect();
-        destroy_plan.add(Effect::Delete {
-            id: resource.id.clone(),
-            identifier,
-            directives: resource.directives.clone(),
-            binding: resource.binding.clone(),
-            dependencies,
-            explicit_dependencies,
-        });
+    for idx in &display_order {
+        destroy_plan.add(delete_effects[*idx].clone());
     }
 
     // Build delete attributes map from current states for display
@@ -528,19 +569,14 @@ async fn run_destroy_locked(
     // Map from resource index to its spinner (populated lazily on dispatch)
     let mut spinners: HashMap<usize, ProgressBar> = HashMap::new();
 
-    // Build reverse dependency map: binding -> {bindings that depend on it}.
-    // For destroy ordering, a resource can only be deleted after ALL its
-    // dependents (resources that reference it) have been deleted first.
-    let dependents_map = build_dependents_map(&resources_to_destroy);
-
     let mut success_count = 0;
     let mut failure_count = 0;
     let mut skip_count = 0;
     let mut destroyed_ids: Vec<ResourceId> = Vec::new();
-    let mut failed_bindings: HashSet<String> = HashSet::new();
+    let mut failed_indices: HashSet<usize> = HashSet::new();
     let mut cancelled = false;
-    // timed_out_resources: binding -> (ResourceId, identifier)
-    let mut timed_out_resources: HashMap<String, (ResourceId, String)> = HashMap::new();
+    // timed_out_resources: delete index -> (ResourceId, identifier)
+    let mut timed_out_resources: HashMap<usize, (ResourceId, String)> = HashMap::new();
 
     let destroy_total = resources_to_destroy.len();
     let completed_counter = AtomicUsize::new(0);
@@ -548,54 +584,23 @@ async fn run_destroy_locked(
     // Pre-compute binding and effect for each resource by index
     let resource_info: Vec<(String, String, Effect)> = resources_to_destroy
         .iter()
-        .map(|resource| {
-            let identifier = current_states
-                .get(&resource.id)
-                .and_then(|s| s.identifier.clone())
-                .unwrap_or_default();
-            let dependencies = get_resource_dependencies(resource);
-            let explicit_dependencies = resource.directives.depends_on.iter().cloned().collect();
-            let effect = Effect::Delete {
-                id: resource.id.clone(),
-                identifier: identifier.clone(),
-                directives: resource.directives.clone(),
-                binding: resource.binding.clone(),
-                dependencies,
-                explicit_dependencies,
+        .zip(delete_effects.iter())
+        .map(|(resource, effect)| {
+            let identifier = match effect {
+                Effect::Delete { identifier, .. } => identifier.clone(),
+                _ => unreachable!("destroy resource_info only contains delete effects"),
             };
             let binding = resource.binding.clone().unwrap_or_else(|| {
                 format!("{}:{}", resource.id.resource_type, resource.id.name_str())
             });
-            (binding, identifier, effect)
+            (binding, identifier, effect.clone())
         })
         .collect();
-
-    // Build binding -> index mapping for ready-queue scheduling
-    let mut binding_to_idx: HashMap<String, usize> = HashMap::new();
-    for (idx, (binding, _, _)) in resource_info.iter().enumerate() {
-        binding_to_idx.insert(binding.clone(), idx);
-    }
-
-    // Build deletion dependency map: for each index, which indices must complete
-    // before this resource can be deleted. A resource's deletion prerequisites
-    // are its dependents (resources that reference it).
-    let mut deletion_deps: HashMap<usize, HashSet<usize>> = HashMap::new();
-    for (idx, (binding, _, _)) in resource_info.iter().enumerate() {
-        let mut deps = HashSet::new();
-        if let Some(dependents) = dependents_map.get(binding) {
-            for dependent_binding in dependents {
-                if let Some(&dep_idx) = binding_to_idx.get(dependent_binding) {
-                    deps.insert(dep_idx);
-                }
-            }
-        }
-        deletion_deps.insert(idx, deps);
-    }
 
     // Track completed and dispatched indices
     let mut completed_indices: HashSet<usize> = HashSet::new();
     let mut dispatched: HashSet<usize> = HashSet::new();
-    let all_indices: Vec<usize> = (0..resources_to_destroy.len()).collect();
+    let all_indices = display_order.clone();
 
     // Track retry counts for dependency-violation retries
     let max_retries: usize = 3;
@@ -631,7 +636,6 @@ async fn run_destroy_locked(
                     newly_ready.push(idx);
                 }
             }
-            newly_ready.sort();
             newly_ready.truncate(parallelism.get().saturating_sub(in_flight.len()));
 
             // Process newly ready resources
@@ -643,15 +647,19 @@ async fn run_destroy_locked(
 
                 dispatched.insert(idx);
 
-                let (binding, identifier, effect) = &resource_info[idx];
+                let (_binding, identifier, effect) = &resource_info[idx];
                 let resource = resources_to_destroy[idx];
 
                 // Check if any dependent has actually failed (non-timeout)
-                if let Some(failed_dep) =
-                    find_failed_dependent(binding, &dependents_map, &failed_bindings)
-                {
+                if let Some(failed_dep_idx) = delete_dependency_in_set(
+                    idx,
+                    &dependency_analysis,
+                    delete_count,
+                    &failed_indices,
+                ) {
                     let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
                     let counter = format!("{}/{}", c, destroy_total).dimmed();
+                    let failed_dep = &resource_info[failed_dep_idx].0;
                     let msg = format!(
                         "{} {} - skipped (dependent {} failed) {}",
                         "⊘".yellow(),
@@ -666,27 +674,22 @@ async fn run_destroy_locked(
                         eprintln!("  {}", msg);
                     }
                     skip_count += 1;
-                    failed_bindings.insert(binding.clone());
+                    failed_indices.insert(idx);
                     completed_indices.insert(idx);
                     continue;
                 }
 
                 // Check if any dependent timed out -- wait for it to complete
-                let timed_out_deps: Vec<String> = dependents_map
-                    .get(binding)
-                    .map(|deps| {
-                        deps.iter()
-                            .filter(|d| timed_out_resources.contains_key(d.as_str()))
-                            .cloned()
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let timed_out_deps = delete_dependencies_in_set(
+                    idx,
+                    &dependency_analysis,
+                    delete_count,
+                    timed_out_resources.keys().copied().collect(),
+                );
 
                 let mut wait_failed = false;
-                for dep_binding in &timed_out_deps {
-                    if let Some((dep_id, dep_identifier)) =
-                        timed_out_resources.remove(dep_binding.as_str())
-                    {
+                for dep_idx in &timed_out_deps {
+                    if let Some((dep_id, dep_identifier)) = timed_out_resources.remove(dep_idx) {
                         multi
                             .println(format!(
                                 "  {} Waiting for {} to be deleted...",
@@ -726,7 +729,7 @@ async fn run_destroy_locked(
                                         format!("read error during wait: {}", msg).red()
                                     ))
                                     .ok();
-                                failed_bindings.insert(dep_binding.clone());
+                                failed_indices.insert(*dep_idx);
                                 failure_count += 1;
                                 wait_failed = true;
                             }
@@ -741,7 +744,7 @@ async fn run_destroy_locked(
                                         "still exists after extended wait".red()
                                     ))
                                     .ok();
-                                failed_bindings.insert(dep_binding.clone());
+                                failed_indices.insert(*dep_idx);
                                 failure_count += 1;
                                 wait_failed = true;
                             }
@@ -765,7 +768,7 @@ async fn run_destroy_locked(
                         eprintln!("  {}", msg);
                     }
                     skip_count += 1;
-                    failed_bindings.insert(binding.clone());
+                    failed_indices.insert(idx);
                     completed_indices.insert(idx);
                     continue;
                 }
@@ -781,7 +784,6 @@ async fn run_destroy_locked(
                 let resource_id = resource.id.clone();
                 let identifier = identifier.clone();
                 let directives = resource.directives.clone();
-                let binding = binding.clone();
 
                 let provider_ref = &provider;
                 in_flight.push(async move {
@@ -795,14 +797,7 @@ async fn run_destroy_locked(
                             },
                         )
                         .await;
-                    (
-                        idx,
-                        binding,
-                        resource_id,
-                        identifier,
-                        started,
-                        delete_result,
-                    )
+                    (idx, resource_id, identifier, started, delete_result)
                 });
             }
         }
@@ -851,8 +846,7 @@ async fn run_destroy_locked(
                     } else {
                         eprintln!("  {}", msg);
                     }
-                    let binding = &resource_info[idx].0;
-                    failed_bindings.insert(binding.clone());
+                    failed_indices.insert(idx);
                     dispatched.insert(idx);
                     completed_indices.insert(idx);
                     failure_count += 1;
@@ -869,8 +863,7 @@ async fn run_destroy_locked(
         }
 
         // Wait for the next deletion to complete
-        let (finished_idx, binding, resource_id, identifier, started, delete_result) = if cancelled
-        {
+        let (finished_idx, resource_id, identifier, started, delete_result) = if cancelled {
             in_flight.next().await.unwrap()
         } else {
             tokio::select! {
@@ -933,7 +926,7 @@ async fn run_destroy_locked(
                     format_effect(effect)
                 );
                 finish_spinner(&mut spinners, finished_idx, msg);
-                timed_out_resources.insert(binding.clone(), (resource_id, identifier));
+                timed_out_resources.insert(finished_idx, (resource_id, identifier));
             }
             Err(e) => {
                 let retries = retry_counts.get(&finished_idx).copied().unwrap_or(0);
@@ -972,7 +965,7 @@ async fn run_destroy_locked(
                     );
                     finish_spinner(&mut spinners, finished_idx, msg);
                     failure_count += 1;
-                    failed_bindings.insert(binding.clone());
+                    failed_indices.insert(finished_idx);
                 }
             }
         }
@@ -980,7 +973,7 @@ async fn run_destroy_locked(
 
     // Handle any remaining timed-out resources that no parent waited on.
     if !cancelled {
-        for (dep_binding, (dep_id, dep_identifier)) in &timed_out_resources {
+        for (dep_idx, (dep_id, dep_identifier)) in &timed_out_resources {
             if cancel.is_cancelled() {
                 cancelled = true;
                 break;
@@ -1024,7 +1017,7 @@ async fn run_destroy_locked(
                         "→".red(),
                         format!("read error during wait: {}", msg).red()
                     );
-                    failed_bindings.insert(dep_binding.clone());
+                    failed_indices.insert(*dep_idx);
                     failure_count += 1;
                 }
                 WaitResult::TimedOut => {
@@ -1034,7 +1027,7 @@ async fn run_destroy_locked(
                         "→".red(),
                         "still exists after extended wait".red()
                     );
-                    failed_bindings.insert(dep_binding.clone());
+                    failed_indices.insert(*dep_idx);
                     failure_count += 1;
                 }
             }
@@ -1123,6 +1116,267 @@ fn observe_destroy_success_for_tests(
 ) {
 }
 
+fn build_destroy_wait_aliases(
+    wait_bindings: &[WaitBinding],
+    resources_to_destroy: &[&Resource],
+) -> Vec<DestroyWaitAlias> {
+    let destroy_targets: HashSet<&str> = resources_to_destroy
+        .iter()
+        .filter_map(|resource| resource.binding.as_deref())
+        .collect();
+    let resource_dependencies: Vec<(&Resource, HashSet<String>)> = resources_to_destroy
+        .iter()
+        .map(|resource| (*resource, get_resource_dependencies(resource)))
+        .collect();
+    let referenced_bindings: HashSet<&str> = resource_dependencies
+        .iter()
+        .flat_map(|(_, dependencies)| dependencies.iter().map(String::as_str))
+        .collect();
+
+    wait_bindings
+        .iter()
+        .filter(|wait| referenced_bindings.contains(wait.binding.as_str()))
+        .filter_map(|wait| {
+            if !destroy_targets.contains(wait.target.as_str()) {
+                return None;
+            }
+            let consumers = resource_dependencies
+                .iter()
+                .filter(|(_, dependencies)| dependencies.contains(wait.binding.as_str()))
+                .map(|(resource, _)| {
+                    resource
+                        .binding
+                        .clone()
+                        .unwrap_or_else(|| resource.id.name_str().to_string())
+                })
+                .collect::<Vec<_>>();
+
+            DestroyWaitAlias::new(
+                wait.binding.as_str().to_string(),
+                wait.target.as_str().to_string(),
+                wait.depends_on
+                    .iter()
+                    .map(|dep| dep.as_str().to_string())
+                    .collect(),
+                consumers,
+            )
+        })
+        .collect()
+}
+
+fn transitive_delete_deps(
+    analysis: &DependencyAnalysis,
+    delete_count: usize,
+) -> HashMap<usize, HashSet<usize>> {
+    (0..delete_count)
+        .map(|idx| {
+            let mut deps = HashSet::new();
+            let mut seen = HashSet::new();
+            collect_delete_deps(idx, analysis, delete_count, &mut seen, &mut deps);
+            (idx, deps)
+        })
+        .collect()
+}
+
+fn collect_delete_deps(
+    idx: usize,
+    analysis: &DependencyAnalysis,
+    delete_count: usize,
+    seen: &mut HashSet<usize>,
+    deps: &mut HashSet<usize>,
+) {
+    let Some(children) = analysis.deps_of(idx) else {
+        return;
+    };
+
+    for &child in children {
+        if !seen.insert(child) {
+            continue;
+        }
+        if child < delete_count {
+            deps.insert(child);
+        } else {
+            collect_delete_deps(child, analysis, delete_count, seen, deps);
+        }
+    }
+}
+
+fn topological_delete_order(
+    delete_count: usize,
+    deletion_deps: &HashMap<usize, HashSet<usize>>,
+    depths: &[usize],
+    names: &[String],
+) -> Result<Vec<usize>, String> {
+    let mut emitted = HashSet::new();
+    let mut order = Vec::with_capacity(delete_count);
+
+    while order.len() < delete_count {
+        let ready = (0..delete_count)
+            .filter(|idx| {
+                !emitted.contains(idx)
+                    && deletion_deps
+                        .get(idx)
+                        .is_none_or(|deps| deps.iter().all(|dep| emitted.contains(dep)))
+            })
+            .max_by(|left, right| {
+                depths[*left]
+                    .cmp(&depths[*right])
+                    .then_with(|| names[*right].cmp(&names[*left]))
+                    .then_with(|| right.cmp(left))
+            });
+
+        let Some(idx) = ready else {
+            return Err(format!(
+                "Circular dependency detected: {}",
+                cycle_path(delete_count, deletion_deps, names)
+            ));
+        };
+
+        emitted.insert(idx);
+        order.push(idx);
+    }
+
+    Ok(order)
+}
+
+fn compute_delete_depths(
+    delete_count: usize,
+    deletion_deps: &HashMap<usize, HashSet<usize>>,
+) -> Vec<usize> {
+    let mut create_parents: HashMap<usize, HashSet<usize>> = HashMap::new();
+    for (&parent, children) in deletion_deps {
+        for &child in children {
+            create_parents.entry(child).or_default().insert(parent);
+        }
+    }
+
+    let mut memo = HashMap::new();
+    (0..delete_count)
+        .map(|idx| compute_delete_depth(idx, &create_parents, &mut memo, &mut HashSet::new()))
+        .collect()
+}
+
+fn compute_delete_depth(
+    idx: usize,
+    create_parents: &HashMap<usize, HashSet<usize>>,
+    memo: &mut HashMap<usize, usize>,
+    visiting: &mut HashSet<usize>,
+) -> usize {
+    if let Some(depth) = memo.get(&idx) {
+        return *depth;
+    }
+    if !visiting.insert(idx) {
+        return 0;
+    }
+    let depth = create_parents
+        .get(&idx)
+        .map(|parents| {
+            parents
+                .iter()
+                .map(|parent| compute_delete_depth(*parent, create_parents, memo, visiting) + 1)
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    visiting.remove(&idx);
+    memo.insert(idx, depth);
+    depth
+}
+
+fn cycle_path(
+    delete_count: usize,
+    deletion_deps: &HashMap<usize, HashSet<usize>>,
+    names: &[String],
+) -> String {
+    fn dfs(
+        idx: usize,
+        deletion_deps: &HashMap<usize, HashSet<usize>>,
+        visiting: &mut Vec<usize>,
+        visited: &mut HashSet<usize>,
+    ) -> Option<Vec<usize>> {
+        if let Some(pos) = visiting.iter().position(|node| *node == idx) {
+            let mut path = visiting[pos..].to_vec();
+            path.push(idx);
+            return Some(path);
+        }
+        if !visited.insert(idx) {
+            return None;
+        }
+        visiting.push(idx);
+        if let Some(deps) = deletion_deps.get(&idx) {
+            let mut sorted: Vec<_> = deps.iter().copied().collect();
+            sorted.sort_unstable();
+            for dep in sorted {
+                if let Some(path) = dfs(dep, deletion_deps, visiting, visited) {
+                    return Some(path);
+                }
+            }
+        }
+        visiting.pop();
+        None
+    }
+
+    let mut visited = HashSet::new();
+    for idx in 0..delete_count {
+        if let Some(path) = dfs(idx, deletion_deps, &mut Vec::new(), &mut visited) {
+            return path
+                .into_iter()
+                .map(|idx| names.get(idx).cloned().unwrap_or_else(|| idx.to_string()))
+                .collect::<Vec<_>>()
+                .join(" -> ");
+        }
+    }
+    "<unknown>".to_string()
+}
+
+fn delete_dependency_in_set(
+    idx: usize,
+    analysis: &DependencyAnalysis,
+    delete_count: usize,
+    candidates: &HashSet<usize>,
+) -> Option<usize> {
+    let mut sorted: Vec<_> = candidates.iter().copied().collect();
+    sorted.sort_unstable();
+    sorted.into_iter().find(|candidate| {
+        *candidate < delete_count && graph_reaches_delete_idx(*candidate, idx, analysis)
+    })
+}
+
+fn delete_dependencies_in_set(
+    idx: usize,
+    analysis: &DependencyAnalysis,
+    delete_count: usize,
+    candidates: HashSet<usize>,
+) -> Vec<usize> {
+    let mut deps: Vec<_> = candidates
+        .into_iter()
+        .filter(|candidate| {
+            *candidate < delete_count && graph_reaches_delete_idx(*candidate, idx, analysis)
+        })
+        .collect();
+    deps.sort_unstable();
+    deps
+}
+
+fn graph_reaches_delete_idx(start: usize, target: usize, analysis: &DependencyAnalysis) -> bool {
+    let mut stack = vec![start];
+    let mut seen = HashSet::new();
+
+    while let Some(idx) = stack.pop() {
+        if !seen.insert(idx) {
+            continue;
+        }
+        if idx == target {
+            return true;
+        }
+        if let Some(dependents) = analysis.dependents_of(idx) {
+            stack.extend(dependents.iter().copied());
+        }
+    }
+
+    false
+}
+
 pub(crate) struct FinalizeDestroyInput<'a> {
     pub backend: &'a dyn StateBackend,
     pub lock: Option<&'a LockInfo>,
@@ -1163,6 +1417,61 @@ mod tests {
     #[test]
     fn destroy_parallelism_default_is_eight() {
         assert_eq!(crate::DEFAULT_PARALLELISM.get(), 8);
+    }
+
+    #[test]
+    fn topological_delete_order_reports_cycles() {
+        let deletion_deps = HashMap::from([(0, HashSet::from([1])), (1, HashSet::from([0]))]);
+        let depths = compute_delete_depths(2, &deletion_deps);
+        let names = vec!["a".to_string(), "b".to_string()];
+
+        let err = topological_delete_order(2, &deletion_deps, &depths, &names).unwrap_err();
+
+        assert_eq!(err, "Circular dependency detected: a -> b -> a");
+    }
+
+    #[test]
+    fn topological_delete_order_uses_depth_tie_break_for_igw_nat_case() {
+        let names = vec![
+            "vpc".to_string(),
+            "igw".to_string(),
+            "subnet".to_string(),
+            "eip".to_string(),
+            "nat_gw".to_string(),
+            "rt".to_string(),
+            "route".to_string(),
+        ];
+        let deletion_deps = HashMap::from([
+            (0, HashSet::from([1, 2, 5])),
+            (1, HashSet::new()),
+            (2, HashSet::from([4])),
+            (3, HashSet::from([4])),
+            (4, HashSet::from([6])),
+            (5, HashSet::from([6])),
+            (6, HashSet::new()),
+        ]);
+        let depths = compute_delete_depths(names.len(), &deletion_deps);
+
+        let order = topological_delete_order(names.len(), &deletion_deps, &depths, &names)
+            .expect("fixture is acyclic");
+
+        let route_pos = order.iter().position(|idx| names[*idx] == "route").unwrap();
+        let nat_pos = order
+            .iter()
+            .position(|idx| names[*idx] == "nat_gw")
+            .unwrap();
+        let igw_pos = order.iter().position(|idx| names[*idx] == "igw").unwrap();
+
+        assert!(
+            route_pos < igw_pos,
+            "route must be destroyed before igw; order: {:?}",
+            order.iter().map(|idx| &names[*idx]).collect::<Vec<_>>()
+        );
+        assert!(
+            nat_pos < igw_pos,
+            "nat_gw must be destroyed before igw; order: {:?}",
+            order.iter().map(|idx| &names[*idx]).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

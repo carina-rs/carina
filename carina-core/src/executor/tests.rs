@@ -1,4 +1,7 @@
 use super::*;
+use crate::effect::deps::{
+    ScheduleInputs, build_effect_dependency_analysis as build_dependency_analysis,
+};
 use crate::effect::{DeferredReplaceDelete, NonEmptyDeletes};
 use crate::plan::Plan;
 use crate::provider::{
@@ -10,7 +13,7 @@ use crate::resource::{
     Value,
 };
 use crate::value::SerializationError;
-use parallel::{build_dependency_analysis, build_dependency_levels};
+use parallel::build_dependency_levels;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -4121,7 +4124,9 @@ fn test_build_dependency_levels_consistent_with_dependency_map() {
     plan.add(Effect::Create(d));
 
     let levels = build_dependency_levels(plan.effects(), &HashMap::new(), &[]);
-    let dep_map = build_dependency_analysis(plan.effects(), &HashMap::new(), &[]).into_deps_of();
+    let dep_map =
+        build_dependency_analysis(plan.effects(), &HashMap::new(), &[], ScheduleInputs::Apply)
+            .into_deps_of();
 
     // Verify levels are consistent with the dependency map:
     // For every effect, its level must be greater than all its dependencies' levels.
@@ -4217,7 +4222,9 @@ fn test_dependency_analysis_respects_delete_dependencies() {
         explicit_dependencies: std::collections::HashSet::new(),
     });
 
-    let deps = build_dependency_analysis(plan.effects(), &HashMap::new(), &[]).into_deps_of();
+    let deps =
+        build_dependency_analysis(plan.effects(), &HashMap::new(), &[], ScheduleInputs::Apply)
+            .into_deps_of();
 
     // vpc delete (idx 0) must depend on subnet delete (idx 1)
     // because subnet must be deleted before vpc (reverse dependency)

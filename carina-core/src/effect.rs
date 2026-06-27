@@ -3,6 +3,12 @@
 //! An Effect describes "what to do" without actually performing the side effect.
 //! Side effects only occur when they are executed via a Provider.
 
+/// Dependency analysis over a slice of [`Effect`]s.
+///
+/// Centralizes the apply/destroy scheduling graph so the parallel scheduler,
+/// the phased scheduler, and the destroy CLI driver all see the same edges.
+pub mod deps;
+
 use std::{
     collections::{BTreeSet, HashSet},
     ops::Deref,
@@ -21,6 +27,17 @@ pub enum PlanOp {
     Read,
     Update,
     Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduleEdge {
+    /// This effect must wait for the named binding to complete.
+    DependsOn(String),
+    /// This effect must complete before the named binding can proceed.
+    BlockedBy(String),
+    /// This effect must complete before the named binding can proceed, but
+    /// only when that binding resolves to a delete effect.
+    BlockedByIfDelete(String),
 }
 
 /// Temporary name used during create-before-destroy replacement.
@@ -1004,6 +1021,72 @@ impl Effect {
                 deps.insert(upstream_binding.clone());
                 deps.into_iter().collect()
             }
+        }
+    }
+
+    /// Scheduling edges this effect contributes when running `apply`.
+    ///
+    /// Returned edges describe ordering constraints relative to other
+    /// bindings; resolving them to concrete effect indices is the
+    /// responsibility of [`crate::effect::deps::build_effect_dependency_analysis`].
+    pub fn apply_edges(&self) -> Vec<ScheduleEdge> {
+        match self {
+            Effect::Delete { dependencies, .. } => dependencies
+                .iter()
+                .cloned()
+                .map(ScheduleEdge::BlockedBy)
+                .collect(),
+            Effect::Replace { from, .. } => from
+                .dependency_bindings
+                .iter()
+                .cloned()
+                .map(ScheduleEdge::BlockedByIfDelete)
+                .collect(),
+            Effect::Wait { .. }
+            | Effect::DeferredCreate { .. }
+            | Effect::DeferredReplace { .. } => self
+                .blocking_bindings()
+                .into_iter()
+                .map(ScheduleEdge::DependsOn)
+                .collect(),
+            Effect::Read { .. }
+            | Effect::Create(_)
+            | Effect::Update { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. } => Vec::new(),
+        }
+    }
+
+    /// Scheduling edges this effect contributes when running `destroy`.
+    ///
+    /// Differs from [`Self::apply_edges`] in two ways: `Replace.from`
+    /// dependency bindings unconditionally block (rather than only when
+    /// they resolve to deletes), and meta effects (`Wait`, deferred
+    /// variants) contribute no edges because they are not present in
+    /// destroy plans.
+    pub fn destroy_edges(&self) -> Vec<ScheduleEdge> {
+        match self {
+            Effect::Delete { dependencies, .. } => dependencies
+                .iter()
+                .cloned()
+                .map(ScheduleEdge::BlockedBy)
+                .collect(),
+            Effect::Replace { from, .. } => from
+                .dependency_bindings
+                .iter()
+                .cloned()
+                .map(ScheduleEdge::BlockedBy)
+                .collect(),
+            Effect::Read { .. }
+            | Effect::Create(_)
+            | Effect::Update { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::Wait { .. }
+            | Effect::DeferredCreate { .. }
+            | Effect::DeferredReplace { .. } => Vec::new(),
         }
     }
 }

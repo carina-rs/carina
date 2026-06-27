@@ -1,13 +1,14 @@
 //! Dependency computation and parallel effect execution.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use tokio_util::sync::CancellationToken;
 
 use crate::effect::Effect;
-use crate::parser::ResourceRef;
+#[cfg(test)]
+use crate::effect::deps::UnresolvedResource;
 use crate::provider::Provider;
 use crate::resource::{Resource, ResourceId, Value};
 
@@ -85,433 +86,19 @@ pub(super) fn is_runtime_noop(effect: &Effect) -> bool {
         || (effect.is_state_operation() && !effect.is_scheduler_meta())
 }
 
-#[derive(Debug, Clone)]
-pub struct UnresolvedResource(Resource);
-
-impl UnresolvedResource {
-    /// Pre-resolution snapshot used by dependency analysis and apply-time
-    /// reference re-resolution.
-    ///
-    /// The executor deliberately accepts this newtype instead of a raw
-    /// [`Resource`] map so saved-plan and live-apply call sites cannot
-    /// accidentally pass resources after `ResourceRef` substitution. The
-    /// wrapped value may still be cloned from CLI-side parser output, but it
-    /// must cross this constructor seam at the pre-resolve snapshot point.
-    pub fn from_pre_resolve(resource: Resource) -> Self {
-        Self(resource)
-    }
-
-    pub fn as_resource(&self) -> &Resource {
-        &self.0
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WritesSet {
-    attrs: BTreeSet<String>,
-}
-
-impl WritesSet {
-    /// Build the static scheduler write set from the plan-time update
-    /// effect only.
-    ///
-    /// Apply-time patch augmentation can still recompute the effective
-    /// patch, but after #3490 it uses the same type-aware comparison as
-    /// plan-time `changed_attributes`. Attributes that are equivalent
-    /// under that comparison are not widened into the provider patch, so
-    /// the scheduler's static safety predicate remains tied to this
-    /// plan-time set.
-    pub(crate) fn from_update(effect: &Effect) -> Option<Self> {
-        let Effect::Update {
-            changed_attributes, ..
-        } = effect
-        else {
-            return None;
-        };
-        Some(Self {
-            attrs: changed_attributes.iter().cloned().collect(),
-        })
-    }
-}
-
-mod reads {
-    use std::collections::BTreeSet;
-
-    use crate::resource::AccessPath;
-
-    use super::WritesSet;
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub(crate) struct KnownReads {
-        attrs: BTreeSet<String>,
-    }
-
-    impl KnownReads {
-        pub(crate) fn from_walker(path: &AccessPath) -> Self {
-            let mut attrs = BTreeSet::new();
-            attrs.insert(path.attribute().to_string());
-            Self { attrs }
-        }
-
-        #[cfg(test)]
-        pub(crate) fn from_attrs(attrs: &[&str]) -> Self {
-            Self {
-                attrs: attrs.iter().map(|attr| (*attr).to_string()).collect(),
-            }
-        }
-
-        pub(crate) fn attrs(&self) -> &BTreeSet<String> {
-            &self.attrs
-        }
-
-        fn union(mut self, other: KnownReads) -> Self {
-            self.attrs.extend(other.attrs);
-            self
-        }
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub(crate) enum ReadsSet {
-        Known(KnownReads),
-        Unknown,
-    }
-
-    impl ReadsSet {
-        pub(crate) fn from_walker(walker_result: KnownReads) -> Self {
-            Self::Known(walker_result)
-        }
-
-        pub(crate) fn unknown() -> Self {
-            Self::Unknown
-        }
-
-        pub(crate) fn merge(self, other: ReadsSet) -> ReadsSet {
-            match (self, other) {
-                (ReadsSet::Known(a), ReadsSet::Known(b)) => ReadsSet::Known(a.union(b)),
-                _ => ReadsSet::Unknown,
-            }
-        }
-
-        pub(crate) fn disjoint(&self, writes: &WritesSet) -> bool {
-            match self {
-                ReadsSet::Known(set) => set.attrs().is_disjoint(&writes.attrs),
-                ReadsSet::Unknown => false,
-            }
-        }
-
-        #[cfg(test)]
-        pub(crate) fn is_unknown(&self) -> bool {
-            matches!(self, ReadsSet::Unknown)
-        }
-    }
-}
-
-use reads::{KnownReads, ReadsSet};
-
-pub(super) struct DependencyAnalysis {
-    deps_of: HashMap<usize, HashSet<usize>>,
-    reads_by_edge: HashMap<usize, HashMap<usize, ReadsSet>>,
-}
-
-impl DependencyAnalysis {
-    fn new(effect_count: usize) -> Self {
-        let deps_of = (0..effect_count).map(|idx| (idx, HashSet::new())).collect();
-        Self {
-            deps_of,
-            reads_by_edge: HashMap::new(),
-        }
-    }
-
-    fn add_edge(&mut self, child: usize, parent: usize, reads: ReadsSet) {
-        self.deps_of.entry(child).or_default().insert(parent);
-        self.reads_by_edge
-            .entry(child)
-            .or_default()
-            .entry(parent)
-            .and_modify(|existing| {
-                let previous = std::mem::replace(existing, ReadsSet::unknown());
-                *existing = previous.merge(reads.clone());
-            })
-            .or_insert(reads);
-    }
-
-    fn remove_edge(&mut self, child: usize, parent: usize) {
-        if let Some(deps) = self.deps_of.get_mut(&child) {
-            deps.remove(&parent);
-        }
-    }
-
-    fn deps_for(&self, child: usize) -> Option<&HashSet<usize>> {
-        self.deps_of.get(&child)
-    }
-
-    fn reads_for_edge(&self, child: usize, parent: usize) -> Option<&ReadsSet> {
-        self.reads_by_edge
-            .get(&child)
-            .and_then(|by_parent| by_parent.get(&parent))
-    }
-
-    pub(super) fn into_deps_of(self) -> HashMap<usize, HashSet<usize>> {
-        self.deps_of
-    }
-}
-
-struct DependencyAnalyzer {
-    binding_to_idx: HashMap<String, usize>,
-    compositions_by_binding: HashMap<String, crate::resource::Composition>,
-}
-
-impl DependencyAnalyzer {
-    fn new(
-        binding_to_idx: HashMap<String, usize>,
-        compositions: &[crate::resource::Composition],
-    ) -> Self {
-        let compositions_by_binding = compositions
-            .iter()
-            .filter_map(|composition| {
-                composition
-                    .binding
-                    .clone()
-                    .map(|binding| (binding, composition.clone()))
-            })
-            .collect();
-        Self {
-            binding_to_idx,
-            compositions_by_binding,
-        }
-    }
-
-    fn collect_from_effect(
-        &self,
-        effect: &Effect,
-        analysis: &mut DependencyAnalysis,
-        child: usize,
-    ) {
-        if let Some(resource) = effect.as_resource_ref() {
-            self.collect_from_resource_ref(resource, analysis, child);
-            return;
-        }
-
-        for binding in effect.blocking_bindings() {
-            self.record_binding_edge(&binding, ReadsSet::unknown(), analysis, child);
-        }
-    }
-
-    fn collect_from_resource_ref(
-        &self,
-        resource: ResourceRef<'_>,
-        analysis: &mut DependencyAnalysis,
-        child: usize,
-    ) {
-        let attrs = resource.attributes();
-        let mut bindings_seen_in_values = HashSet::new();
-        for value in attrs.values() {
-            value.visit_resource_refs(&mut |path| {
-                bindings_seen_in_values.insert(path.binding().to_string());
-                self.record_binding_edge(
-                    path.binding(),
-                    ReadsSet::from_walker(KnownReads::from_walker(path)),
-                    analysis,
-                    child,
-                );
-            });
-            value.visit_binding_refs(&mut |binding| {
-                bindings_seen_in_values.insert(binding.to_string());
-                self.record_binding_edge(binding, ReadsSet::unknown(), analysis, child);
-            });
-        }
-        for binding in resource.dependency_bindings() {
-            if !bindings_seen_in_values.contains(binding) {
-                self.record_binding_edge(binding, ReadsSet::unknown(), analysis, child);
-            }
-        }
-        if let Some(directives) = resource.directives() {
-            for binding in &directives.depends_on {
-                self.record_binding_edge(binding, ReadsSet::unknown(), analysis, child);
-            }
-        }
-    }
-
-    fn collect_from_resource(
-        &self,
-        resource: &Resource,
-        analysis: &mut DependencyAnalysis,
-        child: usize,
-    ) {
-        self.collect_from_resource_ref(ResourceRef::Resource(resource), analysis, child);
-    }
-
-    fn record_binding_edge(
-        &self,
-        binding: &str,
-        reads: ReadsSet,
-        analysis: &mut DependencyAnalysis,
-        child: usize,
-    ) {
-        let mut visited = HashSet::new();
-        self.record_binding_edge_inner(binding, reads, analysis, child, &mut visited);
-    }
-
-    fn record_binding_edge_inner<'a>(
-        &'a self,
-        binding: &'a str,
-        reads: ReadsSet,
-        analysis: &mut DependencyAnalysis,
-        child: usize,
-        visited: &mut HashSet<&'a str>,
-    ) {
-        if !visited.insert(binding) {
-            return;
-        }
-        if let Some(&parent) = self.binding_to_idx.get(binding) {
-            analysis.add_edge(child, parent, reads);
-            return;
-        }
-        let Some(composition) = self.compositions_by_binding.get(binding) else {
-            return;
-        };
-        for inner in crate::deps::get_composition_dependencies(composition) {
-            let key: &'a str =
-                if let Some((k, _)) = self.compositions_by_binding.get_key_value(inner.as_str()) {
-                    k.as_str()
-                } else if let Some((k, _)) = self.binding_to_idx.get_key_value(inner.as_str()) {
-                    k.as_str()
-                } else {
-                    continue;
-                };
-            self.record_binding_edge_inner(key, ReadsSet::unknown(), analysis, child, visited);
-        }
-    }
-}
-
-pub(super) fn build_dependency_analysis(
-    effects: &[Effect],
-    unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
-    compositions: &[crate::resource::Composition],
-) -> DependencyAnalysis {
-    // Build binding -> effect index mapping
-    let mut binding_to_idx: HashMap<String, usize> = HashMap::new();
-    // Fallback: ResourceId name -> effect index for Delete effects without bindings.
-    // When a resource loses its `let` binding (e.g., becomes anonymous in a new .crn),
-    // the Delete effect has binding: None. But other effects may still reference the
-    // old binding name via state-recorded dependency_bindings. The name-based lookup
-    // allows resolving these dependencies.
-    let mut name_to_delete_idx: HashMap<String, usize> = HashMap::new();
-    for (idx, effect) in effects.iter().enumerate() {
-        if let Some(binding) = effect.binding_name() {
-            binding_to_idx.insert(binding, idx);
-        }
-        if let Effect::Delete { id, binding, .. } = effect
-            && binding.is_none()
-        {
-            name_to_delete_idx.insert(id.name_str().to_string(), idx);
-        }
-    }
-
-    let analyzer = DependencyAnalyzer::new(binding_to_idx.clone(), compositions);
-
-    let mut analysis = DependencyAnalysis::new(effects.len());
-    for (idx, effect) in effects.iter().enumerate() {
-        if effect.is_scheduler_meta() {
-            analyzer.collect_from_effect(effect, &mut analysis, idx);
-        } else if effect.as_resource_ref().is_some() {
-            if let Some(unresolved) = unresolved_resources.get(effect.resource_id()) {
-                analyzer.collect_from_resource(unresolved.as_resource(), &mut analysis, idx);
-            } else {
-                analyzer.collect_from_effect(effect, &mut analysis, idx);
-            }
-        }
-    }
-
-    // Helper: look up effect index by binding name, falling back to Delete-by-name.
-    let lookup_idx = |binding: &str| -> Option<usize> {
-        binding_to_idx
-            .get(binding)
-            .or_else(|| name_to_delete_idx.get(binding))
-            .copied()
-    };
-
-    // For Delete effects, add reverse dependencies: if subnet depends on vpc,
-    // the vpc delete must wait for subnet delete (children deleted before parents).
-    let mut reverse_deps: Vec<(usize, usize)> = Vec::new();
-    for (idx, effect) in effects.iter().enumerate() {
-        if let Effect::Delete { dependencies, .. } = effect {
-            for dep_binding in dependencies {
-                if let Some(dep_idx) = lookup_idx(dep_binding) {
-                    reverse_deps.push((dep_idx, idx));
-                }
-            }
-        }
-        // For Replace effects (especially CBD), the old resource (from) may have
-        // depended on a resource that is now being deleted. The delete of that
-        // parent must wait for this Replace to complete first (the old resource
-        // is deleted during the Replace's delete phase).
-        // Use from.dependency_bindings (recorded in state) for the old dependencies.
-        if let Effect::Replace { from, .. } = effect {
-            for dep_binding in &from.dependency_bindings {
-                if let Some(dep_idx) = lookup_idx(dep_binding)
-                    && matches!(&effects[dep_idx], Effect::Delete { .. })
-                {
-                    reverse_deps.push((dep_idx, idx));
-                }
-            }
-        }
-    }
-    for (parent_idx, child_idx) in reverse_deps {
-        analysis.add_edge(parent_idx, child_idx, ReadsSet::unknown());
-    }
-
-    // Wait dependencies: each `Effect::Wait` depends on its blocking
-    // bindings, with the target binding first. This keeps the polling
-    // wait behind the effect that produces its target, plus any explicit
-    // `depends_on = [...]` entries from the wait block.
-    for (idx, effect) in effects.iter().enumerate() {
-        if let Effect::Wait { .. } = effect {
-            for dep_binding in effect.blocking_bindings() {
-                if let Some(dep_idx) = lookup_idx(&dep_binding) {
-                    analysis.add_edge(idx, dep_idx, ReadsSet::unknown());
-                }
-            }
-            // Defensive: ensure the wait has an entry even when it has
-            // no resolved deps (an isolated wait still needs to appear
-            // in deps_of so the scheduler's `&deps_of[&idx]` lookup
-            // doesn't panic).
-        }
-    }
-
-    analysis
-}
-
-pub(super) fn relax_update_update_edges(effects: &[Effect], analysis: &mut DependencyAnalysis) {
-    for child in 0..effects.len() {
-        if !matches!(&effects[child], Effect::Update { .. }) {
-            continue;
-        }
-        let Some(parents) = analysis.deps_for(child).cloned() else {
-            continue;
-        };
-        for parent in parents {
-            let Some(writes) = WritesSet::from_update(&effects[parent]) else {
-                continue;
-            };
-            let Some(reads) = analysis.reads_for_edge(child, parent) else {
-                continue;
-            };
-            if reads.disjoint(&writes) {
-                analysis.remove_edge(child, parent);
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 pub(super) fn build_dependency_levels(
     effects: &[Effect],
     unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
     compositions: &[crate::resource::Composition],
 ) -> Vec<Vec<usize>> {
-    let deps_of =
-        build_dependency_analysis(effects, unresolved_resources, compositions).into_deps_of();
+    let deps_of = crate::effect::deps::build_effect_dependency_analysis(
+        effects,
+        unresolved_resources,
+        compositions,
+        crate::effect::deps::ScheduleInputs::Apply,
+    )
+    .into_deps_of();
 
     // Assign levels: each effect's level is max(deps' levels) + 1, or 0 if no deps
     let mut levels: HashMap<usize, usize> = HashMap::new();
@@ -1144,6 +731,11 @@ pub(super) async fn execute_effects_sequential(
 mod tests {
     use super::*;
     use crate::effect::ChangedCreateOnly;
+    use crate::effect::deps::reads::{KnownReads, ReadsSet};
+    use crate::effect::deps::{
+        ScheduleInputs, WritesSet, build_effect_dependency_analysis as build_dependency_analysis,
+        relax_update_update_edges,
+    };
     use crate::plan::Plan;
     use crate::provider::{
         BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer, ProviderError, ProviderResult,
@@ -1356,7 +948,8 @@ mod tests {
                 _ => None,
             })
             .collect();
-        let mut analysis = build_dependency_analysis(&effects, &unresolved, &[]);
+        let mut analysis =
+            build_dependency_analysis(&effects, &unresolved, &[], ScheduleInputs::Apply);
         relax_update_update_edges(&effects, &mut analysis);
         analysis.into_deps_of().remove(&1).unwrap()
     }
@@ -1497,7 +1090,9 @@ mod tests {
                 UnresolvedResource::from_pre_resolve(listener.clone()),
             ),
         ]);
-        let deps = build_dependency_analysis(plan.effects(), &unresolved, &[]).into_deps_of();
+        let deps =
+            build_dependency_analysis(plan.effects(), &unresolved, &[], ScheduleInputs::Apply)
+                .into_deps_of();
         assert!(
             deps.get(&3).is_some_and(|listener_deps| {
                 listener_deps.contains(&1) && listener_deps.contains(&2)
@@ -1664,7 +1259,7 @@ mod tests {
             (child_id, UnresolvedResource::from_pre_resolve(child)),
         ]);
 
-        let analysis = build_dependency_analysis(&effects, &unresolved, &[]);
+        let analysis = build_dependency_analysis(&effects, &unresolved, &[], ScheduleInputs::Apply);
         assert!(
             analysis
                 .reads_for_edge(1, 0)
@@ -1761,7 +1356,8 @@ mod tests {
             ),
             (child_id, UnresolvedResource::from_pre_resolve(child)),
         ]);
-        let mut analysis = build_dependency_analysis(&effects, &unresolved, &[virt]);
+        let mut analysis =
+            build_dependency_analysis(&effects, &unresolved, &[virt], ScheduleInputs::Apply);
         relax_update_update_edges(&effects, &mut analysis);
         let deps_of = analysis.into_deps_of();
 
@@ -1774,7 +1370,8 @@ mod tests {
     #[test]
     fn relax_update_update_edges_handles_empty_plan() {
         let effects = Vec::new();
-        let mut analysis = build_dependency_analysis(&effects, &HashMap::new(), &[]);
+        let mut analysis =
+            build_dependency_analysis(&effects, &HashMap::new(), &[], ScheduleInputs::Apply);
         relax_update_update_edges(&effects, &mut analysis);
         assert!(analysis.into_deps_of().is_empty());
     }
@@ -1783,7 +1380,8 @@ mod tests {
     fn relax_update_update_edges_handles_single_update_without_parent() {
         let effect = update_effect("only", &[], &["tags"]);
         let effects = vec![effect];
-        let mut analysis = build_dependency_analysis(&effects, &HashMap::new(), &[]);
+        let mut analysis =
+            build_dependency_analysis(&effects, &HashMap::new(), &[], ScheduleInputs::Apply);
         relax_update_update_edges(&effects, &mut analysis);
         assert!(analysis.into_deps_of()[&0].is_empty());
     }
@@ -1795,7 +1393,8 @@ mod tests {
             update_effect("parent", &[], &["tags"]),
             Effect::Create(child),
         ];
-        let mut analysis = build_dependency_analysis(&effects, &HashMap::new(), &[]);
+        let mut analysis =
+            build_dependency_analysis(&effects, &HashMap::new(), &[], ScheduleInputs::Apply);
         relax_update_update_edges(&effects, &mut analysis);
         assert!(analysis.into_deps_of()[&0].is_empty());
     }
@@ -1853,7 +1452,9 @@ mod tests {
             UnresolvedResource::from_pre_resolve(role_policy),
         );
 
-        let deps_of = build_dependency_analysis(&effects, &unresolved, &[virt]).into_deps_of();
+        let deps_of =
+            build_dependency_analysis(&effects, &unresolved, &[virt], ScheduleInputs::Apply)
+                .into_deps_of();
 
         assert!(
             deps_of[&1].contains(&0),

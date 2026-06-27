@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -125,6 +126,26 @@ impl MockProvider {
         config.resource_id_pattern == "*"
             || config.resource_id_pattern == full
             || config.resource_id_pattern == short
+    }
+
+    fn append_delete_log(path: PathBuf, id: &ResourceId) -> Result<(), std::io::Error> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        writeln!(file, "{}", Self::resource_key(id))
+    }
+
+    fn delete_delay_for(id: &ResourceId) -> Option<Duration> {
+        let target = env::var("CARINA_MOCK_DELETE_DELAY_MS_FOR").ok()?;
+        if target != Self::resource_key(id) {
+            return None;
+        }
+        env::var("CARINA_MOCK_DELETE_DELAY_MS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|millis| *millis > 0)
+            .map(Duration::from_millis)
     }
 }
 
@@ -338,6 +359,16 @@ impl Provider for MockProvider {
     ) -> BoxFuture<'_, ProviderResult<()>> {
         let id = id.clone();
         Box::pin(async move {
+            if let Some(delay) = Self::delete_delay_for(&id) {
+                tokio::time::sleep(delay).await;
+            }
+
+            if let Some(path) = env::var_os("CARINA_MOCK_DELETE_LOG").map(PathBuf::from) {
+                Self::append_delete_log(path, &id).map_err(|e| {
+                    ProviderError::internal("Failed to append delete log").with_cause(e)
+                })?;
+            }
+
             let mut states = self.load_states();
             let key = Self::resource_key(&id);
 
@@ -357,6 +388,10 @@ impl Provider for MockProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     // Pin the byte-level shape so MockProvider's state file matches
     // the trailing-newline convention used by carina.state.json
@@ -391,6 +426,63 @@ mod tests {
         assert_eq!(
             provider.required_permissions(&id, carina_core::effect::PlanOp::Create),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn append_delete_log_records_resource_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("delete.log");
+        let first = ResourceId::with_provider("mock", "test.resource", "first", None);
+        let second = ResourceId::with_provider("mock", "test.resource", "second", None);
+
+        MockProvider::append_delete_log(log_path.clone(), &first).unwrap();
+        MockProvider::append_delete_log(log_path.clone(), &second).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(log_path).unwrap(),
+            "test.resource.first\ntest.resource.second\n"
+        );
+    }
+
+    #[test]
+    fn delete_delay_env_var_delays_matching_resource_delete() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state_file = tmp.path().join("mock-state.json");
+        let provider = MockProvider {
+            state_file,
+            partial_create: None,
+            partial_update: None,
+        };
+        let id = ResourceId::with_provider("mock", "test.resource", "slow", None);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        // SAFETY: This test serializes access to the process environment with
+        // ENV_LOCK and clears the variables before releasing the lock.
+        unsafe {
+            env::set_var("CARINA_MOCK_DELETE_DELAY_MS_FOR", "test.resource.slow");
+            env::set_var("CARINA_MOCK_DELETE_DELAY_MS", "25");
+        }
+
+        let started = Instant::now();
+        runtime
+            .block_on(provider.delete(&id, "mock-id", DeleteRequest::default()))
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        // SAFETY: See the set_var safety note above; ENV_LOCK is still held.
+        unsafe {
+            env::remove_var("CARINA_MOCK_DELETE_DELAY_MS_FOR");
+            env::remove_var("CARINA_MOCK_DELETE_DELAY_MS");
+        }
+
+        assert!(
+            elapsed >= Duration::from_millis(25),
+            "matching delete should be delayed by at least 25ms, elapsed {elapsed:?}"
         );
     }
 }

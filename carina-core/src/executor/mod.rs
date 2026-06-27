@@ -23,7 +23,7 @@ mod replace;
 pub(super) mod scheduler;
 pub(crate) mod wait;
 
-pub use parallel::UnresolvedResource;
+pub use crate::effect::deps::UnresolvedResource;
 pub use replace::compute_full_diff_patch;
 
 use std::collections::{HashMap, HashSet};
