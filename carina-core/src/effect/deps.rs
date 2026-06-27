@@ -117,6 +117,10 @@ struct DependencyAnalyzer {
     compositions_by_binding: HashMap<String, crate::resource::Composition>,
 }
 
+fn resource_synthetic_key(id: &ResourceId) -> String {
+    format!("{}:{}", id.resource_type, id.name_str())
+}
+
 impl DependencyAnalyzer {
     fn new(
         binding_to_idx: HashMap<String, usize>,
@@ -286,6 +290,14 @@ pub fn build_effect_dependency_analysis(
             && let Some(binding) = effect.binding_name()
         {
             binding_to_idx.entry(binding).or_insert(idx);
+        }
+        if matches!(inputs, ScheduleInputs::Apply)
+            && !matches!(effect, Effect::Delete { .. })
+            && effect.as_resource_ref().is_some()
+        {
+            binding_to_idx
+                .entry(resource_synthetic_key(effect.resource_id()))
+                .or_insert(idx);
         }
         if let Effect::Delete { id, binding, .. } = effect {
             if let Some(binding) = binding {
@@ -483,6 +495,50 @@ mod tests {
         assert!(
             !deps[&1].contains(&2),
             "old dependency bindings must not make an Update wait for the Delete"
+        );
+    }
+
+    #[test]
+    fn anonymous_consumer_blocked_by_updates_edge_is_recorded() {
+        let producer_id = ResourceId::new("test.Producer", "main");
+        let consumer_id = ResourceId::new("test.Consumer", "anonymous");
+        let mut producer = Resource::new("test.Producer", "main");
+        producer.binding = Some("producer".to_string());
+        let mut consumer = Resource::new("test.Consumer", "anonymous");
+        consumer.set_attr(
+            "producer_id",
+            Value::resource_ref("producer".to_string(), "id".to_string(), vec![]),
+        );
+        let effects = vec![
+            Effect::Create(producer),
+            Effect::Update {
+                id: consumer_id.clone(),
+                from: Box::new(state_for(&consumer_id)),
+                to: consumer.clone(),
+                changed_attributes: vec!["producer_id".to_string()],
+            },
+            Effect::Delete {
+                id: producer_id,
+                identifier: "old-producer".to_string(),
+                directives: Default::default(),
+                binding: Some("producer".to_string()),
+                dependencies: HashSet::new(),
+                explicit_dependencies: HashSet::new(),
+                blocked_by_updates: HashSet::from(["test.Consumer:anonymous".to_string()]),
+            },
+        ];
+        let unresolved = HashMap::from([(
+            consumer_id.clone(),
+            UnresolvedResource::from_pre_resolve(consumer),
+        )]);
+
+        let deps =
+            build_effect_dependency_analysis(&effects, &unresolved, &[], ScheduleInputs::Apply)
+                .into_deps_of();
+
+        assert!(
+            deps[&2].contains(&1),
+            "CBD old delete must wait for anonymous consumer update via synthetic key"
         );
     }
 

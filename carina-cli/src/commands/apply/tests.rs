@@ -2213,7 +2213,10 @@ mod saved_plan_version_tests {
             "error must name the rejected version, got: {msg}",
         );
         assert!(
-            msg.contains("expected 7"),
+            msg.contains(&format!(
+                "expected {}",
+                crate::commands::plan::PlanFile::CURRENT_VERSION
+            )),
             "error must name the expected version, got: {msg}",
         );
         assert!(

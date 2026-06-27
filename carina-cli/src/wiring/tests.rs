@@ -1024,7 +1024,10 @@ moved {
     let tmp = tempfile::tempdir().expect("tempdir");
 
     let err = match create_plan_from_parsed_with_upstream(
-        &parsed,
+        PlanParsedInputs {
+            parsed: &parsed,
+            unresolved_resources: &parsed.resources,
+        },
         &state_file,
         false,
         &HashMap::new(),
@@ -1109,7 +1112,10 @@ removed {
     let tmp = tempfile::tempdir().expect("tempdir");
 
     let err = match create_plan_from_parsed_with_upstream(
-        &parsed,
+        PlanParsedInputs {
+            parsed: &parsed,
+            unresolved_resources: &parsed.resources,
+        },
         &state_file,
         false,
         &HashMap::new(),
@@ -1787,7 +1793,10 @@ moved {{
     );
     let tmp = tempfile::tempdir().expect("tempdir");
     let ctx = create_plan_from_parsed_with_upstream(
-        &parsed,
+        PlanParsedInputs {
+            parsed: &parsed,
+            unresolved_resources: &parsed.resources,
+        },
         &Some(state_file),
         false,
         &HashMap::new(),

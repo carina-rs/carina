@@ -1347,12 +1347,12 @@ impl DeferredCreateTarget {
     }
 
     fn to_deferred_replace_effect(&self, deletes: Vec<DeferredReplaceDelete>) -> Effect {
-        Effect::DeferredReplace {
-            deletes: NonEmptyDeletes::try_new(deletes).expect("planner checked non-empty deletes"),
-            id: self.id.clone(),
-            upstream_binding: self.upstream_binding.clone(),
-            template: Box::new(self.template.clone()),
-        }
+        Effect::deferred_replace(
+            NonEmptyDeletes::try_new(deletes).expect("planner checked non-empty deletes"),
+            self.id.clone(),
+            self.upstream_binding.clone(),
+            Box::new(self.template.clone()),
+        )
     }
 }
 
@@ -1694,7 +1694,10 @@ pub async fn create_plan_from_parsed<E: Clone>(
     base_dir: &Path,
 ) -> Result<PlanContext, AppError> {
     create_plan_from_parsed_with_upstream(
-        parsed,
+        PlanParsedInputs {
+            parsed,
+            unresolved_resources: &parsed.resources,
+        },
         state_file,
         refresh,
         &HashMap::new(),
@@ -1705,8 +1708,46 @@ pub async fn create_plan_from_parsed<E: Clone>(
     .await
 }
 
+pub struct PlanParsedInputs<'a, E> {
+    pub parsed: &'a carina_core::parser::File<E>,
+    pub unresolved_resources: &'a [Resource],
+}
+
+/// Return a managed-resource view with parser-resolved literal attributes
+/// replaced by the corresponding unresolved `ResourceRef`-preserving attrs.
+///
+/// The CLI carries both `parsed` and `unresolved_parsed`: the former has
+/// same-config refs folded into literals before state-derived CBD name
+/// overrides are applied, while the latter still carries the refs. After a
+/// permanent name override changes a producer's `name` to its temporary cloud
+/// value, consumers must be re-resolved from the unresolved snapshot or they
+/// keep the stale pre-override literal and plan a spurious update.
+pub(crate) fn restore_unresolved_managed_attributes(
+    sorted_resources: &[Resource],
+    unresolved_resources: &[Resource],
+) -> Vec<Resource> {
+    let unresolved_by_id: HashMap<ResourceId, &Resource> = unresolved_resources
+        .iter()
+        .map(|resource| (resource.id.clone(), resource))
+        .collect();
+
+    sorted_resources
+        .iter()
+        .map(|resource| {
+            let Some(unresolved) = unresolved_by_id.get(&resource.id) else {
+                return resource.clone();
+            };
+            let mut restored = resource.clone();
+            restored.attributes = unresolved.attributes.clone();
+            restored.dependency_bindings = unresolved.dependency_bindings.clone();
+            restored.quoted_string_attrs = unresolved.quoted_string_attrs.clone();
+            restored
+        })
+        .collect()
+}
+
 pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
-    parsed: &carina_core::parser::File<E>,
+    inputs: PlanParsedInputs<'_, E>,
     state_file: &Option<StateFile>,
     refresh: bool,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
@@ -1714,6 +1755,8 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     resolved_state_block_targets: &ResolvedStateBlockTargets,
     base_dir: &Path,
 ) -> Result<PlanContext, AppError> {
+    let parsed = inputs.parsed;
+    let unresolved_resources = inputs.unresolved_resources;
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
     let ctx = WiringContext::new(factories);
     // Mutable: a same-config deferred-for loop is expanded into concrete
@@ -1729,6 +1772,8 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     // `current_states`.
     let mut sorted_resources =
         sort_resources_by_dependencies(&parsed.resources).map_err(AppError::Validation)?;
+    let mut unresolved_sorted_resources =
+        restore_unresolved_managed_attributes(&sorted_resources, unresolved_resources);
     let data_sources: Vec<carina_core::resource::DataSource> = parsed.data_sources.clone();
 
     // Select appropriate Provider based on configuration
@@ -1917,7 +1962,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
             .map(WaitAliasSpec::from)
             .collect();
         let resolved_data_sources = resolve_data_source_refs_for_refresh(
-            &sorted_resources,
+            &unresolved_sorted_resources,
             &parsed.compositions,
             &data_sources,
             &current_states,
@@ -2022,7 +2067,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         printed_warnings,
     } = expand_same_config_deferred_for(
         parsed,
-        &sorted_resources,
+        &unresolved_sorted_resources,
         &current_states,
         remote_bindings,
         &wait_aliases,
@@ -2030,6 +2075,8 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         &orphan_refreshed_ids,
     )?;
     sorted_resources = resorted;
+    unresolved_sorted_resources =
+        restore_unresolved_managed_attributes(&sorted_resources, unresolved_resources);
     validate_plan_time_state_block_collisions(
         &sorted_resources,
         &moved_pairs,
@@ -2110,7 +2157,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     // `(known after upstream apply: <ref>)` (#2366). `apply` calls
     // `resolve_refs_with_state_and_remote` and still errors on
     // unresolved upstream references.
-    let mut resources = sorted_resources.clone();
+    let mut resources = unresolved_sorted_resources.clone();
     // awscc#251 (follow-up to #3055): #3055 lifted only `saved_attrs`.
     // On a refresh the live value comes from `provider.read()` into
     // `current_states`, a different map. A provider returning an IAM
@@ -2214,7 +2261,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     // retain ResourceRef values for re-resolution at apply time.
     cascade_dependent_updates(
         &mut plan,
-        &sorted_resources,
+        &unresolved_sorted_resources,
         &plan_input_states,
         ctx.schemas(),
     );
@@ -2245,7 +2292,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     Ok(PlanContext {
         plan,
         provider,
-        sorted_resources,
+        sorted_resources: resources,
         current_states,
         moved_origins,
         upstream_snapshot: remote_bindings.clone(),

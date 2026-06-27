@@ -99,6 +99,10 @@ let consumer = mock.test.resource {{
     }
 
     fn write_permanent_name_config(&self) {
+        self.write_permanent_name_config_with_name("stable-name");
+    }
+
+    fn write_permanent_name_config_with_name(&self, name: &str) {
         fs::write(
             self.project.join("main.crn"),
             format!(
@@ -106,12 +110,13 @@ let consumer = mock.test.resource {{
 provider mock {{}}
 
 let permanent = mock.test.resource {{
-  name = "stable-name"
+  name = "{name}"
   force_replace = "new"
   directives {{ create_before_destroy = true }}
 }}
 "#,
-                self.state_path.display()
+                self.state_path.display(),
+                name = name
             ),
         )
         .unwrap();
@@ -278,6 +283,26 @@ let permanent = mock.test.resource {{
         .unwrap();
     }
 
+    fn seed_mock_provider_state_from_carina_state(&self) {
+        let provider_state: serde_json::Map<String, serde_json::Value> = self
+            .state()
+            .resources
+            .into_iter()
+            .map(|row| {
+                (
+                    format!("{}.{}", row.resource_type, row.name),
+                    serde_json::Value::Object(row.attributes.into_iter().collect()),
+                )
+            })
+            .collect();
+        fs::write(
+            &self.mock_state_path,
+            carina_core::utils::pretty_with_newline(&serde_json::Value::Object(provider_state))
+                .unwrap(),
+        )
+        .unwrap();
+    }
+
     fn apply(&self) -> Output {
         carina(&self.project)
             .args([
@@ -376,6 +401,10 @@ fn test_cbd_consumer_reading_name_does_not_break() {
             .any(|entry| entry == "update test.renameable_resource.renamed"),
         "CBD must not issue a rename update; observed log: {op_log:?}"
     );
+
+    scenario.seed_mock_provider_state_from_carina_state();
+    let output = scenario.plan();
+    assert_no_changes("carina plan after apply", &output);
 }
 
 #[test]
@@ -407,6 +436,10 @@ fn cbd_replace_orders_consumer_update_between_create_and_delete() {
         create_pos < update_pos && update_pos < delete_pos,
         "#3625: consumer update must run between CBD create and delete; observed log: {op_log:?}"
     );
+
+    scenario.seed_mock_provider_state_from_carina_state();
+    let output = scenario.plan();
+    assert_no_changes("carina plan after apply", &output);
 }
 
 #[test]
@@ -428,6 +461,7 @@ fn test_cbd_permanent_name_override_persists() {
         .name_overrides
         .get("name")
         .expect("CBD temporary name should persist a permanent name override")
+        .temp_value
         .clone();
     assert!(
         temporary_name.starts_with("stable-name-"),
@@ -443,6 +477,54 @@ fn test_cbd_permanent_name_override_persists() {
             && !stdout.contains("to replace"),
         "permanent name override should prevent a follow-up replace plan\nstdout:\n{stdout}"
     );
+}
+
+#[test]
+fn test_cbd_dsl_rename_after_apply_triggers_new_cbd() {
+    let scenario = Scenario::new();
+    scenario.write_permanent_name_config_with_name("stable-name");
+    scenario.init();
+    scenario.seed_permanent_state();
+    scenario.seed_permanent_mock_provider_state("stable-name", "old");
+
+    let output = scenario.apply();
+    assert_success("carina apply", &output);
+    let state = scenario.state();
+    let first_override = state
+        .find_resource("mock", "test.resource", "permanent")
+        .and_then(|row| row.name_overrides.get("name"))
+        .expect("first apply should record a permanent name override")
+        .clone();
+    assert_eq!(first_override.original_value, "stable-name");
+
+    scenario.seed_mock_provider_state_from_carina_state();
+    scenario.write_permanent_name_config_with_name("stable-name-v2");
+    let output = scenario.plan();
+    assert_success("carina plan after DSL rename", &output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("to replace") || stdout.contains("+/-"),
+        "DSL rename must trigger a new CBD replacement, not no-op\nstdout:\n{stdout}"
+    );
+
+    let output = scenario.apply();
+    assert_success("carina apply after DSL rename", &output);
+    let state = scenario.state();
+    let second_override = state
+        .find_resource("mock", "test.resource", "permanent")
+        .and_then(|row| row.name_overrides.get("name"))
+        .expect("second apply should record a fresh permanent name override");
+    assert_eq!(second_override.original_value, "stable-name-v2");
+    assert_ne!(second_override.temp_value, first_override.temp_value);
+    assert!(
+        second_override.temp_value.starts_with("stable-name-v2-"),
+        "new override should be based on the new DSL name, got {}",
+        second_override.temp_value
+    );
+
+    scenario.seed_mock_provider_state_from_carina_state();
+    let output = scenario.plan();
+    assert_no_changes("carina plan after second apply", &output);
 }
 
 #[test]
@@ -488,7 +570,9 @@ fn test_cbd_delete_failure_records_new_with_temp_name_override() {
         "CBD should record the created replacement even when old delete fails"
     );
     assert_eq!(
-        row.name_overrides.get("name").map(String::as_str),
+        row.name_overrides
+            .get("name")
+            .map(|override_| override_.temp_value.as_str()),
         Some(temporary_name),
         "CBD temporary names should become permanent overrides"
     );
@@ -539,8 +623,9 @@ fn test_cbd_permanent_temp_name_delete_failure_records_new() {
         .get("name")
         .expect("permanent temp-name replacement should persist name override");
     assert!(
-        temporary_name.starts_with("stable-name-"),
-        "temporary name should be based on the desired name, got {temporary_name}"
+        temporary_name.temp_value.starts_with("stable-name-"),
+        "temporary name should be based on the desired name, got {}",
+        temporary_name.temp_value
     );
 
     let op_log = scenario.op_log();
@@ -569,6 +654,16 @@ fn assert_success(label: &str, output: &Output) {
         output.status.success(),
         "{label} failed\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+fn assert_no_changes(label: &str, output: &Output) {
+    assert_success(label, output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("No changes. Infrastructure is up-to-date."),
+        "{label} should report no changes\nstdout:\n{stdout}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stderr),
     );
 }

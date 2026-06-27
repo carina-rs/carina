@@ -253,6 +253,30 @@ fn test_resource_state_deserialization_without_v3_fields() {
 }
 
 #[test]
+fn legacy_string_name_overrides_deserialize_as_compat_entries() {
+    let json = r#"{
+        "resource_type": "iam.Role",
+        "name": "role",
+        "provider": "aws",
+        "attributes": {"name": "my-role-aaaa"},
+        "protected": false,
+        "directives": {},
+        "prefixes": {},
+        "name_overrides": {"name": "my-role-aaaa"},
+        "desired_keys": []
+    }"#;
+
+    let deserialized: ResourceState = serde_json::from_str(json).unwrap();
+    assert_eq!(
+        deserialized.name_overrides.get("name"),
+        Some(&NameOverride {
+            temp_value: "my-role-aaaa".to_string(),
+            original_value: String::new(),
+        })
+    );
+}
+
+#[test]
 fn test_from_provider_state() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
 
@@ -882,9 +906,9 @@ fn test_build_orphan_dependencies() {
 }
 
 #[test]
-fn test_state_file_version_is_v7() {
+fn test_state_file_version_is_current() {
     let state = StateFile::new();
-    assert_eq!(state.version, 7);
+    assert_eq!(state.version, StateFile::CURRENT_VERSION);
 }
 
 #[test]
@@ -1040,6 +1064,48 @@ fn test_check_and_migrate_no_migration_info_for_current_version() {
         "current-version reads must not report a migration"
     );
     assert_eq!(outcome.state.version, StateFile::CURRENT_VERSION);
+}
+
+#[test]
+fn v7_state_migrates_legacy_name_override_strings_to_name_override_objects() {
+    use super::check_and_migrate;
+
+    let json = r#"{
+        "version": 7,
+        "serial": 1,
+        "lineage": "test-lineage",
+        "carina_version": "0.0.1",
+        "resources": [{
+            "resource_type": "iam.Role",
+            "name": "role",
+            "provider": "aws",
+            "identifier": "role-id",
+            "attributes": {"name": "my-role-aaaa"},
+            "protected": false,
+            "directives": {},
+            "prefixes": {},
+            "name_overrides": {"name": "my-role-aaaa"},
+            "binding": "role",
+            "dependency_bindings": []
+        }]
+    }"#;
+
+    let outcome = check_and_migrate(json).unwrap();
+    assert_eq!(
+        outcome.migration,
+        Some(MigrationInfo {
+            from: 7,
+            to: StateFile::CURRENT_VERSION,
+        })
+    );
+    assert_eq!(outcome.state.version, StateFile::CURRENT_VERSION);
+    assert_eq!(
+        outcome.state.resources[0].name_overrides.get("name"),
+        Some(&NameOverride {
+            temp_value: "my-role-aaaa".to_string(),
+            original_value: String::new(),
+        })
+    );
 }
 
 // carina#3266: `state.resources` is managed-only by invariant since

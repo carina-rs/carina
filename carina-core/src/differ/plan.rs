@@ -118,12 +118,11 @@ fn filter_non_removable_removals(
 /// `create_before_destroy`, we need a temporary name for the new resource to
 /// avoid conflicts with the old resource that still exists.
 ///
-/// Returns `None` if no temporary name is needed (no name_attribute,
-/// the resource already uses name_prefix for that attribute, or
-/// the name_attribute value changed between `from` and `to`).
+/// Returns `None` if no temporary name is needed (no name_attribute
+/// or the resource already uses name_prefix for that attribute).
 fn generate_temporary_name(
     resource: &Resource,
-    from: &State,
+    _from: &State,
     schema: &ResourceSchema,
 ) -> Option<TemporaryName> {
     let name_attr = schema.name_attribute.as_ref()?;
@@ -138,13 +137,6 @@ fn generate_temporary_name(
         Some(Value::Concrete(ConcreteValue::String(s))) => s.clone(),
         _ => return None,
     };
-
-    // Skip if the name_attribute value changed (new name is already different from old)
-    if let Some(Value::Concrete(ConcreteValue::String(from_name))) = from.attributes.get(name_attr)
-        && *from_name != original_value
-    {
-        return None;
-    }
 
     let temporary_value = format!("{}-{}", original_value, generate_random_suffix());
 
@@ -208,7 +200,9 @@ pub(crate) fn decompose_replace_into_effects(
     {
         plan.add_permanent_name_override(
             pending.id.clone(),
-            HashMap::from([(temp.attribute.clone(), temp.temporary_value.clone())]),
+            temp.attribute.clone(),
+            temp.temporary_value.clone(),
+            temp.original_value.clone(),
         );
     }
 
@@ -722,6 +716,121 @@ fn known_binding_names(managed: &[Resource], data_sources: &[DataSource]) -> Has
         .collect()
 }
 
+fn cbd_replaced_bindings(pending_replaces: &[PendingReplace]) -> HashSet<String> {
+    pending_replaces
+        .iter()
+        .filter(|pending| pending.create_before_destroy)
+        .filter_map(|pending| pending.to.binding.clone())
+        .collect()
+}
+
+fn promote_pending_replaces_for_dependents(
+    pending_replaces: &mut [PendingReplace],
+    unresolved_managed: &[Resource],
+    registry: &SchemaRegistry,
+) -> bool {
+    let pending_by_binding: HashMap<String, usize> = pending_replaces
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, pending)| pending.to.binding.clone().map(|binding| (binding, idx)))
+        .collect();
+    let mut promoted = false;
+
+    for resource in unresolved_managed {
+        for dep in get_resource_dependencies(resource) {
+            let Some(idx) = pending_by_binding.get(&dep).copied() else {
+                continue;
+            };
+            let Some(pending) = pending_replaces.get_mut(idx) else {
+                continue;
+            };
+            if pending.id == resource.id || pending.create_before_destroy {
+                continue;
+            }
+            pending.create_before_destroy = true;
+            pending.directives.create_before_destroy = true;
+            refresh_pending_temporary_name(pending, registry);
+            promoted = true;
+        }
+    }
+
+    promoted
+}
+
+fn annotate_pending_replaces_from_cbd_dependencies(
+    pending_replaces: &mut [PendingReplace],
+    replaced_bindings: &HashSet<String>,
+    registry: &SchemaRegistry,
+) {
+    for pending in pending_replaces {
+        for dep in get_resource_dependencies(&pending.to) {
+            if !replaced_bindings.contains(&dep) {
+                continue;
+            }
+            let ref_attrs = cascade_ref_attrs(&pending.to.attributes, &dep);
+            let ref_attr_names: Vec<String> = ref_attrs
+                .iter()
+                .map(|ref_attr| ref_attr.attribute.clone())
+                .collect();
+            let create_only_refs = find_changed_create_only(
+                &pending.id.provider,
+                &pending.id.resource_type,
+                &ref_attr_names,
+                registry,
+            );
+            for attr in create_only_refs {
+                if !pending.changed_create_only.contains(&attr) {
+                    pending.changed_create_only.push(attr);
+                }
+            }
+            for ref_attr in ref_attrs {
+                if pending.changed_create_only.contains(&ref_attr.attribute)
+                    && !pending
+                        .cascade_ref_hints
+                        .iter()
+                        .any(|(attr, _)| attr == &ref_attr.attribute)
+                {
+                    pending
+                        .cascade_ref_hints
+                        .push((ref_attr.attribute, ref_attr.hint));
+                }
+            }
+        }
+    }
+}
+
+fn push_pending_replace_if_absent(
+    pending_replaces: &mut Vec<PendingReplace>,
+    pending: PendingReplace,
+) -> bool {
+    if pending_replaces
+        .iter()
+        .any(|existing| existing.id == pending.id)
+    {
+        return false;
+    }
+    pending_replaces.push(pending);
+    true
+}
+
+fn push_consumer_update(
+    consumer_updates_by_replaced: &mut HashMap<String, Vec<(String, Effect)>>,
+    replaced_binding: String,
+    update_key: String,
+    update: Effect,
+) {
+    let updates = consumer_updates_by_replaced
+        .entry(replaced_binding)
+        .or_default();
+    if updates
+        .iter()
+        .any(|(existing_key, _)| existing_key == &update_key)
+    {
+        return;
+    }
+    updates.push((update_key, update));
+}
+
 /// Finalize pending replacements and add visible cascade updates.
 pub fn cascade_dependent_updates(
     plan: &mut Plan,
@@ -764,113 +873,55 @@ pub fn cascade_dependent_updates(
             pending_replaces.extend(decomposed_replaces);
         }
     }
-    let mut binding_to_unresolved: HashMap<String, &Resource> = HashMap::new();
-    for resource in unresolved_managed {
-        let key = resource
-            .binding
-            .clone()
-            .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name_str()));
-        binding_to_unresolved.insert(key, resource);
-    }
-
-    let pending_by_binding: HashMap<String, usize> = pending_replaces
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, pending)| pending.to.binding.clone().map(|binding| (binding, idx)))
-        .collect();
-
-    for resource in unresolved_managed {
-        for dep in get_resource_dependencies(resource) {
-            if let Some(idx) = pending_by_binding.get(&dep)
-                && let Some(pending) = pending_replaces.get_mut(*idx)
-            {
-                pending.create_before_destroy = true;
-                pending.directives.create_before_destroy = true;
-                refresh_pending_temporary_name(pending, registry);
-            }
-        }
-    }
-
-    let replaced_bindings: HashSet<String> = pending_replaces
-        .iter()
-        .filter(|pending| pending.create_before_destroy)
-        .filter_map(|pending| pending.to.binding.clone())
-        .collect();
-
-    for pending in &mut pending_replaces {
-        for dep in get_resource_dependencies(&pending.to) {
-            if !replaced_bindings.contains(&dep) {
-                continue;
-            }
-            let ref_attrs = cascade_ref_attrs(&pending.to.attributes, &dep);
-            let ref_attr_names: Vec<String> = ref_attrs
-                .iter()
-                .map(|ref_attr| ref_attr.attribute.clone())
-                .collect();
-            let create_only_refs = find_changed_create_only(
-                &pending.id.provider,
-                &pending.id.resource_type,
-                &ref_attr_names,
-                registry,
-            );
-            for attr in create_only_refs {
-                if !pending.changed_create_only.contains(&attr) {
-                    pending.changed_create_only.push(attr);
-                }
-            }
-            for ref_attr in ref_attrs {
-                if pending.changed_create_only.contains(&ref_attr.attribute)
-                    && !pending
-                        .cascade_ref_hints
-                        .iter()
-                        .any(|(attr, _)| attr == &ref_attr.attribute)
-                {
-                    pending
-                        .cascade_ref_hints
-                        .push((ref_attr.attribute, ref_attr.hint));
-                }
-            }
-        }
-    }
-
-    let mut dependents_of_replaced: HashMap<String, Vec<String>> = HashMap::new();
-    let planned_ids: HashSet<ResourceId> = plan
-        .effects()
-        .iter()
-        .map(|e| e.resource_id().clone())
-        .chain(pending_replaces.iter().map(|pending| pending.id.clone()))
-        .collect();
-
-    for resource in unresolved_managed {
-        if planned_ids.contains(&resource.id) {
-            continue;
-        }
-        for dep in get_resource_dependencies(resource) {
-            if replaced_bindings.contains(&dep) {
-                let binding = resource.binding.clone().unwrap_or_else(|| {
-                    format!("{}:{}", resource.id.resource_type, resource.id.name_str())
-                });
-                dependents_of_replaced.entry(dep).or_default().push(binding);
-            }
-        }
-    }
-
     let mut consumer_updates_by_replaced: HashMap<String, Vec<(String, Effect)>> = HashMap::new();
     let mut update_ids_to_remove: HashSet<ResourceId> = HashSet::new();
-    for resource in unresolved_managed {
-        if !planned_ids.contains(&resource.id) {
-            continue;
+    let mut cascade_updates_by_id: HashMap<ResourceId, Effect> = HashMap::new();
+
+    loop {
+        let mut changed = promote_pending_replaces_for_dependents(
+            &mut pending_replaces,
+            unresolved_managed,
+            registry,
+        );
+        let replaced_bindings = cbd_replaced_bindings(&pending_replaces);
+        if replaced_bindings.is_empty() {
+            break;
         }
-        let Some(existing_update) = plan
+
+        annotate_pending_replaces_from_cbd_dependencies(
+            &mut pending_replaces,
+            &replaced_bindings,
+            registry,
+        );
+
+        let pending_ids: HashSet<ResourceId> = pending_replaces
+            .iter()
+            .map(|pending| pending.id.clone())
+            .collect();
+        let planned_ids: HashSet<ResourceId> = plan
             .effects()
             .iter()
-            .find(|effect| matches!(effect, Effect::Update { id, .. } if *id == resource.id))
-            .cloned()
-        else {
-            continue;
-        };
-        for dep in get_resource_dependencies(resource) {
-            if replaced_bindings.contains(&dep) {
+            .map(|e| e.resource_id().clone())
+            .chain(pending_ids.iter().cloned())
+            .chain(cascade_updates_by_id.keys().cloned())
+            .collect();
+
+        for resource in unresolved_managed {
+            if !planned_ids.contains(&resource.id) || pending_ids.contains(&resource.id) {
+                continue;
+            }
+            let Some(existing_update) = plan
+                .effects()
+                .iter()
+                .find(|effect| matches!(effect, Effect::Update { id, .. } if *id == resource.id))
+                .cloned()
+            else {
+                continue;
+            };
+            for dep in get_resource_dependencies(resource) {
+                if !replaced_bindings.contains(&dep) {
+                    continue;
+                }
                 let ref_attrs = cascade_ref_attrs(&resource.attributes, &dep);
                 let ref_attr_names: Vec<String> = ref_attrs
                     .iter()
@@ -902,108 +953,132 @@ pub fn cascade_dependent_updates(
                         .filter(|ref_attr| changed_create_only.contains(&ref_attr.attribute))
                         .map(|ref_attr| (ref_attr.attribute, ref_attr.hint))
                         .collect();
-                    pending_replaces.push(PendingReplace {
-                        id: resource.id.clone(),
-                        from,
-                        to: resource.clone(),
-                        directives: resource.directives.clone(),
-                        changed_create_only,
-                        cascade_ref_hints: ref_hints,
-                        create_before_destroy: false,
-                        temporary_name: None,
-                    });
+                    changed |= push_pending_replace_if_absent(
+                        &mut pending_replaces,
+                        PendingReplace {
+                            id: resource.id.clone(),
+                            from,
+                            to: resource.clone(),
+                            directives: resource.directives.clone(),
+                            changed_create_only,
+                            cascade_ref_hints: ref_hints,
+                            create_before_destroy: false,
+                            temporary_name: None,
+                        },
+                    );
                     update_ids_to_remove.insert(resource.id.clone());
                     continue;
                 }
                 let update_key = resource.binding.clone().unwrap_or_else(|| {
                     format!("{}:{}", resource.id.resource_type, resource.id.name_str())
                 });
-                consumer_updates_by_replaced
-                    .entry(dep)
-                    .or_default()
-                    .push((update_key, existing_update.clone()));
+                push_consumer_update(
+                    &mut consumer_updates_by_replaced,
+                    dep,
+                    update_key,
+                    existing_update.clone(),
+                );
             }
         }
+
+        for resource in unresolved_managed {
+            if planned_ids.contains(&resource.id) {
+                continue;
+            }
+            for replaced_binding in get_resource_dependencies(resource) {
+                if !replaced_bindings.contains(&replaced_binding) {
+                    continue;
+                }
+                let from = current_states
+                    .get(&resource.id)
+                    .map(|state| state.as_state().clone())
+                    .unwrap_or_else(|| State::not_found(resource.id.clone()));
+                if !from.exists {
+                    continue;
+                }
+
+                let ref_attrs = cascade_ref_attrs(&resource.attributes, &replaced_binding);
+                let mut ref_attr_names: Vec<String> = ref_attrs
+                    .iter()
+                    .map(|ref_attr| ref_attr.attribute.clone())
+                    .collect();
+                let create_only_refs = find_changed_create_only(
+                    &resource.id.provider,
+                    &resource.id.resource_type,
+                    &ref_attr_names,
+                    registry,
+                );
+
+                if let Some(changed_create_only) = ChangedCreateOnly::new(create_only_refs) {
+                    if resource.directives.prevent_destroy {
+                        plan.add_error(PlanError {
+                            resource_id: resource.id.clone(),
+                            message:
+                                "resource has prevent_destroy set, but cascade from a replaced dependency would replace it (which requires destroying the old resource)"
+                                    .to_string(),
+                        });
+                        continue;
+                    }
+                    let ref_hints: Vec<(String, String)> = ref_attrs
+                        .into_iter()
+                        .filter(|ref_attr| changed_create_only.contains(&ref_attr.attribute))
+                        .map(|ref_attr| (ref_attr.attribute, ref_attr.hint))
+                        .collect();
+                    changed |= push_pending_replace_if_absent(
+                        &mut pending_replaces,
+                        PendingReplace {
+                            id: resource.id.clone(),
+                            from: Box::new(from),
+                            to: resource.clone(),
+                            directives: resource.directives.clone(),
+                            changed_create_only,
+                            cascade_ref_hints: ref_hints,
+                            create_before_destroy: false,
+                            temporary_name: None,
+                        },
+                    );
+                } else {
+                    ref_attr_names.sort();
+                    ref_attr_names.dedup();
+                    if !ref_attr_names.is_empty() {
+                        let update = Effect::Update {
+                            id: resource.id.clone(),
+                            from: Box::new(from),
+                            to: resource.clone(),
+                            changed_attributes: ref_attr_names,
+                        };
+                        let update_key = resource.binding.clone().unwrap_or_else(|| {
+                            format!("{}:{}", resource.id.resource_type, resource.id.name_str())
+                        });
+                        if cascade_updates_by_id
+                            .insert(resource.id.clone(), update.clone())
+                            .is_none()
+                        {
+                            changed = true;
+                        }
+                        push_consumer_update(
+                            &mut consumer_updates_by_replaced,
+                            replaced_binding,
+                            update_key,
+                            update,
+                        );
+                    }
+                }
+            }
+        }
+
+        if !changed {
+            break;
+        }
     }
+
     if !update_ids_to_remove.is_empty() {
         plan.retain(|effect| {
             !matches!(effect, Effect::Update { id, .. } if update_ids_to_remove.contains(id))
         });
     }
 
-    let mut cascade_updates: Vec<Effect> = Vec::new();
-
-    for (replaced_binding, dependent_bindings) in &dependents_of_replaced {
-        for dep_binding in dependent_bindings {
-            let Some(unresolved) = binding_to_unresolved.get(dep_binding) else {
-                continue;
-            };
-            let from = current_states
-                .get(&unresolved.id)
-                .map(|state| state.as_state().clone())
-                .unwrap_or_else(|| State::not_found(unresolved.id.clone()));
-            if !from.exists {
-                continue;
-            }
-
-            let ref_attrs = cascade_ref_attrs(&unresolved.attributes, replaced_binding);
-            let mut ref_attr_names: Vec<String> = ref_attrs
-                .iter()
-                .map(|ref_attr| ref_attr.attribute.clone())
-                .collect();
-            let create_only_refs = find_changed_create_only(
-                &unresolved.id.provider,
-                &unresolved.id.resource_type,
-                &ref_attr_names,
-                registry,
-            );
-
-            if let Some(changed_create_only) = ChangedCreateOnly::new(create_only_refs) {
-                if unresolved.directives.prevent_destroy {
-                    plan.add_error(PlanError {
-                        resource_id: unresolved.id.clone(),
-                        message:
-                            "resource has prevent_destroy set, but cascade from a replaced dependency would replace it (which requires destroying the old resource)"
-                                .to_string(),
-                    });
-                    continue;
-                }
-                let ref_hints: Vec<(String, String)> = ref_attrs
-                    .into_iter()
-                    .filter(|ref_attr| changed_create_only.contains(&ref_attr.attribute))
-                    .map(|ref_attr| (ref_attr.attribute, ref_attr.hint))
-                    .collect();
-                pending_replaces.push(PendingReplace {
-                    id: unresolved.id.clone(),
-                    from: Box::new(from),
-                    to: (*unresolved).clone(),
-                    directives: unresolved.directives.clone(),
-                    changed_create_only,
-                    cascade_ref_hints: ref_hints,
-                    create_before_destroy: false,
-                    temporary_name: None,
-                });
-            } else {
-                ref_attr_names.sort();
-                ref_attr_names.dedup();
-                if !ref_attr_names.is_empty() {
-                    let update = Effect::Update {
-                        id: unresolved.id.clone(),
-                        from: Box::new(from),
-                        to: (*unresolved).clone(),
-                        changed_attributes: ref_attr_names,
-                    };
-                    consumer_updates_by_replaced
-                        .entry(replaced_binding.clone())
-                        .or_default()
-                        .push((dep_binding.clone(), update.clone()));
-                    cascade_updates.push(update);
-                }
-            }
-        }
-    }
-
-    for effect in cascade_updates {
+    for effect in cascade_updates_by_id.into_values() {
         plan.add(effect);
     }
 

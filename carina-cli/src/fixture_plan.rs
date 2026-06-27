@@ -20,12 +20,13 @@ use carina_core::schema::{
 };
 use carina_state::{StateFile, check_and_migrate};
 
+use crate::commands::shared::state_writeback::apply_name_overrides;
 use crate::commands::validate_and_resolve;
 use crate::wiring::{
     WiringContext, add_deferred_create_effects, compute_anonymous_identifiers_with_ctx,
     expand_same_config_deferred_for, normalize_state_with_ctx,
     reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
-    resolve_enum_aliases_in_states,
+    resolve_enum_aliases_in_states, restore_unresolved_managed_attributes,
 };
 
 /// Fixture root path relative to the `carina-cli` crate manifest.
@@ -70,7 +71,9 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     let fixture_pathbuf = fixture_path.to_path_buf();
     let state_path = fixture_path.join(carina_state::LocalBackend::DEFAULT_STATE_FILE);
 
-    let mut parsed = load_configuration(&fixture_pathbuf).unwrap().parsed;
+    let loaded = load_configuration(&fixture_pathbuf).unwrap();
+    let mut parsed = loaded.parsed;
+    let mut unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(&fixture_pathbuf);
     validate_and_resolve(&mut parsed, base_dir, true).unwrap();
 
@@ -102,6 +105,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         assert!(errors.is_empty(), "{errors:?}");
     }
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
+    reconcile_prefixed_names(&mut unresolved_parsed.resources, &state_file);
     let crate::wiring::StateBlockResolution {
         claims: state_block_claims,
         targets: resolved_state_block_targets,
@@ -122,6 +126,16 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             },
             &state_block_claims,
         );
+        carina_core::module_resolver::reconcile_anonymous_module_instances(
+            &mut unresolved_parsed.resources,
+            &|provider, resource_type| {
+                sf.resources_by_type(provider, resource_type)
+                    .into_iter()
+                    .map(|r| r.name.clone())
+                    .collect()
+            },
+            &state_block_claims,
+        );
     }
     if let Some(sf) = state_file.as_mut() {
         reconcile_anonymous_identifiers_with_ctx(
@@ -130,12 +144,22 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             sf,
             &state_block_claims,
         );
+        reconcile_anonymous_identifiers_with_ctx(
+            &wiring,
+            &mut unresolved_parsed.resources,
+            sf,
+            &state_block_claims,
+        );
     }
+    apply_name_overrides(&mut parsed.resources, &state_file);
+    apply_name_overrides(&mut unresolved_parsed.resources, &state_file);
 
     // carina#3181: `parsed.resources` is managed-only; data sources live
     // in `parsed.data_sources`. Only managed resources are dependency-
     // sorted.
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources).unwrap();
+    let unresolved_sorted_resources =
+        restore_unresolved_managed_attributes(&sorted_resources, &unresolved_parsed.resources);
     let data_sources: Vec<carina_core::resource::DataSource> = parsed.data_sources.clone();
 
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
@@ -215,7 +239,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     // as `(known after upstream apply: <ref>)` (#2366). The fixture
     // loader is already lenient about missing upstream state files (see
     // the loop above that silently skips them).
-    let mut resources = sorted_resources.clone();
+    let mut resources = unresolved_sorted_resources.clone();
     let wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
         .wait_bindings
         .iter()
@@ -325,7 +349,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     );
     let deferred_for_expansion = expand_same_config_deferred_for(
         &parsed,
-        &sorted_resources,
+        &unresolved_sorted_resources,
         &current_states,
         &remote_bindings,
         &wait_aliases,
@@ -366,7 +390,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
 
     cascade_dependent_updates(
         &mut plan,
-        &sorted_resources,
+        &unresolved_sorted_resources,
         &plan_input_states,
         wiring.schemas(),
     );

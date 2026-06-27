@@ -25,15 +25,15 @@ impl<'a> PureMetaStep<'a> {
                 upstream_binding,
                 template,
                 ..
-            }
-            | Effect::DeferredReplace {
-                upstream_binding,
-                template,
-                ..
             } => Some(Self {
                 effect,
                 upstream_binding,
                 template,
+            }),
+            Effect::DeferredReplace(payload) => Some(Self {
+                effect,
+                upstream_binding: &payload.upstream_binding,
+                template: &payload.template,
             }),
             Effect::Create(_)
             | Effect::Update { .. }
@@ -76,9 +76,8 @@ pub(super) fn try_dispatch_pure_meta(
 
 pub(super) fn failure_binding_name(effect: &Effect) -> Option<String> {
     match effect {
-        Effect::DeferredCreate { template, .. } | Effect::DeferredReplace { template, .. } => {
-            Some(template.binding_name.clone())
-        }
+        Effect::DeferredCreate { template, .. } => Some(template.binding_name.clone()),
+        Effect::DeferredReplace(payload) => Some(payload.template.binding_name.clone()),
         _ => effect.binding_name(),
     }
 }

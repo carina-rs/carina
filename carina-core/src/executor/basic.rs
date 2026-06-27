@@ -37,20 +37,17 @@ pub(crate) struct ResolvedResourceToken(());
 /// This is the shared result type used by `execute_basic_effect` to avoid
 /// duplicating effect dispatch logic across sequential and phased paths.
 ///
-/// `Success` carries `Option<State>` (typically the dominant variant); the
-/// size disparity with `Failure` / `Deleted` is intentional because
-/// success is the common path and boxing it would add an allocation per
-/// effect on the hot path.
-#[allow(clippy::large_enum_variant)]
+/// State payloads are boxed so the transient result enum stays small without
+/// weakening the exhaustiveness of the success/partial/failure/delete cases.
 pub(super) enum BasicEffectResult {
     Success {
-        state: Option<State>,
+        state: Option<Box<State>>,
         resource_id: ResourceId,
         resolved_attrs: Option<HashMap<String, Value>>,
         binding: Option<String>,
     },
     PartialSuccess {
-        state: State,
+        state: Box<State>,
         resource_id: ResourceId,
         diagnostic: PartialReadDiagnostic,
         resolved_attrs: Option<HashMap<String, Value>>,
@@ -432,7 +429,7 @@ pub(super) fn process_basic_result(result: BasicEffectResult, exec: &mut Executi
                 if let Some(attrs) = &resolved_attrs {
                     exec.bindings.record_applied(binding.as_deref(), attrs, &s);
                 }
-                exec.applied_states.insert(resource_id, s);
+                exec.applied_states.insert(resource_id, *s);
             }
         }
         BasicEffectResult::Failure { refresh } => {
@@ -454,7 +451,7 @@ pub(super) fn process_basic_result(result: BasicEffectResult, exec: &mut Executi
                 exec.bindings
                     .record_applied(binding.as_deref(), attrs, &state);
             }
-            exec.applied_states.insert(resource_id.clone(), state);
+            exec.applied_states.insert(resource_id.clone(), *state);
             exec.partial_diagnostics.push((resource_id, diagnostic));
         }
         BasicEffectResult::Deleted { resource_id, .. } => {
@@ -550,7 +547,7 @@ pub(super) async fn execute_basic_effect<'a>(
                             progress,
                         });
                         BasicEffectResult::PartialSuccess {
-                            state,
+                            state: Box::new(state),
                             resource_id: resource.id.clone(),
                             diagnostic,
                             resolved_attrs: Some(resolved_attrs),
@@ -564,7 +561,7 @@ pub(super) async fn execute_basic_effect<'a>(
                             progress,
                         });
                         BasicEffectResult::Success {
-                            state: Some(state),
+                            state: Some(Box::new(state)),
                             resource_id: resource.id.clone(),
                             resolved_attrs: Some(resolved_attrs),
                             binding: resource.binding.clone(),
@@ -678,7 +675,7 @@ pub(super) async fn execute_basic_effect<'a>(
                             progress,
                         });
                         BasicEffectResult::PartialSuccess {
-                            state,
+                            state: Box::new(state),
                             resource_id: id.clone(),
                             diagnostic,
                             resolved_attrs: Some(resolved_to.as_resource().resolved_attributes()),
@@ -692,7 +689,7 @@ pub(super) async fn execute_basic_effect<'a>(
                             progress,
                         });
                         BasicEffectResult::Success {
-                            state: Some(state),
+                            state: Some(Box::new(state)),
                             resource_id: id.clone(),
                             resolved_attrs: Some(resolved_to.as_resource().resolved_attributes()),
                             binding: to.binding.clone(),
@@ -796,7 +793,7 @@ mod process_basic_result_tests {
 
         process_basic_result(
             BasicEffectResult::PartialSuccess {
-                state: writeback_state,
+                state: Box::new(writeback_state),
                 resource_id: id.clone(),
                 diagnostic: diagnostic.clone(),
                 resolved_attrs: None::<HashMap<String, Value>>,

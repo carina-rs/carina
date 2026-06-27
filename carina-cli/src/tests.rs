@@ -314,7 +314,7 @@ fn plan_file_serde_round_trip() {
     }];
 
     let plan_file = PlanFile {
-        version: 6,
+        version: PlanFile::CURRENT_VERSION,
         carina_version: "0.1.0".to_string(),
         timestamp: "2025-01-01T00:00:00Z".to_string(),
         source_path: "example.crn".to_string(),
@@ -363,7 +363,7 @@ fn plan_file_serde_round_trip() {
     let json = serde_json::to_string_pretty(&plan_file).unwrap();
     let deserialized: PlanFile = serde_json::from_str(&json).unwrap();
 
-    assert_eq!(deserialized.version, 6);
+    assert_eq!(deserialized.version, PlanFile::CURRENT_VERSION);
     assert_eq!(deserialized.carina_version, "0.1.0");
     assert_eq!(deserialized.source_path, "example.crn");
     assert_eq!(deserialized.state_lineage, Some("test-lineage".to_string()));
@@ -2635,7 +2635,7 @@ fn plan_file_serialization_redacts_secrets() {
 
     // Redact before building PlanFile (same as production code does)
     let plan_file = PlanFile {
-        version: 6,
+        version: PlanFile::CURRENT_VERSION,
         carina_version: "0.1.0".to_string(),
         timestamp: "2025-01-01T00:00:00Z".to_string(),
         source_path: "example.crn".to_string(),

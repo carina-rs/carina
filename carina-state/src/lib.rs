@@ -58,6 +58,6 @@ pub use backends::{
 };
 pub use lock::LockInfo;
 pub use state::{
-    LoadedState, MigratedStateFile, MigrationInfo, ResourceState, StateFile, check_and_migrate,
-    check_and_migrate_bytes, log_state_migration_once,
+    LoadedState, MigratedStateFile, MigrationInfo, NameOverride, ResourceState, StateFile,
+    check_and_migrate, check_and_migrate_bytes, log_state_migration_once,
 };

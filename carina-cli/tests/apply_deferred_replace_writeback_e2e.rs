@@ -171,8 +171,8 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
     let mut plan = Plan::new();
     plan.add(Effect::Create(lb.clone()));
     plan.add(Effect::Create(cert.clone()));
-    plan.add(Effect::DeferredReplace {
-        deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+    plan.add(Effect::deferred_replace(
+        NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
             id: validation_id.clone(),
             identifier: "old-validation-id".to_string(),
             directives: Directives::default(),
@@ -182,10 +182,10 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
             blocked_by_updates: HashSet::new(),
         }])
         .expect("fixture has one delete"),
-        id: ResourceId::new("__deferred_for", "validation_records"),
-        upstream_binding: "cert".to_string(),
-        template: Box::new(template),
-    });
+        ResourceId::new("__deferred_for", "validation_records"),
+        "cert".to_string(),
+        Box::new(template),
+    ));
     plan.add(Effect::Create(alias.clone()));
 
     let sorted_resources = vec![lb.clone(), cert.clone(), alias.clone()];
@@ -195,7 +195,7 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
         .collect::<Vec<_>>();
 
     PlanFile {
-        version: 7,
+        version: PlanFile::CURRENT_VERSION,
         carina_version: env!("CARGO_PKG_VERSION").to_string(),
         timestamp: "2026-06-25T00:00:00Z".to_string(),
         source_path: project.display().to_string(),

@@ -25,8 +25,9 @@ use crate::commands::shared::state_writeback::apply_name_overrides;
 use crate::display::{print_plan, refresh_plan_separator};
 use crate::error::AppError;
 use crate::wiring::{
-    WiringContext, build_factories_from_providers, create_plan_from_parsed_with_upstream,
-    reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
+    PlanParsedInputs, WiringContext, build_factories_from_providers,
+    create_plan_from_parsed_with_upstream, reconcile_anonymous_identifiers_with_ctx,
+    reconcile_prefixed_names,
 };
 
 /// Saved plan file for `plan --out` / `apply plan.json`
@@ -128,6 +129,10 @@ pub struct PlanFile {
     pub wait_bindings: Vec<PlanWaitBinding>,
 }
 
+impl PlanFile {
+    pub const CURRENT_VERSION: u32 = 8;
+}
+
 pub(crate) fn collect_delete_attributes(
     plan: &Plan,
     current_states: &HashMap<ResourceId, State>,
@@ -192,6 +197,10 @@ fn build_plan_file<E>(
         .to_string();
 
     Ok(PlanFile {
+        // carina#3625 round 7: bumped 7→8 — permanent_name_overrides
+        // entries now carry original_value so a later DSL rename is
+        // not silently overwritten by an old CBD temporary name.
+        //
         // carina#3625: bumped 6→7 — replacement effects are decomposed
         // into Create/Update/Delete with replace_display metadata.
         //
@@ -210,7 +219,7 @@ fn build_plan_file<E>(
         // the same `ResolvedBindings` view as the live-apply path.
         // Older plans (version below current) are rejected with a
         // clear message pointing the user at re-running `plan`.
-        version: 7,
+        version: PlanFile::CURRENT_VERSION,
         carina_version: env!("CARGO_PKG_VERSION").to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
         source_path,
@@ -681,7 +690,10 @@ pub async fn run_plan(
     // prints post-expansion warnings and returns the still-unresolved
     // loops via `ctx.residual_deferred_for`.
     let ctx = create_plan_from_parsed_with_upstream(
-        &parsed,
+        PlanParsedInputs {
+            parsed: &parsed,
+            unresolved_resources: &unresolved_parsed.resources,
+        },
         &state_file,
         refresh,
         &remote_bindings,

@@ -39,10 +39,50 @@ pub struct ReplaceDisplayMetadata {
     pub previous_attributes: HashMap<String, Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NameOverride {
+    pub temp_value: String,
+    pub original_value: String,
+}
+
+impl<'de> Deserialize<'de> for NameOverride {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Current {
+                temp_value: String,
+                #[serde(default)]
+                original_value: String,
+            },
+            Legacy(String),
+        }
+
+        match Wire::deserialize(deserializer)? {
+            Wire::Current {
+                temp_value,
+                original_value,
+            } => Ok(Self {
+                temp_value,
+                original_value,
+            }),
+            Wire::Legacy(temp_value) => Ok(Self {
+                temp_value,
+                original_value: String::new(),
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermanentNameOverride {
-    pub id: ResourceId,
-    pub overrides: HashMap<String, String>,
+    pub resource_id: ResourceId,
+    pub attribute: String,
+    pub temp_value: String,
+    pub original_value: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -114,6 +154,12 @@ impl Plan {
         &self.replace_display
     }
 
+    #[cfg(any(test, debug_assertions))]
+    pub fn with_replace_display(mut self, metadata: ReplaceDisplayMetadata) -> Self {
+        self.add_replace_display(metadata);
+        self
+    }
+
     pub(crate) fn replace_display_mut(&mut self) -> &mut [ReplaceDisplayMetadata] {
         &mut self.replace_display
     }
@@ -140,14 +186,20 @@ impl Plan {
 
     pub(crate) fn add_permanent_name_override(
         &mut self,
-        id: ResourceId,
-        overrides: HashMap<String, String>,
+        resource_id: ResourceId,
+        attribute: String,
+        temp_value: String,
+        original_value: String,
     ) {
-        if overrides.is_empty() {
+        if attribute.is_empty() {
             return;
         }
-        self.permanent_name_overrides
-            .push(PermanentNameOverride { id, overrides });
+        self.permanent_name_overrides.push(PermanentNameOverride {
+            resource_id,
+            attribute,
+            temp_value,
+            original_value,
+        });
     }
 
     pub(crate) fn add_replacement(&mut self, group: ReplacementGroup) {
@@ -249,7 +301,7 @@ impl Plan {
 
         if !dropped_replace_ids.is_empty() {
             self.permanent_name_overrides
-                .retain(|override_| !dropped_replace_ids.contains(&override_.id));
+                .retain(|override_| !dropped_replace_ids.contains(&override_.resource_id));
         }
         self.replace_display = remapped;
     }
@@ -305,7 +357,7 @@ impl Plan {
                     summary.delete += 1;
                 }
                 Effect::Delete { .. } => {}
-                Effect::DeferredReplace { .. } => {}
+                Effect::DeferredReplace(_) => {}
                 Effect::Import { .. } => summary.import += 1,
                 Effect::Remove { .. } => summary.remove += 1,
                 Effect::Move { .. } => summary.moved += 1,
@@ -470,7 +522,7 @@ impl ModularPlan {
                 | Effect::Move { .. }
                 | Effect::Wait { .. }
                 | Effect::DeferredCreate { .. }
-                | Effect::DeferredReplace { .. } => ModuleSource::Root,
+                | Effect::DeferredReplace(_) => ModuleSource::Root,
             };
             modular.effect_sources.insert(idx, source);
         }
@@ -601,15 +653,11 @@ fn format_effect_brief(effect: &Effect) -> String {
             id,
             upstream_binding
         ),
-        Effect::DeferredReplace {
-            id,
-            upstream_binding,
-            ..
-        } => format!(
+        Effect::DeferredReplace(payload) => format!(
             "{} {} (deferred for replace: waits on {})",
             effect.display_glyph(),
-            id,
-            upstream_binding
+            payload.id,
+            payload.upstream_binding
         ),
     }
 }
@@ -905,12 +953,12 @@ mod tests {
             .collect();
 
         let mut plan = Plan::new();
-        plan.add(Effect::DeferredReplace {
-            deletes: NonEmptyDeletes::try_new(deletes).expect("fixture has deletes"),
-            id: ResourceId::new("route53.RecordSet", "validation_records"),
-            upstream_binding: "cert".to_string(),
-            template: Box::new(template),
-        });
+        plan.add(Effect::deferred_replace(
+            NonEmptyDeletes::try_new(deletes).expect("fixture has deletes"),
+            ResourceId::new("route53.RecordSet", "validation_records"),
+            "cert".to_string(),
+            Box::new(template),
+        ));
 
         let summary = plan.summary();
         assert_eq!(summary.replace, 0);

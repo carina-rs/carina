@@ -427,7 +427,7 @@ pub fn build_detail_rows(
         | Effect::Move { .. }
         | Effect::Wait { .. }
         | Effect::DeferredCreate { .. }
-        | Effect::DeferredReplace { .. } => Vec::new(),
+        | Effect::DeferredReplace(_) => Vec::new(),
     }
 }
 

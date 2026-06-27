@@ -2,6 +2,7 @@
 
 use carina_core::deps::get_resource_dependencies;
 use carina_core::explicit::{self, ExplicitFields};
+pub use carina_core::plan::NameOverride;
 use carina_core::resource::{
     ConcreteValue, Directives, PartialReadMarker, Resource, ResourceId, State, Value,
 };
@@ -43,7 +44,10 @@ impl StateFile {
     ///     state lift each top-level key to a `Leaf` child of the
     ///     root `Struct`; the next plan/apply rebuilds a full tree
     ///     from the resource's authored `Value`.
-    pub const CURRENT_VERSION: u32 = 7;
+    /// v8: Replaced `name_overrides: HashMap<String, String>` with
+    ///     `HashMap<String, NameOverride>` so permanent CBD temporary
+    ///     names remember the DSL value that produced them.
+    pub const CURRENT_VERSION: u32 = 8;
 
     /// Create a new empty state file
     pub fn new() -> Self {
@@ -348,7 +352,7 @@ impl StateFile {
 
     /// Build a map of ResourceId -> name overrides from this state file.
     /// Name overrides come from create_before_destroy with non-renameable attributes.
-    pub fn build_name_overrides(&self) -> HashMap<ResourceId, HashMap<String, String>> {
+    pub fn build_name_overrides(&self) -> HashMap<ResourceId, HashMap<String, NameOverride>> {
         let mut result = HashMap::new();
         for rs in &self.resources {
             if !rs.name_overrides.is_empty() {
@@ -684,10 +688,11 @@ pub struct ResourceState {
     /// Attribute prefixes used to generate names (e.g., {"bucket_name": "my-app-"})
     #[serde(default)]
     pub prefixes: HashMap<String, String>,
-    /// Permanent name overrides from create_before_destroy with non-renameable attributes.
-    /// Maps attribute name to the permanent temporary name (e.g., {"role_name": "my-role-abc123"}).
+    /// Permanent name overrides from create_before_destroy with name attributes.
+    /// Maps attribute name to the permanent temporary name and the DSL
+    /// value that produced it.
     #[serde(default)]
-    pub name_overrides: HashMap<String, String>,
+    pub name_overrides: HashMap<String, NameOverride>,
     /// Tree of fields the user explicitly wrote in their `.crn` for
     /// this resource. Used by the differ both to detect attribute
     /// removals and to project actual-state through the authoring

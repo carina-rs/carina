@@ -174,14 +174,17 @@ fn create_before_destroy_generates_temporary_name_for_name_attribute() {
     assert_eq!(temp.temporary_value.len(), "my-bucket-".len() + 8);
     assert_eq!(plan.permanent_name_overrides().len(), 1);
     assert_eq!(
-        plan.permanent_name_overrides()[0].id,
+        plan.permanent_name_overrides()[0].resource_id,
         ResourceId::new("s3.Bucket", "my-bucket")
     );
+    assert_eq!(plan.permanent_name_overrides()[0].attribute, "bucket_name");
     assert_eq!(
-        plan.permanent_name_overrides()[0]
-            .overrides
-            .get("bucket_name"),
-        Some(&temp.temporary_value)
+        plan.permanent_name_overrides()[0].temp_value,
+        temp.temporary_value
+    );
+    assert_eq!(
+        plan.permanent_name_overrides()[0].original_value,
+        "my-bucket"
     );
     let Effect::Create(to) = &plan.effects()[metadata.create_idx] else {
         unreachable!();
@@ -261,10 +264,16 @@ fn create_before_destroy_generates_permanent_temporary_name_for_updateable_name_
     assert_eq!(temp.original_value, "my-log-group");
     assert_eq!(plan.permanent_name_overrides().len(), 1);
     assert_eq!(
-        plan.permanent_name_overrides()[0]
-            .overrides
-            .get("log_group_name"),
-        Some(&temp.temporary_value)
+        plan.permanent_name_overrides()[0].attribute,
+        "log_group_name"
+    );
+    assert_eq!(
+        plan.permanent_name_overrides()[0].temp_value,
+        temp.temporary_value
+    );
+    assert_eq!(
+        plan.permanent_name_overrides()[0].original_value,
+        "my-log-group"
     );
 }
 
@@ -450,7 +459,7 @@ fn no_temporary_name_without_name_attribute_in_schema() {
 }
 
 #[test]
-fn no_temporary_name_when_name_attribute_changes() {
+fn create_before_destroy_still_generates_temporary_name_when_name_attribute_changes() {
     use crate::schema::{AttributeSchema, AttributeType};
 
     // name_attribute itself changed: old-bucket → new-bucket
@@ -508,9 +517,16 @@ fn no_temporary_name_when_name_attribute_changes() {
     );
 
     assert_eq!(plan.effects().len(), 2);
-    assert!(
-        single_replace_metadata(&plan).temporary_name.is_none(),
-        "Should not generate temporary_name when name_attribute value changes"
+    let temp = single_replace_metadata(&plan)
+        .temporary_name
+        .as_ref()
+        .expect("CBD should keep using a permanent temporary name when the DSL name changes");
+    assert_eq!(temp.attribute, "bucket_name");
+    assert_eq!(temp.original_value, "new-bucket");
+    assert!(temp.temporary_value.starts_with("new-bucket-"));
+    assert_eq!(
+        plan.permanent_name_overrides()[0].original_value,
+        "new-bucket"
     );
 }
 

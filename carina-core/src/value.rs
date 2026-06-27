@@ -1078,13 +1078,8 @@ pub fn redact_secrets_in_effect(
                 template: Box::new(redacted_template),
             }
         }
-        Effect::DeferredReplace {
-            deletes,
-            id,
-            upstream_binding,
-            template,
-        } => {
-            let mut redacted_template = (**template).clone();
+        Effect::DeferredReplace(payload) => {
+            let mut redacted_template = (*payload.template).clone();
             redacted_template.attributes = redacted_template
                 .attributes
                 .iter()
@@ -1092,12 +1087,12 @@ pub fn redact_secrets_in_effect(
                 .collect::<Result<Vec<_>, SerializationError>>()?;
             redacted_template.template_resource =
                 redact_secrets_in_managed_only(&redacted_template.template_resource)?;
-            Effect::DeferredReplace {
-                deletes: deletes.clone(),
-                id: id.clone(),
-                upstream_binding: upstream_binding.clone(),
-                template: Box::new(redacted_template),
-            }
+            Effect::deferred_replace(
+                payload.deletes.clone(),
+                payload.id.clone(),
+                payload.upstream_binding.clone(),
+                Box::new(redacted_template),
+            )
         }
     })
 }
@@ -5198,16 +5193,23 @@ mod tests {
         let mut plan = replacement_plan_with_previous_attrs(HashMap::new());
         plan.add_permanent_name_override(
             id.clone(),
-            HashMap::from([("name".to_string(), "widget-temp".to_string())]),
+            "name".to_string(),
+            "widget-temp".to_string(),
+            "widget".to_string(),
         );
 
         let redacted = redact_secrets_in_plan(&plan).expect("plan redaction succeeds");
 
         assert_eq!(redacted.permanent_name_overrides().len(), 1);
-        assert_eq!(redacted.permanent_name_overrides()[0].id, id);
+        assert_eq!(redacted.permanent_name_overrides()[0].resource_id, id);
+        assert_eq!(redacted.permanent_name_overrides()[0].attribute, "name");
         assert_eq!(
-            redacted.permanent_name_overrides()[0].overrides.get("name"),
-            Some(&"widget-temp".to_string())
+            redacted.permanent_name_overrides()[0].temp_value,
+            "widget-temp"
+        );
+        assert_eq!(
+            redacted.permanent_name_overrides()[0].original_value,
+            "widget"
         );
     }
 
@@ -5241,7 +5243,9 @@ mod tests {
         let mut plan = replacement_plan_with_previous_attrs(HashMap::new());
         plan.add_permanent_name_override(
             id.clone(),
-            HashMap::from([("name".to_string(), "widget-temp".to_string())]),
+            "name".to_string(),
+            "widget-temp".to_string(),
+            "widget".to_string(),
         );
 
         let redacted = redact_secrets_in_plan(&plan).expect("plan redaction succeeds");
@@ -5250,9 +5254,14 @@ mod tests {
 
         assert_eq!(decoded.replace_display().len(), 1);
         assert_eq!(decoded.permanent_name_overrides().len(), 1);
+        assert_eq!(decoded.permanent_name_overrides()[0].attribute, "name");
         assert_eq!(
-            decoded.permanent_name_overrides()[0].overrides.get("name"),
-            Some(&"widget-temp".to_string())
+            decoded.permanent_name_overrides()[0].temp_value,
+            "widget-temp"
+        );
+        assert_eq!(
+            decoded.permanent_name_overrides()[0].original_value,
+            "widget"
         );
     }
 

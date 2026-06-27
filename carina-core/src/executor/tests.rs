@@ -4820,8 +4820,8 @@ async fn dispatch_deferred_replace_runs_deletes_concurrently() {
     cert.binding = Some("cert".to_string());
     let mut plan = Plan::new();
     plan.add(Effect::Create(cert));
-    plan.add(Effect::DeferredReplace {
-        deletes: NonEmptyDeletes::try_new(vec![
+    plan.add(Effect::deferred_replace(
+        NonEmptyDeletes::try_new(vec![
             DeferredReplaceDelete {
                 id: ResourceId::new("test", "validation_records[0]"),
                 identifier: "old-validation-0".to_string(),
@@ -4842,10 +4842,10 @@ async fn dispatch_deferred_replace_runs_deletes_concurrently() {
             },
         ])
         .expect("fixture has deletes"),
-        id: ResourceId::new("__deferred_for", "validation_records"),
-        upstream_binding: "cert".to_string(),
-        template: Box::new(validation_deferred_for_expression()),
-    });
+        ResourceId::new("__deferred_for", "validation_records"),
+        "cert".to_string(),
+        Box::new(validation_deferred_for_expression()),
+    ));
 
     let input = ExecutionInput {
         plan: &plan,
@@ -4916,8 +4916,8 @@ async fn dispatch_deferred_replace_short_circuits_on_delete_failure() {
     cert.binding = Some("cert".to_string());
     let mut plan = Plan::new();
     plan.add(Effect::Create(cert));
-    plan.add(Effect::DeferredReplace {
-        deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+    plan.add(Effect::deferred_replace(
+        NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
             id: ResourceId::new("test", "validation_records[0]"),
             identifier: "old-validation".to_string(),
             directives: Directives::default(),
@@ -4927,10 +4927,10 @@ async fn dispatch_deferred_replace_short_circuits_on_delete_failure() {
             blocked_by_updates: HashSet::new(),
         }])
         .expect("fixture has one delete"),
-        id: ResourceId::new("__deferred_for", "validation_records"),
-        upstream_binding: "cert".to_string(),
-        template: Box::new(validation_deferred_for_expression()),
-    });
+        ResourceId::new("__deferred_for", "validation_records"),
+        "cert".to_string(),
+        Box::new(validation_deferred_for_expression()),
+    ));
 
     let input = ExecutionInput {
         plan: &plan,
@@ -5144,8 +5144,8 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
     let cert_id = cert.id.clone();
     plan.add(Effect::Create(cert.clone()));
     plan.add(Effect::Create(resource_with_binding("alb", "alb")));
-    plan.add(Effect::DeferredReplace {
-        deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+    plan.add(Effect::deferred_replace(
+        NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
             id: ResourceId::new("test", "validation_records[0]"),
             identifier: "old-validation".to_string(),
             directives: Directives::default(),
@@ -5155,10 +5155,10 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
             blocked_by_updates: HashSet::new(),
         }])
         .expect("fixture has one delete"),
-        id: ResourceId::new("__deferred_for", "validation_records"),
-        upstream_binding: "cert".to_string(),
-        template: Box::new(validation_deferred_for_expression()),
-    });
+        ResourceId::new("__deferred_for", "validation_records"),
+        "cert".to_string(),
+        Box::new(validation_deferred_for_expression()),
+    ));
 
     let unresolved = HashMap::from([(cert_id, UnresolvedResource::from_pre_resolve(cert.clone()))]);
     let input = ExecutionInput {

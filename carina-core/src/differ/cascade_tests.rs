@@ -344,6 +344,119 @@ fn cascade_dependent_updates_transitive() {
 }
 
 #[test]
+fn chained_cbd_cascade_promoted_consumer_also_cbd() {
+    let mut registry = base_registry();
+    registry.insert(
+        "",
+        ResourceSchema::new("cdn.Distribution")
+            .attribute(AttributeSchema::new("web_acl_arn", AttributeType::string()).create_only())
+            .attribute(AttributeSchema::new("comment", AttributeType::string()))
+            .attribute(AttributeSchema::new("domain_name", AttributeType::string())),
+    );
+    registry.insert(
+        "",
+        ResourceSchema::new("cdn.CachePolicy")
+            .attribute(AttributeSchema::new(
+                "distribution_domain",
+                AttributeType::string(),
+            ))
+            .attribute(AttributeSchema::new("comment", AttributeType::string())),
+    );
+    let web_acl_id = web_acl_id();
+    let distribution_id = distribution_id();
+    let cache_id = ResourceId::new("cdn.CachePolicy", "main");
+    let cache = Resource::new("cdn.CachePolicy", "main")
+        .with_binding("cache_policy")
+        .with_attribute(
+            "distribution_domain",
+            ref_value("distribution", "domain_name"),
+        )
+        .with_attribute("comment", str_value("unchanged"));
+    let mut distribution_state =
+        current_distribution_state(ref_value("web_acl", "arn"), "unchanged");
+    distribution_state
+        .dependency_bindings
+        .insert("web_acl".to_string());
+    let mut cache_state = state(
+        cache_id.clone(),
+        [
+            (
+                "distribution_domain",
+                ref_value("distribution", "domain_name"),
+            ),
+            ("comment", str_value("unchanged")),
+        ],
+    );
+    cache_state
+        .dependency_bindings
+        .insert("distribution".to_string());
+    let current_states = HashMap::from([
+        (web_acl_id.clone(), current_web_acl_state()),
+        (distribution_id.clone(), distribution_state),
+        (cache_id.clone(), cache_state),
+    ]);
+    let resources = vec![web_acl(), distribution(), cache];
+
+    let plan = cascade_plan_for(&resources, current_states, &registry);
+
+    assert_eq!(
+        updates_for(&plan, &distribution_id).len(),
+        0,
+        "B should be promoted from Update to Replace"
+    );
+    assert_eq!(decomposed_replace_count(&plan, &distribution_id), (1, 1));
+    assert!(
+        replace_metadata_for(&plan, &distribution_id).create_before_destroy,
+        "B must be CBD because C depends on it"
+    );
+    assert_eq!(updates_for(&plan, &cache_id).len(), 1);
+    assert!(
+        delete_blockers_for(&plan, &distribution_id).contains("cache_policy"),
+        "B old delete must wait for C's consumer update"
+    );
+
+    let unresolved: HashMap<_, _> = resources
+        .iter()
+        .map(|resource| {
+            (
+                resource.id.clone(),
+                crate::effect::deps::UnresolvedResource::from_pre_resolve(resource.clone()),
+            )
+        })
+        .collect();
+    let deps = crate::effect::deps::build_effect_dependency_analysis(
+        plan.effects(),
+        &unresolved,
+        &[],
+        crate::effect::deps::ScheduleInputs::Apply,
+    )
+    .into_deps_of();
+    let index_of = |predicate: &dyn Fn(&Effect) -> bool| {
+        plan.effects()
+            .iter()
+            .position(predicate)
+            .expect("effect must exist")
+    };
+    let create_a =
+        index_of(&|effect| matches!(effect, Effect::Create(resource) if resource.id == web_acl_id));
+    let delete_a =
+        index_of(&|effect| matches!(effect, Effect::Delete { id, .. } if id == &web_acl_id));
+    let create_b = index_of(
+        &|effect| matches!(effect, Effect::Create(resource) if resource.id == distribution_id),
+    );
+    let delete_b =
+        index_of(&|effect| matches!(effect, Effect::Delete { id, .. } if id == &distribution_id));
+    let update_c =
+        index_of(&|effect| matches!(effect, Effect::Update { id, .. } if id == &cache_id));
+
+    assert!(deps[&create_b].contains(&create_a));
+    assert!(deps[&update_c].contains(&create_b));
+    assert!(deps[&delete_b].contains(&update_c));
+    assert!(deps[&delete_b].contains(&create_b));
+    assert!(deps[&delete_a].contains(&delete_b));
+}
+
+#[test]
 fn cascade_dependent_updates_anonymous_resource() {
     let registry = base_registry();
     let web_acl_id = web_acl_id();

@@ -275,8 +275,8 @@ fn build_deferred_replace_plan() -> Plan {
 
     let mut plan = Plan::new();
     plan.add(Effect::Create(certificate_resource()));
-    plan.add(Effect::DeferredReplace {
-        deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+    plan.add(Effect::deferred_replace(
+        NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
             id: ResourceId::new("route53.Record", "old-record-0"),
             identifier: "record-0".to_string(),
             directives: Directives::default(),
@@ -286,10 +286,10 @@ fn build_deferred_replace_plan() -> Plan {
             blocked_by_updates: HashSet::new(),
         }])
         .expect("fixture has one delete"),
-        id: ResourceId::new("__deferred_for", "validation_records"),
-        upstream_binding: "cert".to_string(),
-        template: Box::new(deferred),
-    });
+        ResourceId::new("__deferred_for", "validation_records"),
+        "cert".to_string(),
+        Box::new(deferred),
+    ));
     plan
 }
 

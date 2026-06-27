@@ -28,6 +28,7 @@ use std::time::Duration;
 use crate::binding_index::ResolvedBindings;
 use crate::effect::Effect;
 use crate::parser::ProviderConfig;
+use crate::plan::NameOverride;
 use crate::provider::{PartialReadDiagnostic, Provider, ProviderNormalizer};
 use crate::resource::{ResolvedResource, Resource, ResourceId, State};
 use crate::value::SerializationError;
@@ -88,7 +89,7 @@ pub struct ExecutionResult {
     pub applied_states: std::collections::HashMap<ResourceId, State>,
     pub runtime_synthesized_resources: Vec<Resource>,
     pub successfully_deleted: HashSet<ResourceId>,
-    pub permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>>,
+    pub permanent_name_overrides: HashMap<ResourceId, HashMap<String, NameOverride>>,
     pub current_states: HashMap<ResourceId, State>,
     pub bindings: ResolvedBindings,
     pub failed_refreshes: HashSet<ResourceId>,

@@ -51,7 +51,7 @@ use crate::wiring::{
     WiringContext, build_factories_from_providers, create_providers_from_configs,
     get_provider_with_ctx, read_data_source_with_retry, read_with_retry,
     reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
-    resolve_data_source_refs_for_refresh,
+    resolve_data_source_refs_for_refresh, restore_unresolved_managed_attributes,
 };
 
 /// Re-export ExecutionResult as the public API for apply results.
@@ -1045,6 +1045,8 @@ async fn run_apply_locked(
     // managed resources are dependency-sorted; data sources are
     // refreshed in a later phase against the populated `current_states`.
     let mut sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
+    let mut unresolved_sorted_resources =
+        restore_unresolved_managed_attributes(&sorted_resources, &unresolved_parsed.resources);
     let data_sources: Vec<carina_core::resource::DataSource> = parsed.data_sources.clone();
 
     // Build state-file-derived maps up front so anonymous → let-bound
@@ -1215,7 +1217,7 @@ async fn run_apply_locked(
     // Phase 2: resolve data source inputs against the consolidated state
     // and refresh them via `read_data_source` (#1683, #1685).
     let resolved_data_sources = resolve_data_source_refs_for_refresh(
-        &sorted_resources,
+        &unresolved_sorted_resources,
         &parsed.compositions,
         &data_sources,
         &current_states,
@@ -1276,7 +1278,7 @@ async fn run_apply_locked(
     } = crate::wiring::expand_refresh_and_lift_states(crate::wiring::ExpandRefreshAndLiftInputs {
         parsed,
         provider: &provider,
-        sorted_resources: &sorted_resources,
+        sorted_resources: &unresolved_sorted_resources,
         current_states: &mut current_states,
         remote_bindings: &remote_bindings,
         wait_aliases: &wait_aliases,
@@ -1290,6 +1292,8 @@ async fn run_apply_locked(
     })
     .await?;
     sorted_resources = resorted;
+    unresolved_sorted_resources =
+        restore_unresolved_managed_attributes(&sorted_resources, &unresolved_parsed.resources);
     crate::wiring::validate_plan_time_state_block_collisions(
         &sorted_resources,
         &moved_pairs,
@@ -1336,7 +1340,7 @@ async fn run_apply_locked(
     // (carina#3246).
     let pre_apply_input_states = carina_core::resource::into_plan_input_map(current_states.clone());
     let mut bindings = ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
-        managed: &sorted_resources,
+        managed: &unresolved_sorted_resources,
         compositions: &pre_resolve_compositions,
         data_sources: &data_sources,
         current_states: &pre_apply_input_states,
@@ -1345,7 +1349,7 @@ async fn run_apply_locked(
     });
 
     // Resolve references and enum identifiers, then create initial plan for display
-    let mut resources_for_plan = sorted_resources.clone();
+    let mut resources_for_plan = unresolved_sorted_resources.clone();
     resolve_refs_with_state_and_remote(&mut resources_for_plan, &bindings)?;
 
     // Resolve data-source input refs and canonicalize, so each `read`
@@ -1401,7 +1405,12 @@ async fn run_apply_locked(
     // Drive cascade_dependent_updates to add independent consumer Updates
     // for resources whose dependencies are being replaced (CBD), and to
     // decompose PendingReplaces into Create + Update + Delete effects.
-    cascade_dependent_updates(&mut plan, &sorted_resources, &plan_input_states, schemas);
+    cascade_dependent_updates(
+        &mut plan,
+        &unresolved_sorted_resources,
+        &plan_input_states,
+        schemas,
+    );
 
     // Add state block effects (import/removed/moved) to the plan.
     // carina#3329: resolve `import { id = "${…}|…" }` interpolations
@@ -1718,7 +1727,12 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| AppError::Config("Plan file is missing numeric version".to_string()))?;
 
-    // Validate version compatibility. Plan-file version 7
+    // Validate version compatibility. Plan-file version 8
+    // (carina#3625 round 7) records original_value for permanent CBD
+    // name overrides so saved-plan apply cannot silently keep using
+    // an override after the DSL name has changed.
+    //
+    // Plan-file version 7
     // (carina#3625) decomposes Replace into Create/Update/Delete and
     // persists replace_display metadata.
     //
@@ -1741,11 +1755,12 @@ async fn run_apply_from_plan_with_observer_factory(
     // view as the live-apply path (carina#3246). Older plans cannot be
     // applied by the post-#3248 binding-construction path and are
     // rejected outright per the repo's no-backward-compat policy.
-    if plan_version != 7 {
+    if plan_version != u64::from(PlanFile::CURRENT_VERSION) {
         return Err(AppError::Config(format!(
-            "Unsupported plan file version: {} (expected 7). \
+            "Unsupported plan file version: {} (expected {}). \
              Re-run 'carina plan' to produce a plan in the current format.",
-            plan_version
+            plan_version,
+            PlanFile::CURRENT_VERSION
         )));
     }
     let plan_file: PlanFile = serde_json::from_value(plan_value)

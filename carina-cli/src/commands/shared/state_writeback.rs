@@ -10,7 +10,7 @@ use carina_core::executor::ExecutionResult;
 use carina_core::plan::Plan;
 use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 use carina_core::schema::SchemaRegistry;
-use carina_state::{LockInfo, ResourceState, StateBackend, StateFile};
+use carina_state::{LockInfo, NameOverride, ResourceState, StateBackend, StateFile};
 use colored::Colorize;
 
 use crate::error::AppError;
@@ -33,10 +33,20 @@ pub(crate) fn apply_name_overrides(resources: &mut [Resource], state_file: &Opti
 
     for resource in resources.iter_mut() {
         if let Some(name_overrides) = overrides.get(&resource.id) {
-            for (attr, value) in name_overrides {
+            for (attr, override_) in name_overrides {
+                let current_dsl_value =
+                    resource.attributes.get(attr).and_then(|value| match value {
+                        Value::Concrete(ConcreteValue::String(value)) => Some(value.as_str()),
+                        _ => None,
+                    });
+                if !override_.original_value.is_empty()
+                    && current_dsl_value != Some(override_.original_value.as_str())
+                {
+                    continue;
+                }
                 resource.attributes.insert(
                     attr.clone(),
-                    Value::Concrete(ConcreteValue::String(value.clone())),
+                    Value::Concrete(ConcreteValue::String(override_.temp_value.clone())),
                 );
             }
         }
@@ -532,7 +542,7 @@ pub(crate) struct ApplyStateSave<'a> {
     pub runtime_synthesized_resources: &'a [Resource],
     pub current_states: &'a HashMap<ResourceId, State>,
     pub applied_states: &'a HashMap<ResourceId, State>,
-    pub permanent_name_overrides: &'a HashMap<ResourceId, HashMap<String, String>>,
+    pub permanent_name_overrides: &'a HashMap<ResourceId, HashMap<String, NameOverride>>,
     pub plan: &'a Plan,
     pub successfully_deleted: &'a HashSet<ResourceId>,
     pub failed_refreshes: &'a HashSet<ResourceId>,
@@ -899,6 +909,66 @@ mod apply_state_save_tests {
     use carina_core::resource::{ConcreteValue, Directives, Resource, ResourceId, State, Value};
 
     #[test]
+    fn apply_name_overrides_skips_when_dsl_name_changed() {
+        let mut resource = Resource::with_provider("mock", "test.resource", "role", None)
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("my-role-v2".into())),
+            );
+        let id = resource.id.clone();
+        let mut row = ResourceState::new("test.resource", "role", "mock").with_identifier("id");
+        row.name_overrides.insert(
+            "name".to_string(),
+            NameOverride {
+                temp_value: "my-role-aaaa".to_string(),
+                original_value: "my-role".to_string(),
+            },
+        );
+        let mut state = StateFile::new();
+        state.upsert_resource(row);
+
+        apply_name_overrides(std::slice::from_mut(&mut resource), &Some(state));
+
+        assert_eq!(
+            resource.get_attr("name"),
+            Some(&Value::Concrete(ConcreteValue::String(
+                "my-role-v2".to_string()
+            ))),
+            "DSL rename must not be overwritten by the persisted temporary name"
+        );
+        assert_eq!(resource.id, id);
+    }
+
+    #[test]
+    fn apply_name_overrides_applies_legacy_empty_original_value() {
+        let mut resource = Resource::with_provider("mock", "test.resource", "role", None)
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("my-role-v2".into())),
+            );
+        let mut row = ResourceState::new("test.resource", "role", "mock").with_identifier("id");
+        row.name_overrides.insert(
+            "name".to_string(),
+            NameOverride {
+                temp_value: "my-role-aaaa".to_string(),
+                original_value: String::new(),
+            },
+        );
+        let mut state = StateFile::new();
+        state.upsert_resource(row);
+
+        apply_name_overrides(std::slice::from_mut(&mut resource), &Some(state));
+
+        assert_eq!(
+            resource.get_attr("name"),
+            Some(&Value::Concrete(ConcreteValue::String(
+                "my-role-aaaa".to_string()
+            ))),
+            "legacy state without original_value keeps old always-apply behavior"
+        );
+    }
+
+    #[test]
     fn build_state_after_apply_persists_runtime_synthesized_resources() {
         let runtime_child = Resource::new("route53.Record", "validation_records[0]")
             .with_attribute(
@@ -960,12 +1030,12 @@ mod apply_state_save_tests {
             id.provider_instance.clone(),
         )
         .with_binding("validation_records");
-        Effect::DeferredReplace {
-            deletes: NonEmptyDeletes::try_new(vec![deferred_replace_delete(id)])
+        Effect::deferred_replace(
+            NonEmptyDeletes::try_new(vec![deferred_replace_delete(id)])
                 .expect("fixture has one delete"),
-            id: ResourceId::new("__deferred_for", "validation_records"),
-            upstream_binding: "cert".to_string(),
-            template: Box::new(DeferredForExpression {
+            ResourceId::new("__deferred_for", "validation_records"),
+            "cert".to_string(),
+            Box::new(DeferredForExpression {
                 file: Some("main.crn".to_string()),
                 line: 1,
                 header: "for opt in cert.domain_validation_options".to_string(),
@@ -977,14 +1047,7 @@ mod apply_state_save_tests {
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource,
             }),
-        }
-    }
-
-    fn inject_replace_display(plan: Plan, metadata: ReplaceDisplayMetadata) -> Plan {
-        let mut value = serde_json::to_value(&plan).expect("plan serializes");
-        value["replace_display"] =
-            serde_json::to_value(vec![metadata]).expect("metadata serializes");
-        serde_json::from_value(value).expect("plan with metadata deserializes")
+        )
     }
 
     fn cbd_plan_for_with_temporary_name(
@@ -1006,21 +1069,18 @@ mod apply_state_save_tests {
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
         });
-        inject_replace_display(
-            plan,
-            ReplaceDisplayMetadata {
-                id: desired.id.clone(),
-                binding: desired.binding.clone(),
-                create_idx,
-                delete_idx,
-                create_before_destroy: true,
-                changed_create_only: ChangedCreateOnly::new(vec!["force_replace".to_string()])
-                    .expect("fixture has a create-only attr"),
-                cascade_ref_hints: Vec::new(),
-                temporary_name,
-                previous_attributes: HashMap::new(),
-            },
-        )
+        plan.with_replace_display(ReplaceDisplayMetadata {
+            id: desired.id.clone(),
+            binding: desired.binding.clone(),
+            create_idx,
+            delete_idx,
+            create_before_destroy: true,
+            changed_create_only: ChangedCreateOnly::new(vec!["force_replace".to_string()])
+                .expect("fixture has a create-only attr"),
+            cascade_ref_hints: Vec::new(),
+            temporary_name,
+            previous_attributes: HashMap::new(),
+        })
     }
 
     #[test]
@@ -1149,7 +1209,13 @@ mod apply_state_save_tests {
         .with_identifier("new-id");
         let overrides = HashMap::from([(
             id.clone(),
-            HashMap::from([("name".to_string(), "stable-name-temp".to_string())]),
+            HashMap::from([(
+                "name".to_string(),
+                NameOverride {
+                    temp_value: "stable-name-temp".to_string(),
+                    original_value: "stable-name".to_string(),
+                },
+            )]),
         )]);
 
         let state = build_state_after_apply(ApplyStateSave {
@@ -1171,7 +1237,10 @@ mod apply_state_save_tests {
             .expect("resource row should be written");
         assert_eq!(
             row.name_overrides.get("name"),
-            Some(&"stable-name-temp".to_string())
+            Some(&NameOverride {
+                temp_value: "stable-name-temp".to_string(),
+                original_value: "stable-name".to_string(),
+            })
         );
     }
 
@@ -1231,7 +1300,13 @@ mod apply_state_save_tests {
         let plan = cbd_plan_for_with_temporary_name(&desired, "old-id", Some(temporary_name));
         let overrides = HashMap::from([(
             id.clone(),
-            HashMap::from([("name".to_string(), "stable-name-temp".to_string())]),
+            HashMap::from([(
+                "name".to_string(),
+                NameOverride {
+                    temp_value: "stable-name-temp".to_string(),
+                    original_value: "stable-name".to_string(),
+                },
+            )]),
         )]);
 
         let state = build_state_after_apply(ApplyStateSave {
@@ -1258,7 +1333,10 @@ mod apply_state_save_tests {
         );
         assert_eq!(
             row.name_overrides.get("name"),
-            Some(&"stable-name-temp".to_string())
+            Some(&NameOverride {
+                temp_value: "stable-name-temp".to_string(),
+                original_value: "stable-name".to_string(),
+            })
         );
     }
 

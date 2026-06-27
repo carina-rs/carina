@@ -47,11 +47,9 @@ pub fn deferred_summary_for_plan(plan: &Plan) -> DeferredSummaryForPlan {
                 verb: deferred_for_verb(plan, upstream_binding).to_string(),
                 action: DeferredSummaryAction::Add,
             }),
-            Effect::DeferredReplace {
-                upstream_binding, ..
-            } => Some(DeferredSummaryEntry {
-                upstream_binding: upstream_binding.clone(),
-                verb: deferred_for_verb(plan, upstream_binding).to_string(),
+            Effect::DeferredReplace(payload) => Some(DeferredSummaryEntry {
+                upstream_binding: payload.upstream_binding.clone(),
+                verb: deferred_for_verb(plan, &payload.upstream_binding).to_string(),
                 action: DeferredSummaryAction::Replace,
             }),
             _ => None,
@@ -256,24 +254,18 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
                     effect_deps.insert(idx, HashSet::from([upstream_binding.clone()]));
                     continue;
                 }
-                Effect::DeferredReplace {
-                    deletes,
-                    id,
-                    upstream_binding,
-                    template,
-                    ..
-                } => {
-                    let fallback = id.to_string();
+                Effect::DeferredReplace(payload) => {
+                    let fallback = payload.id.to_string();
                     binding_to_effect.insert(fallback.clone(), idx);
-                    binding_to_effect.insert(template.binding_name.clone(), idx);
-                    for delete in deletes {
+                    binding_to_effect.insert(payload.template.binding_name.clone(), idx);
+                    for delete in &payload.deletes {
                         if let Some(binding) = &delete.binding {
                             binding_to_effect.insert(binding.clone(), idx);
                         }
                     }
                     effect_bindings.insert(idx, fallback);
                     effect_types.insert(idx, "deferred_for".to_string());
-                    effect_deps.insert(idx, HashSet::from([upstream_binding.clone()]));
+                    effect_deps.insert(idx, HashSet::from([payload.upstream_binding.clone()]));
                     continue;
                 }
             };
@@ -597,8 +589,8 @@ mod tests {
         };
 
         let mut plan = Plan::new();
-        plan.add(Effect::DeferredReplace {
-            deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+        plan.add(Effect::deferred_replace(
+            NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
                 id: ResourceId::new("route53.Record", "validation_records[0]"),
                 identifier: "record-0".to_string(),
                 directives: Directives::default(),
@@ -608,10 +600,10 @@ mod tests {
                 blocked_by_updates: HashSet::new(),
             }])
             .expect("fixture has one delete"),
-            id: ResourceId::new("__deferred_for", "validation_records"),
-            upstream_binding: "cert".to_string(),
-            template: Box::new(deferred),
-        });
+            ResourceId::new("__deferred_for", "validation_records"),
+            "cert".to_string(),
+            Box::new(deferred),
+        ));
         plan.add(Effect::Delete {
             id: ResourceId::new("route53.Record", "old-record-0"),
             identifier: "record-0".to_string(),
@@ -659,8 +651,8 @@ mod tests {
         };
 
         let mut plan = Plan::new();
-        plan.add(Effect::DeferredReplace {
-            deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+        plan.add(Effect::deferred_replace(
+            NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
                 id: ResourceId::new("route53.Record", "validation_records[0]"),
                 identifier: "record-0".to_string(),
                 directives: Directives::default(),
@@ -670,10 +662,10 @@ mod tests {
                 blocked_by_updates: HashSet::new(),
             }])
             .expect("fixture has one delete"),
-            id: ResourceId::new("__deferred_for", "validation_records"),
-            upstream_binding: "cert".to_string(),
-            template: Box::new(deferred),
-        });
+            ResourceId::new("__deferred_for", "validation_records"),
+            "cert".to_string(),
+            Box::new(deferred),
+        ));
         plan.add(Effect::Wait {
             binding: "wait_validation_record_0".to_string(),
             target_id: ResourceId::new("route53.Record", "validation_records[0]"),

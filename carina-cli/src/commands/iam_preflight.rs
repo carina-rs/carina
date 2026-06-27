@@ -300,15 +300,14 @@ fn effect_required_ops(effect: &Effect) -> Vec<(ResourceId, PlanOp)> {
         Effect::DeferredCreate { template, .. } => {
             effect_required_ops(&Effect::Create(template.template_resource.clone()))
         }
-        Effect::DeferredReplace {
-            deletes, template, ..
-        } => {
-            let mut ops: Vec<_> = deletes
+        Effect::DeferredReplace(payload) => {
+            let mut ops: Vec<_> = payload
+                .deletes
                 .iter()
                 .map(|delete| (delete.id.clone(), PlanOp::Delete))
                 .collect();
             ops.extend(effect_required_ops(&Effect::Create(
-                template.template_resource.clone(),
+                payload.template.template_resource.clone(),
             )));
             ops
         }
@@ -327,9 +326,9 @@ fn effect_resource_ids(effect: &Effect) -> Vec<&ResourceId> {
         Effect::Move { from, to } => vec![from, to],
         Effect::Wait { .. } => Vec::new(),
         Effect::DeferredCreate { id, .. } => vec![id],
-        Effect::DeferredReplace { deletes, id, .. } => {
-            let mut ids = vec![id];
-            ids.extend(deletes.iter().map(|delete| &delete.id));
+        Effect::DeferredReplace(payload) => {
+            let mut ids = vec![&payload.id];
+            ids.extend(payload.deletes.iter().map(|delete| &delete.id));
             ids
         }
     }
@@ -844,8 +843,8 @@ mod tests {
             ResourceId::with_provider("aws", "route53.RecordSet", "validation_records[0]", None);
         let template_resource =
             Resource::with_provider("aws", "route53.RecordSet", "validation_records", None);
-        let effect = Effect::DeferredReplace {
-            deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+        let effect = Effect::deferred_replace(
+            NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
                 id: delete_id.clone(),
                 identifier: "old-record-id".to_string(),
                 directives: Directives::default(),
@@ -855,9 +854,9 @@ mod tests {
                 blocked_by_updates: Default::default(),
             }])
             .expect("fixture has one delete"),
-            id: ResourceId::new("__deferred_for", "validation_records"),
-            upstream_binding: "cert".to_string(),
-            template: Box::new(DeferredForExpression {
+            ResourceId::new("__deferred_for", "validation_records"),
+            "cert".to_string(),
+            Box::new(DeferredForExpression {
                 file: None,
                 line: 1,
                 header: "for opt in cert.domain_validation_options".to_string(),
@@ -869,7 +868,7 @@ mod tests {
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource,
             }),
-        };
+        );
 
         let ops = effect_required_ops(&effect);
 
