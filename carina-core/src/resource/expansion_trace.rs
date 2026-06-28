@@ -89,7 +89,7 @@ impl CallSite {
 
     /// The call site's binding name (instance prefix), e.g. `cluster`.
     pub fn binding(&self) -> &str {
-        self.id.inner().name.as_str()
+        self.id.inner().identity_or_empty()
     }
 }
 
@@ -173,12 +173,12 @@ mod tests {
     use crate::resource::ResourceId;
 
     fn pid(name: &str) -> PersistentId {
-        PersistentId::new(ResourceId::new("aws.s3.Bucket", name))
+        PersistentId::new(ResourceId::with_identity("aws.s3.Bucket", name))
     }
 
     fn site(name: &str, source_path: &str) -> CallSite {
         CallSite::new(
-            EphemeralId::new(ResourceId::new("_virtual", name)),
+            EphemeralId::new(ResourceId::with_identity("_virtual", name)),
             source_path,
         )
     }
@@ -221,7 +221,8 @@ mod tests {
         // The renderer drops the parenthesized `(<path>)` suffix in
         // that case — `None` is syntactically distinct from a real
         // user-supplied empty path.
-        let s = CallSite::without_source(EphemeralId::new(ResourceId::new("_virtual", "r")));
+        let s =
+            CallSite::without_source(EphemeralId::new(ResourceId::with_identity("_virtual", "r")));
         assert_eq!(s.binding(), "r");
         assert_eq!(s.source_path, None);
     }
@@ -254,7 +255,10 @@ mod tests {
         // `HashMap`-backed iteration order is not guaranteed; only
         // the *set* of keys is observable. Verify every recorded leaf
         // shows up exactly once.
-        let mut names: Vec<&str> = t.iter().map(|(p, _)| p.inner().name.as_str()).collect();
+        let mut names: Vec<&str> = t
+            .iter()
+            .map(|(p, _)| p.inner().identity_or_empty())
+            .collect();
         names.sort();
         assert_eq!(names, vec!["a_leaf", "b_leaf"]);
     }

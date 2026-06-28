@@ -145,7 +145,7 @@ fn differ_treats_equal_cyclic_values_as_unchanged() {
     // `type_aware_equal` resolves `Ref` at function entry and so
     // semantically equal cyclic values do not surface a phantom diff.
     let schema = cyclic_webacl_like_schema();
-    let id = ResourceId::new("wafv2.WebACL", "main");
+    let id = ResourceId::with_identity("wafv2.WebACL", "main");
 
     let rules_value = Value::Concrete(ConcreteValue::List(vec![rule_value("BlockBadIPs", 2)]));
     let desired = build_resource(&id, &[("rules", rules_value.clone())]);
@@ -168,7 +168,7 @@ fn differ_surfaces_a_real_change_inside_a_cyclic_value() {
     // the `Ref` resolution didn't accidentally collapse the inner
     // walk into a no-op.
     let schema = cyclic_webacl_like_schema();
-    let id = ResourceId::new("wafv2.WebACL", "main");
+    let id = ResourceId::with_identity("wafv2.WebACL", "main");
 
     let desired_rules = Value::Concrete(ConcreteValue::List(vec![rule_value("BlockBadIPs", 3)]));
     let desired = build_resource(&id, &[("rules", desired_rules)]);
@@ -415,7 +415,7 @@ fn build_resource(id: &ResourceId, attrs: &[(&str, Value)]) -> Resource {
     // touch the private `id` field, but immediately overwrite the
     // synthesized id with the one our test owns (same shape, plus an
     // explicit provider).
-    let mut r = Resource::new(id.resource_type.clone(), id.name.clone().to_string());
+    let mut r = Resource::new(id.resource_type.clone(), id.identity_or_empty().to_string());
     r.id = id.clone();
     for (k, v) in attrs {
         r = r.with_attribute(k.to_string(), v.clone());

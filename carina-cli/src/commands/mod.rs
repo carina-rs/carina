@@ -981,8 +981,8 @@ exports {
         assert!(errors.is_empty(), "aws spelling errors: {errors:?}");
 
         assert_eq!(
-            awscc.resources[0].id.name_str(),
-            aws.resources[0].id.name_str(),
+            awscc.resources[0].id.identity_or_empty(),
+            aws.resources[0].id.identity_or_empty(),
             "resource create-only enum spelling must canonicalize before anonymous hash"
         );
     }

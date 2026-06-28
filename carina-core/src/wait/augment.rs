@@ -135,7 +135,7 @@ mod tests {
         let known_bindings = known.iter().map(|name| (*name).to_string()).collect();
         satisfier_augmentation(
             &provider,
-            &ResourceId::new("acm.Certificate", "cert"),
+            &ResourceId::with_identity("acm.Certificate", "cert"),
             &AttrPath::single("status"),
             &known_bindings,
         )

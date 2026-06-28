@@ -744,7 +744,7 @@ fn test_cascading_update_shows_attribute_diffs() {
 
     // Build a Replace effect with a cascading update that changes vpc_id
     let vpc_from = State::existing(
-        ResourceId::new("ec2.Vpc", "vpc"),
+        ResourceId::with_identity("ec2.Vpc", "vpc"),
         HashMap::from([(
             "cidr_block".to_string(),
             Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
@@ -758,7 +758,7 @@ fn test_cascading_update_shows_attribute_diffs() {
         );
 
     let subnet_from = State::existing(
-        ResourceId::new("ec2.Subnet", "subnet"),
+        ResourceId::with_identity("ec2.Subnet", "subnet"),
         HashMap::from([
             (
                 "vpc_id".to_string(),
@@ -781,7 +781,7 @@ fn test_cascading_update_shows_attribute_diffs() {
         );
 
     let replace_effect = Effect::Replace {
-        id: ResourceId::new("ec2.Vpc", "vpc"),
+        id: ResourceId::with_identity("ec2.Vpc", "vpc"),
         from: Box::new(vpc_from),
         to: vpc_to,
         directives: Directives {
@@ -793,7 +793,7 @@ fn test_cascading_update_shows_attribute_diffs() {
         ])
         .unwrap(),
         cascading_updates: vec![CascadingUpdate {
-            id: ResourceId::new("ec2.Subnet", "subnet"),
+            id: ResourceId::with_identity("ec2.Subnet", "subnet"),
             from: Box::new(subnet_from),
             to: subnet_to,
         }],
@@ -823,9 +823,9 @@ fn test_format_cascading_update_attr_diff() {
     use std::collections::HashMap;
 
     let cascade = CascadingUpdate {
-        id: ResourceId::new("ec2.Subnet", "subnet"),
+        id: ResourceId::with_identity("ec2.Subnet", "subnet"),
         from: Box::new(State::existing(
-            ResourceId::new("ec2.Subnet", "subnet"),
+            ResourceId::with_identity("ec2.Subnet", "subnet"),
             HashMap::from([
                 (
                     "vpc_id".to_string(),
@@ -883,7 +883,7 @@ fn test_format_cascading_update_attr_diff() {
 /// NOT be hidden even though `semantically_equal` returns true.
 #[test]
 fn test_replace_changed_create_only_same_value_shown_as_known_after_apply() {
-    let id = ResourceId::with_provider("awscc", "ec2.Subnet", "subnet", None);
+    let id = ResourceId::with_provider_identity("awscc", "ec2.Subnet", "subnet", None);
     let from = State::existing(
         id.clone(),
         [
@@ -975,7 +975,7 @@ fn test_replace_changed_create_only_same_value_shown_as_known_after_apply() {
 /// binding instead of the resolved value for cascade-triggered same-value attributes.
 #[test]
 fn test_replace_cascade_ref_hints_show_binding() {
-    let id = ResourceId::with_provider("awscc", "ec2.Subnet", "subnet", None);
+    let id = ResourceId::with_provider_identity("awscc", "ec2.Subnet", "subnet", None);
     let from = State::existing(
         id.clone(),
         [(
@@ -1068,7 +1068,7 @@ fn test_deferred_create_renders_deferred_until_apply_marker() {
 
     let mut plan = Plan::new();
     plan.add(Effect::DeferredCreate {
-        id: ResourceId::new("__deferred_for", "validation_records"),
+        id: ResourceId::with_identity("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(deferred),
     });
@@ -1125,7 +1125,7 @@ fn deferred_validation_records_effect() -> Effect {
     };
 
     Effect::DeferredCreate {
-        id: ResourceId::new("__deferred_for", "validation_records"),
+        id: ResourceId::with_identity("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(deferred),
     }
@@ -1133,7 +1133,7 @@ fn deferred_validation_records_effect() -> Effect {
 
 fn delete_record_effect(binding: &str) -> Effect {
     Effect::Delete {
-        id: ResourceId::new("route53.Record", binding),
+        id: ResourceId::with_identity("route53.Record", binding),
         identifier: format!("{binding}-id"),
         directives: Directives::default(),
         binding: Some(binding.to_string()),
@@ -1295,9 +1295,9 @@ fn test_format_cascading_update_diff_excludes_non_ref_attributes() {
     use std::collections::HashMap;
 
     let cascade = CascadingUpdate {
-        id: ResourceId::new("ec2.Subnet", "subnet"),
+        id: ResourceId::with_identity("ec2.Subnet", "subnet"),
         from: Box::new(State::existing(
-            ResourceId::new("ec2.Subnet", "subnet"),
+            ResourceId::with_identity("ec2.Subnet", "subnet"),
             HashMap::from([
                 (
                     "vpc_id".to_string(),
@@ -1361,9 +1361,9 @@ fn test_format_cascading_update_diff_includes_list_with_ref() {
     use std::collections::HashMap;
 
     let cascade = CascadingUpdate {
-        id: ResourceId::new("ec2.Instance", "instance"),
+        id: ResourceId::with_identity("ec2.Instance", "instance"),
         from: Box::new(State::existing(
-            ResourceId::new("ec2.Instance", "instance"),
+            ResourceId::with_identity("ec2.Instance", "instance"),
             HashMap::from([(
                 "security_group_ids".to_string(),
                 Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
@@ -1420,7 +1420,7 @@ fn test_mixed_plan_tree_with_delete_effect() {
     // VPC: Update effect (has `to` resource with binding)
     let vpc_to = make_resource("ec2.Vpc", "vpc", "vpc", &[]);
     let vpc_from = State::existing(
-        ResourceId::new("ec2.Vpc", "vpc"),
+        ResourceId::with_identity("ec2.Vpc", "vpc"),
         HashMap::from([(
             "cidr_block".to_string(),
             Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
@@ -1430,7 +1430,7 @@ fn test_mixed_plan_tree_with_delete_effect() {
     // SG: Replace effect (has `to` resource that depends on VPC)
     let sg_to = make_resource("ec2.SecurityGroup", "sg", "sg", &["vpc"]);
     let sg_from = State::existing(
-        ResourceId::new("ec2.SecurityGroup", "sg"),
+        ResourceId::with_identity("ec2.SecurityGroup", "sg"),
         HashMap::from([(
             "ref_vpc".to_string(),
             Value::Concrete(ConcreteValue::String("vpc-old123".to_string())),
@@ -1440,7 +1440,7 @@ fn test_mixed_plan_tree_with_delete_effect() {
     // Subnet: Delete effect (only has id and identifier — no resource, no deps)
     // In the original DSL, subnet depends on VPC, but Delete loses that info.
     let subnet_delete = Effect::Delete {
-        id: ResourceId::new("ec2.Subnet", "subnet"),
+        id: ResourceId::with_identity("ec2.Subnet", "subnet"),
         identifier: "subnet-12345".to_string(),
         directives: Directives::default(),
         binding: Some("subnet".to_string()),
@@ -1450,13 +1450,13 @@ fn test_mixed_plan_tree_with_delete_effect() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Update {
-        id: ResourceId::new("ec2.Vpc", "vpc"),
+        id: ResourceId::with_identity("ec2.Vpc", "vpc"),
         from: Box::new(vpc_from),
         to: vpc_to,
         changed_attributes: vec!["cidr_block".to_string()],
     });
     plan.add(Effect::Replace {
-        id: ResourceId::new("ec2.SecurityGroup", "sg"),
+        id: ResourceId::with_identity("ec2.SecurityGroup", "sg"),
         from: Box::new(sg_from),
         to: sg_to,
         directives: Directives::default(),
@@ -1523,7 +1523,7 @@ fn test_resolved_ref_loses_dependency_for_tree_nesting() {
     // VPC: Update effect (tags changed)
     let vpc_to = make_resource("ec2.Vpc", "vpc", "vpc", &[]);
     let vpc_from = State::existing(
-        ResourceId::new("ec2.Vpc", "vpc"),
+        ResourceId::with_identity("ec2.Vpc", "vpc"),
         HashMap::from([(
             "cidr_block".to_string(),
             Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
@@ -1550,7 +1550,7 @@ fn test_resolved_ref_loses_dependency_for_tree_nesting() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Update {
-        id: ResourceId::new("ec2.Vpc", "vpc"),
+        id: ResourceId::with_identity("ec2.Vpc", "vpc"),
         from: Box::new(vpc_from),
         to: vpc_to,
         changed_attributes: vec!["tags".to_string()],
@@ -1587,7 +1587,7 @@ fn test_resolved_ref_loses_dependency_for_tree_nesting() {
 #[test]
 fn format_effect_delete_uses_binding_name() {
     let effect = Effect::Delete {
-        id: ResourceId::with_provider("awscc", "ec2.Vpc", "ec2_vpc_fb75c929", None),
+        id: ResourceId::with_provider_identity("awscc", "ec2.Vpc", "ec2_vpc_fb75c929", None),
         identifier: "vpc-12345".to_string(),
         directives: Directives::default(),
         binding: Some("my_vpc".to_string()),
@@ -1600,7 +1600,7 @@ fn format_effect_delete_uses_binding_name() {
 #[test]
 fn format_effect_delete_falls_back_to_id_name() {
     let effect = Effect::Delete {
-        id: ResourceId::with_provider("awscc", "ec2.Vpc", "ec2_vpc_fb75c929", None),
+        id: ResourceId::with_provider_identity("awscc", "ec2.Vpc", "ec2_vpc_fb75c929", None),
         identifier: "vpc-12345".to_string(),
         directives: Directives::default(),
         binding: None,
@@ -1619,19 +1619,19 @@ fn format_effect_delete_falls_back_to_id_name() {
 #[test]
 fn format_effect_create_separates_type_and_name_with_space() {
     let mut r = Resource::new("s3.Bucket", "state_bucket");
-    r.id = ResourceId::with_provider("aws", "s3.Bucket", "state_bucket", None);
+    r.id = ResourceId::with_provider_identity("aws", "s3.Bucket", "state_bucket", None);
     let effect = Effect::Create(r);
     assert_eq!(format_effect(&effect), "Create aws.s3.Bucket state_bucket");
 }
 
 #[test]
 fn format_effect_update_separates_type_and_name_with_space() {
-    let id = ResourceId::with_provider("awscc", "iam.Role", "bs.bootstrap.role", None);
+    let id = ResourceId::with_provider_identity("awscc", "iam.Role", "bs.bootstrap.role", None);
     let mut to = Resource::new("iam.Role", "bs.bootstrap.role");
     to.id = id.clone();
     let effect = Effect::Update {
         id,
-        from: Box::new(State::not_found(ResourceId::with_provider(
+        from: Box::new(State::not_found(ResourceId::with_provider_identity(
             "awscc",
             "iam.Role",
             "bs.bootstrap.role",
@@ -1648,12 +1648,12 @@ fn format_effect_update_separates_type_and_name_with_space() {
 
 #[test]
 fn format_effect_replace_separates_type_and_name_with_space() {
-    let id = ResourceId::with_provider("awscc", "ec2.Vpc", "vpc", None);
+    let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "vpc", None);
     let mut to = Resource::new("ec2.Vpc", "vpc");
     to.id = id.clone();
     let effect = Effect::Replace {
         id,
-        from: Box::new(State::not_found(ResourceId::with_provider(
+        from: Box::new(State::not_found(ResourceId::with_provider_identity(
             "awscc", "ec2.Vpc", "vpc", None,
         ))),
         to,
@@ -1669,7 +1669,7 @@ fn format_effect_replace_separates_type_and_name_with_space() {
 
 #[test]
 fn format_replace_with_removed_create_only_attribute_shows_forcing_detail() {
-    let id = ResourceId::with_provider("test", "Widget", "beta", None);
+    let id = ResourceId::with_provider_identity("test", "Widget", "beta", None);
     let from = State::existing(
         id.clone(),
         [(
@@ -1722,7 +1722,7 @@ fn format_replace_with_removed_create_only_attribute_shows_forcing_detail() {
 #[test]
 fn format_effect_import_separates_type_and_name_with_space() {
     let effect = Effect::Import {
-        id: ResourceId::with_provider("aws", "s3.Bucket", "logs", None),
+        id: ResourceId::with_provider_identity("aws", "s3.Bucket", "logs", None),
         identifier: carina_core::resource::Value::Concrete(
             carina_core::resource::ConcreteValue::String("my-logs-bucket".to_string()),
         ),
@@ -1736,7 +1736,7 @@ fn format_effect_import_separates_type_and_name_with_space() {
 #[test]
 fn format_effect_remove_separates_type_and_name_with_space() {
     let effect = Effect::Remove {
-        id: ResourceId::with_provider("awscc", "ec2.Vpc", "old_vpc", None),
+        id: ResourceId::with_provider_identity("awscc", "ec2.Vpc", "old_vpc", None),
     };
     assert_eq!(
         format_effect(&effect),
@@ -1747,8 +1747,8 @@ fn format_effect_remove_separates_type_and_name_with_space() {
 #[test]
 fn format_effect_move_separates_type_and_name_with_space() {
     let effect = Effect::Move {
-        from: ResourceId::with_provider("awscc", "ec2.Vpc", "vpc_a", None),
-        to: ResourceId::with_provider("awscc", "ec2.Vpc", "vpc_b", None),
+        from: ResourceId::with_provider_identity("awscc", "ec2.Vpc", "vpc_a", None),
+        to: ResourceId::with_provider_identity("awscc", "ec2.Vpc", "vpc_b", None),
     };
     assert_eq!(
         format_effect(&effect),
@@ -1958,7 +1958,7 @@ fn delete_pretty_attribute_does_not_strike_indentation() {
         value: Value::Concrete(ConcreteValue::Map(cache_behavior)),
     };
     let effect = Effect::Delete {
-        id: carina_core::resource::ResourceId::new("cloudfront.Distribution", "dist"),
+        id: carina_core::resource::ResourceId::with_identity("cloudfront.Distribution", "dist"),
         identifier: "E123".to_string(),
         directives: Default::default(),
         binding: None,
@@ -2034,9 +2034,9 @@ fn forcing_changed_uses_plain_green_cli_value() {
         new: "\"new\"".to_string(),
     };
     let effect = Effect::Update {
-        id: ResourceId::new("test.Widget", "w"),
+        id: ResourceId::with_identity("test.Widget", "w"),
         from: Box::new(State::existing(
-            ResourceId::new("test.Widget", "w"),
+            ResourceId::with_identity("test.Widget", "w"),
             HashMap::new(),
         )),
         to: Resource::new("test.Widget", "w"),
@@ -2062,9 +2062,9 @@ fn forcing_changed_multiline_green_style_does_not_cross_newline() {
         new: "[\n  \"new\"\n]".to_string(),
     };
     let effect = Effect::Update {
-        id: ResourceId::new("test.Widget", "w"),
+        id: ResourceId::with_identity("test.Widget", "w"),
         from: Box::new(State::existing(
-            ResourceId::new("test.Widget", "w"),
+            ResourceId::with_identity("test.Widget", "w"),
             HashMap::new(),
         )),
         to: Resource::new("test.Widget", "w"),
@@ -2183,7 +2183,7 @@ fn module_children_render_with_tree_connectors() {
     plan.add(Effect::Create(role));
 
     let cluster_site = CallSite::new(
-        EphemeralId::new(ResourceId::new("_virtual", "cluster")),
+        EphemeralId::new(ResourceId::with_identity("_virtual", "cluster")),
         "./modules/cluster",
     );
     let mut trace = ExpansionTrace::new();
@@ -2227,7 +2227,7 @@ fn module_child_connector_gutter_extends_through_nested_dependents() {
     plan.add(Effect::Create(bucket));
 
     let cluster_site = CallSite::new(
-        EphemeralId::new(ResourceId::new("_virtual", "cluster")),
+        EphemeralId::new(ResourceId::with_identity("_virtual", "cluster")),
         "./modules/cluster",
     );
     let mut trace = ExpansionTrace::new();
@@ -2256,8 +2256,8 @@ fn module_child_connector_gutter_extends_through_nested_dependents() {
 
 #[test]
 fn module_group_with_only_suppressed_move_does_not_emit_orphan_gutter() {
-    let from_id = ResourceId::new("aws.s3.Bucket", "cluster/old_logs");
-    let to_id = ResourceId::new("aws.s3.Bucket", "cluster/logs");
+    let from_id = ResourceId::with_identity("aws.s3.Bucket", "cluster/old_logs");
+    let to_id = ResourceId::with_identity("aws.s3.Bucket", "cluster/logs");
     let mut updated = Resource::new("aws.s3.Bucket", "cluster/logs");
     updated.id = to_id.clone();
 
@@ -2328,8 +2328,8 @@ fn resource_with_only_suppressed_move_dependent_does_not_emit_orphan_gutter() {
         "bucket",
         Value::Concrete(ConcreteValue::String("parent".to_string())),
     );
-    let from_id = ResourceId::new("aws.s3.Bucket", "old_child");
-    let to_id = ResourceId::new("aws.s3.Bucket", "new_child");
+    let from_id = ResourceId::with_identity("aws.s3.Bucket", "old_child");
+    let to_id = ResourceId::with_identity("aws.s3.Bucket", "new_child");
     let mut updated = Resource::new("aws.s3.Bucket", "new_child");
     updated.id = to_id.clone();
 

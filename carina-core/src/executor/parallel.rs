@@ -651,7 +651,7 @@ pub(super) async fn execute_effects_sequential(
                     // resolve_refs sees the same attribute map. Wait
                     // effects do not persist to the state file
                     // (handled by `state_writeback_should_skip`).
-                    let synthetic = ResourceId::new("__wait", &binding);
+                    let synthetic = ResourceId::with_identity("__wait", &binding);
                     let attrs: HashMap<String, Value> = state
                         .attributes
                         .iter()
@@ -756,7 +756,7 @@ mod tests {
     }
 
     fn update_effect(binding: &str, reads: &[(&str, &str)], writes: &[&str]) -> Effect {
-        let id = ResourceId::new("test", binding);
+        let id = ResourceId::with_identity("test", binding);
         let mut to = Resource::new("test", binding);
         to.binding = Some(binding.to_string());
         for (dep, attr) in reads {
@@ -774,7 +774,7 @@ mod tests {
     }
 
     fn replace_effect(binding: &str, reads: &[(&str, &str)]) -> Effect {
-        let id = ResourceId::new("test", binding);
+        let id = ResourceId::with_identity("test", binding);
         let mut to = Resource::new("test", binding);
         to.binding = Some(binding.to_string());
         for (dep, attr) in reads {
@@ -839,10 +839,10 @@ mod tests {
             self.create_log
                 .lock()
                 .unwrap()
-                .push(id.name_str().to_string());
+                .push(id.identity_or_empty().to_string());
             let id = id.clone();
             Box::pin(async move {
-                if id.name_str() == "alb" {
+                if id.identity_or_empty() == "alb" {
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                     Err(ProviderError::api_error("alb create failed"))
                 } else {
@@ -1324,7 +1324,7 @@ mod tests {
             )),
         );
         let virt = Composition {
-            id: ResourceId::with_provider("_virtual", "_virtual", "module", None),
+            id: ResourceId::with_provider_identity("_virtual", "_virtual", "module", None),
             signature: crate::resource::Signature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: virt_attrs,
@@ -1419,7 +1419,7 @@ mod tests {
             )),
         );
         let virt = Composition {
-            id: ResourceId::with_provider("_virtual", "_virtual", "bootstrap", None),
+            id: ResourceId::with_provider_identity("_virtual", "_virtual", "bootstrap", None),
             signature: crate::resource::Signature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: virt_attrs,

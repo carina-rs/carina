@@ -7,8 +7,8 @@ fn cascade_dependent_updates_adds_update_for_dependent() {
     // Subnet depends on VPC via ResourceRef
     // cascade_dependent_updates should add a CascadingUpdate to the Replace
 
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
+    let vpc_id = ResourceId::with_identity("ec2.Vpc", "my-vpc");
+    let subnet_id = ResourceId::with_identity("ec2.Subnet", "my-subnet");
 
     // Unresolved resources (before ref resolution)
     let vpc = Resource::new("ec2.Vpc", "my-vpc")
@@ -118,8 +118,8 @@ fn cascade_skips_resources_already_in_plan() {
     // If the dependent resource already has its own effect (e.g., Update),
     // cascade should not add a duplicate
 
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
+    let vpc_id = ResourceId::with_identity("ec2.Vpc", "my-vpc");
+    let subnet_id = ResourceId::with_identity("ec2.Subnet", "my-subnet");
 
     let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
@@ -214,7 +214,7 @@ fn cascade_skips_resources_already_in_plan() {
 fn cascade_no_op_without_create_before_destroy() {
     // Replace without create_before_destroy should not trigger cascading
 
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
+    let vpc_id = ResourceId::with_identity("ec2.Vpc", "my-vpc");
 
     let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
@@ -277,9 +277,9 @@ fn cascade_transitive_dependencies() {
     // VPC → Subnet → Instance (transitive chain)
     // Only Subnet directly depends on VPC, so only Subnet gets cascading update
 
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
-    let instance_id = ResourceId::new("ec2.Instance", "my-instance");
+    let vpc_id = ResourceId::with_identity("ec2.Vpc", "my-vpc");
+    let subnet_id = ResourceId::with_identity("ec2.Subnet", "my-subnet");
+    let instance_id = ResourceId::with_identity("ec2.Instance", "my-instance");
 
     let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
@@ -383,8 +383,8 @@ fn cascade_anonymous_resource_dependent() {
     // Anonymous resource (no _binding) that depends on a replaced resource
     // should still get a cascading update
 
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
+    let vpc_id = ResourceId::with_identity("ec2.Vpc", "my-vpc");
+    let subnet_id = ResourceId::with_identity("ec2.Subnet", "my-subnet");
 
     let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
@@ -475,8 +475,8 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
 
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
+    let vpc_id = ResourceId::with_identity("ec2.Vpc", "my-vpc");
+    let subnet_id = ResourceId::with_identity("ec2.Subnet", "my-subnet");
 
     // Unresolved resources (before ref resolution)
     let vpc = Resource::new("ec2.Vpc", "my-vpc")
@@ -629,8 +629,8 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
 fn cascade_generates_replace_when_create_only_list_contains_nested_ref() {
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let attachment_id = ResourceId::new("ec2.RouteTableAssociation", "my-assoc");
+    let vpc_id = ResourceId::with_identity("ec2.Vpc", "my-vpc");
+    let attachment_id = ResourceId::with_identity("ec2.RouteTableAssociation", "my-assoc");
 
     let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
@@ -756,8 +756,8 @@ fn cascade_generates_replace_when_create_only_list_contains_nested_ref() {
 fn cascade_hint_prefers_resource_ref_over_binding_ref_in_mixed_list() {
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let attachment_id = ResourceId::new("ec2.RouteTableAssociation", "my-assoc");
+    let vpc_id = ResourceId::with_identity("ec2.Vpc", "my-vpc");
+    let attachment_id = ResourceId::with_identity("ec2.RouteTableAssociation", "my-assoc");
 
     let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
@@ -861,8 +861,8 @@ fn cascade_hint_prefers_resource_ref_over_binding_ref_in_mixed_list() {
 fn cascade_generates_replace_when_create_only_map_contains_nested_ref() {
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let tagged_id = ResourceId::new("ec2.TaggedResource", "my-tagged");
+    let vpc_id = ResourceId::with_identity("ec2.Vpc", "my-vpc");
+    let tagged_id = ResourceId::with_identity("ec2.TaggedResource", "my-tagged");
 
     let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
@@ -1000,8 +1000,8 @@ fn cascade_generates_replace_when_create_only_map_contains_nested_ref() {
 fn cascade_prevent_destroy_blocks_nested_map_ref_promotion_to_replace() {
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let tagged_id = ResourceId::new("ec2.TaggedResource", "my-tagged");
+    let vpc_id = ResourceId::with_identity("ec2.Vpc", "my-vpc");
+    let tagged_id = ResourceId::with_identity("ec2.TaggedResource", "my-tagged");
 
     let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
@@ -1126,8 +1126,8 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
 
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
+    let vpc_id = ResourceId::with_identity("ec2.Vpc", "my-vpc");
+    let subnet_id = ResourceId::with_identity("ec2.Subnet", "my-subnet");
 
     // Unresolved resources (before ref resolution)
     let vpc = Resource::new("ec2.Vpc", "my-vpc")
@@ -1292,8 +1292,8 @@ fn auto_detect_create_before_destroy_when_resource_has_dependents() {
 
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
+    let vpc_id = ResourceId::with_identity("ec2.Vpc", "my-vpc");
+    let subnet_id = ResourceId::with_identity("ec2.Subnet", "my-subnet");
 
     // Unresolved resources (before ref resolution)
     let vpc = Resource::new("ec2.Vpc", "my-vpc")
@@ -1415,8 +1415,8 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
 
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
+    let vpc_id = ResourceId::with_identity("ec2.Vpc", "my-vpc");
+    let subnet_id = ResourceId::with_identity("ec2.Subnet", "my-subnet");
 
     // Unresolved resources (before ref resolution)
     let vpc = Resource::new("ec2.Vpc", "my-vpc")
@@ -1558,8 +1558,8 @@ fn cascade_prevent_destroy_blocks_promotion_to_replace() {
 
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
+    let vpc_id = ResourceId::with_identity("ec2.Vpc", "my-vpc");
+    let subnet_id = ResourceId::with_identity("ec2.Subnet", "my-subnet");
 
     let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")
@@ -1683,8 +1683,8 @@ fn cascade_prevent_destroy_blocks_merge_upgrade_to_replace() {
 
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
+    let vpc_id = ResourceId::with_identity("ec2.Vpc", "my-vpc");
+    let subnet_id = ResourceId::with_identity("ec2.Subnet", "my-subnet");
 
     let vpc = Resource::new("ec2.Vpc", "my-vpc")
         .with_binding("vpc")

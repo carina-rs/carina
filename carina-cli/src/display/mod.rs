@@ -587,7 +587,7 @@ impl<'a> TreeRenderContext<'a> {
                 if self.detail == DetailLevel::None {
                     let name_part = format_compact_name(
                         carina_core::parser::ResourceRef::Resource(r),
-                        r.id.name_str(),
+                        r.id.identity_or_empty(),
                         parent_binding,
                     );
                     writeln!(
@@ -604,7 +604,7 @@ impl<'a> TreeRenderContext<'a> {
                         "{}{} {}",
                         line_prefix,
                         r.id.display_type().cyan().bold(),
-                        r.id.name_str().white().bold()
+                        r.id.identity_or_empty().white().bold()
                     )
                     .unwrap();
                 }
@@ -613,11 +613,11 @@ impl<'a> TreeRenderContext<'a> {
                 let moved_note = self
                     .moved_origins
                     .get(id)
-                    .map(|from| format!(" (moved from: {})", from.name_str()));
+                    .map(|from| format!(" (moved from: {})", from.identity_or_empty()));
                 if self.detail == DetailLevel::None {
                     let name_part = format_compact_name(
                         carina_core::parser::ResourceRef::Resource(to),
-                        id.name_str(),
+                        id.identity_or_empty(),
                         parent_binding,
                     );
                     writeln!(
@@ -635,7 +635,7 @@ impl<'a> TreeRenderContext<'a> {
                         "{}{} {}{}",
                         line_prefix,
                         id.display_type().cyan().bold(),
-                        id.name_str().yellow().bold(),
+                        id.identity_or_empty().yellow().bold(),
                         moved_note.as_deref().unwrap_or("").yellow()
                     )
                     .unwrap();
@@ -652,11 +652,11 @@ impl<'a> TreeRenderContext<'a> {
                 let moved_note = self
                     .moved_origins
                     .get(id)
-                    .map(|from| format!(" (moved from: {})", from.name_str()));
+                    .map(|from| format!(" (moved from: {})", from.identity_or_empty()));
                 if self.detail == DetailLevel::None {
                     let name_part = format_compact_name(
                         carina_core::parser::ResourceRef::Resource(to),
-                        id.name_str(),
+                        id.identity_or_empty(),
                         parent_binding,
                     );
                     writeln!(
@@ -675,7 +675,7 @@ impl<'a> TreeRenderContext<'a> {
                         "{}{} {} {}{}",
                         line_prefix,
                         id.display_type().cyan().bold(),
-                        id.name_str().magenta().bold(),
+                        id.identity_or_empty().magenta().bold(),
                         replace_note.magenta(),
                         moved_note.as_deref().unwrap_or("").magenta()
                     )
@@ -683,7 +683,7 @@ impl<'a> TreeRenderContext<'a> {
                 }
             }
             Effect::Delete { id, binding, .. } => {
-                let display_name = binding.as_deref().unwrap_or(id.name_str());
+                let display_name = binding.as_deref().unwrap_or(id.identity_or_empty());
                 writeln!(
                     self.out,
                     "{}{} {}",
@@ -697,7 +697,7 @@ impl<'a> TreeRenderContext<'a> {
                 if self.detail == DetailLevel::None {
                     let name_part = format_compact_name(
                         carina_core::parser::ResourceRef::DataSource(resource),
-                        resource.id.name_str(),
+                        resource.id.identity_or_empty(),
                         parent_binding,
                     );
                     writeln!(
@@ -715,7 +715,7 @@ impl<'a> TreeRenderContext<'a> {
                         "{}{} {} {}",
                         line_prefix,
                         resource.id.display_type().cyan().bold(),
-                        resource.id.name_str().cyan().bold(),
+                        resource.id.identity_or_empty().cyan().bold(),
                         "(data source)".dimmed()
                     )
                     .unwrap();
@@ -734,7 +734,7 @@ impl<'a> TreeRenderContext<'a> {
                     "{}{} {} {}",
                     line_prefix,
                     id.display_type().cyan().bold(),
-                    id.name_str().cyan().bold(),
+                    id.identity_or_empty().cyan().bold(),
                     format!("(import: {})", identifier_str).dimmed()
                 )
                 .unwrap();
@@ -750,7 +750,7 @@ impl<'a> TreeRenderContext<'a> {
                     // "state-only success looks like failure" misread
                     // even after the leading `x` glyph fix. Yellow
                     // matches the `~` symbol family and Move's row.
-                    id.name_str().yellow().bold(),
+                    id.identity_or_empty().yellow().bold(),
                     "(remove from state)".dimmed()
                 )
                 .unwrap();
@@ -767,8 +767,8 @@ impl<'a> TreeRenderContext<'a> {
                     "{}{} {} {}",
                     line_prefix,
                     to.display_type().cyan().bold(),
-                    to.name_str().yellow().bold(),
-                    format!("(moved from: {})", from.name_str()).dimmed()
+                    to.identity_or_empty().yellow().bold(),
+                    format!("(moved from: {})", from.identity_or_empty()).dimmed()
                 )
                 .unwrap();
             }
@@ -2209,7 +2209,7 @@ pub fn format_effect(effect: &Effect) -> String {
             }
         }
         Effect::Delete { id, binding, .. } => {
-            let display_name = binding.as_deref().unwrap_or(id.name_str());
+            let display_name = binding.as_deref().unwrap_or(id.identity_or_empty());
             format!("Delete {} {}", id.display_type(), display_name)
         }
         Effect::Read { resource } => {

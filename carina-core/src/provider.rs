@@ -106,7 +106,13 @@ impl std::fmt::Display for ProviderError {
         // between the structured multi-line render and the legacy
         // chain-walk render so non-AWS errors keep the same shape.
         if let Some(ref id) = detail.resource_id {
-            write!(f, "[{}.{}] {}", id.resource_type, id.name, detail.message)?;
+            write!(
+                f,
+                "[{}.{}] {}",
+                id.resource_type,
+                id.identity_or_empty(),
+                detail.message
+            )?;
         } else {
             write!(f, "{}", detail.message)?;
         }
@@ -1595,14 +1601,14 @@ mod tests {
     #[tokio::test]
     async fn mock_provider_read_returns_not_found() {
         let provider = MockProvider;
-        let id = ResourceId::new("test", "example");
+        let id = ResourceId::with_identity("test", "example");
         let state = provider.read(&id, None, ReadRequest).await.unwrap();
         assert!(!state.exists);
     }
 
     #[test]
     fn create_outcome_exposes_state_and_diagnostic() {
-        let id = ResourceId::new("test", "example");
+        let id = ResourceId::with_identity("test", "example");
         let state = State::existing(id, HashMap::new()).with_identifier("mock-id");
         let diagnostic = PartialReadDiagnostic::new(
             "mock partial create".to_string(),
@@ -1629,7 +1635,7 @@ mod tests {
 
     #[test]
     fn create_outcome_empty_partial_diagnostic_becomes_success() {
-        let id = ResourceId::new("test", "example");
+        let id = ResourceId::with_identity("test", "example");
         let state = State::existing(id, HashMap::new()).with_identifier("mock-id");
 
         let outcome = CreateOutcome::partial_success(
@@ -1681,7 +1687,7 @@ mod tests {
     #[test]
     fn provider_default_satisfier_hint_is_empty() {
         let provider = MockProvider;
-        let id = ResourceId::new("test", "example");
+        let id = ResourceId::with_identity("test", "example");
         assert_eq!(
             provider.satisfier_hint(&id, &AttrPath::single("status")),
             Vec::new()
@@ -1865,7 +1871,7 @@ mod tests {
         let mut router = ProviderRouter::new();
         router.add_provider("mock".to_string(), Box::new(MockProvider));
 
-        let id = ResourceId::with_provider("mock", "test", "example", None);
+        let id = ResourceId::with_provider_identity("mock", "test", "example", None);
         let state = router.read(&id, None, ReadRequest).await.unwrap();
         assert!(!state.exists);
     }
@@ -1972,7 +1978,7 @@ mod tests {
     #[test]
     fn provider_error_display_with_resource_id_and_cause() {
         let cause = std::io::Error::other("timeout");
-        let id = ResourceId::new("s3.Bucket", "my-bucket");
+        let id = ResourceId::with_identity("s3.Bucket", "my-bucket");
         let err = ProviderError::api_error("Failed to read")
             .with_cause(cause)
             .for_resource(id);
@@ -1996,7 +2002,7 @@ mod tests {
     /// non-AWS errors.
     #[test]
     fn provider_error_display_multi_line_when_structured_fields_populated() {
-        let id = ResourceId::new("iam.Roles", "admin_access_roles");
+        let id = ResourceId::with_identity("iam.Roles", "admin_access_roles");
         let err = ProviderError::api_error("Failed to list IAM roles")
             .for_resource(id)
             .with_operation("iam.ListRoles")
@@ -2174,7 +2180,7 @@ mod tests {
     #[test]
     fn provider_error_display_multi_line_all_fields_including_cause() {
         let cause = std::io::Error::other("tls handshake failed");
-        let id = ResourceId::new("iam.Roles", "admin_access_roles");
+        let id = ResourceId::with_identity("iam.Roles", "admin_access_roles");
         let err = ProviderError::api_error("Failed to list IAM roles")
             .with_cause(cause)
             .for_resource(id)
@@ -2282,7 +2288,7 @@ mod tests {
 
     #[test]
     fn build_update_patch_classifies_ops() {
-        let id = ResourceId::new("test", "example");
+        let id = ResourceId::with_identity("test", "example");
         let mut from_attrs = HashMap::new();
         from_attrs.insert(
             "a".to_string(),
@@ -2333,7 +2339,7 @@ mod tests {
         let mut router = ProviderRouter::new();
         router.add_provider("mock".to_string(), Box::new(MockProvider));
 
-        let id = ResourceId::with_provider("mock", "test", "example", None);
+        let id = ResourceId::with_provider_identity("mock", "test", "example", None);
         let from = State::existing(id.clone(), HashMap::new());
         let request = UpdateRequest {
             from,
@@ -2352,7 +2358,7 @@ mod tests {
         let mut router = ProviderRouter::new();
         router.add_provider("mock".to_string(), Box::new(MockProvider));
 
-        let id = ResourceId::with_provider("mock", "test", "example", None);
+        let id = ResourceId::with_provider_identity("mock", "test", "example", None);
         let request = DeleteRequest::default();
         let result = router.delete(&id, "mock-id-123", request).await;
         assert!(result.is_ok());
@@ -2361,7 +2367,7 @@ mod tests {
     #[tokio::test]
     async fn provider_router_returns_error_for_unknown_provider() {
         let router = ProviderRouter::new();
-        let id = ResourceId::with_provider("nonexistent", "test", "example", None);
+        let id = ResourceId::with_provider_identity("nonexistent", "test", "example", None);
         let result = router.read(&id, None, ReadRequest).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -2439,7 +2445,7 @@ mod tests {
             Box::new(TaggedProvider { tag: "us" }),
         );
 
-        let default_id = ResourceId::with_provider("mock", "test", "a", None);
+        let default_id = ResourceId::with_provider_identity("mock", "test", "a", None);
         let state = router.read(&default_id, None, ReadRequest).await.unwrap();
         assert_eq!(
             state.attributes.get("tag"),
@@ -2449,7 +2455,7 @@ mod tests {
             "resources without provider_instance must route to the kind's default instance"
         );
 
-        let us_id = ResourceId::with_provider("mock", "test", "b", Some("us".to_string()));
+        let us_id = ResourceId::with_provider_identity("mock", "test", "b", Some("us".to_string()));
         let state = router.read(&us_id, None, ReadRequest).await.unwrap();
         assert_eq!(
             state.attributes.get("tag"),
@@ -2463,7 +2469,8 @@ mod tests {
         let mut router = ProviderRouter::new();
         router.add_provider("mock".to_string(), Box::new(MockProvider));
 
-        let id = ResourceId::with_provider("mock", "test", "x", Some("missing".to_string()));
+        let id =
+            ResourceId::with_provider_identity("mock", "test", "x", Some("missing".to_string()));
         let err = router.read(&id, None, ReadRequest).await.unwrap_err();
         let msg = err.message();
         assert!(
@@ -2691,7 +2698,7 @@ mod tests {
         );
 
         // Test hydrate_read_state
-        let id = ResourceId::new("test", "example");
+        let id = ResourceId::with_identity("test", "example");
         let mut states = HashMap::new();
         states.insert(id.clone(), State::existing(id.clone(), HashMap::new()));
         let mut saved: SavedAttrs = HashMap::new();

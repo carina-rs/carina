@@ -790,8 +790,8 @@ fn create_independent_create_plan<const N: usize>(names: [&str; N]) -> Plan {
 }
 
 fn create_interdependent_replace_plan() -> Plan {
-    let a_id = ResourceId::new("test", "a");
-    let b_id = ResourceId::new("test", "b");
+    let a_id = ResourceId::with_identity("test", "a");
+    let b_id = ResourceId::with_identity("test", "b");
 
     let a_from = State::existing(a_id.clone(), HashMap::new()).with_identifier("a-old");
     let mut a_to = Resource::new("test", "a");
@@ -840,7 +840,7 @@ fn create_interdependent_replace_plan_with_renames<const N: usize>(names: [&str;
     };
     let mut plan = Plan::new();
     for (idx, name) in names.iter().enumerate() {
-        let id = ResourceId::new("test", *name);
+        let id = ResourceId::with_identity("test", *name);
         let from =
             State::existing(id.clone(), HashMap::new()).with_identifier(format!("{name}-old"));
         let mut to = Resource::new("test", *name);
@@ -904,7 +904,7 @@ impl DelayedCountingProvider {
 
     fn delay_for(&self, id: &ResourceId) -> std::time::Duration {
         self.delays
-            .get(id.name_str())
+            .get(id.identity_or_empty())
             .copied()
             .unwrap_or(self.default_delay)
     }
@@ -939,9 +939,12 @@ impl Provider for DelayedCountingProvider {
         let cancel_after_create = self.cancel_after_create.clone();
         let cancel = self.cancel.clone();
         Box::pin(async move {
-            started.lock().unwrap().push(id.name_str().to_string());
+            started
+                .lock()
+                .unwrap()
+                .push(id.identity_or_empty().to_string());
             tokio::time::sleep(delay).await;
-            if cancel_after_create.as_deref() == Some(id.name_str())
+            if cancel_after_create.as_deref() == Some(id.identity_or_empty())
                 && let Some(cancel) = cancel
             {
                 cancel.cancel();
@@ -964,7 +967,7 @@ impl Provider for DelayedCountingProvider {
             started
                 .lock()
                 .unwrap()
-                .push(format!("update:{}", id.name_str()));
+                .push(format!("update:{}", id.identity_or_empty()));
             let mut attrs = HashMap::new();
             attrs.insert(
                 "finalized".to_string(),
@@ -988,7 +991,7 @@ impl Provider for DelayedCountingProvider {
             started
                 .lock()
                 .unwrap()
-                .push(format!("delete:{}", id.name_str()));
+                .push(format!("delete:{}", id.identity_or_empty()));
             Ok(())
         })
     }
@@ -1199,7 +1202,7 @@ impl ExecutionObserver for RecordingCancelsWhenWaitStarted {
 impl ExecutionObserver for CancelsWhenStarted {
     fn on_event(&self, event: &ExecutionEvent) {
         if let ExecutionEvent::EffectStarted { effect } = event
-            && effect.resource_id().name_str() == self.name
+            && effect.resource_id().identity_or_empty() == self.name
         {
             self.token.cancel();
         }
@@ -1547,7 +1550,7 @@ async fn execute_plan_cancelled_while_effect_in_flight_records_that_effect() {
     assert!(
         result
             .applied_states
-            .contains_key(&ResourceId::new("test", "r2"))
+            .contains_key(&ResourceId::with_identity("test", "r2"))
     );
     assert_eq!(provider.started_names(), vec!["r1", "r2"]);
 }
@@ -1583,7 +1586,7 @@ async fn execute_plan_phased_cancel_during_phase4_preserves_unprocessed_cbd_crea
     for name in ["a", "b"] {
         let state = result
             .applied_states
-            .get(&ResourceId::new("test", name))
+            .get(&ResourceId::with_identity("test", name))
             .expect("finalized resource should be recorded");
         assert_eq!(
             state.attributes.get("finalized"),
@@ -1593,7 +1596,7 @@ async fn execute_plan_phased_cancel_during_phase4_preserves_unprocessed_cbd_crea
     for name in ["c", "d"] {
         let state = result
             .applied_states
-            .get(&ResourceId::new("test", name))
+            .get(&ResourceId::with_identity("test", name))
             .expect("unprocessed CBD create state should be preserved");
         assert_eq!(
             state.attributes.get("finalized"),
@@ -1633,7 +1636,7 @@ async fn execute_plan_phased_cancelled_between_phases_keeps_completed_resources_
     assert!(
         result
             .applied_states
-            .contains_key(&ResourceId::new("test", "a"))
+            .contains_key(&ResourceId::with_identity("test", "a"))
     );
     assert!(
         !provider
@@ -2282,8 +2285,11 @@ async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
     ))));
     to_resource.set_attr("master_password", secret_value.clone());
 
-    let secret_ctx =
-        crate::value::SecretHashContext::new(rid.display_type(), rid.name_str(), "master_password");
+    let secret_ctx = crate::value::SecretHashContext::new(
+        rid.display_type(),
+        rid.identity_or_empty(),
+        "master_password",
+    );
     let hash_json = crate::value::value_to_json_with_context(&secret_value, Some(&secret_ctx))
         .expect("secret hash must serialize");
     let hash_str = hash_json
@@ -2348,8 +2354,11 @@ async fn test_apply_effective_changed_skips_secret_shape_divergence() {
         ])),
     );
 
-    let secret_ctx =
-        crate::value::SecretHashContext::new(rid.display_type(), rid.name_str(), "master_password");
+    let secret_ctx = crate::value::SecretHashContext::new(
+        rid.display_type(),
+        rid.identity_or_empty(),
+        "master_password",
+    );
     let hash_json = crate::value::value_to_json_with_context(&secret_value, Some(&secret_ctx))
         .expect("secret hash must serialize");
     let hash_str = hash_json
@@ -2620,7 +2629,7 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
 #[tokio::test]
 async fn test_simple_delete() {
     let provider = MockProvider::new();
-    let rid = ResourceId::new("test", "a");
+    let rid = ResourceId::with_identity("test", "a");
 
     let mut plan = Plan::new();
     plan.add(Effect::Delete {
@@ -2701,7 +2710,7 @@ async fn test_failed_effect_propagates_to_dependent() {
 async fn test_cbd_creates_before_deletes() {
     // CBD Replace: create should happen before delete
     let provider = MockProvider::new();
-    let rid = ResourceId::new("test", "a");
+    let rid = ResourceId::with_identity("test", "a");
     let from = State::existing(rid.clone(), HashMap::new()).with_identifier("old-id");
     let to = Resource::new("test", "a");
 
@@ -2752,13 +2761,13 @@ async fn test_cbd_creates_before_deletes() {
 #[tokio::test]
 async fn test_cbd_cascade_update_patch_uses_plan_time_comparison_semantics() {
     let provider = MockProvider::new();
-    let replace_id = ResourceId::with_provider("test", "replace", "replace", None);
+    let replace_id = ResourceId::with_provider_identity("test", "replace", "replace", None);
     let replace_from =
         State::existing(replace_id.clone(), HashMap::new()).with_identifier("replace-old");
     let mut replace_to = Resource::with_provider("test", "replace", "replace", None);
     replace_to.binding = Some("replace".to_string());
 
-    let cascade_id = ResourceId::with_provider("test", "a", "a", None);
+    let cascade_id = ResourceId::with_provider_identity("test", "a", "a", None);
     let mut cascade_from_attrs = HashMap::new();
     cascade_from_attrs.insert(
         "description".to_string(),
@@ -2838,7 +2847,7 @@ async fn test_cbd_cascade_update_patch_uses_plan_time_comparison_semantics() {
 #[tokio::test]
 async fn test_cbd_rename_partial_create_partial_counts_once() {
     let provider = MockProvider::new();
-    let id = ResourceId::with_provider("test", "replace", "replace", None);
+    let id = ResourceId::with_provider_identity("test", "replace", "replace", None);
     let from = State::existing(id.clone(), HashMap::new()).with_identifier("replace-old");
     let mut to = Resource::with_provider("test", "replace", "replace", None);
     to.binding = Some("replace".to_string());
@@ -2918,7 +2927,7 @@ async fn test_cbd_rename_partial_create_partial_counts_once() {
 #[tokio::test]
 async fn test_cbd_rename_success_create_partial_keeps_create_marker() {
     let provider = MockProvider::new();
-    let id = ResourceId::with_provider("test", "replace", "replace", None);
+    let id = ResourceId::with_provider_identity("test", "replace", "replace", None);
     let from = State::existing(id.clone(), HashMap::new()).with_identifier("replace-old");
     let mut to = Resource::with_provider("test", "replace", "replace", None);
     to.binding = Some("replace".to_string());
@@ -2991,7 +3000,7 @@ async fn test_cbd_rename_success_create_partial_keeps_create_marker() {
 async fn test_dbd_deletes_before_creates() {
     // Non-CBD Replace: delete should happen before create
     let provider = MockProvider::new();
-    let rid = ResourceId::new("test", "a");
+    let rid = ResourceId::with_identity("test", "a");
     let from = State::existing(rid.clone(), HashMap::new()).with_identifier("old-id");
     let to = Resource::new("test", "a");
 
@@ -3044,8 +3053,8 @@ async fn test_phased_cbd_creates_in_forward_order_deletes_in_reverse() {
     //   Phase 3: delete subnet, delete vpc (reverse)
     //   Phase 4: finalize (success events)
     let provider = MockProvider::new();
-    let vpc_id = ResourceId::new("test", "vpc");
-    let subnet_id = ResourceId::new("test", "subnet");
+    let vpc_id = ResourceId::with_identity("test", "vpc");
+    let subnet_id = ResourceId::with_identity("test", "subnet");
 
     let vpc_from = State::existing(vpc_id.clone(), HashMap::new()).with_identifier("vpc-old");
     let mut vpc_to = Resource::new("test", "vpc");
@@ -3130,8 +3139,8 @@ async fn test_phased_noncbd_creates_after_deletes() {
     //   Phase 3: delete subnet, delete vpc (reverse dependency)
     //   Phase 4: create vpc, create subnet (forward dependency)
     let provider = MockProvider::new();
-    let vpc_id = ResourceId::new("test", "vpc");
-    let subnet_id = ResourceId::new("test", "subnet");
+    let vpc_id = ResourceId::with_identity("test", "vpc");
+    let subnet_id = ResourceId::with_identity("test", "subnet");
 
     let vpc_from = State::existing(vpc_id.clone(), HashMap::new()).with_identifier("vpc-old");
     let mut vpc_to = Resource::new("test", "vpc");
@@ -3566,7 +3575,7 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
             _request: CreateRequest,
         ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
             let id_clone = id.clone();
-            let name = id.name_str().to_string();
+            let name = id.identity_or_empty().to_string();
             let delay = self.delays.get(&name).copied().unwrap_or(Duration::ZERO);
             let log = self.call_log.clone();
             Box::pin(async move {
@@ -3751,7 +3760,7 @@ impl Provider for DelayedUpdateProvider {
                 "tags".to_string(),
                 Value::Concrete(ConcreteValue::String("new".to_string())),
             );
-            if change_unrelated_id && id.name_str() == "vpc" {
+            if change_unrelated_id && id.identity_or_empty() == "vpc" {
                 attrs.insert(
                     "id".to_string(),
                     Value::Concrete(ConcreteValue::String("provider-violated-id".to_string())),
@@ -4011,8 +4020,8 @@ async fn test_waiting_events_emitted_for_dependent_effects() {
     let observer = MockObserver::new();
     let provider = MockProvider::new();
     // Push create results for both resources
-    let a_id = ResourceId::new("test", "a");
-    let c_id = ResourceId::new("test", "c");
+    let a_id = ResourceId::with_identity("test", "a");
+    let c_id = ResourceId::with_identity("test", "c");
     // Publish `id` in state.attributes so dependents resolve their
     // `ResourceRef(parent, "id")` refs (post-#3032 the executor
     // rejects unresolved refs at the apply seam).
@@ -4071,7 +4080,7 @@ fn test_build_dependency_levels_respects_delete_dependencies() {
     // For deletion: vpc delete must wait for subnet delete → subnet first, then vpc
     let mut plan = Plan::new();
     plan.add(Effect::Delete {
-        id: ResourceId::new("ec2.Vpc", "my-vpc"),
+        id: ResourceId::with_identity("ec2.Vpc", "my-vpc"),
         identifier: "vpc-123".to_string(),
         directives: Directives::default(),
         binding: Some("vpc".to_string()),
@@ -4079,7 +4088,7 @@ fn test_build_dependency_levels_respects_delete_dependencies() {
         explicit_dependencies: HashSet::new(),
     });
     plan.add(Effect::Delete {
-        id: ResourceId::new("ec2.Subnet", "my-subnet"),
+        id: ResourceId::with_identity("ec2.Subnet", "my-subnet"),
         identifier: "subnet-456".to_string(),
         directives: Directives::default(),
         binding: Some("subnet".to_string()),
@@ -4157,7 +4166,7 @@ fn test_build_dependency_levels_consistent_with_dependency_map() {
 #[tokio::test]
 async fn test_update_effect_binding_map_propagation() {
     let provider = MockProvider::new();
-    let ra_id = ResourceId::new("test", "a");
+    let ra_id = ResourceId::with_identity("test", "a");
 
     // Create initial state
     let from_state = State::existing(ra_id.clone(), HashMap::new()).with_identifier("id-original");
@@ -4206,7 +4215,7 @@ async fn test_update_effect_binding_map_propagation() {
 fn test_dependency_analysis_respects_delete_dependencies() {
     let mut plan = Plan::new();
     plan.add(Effect::Delete {
-        id: ResourceId::new("ec2.Vpc", "my-vpc"),
+        id: ResourceId::with_identity("ec2.Vpc", "my-vpc"),
         identifier: "vpc-123".to_string(),
         directives: Directives::default(),
         binding: Some("vpc".to_string()),
@@ -4214,7 +4223,7 @@ fn test_dependency_analysis_respects_delete_dependencies() {
         explicit_dependencies: std::collections::HashSet::new(),
     });
     plan.add(Effect::Delete {
-        id: ResourceId::new("ec2.Subnet", "my-subnet"),
+        id: ResourceId::with_identity("ec2.Subnet", "my-subnet"),
         identifier: "subnet-456".to_string(),
         directives: Directives::default(),
         binding: Some("subnet".to_string()),
@@ -4433,9 +4442,9 @@ impl Provider for RecordingMockProvider {
 #[tokio::test]
 async fn test_delete_waits_for_replace_cbd_of_dependent() {
     let provider = MockProvider::new();
-    let tgw_a_id = ResourceId::new("test", "tgw_a");
-    let tgw_b_id = ResourceId::new("test", "tgw_b");
-    let attachment_id = ResourceId::new("test", "attachment");
+    let tgw_a_id = ResourceId::with_identity("test", "tgw_a");
+    let tgw_b_id = ResourceId::with_identity("test", "tgw_b");
+    let attachment_id = ResourceId::with_identity("test", "attachment");
 
     // tgw_a is being deleted (binding removed from desired config)
     let tgw_a_deps: HashSet<String> = HashSet::new();
@@ -4534,9 +4543,9 @@ async fn test_delete_waits_for_replace_cbd_of_dependent() {
 #[tokio::test]
 async fn test_delete_waits_for_replace_cbd_even_when_delete_binding_is_none() {
     let provider = MockProvider::new();
-    let tgw_a_id = ResourceId::new("test", "tgw_a");
-    let tgw_b_id = ResourceId::new("test", "tgw_b");
-    let attachment_id = ResourceId::new("test", "attachment");
+    let tgw_a_id = ResourceId::with_identity("test", "tgw_a");
+    let tgw_b_id = ResourceId::with_identity("test", "tgw_b");
+    let attachment_id = ResourceId::with_identity("test", "attachment");
 
     // tgw_a Delete has binding: None (anonymous in step2 .crn)
     // but state recorded it as "tgw_a"
@@ -4937,7 +4946,7 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
     // ResourceId. This is what guarantees state writeback never sees
     // it as a real resource — `sorted_resources` (the writeback input)
     // does not contain `__wait` IDs.
-    let synthetic = ResourceId::new("__wait", "cert_issued");
+    let synthetic = ResourceId::with_identity("__wait", "cert_issued");
     assert!(
         result.applied_states.contains_key(&synthetic),
         "wait should register its captured State under the __wait synthetic id"
@@ -5734,7 +5743,7 @@ async fn deferred_create_dispatches_after_upstream_replace_before_wait_phased() 
     )
     .with_identifier("new");
     let dep_state = State::existing(dep_id.clone(), HashMap::new()).with_identifier("dep-new");
-    let validation_id = ResourceId::new("test", "validation_records[0]");
+    let validation_id = ResourceId::with_identity("test", "validation_records[0]");
     let validation_state =
         State::existing(validation_id.clone(), HashMap::new()).with_identifier("validation");
 
@@ -5768,7 +5777,7 @@ async fn deferred_create_dispatches_after_upstream_replace_before_wait_phased() 
         cascade_ref_hints: Vec::new(),
     });
     plan.add(Effect::DeferredCreate {
-        id: ResourceId::new("__deferred_for", "validation_records"),
+        id: ResourceId::with_identity("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(validation_deferred_for_expression()),
     });
@@ -5894,7 +5903,7 @@ async fn deferred_create_emits_zero_children_when_collection_is_empty() {
         cascade_ref_hints: Vec::new(),
     });
     plan.add(Effect::DeferredCreate {
-        id: ResourceId::new("__deferred_for", "validation_records"),
+        id: ResourceId::with_identity("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(validation_deferred_for_expression()),
     });
@@ -6049,7 +6058,7 @@ async fn deferred_create_cancelled_after_upstream_create_reports_skipped() {
         cascade_ref_hints: Vec::new(),
     });
     plan.add(Effect::DeferredCreate {
-        id: ResourceId::new("__deferred_for", "validation_records"),
+        id: ResourceId::with_identity("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(validation_deferred_for_expression()),
     });
@@ -6088,7 +6097,7 @@ async fn deferred_create_returns_error_when_upstream_binding_missing() {
     let provider = MockProvider::new();
     let mut plan = Plan::new();
     plan.add(Effect::DeferredCreate {
-        id: ResourceId::new("__deferred_for", "validation_records"),
+        id: ResourceId::with_identity("__deferred_for", "validation_records"),
         upstream_binding: "missing_cert".to_string(),
         template: Box::new(validation_deferred_for_expression()),
     });
@@ -6127,7 +6136,7 @@ async fn deferred_create_returns_error_when_iterable_attr_missing() {
     let mut plan = Plan::new();
     plan.add(Effect::Create(cert));
     plan.add(Effect::DeferredCreate {
-        id: ResourceId::new("__deferred_for", "validation_records"),
+        id: ResourceId::with_identity("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(validation_deferred_for_expression()),
     });
@@ -6174,7 +6183,7 @@ async fn apply_time_deferred_create_emits_failed_on_shape_mismatch() {
     let mut plan = Plan::new();
     plan.add(Effect::Create(cert));
     plan.add(Effect::DeferredCreate {
-        id: ResourceId::new("__deferred_for", "validation_records"),
+        id: ResourceId::with_identity("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(validation_deferred_for_expression()),
     });
@@ -6271,7 +6280,7 @@ async fn dispatch_deferred_replace_runs_deletes_concurrently() {
         }
     }
 
-    let cert_id = ResourceId::new("test", "cert_concurrent_deferred_replace");
+    let cert_id = ResourceId::with_identity("test", "cert_concurrent_deferred_replace");
     let cert_state = State::existing(
         cert_id.clone(),
         HashMap::from([(
@@ -6293,7 +6302,7 @@ async fn dispatch_deferred_replace_runs_deletes_concurrently() {
             )])),
         )]),
     );
-    let validation_id = ResourceId::new("test", "validation_records[0]");
+    let validation_id = ResourceId::with_identity("test", "validation_records[0]");
     let validation_state =
         State::existing(validation_id.clone(), HashMap::new()).with_identifier("new-validation");
     let entered_deletes = Arc::new(AtomicUsize::new(0));
@@ -6316,7 +6325,7 @@ async fn dispatch_deferred_replace_runs_deletes_concurrently() {
     plan.add(Effect::DeferredReplace {
         deletes: NonEmptyDeletes::try_new(vec![
             DeferredReplaceDelete {
-                id: ResourceId::new("test", "validation_records[0]"),
+                id: ResourceId::with_identity("test", "validation_records[0]"),
                 identifier: "old-validation-0".to_string(),
                 directives: Directives::default(),
                 binding: Some("validation_records[0]".to_string()),
@@ -6324,7 +6333,7 @@ async fn dispatch_deferred_replace_runs_deletes_concurrently() {
                 explicit_dependencies: HashSet::new(),
             },
             DeferredReplaceDelete {
-                id: ResourceId::new("test", "validation_records[1]"),
+                id: ResourceId::with_identity("test", "validation_records[1]"),
                 identifier: "old-validation-1".to_string(),
                 directives: Directives::default(),
                 binding: Some("validation_records[1]".to_string()),
@@ -6333,7 +6342,7 @@ async fn dispatch_deferred_replace_runs_deletes_concurrently() {
             },
         ])
         .expect("fixture has deletes"),
-        id: ResourceId::new("__deferred_for", "validation_records"),
+        id: ResourceId::with_identity("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(validation_deferred_for_expression()),
     });
@@ -6373,7 +6382,7 @@ async fn dispatch_deferred_replace_runs_deletes_concurrently() {
 
 #[tokio::test]
 async fn dispatch_deferred_replace_short_circuits_on_delete_failure() {
-    let cert_id = ResourceId::new("test", "cert_delete_failure");
+    let cert_id = ResourceId::with_identity("test", "cert_delete_failure");
     let cert_state = State::existing(
         cert_id.clone(),
         HashMap::from([(
@@ -6398,7 +6407,7 @@ async fn dispatch_deferred_replace_short_circuits_on_delete_failure() {
     let provider = MockProvider::new();
     provider.push_create(Ok(cert_state));
     provider.push_delete(Err(ProviderError::api_error("delete failed")));
-    provider.push_read(Ok(State::not_found(ResourceId::new(
+    provider.push_read(Ok(State::not_found(ResourceId::with_identity(
         "test",
         "validation_records[0]",
     ))));
@@ -6409,7 +6418,7 @@ async fn dispatch_deferred_replace_short_circuits_on_delete_failure() {
     plan.add(Effect::Create(cert));
     plan.add(Effect::DeferredReplace {
         deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
-            id: ResourceId::new("test", "validation_records[0]"),
+            id: ResourceId::with_identity("test", "validation_records[0]"),
             identifier: "old-validation".to_string(),
             directives: Directives::default(),
             binding: Some("validation_records[0]".to_string()),
@@ -6417,7 +6426,7 @@ async fn dispatch_deferred_replace_short_circuits_on_delete_failure() {
             explicit_dependencies: HashSet::new(),
         }])
         .expect("fixture has one delete"),
-        id: ResourceId::new("__deferred_for", "validation_records"),
+        id: ResourceId::with_identity("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(validation_deferred_for_expression()),
     });
@@ -6456,19 +6465,19 @@ async fn phased_deferred_replace_gate_skips_on_absorbed_delete_failure() {
     // Regression for carina#3611: current phased.rs records failures by
     // binding string only, so an expanded DeferredReplace delete failure can
     // be missed by the DR gate and the child Create is materialized anyway.
-    let cert_id = ResourceId::new("test", "cert_delete_failure_phased");
+    let cert_id = ResourceId::with_identity("test", "cert_delete_failure_phased");
     let mut cert = Resource::new("test", "cert_delete_failure_phased");
     cert.binding = Some("cert".to_string());
     let old_cert_state =
         State::existing(cert_id.clone(), HashMap::new()).with_identifier("cert-old");
 
-    let dep_id = ResourceId::new("test", "dep_delete_failure_phased");
+    let dep_id = ResourceId::with_identity("test", "dep_delete_failure_phased");
     let mut dep = Resource::new("test", "dep_delete_failure_phased");
     dep.binding = Some("dep".to_string());
     dep.dependency_bindings.insert("cert".to_string());
     let old_dep_state = State::existing(dep_id.clone(), HashMap::new()).with_identifier("dep-old");
 
-    let validation_id = ResourceId::new("test", "validation_records[0]");
+    let validation_id = ResourceId::with_identity("test", "validation_records[0]");
     let validation_state =
         State::existing(validation_id.clone(), HashMap::new()).with_identifier("new-validation");
 
@@ -6514,7 +6523,7 @@ async fn phased_deferred_replace_gate_skips_on_absorbed_delete_failure() {
             explicit_dependencies: HashSet::new(),
         }])
         .expect("fixture has one delete"),
-        id: ResourceId::new("__deferred_for", "validation_records"),
+        id: ResourceId::with_identity("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(validation_deferred_for_expression()),
     });
@@ -6597,13 +6606,13 @@ async fn phased_cbd_replace_skips_when_phase1_dependency_fails() {
     let mut bucket = Resource::new("test", "bucket_phase1_cbd_dep");
     bucket.binding = Some("bucket".to_string());
 
-    let anchor_id = ResourceId::new("test", "anchor_phase1_cbd_dep");
+    let anchor_id = ResourceId::with_identity("test", "anchor_phase1_cbd_dep");
     let mut anchor_to = Resource::new("test", "anchor_phase1_cbd_dep");
     anchor_to.binding = Some("anchor".to_string());
     let anchor_from =
         State::existing(anchor_id.clone(), HashMap::new()).with_identifier("old-anchor");
 
-    let policy_id = ResourceId::new("test", "policy_phase1_cbd_dep");
+    let policy_id = ResourceId::with_identity("test", "policy_phase1_cbd_dep");
     let mut policy_to = make_resource("policy", &["anchor"]);
     policy_to.id = policy_id.clone();
     policy_to.directives = Directives {
@@ -6692,13 +6701,13 @@ async fn phased_replace_delete_skips_when_phase1_dependency_fails() {
     let mut bucket = Resource::new("test", "bucket_phase1_delete_dep");
     bucket.binding = Some("bucket".to_string());
 
-    let anchor_id = ResourceId::new("test", "anchor_phase1_delete_dep");
+    let anchor_id = ResourceId::with_identity("test", "anchor_phase1_delete_dep");
     let mut anchor_to = Resource::new("test", "anchor_phase1_delete_dep");
     anchor_to.binding = Some("anchor".to_string());
     let anchor_from =
         State::existing(anchor_id.clone(), HashMap::new()).with_identifier("old-anchor");
 
-    let target_id = ResourceId::new("test", "anonymous_phase1_delete_dep");
+    let target_id = ResourceId::with_identity("test", "anonymous_phase1_delete_dep");
     let mut target_to = make_resource("anonymous_phase1_delete_dep", &["anchor"]);
     target_to.binding = None;
     target_to.directives.depends_on.push("bucket".to_string());
@@ -6791,18 +6800,18 @@ async fn phased_anonymous_replace_failure_propagates_to_dependent_wait() {
     // kept failed_bindings: HashSet<String>, so a failed anonymous Replace
     // (binding_name() == None) is not recorded and a dependent Wait can run
     // until timeout instead of being skipped as dependency-failed.
-    let a_id = ResourceId::new("test", "a_anonymous_wait_gate");
+    let a_id = ResourceId::with_identity("test", "a_anonymous_wait_gate");
     let mut a = Resource::new("test", "a_anonymous_wait_gate");
     a.binding = Some("a".to_string());
     let old_a_state = State::existing(a_id.clone(), HashMap::new()).with_identifier("a-old");
 
-    let b_id = ResourceId::new("test", "b_anonymous_wait_gate");
+    let b_id = ResourceId::with_identity("test", "b_anonymous_wait_gate");
     let mut b = Resource::new("test", "b_anonymous_wait_gate");
     b.binding = Some("b".to_string());
     b.dependency_bindings.insert("a".to_string());
     let old_b_state = State::existing(b_id.clone(), HashMap::new()).with_identifier("b-old");
 
-    let anonymous_id = ResourceId::new("test", "anonymous_wait_target");
+    let anonymous_id = ResourceId::with_identity("test", "anonymous_wait_target");
     let old_anonymous_state =
         State::existing(anonymous_id.clone(), HashMap::new()).with_identifier("anon-old");
     let anonymous_to = Resource::new("test", "anonymous_wait_target");
@@ -6929,19 +6938,19 @@ async fn phased_cross_phase_explicit_dependency_failure_triggers_wait_terminal()
     use crate::effect::ChangedCreateOnly;
     use crate::wait::predicate::{AttrPath, WaitPredicate};
 
-    let failed_id = ResourceId::new("test", "failed_cross_phase_update");
+    let failed_id = ResourceId::with_identity("test", "failed_cross_phase_update");
     let old_failed_state =
         State::existing(failed_id.clone(), HashMap::new()).with_identifier("failed-old");
     let mut failed_to = Resource::new("test", "failed_cross_phase_update");
     failed_to.binding = Some("b".to_string());
 
-    let parent_id = ResourceId::new("test", "cross_phase_wait_parent");
+    let parent_id = ResourceId::with_identity("test", "cross_phase_wait_parent");
     let mut parent = Resource::new("test", "cross_phase_wait_parent");
     parent.binding = Some("parent".to_string());
     let old_parent_state =
         State::existing(parent_id.clone(), HashMap::new()).with_identifier("parent-old");
 
-    let child_id = ResourceId::new("test", "cross_phase_wait_child");
+    let child_id = ResourceId::with_identity("test", "cross_phase_wait_child");
     let mut child = Resource::new("test", "cross_phase_wait_child");
     child.binding = Some("child".to_string());
     child.dependency_bindings.insert("parent".to_string());
@@ -7083,7 +7092,7 @@ fn phased_anonymous_replace_failure_unblocks_wait_terminal_check() {
     // The scheduler graph proves the Wait depends on the failed anonymous
     // Replace, and the terminal counter must consult the same FailureView
     // rather than a lossy failed-binding-name projection.
-    let anonymous_id = ResourceId::new("test", "anonymous_wait_terminal_target");
+    let anonymous_id = ResourceId::with_identity("test", "anonymous_wait_terminal_target");
     let old_anonymous_state =
         State::existing(anonymous_id.clone(), HashMap::new()).with_identifier("anon-old");
     let anonymous_to = Resource::new("test", "anonymous_wait_terminal_target");
@@ -7179,7 +7188,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
             Box::pin(async move {
                 let is_alb = resources
                     .iter()
-                    .any(|resource| resource.id.name_str() == "alb");
+                    .any(|resource| resource.id.identity_or_empty() == "alb");
                 {
                     let _aws = self.scenario.aws_normalize.lock().await;
                     tokio::task::yield_now().await;
@@ -7229,7 +7238,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
             id: &ResourceId,
         ) -> ProviderResult<crate::provider::CreateOutcome> {
             self.scenario.record(format!("create:{id}"));
-            if id.name_str() == "cert" {
+            if id.identity_or_empty() == "cert" {
                 let _provider_lock = self.scenario.awscc_shared.lock().await;
                 self.scenario.alb_waiting_for_awscc.notified().await;
                 return Ok(crate::provider::CreateOutcome::Success {
@@ -7237,7 +7246,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
                 });
             }
 
-            if id.name_str() == "alb" {
+            if id.identity_or_empty() == "alb" {
                 let _provider_lock = self.scenario.awscc_shared.lock().await;
                 return Ok(crate::provider::CreateOutcome::Success {
                     state: State::existing(id.clone(), HashMap::new()).with_identifier("alb-id"),
@@ -7246,7 +7255,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
 
             Ok(crate::provider::CreateOutcome::Success {
                 state: State::existing(id.clone(), HashMap::new())
-                    .with_identifier(format!("{}-id", id.name_str())),
+                    .with_identifier(format!("{}-id", id.identity_or_empty())),
             })
         }
 
@@ -7327,7 +7336,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
     plan.add(Effect::Create(resource_with_binding("alb", "alb")));
     plan.add(Effect::DeferredReplace {
         deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
-            id: ResourceId::new("test", "validation_records[0]"),
+            id: ResourceId::with_identity("test", "validation_records[0]"),
             identifier: "old-validation".to_string(),
             directives: Directives::default(),
             binding: Some("validation_records[0]".to_string()),
@@ -7335,7 +7344,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
             explicit_dependencies: HashSet::new(),
         }])
         .expect("fixture has one delete"),
-        id: ResourceId::new("__deferred_for", "validation_records"),
+        id: ResourceId::with_identity("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(validation_deferred_for_expression()),
     });
@@ -7368,13 +7377,14 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
         result
             .runtime_synthesized_resources
             .iter()
-            .any(|resource| resource.id == ResourceId::new("test", "validation_records[0]")),
+            .any(|resource| resource.id
+                == ResourceId::with_identity("test", "validation_records[0]")),
         "deferred replace gate must synthesize the child create"
     );
     assert!(
         result
             .applied_states
-            .contains_key(&ResourceId::new("test", "validation_records[0]")),
+            .contains_key(&ResourceId::with_identity("test", "validation_records[0]")),
         "post-state must include the synthesized child create"
     );
     assert!(
@@ -7429,9 +7439,9 @@ fn cert_state_for_deferred_replace_deadlock(id: &ResourceId) -> State {
 async fn test_phased_move_with_interdependent_replace_does_not_panic() {
     let provider = MockProvider::new();
 
-    let role_id = ResourceId::new("test", "role");
-    let policy_old_id = ResourceId::new("test", "policy_old");
-    let policy_new_id = ResourceId::new("test", "policy_new");
+    let role_id = ResourceId::with_identity("test", "role");
+    let policy_old_id = ResourceId::with_identity("test", "policy_old");
+    let policy_new_id = ResourceId::with_identity("test", "policy_new");
 
     let role_from = State::existing(role_id.clone(), HashMap::new()).with_identifier("role-old");
     let mut role_to = Resource::new("test", "role");
@@ -7473,7 +7483,10 @@ async fn test_phased_move_with_interdependent_replace_does_not_panic() {
     provider.push_delete(Ok(()));
     provider.push_create(Ok(ok_state(&role_id)));
     provider.push_delete(Ok(()));
-    provider.push_create(Ok(ok_state(&ResourceId::new("test", "policy_new"))));
+    provider.push_create(Ok(ok_state(&ResourceId::with_identity(
+        "test",
+        "policy_new",
+    ))));
 
     let input = ExecutionInput {
         plan: &plan,
@@ -7537,7 +7550,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
     // The DSL attributes hold input filters only; the produced `arns`
     // list lives in `current_states[ds.id]`. `with_provider` matches
     // the id shape real apply uses.
-    let ds_id = ResourceId::with_provider("aws", "iam.Roles", "admin_access_roles", None);
+    let ds_id = ResourceId::with_provider_identity("aws", "iam.Roles", "admin_access_roles", None);
     let mut ds = DataSource::with_provider("aws", "iam.Roles", "admin_access_roles", None);
     ds.id = ds_id.clone();
     ds.binding = Some("admin_access_roles".to_string());
@@ -7570,7 +7583,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
     // `admin_access_roles.arns`. (Modelled as a top-level attribute
     // for test concision; the production case nests it inside a
     // struct, but the resolve path is the same per-attribute one.)
-    let role_id = ResourceId::with_provider("awscc", "iam.Role", "rd.role", None);
+    let role_id = ResourceId::with_provider_identity("awscc", "iam.Role", "rd.role", None);
     let role = {
         let mut r = Resource::with_provider("awscc", "iam.Role", "rd.role", None);
         r.id = role_id.clone();

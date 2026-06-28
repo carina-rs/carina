@@ -423,7 +423,7 @@ mod tests {
 
     #[test]
     fn wait_observed_attr_is_deterministic() {
-        let target_id = ResourceId::new("aws.test.Resource", "demo");
+        let target_id = ResourceId::with_identity("aws.test.Resource", "demo");
         let attrs = HashMap::from([
             (
                 "status".to_string(),
@@ -442,7 +442,7 @@ mod tests {
 
     #[test]
     fn wait_observed_attr_uses_predicate_attr_when_present() {
-        let target_id = ResourceId::new("aws.test.Resource", "demo");
+        let target_id = ResourceId::with_identity("aws.test.Resource", "demo");
         let status = AttrPath::single("status");
         let predicate = equals_predicate(status, "pending");
         let attrs = HashMap::from([
@@ -462,7 +462,7 @@ mod tests {
 
     #[test]
     fn wait_observed_attr_formats_multi_segment_predicate_attr() {
-        let target_id = ResourceId::new("aws.test.Resource", "demo");
+        let target_id = ResourceId::with_identity("aws.test.Resource", "demo");
         let renewal_status =
             AttrPath::try_new(vec!["renewal_summary".into(), "renewal_status".into()]).unwrap();
         let predicate = equals_predicate(renewal_status, "PENDING");
@@ -483,7 +483,7 @@ mod tests {
 
     #[test]
     fn wait_observed_attr_falls_back_to_sort_first_when_predicate_attr_missing() {
-        let target_id = ResourceId::new("aws.test.Resource", "demo");
+        let target_id = ResourceId::with_identity("aws.test.Resource", "demo");
         let xyz = AttrPath::single("xyz");
         let predicate = equals_predicate(xyz, "present");
         let attrs = HashMap::from([
@@ -503,7 +503,7 @@ mod tests {
 
     #[test]
     fn wait_observed_attr_uses_display_formatting() {
-        let target_id = ResourceId::new("aws.test.Resource", "demo");
+        let target_id = ResourceId::with_identity("aws.test.Resource", "demo");
         let attrs = HashMap::from([(
             "arn".to_string(),
             Value::Concrete(ConcreteValue::String(
@@ -521,7 +521,7 @@ mod tests {
 
     #[test]
     fn wait_observed_attr_handles_unknown_value() {
-        let target_id = ResourceId::new("aws.test.Resource", "demo");
+        let target_id = ResourceId::with_identity("aws.test.Resource", "demo");
         let attrs = HashMap::from([(
             "status".to_string(),
             Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),

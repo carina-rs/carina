@@ -25,7 +25,7 @@ fn make_managed(binding: &str, attrs: &[(&str, Value)]) -> Resource {
         attributes.insert((*k).into(), v.clone());
     }
     Resource {
-        id: ResourceId::new("aws.s3.Bucket", binding),
+        id: ResourceId::with_identity("aws.s3.Bucket", binding),
         attributes,
         directives: Default::default(),
         prefixes: HashMap::new(),
@@ -45,7 +45,7 @@ fn make_virtual(binding: &str, attrs: &[(&str, Value)]) -> Composition {
         );
     }
     Composition {
-        id: ResourceId::new("_virtual.module", binding),
+        id: ResourceId::with_identity("_virtual.module", binding),
         signature: Signature {
             arguments: IndexMap::new(),
             attributes,

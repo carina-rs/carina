@@ -39,7 +39,7 @@ fn make_managed(binding: &str, attrs: &[(&str, Value)]) -> Resource {
         attributes.insert((*k).into(), v.clone());
     }
     Resource {
-        id: ResourceId::new("aws.s3.Bucket", binding),
+        id: ResourceId::with_identity("aws.s3.Bucket", binding),
         attributes,
         directives: Default::default(),
         prefixes: HashMap::new(),
@@ -59,7 +59,7 @@ fn make_virtual(binding: &str, attrs: &[(&str, Value)]) -> Composition {
         );
     }
     Composition {
-        id: ResourceId::new("_virtual.module", binding),
+        id: ResourceId::with_identity("_virtual.module", binding),
         signature: Signature {
             arguments: IndexMap::new(),
             attributes,
@@ -311,17 +311,19 @@ fn resolve_managed_refs_legacy_shim_produces_identical_result() {
 
     for (m, l) in managed.iter().zip(legacy.iter()) {
         assert_eq!(
-            m.attributes, l.attributes,
+            m.attributes,
+            l.attributes,
             "managed/legacy attribute divergence for {}",
-            m.id.name,
+            m.id.identity_or_empty(),
         );
         // `dependency_bindings` is the second mutation the legacy
         // pipeline performs; the bridge's writeback contract names
         // both fields, so the equivalence guard does too.
         assert_eq!(
-            m.dependency_bindings, l.dependency_bindings,
+            m.dependency_bindings,
+            l.dependency_bindings,
             "managed/legacy dependency_bindings divergence for {}",
-            m.id.name,
+            m.id.identity_or_empty(),
         );
     }
 }

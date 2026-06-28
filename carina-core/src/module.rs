@@ -373,7 +373,7 @@ impl RootConfigSignature {
             let binding_name = resource
                 .binding
                 .clone()
-                .unwrap_or_else(|| resource.id.name_str().to_string());
+                .unwrap_or_else(|| resource.id.identity_or_empty().to_string());
 
             let resource_type_str = resource
                 .attributes
@@ -417,7 +417,7 @@ impl RootConfigSignature {
             let binding_name = resource
                 .binding
                 .clone()
-                .unwrap_or_else(|| resource.id.name_str().to_string());
+                .unwrap_or_else(|| resource.id.identity_or_empty().to_string());
 
             for (attr_key, value) in &resource.attributes {
                 if attr_key.starts_with('_') {
@@ -848,7 +848,7 @@ impl ModuleSignature {
             let binding_name = resource
                 .binding
                 .clone()
-                .unwrap_or_else(|| resource.id.name_str().to_string());
+                .unwrap_or_else(|| resource.id.identity_or_empty().to_string());
 
             let resource_type_str = resource
                 .attributes
@@ -881,7 +881,7 @@ impl ModuleSignature {
             let binding_name = resource
                 .binding
                 .clone()
-                .unwrap_or_else(|| resource.id.name_str().to_string());
+                .unwrap_or_else(|| resource.id.identity_or_empty().to_string());
 
             for (attr_key, value) in &resource.attributes {
                 if attr_key.starts_with('_') {

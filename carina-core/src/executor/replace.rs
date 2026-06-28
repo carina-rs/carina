@@ -57,7 +57,7 @@ pub fn compute_full_diff_patch(
                 });
                 let secret_ctx = Some(SecretHashContext::new(
                     resource_id.display_type(),
-                    resource_id.name_str(),
+                    resource_id.identity_or_empty(),
                     key,
                 ));
                 let comparison_value =

@@ -150,10 +150,13 @@ fn topological_sort(resources: &[Resource]) -> Result<Vec<Resource>, String> {
         visiting: &mut Vec<String>,
         sorted: &mut Vec<Resource>,
     ) -> Result<(), String> {
-        let binding_name = resource
-            .binding
-            .clone()
-            .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name_str()));
+        let binding_name = resource.binding.clone().unwrap_or_else(|| {
+            format!(
+                "{}:{}",
+                resource.id.resource_type,
+                resource.id.identity_or_empty()
+            )
+        });
 
         if visited.contains(&binding_name) {
             return Ok(());
@@ -209,7 +212,7 @@ mod tests {
     fn wait_effect_with_explicit_dependency(binding: Option<&str>) -> Effect {
         Effect::Wait {
             binding: "cert_issued".to_string(),
-            target_id: ResourceId::new("acm.Certificate", "cert"),
+            target_id: ResourceId::with_identity("acm.Certificate", "cert"),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
                 value: Value::Concrete(crate::resource::ConcreteValue::String(
@@ -266,7 +269,7 @@ mod tests {
         let mut dep_bindings = BTreeSet::new();
         dep_bindings.insert("explicit_dep".to_string());
         let virt = Composition {
-            id: ResourceId::new("_virtual.module", "v"),
+            id: ResourceId::with_identity("_virtual.module", "v"),
             signature: Signature {
                 arguments: IndexMap::new(),
                 attributes,
@@ -454,9 +457,9 @@ mod tests {
         let creation_order: Vec<String> = sorted
             .iter()
             .map(|r| {
-                r.binding
-                    .clone()
-                    .unwrap_or_else(|| format!("{}:{}", r.id.resource_type, r.id.name_str()))
+                r.binding.clone().unwrap_or_else(|| {
+                    format!("{}:{}", r.id.resource_type, r.id.identity_or_empty())
+                })
             })
             .collect();
 
@@ -538,9 +541,9 @@ mod tests {
         let creation_order: Vec<String> = sorted
             .iter()
             .map(|r| {
-                r.binding
-                    .clone()
-                    .unwrap_or_else(|| format!("{}:{}", r.id.resource_type, r.id.name_str()))
+                r.binding.clone().unwrap_or_else(|| {
+                    format!("{}:{}", r.id.resource_type, r.id.identity_or_empty())
+                })
             })
             .collect();
 

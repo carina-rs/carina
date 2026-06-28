@@ -169,7 +169,7 @@ pub fn reconcile_prefixed_names(
         let state_info = find_state(
             &resource.id.provider,
             &resource.id.resource_type,
-            resource.id.name_str(),
+            resource.id.identity_or_empty(),
         );
         let state_info = match state_info {
             Some(si) => si,
@@ -563,7 +563,7 @@ pub fn compute_anonymous_identifiers_for_test(
     )
 }
 
-/// Compute stable identifiers for anonymous resources (those with empty ResourceId.name).
+/// Compute stable identifiers for anonymous resources (those without ResourceId identity).
 /// Uses create-only properties and provider identity attributes to generate a deterministic hash.
 ///
 /// `identity_attributes_fn` takes a provider name and returns the list of identity attribute names
@@ -581,7 +581,7 @@ pub fn compute_anonymous_identifiers_with_provider_configs(
     let mut computed: Vec<(usize, String)> = Vec::new();
 
     for (idx, resource) in resources.iter().enumerate() {
-        if !resource.id.name.is_pending() {
+        if resource.id.identity.is_some() {
             continue;
         }
 
@@ -719,8 +719,12 @@ pub fn compute_anonymous_identifiers_with_provider_configs(
         let provider = resources[idx].id.provider.clone();
         let resource_type = resources[idx].id.resource_type.clone();
         let provider_instance = resources[idx].id.provider_instance.clone();
-        resources[idx].id =
-            ResourceId::with_provider(&provider, &resource_type, identifier, provider_instance);
+        resources[idx].id = ResourceId::with_provider_identity(
+            &provider,
+            &resource_type,
+            identifier,
+            provider_instance,
+        );
     }
 
     Ok(())
@@ -838,13 +842,13 @@ pub fn reconcile_anonymous_identifiers(
         used_names
             .entry(key)
             .or_default()
-            .insert(resource.id.name_str().to_string());
+            .insert(resource.id.identity_or_empty().to_string());
     }
 
     let mut claimed_names: HashMap<(String, String), HashSet<String>> = HashMap::new();
 
     for resource in resources.iter_mut() {
-        if resource.id.name.is_pending() {
+        if resource.id.identity.is_none() {
             continue;
         }
 
@@ -858,7 +862,7 @@ pub fn reconcile_anonymous_identifiers(
         if claims.claims_to(
             &resource.id.provider,
             &resource.id.resource_type,
-            resource.id.name_str(),
+            resource.id.identity_or_empty(),
         ) {
             continue;
         }
@@ -877,7 +881,7 @@ pub fn reconcile_anonymous_identifiers(
         // If the resource's name already exists in state, no reconciliation is needed.
         if state_entries
             .iter()
-            .any(|e| e.name == resource.id.name_str())
+            .any(|e| e.name == resource.id.identity_or_empty())
         {
             continue;
         }
@@ -897,14 +901,14 @@ pub fn reconcile_anonymous_identifiers(
             // No create-only properties or none set: use SimHash-based Hamming distance
             // matching to find the closest state entry.
             let Some(AnonymousHashSuffix::SimHash(resource_hash)) =
-                extract_hash_from_identifier(resource.id.name_str())
+                extract_hash_from_identifier(resource.id.identity_or_empty())
             else {
                 continue;
             };
 
             let candidates = state_entries
                 .iter()
-                .filter(|entry| entry.name != resource.id.name_str())
+                .filter(|entry| entry.name != resource.id.identity_or_empty())
                 .filter(|entry| {
                     !claims.claims_from(
                         &resource.id.provider,
@@ -932,7 +936,10 @@ pub fn reconcile_anonymous_identifiers(
                 // pre-provider-prefix). Keep our freshly-computed new-format
                 // name on the resource and record a rename so the wiring
                 // layer can re-key the state entry.
-                renames.push((state_name.to_string(), resource.id.name_str().to_string()));
+                renames.push((
+                    state_name.to_string(),
+                    resource.id.identity_or_empty().to_string(),
+                ));
                 claimed_names
                     .entry(key)
                     .or_default()
@@ -952,7 +959,7 @@ pub fn reconcile_anonymous_identifiers(
         let mut full_matches: Vec<&str> = Vec::new();
         let mut partial_matches: Vec<&str> = Vec::new();
         for entry in &state_entries {
-            if entry.name == resource.id.name_str() {
+            if entry.name == resource.id.identity_or_empty() {
                 // Same identifier, no reconciliation needed
                 continue;
             }
@@ -1001,7 +1008,7 @@ pub fn reconcile_anonymous_identifiers(
         };
 
         if let Some(matched_name) = matched_name {
-            resource.id = ResourceId::with_provider(
+            resource.id = ResourceId::with_provider_identity(
                 &resource.id.provider,
                 &resource.id.resource_type,
                 matched_name,
@@ -1061,7 +1068,7 @@ pub fn detect_anonymous_to_named_renames(
         used_names
             .entry(key)
             .or_default()
-            .insert(resource.id.name_str().to_string());
+            .insert(resource.id.identity_or_empty().to_string());
     }
 
     let mut renames: Vec<(ResourceId, ResourceId)> = Vec::new();
@@ -1074,7 +1081,7 @@ pub fn detect_anonymous_to_named_renames(
         if claims.claims_to(
             &resource.id.provider,
             &resource.id.resource_type,
-            resource.id.name_str(),
+            resource.id.identity_or_empty(),
         ) {
             continue;
         }
@@ -1088,7 +1095,7 @@ pub fn detect_anonymous_to_named_renames(
         // Skip if the binding name already exists in state — nothing to rename.
         if state_entries
             .iter()
-            .any(|e| e.name == resource.id.name_str())
+            .any(|e| e.name == resource.id.identity_or_empty())
         {
             continue;
         }
@@ -1164,7 +1171,7 @@ pub fn detect_anonymous_to_named_renames(
         };
 
         if let Some(name) = matched_name {
-            let from = ResourceId::with_provider(
+            let from = ResourceId::with_provider_identity(
                 &resource.id.provider,
                 &resource.id.resource_type,
                 name,

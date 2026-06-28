@@ -808,7 +808,7 @@ async fn run_apply_with_observer_factory(
                         .ok_or("Backend does not specify a resource type")?;
                     let bucket_resource_name = parsed
                         .find_resource_by_attr(backend_resource_type, "bucket", &bucket_name)
-                        .map(|r| r.id.name_str().to_string())
+                        .map(|r| r.id.identity_or_empty().to_string())
                         .ok_or_else(|| {
                             format!(
                                 "Auto-injected state bucket resource '{}' not found after re-parse",
@@ -1066,8 +1066,11 @@ async fn run_apply_locked(
             sorted_resources
                 .iter()
                 .filter_map(|r| {
-                    let rs =
-                        sf.find_resource(&r.id.provider, &r.id.resource_type, r.id.name_str())?;
+                    let rs = sf.find_resource(
+                        &r.id.provider,
+                        &r.id.resource_type,
+                        r.id.identity_or_empty(),
+                    )?;
                     if rs.dependency_bindings.is_empty() {
                         None
                     } else {

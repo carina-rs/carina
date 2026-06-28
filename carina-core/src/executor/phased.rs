@@ -625,7 +625,7 @@ pub(super) async fn execute_effects_phased(
                             progress,
                         });
                         success_count += 1;
-                        let synthetic = ResourceId::new("__wait", &binding);
+                        let synthetic = ResourceId::with_identity("__wait", &binding);
                         let attrs: HashMap<String, Value> = state
                             .attributes
                             .iter()
@@ -2051,7 +2051,7 @@ pub(super) async fn execute_effects_phased(
                             progress,
                         });
                         success_count += 1;
-                        let synthetic = ResourceId::new("__wait", &binding);
+                        let synthetic = ResourceId::with_identity("__wait", &binding);
                         let attrs: HashMap<String, Value> = state
                             .attributes
                             .iter()
@@ -2197,10 +2197,10 @@ mod tests {
             self.create_log
                 .lock()
                 .unwrap()
-                .push(id.name_str().to_string());
+                .push(id.identity_or_empty().to_string());
             let id = id.clone();
             Box::pin(async move {
-                if id.name_str() == "alb" {
+                if id.identity_or_empty() == "alb" {
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                     Err(ProviderError::api_error("alb create failed"))
                 } else {
@@ -2315,7 +2315,7 @@ mod tests {
             )),
         );
         Composition {
-            id: ResourceId::with_provider("_virtual", "_virtual", id_name, None),
+            id: ResourceId::with_provider_identity("_virtual", "_virtual", id_name, None),
             signature: crate::resource::Signature {
                 arguments: indexmap::IndexMap::new(),
                 attributes,

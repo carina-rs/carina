@@ -1084,7 +1084,7 @@ mod resolved_bindings_tests {
 
     #[test]
     fn local_binding_merges_state_attributes_when_dsl_missing_them() {
-        let rid = ResourceId::new("test.resource", "my-vpc");
+        let rid = ResourceId::with_identity("test.resource", "my-vpc");
         let resources = vec![make_resource(
             "my-vpc",
             Some("vpc"),
@@ -1148,8 +1148,8 @@ mod resolved_bindings_tests {
 
     #[test]
     fn pre_apply_materializes_partial_read_unknown_for_sibling_ref() {
-        let id_a = ResourceId::new("test.resource", "a");
-        let id_b = ResourceId::new("test.resource", "b");
+        let id_a = ResourceId::with_identity("test.resource", "a");
+        let id_b = ResourceId::with_identity("test.resource", "b");
         let a = make_resource("a", Some("a"), vec![]);
         let b = make_resource(
             "b",
@@ -1324,7 +1324,7 @@ mod resolved_bindings_tests {
         // `State.exists = false` represents a tombstone (resource was
         // destroyed since the last apply). The resolver must not merge
         // its attributes — they describe a no-longer-real resource.
-        let rid = ResourceId::new("test.resource", "my-vpc");
+        let rid = ResourceId::with_identity("test.resource", "my-vpc");
         let resources = vec![make_resource(
             "my-vpc",
             Some("vpc"),
@@ -1390,7 +1390,7 @@ mod resolved_bindings_tests {
         .into_iter()
         .collect();
         let state = State {
-            id: ResourceId::new("test.resource", "my-vpc"),
+            id: ResourceId::with_identity("test.resource", "my-vpc"),
             identifier: None,
             exists: true,
             attributes: vec![
@@ -1442,7 +1442,7 @@ mod resolved_bindings_tests {
         let mut resolved = ResolvedBindings::default();
         let attrs: HashMap<String, Value> = HashMap::new();
         let state = State {
-            id: ResourceId::new("test.resource", "anon"),
+            id: ResourceId::with_identity("test.resource", "anon"),
             identifier: None,
             exists: true,
             attributes: HashMap::new(),
@@ -1483,7 +1483,7 @@ mod resolved_bindings_tests {
 
         let mut child = parent.clone();
         let extra_state = State {
-            id: ResourceId::new("test.resource", "subnet"),
+            id: ResourceId::with_identity("test.resource", "subnet"),
             identifier: None,
             exists: true,
             attributes: vec![(
@@ -1742,7 +1742,7 @@ mod resolved_bindings_tests {
     /// what the provider *returned*.
     #[test]
     fn data_source_binding_merges_state_attributes() {
-        let ds_id = ResourceId::new("aws.iam.Roles", "admin_access_roles");
+        let ds_id = ResourceId::with_identity("aws.iam.Roles", "admin_access_roles");
         let mut ds = DataSource::new("aws.iam.Roles", "admin_access_roles");
         ds.id = ds_id.clone();
         ds.binding = Some("admin_access_roles".to_string());
@@ -1828,7 +1828,7 @@ mod resolved_bindings_tests {
     /// view must surface the post-read value, not the pre-read filter.
     #[test]
     fn data_source_binding_state_wins_on_key_collision() {
-        let ds_id = ResourceId::new("aws.example.Echo", "echo");
+        let ds_id = ResourceId::with_identity("aws.example.Echo", "echo");
         let mut ds = DataSource::new("aws.example.Echo", "echo");
         ds.id = ds_id.clone();
         ds.binding = Some("echo".to_string());
@@ -1884,7 +1884,7 @@ mod resolved_bindings_tests {
     /// so it pins the state-only variant.
     #[test]
     fn data_source_binding_with_no_dsl_inputs_exposes_state_only() {
-        let ds_id = ResourceId::with_provider("aws", "sts.CallerIdentity", "caller", None);
+        let ds_id = ResourceId::with_provider_identity("aws", "sts.CallerIdentity", "caller", None);
         let mut ds = DataSource::with_provider("aws", "sts.CallerIdentity", "caller", None);
         ds.id = ds_id.clone();
         ds.binding = Some("caller".to_string());

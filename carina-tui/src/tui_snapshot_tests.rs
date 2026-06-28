@@ -83,9 +83,9 @@ fn build_all_create_plan() -> Plan {
 fn build_mixed_operations_plan() -> Plan {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
-        id: ResourceId::new("ec2.Vpc", "my-vpc"),
+        id: ResourceId::with_identity("ec2.Vpc", "my-vpc"),
         from: Box::new(State::existing(
-            ResourceId::new("ec2.Vpc", "my-vpc"),
+            ResourceId::with_identity("ec2.Vpc", "my-vpc"),
             [
                 (
                     "cidr_block".to_string(),
@@ -124,7 +124,7 @@ fn build_mixed_operations_plan() -> Plan {
             ),
     ));
     plan.add(Effect::Delete {
-        id: ResourceId::new("ec2.Subnet", "old-subnet"),
+        id: ResourceId::with_identity("ec2.Subnet", "old-subnet"),
         identifier: "subnet-12345678".to_string(),
         directives: Directives::default(),
         binding: Some("old_subnet".to_string()),
@@ -173,9 +173,9 @@ fn build_map_key_diff_plan() -> Plan {
     .collect();
 
     plan.add(Effect::Update {
-        id: ResourceId::new("ec2.Vpc", "my-vpc"),
+        id: ResourceId::with_identity("ec2.Vpc", "my-vpc"),
         from: Box::new(State::existing(
-            ResourceId::new("ec2.Vpc", "my-vpc"),
+            ResourceId::with_identity("ec2.Vpc", "my-vpc"),
             [
                 (
                     "_binding".to_string(),
@@ -224,7 +224,7 @@ fn build_deferred_for_plan() -> Plan {
     let mut plan = Plan::new();
     plan.add(Effect::Create(certificate_resource()));
     plan.add(Effect::DeferredCreate {
-        id: ResourceId::new("__deferred_for", "validation_records"),
+        id: ResourceId::with_identity("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(deferred),
     });
@@ -249,7 +249,7 @@ fn build_anonymous_deferred_for_plan() -> Plan {
     let mut plan = Plan::new();
     plan.add(Effect::Create(certificate_resource()));
     plan.add(Effect::DeferredCreate {
-        id: ResourceId::new("__deferred_for", "_anon_validation_records"),
+        id: ResourceId::with_identity("__deferred_for", "_anon_validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(deferred),
     });
@@ -276,7 +276,7 @@ fn build_deferred_replace_plan() -> Plan {
     plan.add(Effect::Create(certificate_resource()));
     plan.add(Effect::DeferredReplace {
         deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
-            id: ResourceId::new("route53.Record", "old-record-0"),
+            id: ResourceId::with_identity("route53.Record", "old-record-0"),
             identifier: "record-0".to_string(),
             directives: Directives::default(),
             binding: Some("validation_records[0]".to_string()),
@@ -284,7 +284,7 @@ fn build_deferred_replace_plan() -> Plan {
             explicit_dependencies: HashSet::new(),
         }])
         .expect("fixture has one delete"),
-        id: ResourceId::new("__deferred_for", "validation_records"),
+        id: ResourceId::with_identity("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(deferred),
     });
@@ -495,13 +495,13 @@ fn snapshot_filter_mode_route_table() {
 fn build_moved_with_changes_plan() -> Plan {
     let mut plan = Plan::new();
     plan.add(Effect::Move {
-        from: ResourceId::new("ec2.Vpc", "old_vpc"),
-        to: ResourceId::new("ec2.Vpc", "new_vpc"),
+        from: ResourceId::with_identity("ec2.Vpc", "old_vpc"),
+        to: ResourceId::with_identity("ec2.Vpc", "new_vpc"),
     });
     plan.add(Effect::Update {
-        id: ResourceId::new("ec2.Vpc", "new_vpc"),
+        id: ResourceId::with_identity("ec2.Vpc", "new_vpc"),
         from: Box::new(State::existing(
-            ResourceId::new("ec2.Vpc", "new_vpc"),
+            ResourceId::with_identity("ec2.Vpc", "new_vpc"),
             [
                 (
                     "cidr_block".to_string(),
@@ -552,8 +552,8 @@ fn build_moved_with_changes_plan() -> Plan {
 fn build_moved_pure_plan() -> Plan {
     let mut plan = Plan::new();
     plan.add(Effect::Move {
-        from: ResourceId::new("ec2.Vpc", "old_vpc"),
-        to: ResourceId::new("ec2.Vpc", "new_vpc"),
+        from: ResourceId::with_identity("ec2.Vpc", "old_vpc"),
+        to: ResourceId::with_identity("ec2.Vpc", "new_vpc"),
     });
     plan
 }

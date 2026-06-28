@@ -33,7 +33,7 @@ fn create_test_module() -> ParsedFile {
         data_sources: vec![],
         compositions: vec![],
         resources: vec![Resource {
-            id: ResourceId::new("security_group", "sg"),
+            id: ResourceId::with_identity("security_group", "sg"),
             attributes: {
                 let mut attrs = HashMap::new();
                 attrs.insert(
@@ -143,7 +143,7 @@ fn test_substitute_arguments_nested() {
 /// no `let` binding). Used to verify that expansion preserves
 /// `Pending` rather than collapsing it to `Bound("<instance>.")` —
 /// a `Bound` value with a trailing dot would slip past
-/// `compute_anonymous_identifiers`'s `is_pending` filter and never
+/// `compute_anonymous_identifiers`'s absent-identity filter and never
 /// receive its hash-derived suffix (#2516).
 fn create_test_module_with_anonymous_resource() -> ParsedFile {
     ParsedFile {
@@ -151,7 +151,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
         data_sources: vec![],
         compositions: vec![],
         resources: vec![Resource {
-            id: ResourceId::with_provider("awscc", "iam.RolePolicy", "", None),
+            id: ResourceId::with_provider("awscc", "iam.RolePolicy", None, None),
             attributes: {
                 let mut attrs = IndexMap::new();
                 attrs.insert(
@@ -187,9 +187,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
 }
 
 #[test]
-fn test_expand_anonymous_resource_in_named_module_keeps_name_pending() {
-    use crate::resource::ResourceName;
-
+fn test_expand_anonymous_resource_in_named_module_keeps_identity_absent() {
     let resolver = {
         let mut r = ModuleResolver::new(".");
         r.imported_modules.insert(
@@ -211,11 +209,11 @@ fn test_expand_anonymous_resource_in_named_module_keeps_name_pending() {
     assert_eq!(expanded.len(), 1);
     let policy = &expanded[0];
     assert!(
-        matches!(policy.id.name, ResourceName::Pending),
-        "anonymous resource inside a module instance must remain Pending after expansion \
-         (compute_anonymous_identifiers filters on Pending and would skip a Bound value); \
+        policy.id.identity.is_none(),
+        "anonymous resource inside a module instance must keep identity absent after expansion \
+         (compute_anonymous_identifiers filters on absent identity and would skip an assigned value); \
          got {:?}",
-        policy.id.name,
+        policy.id.identity,
     );
     assert_eq!(
         policy.module_source,
@@ -257,7 +255,7 @@ fn test_expand_module_call() {
     assert_eq!(expanded.len(), 1);
 
     let sg = &expanded[0];
-    assert_eq!(sg.id.name_str(), "my_instance.sg");
+    assert_eq!(sg.id.identity_or_empty(), "my_instance.sg");
     assert_eq!(
         sg.get_attr("vpc_id"),
         Some(&Value::Concrete(ConcreteValue::String(
@@ -294,7 +292,12 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
         data_sources: vec![],
         compositions: vec![],
         resources: vec![Resource {
-            id: ResourceId::with_provider("aws", "acm.Certificate", "cert", Some("us".to_string())),
+            id: ResourceId::with_provider_identity(
+                "aws",
+                "acm.Certificate",
+                "cert",
+                Some("us".to_string()),
+            ),
             attributes: {
                 let mut attrs = IndexMap::new();
                 attrs.insert(
@@ -387,7 +390,7 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
     let state_name = format!("thing_{:016x}.role", state_hash);
 
     let mut resources = vec![Resource {
-        id: ResourceId::with_provider(
+        id: ResourceId::with_provider_identity(
             "aws",
             "iam.Role",
             format!("{}.role", current_prefix),
@@ -419,7 +422,7 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
     reconcile_anonymous_module_instances(&mut resources, &state_lookup);
 
     assert_eq!(
-        resources[0].id.name_str(),
+        resources[0].id.identity_or_empty(),
         state_name,
         "precondition: remap must actually have rewritten the name",
     );
@@ -440,7 +443,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
         compositions: vec![],
         resources: vec![
             Resource {
-                id: ResourceId::new("ec2.Vpc", "main_vpc"),
+                id: ResourceId::with_identity("ec2.Vpc", "main_vpc"),
                 attributes: {
                     let mut attrs = HashMap::new();
                     attrs.insert(
@@ -459,7 +462,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                 quoted_string_attrs: std::collections::HashSet::new(),
             },
             Resource {
-                id: ResourceId::new("ec2.Subnet", "sub"),
+                id: ResourceId::with_identity("ec2.Subnet", "sub"),
                 attributes: {
                     let mut attrs = HashMap::new();
                     attrs.insert(
@@ -587,8 +590,8 @@ fn test_multiple_module_instances_no_collision() {
     );
 
     // Resource names should also be distinct (dot notation)
-    assert_eq!(expanded_a[0].id.name_str(), "prod.main_vpc");
-    assert_eq!(expanded_b[0].id.name_str(), "staging.main_vpc");
+    assert_eq!(expanded_a[0].id.identity_or_empty(), "prod.main_vpc");
+    assert_eq!(expanded_b[0].id.identity_or_empty(), "staging.main_vpc");
 }
 
 /// Module with an attributes block that exposes a security_group binding.
@@ -600,7 +603,7 @@ fn create_module_with_attributes() -> ParsedFile {
         data_sources: vec![],
         compositions: vec![],
         resources: vec![Resource {
-            id: ResourceId::new("security_group", "sg"),
+            id: ResourceId::with_identity("security_group", "sg"),
             attributes: {
                 let mut attrs = HashMap::new();
                 attrs.insert(
@@ -766,8 +769,9 @@ fn test_expand_module_call_populates_expansion_trace_single_level() {
 
     // The chain element points at this call site's instance prefix
     // (`_virtual.<instance_prefix>`).
-    let expected_call_site =
-        crate::resource::EphemeralId::new(crate::resource::ResourceId::new("_virtual", "web"));
+    let expected_call_site = crate::resource::EphemeralId::new(
+        crate::resource::ResourceId::with_identity("_virtual", "web"),
+    );
     assert_eq!(chain[0].id, expected_call_site);
 }
 
@@ -850,9 +854,12 @@ fn test_build_expansion_trace_prepends_outer_call_site_to_inner_chain() {
     // Simulate an inner module that already finished its own
     // expansion: one leaf nested one level deep (inner_call_site).
     let mut inner_trace = ExpansionTrace::new();
-    let inner_leaf = PersistentId::new(ResourceId::new("aws.s3.Bucket", "outer.inner.logs"));
+    let inner_leaf = PersistentId::new(ResourceId::with_identity(
+        "aws.s3.Bucket",
+        "outer.inner.logs",
+    ));
     let inner_call_site = CallSite::new(
-        EphemeralId::new(ResourceId::new("_virtual", "outer.inner")),
+        EphemeralId::new(ResourceId::with_identity("_virtual", "outer.inner")),
         "./modules/inner",
     );
     inner_trace.record(inner_leaf.clone(), vec![inner_call_site.clone()]);
@@ -875,7 +882,7 @@ fn test_build_expansion_trace_prepends_outer_call_site_to_inner_chain() {
         2,
         "two-level expansion must produce a two-element chain, got {chain:?}",
     );
-    let expected_outer = EphemeralId::new(ResourceId::new("_virtual", "outer"));
+    let expected_outer = EphemeralId::new(ResourceId::with_identity("_virtual", "outer"));
     assert_eq!(
         chain[0].id, expected_outer,
         "outermost element must be the outer call site",
@@ -1179,7 +1186,7 @@ thing { name = 'beta'  }
         .resources
         .iter()
         .filter(|r| r.id.resource_type == "iam.Role")
-        .map(|r| r.id.name_str().to_string())
+        .map(|r| r.id.identity_or_empty().to_string())
         .collect();
     assert_eq!(role_addresses.len(), 2, "got {:?}", role_addresses);
 
@@ -1212,7 +1219,7 @@ thing              { name = 'anon-call'  }
     let addrs: Vec<&str> = parsed
         .resources
         .iter()
-        .map(|r| r.id.name.as_str())
+        .map(|r| r.id.identity_or_empty())
         .collect();
     assert!(addrs.iter().any(|n| n.starts_with("named.")), "{:?}", addrs);
     assert!(addrs.iter().any(|n| n.starts_with("thing_")), "{:?}", addrs);
@@ -1235,7 +1242,7 @@ thing { name = 'after-edit' }
         .resources
         .iter()
         .filter(|r| r.id.resource_type == "iam.Role")
-        .map(|r| r.id.name_str().to_string())
+        .map(|r| r.id.identity_or_empty().to_string())
         .collect();
     assert_eq!(before.len(), 1);
     let (new_prefix, _) = before[0].split_once('.').unwrap();
@@ -1254,7 +1261,7 @@ thing { name = 'after-edit' }
         .resources
         .iter()
         .filter(|r| r.id.resource_type == "iam.Role")
-        .map(|r| r.id.name_str().to_string())
+        .map(|r| r.id.identity_or_empty().to_string())
         .collect();
     assert_eq!(
         after,
@@ -1288,7 +1295,8 @@ thing { name = 'after-edit' }
         .find(|r| r.id.resource_type == "iam.Role")
         .unwrap()
         .id
-        .name_str()
+        .identity_str()
+        .unwrap_or("")
         .to_string();
     let (current_prefix, _) = before_name.split_once('.').unwrap();
     let (_, current_hash) = parse_synthetic_instance_prefix(current_prefix).unwrap();
@@ -1318,7 +1326,8 @@ thing { name = 'after-edit' }
             .find(|r| r.id.resource_type == "iam.Role")
             .unwrap()
             .id
-            .name_str(),
+            .identity_str()
+            .unwrap_or(""),
         before_name,
         "a claimed state child must exclude the whole state prefix from orphan candidates",
     );
@@ -1336,7 +1345,8 @@ thing { name = 'after-edit' }
         .find(|r| r.id.resource_type == "iam.Role")
         .unwrap()
         .id
-        .name_str()
+        .identity_str()
+        .unwrap_or("")
         .to_string();
     let (current_prefix, _) = before_name.split_once('.').unwrap();
     let (_, current_hash) = parse_synthetic_instance_prefix(current_prefix).unwrap();
@@ -1366,7 +1376,8 @@ thing { name = 'after-edit' }
             .find(|r| r.id.resource_type == "iam.Role")
             .unwrap()
             .id
-            .name_str(),
+            .identity_str()
+            .unwrap_or(""),
         before_name,
         "a claimed desired child must pin the whole current prefix",
     );
@@ -1390,7 +1401,8 @@ thing { name = 'a' }
         .find(|r| r.id.resource_type == "iam.Role")
         .unwrap()
         .id
-        .name_str()
+        .identity_str()
+        .unwrap_or("")
         .to_string();
 
     // State entry uses a different module name.
@@ -1403,7 +1415,8 @@ thing { name = 'a' }
         .find(|r| r.id.resource_type == "iam.Role")
         .unwrap()
         .id
-        .name_str()
+        .identity_str()
+        .unwrap_or("")
         .to_string();
     assert_eq!(before_name, after_name);
 }
@@ -1462,7 +1475,8 @@ thing { name = 'after-edit' }
         .find(|r| r.id.resource_type == "iam.Role")
         .unwrap()
         .id
-        .name_str()
+        .identity_str()
+        .unwrap_or("")
         .to_string();
     let (new_prefix, _) = role_name_before.split_once('.').unwrap();
     let (_, new_hash) = parse_synthetic_instance_prefix(new_prefix).unwrap();
@@ -1484,7 +1498,7 @@ thing { name = 'after-edit' }
         .find(|r| r.id.resource_type == "iam.Role")
         .unwrap();
     assert_eq!(
-        role_after.id.name_str(),
+        role_after.id.identity_or_empty(),
         format!("thing_{:016x}.role", state_hash),
         "Role address must be remapped to the state prefix",
     );
@@ -1494,7 +1508,7 @@ thing { name = 'after-edit' }
         .find(|r| r.id.resource_type == "iam.OidcProvider")
         .unwrap();
     assert_eq!(
-        provider_after.id.name_str(),
+        provider_after.id.identity_or_empty(),
         format!("thing_{:016x}.provider_res", state_hash),
         "OidcProvider address must be remapped to the state prefix",
     );
@@ -1519,7 +1533,8 @@ thing { name = 'a' }
         .find(|r| r.id.resource_type == "iam.Role")
         .unwrap()
         .id
-        .name_str()
+        .identity_str()
+        .unwrap_or("")
         .to_string();
     let (prefix, _) = before_name.split_once('.').unwrap();
     let (_, cur_hash) = parse_synthetic_instance_prefix(prefix).unwrap();
@@ -1545,7 +1560,8 @@ thing { name = 'a' }
         .find(|r| r.id.resource_type == "iam.Role")
         .unwrap()
         .id
-        .name_str()
+        .identity_str()
+        .unwrap_or("")
         .to_string();
     assert_eq!(before_name, after_name, "ambiguous match must not remap");
 }
@@ -1570,7 +1586,14 @@ thing { name = 'unchanged-but-different' }
         .resources
         .iter()
         .filter(|r| r.id.resource_type == "iam.Role")
-        .map(|r| r.id.name_str().split_once('.').unwrap().0.to_string())
+        .map(|r| {
+            r.id.identity_str()
+                .unwrap_or("")
+                .split_once('.')
+                .unwrap()
+                .0
+                .to_string()
+        })
         .collect();
     assert_eq!(prefixes_before.len(), 2);
     let mut iter = prefixes_before.iter();
@@ -1587,7 +1610,14 @@ thing { name = 'unchanged-but-different' }
         .resources
         .iter()
         .filter(|r| r.id.resource_type == "iam.Role")
-        .map(|r| r.id.name_str().split_once('.').unwrap().0.to_string())
+        .map(|r| {
+            r.id.identity_str()
+                .unwrap_or("")
+                .split_once('.')
+                .unwrap()
+                .0
+                .to_string()
+        })
         .collect();
     assert_eq!(
         prefixes_after, prefixes_before,
@@ -1644,7 +1674,7 @@ fn test_expand_module_call_uses_dot_path_addressing() {
 
     let sg = &expanded[0];
     // Resource name should use dot notation, not underscore
-    assert_eq!(sg.id.name_str(), "my_instance.sg");
+    assert_eq!(sg.id.identity_or_empty(), "my_instance.sg");
 }
 
 #[test]
@@ -1675,8 +1705,8 @@ fn test_module_dot_path_bindings_and_refs() {
         .resources;
 
     // Resource names should use dot notation
-    assert_eq!(expanded[0].id.name_str(), "prod.main_vpc");
-    assert_eq!(expanded[1].id.name_str(), "prod.sub");
+    assert_eq!(expanded[0].id.identity_or_empty(), "prod.main_vpc");
+    assert_eq!(expanded[1].id.identity_or_empty(), "prod.sub");
 
     // binding should use dot notation
     assert_eq!(expanded[0].binding, Some("prod.vpc".to_string()));
@@ -1706,7 +1736,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
         // A resource that consumes the wait binding the same way the
         // real CloudFront Distribution consumes `cert_issued`.
         m.resources.push(Resource {
-            id: ResourceId::new("cloudfront.Distribution", "distribution"),
+            id: ResourceId::with_identity("cloudfront.Distribution", "distribution"),
             attributes: {
                 let mut attrs = HashMap::new();
                 attrs.insert(
@@ -1946,7 +1976,7 @@ fn create_module_with_interpolation() -> ParsedFile {
         data_sources: vec![],
         compositions: vec![],
         resources: vec![Resource {
-            id: ResourceId::new("ec2.Vpc", "vpc"),
+            id: ResourceId::with_identity("ec2.Vpc", "vpc"),
             attributes: {
                 let mut attrs = HashMap::new();
                 attrs.insert(
@@ -4498,7 +4528,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
         // `rewrite_intra_module_refs`). Add it so this unit faithfully
         // models the real `let cert = aws.acm.Certificate { … }` case.
         m.resources.push(Resource {
-            id: ResourceId::new("acm.Certificate", "cert"),
+            id: ResourceId::with_identity("acm.Certificate", "cert"),
             attributes: HashMap::new().into_iter().collect(),
             directives: Directives::default(),
             prefixes: HashMap::new(),
@@ -4518,7 +4548,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
             iterable_attr: "domain_validation_options".to_string(),
             binding: ForBinding::Map("_".to_string(), "opt".to_string()),
             template_resource: Resource {
-                id: ResourceId::new("route53.RecordSet", "placeholder"),
+                id: ResourceId::with_identity("route53.RecordSet", "placeholder"),
                 attributes: {
                     // The loop body references the module-internal
                     // `cert` binding — the part of the template
@@ -4658,7 +4688,7 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
             iterable_attr: "list".to_string(),
             binding: ForBinding::Map("_".to_string(), "a".to_string()),
             template_resource: Resource {
-                id: ResourceId::new("sso.Assignment", "placeholder"),
+                id: ResourceId::with_identity("sso.Assignment", "placeholder"),
                 attributes: HashMap::new().into_iter().collect(),
                 directives: Directives::default(),
                 prefixes: HashMap::new(),

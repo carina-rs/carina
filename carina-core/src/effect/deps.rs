@@ -408,7 +408,7 @@ pub fn build_effect_dependency_analysis(
         if let Effect::Delete { id, binding, .. } = effect
             && binding.is_none()
         {
-            name_to_delete_idx.insert(id.name_str().to_string(), idx);
+            name_to_delete_idx.insert(id.identity_or_empty().to_string(), idx);
         }
     }
     let alias_offset = effects.len();
@@ -525,7 +525,7 @@ mod tests {
     #[test]
     fn destroy_delete_edges_block_dependencies_by_consumers() {
         let parent = Effect::Delete {
-            id: ResourceId::new("test", "parent"),
+            id: ResourceId::with_identity("test", "parent"),
             identifier: "parent-id".to_string(),
             directives: Default::default(),
             binding: Some("parent".to_string()),
@@ -533,7 +533,7 @@ mod tests {
             explicit_dependencies: HashSet::new(),
         };
         let child = Effect::Delete {
-            id: ResourceId::new("test", "child"),
+            id: ResourceId::with_identity("test", "child"),
             identifier: "child-id".to_string(),
             directives: Default::default(),
             binding: Some("child".to_string()),
@@ -556,7 +556,7 @@ mod tests {
     #[test]
     fn destroy_wait_alias_bridges_target_to_consumers() {
         let cert = Effect::Delete {
-            id: ResourceId::new("test", "cert"),
+            id: ResourceId::with_identity("test", "cert"),
             identifier: "cert-id".to_string(),
             directives: Default::default(),
             binding: Some("cert".to_string()),
@@ -564,7 +564,7 @@ mod tests {
             explicit_dependencies: HashSet::new(),
         };
         let listener = Effect::Delete {
-            id: ResourceId::new("test", "listener"),
+            id: ResourceId::with_identity("test", "listener"),
             identifier: "listener-id".to_string(),
             directives: Default::default(),
             binding: Some("listener".to_string()),
@@ -602,15 +602,18 @@ mod tests {
         let mut x = Resource::new("test", "x");
         x.binding = Some("x".to_string());
 
-        let from = State::existing(ResourceId::new("test", "replace_me"), HashMap::new())
-            .with_dependency_bindings(std::collections::BTreeSet::from(["x".to_string()]));
+        let from = State::existing(
+            ResourceId::with_identity("test", "replace_me"),
+            HashMap::new(),
+        )
+        .with_dependency_bindings(std::collections::BTreeSet::from(["x".to_string()]));
         let mut to = Resource::new("test", "replace_me");
         to.binding = Some("replace_me".to_string());
 
         let effects = vec![
             Effect::Create(x),
             Effect::Replace {
-                id: ResourceId::new("test", "replace_me"),
+                id: ResourceId::with_identity("test", "replace_me"),
                 from: Box::new(from),
                 to,
                 directives: Default::default(),
@@ -634,7 +637,7 @@ mod tests {
     #[test]
     fn unknown_destroy_dependency_names_are_dropped() {
         let orphan = Effect::Delete {
-            id: ResourceId::new("test", "listener"),
+            id: ResourceId::with_identity("test", "listener"),
             identifier: "listener-id".to_string(),
             directives: Default::default(),
             binding: Some("listener".to_string()),

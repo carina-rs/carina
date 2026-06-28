@@ -30,69 +30,47 @@ impl<'a> EnumAttr<'a> {
     }
 }
 
-/// The `name` portion of a `ResourceId`.
+/// Opaque resource identity.
 ///
-/// Anonymous resources start out as `Pending` because the parser sees
-/// the resource block before it has extracted the `name` attribute.
-/// A later post-processing pass converts `Pending` to `Bound(name)`
-/// once the attribute has been read. Encoding this transient state in
-/// the type makes it impossible to confuse "anonymous, ID not yet
-/// assigned" with "actual ID is the empty string" (#2225).
-///
-/// On disk the variant is collapsed to a plain JSON string for
-/// backward compatibility with v5 state files: `Pending` round-trips
-/// through `""`, `Bound(s)` through `s`. The discriminant is
-/// reconstructed on deserialization.
+/// Identity is independent from any schema `name` attribute. Empty
+/// strings are not valid identities; callers that do not yet have an
+/// identity must represent that as `None` on [`ResourceId`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum ResourceName {
-    /// An identifier already extracted (from a `let` binding or the
-    /// `name` attribute of an anonymous resource).
-    Bound(String),
-    /// An anonymous resource whose `name` attribute has not yet been
-    /// promoted to the `ResourceId`. Must be replaced with `Bound`
-    /// before the value can flow to plan generation, state, or
-    /// providers.
-    Pending,
-}
+pub struct ResourceIdentity(String);
 
-impl ResourceName {
-    /// True when this `ResourceName` has not yet been bound to a
-    /// concrete identifier.
-    pub fn is_pending(&self) -> bool {
-        matches!(self, Self::Pending)
+impl ResourceIdentity {
+    pub(crate) fn new(s: impl Into<String>) -> Self {
+        let s = s.into();
+        assert!(!s.is_empty(), "resource identity cannot be empty");
+        Self(s)
     }
 
-    /// Borrow the bound identifier as a `&str`. `Pending` returns the
-    /// empty string — sites that need to distinguish must `match` on
-    /// the variant directly.
     pub fn as_str(&self) -> &str {
-        match self {
-            Self::Bound(s) => s,
-            Self::Pending => "",
-        }
+        &self.0
     }
 }
 
-impl std::fmt::Display for ResourceName {
+impl std::fmt::Display for ResourceIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
-impl Serialize for ResourceName {
+impl Serialize for ResourceIdentity {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(self.as_str())
     }
 }
 
-impl<'de> Deserialize<'de> for ResourceName {
+impl<'de> Deserialize<'de> for ResourceIdentity {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
-        Ok(if s.is_empty() {
-            Self::Pending
-        } else {
-            Self::Bound(s)
-        })
+        if s.is_empty() {
+            return Err(serde::de::Error::custom(
+                "resource identity cannot be empty",
+            ));
+        }
+        Ok(Self(s))
     }
 }
 
@@ -103,13 +81,10 @@ pub struct ResourceId {
     pub provider: String,
     /// Resource type (e.g., "s3.Bucket", "ec2.Instance")
     pub resource_type: String,
-    /// Resource name (identifier specified in DSL).
-    ///
-    /// `Pending` means the resource is anonymous and the `name`
-    /// attribute has not yet been promoted into the `ResourceId`.
-    /// All downstream consumers (state, plan, providers) require
-    /// `Bound`.
-    pub name: ResourceName,
+    /// Resource identity. `None` means the parser has not assigned one
+    /// yet, which is only valid before the resolver boundary.
+    #[serde(default, alias = "name")]
+    pub identity: Option<ResourceIdentity>,
     /// Binding name of the provider instance this resource is routed
     /// to. `None` resolves to the kind's default instance.
     /// Hash/Eq include the field so two resources differing only in
@@ -119,13 +94,17 @@ pub struct ResourceId {
 }
 
 impl ResourceId {
-    pub fn new(resource_type: impl Into<String>, name: impl Into<String>) -> Self {
+    pub fn new(resource_type: impl Into<String>, identity: Option<ResourceIdentity>) -> Self {
         Self {
             provider: String::new(),
             resource_type: resource_type.into(),
-            name: ResourceName::from_string(name.into()),
+            identity,
             provider_instance: None,
         }
+    }
+
+    pub fn with_identity(resource_type: impl Into<String>, identity: impl Into<String>) -> Self {
+        Self::new(resource_type, Some(ResourceIdentity::new(identity)))
     }
 
     /// Construct a `ResourceId` with explicit routing.
@@ -140,28 +119,55 @@ impl ResourceId {
     pub fn with_provider(
         provider: impl Into<String>,
         resource_type: impl Into<String>,
-        name: impl Into<String>,
+        identity: Option<ResourceIdentity>,
         provider_instance: Option<String>,
     ) -> Self {
         Self {
             provider: provider.into(),
             resource_type: resource_type.into(),
-            name: ResourceName::from_string(name.into()),
+            identity,
             provider_instance,
         }
     }
 
-    /// Borrow the resolved identifier as `&str`. `Pending` returns
-    /// the empty string; sites that distinguish should `match` on
-    /// `self.name` directly.
-    pub fn name_str(&self) -> &str {
-        self.name.as_str()
+    pub fn with_provider_identity(
+        provider: impl Into<String>,
+        resource_type: impl Into<String>,
+        identity: impl Into<String>,
+        provider_instance: Option<String>,
+    ) -> Self {
+        Self::with_provider(
+            provider,
+            resource_type,
+            Some(ResourceIdentity::new(identity)),
+            provider_instance,
+        )
     }
 
-    /// Set the resource's name, replacing any existing `Pending` or
-    /// `Bound` variant with `Bound(name)`.
-    pub fn set_name(&mut self, name: impl Into<String>) {
-        self.name = ResourceName::Bound(name.into());
+    /// Construct from state/WIT strings where an empty name means "no identity".
+    pub fn with_provider_name_compat(
+        provider: impl Into<String>,
+        resource_type: impl Into<String>,
+        name: &str,
+        provider_instance: Option<String>,
+    ) -> Self {
+        if name.is_empty() {
+            Self::with_provider(provider, resource_type, None, provider_instance)
+        } else {
+            Self::with_provider_identity(provider, resource_type, name, provider_instance)
+        }
+    }
+
+    pub fn identity_str(&self) -> Option<&str> {
+        self.identity.as_ref().map(ResourceIdentity::as_str)
+    }
+
+    pub fn identity_or_empty(&self) -> &str {
+        self.identity_str().unwrap_or("")
+    }
+
+    pub fn set_identity(&mut self, identity: ResourceIdentity) {
+        self.identity = Some(identity);
     }
 
     /// Returns the display type including provider prefix if available
@@ -176,9 +182,9 @@ impl ResourceId {
     /// Borrow this id as a human-facing display value.
     ///
     /// Unlike the default `Display`, which renders the canonical dotted
-    /// form (`provider.resource_type.name`) used as a logical identifier
+    /// form (`provider.resource_type.identity`) used as a logical identifier
     /// for hashmap keys, binding fallbacks, and DSL syntax, this wrapper
-    /// renders `provider.resource_type` and `name` separated by a single
+    /// renders `provider.resource_type` and `identity` separated by a single
     /// space — making the type/address boundary visible to readers
     /// (carina-rs/carina#2572).
     ///
@@ -193,7 +199,7 @@ impl ResourceId {
 /// Human-facing display wrapper for [`ResourceId`].
 ///
 /// Construct with [`ResourceId::human`]; renders via `Display` as
-/// `provider.resource_type<SPACE>name` (or `resource_type<SPACE>name`
+/// `provider.resource_type<SPACE>identity` (or `resource_type<SPACE>identity`
 /// when the provider segment is empty).
 ///
 /// The wrapper exists as a distinct type, rather than as a second
@@ -206,35 +212,34 @@ pub struct ResourceIdDisplay<'a>(&'a ResourceId);
 impl std::fmt::Display for ResourceIdDisplay<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let id = self.0;
-        if id.provider.is_empty() {
-            write!(f, "{} {}", id.resource_type, id.name)
-        } else {
-            write!(f, "{}.{} {}", id.provider, id.resource_type, id.name)
-        }
-    }
-}
-
-impl ResourceName {
-    /// Convert a string into a `ResourceName`. Empty input becomes
-    /// `Pending`; any other input becomes `Bound`. Used by
-    /// `ResourceId::new` / `with_provider` to keep the legacy
-    /// `String` constructors compatible.
-    pub fn from_string(s: String) -> Self {
-        if s.is_empty() {
-            Self::Pending
-        } else {
-            Self::Bound(s)
+        match (id.provider.is_empty(), id.identity_str()) {
+            (true, Some(identity)) => write!(f, "{} {}", id.resource_type, identity),
+            (true, None) => write!(f, "{}", id.resource_type),
+            (false, Some(identity)) => {
+                write!(f, "{}.{} {}", id.provider, id.resource_type, identity)
+            }
+            (false, None) => write!(f, "{}.{}", id.provider, id.resource_type),
         }
     }
 }
 
 impl std::fmt::Display for ResourceId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.provider.is_empty() {
-            write!(f, "{}.{}", self.resource_type, self.name)
-        } else {
-            write!(f, "{}.{}.{}", self.provider, self.resource_type, self.name)
+        match (self.provider.is_empty(), self.identity_str()) {
+            (true, Some(id)) => write!(f, "{}.{}", self.resource_type, id),
+            (true, None) => write!(f, "{}", self.resource_type),
+            (false, Some(id)) => write!(f, "{}.{}.{}", self.provider, self.resource_type, id),
+            (false, None) => write!(f, "{}.{}", self.provider, self.resource_type),
         }
+    }
+}
+
+pub(crate) fn identity_if_present(identity: impl Into<String>) -> Option<ResourceIdentity> {
+    let identity = identity.into();
+    if identity.is_empty() {
+        None
+    } else {
+        Some(ResourceIdentity::new(identity))
     }
 }
 
@@ -1749,7 +1754,7 @@ pub struct Resource {
     /// radius. Sharing a struct with the attributes also makes the
     /// lookup rename-proof: there is no separate identifier keying
     /// the metadata, so `compute_anonymous_identifiers` can rewrite
-    /// `Resource.id.name` freely (#2229).
+    /// `Resource.id.identity` freely (#2229).
     ///
     /// Parse-time only; `#[serde(skip)]` keeps it out of state.
     #[serde(default, skip)]
@@ -1759,7 +1764,7 @@ pub struct Resource {
 impl Resource {
     pub fn new(resource_type: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
-            id: ResourceId::new(resource_type, name),
+            id: ResourceId::new(resource_type, identity_if_present(name)),
             attributes: IndexMap::new(),
             directives: Directives::default(),
             prefixes: HashMap::new(),
@@ -1787,7 +1792,12 @@ impl Resource {
         provider_instance: Option<String>,
     ) -> Self {
         Self {
-            id: ResourceId::with_provider(provider, resource_type, name, provider_instance),
+            id: ResourceId::with_provider(
+                provider,
+                resource_type,
+                identity_if_present(name),
+                provider_instance,
+            ),
             attributes: IndexMap::new(),
             directives: Directives::default(),
             prefixes: HashMap::new(),

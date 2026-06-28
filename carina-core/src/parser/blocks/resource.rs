@@ -39,10 +39,6 @@ pub(in crate::parser) fn parse_anonymous_resource(
     let attributes = parse_block_contents_with_quoted(iter, ctx, &mut quoted_out)?;
     let quoted_string_attrs = quoted_out.unwrap_or_default();
 
-    // Anonymous resources get an empty name that will be replaced by a hash-based
-    // identifier computed from create-only properties after parsing.
-    let resource_name = String::new();
-
     let mut attributes = attributes;
     attributes.insert(
         "_type".to_string(),
@@ -55,7 +51,7 @@ pub(in crate::parser) fn parse_anonymous_resource(
     let id = ResourceId::with_provider(
         provider,
         resource_type,
-        resource_name,
+        None,
         directives.provider_instance.clone(),
     );
 
@@ -223,7 +219,7 @@ pub(crate) fn parse_resource_expr(
         Value::Concrete(ConcreteValue::String(namespaced_type.clone())),
     );
 
-    let id = ResourceId::with_provider(
+    let id = ResourceId::with_provider_identity(
         provider,
         resource_type,
         resource_name,
@@ -279,7 +275,7 @@ pub(crate) fn parse_read_resource_expr(
         Value::Concrete(ConcreteValue::String(namespaced_type.clone())),
     );
 
-    let id = ResourceId::with_provider(
+    let id = ResourceId::with_provider_identity(
         provider,
         resource_type,
         resource_name,

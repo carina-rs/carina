@@ -57,55 +57,84 @@ fn value_serde_round_trip() {
 
 #[test]
 fn resource_id_serde_round_trip() {
-    let id = ResourceId::with_provider("awscc", "ec2.Vpc", "main-vpc", None);
+    let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main-vpc", None);
     let json = serde_json::to_string(&id).unwrap();
     let deserialized: ResourceId = serde_json::from_str(&json).unwrap();
     assert_eq!(id, deserialized);
 }
 
-// The "anonymous, awaiting `name` extraction" state is type-distinct
-// from a bound name, so the parser cannot accidentally produce a
-// `ResourceId` whose `name` is the empty string and have it be
-// mistaken for a valid identifier (#2225).
-
 #[test]
-fn resource_name_pending_is_distinct_from_bound_empty() {
-    let pending = ResourceName::Pending;
-    let bound_empty = ResourceName::Bound(String::new());
-    assert_ne!(pending, bound_empty);
-    assert!(pending.is_pending());
-    assert!(!bound_empty.is_pending());
+fn resource_identity_rejects_empty_string() {
+    let err = serde_json::from_str::<ResourceIdentity>(r#""""#).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("resource identity cannot be empty")
+    );
 }
 
 #[test]
-fn resource_id_pending_serde_round_trips_as_empty_string() {
-    // V5 state files persist `name` as a plain JSON string. To preserve
-    // backward compatibility, ResourceName::Pending serializes to "" and
-    // deserializes from "" — round-trip is exact.
+#[should_panic(expected = "resource identity cannot be empty")]
+fn resource_identity_new_rejects_empty() {
+    ResourceIdentity::new("");
+}
+
+#[test]
+fn identity_or_empty_returns_empty_for_none() {
+    let id = ResourceId::with_provider("aws", "s3.Bucket", None, None);
+    assert_eq!(id.identity_or_empty(), "");
+}
+
+#[test]
+fn with_provider_name_compat_maps_empty_to_none() {
+    let id = ResourceId::with_provider_name_compat("aws", "s3.Bucket", "", None);
+    assert!(id.identity.is_none());
+}
+
+#[test]
+fn with_provider_name_compat_maps_nonempty_to_some() {
+    let id = ResourceId::with_provider_name_compat("aws", "s3.Bucket", "my-bucket", None);
+    assert_eq!(id.identity_str(), Some("my-bucket"));
+}
+
+#[test]
+fn resource_id_absent_identity_serde_round_trips_as_null() {
     let id = ResourceId {
         provider: "aws".to_string(),
         resource_type: "ec2.Subnet".to_string(),
-        name: ResourceName::Pending,
+        identity: None,
         provider_instance: None,
     };
     let json = serde_json::to_string(&id).unwrap();
-    assert!(json.contains("\"name\":\"\""), "got: {json}");
+    assert!(json.contains("\"identity\":null"), "got: {json}");
     let deserialized: ResourceId = serde_json::from_str(&json).unwrap();
     assert_eq!(id, deserialized);
-    assert!(deserialized.name.is_pending());
+    assert!(deserialized.identity.is_none());
 }
 
 #[test]
-fn resource_id_bound_serde_round_trips_as_string() {
-    let id = ResourceId::with_provider("aws", "ec2.Subnet", "my-subnet", None);
+fn resource_id_identity_serde_round_trips_as_string() {
+    let id = ResourceId::with_provider_identity("aws", "ec2.Subnet", "my-subnet", None);
     let json = serde_json::to_string(&id).unwrap();
-    assert!(json.contains("\"name\":\"my-subnet\""), "got: {json}");
+    assert!(json.contains("\"identity\":\"my-subnet\""), "got: {json}");
     let deserialized: ResourceId = serde_json::from_str(&json).unwrap();
     assert_eq!(id, deserialized);
-    match deserialized.name {
-        ResourceName::Bound(s) => assert_eq!(s, "my-subnet"),
-        _ => panic!("expected Bound"),
-    }
+    assert_eq!(deserialized.identity_str(), Some("my-subnet"));
+}
+
+#[test]
+fn resource_id_deserializes_legacy_name_alias() {
+    let legacy = r#"{"provider":"aws","resource_type":"ec2.Subnet","name":"my-subnet"}"#;
+    let deserialized: ResourceId = serde_json::from_str(legacy).unwrap();
+    assert_eq!(deserialized.identity_str(), Some("my-subnet"));
+}
+
+#[test]
+fn resource_id_rejects_legacy_empty_name() {
+    let legacy = r#"{"provider":"aws","resource_type":"ec2.Subnet","name":""}"#;
+    assert!(
+        serde_json::from_str::<ResourceId>(legacy).is_err(),
+        "empty legacy name must fail — identity cannot be empty"
+    );
 }
 
 /// The AC test from #2225: lookups keyed by `ResourceId` must remain
@@ -118,18 +147,15 @@ fn resource_id_rename_pending_to_bound() {
     let mut id = ResourceId {
         provider: "aws".to_string(),
         resource_type: "ec2.Subnet".to_string(),
-        name: ResourceName::Pending,
+        identity: None,
         provider_instance: None,
     };
-    // The post-pass converts Pending → Bound with the extracted name.
-    id.set_name("app-subnet".to_string());
-    match &id.name {
-        ResourceName::Bound(s) => assert_eq!(s, "app-subnet"),
-        _ => panic!("expected Bound after set_name"),
-    }
+    // The post-pass assigns the extracted identity.
+    id.set_identity(ResourceIdentity::new("app-subnet".to_string()));
+    assert_eq!(id.identity_str(), Some("app-subnet"));
     // After renaming, the same string can produce an equal ResourceId
     // from any other code path (e.g. building a key for a sibling map).
-    let constructed = ResourceId::with_provider("aws", "ec2.Subnet", "app-subnet", None);
+    let constructed = ResourceId::with_provider_identity("aws", "ec2.Subnet", "app-subnet", None);
     assert_eq!(id, constructed);
 }
 
@@ -146,7 +172,7 @@ fn state_serde_round_trip() {
     );
 
     let state = State::existing(
-        ResourceId::with_provider("aws", "s3.Bucket", "my-bucket", None),
+        ResourceId::with_provider_identity("aws", "s3.Bucket", "my-bucket", None),
         attrs,
     )
     .with_identifier("my-bucket");
@@ -759,7 +785,7 @@ fn resource_dependency_bindings_iteration_is_sorted() {
 /// that delete-ordering metadata is also dedup'd and stable (#2228).
 #[test]
 fn state_dependency_bindings_dedup_on_duplicate_insert() {
-    let mut state = State::not_found(ResourceId::new("ec2.Subnet", "my-subnet"));
+    let mut state = State::not_found(ResourceId::with_identity("ec2.Subnet", "my-subnet"));
     state.dependency_bindings.insert("vpc".to_string());
     state.dependency_bindings.insert("vpc".to_string());
     assert_eq!(state.dependency_bindings.len(), 1);
@@ -1386,7 +1412,7 @@ fn unknown_cannot_round_trip_through_serde_json() {
 
 #[test]
 fn human_display_separates_type_from_name_with_space() {
-    let id = ResourceId::with_provider(
+    let id = ResourceId::with_provider_identity(
         "awscc",
         "iam.OidcProvider",
         "bs.bootstrap.oidc_provider",
@@ -1402,9 +1428,9 @@ fn human_display_separates_type_from_name_with_space() {
 
 #[test]
 fn human_display_omits_provider_segment_when_empty() {
-    // ResourceId::new (no provider) is used in some early-pipeline code paths
+    // ResourceId::with_identity (no provider) is used in some early-pipeline code paths
     // and in tests. The human format must still separate type from name.
-    let id = ResourceId::new("s3.Bucket", "state_bucket");
+    let id = ResourceId::with_identity("s3.Bucket", "state_bucket");
     assert_eq!(format!("{}", id.human()), "s3.Bucket state_bucket");
 }
 
@@ -1413,17 +1439,21 @@ fn human_display_does_not_alter_logical_display() {
     // The default Display remains the canonical dotted form because state
     // files, hashmap keys, binding fallbacks, and DSL identifiers all rely
     // on it. Only the human() wrapper changes shape.
-    let id = ResourceId::with_provider("aws", "s3.Bucket", "state_bucket", None);
+    let id = ResourceId::with_provider_identity("aws", "s3.Bucket", "state_bucket", None);
     assert_eq!(format!("{}", id), "aws.s3.Bucket.state_bucket");
 }
 
 #[test]
-fn human_display_handles_pending_name() {
-    // ResourceName::Pending renders as empty in Display; human() should
-    // still emit the separating space so callers can rely on a stable shape.
-    let mut id = ResourceId::with_provider("awscc", "ec2.Vpc", "", None);
-    id.name = ResourceName::Pending;
-    assert_eq!(format!("{}", id.human()), "awscc.ec2.Vpc ");
+fn human_display_handles_absent_identity() {
+    // An absent identity omits the identity segment rather than leaving
+    // trailing separators in human-facing display.
+    let id = ResourceId::with_provider("awscc", "ec2.Vpc", None, None);
+    assert_eq!(format!("{}", id), "awscc.ec2.Vpc");
+    assert_eq!(format!("{}", id.human()), "awscc.ec2.Vpc");
+
+    let local_id = ResourceId::new("custom.Type", None);
+    assert_eq!(format!("{}", local_id), "custom.Type");
+    assert_eq!(format!("{}", local_id.human()), "custom.Type");
 }
 
 // ---------------------------------------------------------------------

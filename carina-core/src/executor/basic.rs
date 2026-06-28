@@ -632,7 +632,7 @@ pub(super) async fn execute_basic_effect<'a>(
                 });
                 let secret_ctx = Some(SecretHashContext::new(
                     id.display_type(),
-                    id.name_str(),
+                    id.identity_or_empty(),
                     key,
                 ));
                 let Some(comparison_value) =
@@ -763,7 +763,7 @@ mod process_basic_result_tests {
 
     #[test]
     fn partial_success_records_state_and_diagnostic() {
-        let id = ResourceId::with_provider("mock", "test.resource", "r1", None);
+        let id = ResourceId::with_provider_identity("mock", "test.resource", "r1", None);
         let state = State::existing(id.clone(), HashMap::new()).with_identifier("mock-id");
         let diagnostic = PartialReadDiagnostic::new(
             "mock partial create".to_string(),

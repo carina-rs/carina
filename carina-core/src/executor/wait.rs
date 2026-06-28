@@ -369,7 +369,7 @@ pub async fn execute_wait_effect(
 ) -> WaitOutcome {
     execute_wait_effect_with_heartbeat_gap(
         provider,
-        target_id.name_str(),
+        target_id.identity_or_empty(),
         target_id,
         identifier_resolver,
         until,
@@ -580,7 +580,7 @@ mod tests {
             "status".to_string(),
             Value::Concrete(ConcreteValue::String(status.to_string())),
         );
-        State::existing(ResourceId::new("acm.Certificate", "cert"), attrs)
+        State::existing(ResourceId::with_identity("acm.Certificate", "cert"), attrs)
     }
 
     fn equals_status(value: &str) -> WaitPredicate {
@@ -644,7 +644,7 @@ mod tests {
     async fn wait_returns_immediately_when_until_already_true() {
         let provider = ReadSequenceProvider::new(vec![state_with_status("ISSUED")]);
         let pred = equals_status("ISSUED");
-        let target = ResourceId::new("acm.Certificate", "cert");
+        let target = ResourceId::with_identity("acm.Certificate", "cert");
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let result = execute_wait_effect(
@@ -678,7 +678,7 @@ mod tests {
             state_with_status("ISSUED"),
         ]);
         let pred = equals_status("ISSUED");
-        let target = ResourceId::new("acm.Certificate", "cert");
+        let target = ResourceId::with_identity("acm.Certificate", "cert");
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let result = execute_wait_effect(
@@ -703,7 +703,7 @@ mod tests {
     async fn wait_returns_timeout_when_predicate_stays_false() {
         let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING_VALIDATION")]);
         let pred = equals_status("ISSUED");
-        let target = ResourceId::new("acm.Certificate", "cert");
+        let target = ResourceId::with_identity("acm.Certificate", "cert");
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let result = execute_wait_effect(
@@ -738,7 +738,7 @@ mod tests {
 
     #[test]
     fn wait_timeout_failure_message_uses_display_formatting_for_last_attrs() {
-        let target = ResourceId::new("acm.Certificate", "cert");
+        let target = ResourceId::with_identity("acm.Certificate", "cert");
         let outcome = WaitOutcome::Timeout {
             last_attrs: HashMap::from([
                 (
@@ -766,7 +766,7 @@ mod tests {
 
     #[test]
     fn wait_timeout_failure_message_handles_empty_last_attrs() {
-        let target = ResourceId::new("acm.Certificate", "cert");
+        let target = ResourceId::with_identity("acm.Certificate", "cert");
         let outcome = WaitOutcome::Timeout {
             last_attrs: HashMap::new(),
             elapsed: Duration::from_secs(1),
@@ -779,7 +779,7 @@ mod tests {
 
     #[test]
     fn wait_timeout_failure_message_handles_unknown_and_deferred_attrs() {
-        let target = ResourceId::new("acm.Certificate", "cert");
+        let target = ResourceId::with_identity("acm.Certificate", "cert");
         let outcome = WaitOutcome::Timeout {
             last_attrs: HashMap::from([
                 (
@@ -811,10 +811,10 @@ mod tests {
     async fn wait_returns_not_found_when_target_disappears() {
         let provider = ReadSequenceProvider::new(vec![
             state_with_status("PENDING_VALIDATION"),
-            State::not_found(ResourceId::new("acm.Certificate", "cert")),
+            State::not_found(ResourceId::with_identity("acm.Certificate", "cert")),
         ]);
         let pred = equals_status("ISSUED");
-        let target = ResourceId::new("acm.Certificate", "cert");
+        let target = ResourceId::with_identity("acm.Certificate", "cert");
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let result = execute_wait_effect(
@@ -838,7 +838,7 @@ mod tests {
     async fn wait_returns_unsatisfiable_when_cancelled() {
         let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING_VALIDATION")]);
         let pred = equals_status("ISSUED");
-        let target = ResourceId::new("acm.Certificate", "cert");
+        let target = ResourceId::with_identity("acm.Certificate", "cert");
         let (cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let reads_seen = AtomicUsize::new(0);
@@ -884,7 +884,7 @@ mod tests {
     async fn wait_emits_heartbeat_at_max_interval() {
         let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING_VALIDATION")]);
         let pred = equals_status("ISSUED");
-        let target = ResourceId::new("acm.Certificate", "cert");
+        let target = ResourceId::with_identity("acm.Certificate", "cert");
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = HeartbeatObserver::new();
 
