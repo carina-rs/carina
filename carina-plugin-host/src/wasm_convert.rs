@@ -385,7 +385,7 @@ pub fn core_to_wit_resource_id(id: &CoreResourceId) -> wit::ResourceId {
     wit::ResourceId {
         provider: id.provider.clone(),
         resource_type: id.resource_type.clone(),
-        name: id.identity_or_empty().to_string(),
+        identity: id.identity_or_empty().to_string(),
     }
 }
 
@@ -395,7 +395,7 @@ pub fn wit_to_core_resource_id(id: &wit::ResourceId) -> CoreResourceId {
     // Tracked as a follow-up to extend the WIT contract; until then,
     // callers that need routing must thread it through alongside the
     // converted id.
-    CoreResourceId::with_provider_name_compat(&id.provider, &id.resource_type, &id.name, None)
+    CoreResourceId::with_provider_name_compat(&id.provider, &id.resource_type, &id.identity, None)
 }
 
 // -- State --
@@ -1511,7 +1511,7 @@ mod tests {
         let wit = core_to_wit_resource_id(&core);
         assert_eq!(wit.provider, "aws");
         assert_eq!(wit.resource_type, "s3.Bucket");
-        assert_eq!(wit.name, "my-bucket");
+        assert_eq!(wit.identity, "my-bucket");
         let back = wit_to_core_resource_id(&wit);
         assert_eq!(core, back);
     }
@@ -1593,7 +1593,7 @@ mod tests {
         let wit = core_to_wit_resource(&resource).unwrap();
         assert_eq!(wit.id.provider, "aws");
         assert_eq!(wit.id.resource_type, "s3.Bucket");
-        assert_eq!(wit.id.name, "my-bucket");
+        assert_eq!(wit.id.identity, "my-bucket");
 
         let back = wit_to_core_resource(&wit);
         assert_eq!(back.id, resource.id);

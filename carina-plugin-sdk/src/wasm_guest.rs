@@ -117,7 +117,7 @@ macro_rules! export_provider {
                 proto::ResourceId {
                     provider: id.provider.clone(),
                     resource_type: id.resource_type.clone(),
-                    name: id.name.clone(),
+                    name: id.identity.clone(),
                 }
             }
 
@@ -135,7 +135,7 @@ macro_rules! export_provider {
                 wit_types::ResourceId {
                     provider: id.provider.clone(),
                     resource_type: id.resource_type.clone(),
-                    name: id.name.clone(),
+                    identity: id.name.clone(),
                 }
             }
 
@@ -719,7 +719,7 @@ macro_rules! export_provider {
                 proto::ResourceId {
                     provider: id.provider.clone(),
                     resource_type: id.resource_type.clone(),
-                    name: id.name.clone(),
+                    name: id.identity.clone(),
                 }
             }
 
@@ -737,7 +737,7 @@ macro_rules! export_provider {
                 wit_types::ResourceId {
                     provider: id.provider.clone(),
                     resource_type: id.resource_type.clone(),
-                    name: id.name.clone(),
+                    identity: id.name.clone(),
                 }
             }
 
